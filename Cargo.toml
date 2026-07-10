@@ -1,0 +1,12 @@
+[package]
+name = "multi"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+crossterm = "0.29.0"
+# Pinned to portable-pty's nix so the tree carries one copy, not two.
+nix = { version = "0.28", features = ["signal"] }
+portable-pty = "0.9.0"
+signal-hook = { version = "0.3", default-features = false }
+vt100 = "0.16.2"

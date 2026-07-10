@@ -1,0 +1,51 @@
+//! Small display helpers: relative time and column-bounded truncation.
+
+use std::time::Duration;
+
+/// Coarse relative age, matching the fleet-view idiom: `3s` / `4m` / `2h` / `5d`.
+/// One unit, no decimals — this is a glanceable column, not a stopwatch.
+pub fn rel_time(d: Duration) -> String {
+    let s = d.as_secs();
+    if s < 60 {
+        format!("{s}s")
+    } else if s < 3600 {
+        format!("{}m", s / 60)
+    } else if s < 86_400 {
+        format!("{}h", s / 3600)
+    } else {
+        format!("{}d", s / 86_400)
+    }
+}
+
+/// Truncate to at most `max` display columns, appending `…` when cut.
+///
+/// Control chars are flattened to spaces so a stray escape/newline from a
+/// child's output can't corrupt a dashboard row. Width is counted per-char
+/// (one column each) — a known approximation that undercounts CJK/wide
+/// glyphs; the real width table is a v2 concern (Logria's `LengthFinder`).
+pub fn truncate(s: &str, max: usize) -> String {
+    if max == 0 {
+        return String::new();
+    }
+    let clean = s.chars().map(|c| if c.is_control() { ' ' } else { c });
+    let count = s.chars().filter(|c| !c.is_control()).count().max(s.chars().count());
+    if count <= max {
+        return clean.collect();
+    }
+    let mut out: String = clean.take(max - 1).collect();
+    out.push('…');
+    out
+}
+
+/// Truncate then right-pad with spaces to exactly `width` columns.
+pub fn pad(s: &str, width: usize) -> String {
+    let t = truncate(s, width);
+    let w = t.chars().count();
+    if w < width {
+        let mut t = t;
+        t.extend(std::iter::repeat_n(' ', width - w));
+        t
+    } else {
+        t
+    }
+}
