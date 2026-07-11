@@ -1,7 +1,7 @@
 //! The client half of the phase-2 seam: UI state (modes, selection, pickers)
 //! and the single-threaded event loop. It owns **no** processes — the
 //! `Supervisor` does — and drives the task set only through `Command`s, painting
-//! the `TaskView` mirror it gets back as `Event`s. Modes are the `multi`
+//! the `TaskView` mirror it gets back as `Event`s. Modes are the `fleetcom`
 //! analogue of Logria's `InputType` handlers.
 //!
 //! The core sits behind a `Transport` (milestone 2: the supervisor on its own
@@ -116,7 +116,7 @@ pub struct App {
     /// Bytes of the last painted frame; the renderer skips the write when the
     /// next frame is identical.
     pub last_frame: Vec<u8>,
-    /// Directory `multi` was launched from — base for relative `@` paths and
+    /// Directory `fleetcom` was launched from — base for relative `@` paths and
     /// the "default" section that sorts first in "by dir" mode.
     pub invocation_dir: PathBuf,
     pub invocation_label: String,
@@ -171,7 +171,7 @@ pub fn bucket(v: &TaskView) -> u8 {
 
 impl App {
     /// Default client: connect to the daemon (autostarting it if needed), so
-    /// jobs outlive the UI. The core lives in `multi --daemon`, reached over the
+    /// jobs outlive the UI. The core lives in `fleetcom --daemon`, reached over the
     /// socket.
     pub fn connect(rows: u16, cols: u16) -> io::Result<App> {
         let stream = crate::daemon::connect_or_autostart()?;
@@ -293,7 +293,7 @@ impl App {
     }
 
     /// Load and run a named session. Public so `main` can trigger a startup load
-    /// (`multi <session>`); the outcome shows in the status line one tick later.
+    /// (`fleetcom <session>`); the outcome shows in the status line one tick later.
     pub fn load_session(&mut self, name: &str) {
         self.transport.send(Command::LoadSession {
             name: name.to_string(),
@@ -843,7 +843,7 @@ impl App {
     }
 
     fn on_key_attached(&mut self, out: &mut Stdout, k: KeyEvent) -> io::Result<()> {
-        // The one key `multi` steals from the child: Ctrl-\ backgrounds it.
+        // The one key `fleetcom` steals from the child: Ctrl-\ backgrounds it.
         // Everything else — including Ctrl-C/Z/D — is forwarded verbatim.
         //
         // Ctrl-\ sends byte 0x1C, which crossterm's legacy decoder reports as

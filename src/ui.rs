@@ -91,7 +91,7 @@ fn render_dashboard(out: &mut impl Write, app: &App) -> io::Result<()> {
         SetAttribute(Attribute::Bold),
         Print(pad(
             &format!(
-                "  multi   {running} running · {idle} idle · {done} done      by {}{mode_tag}",
+                "  fleetcom   {running} running · {idle} idle · {done} done      by {}{mode_tag}",
                 app.group_mode.label()
             ),
             cols

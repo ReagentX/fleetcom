@@ -1,4 +1,4 @@
-# multi
+# fleetcom
 
 A fleet-view supervisor for arbitrary shell commands.
 
@@ -23,24 +23,24 @@ Unix only — it relies on PTYs and process-group signals (`killpg`).
 
 From the project root:
 
-- `cargo install --path .` to install `multi` on your `PATH`, or
-- `cargo build --release` and run `target/release/multi`.
+- `cargo install --path .` to install `fleetcom` on your `PATH`, or
+- `cargo build --release` and run `target/release/fleetcom`.
 
 ## Usage
 
-There are a few ways to invoke `multi`:
+There are a few ways to invoke `fleetcom`:
 
-- `multi`
+- `fleetcom`
   - Connects to the daemon (autostarting it if needed) and opens the dashboard
-- `multi <session>`
+- `fleetcom <session>`
   - Loads a saved session at startup, then opens the dashboard
-- `multi --foreground`
+- `fleetcom --foreground`
   - Runs everything in-process, without a daemon (jobs die when you quit)
-- `multi --kill`
+- `fleetcom --kill`
   - Kills the daemon and its running jobs
 
-The daemon starts itself the first time you run `multi`; you never invoke
-`multi --daemon` directly.
+The daemon starts itself the first time you run `fleetcom`; you never invoke
+`fleetcom --daemon` directly.
 
 ## Key Commands
 
@@ -80,8 +80,8 @@ backgrounding an attached task never tells the child it lost the foreground.
 ### Jobs outlive the UI
 
 A per-user daemon owns the processes and their terminals. `q` disconnects the
-client and leaves everything running; the next `multi` reattaches. `Q` (or
-`multi --kill`) group-kills the running jobs and stops the daemon. If the daemon
+client and leaves everything running; the next `fleetcom` reattaches. `Q` (or
+`fleetcom --kill`) group-kills the running jobs and stops the daemon. If the daemon
 dies, the client says so and offers to reconnect rather than freezing on a stale
 view.
 
@@ -101,12 +101,12 @@ without leaving the dashboard.
 ### Sessions
 
 Save the current set of `{directory: [commands]}` as a named recipe and reload
-it later (`w` / `o`, or `multi <name>`). Loading re-runs the commands; it does
+it later (`w` / `o`, or `fleetcom <name>`). Loading re-runs the commands; it does
 not resurrect live processes — that is the daemon's job.
 
 ## Notes
 
-`multi` mimics the multi-pane "fleet view" of an agentic coding session, but for
+`fleetcom` mimics the multi-pane "fleet view" of an agentic coding session, but for
 any shell command. It is built for supervising several concurrent, long-running
 commands at once: build/test/watch loops, servers, and interactive agent CLIs
 that sit idle awaiting input.
@@ -120,7 +120,7 @@ that sit idle awaiting input.
 
 ### When to avoid it
 
-- For interactive multiplexing of shells you drive by hand, use `tmux` — `multi`
+- For interactive multiplexing of shells you drive by hand, use `tmux` — `fleetcom`
   runs one command per pane, not a shell session
 - It is not a full process manager: crash-resilient ownership (adopting jobs
   after a daemon *crash*, as opposed to a clean shutdown) is out of scope
@@ -134,5 +134,5 @@ that sit idle awaiting input.
   runs every job under that environment. A second terminal with a different
   `PATH` or virtualenv attaches to the same daemon, and its commands resolve
   against the first terminal's environment, not its own.
-- The daemon serves **one client at a time**; a second `multi` connects but
+- The daemon serves **one client at a time**; a second `fleetcom` connects but
   waits until the first disconnects (`q`).

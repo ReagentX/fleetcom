@@ -94,7 +94,7 @@ mod tests {
         assert_eq!(resolve(base, "/a/b/../../c"), PathBuf::from("/c"));
         assert_eq!(resolve(base, "/../x"), PathBuf::from("/x")); // can't climb past root
         assert_eq!(
-            resolve(base, "/Users/x/Code/Rust/multi/../imessage-exporter"),
+            resolve(base, "/Users/x/Code/Rust/fleetcom/../imessage-exporter"),
             PathBuf::from("/Users/x/Code/Rust/imessage-exporter")
         );
         // relative input resolves against base, then collapses

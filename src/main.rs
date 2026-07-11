@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 
-//! `multi` — a fleet-view supervisor for arbitrary shell commands. Each task is
+//! `fleetcom` — a fleet-view supervisor for arbitrary shell commands. Each task is
 //! a command in its own PTY; the dashboard groups them by status, and you can
 //! peek at, attach to, and background any of them.
 
@@ -39,7 +39,7 @@ fn main() -> io::Result<()> {
     if args.iter().any(|a| a == "--daemon") {
         return daemon::run_daemon();
     }
-    // `multi --kill`: tell a running daemon to kill everything and exit.
+    // `fleetcom --kill`: tell a running daemon to kill everything and exit.
     if args.iter().any(|a| a == "--kill") {
         return daemon::run_kill();
     }
@@ -62,12 +62,12 @@ fn main() -> io::Result<()> {
                 // Still in raw/alt-screen — restore before reporting the failure.
                 let _ = execute!(out, Show, LeaveAlternateScreen);
                 let _ = disable_raw_mode();
-                eprintln!("multi: could not reach the daemon: {e}");
+                eprintln!("fleetcom: could not reach the daemon: {e}");
                 return Err(e);
             }
         }
     };
-    // `multi [--foreground] <session>` loads that session at startup; the result
+    // `fleetcom [--foreground] <session>` loads that session at startup; the result
     // shows in the status line. `-`-prefixed args are flags, skipped here.
     if let Some(name) = args.iter().find(|a| !a.starts_with('-')) {
         app.load_session(name);

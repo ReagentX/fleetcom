@@ -157,7 +157,7 @@ impl Drop for ThreadTransport {
     }
 }
 
-/// Milestone 3: the core is a separate process (`multi --daemon`), reached over a
+/// Milestone 3: the core is a separate process (`fleetcom --daemon`), reached over a
 /// Unix socket. Commands are written as frames on the connection; a reader thread
 /// turns inbound event frames back into `Event`s on a channel, so `poll` drains
 /// the channel exactly like `ThreadTransport` — the client can't tell the core

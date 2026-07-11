@@ -33,12 +33,12 @@ pub fn sanitize(name: &str) -> String {
         .collect()
 }
 
-/// `<config>/multi/sessions`, overridable with `MULTI_CONFIG_DIR`.
+/// `<config>/fleetcom/sessions`, overridable with `FLEETCOM_CONFIG_DIR`.
 pub fn sessions_dir() -> Option<PathBuf> {
-    if let Ok(dir) = std::env::var("MULTI_CONFIG_DIR") {
+    if let Ok(dir) = std::env::var("FLEETCOM_CONFIG_DIR") {
         return Some(PathBuf::from(dir).join("sessions"));
     }
-    dirs::config_dir().map(|c| c.join("multi").join("sessions"))
+    dirs::config_dir().map(|c| c.join("fleetcom").join("sessions"))
 }
 
 fn to_json(cfg: &SessionConfig) -> String {
@@ -119,7 +119,7 @@ mod tests {
     use super::*;
 
     fn temp(tag: &str) -> PathBuf {
-        let d = std::env::temp_dir().join(format!("multi_session_test_{tag}"));
+        let d = std::env::temp_dir().join(format!("fleetcom_session_test_{tag}"));
         let _ = fs::remove_dir_all(&d);
         d
     }

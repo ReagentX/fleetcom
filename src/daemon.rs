@@ -1,12 +1,12 @@
-//! The daemon: `multi --daemon`. Owns the one `Supervisor`, listens on a
+//! The daemon: `fleetcom --daemon`. Owns the one `Supervisor`, listens on a
 //! per-user Unix socket, and serves a client at a time — reading framed
 //! `Command`s, applying them, writing framed `Event`s back. It runs the shared
 //! event-driven `core::run_loop` with a socket where the in-process channels
 //! were. The supervisor **outlives each client connection**, which is the whole
-//! point of phase 2: `q` disconnects, the jobs keep running, the next `multi`
+//! point of phase 2: `q` disconnects, the jobs keep running, the next `fleetcom`
 //! reattaches.
 //!
-//! Autostart lives here too: a plain `multi` connects to a running daemon, or
+//! Autostart lives here too: a plain `fleetcom` connects to a running daemon, or
 //! spawns one (detached, its own process group) and polls the socket until it's
 //! up — tmux's model.
 
@@ -28,22 +28,22 @@ use crate::frame::{read_frame, write_frame};
 use crate::protocol::{Command, decode_command, encode_command, encode_event};
 use crate::supervisor::Supervisor;
 
-/// Per-user directory holding the socket. `MULTI_RUNTIME_DIR` overrides it
-/// (tests point it at an isolated temp dir); else `$XDG_RUNTIME_DIR/multi`
-/// (per-user on Linux); else `$TMPDIR/multi-$uid` — the macOS path, where
+/// Per-user directory holding the socket. `FLEETCOM_RUNTIME_DIR` overrides it
+/// (tests point it at an isolated temp dir); else `$XDG_RUNTIME_DIR/fleetcom`
+/// (per-user on Linux); else `$TMPDIR/fleetcom-$uid` — the macOS path, where
 /// `$TMPDIR` is already per-user and the uid suffix covers a shared `/tmp` on an
 /// XDG-less Linux.
 fn runtime_dir() -> PathBuf {
-    if let Ok(d) = std::env::var("MULTI_RUNTIME_DIR") {
+    if let Ok(d) = std::env::var("FLEETCOM_RUNTIME_DIR") {
         return PathBuf::from(d);
     }
     if let Ok(d) = std::env::var("XDG_RUNTIME_DIR")
         && !d.is_empty()
     {
-        return PathBuf::from(d).join("multi");
+        return PathBuf::from(d).join("fleetcom");
     }
     let uid = nix::unistd::getuid().as_raw();
-    std::env::temp_dir().join(format!("multi-{uid}"))
+    std::env::temp_dir().join(format!("fleetcom-{uid}"))
 }
 
 fn socket_path() -> PathBuf {
@@ -86,7 +86,7 @@ fn ensure_runtime_dir(dir: &Path) -> io::Result<()> {
 
 /// Connect to the running daemon, autostarting one if absent. A live socket
 /// connects straight through. `ECONNREFUSED` means a stale socket file with no
-/// listener → remove it. Either way (that or `ENOENT`) spawn `multi --daemon`
+/// listener → remove it. Either way (that or `ENOENT`) spawn `fleetcom --daemon`
 /// and poll ~1s for it to bind.
 pub fn connect_or_autostart() -> io::Result<UnixStream> {
     let path = socket_path();
@@ -112,7 +112,7 @@ pub fn connect_or_autostart() -> io::Result<UnixStream> {
     ))
 }
 
-/// Spawn `multi --daemon` detached: its own process group (so a terminal SIGHUP
+/// Spawn `fleetcom --daemon` detached: its own process group (so a terminal SIGHUP
 /// to the client's group never reaches it — the safe `process_group(0)`, not an
 /// `unsafe` `setsid`), stdio off the terminal, stderr to a log for debugging.
 fn spawn_daemon() -> io::Result<()> {
@@ -130,7 +130,7 @@ fn spawn_daemon() -> io::Result<()> {
     Ok(())
 }
 
-/// `multi --kill`: connect to a running daemon and tell it to group-kill every
+/// `fleetcom --kill`: connect to a running daemon and tell it to group-kill every
 /// job and stop. Blocks until the socket closes — the daemon shuts the
 /// connection once it has killed the jobs and exited, so this returns only when
 /// they're actually gone. A no-op (with a message) if no daemon is running.
@@ -145,13 +145,13 @@ pub fn run_kill() -> io::Result<()> {
             Ok(())
         }
         Err(_) => {
-            eprintln!("multi: no daemon running");
+            eprintln!("fleetcom: no daemon running");
             Ok(())
         }
     }
 }
 
-/// The daemon entry point (`multi --daemon`). Binds the socket and serves clients
+/// The daemon entry point (`fleetcom --daemon`). Binds the socket and serves clients
 /// until an explicit shutdown. The supervisor is created once and persists across
 /// reconnects — jobs outlive any single client.
 pub fn run_daemon() -> io::Result<()> {
@@ -201,7 +201,7 @@ pub fn run_daemon() -> io::Result<()> {
                     break;
                 }
                 // Otherwise the client merely disconnected; keep the tasks and
-                // accept the next `multi`, which reattaches to them.
+                // accept the next `fleetcom`, which reattaches to them.
             }
             Err(e) if e.kind() == ErrorKind::WouldBlock => {
                 sup.reap();

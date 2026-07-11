@@ -1,14 +1,34 @@
 [package]
-name = "multi"
-version = "0.1.0"
+authors = ["Christopher Sardegna <fleetcom@reagentx.net>"]
+categories = ["command-line-interface", "command-line-utilities"]
+description = "A fleet-view supervisor for arbitrary shell commands."
 edition = "2024"
+keywords = ["cli", "tui", "pty", "supervisor", "process"]
+license = "GPL-3.0-or-later"
+name = "fleetcom"
+readme = "README.md"
+repository = "https://github.com/ReagentX/fleetcom"
+version = "0.1.0"
 
 [dependencies]
-crossterm = "0.29.0"
-dirs = "6"
-jzon = "0.12.5"
-# Pinned to portable-pty's nix so the tree carries one copy, not two.
+crossterm = "=0.29.0"
+dirs = "=6.0.0"
+jzon = "=0.12.5"
+# Held to portable-pty's nix (^0.28) — one copy in the tree, not two. Caret, not
+# `=`, so it tracks 0.28 patch releases. crates.io shows a newer nix (0.31);
+# bumping past portable-pty splits the tree into two copies. Same as signal-hook.
 nix = { version = "0.28", features = ["signal", "user", "fs"] }
-portable-pty = "0.9.0"
+portable-pty = "=0.9.0"
+# Held to crossterm's signal-hook (^0.3.17) — one copy in the tree, not two.
+# Caret, not `=`, so it tracks 0.3 patch releases. crates.io shows a newer
+# signal-hook (0.4); bumping past crossterm splits the tree. Same as nix.
 signal-hook = { version = "0.3", default-features = false }
-vt100 = "0.16.2"
+vt100 = "=0.16.2"
+
+[profile.release]
+# Perform Link Time Optimization
+lto = true
+# Use a single codegen unit for the entire crate
+codegen-units = 1
+# Do not unwind stack on crash
+panic = "abort"

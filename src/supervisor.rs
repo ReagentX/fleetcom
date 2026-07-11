@@ -1,5 +1,5 @@
 //! The task owner: holds every `Task`, allocates ids, reaps exits, and answers
-//! `Command`s with `Event`s. This is the unit phase 2 lifts into `multi
+//! `Command`s with `Event`s. This is the unit phase 2 lifts into `fleetcom
 //! --daemon` — it already speaks only `protocol` types, never UI state, so the
 //! split is a transport change, not a rewrite.
 //!
