@@ -3,7 +3,7 @@
 //! redraws. Modes are the `multi` analogue of Logria's `InputType` handlers.
 
 use std::io::{self, Stdout};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -447,9 +447,10 @@ impl App {
         self.mode = Mode::Spawn;
     }
 
-    /// Turn a typed path fragment into an absolute path against the base rules.
-    /// The `components().collect()` normalizes away a trailing slash so a stored
-    /// cwd never renders as `~/test//`.
+    /// Turn a typed path fragment into a fully-qualified, lexically-clean
+    /// absolute path: `~`/relative are resolved against the invocation dir, then
+    /// `lexical_clean` collapses `.`/`..` and trailing slashes so a stored cwd
+    /// reads as `~/a/c`, never `~/a/b/../c` or `~/test//`.
     fn resolve(&self, s: &str) -> PathBuf {
         let expanded = expand_tilde(s);
         let p = if expanded.is_empty() {
@@ -459,7 +460,7 @@ impl App {
         } else {
             self.invocation_dir.join(expanded)
         };
-        p.components().collect()
+        lexical_clean(&p)
     }
 
     /// Navigate into `dir`: retype the input as its path (trailing slash) so
@@ -793,6 +794,31 @@ fn expand_tilde(s: &str) -> String {
     s.to_string()
 }
 
+/// Collapse `.` and `..` lexically (no filesystem access, no symlink
+/// resolution): `/a/b/../c` → `/a/c`. Kept lexical rather than
+/// `fs::canonicalize` so `/tmp` stays `/tmp` (not `/private/tmp`) and the path
+/// need not exist yet — this only tidies what the user typed.
+fn lexical_clean(p: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for comp in p.components() {
+        match comp {
+            Component::CurDir => {}
+            Component::ParentDir => match out.components().next_back() {
+                Some(Component::Normal(_)) => {
+                    out.pop();
+                }
+                Some(Component::RootDir) => {} // `/..` stays `/`
+                _ => out.push(Component::ParentDir), // leading `..` in a relative path
+            },
+            other => out.push(other.as_os_str()),
+        }
+    }
+    if out.as_os_str().is_empty() {
+        out.push(".");
+    }
+    out
+}
+
 /// Split a typed path into (directory-so-far, trailing fragment). The fragment
 /// is prefix-matched against candidates; the directory is what we list.
 fn split_input(input: &str) -> (&str, &str) {
@@ -931,6 +957,20 @@ mod tests {
         let app = App::new(30, 100);
         assert_eq!(app.resolve("/tmp/"), PathBuf::from("/tmp"));
         assert_eq!(app.resolve("/tmp"), PathBuf::from("/tmp"));
+    }
+
+    #[test]
+    fn resolve_collapses_dotdot() {
+        let app = App::new(30, 100);
+        assert_eq!(app.resolve("/a/b/../c"), PathBuf::from("/a/c"));
+        assert_eq!(app.resolve("/a/b/../../c"), PathBuf::from("/c"));
+        assert_eq!(app.resolve("/../x"), PathBuf::from("/x")); // can't climb past root
+        assert_eq!(
+            app.resolve("/Users/x/Code/Rust/multi/../imessage-exporter"),
+            PathBuf::from("/Users/x/Code/Rust/imessage-exporter")
+        );
+        // relative input resolves against the invocation dir, then collapses
+        assert_eq!(app.resolve("sub/.."), app.invocation_dir);
     }
 
     #[test]
