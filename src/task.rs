@@ -14,6 +14,8 @@ use nix::sys::signal::{Signal, killpg};
 use nix::unistd::Pid;
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
 
+use crate::core::{Wake, Waker};
+
 /// Map a dependency error (portable-pty returns `anyhow`) into `io::Error` so
 /// the whole crate speaks stdlib `io::Result` and never grows an `anyhow` dep.
 fn io_err(e: impl std::fmt::Display) -> io::Error {
@@ -53,9 +55,30 @@ pub struct Task {
     pub finished: Option<Instant>,
 }
 
+/// Wake the core loop that this task's screen advanced. Best-effort: the slot is
+/// empty between connections, and a closed channel just means the loop is gone —
+/// either way the parser already holds the bytes, so a dropped signal only delays
+/// a repaint to the next backstop tick.
+fn signal(waker: &Waker) {
+    if let Ok(slot) = waker.lock()
+        && let Some(tx) = slot.as_ref()
+    {
+        let _ = tx.send(Wake::Output);
+    }
+}
+
 impl Task {
     /// Spawn `command` under `$SHELL -c` in `cwd`, in a fresh PTY sized `rows`×`cols`.
-    pub fn spawn(id: u64, command: &str, cwd: &Path, rows: u16, cols: u16) -> io::Result<Task> {
+    /// `waker` lets the reader thread nudge the core loop when the PTY produces
+    /// output, so an attached screen refreshes without a polling delay.
+    pub fn spawn(
+        id: u64,
+        command: &str,
+        cwd: &Path,
+        rows: u16,
+        cols: u16,
+        waker: Waker,
+    ) -> io::Result<Task> {
         let pair = native_pty_system()
             .openpty(PtySize {
                 rows,
@@ -100,12 +123,18 @@ impl Task {
         let handle = {
             let parser = Arc::clone(&parser);
             let last_activity = Arc::clone(&last_activity);
+            let waker = Arc::clone(&waker);
             thread::spawn(move || {
                 let mut buf = [0u8; 8192];
                 loop {
                     match reader.read(&mut buf) {
-                        // EOF (child's pty fds all closed) or a read error: done.
-                        Ok(0) | Err(_) => break,
+                        // EOF (child's pty fds all closed) or a read error: the
+                        // child likely exited — wake the loop so it reaps promptly
+                        // rather than waiting out the idle backstop.
+                        Ok(0) | Err(_) => {
+                            signal(&waker);
+                            break;
+                        }
                         Ok(n) => {
                             if let Ok(mut p) = parser.lock() {
                                 p.process(&buf[..n]);
@@ -113,6 +142,8 @@ impl Task {
                             if let Ok(mut t) = last_activity.lock() {
                                 *t = Instant::now();
                             }
+                            // Screen advanced — nudge the core to ship it.
+                            signal(&waker);
                         }
                     }
                 }
@@ -261,11 +292,17 @@ mod tests {
         std::env::current_dir().unwrap()
     }
 
+    /// Tests drive the reader directly, so there is no core loop to wake.
+    fn no_waker() -> Waker {
+        Arc::new(Mutex::new(None))
+    }
+
     /// End-to-end plumbing: spawn under a PTY, the reader thread feeds vt100,
     /// the screen reflects the output, and the exit code is reaped.
     #[test]
     fn spawn_reads_output_and_exits_zero() {
-        let mut t = Task::spawn(1, "printf 'alpha\\nomega\\n'", &here(), 24, 80).unwrap();
+        let mut t =
+            Task::spawn(1, "printf 'alpha\\nomega\\n'", &here(), 24, 80, no_waker()).unwrap();
         let mut preview = String::new();
         for _ in 0..100 {
             t.poll_exit().unwrap();
@@ -282,7 +319,7 @@ mod tests {
 
     #[test]
     fn nonzero_exit_is_recorded() {
-        let mut t = Task::spawn(2, "exit 3", &here(), 24, 80).unwrap();
+        let mut t = Task::spawn(2, "exit 3", &here(), 24, 80, no_waker()).unwrap();
         for _ in 0..100 {
             t.poll_exit().unwrap();
             if t.finished.is_some() {
@@ -300,7 +337,7 @@ mod tests {
 
     #[test]
     fn resize_is_reflected_in_the_grid() {
-        let mut t = Task::spawn(3, "sleep 5", &here(), 24, 80).unwrap();
+        let mut t = Task::spawn(3, "sleep 5", &here(), 24, 80, no_waker()).unwrap();
         t.resize(30, 100).unwrap();
         assert_eq!(t.parser.lock().unwrap().screen().size(), (30, 100));
         t.terminate();

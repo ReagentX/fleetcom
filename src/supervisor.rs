@@ -9,8 +9,11 @@
 //! own thread, `drain` becomes a receive.
 
 use std::path::PathBuf;
+use std::sync::mpsc::Sender;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use crate::core::{Wake, Waker};
 use crate::path;
 use crate::protocol::{Command, Event, ScreenView, TaskView};
 use crate::session::{self, SessionConfig};
@@ -57,6 +60,11 @@ pub struct Supervisor {
     /// matters for a hand-edited relative entry.
     base_dir: PathBuf,
     events: Vec<Event>,
+    /// Handed to every `Task` so its reader thread can wake the core loop when the
+    /// PTY produces output. The serving loop installs its sender on connect
+    /// (`set_waker`) and drops it on disconnect (`clear_waker`); between clients
+    /// it is `None`, so an unattached daemon's task output accumulates cost-free.
+    waker: Waker,
 }
 
 impl Supervisor {
@@ -70,6 +78,23 @@ impl Supervisor {
             last_screen: None,
             base_dir,
             events: Vec::new(),
+            waker: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    /// Install the sender the current serving loop waits on, so task reader
+    /// threads (present and future — they share this one slot) wake it on output.
+    pub fn set_waker(&self, tx: Sender<Wake>) {
+        if let Ok(mut slot) = self.waker.lock() {
+            *slot = Some(tx);
+        }
+    }
+
+    /// Drop the installed sender on disconnect: task threads stop signalling a
+    /// defunct loop, and the next client installs its own.
+    pub fn clear_waker(&self) {
+        if let Ok(mut slot) = self.waker.lock() {
+            *slot = None;
         }
     }
 
@@ -206,7 +231,14 @@ impl Supervisor {
             )));
             return;
         }
-        match Task::spawn(self.next_id, command, &cwd, self.rows, self.cols) {
+        match Task::spawn(
+            self.next_id,
+            command,
+            &cwd,
+            self.rows,
+            self.cols,
+            Arc::clone(&self.waker),
+        ) {
             Ok(task) => {
                 self.next_id += 1;
                 self.tasks.push(task);
@@ -266,7 +298,14 @@ impl Supervisor {
                     skipped += 1;
                     continue;
                 }
-                if let Ok(task) = Task::spawn(self.next_id, cmd, &resolved, self.rows, self.cols) {
+                if let Ok(task) = Task::spawn(
+                    self.next_id,
+                    cmd,
+                    &resolved,
+                    self.rows,
+                    self.cols,
+                    Arc::clone(&self.waker),
+                ) {
                     self.next_id += 1;
                     self.tasks.push(task);
                     spawned += 1;

@@ -5,6 +5,7 @@
 //! peek at, attach to, and background any of them.
 
 mod app;
+mod core;
 mod daemon;
 mod format;
 mod frame;

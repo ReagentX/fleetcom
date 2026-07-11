@@ -11,14 +11,19 @@
 //!
 //! Milestone 3's Unix-domain socket is a third impl — `send` writes a framed
 //! command, `poll` reads ready event frames — and the client is none the wiser.
+//!
+//! Both live transports carry a `wait_tx: Sender<()>` into their event-reader:
+//! after delivering an `Event` to the client's mirror, they poke it to wake the
+//! client's run loop (which blocks on the matching receiver). That is the client
+//! half of the event-driven path — the run loop reacts to a fresh screen the
+//! instant it arrives, with no polling delay.
 
-use std::io;
 use std::net::Shutdown;
 use std::os::unix::net::UnixStream;
-use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, TryRecvError, channel};
+use std::sync::mpsc::{Receiver, Sender, TryRecvError, channel};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
 
+use crate::core::{Wake, run_loop};
 use crate::frame::{read_frame, write_frame};
 use crate::protocol::{Command, Event, decode_event, encode_command};
 use crate::supervisor::Supervisor;
@@ -69,9 +74,12 @@ fn drain(rx: &Receiver<Event>, dead: &mut bool) -> Vec<Event> {
     evs
 }
 
-/// The core on its own thread, behind two channels. The loopback of milestone 2.
+/// The core on its own thread, behind two channels. The loopback of milestone 2,
+/// now running the shared event-driven `core::run_loop`.
 pub struct ThreadTransport {
-    cmd_tx: Sender<Command>,
+    /// Commands to the core, wrapped as `Wake::Cmd` so they share the one channel
+    /// the core loop waits on (task output arrives on it as `Wake::Output`).
+    wake_tx: Sender<Wake>,
     evt_rx: Receiver<Event>,
     handle: Option<JoinHandle<()>>,
     /// Set when the event channel disconnects — the core thread ended (a normal
@@ -80,12 +88,29 @@ pub struct ThreadTransport {
 }
 
 impl ThreadTransport {
-    pub fn spawn(sup: Supervisor) -> ThreadTransport {
-        let (cmd_tx, cmd_rx) = channel::<Command>();
+    /// Run `sup` on its own thread. `wait_tx` wakes the *client's* run loop when
+    /// an event is produced — the foreground analogue of the socket reader poking
+    /// the client on an inbound frame.
+    pub fn spawn(sup: Supervisor, wait_tx: Sender<()>) -> ThreadTransport {
+        let (wake_tx, wake_rx) = channel::<Wake>();
         let (evt_tx, evt_rx) = channel::<Event>();
-        let handle = thread::spawn(move || core_loop(sup, cmd_rx, evt_tx));
+        // Install the waker before the thread starts, so tasks spawned on the core
+        // can signal output back to this same loop.
+        sup.set_waker(wake_tx.clone());
+        let handle = thread::spawn(move || {
+            let mut sup = sup;
+            run_loop(&mut sup, &wake_rx, |ev| {
+                if evt_tx.send(ev.clone()).is_err() {
+                    return false; // client dropped the receiver
+                }
+                let _ = wait_tx.send(());
+                true
+            });
+            // Loop returned (Shutdown or client gone): `sup` drops here, and with
+            // it every Task (Task::drop → killpg), so no job outlives the core.
+        });
         ThreadTransport {
-            cmd_tx,
+            wake_tx,
             evt_rx,
             handle: Some(handle),
             dead: false,
@@ -95,8 +120,8 @@ impl ThreadTransport {
     fn stop(&mut self) {
         // Tell the core to kill jobs and exit, then wait for it. The join is what
         // guarantees the SIGKILLs have been sent before we return — the core
-        // clears its tasks (Task::drop → killpg) as it unwinds `core_loop`.
-        let _ = self.cmd_tx.send(Command::Shutdown);
+        // clears its tasks (Task::drop → killpg) as `run_loop` returns.
+        let _ = self.wake_tx.send(Wake::Cmd(Command::Shutdown));
         if let Some(h) = self.handle.take() {
             let _ = h.join();
         }
@@ -107,7 +132,7 @@ impl Transport for ThreadTransport {
     fn send(&mut self, cmd: Command) {
         // A dead core thread means we're already tearing down; dropping the
         // command is the right thing.
-        let _ = self.cmd_tx.send(cmd);
+        let _ = self.wake_tx.send(Wake::Cmd(cmd));
     }
 
     fn poll(&mut self) -> Vec<Event> {
@@ -146,27 +171,38 @@ pub struct SocketTransport {
 }
 
 impl SocketTransport {
-    /// Wrap an already-connected stream (see `daemon::connect_or_autostart`).
-    pub fn connect(stream: UnixStream) -> io::Result<SocketTransport> {
-        let read = stream.try_clone()?;
+    /// Build over pre-split stream halves (`write`, `read`). The `try_clone` that
+    /// can fail is the caller's job — done outside the transport so the App's
+    /// transport factory stays infallible. `wait_tx` wakes the client's run loop
+    /// on each inbound event.
+    pub fn from_halves(
+        write: UnixStream,
+        read: UnixStream,
+        wait_tx: Sender<()>,
+    ) -> SocketTransport {
         let (evt_tx, evt_rx) = channel();
         let reader = thread::spawn(move || {
             let mut read = read;
             // Ends on EOF (daemon gone) or when the event channel closes.
             while let Ok((kind, payload)) = read_frame(&mut read) {
-                if let Some(ev) = decode_event(kind, &payload)
-                    && evt_tx.send(ev).is_err()
-                {
-                    break;
+                if let Some(ev) = decode_event(kind, &payload) {
+                    if evt_tx.send(ev).is_err() {
+                        break;
+                    }
+                    // Nudge the client loop so the fresh screen paints at once.
+                    let _ = wait_tx.send(());
                 }
             }
+            // EOF: the daemon is gone. Poke once more so the client wakes and sees
+            // the drop (via `poll` → disconnected) now, not on the idle backstop.
+            let _ = wait_tx.send(());
         });
-        Ok(SocketTransport {
-            write: stream,
+        SocketTransport {
+            write,
             evt_rx,
             reader: Some(reader),
             dead: false,
-        })
+        }
     }
 }
 
@@ -202,46 +238,6 @@ impl Transport for SocketTransport {
             let _ = h.join();
         }
     }
-}
-
-/// The core's own event loop: apply commands as they arrive, tick on a fixed
-/// cadence, ship the resulting events. `recv_timeout` wakes immediately on a
-/// command — so attached keystrokes forward promptly — but still ticks every
-/// `TICK` when idle, so live panes refresh. Ends on `Shutdown` or a dropped
-/// client; either way `sup` drops here, terminating every job.
-fn core_loop(mut sup: Supervisor, cmd_rx: Receiver<Command>, evt_tx: Sender<Event>) {
-    const TICK: Duration = Duration::from_millis(50);
-    loop {
-        match cmd_rx.recv_timeout(TICK) {
-            Ok(cmd) => {
-                if apply_or_stop(&mut sup, cmd) {
-                    return;
-                }
-                // Drain any other queued commands before ticking, so a burst
-                // (e.g. load-session's spawns) applies in a single pass.
-                while let Ok(cmd) = cmd_rx.try_recv() {
-                    if apply_or_stop(&mut sup, cmd) {
-                        return;
-                    }
-                }
-            }
-            Err(RecvTimeoutError::Timeout) => {}
-            Err(RecvTimeoutError::Disconnected) => return, // client gone
-        }
-        sup.tick();
-        for ev in sup.drain() {
-            if evt_tx.send(ev).is_err() {
-                return; // client gone
-            }
-        }
-    }
-}
-
-/// Apply one command; return `true` if it was `Shutdown` (the caller must stop).
-fn apply_or_stop(sup: &mut Supervisor, cmd: Command) -> bool {
-    let stop = matches!(cmd, Command::Shutdown);
-    sup.apply(cmd);
-    stop
 }
 
 /// Synchronous, in-thread transport for tests: `poll` ticks the supervisor

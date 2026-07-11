@@ -12,6 +12,8 @@ use std::io::{self, Stdout};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{Receiver, Sender, channel};
+use std::thread;
 use std::time::Duration;
 
 use crossterm::event::{self, Event as CtEvent, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
@@ -127,6 +129,21 @@ pub struct App {
     pub session_sel: usize,
     /// Transient one-line notice (save/load result), dismissed on the next key.
     pub status: Option<String>,
+    /// Parsed terminal events from the stdin reader thread. crossterm owns the
+    /// tty, so a dedicated thread blocks on `event::read()` and forwards here; the
+    /// run loop drains this instead of polling stdin itself.
+    input_rx: Receiver<CtEvent>,
+    /// The stdin thread's sender, taken by `run` when it spawns that thread — so
+    /// tests that never call `run` never start it.
+    input_tx: Option<Sender<CtEvent>>,
+    /// Woken by *both* the stdin thread and the transport's event reader (each
+    /// pokes a `()` after enqueuing). The run loop blocks here, so it reacts to a
+    /// keystroke or a fresh screen at once; the payload waits in `input_rx` /
+    /// `transport.poll()`. This is the client half of the event-driven path.
+    wait_rx: Receiver<()>,
+    /// Kept so `run` can hand the stdin thread a poker, and `reconnect` a fresh
+    /// transport one.
+    wait_tx: Sender<()>,
     /// Set by an external SIGTERM/SIGHUP/SIGINT; the loop treats it as quit so
     /// teardown runs and the terminal is restored.
     term_signal: Arc<AtomicBool>,
@@ -158,8 +175,12 @@ impl App {
     /// socket.
     pub fn connect(rows: u16, cols: u16) -> io::Result<App> {
         let stream = crate::daemon::connect_or_autostart()?;
-        let transport = SocketTransport::connect(stream)?;
-        let mut app = App::assemble(rows, cols, move |_, _, _| Box::new(transport));
+        // Split the stream here (the fallible part) so the transport factory in
+        // `assemble` — which owns the wake sender — stays infallible.
+        let read = stream.try_clone()?;
+        let mut app = App::assemble(rows, cols, move |_, _, _, wait_tx| {
+            Box::new(SocketTransport::from_halves(stream, read, wait_tx))
+        });
         app.daemon_backed = true;
         Ok(app)
     }
@@ -168,7 +189,13 @@ impl App {
     /// needed). The old jobs died with the old daemon — daemon death is task
     /// death — so the new session starts empty; the mirror is cleared to match.
     fn reconnect(&mut self) {
-        match crate::daemon::connect_or_autostart().and_then(SocketTransport::connect) {
+        let wait_tx = self.wait_tx.clone();
+        let build = move || -> io::Result<SocketTransport> {
+            let stream = crate::daemon::connect_or_autostart()?;
+            let read = stream.try_clone()?;
+            Ok(SocketTransport::from_halves(stream, read, wait_tx))
+        };
+        match build() {
             Ok(t) => {
                 self.transport = Box::new(t);
                 self.transport.send(Command::Resize {
@@ -189,12 +216,11 @@ impl App {
     /// `--foreground`: run the core in-process on a thread (no daemon). A
     /// non-daemon escape hatch, and the deterministic target the UI harnesses use.
     pub fn new_foreground(rows: u16, cols: u16) -> App {
-        App::assemble(rows, cols, |pr, c, dir| {
-            Box::new(ThreadTransport::spawn(Supervisor::new(
-                pr,
-                c,
-                dir.to_path_buf(),
-            )))
+        App::assemble(rows, cols, |pr, c, dir, wait_tx| {
+            Box::new(ThreadTransport::spawn(
+                Supervisor::new(pr, c, dir.to_path_buf()),
+                wait_tx,
+            ))
         })
     }
 
@@ -207,14 +233,18 @@ impl App {
     fn assemble(
         rows: u16,
         cols: u16,
-        make: impl FnOnce(u16, u16, &Path) -> Box<dyn Transport>,
+        make: impl FnOnce(u16, u16, &Path, Sender<()>) -> Box<dyn Transport>,
     ) -> App {
         let invocation_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         let invocation_label = path::abbreviate(&invocation_dir);
         // The core runs every PTY at the *content* size — full height minus the
         // one row attached mode reserves for its status bar.
         let pane_rows = rows.saturating_sub(1).max(1);
-        let mut transport = make(pane_rows, cols, &invocation_dir);
+        // One wake channel, poked by the stdin thread and the transport's event
+        // reader alike; one input channel from the stdin thread.
+        let (wait_tx, wait_rx) = channel::<()>();
+        let (input_tx, input_rx) = channel::<CtEvent>();
+        let mut transport = make(pane_rows, cols, &invocation_dir, wait_tx.clone());
         transport.send(Command::Resize {
             rows: pane_rows,
             cols,
@@ -242,6 +272,10 @@ impl App {
             session_names: Vec::new(),
             session_sel: 0,
             status: None,
+            input_rx,
+            input_tx: Some(input_tx),
+            wait_rx,
+            wait_tx,
             term_signal: Arc::new(AtomicBool::new(false)),
             should_quit: false,
             exit_intent: ExitIntent::Disconnect,
@@ -411,6 +445,25 @@ impl App {
     }
 
     pub fn run(&mut self, out: &mut Stdout) -> io::Result<()> {
+        // Spawn the stdin reader once. crossterm owns the tty and buffers parsed
+        // events internally, so rather than fight it with an external `poll(2)`
+        // (also barred by `#![forbid(unsafe_code)]`), a dedicated thread blocks on
+        // `event::read()` and forwards each event, poking the wake channel.
+        // Detached: it dies at process exit while parked in `read()`, exactly like
+        // the daemon's reader threads.
+        if let Some(input_tx) = self.input_tx.take() {
+            let wait_tx = self.wait_tx.clone();
+            thread::spawn(move || {
+                // Ends on a read error (tty gone) or when the run loop drops the
+                // receiver.
+                while let Ok(ev) = event::read() {
+                    if input_tx.send(ev).is_err() {
+                        break; // run loop gone
+                    }
+                    let _ = wait_tx.send(());
+                }
+            });
+        }
         loop {
             // Reconcile with the core: declare the watched task, then pull a
             // fresh snapshot (+ its screen). Both are terminal-free, so they run
@@ -450,10 +503,18 @@ impl App {
 
             ui::render(out, self)?;
 
-            // ~12fps: fast enough for live panes, cheap enough to idle on.
-            // A velocity-adaptive poll (Logria's RollingMean) is the v2 tune.
-            if event::poll(Duration::from_millis(80))? {
-                match event::read()? {
+            // Block until input arrives, the core pushes an event, or the backstop
+            // fires. The token is only "go look"; the payload waits in the
+            // channels drained below and by `sync()` at the top of the next turn.
+            // The 100 ms backstop bounds how long a `term_signal` goes unnoticed —
+            // the hot path (keystroke, echo) wakes immediately, never on it.
+            let _ = self.wait_rx.recv_timeout(Duration::from_millis(100));
+            while self.wait_rx.try_recv().is_ok() {} // coalesce wake tokens
+
+            // Handle every buffered key/resize in one pass — coalesces a paste and
+            // shaves the last keystroke's echo (no render between chars).
+            while let Ok(ev) = self.input_rx.try_recv() {
+                match ev {
                     // Accept Repeat too, so a held key still forwards when attached.
                     CtEvent::Key(k)
                         if matches!(k.kind, KeyEventKind::Press | KeyEventKind::Repeat) =>
@@ -946,7 +1007,7 @@ mod tests {
         /// A synchronous App: the supervisor ticks inline on `poll`, so `send`
         /// then `pump` is deterministic with no core-thread timing to race.
         fn new_local(rows: u16, cols: u16) -> App {
-            App::assemble(rows, cols, |pr, c, dir| {
+            App::assemble(rows, cols, |pr, c, dir, _wait_tx| {
                 Box::new(LocalTransport::new(Supervisor::new(
                     pr,
                     c,

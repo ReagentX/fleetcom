@@ -18,9 +18,10 @@ pub const KIND_SCREEN: u8 = 2;
 /// a few hundred KiB at most.
 const MAX_FRAME: u32 = 64 * 1024 * 1024;
 
-/// Write one frame and flush. Flushing per frame keeps latency low (the peer
-/// sees each command/event immediately); coalescing high-rate screen frames is
-/// the milestone-4 backpressure work.
+/// Write one frame and flush. Flushing per frame keeps latency low: the peer sees
+/// each command/event immediately. A firehose can't drown the socket because the
+/// core loop already coalesces screen emission to one frame per `FRAME_MIN` (see
+/// `core::run_loop`) — the flush here is per *emitted* frame, not per output byte.
 pub fn write_frame(w: &mut impl Write, kind: u8, payload: &[u8]) -> io::Result<()> {
     let len = u32::try_from(payload.len())
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "frame too large"))?;

@@ -1,9 +1,10 @@
 //! The daemon: `multi --daemon`. Owns the one `Supervisor`, listens on a
 //! per-user Unix socket, and serves a client at a time — reading framed
-//! `Command`s, applying them, writing framed `Event`s back. It is the milestone-2
-//! core loop with a socket where the channels were. The supervisor **outlives
-//! each client connection**, which is the whole point of phase 2: `q`
-//! disconnects, the jobs keep running, the next `multi` reattaches.
+//! `Command`s, applying them, writing framed `Event`s back. It runs the shared
+//! event-driven `core::run_loop` with a socket where the in-process channels
+//! were. The supervisor **outlives each client connection**, which is the whole
+//! point of phase 2: `q` disconnects, the jobs keep running, the next `multi`
+//! reattaches.
 //!
 //! Autostart lives here too: a plain `multi` connects to a running daemon, or
 //! spawns one (detached, its own process group) and polls the socket until it's
@@ -16,12 +17,13 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::mpsc::{RecvTimeoutError, channel};
+use std::sync::mpsc::channel;
 use std::thread;
 use std::time::Duration;
 
 use nix::fcntl::{Flock, FlockArg};
 
+use crate::core::{LoopExit, Wake, run_loop};
 use crate::frame::{read_frame, write_frame};
 use crate::protocol::{Command, decode_command, encode_command, encode_event};
 use crate::supervisor::Supervisor;
@@ -221,26 +223,32 @@ enum ServeOutcome {
 }
 
 /// Serve one client to completion. A reader thread turns inbound frames into
-/// `Command`s on a channel; this loop applies them, ticks, and writes back
-/// `Event` frames — the milestone-2 core loop with socket I/O at the edges.
+/// `Wake::Cmd`s on the channel the core loop waits on; task output arrives on the
+/// same channel as `Wake::Output` (via the supervisor's waker), so `run_loop`
+/// reacts to a keystroke's echo the instant the child emits it — the milestone-2
+/// core loop, now event-driven, with socket I/O at the edges.
 fn serve_client(sup: &mut Supervisor, stream: UnixStream) -> ServeOutcome {
     let Ok(read) = stream.try_clone() else {
         return ServeOutcome::Disconnected;
     };
-    let (cmd_tx, cmd_rx) = channel::<Command>();
-    // Reader thread: block on frames, decode, forward. Ends on EOF (client gone)
-    // or when the channel closes (this loop returned). Detached — never joined —
-    // so a half-closing client can't wedge the daemon.
+    let (wake_tx, wake_rx) = channel::<Wake>();
+    // Install the waker so task reader threads wake this loop on output; cleared
+    // when we return, so their signals stop reaching a defunct receiver.
+    sup.set_waker(wake_tx.clone());
+    // Reader thread: block on frames, decode, forward as `Wake::Cmd`. Ends on EOF
+    // (client gone) or when the channel closes (this loop returned). Detached —
+    // never joined — so a half-closing client can't wedge the daemon. A final
+    // `Hangup` lets the loop notice the client left at once, not on a later write.
     thread::spawn(move || {
         let mut read = read;
-        // Ends on EOF (client gone) or when the channel closes (loop returned).
         while let Ok((kind, payload)) = read_frame(&mut read) {
             if let Some(cmd) = decode_command(kind, &payload)
-                && cmd_tx.send(cmd).is_err()
+                && wake_tx.send(Wake::Cmd(cmd)).is_err()
             {
-                break;
+                return;
             }
         }
+        let _ = wake_tx.send(Wake::Hangup);
     });
 
     let mut write = stream;
@@ -250,33 +258,13 @@ fn serve_client(sup: &mut Supervisor, stream: UnixStream) -> ServeOutcome {
     // and `accept` — and `--kill` could never get in. Cap how long one event
     // write may block; a timeout surfaces as an error below and drops the client.
     let _ = write.set_write_timeout(Some(Duration::from_secs(5)));
-    const TICK: Duration = Duration::from_millis(50);
-    loop {
-        match cmd_rx.recv_timeout(TICK) {
-            Ok(Command::Shutdown) => {
-                sup.apply(Command::Shutdown); // group-kill every job
-                return ServeOutcome::Shutdown;
-            }
-            Ok(cmd) => {
-                sup.apply(cmd);
-                // Drain a burst (e.g. load-session spawns) before ticking.
-                while let Ok(cmd) = cmd_rx.try_recv() {
-                    if matches!(cmd, Command::Shutdown) {
-                        sup.apply(Command::Shutdown);
-                        return ServeOutcome::Shutdown;
-                    }
-                    sup.apply(cmd);
-                }
-            }
-            Err(RecvTimeoutError::Timeout) => {}
-            Err(RecvTimeoutError::Disconnected) => return ServeOutcome::Disconnected,
-        }
-        sup.tick();
-        for ev in sup.drain() {
-            let (kind, payload) = encode_event(&ev);
-            if write_frame(&mut write, kind, &payload).is_err() {
-                return ServeOutcome::Disconnected; // client gone
-            }
-        }
+    let outcome = run_loop(sup, &wake_rx, |ev| {
+        let (kind, payload) = encode_event(ev);
+        write_frame(&mut write, kind, &payload).is_ok()
+    });
+    sup.clear_waker();
+    match outcome {
+        LoopExit::Shutdown => ServeOutcome::Shutdown,
+        LoopExit::ClientGone => ServeOutcome::Disconnected,
     }
 }
