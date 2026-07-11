@@ -12,11 +12,14 @@
 //! Milestone 3's Unix-domain socket is a third impl — `send` writes a framed
 //! command, `poll` reads ready event frames — and the client is none the wiser.
 
+use std::io;
+use std::os::unix::net::UnixStream;
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
-use crate::protocol::{Command, Event};
+use crate::frame::{read_frame, write_frame};
+use crate::protocol::{Command, Event, decode_event, encode_command};
 use crate::supervisor::Supervisor;
 
 /// The client↔core seam. Deliberately one-way-each: commands never return a
@@ -89,6 +92,68 @@ impl Drop for ThreadTransport {
         // Belt-and-suspenders: if the loop exited without an explicit shutdown
         // (a panic path), still stop the core so no thread is left running.
         self.stop();
+    }
+}
+
+/// Milestone 3: the core is a separate process (`multi --daemon`), reached over a
+/// Unix socket. Commands are written as frames on the connection; a reader thread
+/// turns inbound event frames back into `Event`s on a channel, so `poll` drains
+/// the channel exactly like `ThreadTransport` — the client can't tell the core
+/// moved out of process.
+pub struct SocketTransport {
+    write: UnixStream,
+    evt_rx: Receiver<Event>,
+    reader: Option<JoinHandle<()>>,
+}
+
+impl SocketTransport {
+    /// Wrap an already-connected stream (see `daemon::connect_or_autostart`).
+    pub fn connect(stream: UnixStream) -> io::Result<SocketTransport> {
+        let read = stream.try_clone()?;
+        let (evt_tx, evt_rx) = channel();
+        let reader = thread::spawn(move || {
+            let mut read = read;
+            // Ends on EOF (daemon gone) or when the event channel closes.
+            while let Ok((kind, payload)) = read_frame(&mut read) {
+                if let Some(ev) = decode_event(kind, &payload)
+                    && evt_tx.send(ev).is_err()
+                {
+                    break;
+                }
+            }
+        });
+        Ok(SocketTransport {
+            write: stream,
+            evt_rx,
+            reader: Some(reader),
+        })
+    }
+}
+
+impl Transport for SocketTransport {
+    fn send(&mut self, cmd: Command) {
+        let (kind, payload) = encode_command(&cmd);
+        // A broken pipe means the daemon is gone; we're tearing down anyway.
+        let _ = write_frame(&mut self.write, kind, &payload);
+    }
+
+    fn poll(&mut self) -> Vec<Event> {
+        let mut evs = Vec::new();
+        while let Ok(ev) = self.evt_rx.try_recv() {
+            evs.push(ev);
+        }
+        evs
+    }
+
+    fn shutdown(&mut self) {
+        // Milestone 3 keeps `q` = kill-all: tell the daemon to group-kill every
+        // job and exit, then wait for the socket to close (daemon gone = jobs
+        // killed) before the client restores the terminal. The disconnect-vs-quit
+        // split is the next commit.
+        self.send(Command::Shutdown);
+        if let Some(h) = self.reader.take() {
+            let _ = h.join();
+        }
     }
 }
 

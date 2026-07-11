@@ -21,7 +21,7 @@ use crate::protocol::{Command, Event, ScreenView, TaskView};
 use crate::session;
 use crate::supervisor::Supervisor;
 use crate::task::Lifecycle;
-use crate::transport::{ThreadTransport, Transport};
+use crate::transport::{SocketTransport, ThreadTransport, Transport};
 use crate::ui;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -144,23 +144,43 @@ pub fn bucket(v: &TaskView) -> u8 {
 }
 
 impl App {
-    pub fn new(rows: u16, cols: u16) -> App {
-        // Production: the supervisor runs on its own thread behind a channel.
-        App::assemble(rows, cols, |sup| Box::new(ThreadTransport::spawn(sup)))
+    /// Default client: connect to the daemon (autostarting it if needed), so
+    /// jobs outlive the UI. The core lives in `multi --daemon`, reached over the
+    /// socket.
+    pub fn connect(rows: u16, cols: u16) -> io::Result<App> {
+        let stream = crate::daemon::connect_or_autostart()?;
+        let transport = SocketTransport::connect(stream)?;
+        Ok(App::assemble(rows, cols, move |_, _, _| Box::new(transport)))
     }
 
-    /// Build the App around whatever transport `make` wraps the supervisor in —
-    /// a `ThreadTransport` in production, a synchronous `LocalTransport` in
-    /// tests. Everything but the transport is identical.
-    fn assemble(rows: u16, cols: u16, make: impl FnOnce(Supervisor) -> Box<dyn Transport>) -> App {
+    /// `--foreground`: run the core in-process on a thread (no daemon). A
+    /// non-daemon escape hatch, and the deterministic target the UI harnesses use.
+    pub fn new_foreground(rows: u16, cols: u16) -> App {
+        App::assemble(rows, cols, |pr, c, dir| {
+            Box::new(ThreadTransport::spawn(Supervisor::new(pr, c, dir.to_path_buf())))
+        })
+    }
+
+    /// Build the App around whatever transport `make` returns. The in-process
+    /// transports (`ThreadTransport`, test `LocalTransport`) build a `Supervisor`
+    /// from `(pane_rows, cols, invocation_dir)`; `SocketTransport` ignores those
+    /// and talks to the daemon's supervisor instead. Either way the client then
+    /// declares its content size up front — essential for the daemon, which
+    /// otherwise sizes PTYs at its 24x80 default; a harmless no-op in-process.
+    fn assemble(
+        rows: u16,
+        cols: u16,
+        make: impl FnOnce(u16, u16, &Path) -> Box<dyn Transport>,
+    ) -> App {
         let invocation_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         let invocation_label = path::abbreviate(&invocation_dir);
         // The core runs every PTY at the *content* size — full height minus the
         // one row attached mode reserves for its status bar.
         let pane_rows = rows.saturating_sub(1).max(1);
-        let supervisor = Supervisor::new(pane_rows, cols, invocation_dir.clone());
+        let mut transport = make(pane_rows, cols, &invocation_dir);
+        transport.send(Command::Resize { rows: pane_rows, cols });
         App {
-            transport: make(supervisor),
+            transport,
             views: Vec::new(),
             focused_screen: None,
             watched: None,
@@ -845,7 +865,9 @@ mod tests {
         /// A synchronous App: the supervisor ticks inline on `poll`, so `send`
         /// then `pump` is deterministic with no core-thread timing to race.
         fn new_local(rows: u16, cols: u16) -> App {
-            App::assemble(rows, cols, |sup| Box::new(LocalTransport::new(sup)))
+            App::assemble(rows, cols, |pr, c, dir| {
+                Box::new(LocalTransport::new(Supervisor::new(pr, c, dir.to_path_buf())))
+            })
         }
 
         /// Drive one core sync so `views` reflects the latest spawns and reaps —

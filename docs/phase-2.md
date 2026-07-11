@@ -144,8 +144,15 @@ For jobs to outlive the UI, something other than the UI must own them → a
    unit tests + 9 harnesses green (idle still 0 B/2 s, fast group-kill quit,
    SIGTERM restore). The socket is a third `Transport` impl — the client is
    already blind to which it holds.
-3. **Real daemon + socket.** Split into `multi` / `multi --daemon`; framing +
-   autostart + attach/detach. `q` becomes disconnect; add explicit quit/kill.
+3. **Real daemon + socket.** *Commit 1 (3a) done:* `frame.rs` (`[u32 len][u8
+   kind][payload]`) + `Command`/`Event` serialization (jzon control, raw `Screen`
+   tail) + `daemon.rs` (`multi --daemon` owns the one `Supervisor`, persists
+   across reconnects) + `SocketTransport` (a third `Transport` impl) + autostart.
+   `ThreadTransport` lives on as `multi --foreground`. **`q` still kills all**, so
+   the 9 UI harnesses (now on `--foreground`) stay green; 3 new daemon harnesses
+   cover spawn/attach/reattach over the socket. *Commit 2 (3b) next:* the
+   disconnect/quit split — `q` disconnects, `Q`/`multi --kill` tears the daemon
+   down, signals disconnect.
 4. **Live reattach.** `ScreenFull`/`ScreenDiff` streaming; scrollback retention.
 5. **New-model UX.** Disconnect vs. quit bindings, "daemon status",
    reconnect-on-drop.

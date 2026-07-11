@@ -5,7 +5,9 @@
 //! peek at, attach to, and background any of them.
 
 mod app;
+mod daemon;
 mod format;
+mod frame;
 mod path;
 mod protocol;
 mod session;
@@ -30,6 +32,13 @@ use crossterm::{
 use app::App;
 
 fn main() -> io::Result<()> {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+
+    // Daemon mode is headless — no terminal setup, just serve the socket.
+    if args.iter().any(|a| a == "--daemon") {
+        return daemon::run_daemon();
+    }
+
     install_panic_hook();
 
     let mut out = io::stdout();
@@ -37,11 +46,26 @@ fn main() -> io::Result<()> {
     execute!(out, EnterAlternateScreen, Clear(ClearType::All), Hide)?;
 
     let (cols, rows) = size()?;
-    let mut app = App::new(rows, cols);
-    // `multi <session>` loads that session at startup; the result shows in the
-    // status line. `-`-prefixed args are reserved for future flags.
-    if let Some(name) = std::env::args().nth(1).filter(|a| !a.starts_with('-')) {
-        app.load_session(&name);
+    // Default connects to (or autostarts) the daemon so jobs outlive the UI;
+    // `--foreground` runs the core in-process instead.
+    let mut app = if args.iter().any(|a| a == "--foreground") {
+        App::new_foreground(rows, cols)
+    } else {
+        match App::connect(rows, cols) {
+            Ok(a) => a,
+            Err(e) => {
+                // Still in raw/alt-screen — restore before reporting the failure.
+                let _ = execute!(out, Show, LeaveAlternateScreen);
+                let _ = disable_raw_mode();
+                eprintln!("multi: could not reach the daemon: {e}");
+                return Err(e);
+            }
+        }
+    };
+    // `multi [--foreground] <session>` loads that session at startup; the result
+    // shows in the status line. `-`-prefixed args are flags, skipped here.
+    if let Some(name) = args.iter().find(|a| !a.starts_with('-')) {
+        app.load_session(name);
     }
     install_signal_handlers(app.signal_flag())?;
     let result = app.run(&mut out);
