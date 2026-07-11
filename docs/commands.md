@@ -1,6 +1,6 @@
 # Commands
 
-`fleetcom` has two command surfaces: **keys** inside the dashboard and its overlays, and **flags** at launch.
+`fleetcom` has two control surfaces: launch arguments select the operating mode, while keys control the dashboard and its overlays.
 
 ## Invocation
 
@@ -13,7 +13,7 @@
 | `fleetcom --help` / `-h` | Print usage and exit |
 | `fleetcom --version` / `-V` | Print the version and exit |
 
-`--daemon` exists but is internal: the first `fleetcom` autostarts it for you, and you never invoke it by hand. The first non-`-` argument is taken as the session name (one at most).
+`--daemon` is internal. An ordinary invocation starts it when necessary. The first non-`-` argument is treated as the session name; a second is rejected.
 
 ## Dashboard
 
@@ -47,11 +47,11 @@
 
 #### Peek vs. attach
 
-`Space` opens a read-only overlay: the selected task's live screen, framed in a box and updating as it runs. `↑`/`↓` move between tasks *without leaving peek*, so you can flip through the fleet; `Space`, `Esc`, or `q` closes it. `Enter` (from the dashboard or from peek) *attaches*: the task takes the whole terminal and your keystrokes go to it, cursor and all, so a live `vim` or `htop` behaves exactly as it would on its own.
+`Space` opens a read-only overlay containing the selected task's live screen. `↑`/`↓` move between tasks without closing the overlay; `Space`, `Esc`, or `q` closes it. `Enter`, from either the dashboard or peek, attaches to the task and forwards input to its PTY. Full-screen programs such as `vim` and `htop` retain their terminal state and cursor.
 
 #### Attach and background
 
-While attached, one key is reserved: `Ctrl-\` backgrounds the task and returns you to the dashboard. Everything else (including `Ctrl-C`, `Ctrl-Z`, `Ctrl-D`) is forwarded verbatim to the child, so the program never learns it lost the foreground. (`Ctrl-\` is the physical chord; it works whether the terminal reports it as `Ctrl-\` or, under crossterm's legacy decoder, `Ctrl-4`.)
+While attached, `Ctrl-\` returns to the dashboard. Every other key, including `Ctrl-C`, `Ctrl-Z`, and `Ctrl-D`, is forwarded to the child. `Ctrl-\` refers to the physical chord; the input handler accepts both `Ctrl-\` and the `Ctrl-4` representation produced by crossterm's legacy decoder.
 
 #### Destroy is Shift-gated
 
@@ -59,7 +59,7 @@ While attached, one key is reserved: `Ctrl-\` backgrounds the task and returns y
 
 #### Rerun
 
-`r` re-executes a *finished* task's command (same command string, same directory, same daemon-captured environment as every spawn) in the same row: the task keeps its id, its `◆` tag, and its list position; only the clock and the screen reset. On a running task `r` is a no-op: a rerun that had to kill first would be destructive, and destroy is `X`'s Shift-gated job. It also works from inside peek, so you can read a result and rerun it without closing the overlay.
+`r` re-executes a *finished* task's command using the same command string, directory, and daemon-captured environment. The task retains its ID, `◆` tag, and list position; its clock and screen reset. On a running task, `r` is a no-op because rerunning would first require a destructive kill. Rerun also works inside peek, which keeps the result visible while starting the next run.
 
 #### Detach vs. quit
 
@@ -77,7 +77,7 @@ While attached, one key is reserved: `Ctrl-\` backgrounds the task and returns y
 - Recent directories: ones you've launched in before; `Enter` runs there, `Tab`/`→` browses into them.
 - Subdirectories of the current path: `Enter` or `Tab`/`→` descends into one.
 
-Type to filter; `Backspace` climbs back up the typed path; `↑`/`↓` move the highlight; `Esc` cancels. It's live completion, so you can walk anywhere in the tree and launch there without leaving the dashboard.
+Typing filters the rows; `Backspace` climbs the typed path; `↑`/`↓` move the highlight; `Esc` cancels. Completion updates on each input, permitting navigation and launch without leaving the dashboard.
 
 ## Peek
 
@@ -89,4 +89,4 @@ The task owns the terminal, and its status bar reads `[attached] <command>    Ct
 
 ## When the daemon drops
 
-If the connection to the daemon is lost, the screen clears to a banner. The old task list would be a lie, since those jobs died with the daemon. `r` reconnects (when daemon-backed); `q` quits. A `--foreground` core has nothing to reconnect to, so it only offers quit.
+If the daemon connection is lost, the client clears the task list because it can no longer verify that state. `r` reconnects in daemon-backed mode; `q` quits. A `--foreground` core has no external process to reconnect to, so only quit is available.

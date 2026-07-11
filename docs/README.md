@@ -1,6 +1,6 @@
 # fleetcom Documentation
 
-How to install, configure, and drive `fleetcom`, and where it keeps its files.
+`fleetcom` splits durable session recipes from ephemeral daemon state. This document covers those paths, installation from source, and a complete first run.
 
 ## Index
 
@@ -10,25 +10,25 @@ How to install, configure, and drive `fleetcom`, and where it keeps its files.
 - [Sample Usage Session](#sample-usage-session): a first run, start to finish
 - [Notes & Caveats](#notes--caveats): the sharp edges
 
-## Advanced Installation
+## Installation from source
 
 `fleetcom` is Unix-only: it relies on PTYs and process-group signals (`killpg`).
 
-`cargo install fleetcom` is the normal path once it's published. To build from a clone:
+From a repository clone:
 
 - `cargo test`: confirm the suite passes
 - `cargo build --release`: compile to `target/release/fleetcom`
-- `cargo install --path .`: put `fleetcom` on your `PATH`
+- `cargo install --path .`: put `fleetcom` on `PATH`
 
 ## Directory & Environment Configuration
 
-`fleetcom` writes two kinds of state, in two different places. **Runtime** state
-(the daemon's socket and lock) is ephemeral. **Config** state (your saved
-sessions) is durable.
+`fleetcom` writes two kinds of state in separate locations. **Runtime** state
+contains the ephemeral daemon socket and lock. **Config** state contains durable
+session recipes.
 
 ### Runtime directory (socket + lock)
 
-Holds `default.sock` (the client↔daemon socket, mode `0600`) and `daemon.lock` (the single-instance `flock`; the running daemon writes its pid inside, which is what `--kill` signals). The directory is created `0700` and validated: if it already exists it must be a real directory this user owns. A symlink or a directory planted by someone else is rejected, so a shared `/tmp` can't be used to hijack the socket.
+The runtime directory holds `default.sock`, the mode-`0600` client↔daemon socket, and `daemon.lock`, the single-instance `flock`. The daemon writes its PID into the lock file, which is how `--kill` finds it. The directory is created with mode `0700`; an existing path must be a real directory owned by the current user. Symlinks and directories owned by another user are rejected.
 
 Resolved in this order:
 
@@ -38,7 +38,7 @@ Resolved in this order:
 | 2 | `$XDG_RUNTIME_DIR` is set and non-empty (Linux) | `$XDG_RUNTIME_DIR/fleetcom` |
 | 3 | otherwise | `$TMPDIR/fleetcom-$uid` |
 
-On macOS `$TMPDIR` is already per-user; the `$uid` suffix on the fallback is what keeps users apart on a shared `/tmp` (an XDG-less Linux box).
+On macOS, `$TMPDIR` is already per-user. The `$uid` suffix also separates users when the fallback resolves beneath a shared `/tmp`.
 
 ### Config directory (sessions)
 
@@ -54,7 +54,7 @@ The platform default is [`dirs::config_dir()`](https://docs.rs/dirs/latest/dirs/
 
 ## Sample Usage Session
 
-A first run, from an empty dashboard to a saved, backgrounded fleet. The frames below are schematic of the real layout, not pixel captures.
+The following walkthrough moves from an empty dashboard to a saved fleet. The frames are layout sketches rather than terminal captures.
 
 Start it. The first `fleetcom` autostarts the daemon and opens an empty dashboard:
 
@@ -65,7 +65,7 @@ Start it. The first `fleetcom` autostarts the daemon and opens an empty dashboar
   ↑↓ select · enter attach · space peek · n/@ new · s sort · m tag · r rerun · X kill · q detach · Q quit
 ```
 
-Press `n`, type a command, `Enter`. It runs in its own PTY and shows up under **Running**. Add a second the same way:
+Press `n`, enter a command, and press `Enter`. The command runs in its own PTY and appears under **Running**. Repeat the process for a second command:
 
 ```text
   fleetcom   2 running · 0 idle · 0 done      by state
@@ -88,13 +88,13 @@ Each row is `glyph · tag · command · latest output · age`. `Space` peeks: a 
   └ space/esc close · enter attach ─────────────────────┘
 ```
 
-`Enter` attaches: the task takes the whole terminal and your keystrokes go to it. The status bar shows the one reserved key:
+`Enter` attaches to the task. Keystrokes then go to its PTY, except for the reserved background chord shown in the status bar:
 
 ```text
   [attached] npm run dev                       Ctrl-\ background
 ```
 
-`Ctrl-\` backgrounds it and returns to the dashboard. `m` tags the selected task "in use": it gets a `◆` and pins to the top:
+`Ctrl-\` returns to the dashboard. `m` tags the selected task "in use," adding `◆` and moving it to the first section:
 
 ```text
   fleetcom   2 running · 0 idle · 0 done      by state
@@ -106,11 +106,11 @@ Each row is `glyph · tag · command · latest output · age`. `Space` peeks: a 
   ✻  npm run dev              VITE v5.0  ready in 312 ms        1m
 ```
 
-`w`, a name, `Enter` saves the fleet as a [session](sessions.md). Now `q` disconnects: the daemon and both jobs keep running without you. Run `fleetcom` again and you reattach to exactly this dashboard. `Q` (or `fleetcom --kill`) kills the jobs (`TERM`, then `KILL` after a 2 s grace) and stops the daemon.
+`w`, a name, and `Enter` save the fleet as a [session](sessions.md). `q` then disconnects while the daemon and both jobs continue running. A subsequent `fleetcom` invocation reconstructs the dashboard from the daemon's current task state. `Q` or `fleetcom --kill` stops the jobs (`TERM`, then `KILL` after a two-second grace period) and exits the daemon.
 
 ## Notes & Caveats
 
-- **Commands run through a non-interactive shell** (`$SHELL -c`), so functions and aliases from your `~/.zshrc` aren't available. An opt-in interactive mode is planned.
+- **Commands run through a non-interactive shell** (`$SHELL -c`), so functions and aliases from `~/.zshrc` are unavailable.
 - **The daemon captures the environment of the client that _first_ starts it** and runs every job under that environment. A second terminal with a different `PATH` or virtualenv attaches to the same daemon, and its commands resolve against the first terminal's environment, not its own.
 - **The daemon serves one client at a time.** A second `fleetcom` connects but waits until the first disconnects (`q`).
 - **Kills are graceful-first.** `X`, `Q`, `--kill`, and daemon signals all send `SIGTERM` to the job's _process group_ and escalate to `SIGKILL` only after a 2-second grace, so a `TERM` handler gets its chance to flush and exit cleanly. A job that re-backgrounds itself past its own shell's exit (`cmd &`, then the shell exits) leaves that group and survives either signal. Kill it by hand. This is deliberate: once the shell is reaped its PID can be recycled, so signalling the old group could hit an unrelated process.

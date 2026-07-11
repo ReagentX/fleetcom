@@ -1,6 +1,6 @@
 # Sessions
 
-A session is a **recipe**: a set of `{directory: [commands]}` pairs you can save and replay. Loading one re-runs its commands; it does not resurrect live processes. Keeping running jobs alive across disconnects is the [daemon](README.md#directory--environment-configuration)'s job, not a session's.
+A session records `{directory: [commands]}` pairs for later replay. Loading a session starts new processes; it does not restore the processes that existed when the file was saved. The [daemon](README.md#directory--environment-configuration) separately keeps live jobs running across client disconnects.
 
 ## Storage
 
@@ -12,7 +12,7 @@ Sessions live under the [config directory](README.md#config-directory-sessions),
 
 `<config>` is `$FLEETCOM_CONFIG_DIR` if set, otherwise the platform config directory (`~/.config/fleetcom` on Linux, `~/Library/Application Support/fleetcom` on macOS). It's created on the first save.
 
-The filename is the session name, sanitized: leading and trailing whitespace trimmed, then every control character and any of `* " / \ < > : | ? .` replaced with `_`, capped at 255 characters. So `my/session` is stored as `my_session.json`, and `a.b` as `a_b.json`. `.` is replaced too, so a name can't smuggle in its own extension.
+The filename derives from the session name. Leading and trailing whitespace is removed; control characters and any of `* " / \ < > : | ? .` become `_`; the result is capped at 255 characters. As a result, `my/session` becomes `my_session.json` and `a.b` becomes `a_b.json`. Replacing `.` prevents the name from supplying another extension.
 
 ## Format
 
@@ -32,9 +32,9 @@ A session is a JSON object mapping a working directory to the commands to run th
 
 - Keys are directory paths: each task's working directory.
 - Values are ordered lists of shell command strings. Order is preserved, and each command runs in its own PTY under that directory.
-- Directories serialize alphabetically (the on-disk form is a `BTreeMap`), so a session's file is stable no matter what order you added the tasks in: clean diffs, git-friendly.
+- Directories serialize alphabetically because the in-memory representation is a `BTreeMap`. Command order remains stable within each directory.
 
-Hand-editing is fine. The schema is a flat map: no version field, no metadata. An unparsable file is an error at load; anything that isn't a `string → [string]` entry is skipped.
+The schema is a flat map with no version field or metadata, so files can be edited directly. Invalid JSON fails the load. Within valid JSON, entries that do not produce string command values are omitted.
 
 ## Saving and loading
 
@@ -42,4 +42,4 @@ Hand-editing is fine. The schema is a flat map: no version field, no metadata. A
 - Load in-app: `o`, pick from the list, `Enter`.
 - Load at launch: `fleetcom <name>`.
 
-Loading spawns every command fresh: it's a *replay*, not a restore. You get new processes running the same commands, not the exact processes you had when you saved. (Live jobs already outlive a disconnect on their own; that's the daemon, not the session.)
+Loading always spawns new processes from the stored commands. Existing live jobs are daemon state and are not part of the session file.
