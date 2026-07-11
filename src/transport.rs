@@ -2,21 +2,17 @@
 //! (a `Command` out) and `poll` (the `Event`s back), so the transport underneath
 //! is swappable without touching `app.rs`:
 //!
-//! - `ThreadTransport` (milestone 2) runs the `Supervisor` on its own thread,
-//!   reached over a pair of mpsc channels: commands one way, events the other.
-//!   This is the loopback that proves the message set carries the whole UI with
-//!   no shared state beyond the channels.
+//! - `ThreadTransport` runs the `Supervisor` on its own thread, reached over a
+//!   pair of mpsc channels: commands one way, events the other.
+//! - `SocketTransport` reaches a `fleetcom --daemon` over a Unix socket: `send`
+//!   writes a framed command, `poll` reads ready event frames.
 //! - `LocalTransport` keeps the supervisor in-thread and ticks it inline, so the
 //!   unit tests stay deterministic: `send` then `poll` sees the result at once.
 //!
-//! Milestone 3's Unix-domain socket is a third impl: `send` writes a framed
-//! command, `poll` reads ready event frames, and the client is none the wiser.
-//!
 //! Both live transports carry a `wait_tx: Sender<()>` into their event-reader:
 //! after delivering an `Event` to the client's mirror, they poke it to wake the
-//! client's run loop (which blocks on the matching receiver). That is the client
-//! half of the event-driven path: the run loop reacts to a fresh screen the
-//! instant it arrives, with no polling delay.
+//! client's run loop (which blocks on the matching receiver), so the loop reacts
+//! to a fresh screen the instant it arrives, with no polling delay.
 
 use std::net::Shutdown;
 use std::os::unix::net::UnixStream;
@@ -74,8 +70,8 @@ fn drain(rx: &Receiver<Event>, dead: &mut bool) -> Vec<Event> {
     evs
 }
 
-/// The core on its own thread, behind two channels. The loopback of milestone 2,
-/// now running the shared event-driven `core::run_loop`.
+/// The core on its own thread, behind two channels, running the shared
+/// event-driven `core::run_loop`.
 pub struct ThreadTransport {
     /// Commands to the core, wrapped as `Wake::Cmd` so they share the one channel
     /// the core loop waits on (task output arrives on it as `Wake::Output`).
@@ -89,8 +85,7 @@ pub struct ThreadTransport {
 
 impl ThreadTransport {
     /// Run `sup` on its own thread. `wait_tx` wakes the *client's* run loop when
-    /// an event is produced: the foreground analogue of the socket reader poking
-    /// the client on an inbound frame.
+    /// an event is produced, so the loop reacts without polling.
     pub fn spawn(sup: Supervisor, wait_tx: Sender<()>) -> ThreadTransport {
         let (wake_tx, wake_rx) = channel::<Wake>();
         let (evt_tx, evt_rx) = channel::<Event>();
@@ -157,11 +152,10 @@ impl Drop for ThreadTransport {
     }
 }
 
-/// Milestone 3: the core is a separate process (`fleetcom --daemon`), reached over a
-/// Unix socket. Commands are written as frames on the connection; a reader thread
+/// The core as a separate process (`fleetcom --daemon`), reached over a Unix
+/// socket. Commands are written as frames on the connection; a reader thread
 /// turns inbound event frames back into `Event`s on a channel, so `poll` drains
-/// the channel exactly like `ThreadTransport`. The client can't tell the core
-/// moved out of process.
+/// the channel exactly like `ThreadTransport`.
 pub struct SocketTransport {
     write: UnixStream,
     evt_rx: Receiver<Event>,
@@ -242,7 +236,7 @@ impl Transport for SocketTransport {
 
 /// Synchronous, in-thread transport for tests: `poll` ticks the supervisor
 /// inline, so a `send` is visible on the very next `poll` with no thread timing
-/// to race. (The seam a `--no-daemon` foreground mode would reuse.)
+/// to race.
 #[cfg(test)]
 pub struct LocalTransport {
     sup: Supervisor,

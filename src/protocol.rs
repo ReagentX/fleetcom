@@ -1,13 +1,11 @@
-//! The seam between the client (UI) and the supervisor (task owner). These are
-//! the types that will cross the Unix-domain socket in phase 2's daemon split;
-//! defining them now (and routing the in-process UI through them) proves the
-//! boundary before any IPC exists (see `docs/phase-2.md`, milestone 1).
+//! The seam between the client (UI) and the supervisor (task owner): the types
+//! that cross the Unix-domain socket to the daemon.
 //!
 //! `Command` is client→core, `Event` is core→client, and `TaskView`/`ScreenView`
 //! are the read-only snapshots the client renders instead of reaching into a
 //! live `Task`. Nothing here holds a process handle or a process-local
-//! `Instant`, so it is already wire-shaped: milestone 3 adds serialization, not
-//! new fields.
+//! `Instant`: a socket peer could interpret neither, so the types stay
+//! wire-shaped.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -17,8 +15,7 @@ use crate::task::Lifecycle;
 
 /// A client→core request. Every mutation of the task set is one of these; the
 /// client never touches a `Task` directly. Fire-and-forget: results come back
-/// as `Event`s, never return values, so the shape already matches a one-way
-/// command channel.
+/// as `Event`s, never as return values.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Command {
     /// Run `command` under `$SHELL -c` in `cwd`.
@@ -45,12 +42,10 @@ pub enum Command {
 }
 
 /// A core→client message. The client keeps a local mirror of the task set and
-/// the watched screen, updated only by these: exactly what phase 2 streams over
-/// the socket.
+/// the watched screen, updated only by these.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Event {
-    /// Full task-set snapshot; replaces the client's mirror wholesale. (The
-    /// per-task `TaskDelta` optimization is deferred; see `docs/phase-2.md`.)
+    /// Full task-set snapshot; replaces the client's mirror wholesale.
     Tasks(Vec<TaskView>),
     /// The watched task's current screen (attach/peek source).
     Screen(ScreenView),
@@ -89,12 +84,10 @@ pub struct ScreenView {
 // --- wire format -------------------------------------------------------------
 //
 // Control messages (every `Command`, and the `Tasks`/`Status` events) go over as
-// jzon: low-frequency, human-debuggable, and it reuses the dep already pulled
-// in for session files. The `Screen` event is the exception: its
-// `contents_formatted` bytes are the high-frequency firehose, so they ride a raw
-// tail after a small jzon header rather than bloating into a JSON number array.
-// Serialization lives here, next to the types, so the wire stays in lockstep
-// with the fields. A socket peer is just `decode_*(read_frame(...))`.
+// jzon: low-frequency and human-debuggable. The `Screen` event is the exception:
+// its `contents_formatted` bytes are the high-frequency firehose, so they ride a
+// raw tail after a small jzon header rather than bloating into a JSON number
+// array. A socket peer is just `decode_*(read_frame(...))`.
 
 fn ps(p: &Path) -> String {
     p.to_string_lossy().into_owned()

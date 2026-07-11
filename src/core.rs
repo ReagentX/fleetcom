@@ -176,11 +176,11 @@ mod tests {
         );
     }
 
-    /// The whole point, end to end: a keystroke to a watched task echoes back as a
-    /// `Screen` event well inside the old fixed-tick cadence. Exercises the real
-    /// path (a live PTY, its reader thread signalling the waker, `run_loop`
-    /// waking and ticking), so it also fails loudly if the waker wiring breaks
-    /// (echo would then only surface on the 200 ms backstop).
+    /// A keystroke to a watched task echoes back as a `Screen` event within a
+    /// frame, not on the idle backstop. Exercises the real path (a live PTY, its
+    /// reader thread signalling the waker, `run_loop` waking and ticking), so it
+    /// fails loudly if the waker wiring breaks (echo would then only surface on
+    /// the 200 ms backstop).
     #[test]
     fn watched_input_echoes_without_polling_delay() {
         use std::sync::mpsc::channel;

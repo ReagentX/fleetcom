@@ -1,14 +1,13 @@
 //! The daemon: `fleetcom --daemon`. Owns the one `Supervisor`, listens on a
 //! per-user Unix socket, and serves a client at a time: reading framed
 //! `Command`s, applying them, writing framed `Event`s back. It runs the shared
-//! event-driven `core::run_loop` with a socket where the in-process channels
-//! were. The supervisor **outlives each client connection**, which is the whole
-//! point of phase 2: `q` disconnects, the jobs keep running, the next `fleetcom`
+//! event-driven `core::run_loop`. The supervisor **outlives each client
+//! connection**: `q` disconnects, the jobs keep running, and the next `fleetcom`
 //! reattaches.
 //!
 //! Autostart lives here too: a plain `fleetcom` connects to a running daemon, or
 //! spawns one (detached, its own process group) and polls the socket until it's
-//! up. tmux's model.
+//! up.
 
 use std::fs;
 use std::io::{self, ErrorKind, Read};
@@ -225,8 +224,7 @@ enum ServeOutcome {
 /// Serve one client to completion. A reader thread turns inbound frames into
 /// `Wake::Cmd`s on the channel the core loop waits on; task output arrives on the
 /// same channel as `Wake::Output` (via the supervisor's waker), so `run_loop`
-/// reacts to a keystroke's echo the instant the child emits it. The milestone-2
-/// core loop, now event-driven, with socket I/O at the edges.
+/// reacts to a keystroke's echo the instant the child emits it.
 fn serve_client(sup: &mut Supervisor, stream: UnixStream) -> ServeOutcome {
     let Ok(read) = stream.try_clone() else {
         return ServeOutcome::Disconnected;

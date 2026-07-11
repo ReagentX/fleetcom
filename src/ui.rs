@@ -1,12 +1,12 @@
-//! Hand-rolled crossterm rendering. Same idiom as Logria (move, print padded,
-//! clear the tail), no ratatui. Every view renders into an in-memory buffer;
-//! `render` writes that buffer to the terminal in a single `write_all` and only
-//! when it differs from the last frame. That makes each frame atomic (no
-//! half-painted tearing) and skips work entirely when nothing changed.
+//! Hand-rolled crossterm rendering (move, print padded, clear the tail), no
+//! ratatui. Every view renders into an in-memory buffer; `render` writes that
+//! buffer to the terminal in a single `write_all` and only when it differs from
+//! the last frame. That makes each frame atomic (no half-painted tearing) and
+//! skips work entirely when nothing changed.
 //!
 //! The renderer reads only the client's mirror (the `TaskView` list and the
-//! watched `ScreenView`), never a live `Task`. Everything it needs is already a
-//! plain snapshot, which is why the same code will paint socket data unchanged.
+//! watched `ScreenView`), never a live `Task` — everything it needs is a plain
+//! snapshot.
 
 use std::io::{self, Stdout, Write};
 

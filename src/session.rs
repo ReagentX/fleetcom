@@ -2,8 +2,8 @@
 //! per session name under the user's config dir.
 //!
 //! A session is a *recipe*: loading it re-runs the commands; it does not
-//! resurrect live processes (that's the daemon's job, a later phase). Uses
-//! `jzon`, not serde: the schema is a flat map that needs no derive.
+//! resurrect live processes (that's the daemon's job). Uses `jzon`, not serde:
+//! the schema is a flat map that needs no derive.
 
 use std::collections::BTreeMap;
 use std::fs;

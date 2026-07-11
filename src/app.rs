@@ -1,12 +1,8 @@
-//! The client half of the phase-2 seam: UI state (modes, selection, pickers)
-//! and the single-threaded event loop. It owns **no** processes (the
-//! `Supervisor` does) and drives the task set only through `Command`s, painting
-//! the `TaskView` mirror it gets back as `Event`s. Modes are the `fleetcom`
-//! analogue of Logria's `InputType` handlers.
-//!
-//! The core sits behind a `Transport` (milestone 2: the supervisor on its own
-//! thread over a channel); the loop only ever calls `send`/`poll`/`shutdown`, so
-//! milestone 3's socket swaps in without touching anything here.
+//! The client: UI state (modes, selection, pickers) and the single-threaded
+//! event loop. It owns **no** processes (the `Supervisor` does) and drives the
+//! task set only through `Command`s, painting the `TaskView` mirror it gets back
+//! as `Event`s. The loop only ever calls `send`/`poll`/`shutdown` on its
+//! `Transport`, never touching the machinery underneath.
 
 use std::io::{self, Stdout};
 use std::path::{Path, PathBuf};
@@ -81,10 +77,9 @@ pub struct DirCand {
 }
 
 pub struct App {
-    /// The link to the core (the task owner). Milestone 2 makes this a
-    /// `ThreadTransport` (the supervisor on its own thread behind a channel),
-    /// but the client only ever calls `send`/`poll`/`shutdown`, so it neither
-    /// knows nor cares. Milestone 3 swaps in a socket-backed transport here.
+    /// The link to the core (the task owner): a `ThreadTransport` (in-process)
+    /// or `SocketTransport` (daemon). The client only ever calls
+    /// `send`/`poll`/`shutdown`, so it neither knows nor cares which.
     transport: Box<dyn Transport>,
     /// Local mirror of the task set, replaced wholesale by `Event::Tasks`. The
     /// client renders and navigates this, never a live `Task`. `pub` so the

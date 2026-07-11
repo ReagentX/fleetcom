@@ -1,12 +1,8 @@
 //! The task owner: holds every `Task`, allocates ids, reaps exits, and answers
-//! `Command`s with `Event`s. This is the unit phase 2 lifts into `fleetcom
-//! --daemon`. It already speaks only `protocol` types, never UI state, so the
-//! split is a transport change, not a rewrite.
-//!
-//! In process for now: the client calls `apply`/`tick`/`drain` directly. The
-//! loopback channel (milestone 2) and the socket (milestone 3) slot in behind
-//! those same three calls: `apply` becomes a send, `tick` runs on the core's
-//! own thread, `drain` becomes a receive.
+//! `Command`s with `Event`s. It speaks only `protocol` types, never UI state.
+//! Driven through three calls: `apply` (one `Command`), `tick` (reap, then emit
+//! a task snapshot plus the watched screen), and `drain` (take the queued
+//! `Event`s).
 
 use std::path::PathBuf;
 use std::sync::mpsc::Sender;
@@ -99,8 +95,7 @@ impl Supervisor {
     }
 
     /// Apply one client request. Fire-and-forget: any result (a save/load
-    /// notice, a spawn failure) is queued as `Event::Status`, never returned,
-    /// so the signature already matches the socket's one-way command channel.
+    /// notice, a spawn failure) is queued as `Event::Status`, never returned.
     pub fn apply(&mut self, cmd: Command) {
         match cmd {
             Command::Spawn { command, cwd } => self.spawn(&command, cwd),

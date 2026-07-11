@@ -1,9 +1,8 @@
 //! Length-prefixed, kind-tagged framing over a byte stream: `[u32 len][u8 kind]
 //! [payload]`, `len` counting the payload only. `read_frame` uses `read_exact`,
-//! so a frame split across partial socket reads reassembles correctly. The main
-//! new hazard in going from channels to a socket. `kind` separates jzon control
-//! frames from the raw-bytes screen frames, so high-frequency pane data pays no
-//! base64/number-array tax.
+//! so a frame split across partial socket reads reassembles correctly. `kind`
+//! separates jzon control frames from the raw-bytes screen frames, so
+//! high-frequency pane data pays no base64/number-array tax.
 
 use std::io::{self, Read, Write};
 
