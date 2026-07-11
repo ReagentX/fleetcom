@@ -13,7 +13,7 @@
 | `fleetcom --help` / `-h` | Print usage and exit |
 | `fleetcom --version` / `-V` | Print the version and exit |
 
-`--daemon` exists but is internal: the first `fleetcom` autostarts it for you, and you never invoke it by hand. The first non-`-` argument is taken as the session name (one at most). An unrecognized flag is an error, not a shrug: `--foregroud` must not silently connect to the daemon and change what `Q` kills.
+`--daemon` exists but is internal: the first `fleetcom` autostarts it for you, and you never invoke it by hand. The first non-`-` argument is taken as the session name (one at most).
 
 ## Dashboard
 

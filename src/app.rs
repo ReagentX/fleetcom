@@ -101,7 +101,7 @@ pub struct App {
     pub daemon_backed: bool,
 
     /// The *id* of the selected task, not a row index. Selection sticks to the
-    /// task itself, so it can't jump to a neighbour when the list reorders
+    /// task itself, so it can't jump to a neighbor when the list reorders
     /// (a task exits, or gets tagged into another bucket).
     pub selected_id: Option<u64>,
     pub mode: Mode,
@@ -912,16 +912,16 @@ impl App {
         let id = self.views[i].id;
         let finished = matches!(self.views[i].lifecycle, Lifecycle::Ok | Lifecycle::Failed);
         if finished {
-            // Drop it, landing selection on the neighbour (not the top). The
-            // removal reflects next tick, so pick the neighbour id from the
+            // Drop it, landing selection on the neighbor (not the top). The
+            // removal reflects next tick, so pick the neighbor id from the
             // *current* order now and pin selection to it.
             let order = self.display_order();
             let pos = order.iter().position(|&x| x == i).unwrap_or(0);
-            let neighbour = order
+            let neighbor = order
                 .get(pos + 1)
                 .or_else(|| pos.checked_sub(1).and_then(|p| order.get(p)))
                 .map(|&x| self.views[x].id);
-            self.selected_id = neighbour;
+            self.selected_id = neighbor;
             self.transport.send(Command::Remove { id });
         } else {
             // Kill in place; the next tick reaps it into the Completed bucket.
