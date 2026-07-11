@@ -24,6 +24,14 @@ const IDLE_AFTER: Duration = Duration::from_millis(600);
 /// task's id, its formatted bytes, cursor position, and cursor visibility.
 type LastScreen = (u64, Vec<u8>, (u16, u16), bool);
 
+/// Ceiling for PTY dimensions accepted from a (possibly crafted) `Resize`. A 0
+/// dimension underflows vt100 (`grid.rs` does `size.rows - 1`) — panic in debug,
+/// out-of-bounds in release — and an unbounded one (up to `u16::MAX`) would
+/// allocate a multi-billion-cell grid and OOM. Real terminals never approach
+/// this, so clamping to `[1, MAX_DIM]` is invisible in normal use and a hard
+/// stop against a malicious peer.
+const MAX_DIM: u16 = 1000;
+
 pub struct Supervisor {
     tasks: Vec<Task>,
     next_id: u64,
@@ -81,10 +89,13 @@ impl Supervisor {
                 }
             }
             Command::Resize { rows, cols } => {
-                self.rows = rows;
-                self.cols = cols;
+                // Clamp at the trust boundary: the dimensions arrive as untrusted
+                // `u64`s truncated to `u16` in `decode_command`, and go straight
+                // to the PTY and vt100. Nonzero, capped — see `MAX_DIM`.
+                self.rows = rows.clamp(1, MAX_DIM);
+                self.cols = cols.clamp(1, MAX_DIM);
                 for t in &mut self.tasks {
-                    let _ = t.resize(rows, cols);
+                    let _ = t.resize(self.rows, self.cols);
                 }
             }
             Command::Watch { id } => {
@@ -351,5 +362,27 @@ mod tests {
             !s.drain().iter().any(|e| matches!(e, Event::Screen(_))),
             "unchanged screen must not be resent"
         );
+    }
+
+    /// A crafted `Resize` with zero or enormous dimensions must be clamped, not
+    /// forwarded to vt100 — 0 underflows its `size.rows - 1` (panics in debug),
+    /// and `u16::MAX` would allocate a multi-billion-cell grid. Reaching the end
+    /// without a panic/OOM is the assertion.
+    #[test]
+    fn resize_clamps_hostile_dimensions() {
+        let mut s = Supervisor::new(24, 80, here());
+        s.apply(Command::Spawn {
+            command: "sleep 30".into(),
+            cwd: here(),
+        });
+        s.apply(Command::Resize { rows: 0, cols: 0 });
+        s.tick(); // exercises the resized grid (snapshot + screen) — no panic
+        let _ = s.drain();
+        s.apply(Command::Resize {
+            rows: u16::MAX,
+            cols: u16::MAX,
+        });
+        s.tick(); // clamped to MAX_DIM² cells, not u16::MAX² — no OOM
+        let _ = s.drain();
     }
 }
