@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 
-//! `fleetcom` — a fleet-view supervisor for arbitrary shell commands. Each task is
+//! `fleetcom`: a fleet-view supervisor for arbitrary shell commands. Each task is
 //! a command in its own PTY; the dashboard groups them by status, and you can
 //! peek at, attach to, and background any of them.
 
@@ -35,7 +35,7 @@ use app::App;
 fn main() -> io::Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
 
-    // Daemon mode is headless — no terminal setup, just serve the socket.
+    // Daemon mode is headless: no terminal setup, just serve the socket.
     if args.iter().any(|a| a == "--daemon") {
         return daemon::run_daemon();
     }
@@ -59,7 +59,7 @@ fn main() -> io::Result<()> {
         match App::connect(rows, cols) {
             Ok(a) => a,
             Err(e) => {
-                // Still in raw/alt-screen — restore before reporting the failure.
+                // Still in raw/alt-screen: restore before reporting the failure.
                 let _ = execute!(out, Show, LeaveAlternateScreen);
                 let _ = disable_raw_mode();
                 eprintln!("fleetcom: could not reach the daemon: {e}");
@@ -94,7 +94,7 @@ fn install_signal_handlers(flag: Arc<AtomicBool>) -> io::Result<()> {
     Ok(())
 }
 
-/// Restore the terminal on panic — otherwise a crash leaves the user in raw
+/// Restore the terminal on panic. Otherwise a crash leaves the user in raw
 /// mode on the alternate screen with no cursor.
 fn install_panic_hook() {
     let default = std::panic::take_hook();

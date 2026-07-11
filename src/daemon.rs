@@ -1,5 +1,5 @@
 //! The daemon: `fleetcom --daemon`. Owns the one `Supervisor`, listens on a
-//! per-user Unix socket, and serves a client at a time — reading framed
+//! per-user Unix socket, and serves a client at a time: reading framed
 //! `Command`s, applying them, writing framed `Event`s back. It runs the shared
 //! event-driven `core::run_loop` with a socket where the in-process channels
 //! were. The supervisor **outlives each client connection**, which is the whole
@@ -8,7 +8,7 @@
 //!
 //! Autostart lives here too: a plain `fleetcom` connects to a running daemon, or
 //! spawns one (detached, its own process group) and polls the socket until it's
-//! up — tmux's model.
+//! up. tmux's model.
 
 use std::fs;
 use std::io::{self, ErrorKind, Read};
@@ -30,7 +30,7 @@ use crate::supervisor::Supervisor;
 
 /// Per-user directory holding the socket. `FLEETCOM_RUNTIME_DIR` overrides it
 /// (tests point it at an isolated temp dir); else `$XDG_RUNTIME_DIR/fleetcom`
-/// (per-user on Linux); else `$TMPDIR/fleetcom-$uid` — the macOS path, where
+/// (per-user on Linux); else `$TMPDIR/fleetcom-$uid`, the macOS path, where
 /// `$TMPDIR` is already per-user and the uid suffix covers a shared `/tmp` on an
 /// XDG-less Linux.
 fn runtime_dir() -> PathBuf {
@@ -52,7 +52,7 @@ fn socket_path() -> PathBuf {
 
 /// Create (or validate) the runtime dir with private `0700` perms, so the socket
 /// and control channel inside it are unreachable by other local users. If it
-/// already exists it must be a real directory this user owns — a symlink or a
+/// already exists it must be a real directory this user owns. A symlink or a
 /// dir planted by someone else (the classic shared-`/tmp` attack) is rejected,
 /// and loose perms are tightened. `0700` on the leaf is enough: no one can
 /// traverse into it even from a world-writable parent.
@@ -95,7 +95,7 @@ pub fn connect_or_autostart() -> io::Result<UnixStream> {
     }
     // Any failure is handled the same way, and we NEVER unlink the socket here.
     // `ECONNREFUSED` on AF_UNIX also means a live daemon's accept backlog is
-    // momentarily full — not a dead socket — so removing it could displace a
+    // momentarily full (not a dead socket), so removing it could displace a
     // running daemon. Just (auto)start a daemon: its flock ensures only one
     // binds, and that sole daemon safely reclaims a genuinely stale socket under
     // the lock (see `run_daemon`).
@@ -113,7 +113,7 @@ pub fn connect_or_autostart() -> io::Result<UnixStream> {
 }
 
 /// Spawn `fleetcom --daemon` detached: its own process group (so a terminal SIGHUP
-/// to the client's group never reaches it — the safe `process_group(0)`, not an
+/// to the client's group never reaches it; the safe `process_group(0)`, not an
 /// `unsafe` `setsid`), stdio off the terminal, stderr to a log for debugging.
 fn spawn_daemon() -> io::Result<()> {
     let exe = std::env::current_exe()?;
@@ -131,7 +131,7 @@ fn spawn_daemon() -> io::Result<()> {
 }
 
 /// `fleetcom --kill`: connect to a running daemon and tell it to group-kill every
-/// job and stop. Blocks until the socket closes — the daemon shuts the
+/// job and stop. Blocks until the socket closes: the daemon shuts the
 /// connection once it has killed the jobs and exited, so this returns only when
 /// they're actually gone. A no-op (with a message) if no daemon is running.
 pub fn run_kill() -> io::Result<()> {
@@ -153,7 +153,7 @@ pub fn run_kill() -> io::Result<()> {
 
 /// The daemon entry point (`fleetcom --daemon`). Binds the socket and serves clients
 /// until an explicit shutdown. The supervisor is created once and persists across
-/// reconnects — jobs outlive any single client.
+/// reconnects: jobs outlive any single client.
 pub fn run_daemon() -> io::Result<()> {
     let dir = runtime_dir();
     ensure_runtime_dir(&dir)?; // private 0700 dir; reject a planted one (#1)
@@ -163,7 +163,7 @@ pub fn run_daemon() -> io::Result<()> {
     // socket. A concurrent autostart (two clients racing to spawn a daemon) or a
     // spurious respawn fails this lock and exits, instead of unlinking a live
     // daemon's socket out from under it. flock releases automatically when this
-    // process dies, so a crash leaves no stale lock — the next daemon reclaims.
+    // process dies, so a crash leaves no stale lock. The next daemon reclaims.
     let lock_file = fs::OpenOptions::new()
         .create(true)
         .write(true)
@@ -176,7 +176,7 @@ pub fn run_daemon() -> io::Result<()> {
         Err(_) => return Ok(()), // another daemon already owns the socket
     };
 
-    // Sole owner now — safe to reclaim a stale socket and bind it privately.
+    // Sole owner now: safe to reclaim a stale socket and bind it privately.
     let _ = fs::remove_file(&path);
     let listener = UnixListener::bind(&path)?;
     fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?; // #1
@@ -225,7 +225,7 @@ enum ServeOutcome {
 /// Serve one client to completion. A reader thread turns inbound frames into
 /// `Wake::Cmd`s on the channel the core loop waits on; task output arrives on the
 /// same channel as `Wake::Output` (via the supervisor's waker), so `run_loop`
-/// reacts to a keystroke's echo the instant the child emits it — the milestone-2
+/// reacts to a keystroke's echo the instant the child emits it. The milestone-2
 /// core loop, now event-driven, with socket I/O at the edges.
 fn serve_client(sup: &mut Supervisor, stream: UnixStream) -> ServeOutcome {
     let Ok(read) = stream.try_clone() else {
@@ -236,8 +236,8 @@ fn serve_client(sup: &mut Supervisor, stream: UnixStream) -> ServeOutcome {
     // when we return, so their signals stop reaching a defunct receiver.
     sup.set_waker(wake_tx.clone());
     // Reader thread: block on frames, decode, forward as `Wake::Cmd`. Ends on EOF
-    // (client gone) or when the channel closes (this loop returned). Detached —
-    // never joined — so a half-closing client can't wedge the daemon. A final
+    // (client gone) or when the channel closes (this loop returned). Detached,
+    // never joined, so a half-closing client can't wedge the daemon. A final
     // `Hangup` lets the loop notice the client left at once, not on a later write.
     thread::spawn(move || {
         let mut read = read;
@@ -255,7 +255,7 @@ fn serve_client(sup: &mut Supervisor, stream: UnixStream) -> ServeOutcome {
     // A client that stops draining the socket (crashed, SIGSTOPped, or hostile)
     // must not wedge the daemon: the serve loop is synchronous, so a `write_frame`
     // blocked forever on a full send buffer would freeze reads, ticks, reaping,
-    // and `accept` — and `--kill` could never get in. Cap how long one event
+    // and `accept`, and `--kill` could never get in. Cap how long one event
     // write may block; a timeout surfaces as an error below and drops the client.
     let _ = write.set_write_timeout(Some(Duration::from_secs(5)));
     let outcome = run_loop(sup, &wake_rx, |ev| {

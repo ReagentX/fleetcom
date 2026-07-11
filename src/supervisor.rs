@@ -1,11 +1,11 @@
 //! The task owner: holds every `Task`, allocates ids, reaps exits, and answers
 //! `Command`s with `Event`s. This is the unit phase 2 lifts into `fleetcom
-//! --daemon` — it already speaks only `protocol` types, never UI state, so the
+//! --daemon`. It already speaks only `protocol` types, never UI state, so the
 //! split is a transport change, not a rewrite.
 //!
 //! In process for now: the client calls `apply`/`tick`/`drain` directly. The
 //! loopback channel (milestone 2) and the socket (milestone 3) slot in behind
-//! those same three calls — `apply` becomes a send, `tick` runs on the core's
+//! those same three calls: `apply` becomes a send, `tick` runs on the core's
 //! own thread, `drain` becomes a receive.
 
 use std::path::PathBuf;
@@ -20,7 +20,7 @@ use crate::session::{self, SessionConfig};
 use crate::task::Task;
 
 /// No output for this long ⇒ `Lifecycle::Idle`. Owned here because the core, not
-/// the client, computes lifecycle — it holds the clock and the live parser.
+/// the client, computes lifecycle. It holds the clock and the live parser.
 const IDLE_AFTER: Duration = Duration::from_millis(600);
 
 /// The fingerprint of the last `Screen` sent, for send-on-change: the watched
@@ -28,8 +28,8 @@ const IDLE_AFTER: Duration = Duration::from_millis(600);
 type LastScreen = (u64, Vec<u8>, (u16, u16), bool);
 
 /// Ceiling for PTY dimensions accepted from a (possibly crafted) `Resize`. A 0
-/// dimension underflows vt100 (`grid.rs` does `size.rows - 1`) — panic in debug,
-/// out-of-bounds in release — and an unbounded one (up to `u16::MAX`) would
+/// dimension underflows vt100 (`grid.rs` does `size.rows - 1`): panic in debug,
+/// out-of-bounds in release. An unbounded one (up to `u16::MAX`) would
 /// allocate a multi-billion-cell grid and OOM. Real terminals never approach
 /// this, so clamping to `[1, MAX_DIM]` is invisible in normal use and a hard
 /// stop against a malicious peer.
@@ -37,7 +37,7 @@ const MAX_DIM: u16 = 1000;
 
 /// Ceiling on live tasks. Each is a PTY (fds) + child + reader thread + a vt100
 /// grid, so an unbounded `Spawn` loop or a huge session recipe could exhaust
-/// file descriptors and memory. Far above any real fleet — a guardrail, not a
+/// file descriptors and memory. Far above any real fleet: a guardrail, not a
 /// working limit.
 const MAX_TASKS: usize = 256;
 
@@ -50,12 +50,12 @@ pub struct Supervisor {
     cols: u16,
     /// The task whose screen the client is watching (attach/peek), or `None`.
     watched: Option<u64>,
-    /// The last `Screen` we emitted — `(id, formatted, cursor, hide)` — so an
+    /// The last `Screen` we emitted (`(id, formatted, cursor, hide)`), so an
     /// unchanged screen isn't re-serialized and re-sent every tick. Reset to
     /// `None` whenever `watched` changes, so re-attaching always gets a fresh
     /// full screen (the client cleared its copy on detach).
     last_screen: Option<LastScreen>,
-    /// Base for resolving a session recipe's stored dirs — the daemon's cwd; in
+    /// Base for resolving a session recipe's stored dirs: the daemon's cwd; in
     /// process that's the invocation dir. Recipe dirs are absolute, so this only
     /// matters for a hand-edited relative entry.
     base_dir: PathBuf,
@@ -83,7 +83,7 @@ impl Supervisor {
     }
 
     /// Install the sender the current serving loop waits on, so task reader
-    /// threads (present and future — they share this one slot) wake it on output.
+    /// threads (present and future; they share this one slot) wake it on output.
     pub fn set_waker(&self, tx: Sender<Wake>) {
         if let Ok(mut slot) = self.waker.lock() {
             *slot = Some(tx);
@@ -99,7 +99,7 @@ impl Supervisor {
     }
 
     /// Apply one client request. Fire-and-forget: any result (a save/load
-    /// notice, a spawn failure) is queued as `Event::Status`, never returned —
+    /// notice, a spawn failure) is queued as `Event::Status`, never returned,
     /// so the signature already matches the socket's one-way command channel.
     pub fn apply(&mut self, cmd: Command) {
         match cmd {
@@ -122,7 +122,7 @@ impl Supervisor {
             Command::Resize { rows, cols } => {
                 // Clamp at the trust boundary: the dimensions arrive as untrusted
                 // `u64`s truncated to `u16` in `decode_command`, and go straight
-                // to the PTY and vt100. Nonzero, capped — see `MAX_DIM`.
+                // to the PTY and vt100. Nonzero, capped; see `MAX_DIM`.
                 self.rows = rows.clamp(1, MAX_DIM);
                 self.cols = cols.clamp(1, MAX_DIM);
                 for t in &mut self.tasks {
@@ -148,7 +148,7 @@ impl Supervisor {
         }
     }
 
-    /// Reap any exited children — latch their exit code and finish time. Cheap
+    /// Reap any exited children: latch their exit code and finish time. Cheap
     /// (no snapshotting), so the daemon can call it while **no client is
     /// attached**: otherwise a job that exits after `q` stays a zombie until
     /// someone reconnects and a full `tick` runs.
@@ -189,7 +189,7 @@ impl Supervisor {
             && let Some(t) = self.tasks.iter().find(|t| t.id == id)
         {
             let (formatted, cursor, hide_cursor) = t.formatted();
-            // Skip the send when nothing the client renders has changed — an
+            // Skip the send when nothing the client renders has changed. An
             // idle attached task would otherwise re-ship its whole screen 20x/s.
             let unchanged = matches!(
                 &self.last_screen,
@@ -227,7 +227,7 @@ impl Supervisor {
     fn spawn(&mut self, command: &str, cwd: PathBuf) {
         if self.tasks.len() >= MAX_TASKS {
             self.events.push(Event::Status(format!(
-                "task limit reached ({MAX_TASKS}) — not spawning"
+                "task limit reached ({MAX_TASKS}), not spawning"
             )));
             return;
         }
@@ -268,7 +268,7 @@ impl Supervisor {
         let cfg = self.session_config();
         let count: usize = cfg.values().map(Vec::len).sum();
         let status = match session::save(name, &cfg) {
-            Ok(_) => format!("saved '{name}' — {count} command(s)"),
+            Ok(_) => format!("saved '{name}': {count} command(s)"),
             Err(e) => format!("save failed: {e}"),
         };
         self.events.push(Event::Status(status));
@@ -314,10 +314,10 @@ impl Supervisor {
         }
         let status = if skipped > 0 {
             format!(
-                "loaded '{name}' — {spawned} task(s), {skipped} skipped (missing dir or task limit)"
+                "loaded '{name}': {spawned} task(s), {skipped} skipped (missing dir or task limit)"
             )
         } else {
-            format!("loaded '{name}' — {spawned} task(s)")
+            format!("loaded '{name}': {spawned} task(s)")
         };
         self.events.push(Event::Status(status));
     }
@@ -358,7 +358,7 @@ mod tests {
     }
 
     /// `tick` emits exactly a `Tasks` snapshot while nothing is watched, and
-    /// adds a `Screen` for the watched task once `Watch` is set — the contract
+    /// adds a `Screen` for the watched task once `Watch` is set: the contract
     /// the client's render loop depends on.
     #[test]
     fn tick_emits_snapshot_and_watched_screen() {
@@ -391,7 +391,7 @@ mod tests {
     }
 
     /// A watched task whose screen hasn't changed must not re-emit a `Screen`
-    /// every tick — the send-on-change that kills idle attach churn.
+    /// every tick: the send-on-change that kills idle attach churn.
     #[test]
     fn watched_screen_not_resent_when_unchanged() {
         let mut s = Supervisor::new(24, 80, here());
@@ -430,7 +430,7 @@ mod tests {
     }
 
     /// A crafted `Resize` with zero or enormous dimensions must be clamped, not
-    /// forwarded to vt100 — 0 underflows its `size.rows - 1` (panics in debug),
+    /// forwarded to vt100. 0 underflows its `size.rows - 1` (panics in debug),
     /// and `u16::MAX` would allocate a multi-billion-cell grid. Reaching the end
     /// without a panic/OOM is the assertion.
     #[test]
@@ -441,13 +441,13 @@ mod tests {
             cwd: here(),
         });
         s.apply(Command::Resize { rows: 0, cols: 0 });
-        s.tick(); // exercises the resized grid (snapshot + screen) — no panic
+        s.tick(); // exercises the resized grid (snapshot + screen): no panic
         let _ = s.drain();
         s.apply(Command::Resize {
             rows: u16::MAX,
             cols: u16::MAX,
         });
-        s.tick(); // clamped to MAX_DIM² cells, not u16::MAX² — no OOM
+        s.tick(); // clamped to MAX_DIM² cells, not u16::MAX²: no OOM
         let _ = s.drain();
     }
 }

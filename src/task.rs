@@ -1,7 +1,7 @@
 //! A single supervised command: a PTY, its child, and a background thread that
 //! pumps the master into a `vt100` screen. Everything the UI shows is derived
 //! from that screen, so peek/attach/preview are all the same grid at different
-//! sizes, and "backgrounding" an attached task is a pure focus change — the
+//! sizes, and "backgrounding" an attached task is a pure focus change. The
 //! child never learns it lost the foreground.
 
 use std::io::{self, Read, Write};
@@ -22,7 +22,7 @@ fn io_err(e: impl std::fmt::Display) -> io::Error {
     io::Error::other(e.to_string())
 }
 
-/// Derived lifecycle state — a fact about the process, kept separate from the
+/// Derived lifecycle state: a fact about the process, kept separate from the
 /// user's `tagged` intent. "Idle" is honest: it means no output for a while,
 /// **not** "blocked on stdin read" (which is not observable for arbitrary
 /// commands). The user's manual tag is the signal for "I need to act on this."
@@ -37,7 +37,7 @@ pub enum Lifecycle {
 pub struct Task {
     pub id: u64,
     pub command: String,
-    /// Working directory the command was launched in — the grouping key for
+    /// Working directory the command was launched in: the grouping key for
     /// "by dir" mode and the label shown when it differs from the default.
     pub cwd: PathBuf,
     /// Kept for resize (`TIOCSWINSZ`); `try_clone_reader`/`take_writer` borrow it.
@@ -45,7 +45,7 @@ pub struct Task {
     writer: Box<dyn Write + Send>,
     child: Box<dyn Child + Send + Sync>,
     /// Shared with the reader thread: it writes (process bytes), the UI reads
-    /// (render/preview). Contention is trivial — writes are per output chunk.
+    /// (render/preview). Contention is trivial: writes are per output chunk.
     parser: Arc<Mutex<vt100::Parser>>,
     last_activity: Arc<Mutex<Instant>>,
     handle: Option<JoinHandle<()>>,
@@ -56,8 +56,8 @@ pub struct Task {
 }
 
 /// Wake the core loop that this task's screen advanced. Best-effort: the slot is
-/// empty between connections, and a closed channel just means the loop is gone —
-/// either way the parser already holds the bytes, so a dropped signal only delays
+/// empty between connections, and a closed channel just means the loop is gone.
+/// Either way the parser already holds the bytes, so a dropped signal only delays
 /// a repaint to the next backstop tick.
 fn signal(waker: &Waker) {
     if let Ok(slot) = waker.lock()
@@ -92,7 +92,7 @@ impl Task {
         let mut cmd = CommandBuilder::new(shell);
         // Non-interactive `-c`: fast and clean. It does NOT source the user's
         // interactive rc (~/.zshrc), so shell functions/aliases like `br` won't
-        // resolve — running each command through an interactive shell (`-i`) would
+        // resolve. Running each command through an interactive shell (`-i`) would
         // fix that, but it sources the full rc on *every* spawn, which is slow and
         // triggers a pyenv/plugin thundering-herd when several launch at once. An
         // opt-in interactive mode is the intended fix; see the README.
@@ -105,7 +105,7 @@ impl Task {
         }
         cmd.env("TERM", "xterm-256color");
         // Override the inherited (stale) PWD so the shell's logical cwd matches
-        // where we actually put it — otherwise prompts and `pwd` lie.
+        // where we actually put it. Otherwise prompts and `pwd` lie.
         cmd.env("PWD", cwd.as_os_str());
         cmd.cwd(cwd);
 
@@ -129,7 +129,7 @@ impl Task {
                 loop {
                     match reader.read(&mut buf) {
                         // EOF (child's pty fds all closed) or a read error: the
-                        // child likely exited — wake the loop so it reaps promptly
+                        // child likely exited: wake the loop so it reaps promptly
                         // rather than waiting out the idle backstop.
                         Ok(0) | Err(_) => {
                             signal(&waker);
@@ -142,7 +142,7 @@ impl Task {
                             if let Ok(mut t) = last_activity.lock() {
                                 *t = Instant::now();
                             }
-                            // Screen advanced — nudge the core to ship it.
+                            // Screen advanced: nudge the core to ship it.
                             signal(&waker);
                         }
                     }
@@ -252,19 +252,19 @@ impl Task {
         self.writer.flush()
     }
 
-    /// Kill the whole job — the process *group*, not just the direct child — so
+    /// Kill the whole job: the process *group*, not just the direct child, so
     /// a shell's foreground children die with it and the PTY slave closes (that
     /// EOF is what lets the reader thread end).
     ///
     /// Non-blocking on purpose: we never `join` the reader. A grandchild that
     /// escaped the group (its own `setsid`) and kept the PTY open would make the
-    /// read — and thus the whole UI — hang forever, which is exactly the freeze
+    /// read (and thus the whole UI) hang forever, which is exactly the freeze
     /// this replaces. The detached thread ends on EOF; process exit reaps it.
     ///
     /// Gated on `finished.is_none()`: once we've reaped the child, its pid can
     /// be recycled, and signalling a recycled pgid could hit an unrelated group.
     /// The cost is that a process explicitly backgrounded past its parent's exit
-    /// (`cmd &`) may survive — an acceptable, arguably-intended outcome.
+    /// (`cmd &`) may survive: an acceptable, arguably-intended outcome.
     pub fn terminate(&mut self) {
         if self.finished.is_none() {
             if let Some(pid) = self.child.process_id() {

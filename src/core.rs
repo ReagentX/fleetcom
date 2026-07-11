@@ -1,20 +1,20 @@
 //! The core event loop, shared by the daemon (`daemon::serve_client`) and the
 //! in-process foreground core (`transport::ThreadTransport`). Both drive one
-//! `Supervisor` identically: block until something happens — a client `Command`,
-//! or a task producing PTY output — apply it, then tick and ship the resulting
+//! `Supervisor` identically: block until something happens (a client `Command`,
+//! or a task producing PTY output), apply it, then tick and ship the resulting
 //! `Event`s.
 //!
 //! It is fully event-driven. The loop waits on a single `Wake` channel that both
 //! the command source *and* every task's reader thread feed, so there is no fixed
 //! polling cadence: an idle core sleeps, and an attached keystroke's echo ships
-//! within a frame of the child emitting it — no round-trip stall. Two timers
+//! within a frame of the child emitting it. No round-trip stall. Two timers
 //! bound the extremes, neither on the interactive path:
 //!
 //! - `FRAME_MIN` caps screen emission under a firehose (a watched `yes`): a burst
 //!   of output coalesces into at most one screen per interval.
 //! - `FALLBACK` is the idle backstop for the *time-based* dashboard state
 //!   (`started_ago`, the Active→Idle edge) that no wake announces, and the ceiling
-//!   on how long a missed wake could stall a repaint — a self-heal, not the norm.
+//!   on how long a missed wake could stall a repaint. A self-heal, not the norm.
 
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
@@ -33,13 +33,13 @@ pub enum Wake {
     /// A task wrote output; its `vt100` screen advanced (the reader thread has
     /// already fed the parser), so the loop should tick to ship it.
     Output,
-    /// The command source ended — the client's socket hit EOF. Distinct from a
+    /// The command source ended: the client's socket hit EOF. Distinct from a
     /// `Shutdown` command: the jobs keep running, only this connection is done.
     Hangup,
 }
 
 /// The slot the `Supervisor` hands to each `Task` so its reader thread can wake
-/// the core loop on output. `None` between connections — no loop is listening —
+/// the core loop on output. `None` between connections (no loop is listening),
 /// so an unattached daemon's task output just accumulates in the parser, free.
 pub type Waker = Arc<Mutex<Option<Sender<Wake>>>>;
 
@@ -53,7 +53,7 @@ pub enum LoopExit {
 }
 
 /// Screen-emission ceiling: coalesce a firehose to at most one screen per
-/// interval. 8 ms ⇒ ≤125 fps — under perception, yet a hard cap on the work a
+/// interval. 8 ms ⇒ ≤125 fps: under perception, yet a hard cap on the work a
 /// watched `yes` can induce. Interactive echo is sparse, so it never waits the
 /// full interval.
 const FRAME_MIN: Duration = Duration::from_millis(8);
@@ -79,7 +79,7 @@ fn ready_to_tick(dirty: bool, since_last_tick: Duration) -> bool {
 }
 
 /// Drive `sup` until shutdown or the client leaves, shipping events through
-/// `emit` — which returns `false` when its sink is gone (a closed socket), the
+/// `emit` (returns `false` when its sink is gone, e.g. a closed socket): the
 /// signal that ends the loop with `ClientGone`.
 pub fn run_loop(
     sup: &mut Supervisor,
@@ -88,7 +88,7 @@ pub fn run_loop(
 ) -> LoopExit {
     // `dirty` = state changed since the last tick (a command applied, or a task
     // emitted output). Start `last_tick` a full backstop in the past so the first
-    // wake — the client's opening Resize/Watch — ticks at once.
+    // wake (the client's opening Resize/Watch) ticks at once.
     let mut dirty = false;
     let mut last_tick = Instant::now()
         .checked_sub(FALLBACK)
@@ -125,7 +125,7 @@ pub fn run_loop(
     }
 }
 
-/// Fold one wake into the supervisor. Returns `Some` when the loop must exit — a
+/// Fold one wake into the supervisor. Returns `Some` when the loop must exit: a
 /// `Shutdown` command, or the client hanging up.
 fn apply(sup: &mut Supervisor, wake: Wake, dirty: &mut bool) -> Option<LoopExit> {
     match wake {
@@ -163,7 +163,7 @@ mod tests {
         assert_eq!(wait_for(true, Duration::from_millis(8)), Duration::ZERO);
     }
 
-    /// Idle: don't tick at the frame floor, only at the backstop — so a quiet
+    /// Idle: don't tick at the frame floor, only at the backstop. A quiet
     /// attached pane wakes ~5x/s (for the clock), not 125x/s.
     #[test]
     fn idle_waits_the_backstop_not_the_floor() {
@@ -178,8 +178,8 @@ mod tests {
 
     /// The whole point, end to end: a keystroke to a watched task echoes back as a
     /// `Screen` event well inside the old fixed-tick cadence. Exercises the real
-    /// path — a live PTY, its reader thread signalling the waker, `run_loop`
-    /// waking and ticking — so it also fails loudly if the waker wiring breaks
+    /// path (a live PTY, its reader thread signalling the waker, `run_loop`
+    /// waking and ticking), so it also fails loudly if the waker wiring breaks
     /// (echo would then only surface on the 200 ms backstop).
     #[test]
     fn watched_input_echoes_without_polling_delay() {
@@ -195,7 +195,7 @@ mod tests {
             run_loop(&mut sup, &wake_rx, |ev| evt_tx.send(ev.clone()).is_ok());
         });
 
-        // `cat` echoes stdin (and the PTY line discipline does too) — either way
+        // `cat` echoes stdin (and the PTY line discipline does too). Either way
         // input to the master shows up on the watched screen.
         wake_tx
             .send(Wake::Cmd(Command::Spawn {
@@ -232,7 +232,7 @@ mod tests {
         // slack for CI jitter while still catching that regression.
         assert!(
             latency < Duration::from_millis(50),
-            "echo took {latency:?} — expected an event-driven wake, not a poll"
+            "echo took {latency:?}: expected an event-driven wake, not a poll"
         );
 
         wake_tx.send(Wake::Cmd(Command::Shutdown)).unwrap();

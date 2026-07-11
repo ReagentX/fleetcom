@@ -3,19 +3,19 @@
 //! is swappable without touching `app.rs`:
 //!
 //! - `ThreadTransport` (milestone 2) runs the `Supervisor` on its own thread,
-//!   reached over a pair of mpsc channels — commands one way, events the other.
+//!   reached over a pair of mpsc channels: commands one way, events the other.
 //!   This is the loopback that proves the message set carries the whole UI with
 //!   no shared state beyond the channels.
 //! - `LocalTransport` keeps the supervisor in-thread and ticks it inline, so the
 //!   unit tests stay deterministic: `send` then `poll` sees the result at once.
 //!
-//! Milestone 3's Unix-domain socket is a third impl — `send` writes a framed
-//! command, `poll` reads ready event frames — and the client is none the wiser.
+//! Milestone 3's Unix-domain socket is a third impl: `send` writes a framed
+//! command, `poll` reads ready event frames, and the client is none the wiser.
 //!
 //! Both live transports carry a `wait_tx: Sender<()>` into their event-reader:
 //! after delivering an `Event` to the client's mirror, they poke it to wake the
 //! client's run loop (which blocks on the matching receiver). That is the client
-//! half of the event-driven path — the run loop reacts to a fresh screen the
+//! half of the event-driven path: the run loop reacts to a fresh screen the
 //! instant it arrives, with no polling delay.
 
 use std::net::Shutdown;
@@ -47,18 +47,18 @@ pub trait Transport {
     /// Return every event ready since the last poll (may be empty).
     fn poll(&mut self) -> Vec<Event>;
     /// Whether the core is still reachable. Goes false when the event channel
-    /// disconnects — the daemon died, or an in-process core panicked — which the
+    /// disconnects (the daemon died, or an in-process core panicked), which the
     /// client surfaces instead of freezing on a stale mirror.
     fn connected(&self) -> bool;
-    /// Tear down per `intent`, blocking until it's done — so the client restores
+    /// Tear down per `intent`, blocking until it's done, so the client restores
     /// the terminal only after the core has acted (jobs killed on `Quit`, the
     /// connection closed on `Disconnect`).
     fn shutdown(&mut self, intent: ExitIntent);
 }
 
 /// Drain every ready event without blocking; flip `dead` if the channel has
-/// disconnected (the core is gone). Shared by the threaded and socket transports
-/// — the client renders at its own cadence and coalesces newer over older.
+/// disconnected (the core is gone). Shared by the threaded and socket transports.
+/// The client renders at its own cadence and coalesces newer over older.
 fn drain(rx: &Receiver<Event>, dead: &mut bool) -> Vec<Event> {
     let mut evs = Vec::new();
     loop {
@@ -82,14 +82,14 @@ pub struct ThreadTransport {
     wake_tx: Sender<Wake>,
     evt_rx: Receiver<Event>,
     handle: Option<JoinHandle<()>>,
-    /// Set when the event channel disconnects — the core thread ended (a normal
+    /// Set when the event channel disconnects: the core thread ended (a normal
     /// shutdown, or a panic). Only the panic case matters to the client.
     dead: bool,
 }
 
 impl ThreadTransport {
     /// Run `sup` on its own thread. `wait_tx` wakes the *client's* run loop when
-    /// an event is produced — the foreground analogue of the socket reader poking
+    /// an event is produced: the foreground analogue of the socket reader poking
     /// the client on an inbound frame.
     pub fn spawn(sup: Supervisor, wait_tx: Sender<()>) -> ThreadTransport {
         let (wake_tx, wake_rx) = channel::<Wake>();
@@ -119,7 +119,7 @@ impl ThreadTransport {
 
     fn stop(&mut self) {
         // Tell the core to kill jobs and exit, then wait for it. The join is what
-        // guarantees the SIGKILLs have been sent before we return — the core
+        // guarantees the SIGKILLs have been sent before we return. The core
         // clears its tasks (Task::drop → killpg) as `run_loop` returns.
         let _ = self.wake_tx.send(Wake::Cmd(Command::Shutdown));
         if let Some(h) = self.handle.take() {
@@ -160,19 +160,19 @@ impl Drop for ThreadTransport {
 /// Milestone 3: the core is a separate process (`fleetcom --daemon`), reached over a
 /// Unix socket. Commands are written as frames on the connection; a reader thread
 /// turns inbound event frames back into `Event`s on a channel, so `poll` drains
-/// the channel exactly like `ThreadTransport` — the client can't tell the core
+/// the channel exactly like `ThreadTransport`. The client can't tell the core
 /// moved out of process.
 pub struct SocketTransport {
     write: UnixStream,
     evt_rx: Receiver<Event>,
     reader: Option<JoinHandle<()>>,
-    /// Set when the reader thread ends on socket EOF — the daemon is gone.
+    /// Set when the reader thread ends on socket EOF: the daemon is gone.
     dead: bool,
 }
 
 impl SocketTransport {
     /// Build over pre-split stream halves (`write`, `read`). The `try_clone` that
-    /// can fail is the caller's job — done outside the transport so the App's
+    /// can fail is the caller's job: done outside the transport so the App's
     /// transport factory stays infallible. `wait_tx` wakes the client's run loop
     /// on each inbound event.
     pub fn from_halves(
@@ -233,7 +233,7 @@ impl Transport for SocketTransport {
             }
         }
         // Either way, wait for our reader to see the socket close before the
-        // client restores the terminal — on Quit that means the jobs are dead.
+        // client restores the terminal. On Quit that means the jobs are dead.
         if let Some(h) = self.reader.take() {
             let _ = h.join();
         }

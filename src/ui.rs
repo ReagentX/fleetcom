@@ -1,11 +1,11 @@
-//! Hand-rolled crossterm rendering — same idiom as Logria (move, print padded,
+//! Hand-rolled crossterm rendering. Same idiom as Logria (move, print padded,
 //! clear the tail), no ratatui. Every view renders into an in-memory buffer;
 //! `render` writes that buffer to the terminal in a single `write_all` and only
 //! when it differs from the last frame. That makes each frame atomic (no
 //! half-painted tearing) and skips work entirely when nothing changed.
 //!
-//! The renderer reads only the client's mirror — the `TaskView` list and the
-//! watched `ScreenView` — never a live `Task`. Everything it needs is already a
+//! The renderer reads only the client's mirror (the `TaskView` list and the
+//! watched `ScreenView`), never a live `Task`. Everything it needs is already a
 //! plain snapshot, which is why the same code will paint socket data unchanged.
 
 use std::io::{self, Stdout, Write};
@@ -277,7 +277,7 @@ fn render_peek(out: &mut impl Write, app: &App) -> io::Result<()> {
     Ok(())
 }
 
-/// The `@` picker: a bottom panel over the dashboard — a typed-path input plus
+/// The `@` picker: a bottom panel over the dashboard. A typed-path input plus
 /// the matching subdirectories, `dir_sel` highlighted.
 fn render_pickdir(out: &mut impl Write, app: &App) -> io::Result<()> {
     let cols = app.cols as usize;
@@ -422,7 +422,7 @@ fn center(s: &str, width: usize) -> String {
 }
 
 /// Full-screen banner shown when the daemon connection drops: a cleared screen
-/// (the stale task list would lie — those jobs died with the daemon) and the two
+/// (the stale task list would lie: those jobs died with the daemon) and the two
 /// things the user needs, what happened and what to do.
 fn render_disconnected(out: &mut impl Write, app: &App) -> io::Result<()> {
     let cols = app.cols as usize;

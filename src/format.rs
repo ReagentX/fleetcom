@@ -3,7 +3,7 @@
 use std::time::Duration;
 
 /// Coarse relative age, matching the fleet-view idiom: `3s` / `4m` / `2h` / `5d`.
-/// One unit, no decimals — this is a glanceable column, not a stopwatch.
+/// One unit, no decimals. This is a glanceable column, not a stopwatch.
 pub fn rel_time(d: Duration) -> String {
     let s = d.as_secs();
     if s < 60 {
@@ -21,7 +21,7 @@ pub fn rel_time(d: Duration) -> String {
 ///
 /// Control chars are flattened to spaces so a stray escape/newline from a
 /// child's output can't corrupt a dashboard row. Width is counted per-char
-/// (one column each) — a known approximation that undercounts CJK/wide
+/// (one column each): a known approximation that undercounts CJK/wide
 /// glyphs; the real width table is a v2 concern (Logria's `LengthFinder`).
 pub fn truncate(s: &str, max: usize) -> String {
     if max == 0 {

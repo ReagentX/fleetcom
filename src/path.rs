@@ -36,7 +36,7 @@ pub fn expand_tilde(s: &str) -> String {
 /// Collapse `.` and `..` lexically (no filesystem access, no symlink
 /// resolution): `/a/b/../c` → `/a/c`. Kept lexical rather than
 /// `fs::canonicalize` so `/tmp` stays `/tmp` (not `/private/tmp`) and the path
-/// need not exist yet — this only tidies what the user typed.
+/// need not exist yet. This only tidies what the user typed.
 pub fn lexical_clean(p: &Path) -> PathBuf {
     let mut out = PathBuf::new();
     for comp in p.components() {
@@ -62,7 +62,7 @@ pub fn lexical_clean(p: &Path) -> PathBuf {
 /// path: `~`/relative are resolved against `base`, then `lexical_clean`
 /// collapses `.`/`..` and trailing slashes so a stored cwd reads as `~/a/c`,
 /// never `~/a/b/../c` or `~/test//`. `base` is the invocation dir for the `@`
-/// picker and the daemon cwd for session load — both absolute, so a recipe's
+/// picker and the daemon cwd for session load. Both absolute, so a recipe's
 /// stored `~/a` or `/tmp` never actually needs it.
 pub fn resolve(base: &Path, s: &str) -> PathBuf {
     let expanded = expand_tilde(s);

@@ -1,7 +1,7 @@
 //! Session save/load: a `{dir: [command, ...]}` recipe, JSON on disk, one file
 //! per session name under the user's config dir.
 //!
-//! A session is a *recipe* — loading it re-runs the commands; it does not
+//! A session is a *recipe*: loading it re-runs the commands; it does not
 //! resurrect live processes (that's the daemon's job, a later phase). Uses
 //! `jzon`, not serde: the schema is a flat map that needs no derive.
 

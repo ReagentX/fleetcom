@@ -1,6 +1,6 @@
 //! Length-prefixed, kind-tagged framing over a byte stream: `[u32 len][u8 kind]
 //! [payload]`, `len` counting the payload only. `read_frame` uses `read_exact`,
-//! so a frame split across partial socket reads reassembles correctly — the main
+//! so a frame split across partial socket reads reassembles correctly. The main
 //! new hazard in going from channels to a socket. `kind` separates jzon control
 //! frames from the raw-bytes screen frames, so high-frequency pane data pays no
 //! base64/number-array tax.
@@ -14,14 +14,14 @@ pub const KIND_CONTROL: u8 = 1;
 pub const KIND_SCREEN: u8 = 2;
 
 /// Reject an absurd length prefix (corrupt or hostile peer) before allocating.
-/// 64 MiB is far above any real frame — a full 8K screen's formatted bytes are
+/// 64 MiB is far above any real frame. A full 8K screen's formatted bytes are
 /// a few hundred KiB at most.
 const MAX_FRAME: u32 = 64 * 1024 * 1024;
 
 /// Write one frame and flush. Flushing per frame keeps latency low: the peer sees
 /// each command/event immediately. A firehose can't drown the socket because the
 /// core loop already coalesces screen emission to one frame per `FRAME_MIN` (see
-/// `core::run_loop`) — the flush here is per *emitted* frame, not per output byte.
+/// `core::run_loop`). The flush here is per *emitted* frame, not per output byte.
 pub fn write_frame(w: &mut impl Write, kind: u8, payload: &[u8]) -> io::Result<()> {
     let len = u32::try_from(payload.len())
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "frame too large"))?;
@@ -32,7 +32,7 @@ pub fn write_frame(w: &mut impl Write, kind: u8, payload: &[u8]) -> io::Result<(
 }
 
 /// Read one whole frame, blocking until it's complete. Returns `(kind, payload)`.
-/// An EOF between frames surfaces as `UnexpectedEof` — the caller treats that as
+/// An EOF between frames surfaces as `UnexpectedEof`. The caller treats that as
 /// "peer gone".
 pub fn read_frame(r: &mut impl Read) -> io::Result<(u8, Vec<u8>)> {
     let mut len_buf = [0u8; 4];
@@ -57,7 +57,7 @@ mod tests {
     use std::io::Cursor;
 
     /// Two frames written back-to-back read back intact and in order, including
-    /// an empty payload — the length prefix delimits them, not any separator.
+    /// an empty payload. The length prefix delimits them, not any separator.
     #[test]
     fn frames_round_trip_back_to_back() {
         let mut buf: Vec<u8> = Vec::new();
@@ -79,7 +79,7 @@ mod tests {
         assert!(read_frame(&mut cur).is_err());
     }
 
-    /// A frame arriving in two reads (header, then payload) still reassembles —
+    /// A frame arriving in two reads (header, then payload) still reassembles.
     /// `read_exact` is what makes partial socket reads safe.
     #[test]
     fn split_read_reassembles() {

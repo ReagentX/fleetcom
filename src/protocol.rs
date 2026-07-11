@@ -1,6 +1,6 @@
 //! The seam between the client (UI) and the supervisor (task owner). These are
 //! the types that will cross the Unix-domain socket in phase 2's daemon split;
-//! defining them now — and routing the in-process UI through them — proves the
+//! defining them now (and routing the in-process UI through them) proves the
 //! boundary before any IPC exists (see `docs/phase-2.md`, milestone 1).
 //!
 //! `Command` is client→core, `Event` is core→client, and `TaskView`/`ScreenView`
@@ -16,8 +16,8 @@ use crate::frame::{KIND_CONTROL, KIND_SCREEN};
 use crate::task::Lifecycle;
 
 /// A client→core request. Every mutation of the task set is one of these; the
-/// client never touches a `Task` directly. Fire-and-forget — results come back
-/// as `Event`s, never return values — so the shape already matches a one-way
+/// client never touches a `Task` directly. Fire-and-forget: results come back
+/// as `Event`s, never return values, so the shape already matches a one-way
 /// command channel.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Command {
@@ -29,7 +29,7 @@ pub enum Command {
     Remove { id: u64 },
     /// Set the manual "in use" tag.
     Tag { id: u64, on: bool },
-    /// Client terminal resized: `rows`×`cols` is the PTY *content* size — the
+    /// Client terminal resized: `rows`×`cols` is the PTY *content* size. The
     /// client has already subtracted the row it reserves for its status bar.
     Resize { rows: u16, cols: u16 },
     /// Stream this task's screen (attach or peek), or `None` to stop.
@@ -45,12 +45,12 @@ pub enum Command {
 }
 
 /// A core→client message. The client keeps a local mirror of the task set and
-/// the watched screen, updated only by these — exactly what phase 2 streams over
+/// the watched screen, updated only by these: exactly what phase 2 streams over
 /// the socket.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Event {
     /// Full task-set snapshot; replaces the client's mirror wholesale. (The
-    /// per-task `TaskDelta` optimization is deferred — see `docs/phase-2.md`.)
+    /// per-task `TaskDelta` optimization is deferred; see `docs/phase-2.md`.)
     Tasks(Vec<TaskView>),
     /// The watched task's current screen (attach/peek source).
     Screen(ScreenView),
@@ -58,7 +58,7 @@ pub enum Event {
     Status(String),
 }
 
-/// A read-only snapshot of one task — everything a dashboard row needs, with no
+/// A read-only snapshot of one task: everything a dashboard row needs, with no
 /// handle into the live process. Time is pre-reduced to `started_ago` and
 /// `lifecycle` is pre-computed by the core (it owns the clock and the idle
 /// threshold), so nothing here depends on a process-local `Instant` that a
@@ -89,12 +89,12 @@ pub struct ScreenView {
 // --- wire format -------------------------------------------------------------
 //
 // Control messages (every `Command`, and the `Tasks`/`Status` events) go over as
-// jzon — low-frequency, human-debuggable, and it reuses the dep already pulled
+// jzon: low-frequency, human-debuggable, and it reuses the dep already pulled
 // in for session files. The `Screen` event is the exception: its
 // `contents_formatted` bytes are the high-frequency firehose, so they ride a raw
 // tail after a small jzon header rather than bloating into a JSON number array.
 // Serialization lives here, next to the types, so the wire stays in lockstep
-// with the fields — a socket peer is just `decode_*(read_frame(...))`.
+// with the fields. A socket peer is just `decode_*(read_frame(...))`.
 
 fn ps(p: &Path) -> String {
     p.to_string_lossy().into_owned()
@@ -183,7 +183,7 @@ pub fn encode_command(cmd: &Command) -> (u8, Vec<u8>) {
 }
 
 /// Parse a command from a received frame. `None` on a wrong kind, non-UTF-8/
-/// non-JSON payload, unknown discriminant, or a missing/mistyped field — the
+/// non-JSON payload, unknown discriminant, or a missing/mistyped field. The
 /// daemon drops a malformed command rather than trusting it.
 pub fn decode_command(kind: u8, payload: &[u8]) -> Option<Command> {
     if kind != KIND_CONTROL {
@@ -236,8 +236,8 @@ pub fn decode_command(kind: u8, payload: &[u8]) -> Option<Command> {
 }
 
 /// Serialize an event to `(kind, payload)`. `Tasks`/`Status` are jzon control
-/// frames; `Screen` is a `KIND_SCREEN` frame — `[u32 header_len][jzon header]
-/// [raw formatted bytes]` — so the formatted firehose stays raw.
+/// frames; `Screen` is a `KIND_SCREEN` frame (`[u32 header_len][jzon header]
+/// [raw formatted bytes]`), so the formatted firehose stays raw.
 pub fn encode_event(ev: &Event) -> (u8, Vec<u8>) {
     match ev {
         Event::Tasks(views) => {

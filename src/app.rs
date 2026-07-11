@@ -1,6 +1,6 @@
 //! The client half of the phase-2 seam: UI state (modes, selection, pickers)
-//! and the single-threaded event loop. It owns **no** processes — the
-//! `Supervisor` does — and drives the task set only through `Command`s, painting
+//! and the single-threaded event loop. It owns **no** processes (the
+//! `Supervisor` does) and drives the task set only through `Command`s, painting
 //! the `TaskView` mirror it gets back as `Event`s. Modes are the `fleetcom`
 //! analogue of Logria's `InputType` handlers.
 //!
@@ -65,11 +65,11 @@ impl GroupMode {
 /// What Enter does with a picker row.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum DirKind {
-    /// The current directory (row 0) — Enter runs the command here.
+    /// The current directory (row 0): Enter runs the command here.
     Use,
-    /// A recently-used dir — Enter runs the command there (one-press reuse).
+    /// A recently-used dir: Enter runs the command there (one-press reuse).
     Jump,
-    /// A subdirectory — Enter and Tab descend into it.
+    /// A subdirectory: Enter and Tab descend into it.
     Into,
 }
 
@@ -82,7 +82,7 @@ pub struct DirCand {
 
 pub struct App {
     /// The link to the core (the task owner). Milestone 2 makes this a
-    /// `ThreadTransport` — the supervisor on its own thread behind a channel —
+    /// `ThreadTransport` (the supervisor on its own thread behind a channel),
     /// but the client only ever calls `send`/`poll`/`shutdown`, so it neither
     /// knows nor cares. Milestone 3 swaps in a socket-backed transport here.
     transport: Box<dyn Transport>,
@@ -98,7 +98,7 @@ pub struct App {
     /// core). Only a daemon client can meaningfully reconnect after a drop.
     pub daemon_backed: bool,
 
-    /// The *id* of the selected task — not a row index. Selection sticks to the
+    /// The *id* of the selected task, not a row index. Selection sticks to the
     /// task itself, so it can't jump to a neighbour when the list reorders
     /// (a task exits, or gets tagged into another bucket).
     pub selected_id: Option<u64>,
@@ -108,7 +108,7 @@ pub struct App {
     /// Directory a spawned command runs in. Set to `invocation_dir` for the `n`
     /// flow, or to the picked directory for the `@` flow.
     pub spawn_cwd: PathBuf,
-    /// Id of the attached task, if any — by id (not index) so it survives the
+    /// Id of the attached task, if any: by id (not index) so it survives the
     /// task list changing underneath it.
     pub focused_id: Option<u64>,
     pub rows: u16,
@@ -116,7 +116,7 @@ pub struct App {
     /// Bytes of the last painted frame; the renderer skips the write when the
     /// next frame is identical.
     pub last_frame: Vec<u8>,
-    /// Directory `fleetcom` was launched from — base for relative `@` paths and
+    /// Directory `fleetcom` was launched from: base for relative `@` paths and
     /// the "default" section that sorts first in "by dir" mode.
     pub invocation_dir: PathBuf,
     pub invocation_label: String,
@@ -133,7 +133,7 @@ pub struct App {
     /// tty, so a dedicated thread blocks on `event::read()` and forwards here; the
     /// run loop drains this instead of polling stdin itself.
     input_rx: Receiver<CtEvent>,
-    /// The stdin thread's sender, taken by `run` when it spawns that thread — so
+    /// The stdin thread's sender, taken by `run` when it spawns that thread, so
     /// tests that never call `run` never start it.
     input_tx: Option<Sender<CtEvent>>,
     /// Woken by *both* the stdin thread and the transport's event reader (each
@@ -156,7 +156,7 @@ pub struct App {
 
 /// Grouping key for the dashboard: user-tagged first, then live, then done.
 /// The manual tag ("I'm using this") overrides everything, *including* a
-/// finished process — so tagging pulls a task out of Completed into In use.
+/// finished process. Tagging pulls a task out of Completed into In use.
 /// That is how the tag rebuilds the fleet-view buckets without pretending to
 /// detect "awaiting input".
 pub fn bucket(v: &TaskView) -> u8 {
@@ -176,7 +176,7 @@ impl App {
     pub fn connect(rows: u16, cols: u16) -> io::Result<App> {
         let stream = crate::daemon::connect_or_autostart()?;
         // Split the stream here (the fallible part) so the transport factory in
-        // `assemble` — which owns the wake sender — stays infallible.
+        // `assemble` (which owns the wake sender) stays infallible.
         let read = stream.try_clone()?;
         let mut app = App::assemble(rows, cols, move |_, _, _, wait_tx| {
             Box::new(SocketTransport::from_halves(stream, read, wait_tx))
@@ -186,8 +186,8 @@ impl App {
     }
 
     /// Rebuild the daemon connection after a drop (autostarting a fresh daemon if
-    /// needed). The old jobs died with the old daemon — daemon death is task
-    /// death — so the new session starts empty; the mirror is cleared to match.
+    /// needed). The old jobs died with the old daemon (daemon death is task
+    /// death), so the new session starts empty; the mirror is cleared to match.
     fn reconnect(&mut self) {
         let wait_tx = self.wait_tx.clone();
         let build = move || -> io::Result<SocketTransport> {
@@ -207,7 +207,7 @@ impl App {
                 self.watched = None;
                 self.selected_id = None;
                 self.mode = Mode::Dashboard;
-                self.status = Some("reconnected — fresh daemon".to_string());
+                self.status = Some("reconnected to fresh daemon".to_string());
             }
             Err(e) => self.status = Some(format!("reconnect failed: {e}")),
         }
@@ -228,7 +228,7 @@ impl App {
     /// transports (`ThreadTransport`, test `LocalTransport`) build a `Supervisor`
     /// from `(pane_rows, cols, invocation_dir)`; `SocketTransport` ignores those
     /// and talks to the daemon's supervisor instead. Either way the client then
-    /// declares its content size up front — essential for the daemon, which
+    /// declares its content size up front. Essential for the daemon, which
     /// otherwise sizes PTYs at its 24x80 default; a harmless no-op in-process.
     fn assemble(
         rows: u16,
@@ -237,7 +237,7 @@ impl App {
     ) -> App {
         let invocation_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         let invocation_label = path::abbreviate(&invocation_dir);
-        // The core runs every PTY at the *content* size — full height minus the
+        // The core runs every PTY at the *content* size: full height minus the
         // one row attached mode reserves for its status bar.
         let pane_rows = rows.saturating_sub(1).max(1);
         // One wake channel, poked by the stdin thread and the transport's event
@@ -311,7 +311,7 @@ impl App {
         self.views.iter().position(|v| v.id == id)
     }
 
-    /// The watched task's screen, but only if it's the one `id` expects — guards
+    /// The watched task's screen, but only if it's the one `id` expects. Guards
     /// against painting a stale screen for the wrong task on the frame a watch
     /// switches (a real race once the core is across a socket).
     pub fn screen_for(&self, id: u64) -> Option<&ScreenView> {
@@ -330,7 +330,7 @@ impl App {
 
     /// Grouped view of the tasks: `(section label, view indices)` in render
     /// order. Both grouping modes sub-sort by state bucket then spawn order, so
-    /// "nesting" is uniform. This is the single source of order — `display_order`
+    /// "nesting" is uniform. This is the single source of order: `display_order`
     /// is just its flattening, so navigation and rendering can't disagree.
     pub fn sections(&self) -> Vec<(String, Vec<usize>)> {
         let mut labeled: Vec<(u8, String, u8, u64, usize)> = self
@@ -370,7 +370,7 @@ impl App {
         out
     }
 
-    /// Flattened section order — the sequence the selection cursor moves through.
+    /// Flattened section order: the sequence the selection cursor moves through.
     pub fn display_order(&self) -> Vec<usize> {
         self.sections().into_iter().flat_map(|(_, v)| v).collect()
     }
@@ -432,8 +432,8 @@ impl App {
     }
 
     /// Pull whatever the core has emitted and fold it into the local mirror. The
-    /// transport decides how those events arrive — a threaded channel drain in
-    /// production, an inline supervisor tick in tests — but the fold is the same.
+    /// transport decides how those events arrive (a threaded channel drain in
+    /// production, an inline supervisor tick in tests), but the fold is the same.
     fn sync(&mut self) {
         for ev in self.transport.poll() {
             match ev {
@@ -467,7 +467,7 @@ impl App {
         loop {
             // Reconcile with the core: declare the watched task, then pull a
             // fresh snapshot (+ its screen). Both are terminal-free, so they run
-            // *before* the quit check — on SIGHUP the terminal is already gone
+            // *before* the quit check. On SIGHUP the terminal is already gone
             // and a render would error and skip teardown, orphaning the jobs.
             let watch = match self.mode {
                 Mode::Peek => self.selected_id,
@@ -486,7 +486,7 @@ impl App {
             }
 
             if self.term_signal.load(Ordering::Relaxed) {
-                // A terminating signal detaches — the daemon keeps the jobs.
+                // A terminating signal detaches: the daemon keeps the jobs.
                 self.exit_intent = ExitIntent::Disconnect;
                 self.should_quit = true;
             }
@@ -506,12 +506,12 @@ impl App {
             // Block until input arrives, the core pushes an event, or the backstop
             // fires. The token is only "go look"; the payload waits in the
             // channels drained below and by `sync()` at the top of the next turn.
-            // The 100 ms backstop bounds how long a `term_signal` goes unnoticed —
-            // the hot path (keystroke, echo) wakes immediately, never on it.
+            // The 100 ms backstop bounds how long a `term_signal` goes unnoticed.
+            // The hot path (keystroke, echo) wakes immediately, never on it.
             let _ = self.wait_rx.recv_timeout(Duration::from_millis(100));
             while self.wait_rx.try_recv().is_ok() {} // coalesce wake tokens
 
-            // Handle every buffered key/resize in one pass — coalesces a paste and
+            // Handle every buffered key/resize in one pass: coalesces a paste and
             // shaves the last keystroke's echo (no render between chars).
             while let Ok(ev) = self.input_rx.try_recv() {
                 match ev {
@@ -550,7 +550,7 @@ impl App {
     // --- `@` directory picker -------------------------------------------------
 
     /// Recompute picker rows: the current directory first (row 0, "run here"),
-    /// then — before you've typed anything — the in-use dirs for one-press
+    /// then, before you've typed anything, the in-use dirs for one-press
     /// reuse, then the subdirectories of the current dir matching the fragment.
     fn refresh_dir_candidates(&mut self) {
         let (base_str, partial) = split_input(&self.dir_input);
@@ -594,7 +594,7 @@ impl App {
     }
 
     /// Distinct working directories of current tasks, most-recently-spawned
-    /// first — the "recent" quick-pick list.
+    /// first: the "recent" quick-pick list.
     fn in_use_dirs(&self) -> Vec<PathBuf> {
         let mut order: Vec<usize> = (0..self.views.len()).collect();
         order.sort_by_key(|&i| std::cmp::Reverse(self.views[i].id));
@@ -631,7 +631,7 @@ impl App {
         // Any key dismisses a lingering save/load notice.
         self.status = None;
         // Global escape hatch, except while attached (Ctrl-C belongs to the child).
-        // Ctrl-C disconnects — it leaves the daemon and jobs running.
+        // Ctrl-C disconnects: it leaves the daemon and jobs running.
         if self.mode != Mode::Attached
             && k.code == KeyCode::Char('c')
             && k.modifiers.contains(KeyModifiers::CONTROL)
@@ -715,7 +715,7 @@ impl App {
             }
             // Destroy is Shift-gated, like `Q` vs `q`: plain `X` kills the
             // selected task (or removes a finished one); `x` is a deliberate
-            // no-op. It is *not* `^X` — a Ctrl chord can't carry the shift
+            // no-op. It is *not* `^X`: a Ctrl chord can't carry the shift
             // distinction: the tty sends 0x18 for both Ctrl+x and Ctrl+Shift+X
             // (no shift bit), so only an unmodified capital reliably means
             // "yes, destroy this".
@@ -844,7 +844,7 @@ impl App {
 
     fn on_key_attached(&mut self, out: &mut Stdout, k: KeyEvent) -> io::Result<()> {
         // The one key `fleetcom` steals from the child: Ctrl-\ backgrounds it.
-        // Everything else — including Ctrl-C/Z/D — is forwarded verbatim.
+        // Everything else (including Ctrl-C/Z/D) is forwarded verbatim.
         //
         // Ctrl-\ sends byte 0x1C, which crossterm's legacy decoder reports as
         // Ctrl+'4' (it maps 0x1C..=0x1F → '4'..='7'); only under the kitty
@@ -875,7 +875,7 @@ impl App {
     fn attach(&mut self) {
         if let Some(i) = self.selected_task() {
             // All tasks already run at the client's content size, so there's no
-            // resize to do — just take focus. The screen arrives via `Watch`,
+            // resize to do: just take focus. The screen arrives via `Watch`,
             // sent from the run loop next tick.
             self.focused_id = Some(self.views[i].id);
             self.mode = Mode::Attached;
@@ -908,10 +908,10 @@ impl App {
 
     /// Leave, per `exit_intent`: `Disconnect` detaches and the daemon keeps the
     /// jobs running; `Quit` group-kills every job and stops the daemon. Against
-    /// an in-process core (`--foreground`) both kill everything — there's no
+    /// an in-process core (`--foreground`) both kill everything: there's no
     /// daemon to outlive the UI.
     fn shutdown(&mut self) {
-        // Blocks until the transport has acted on the intent — on `Quit` the
+        // Blocks until the transport has acted on the intent. On `Quit` the
         // jobs are dead before `main` restores the terminal; on `Disconnect` the
         // daemon keeps running.
         self.transport.shutdown(self.exit_intent);
@@ -1021,7 +1021,7 @@ mod tests {
             })
         }
 
-        /// Drive one core sync so `views` reflects the latest spawns and reaps —
+        /// Drive one core sync so `views` reflects the latest spawns and reaps:
         /// the test-side equivalent of one run-loop tick.
         fn pump(&mut self) {
             self.sync();
