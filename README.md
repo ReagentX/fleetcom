@@ -15,6 +15,11 @@ one terminal and reattach from another.
 - Save and reload `{directory: [commands]}` sessions
 - Group by state or working directory; pick a directory to launch in with `@`
 
+## Documentation
+
+Deeper reference — configuration and on-disk layout, the session format, every
+command, and a first-run walkthrough — lives in [`docs/`](docs/README.md).
+
 ## Installation
 
 Unix only — it relies on PTYs and process-group signals (`killpg`).
