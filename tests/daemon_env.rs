@@ -1,8 +1,8 @@
 //! A non-UTF-8 environment variable must not break spawning. `Task::spawn`
 //! inherits the environment via `vars_os`; the `vars()` it replaced panics on
-//! the first non-Unicode value, which under the daemon's release profile
-//! (`panic = "abort"`) killed the daemon (and with it the whole fleet) on
-//! every spawn.
+//! the first non-Unicode value, and spawn runs on the daemon's main thread,
+//! so that panic killed the daemon (and with it the whole fleet) on every
+//! spawn.
 
 mod common;
 
