@@ -8,7 +8,7 @@ license = "GPL-3.0-or-later"
 name = "fleetcom"
 readme = "README.md"
 repository = "https://github.com/ReagentX/fleetcom"
-version = "0.1.0"
+version = "0.0.0"
 
 [dependencies]
 crossterm = "=0.29.0"
