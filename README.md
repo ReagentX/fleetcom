@@ -37,7 +37,7 @@ There are a few ways to invoke `multi`:
 - `multi --foreground`
   - Runs everything in-process, without a daemon (jobs die when you quit)
 - `multi --kill`
-  - Kills the daemon and every job it owns
+  - Kills the daemon and its running jobs
 
 The daemon starts itself the first time you run `multi`; you never invoke
 `multi --daemon` directly.
@@ -59,7 +59,7 @@ The daemon starts itself the first time you run `multi`; you never invoke
 | `w` | save the current tasks as a session |
 | `o` | load a saved session |
 | `q` | disconnect — leave the daemon and jobs running |
-| `Q` | quit — kill every job and stop the daemon |
+| `Q` | quit — kill the jobs and stop the daemon |
 
 ### Attached
 
@@ -81,8 +81,15 @@ backgrounding an attached task never tells the child it lost the foreground.
 
 A per-user daemon owns the processes and their terminals. `q` disconnects the
 client and leaves everything running; the next `multi` reattaches. `Q` (or
-`multi --kill`) tears it all down. If the daemon dies, the client says so and
-offers to reconnect rather than freezing on a stale view.
+`multi --kill`) group-kills the running jobs and stops the daemon. If the daemon
+dies, the client says so and offers to reconnect rather than freezing on a stale
+view.
+
+Teardown caveat: `Q` signals each job's *process group*. A job that
+re-backgrounds itself past its own shell's exit (`cmd &`, then the shell exits)
+leaves that group and survives — kill it by hand. This is deliberate: once the
+shell is reaped its PID can be recycled, so signalling the old group could hit
+an unrelated process.
 
 ### Grouping and the `@` picker
 
