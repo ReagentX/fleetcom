@@ -88,15 +88,15 @@ fn ensure_runtime_dir(dir: &Path) -> io::Result<()> {
 /// and poll ~1s for it to bind.
 pub fn connect_or_autostart() -> io::Result<UnixStream> {
     let path = socket_path();
-    match UnixStream::connect(&path) {
-        Ok(s) => return Ok(s),
-        // Stale file, no listener: clear it so the new daemon can bind. On ENOENT
-        // there's nothing to remove — don't delete a socket we didn't confirm dead.
-        Err(e) if e.kind() == ErrorKind::ConnectionRefused => {
-            let _ = fs::remove_file(&path);
-        }
-        Err(_) => {}
+    if let Ok(s) = UnixStream::connect(&path) {
+        return Ok(s);
     }
+    // Any failure is handled the same way, and we NEVER unlink the socket here.
+    // `ECONNREFUSED` on AF_UNIX also means a live daemon's accept backlog is
+    // momentarily full — not a dead socket — so removing it could displace a
+    // running daemon. Just (auto)start a daemon: its flock ensures only one
+    // binds, and that sole daemon safely reclaims a genuinely stale socket under
+    // the lock (see `run_daemon`).
     spawn_daemon()?;
     for _ in 0..100 {
         if let Ok(s) = UnixStream::connect(&path) {
@@ -244,6 +244,12 @@ fn serve_client(sup: &mut Supervisor, stream: UnixStream) -> ServeOutcome {
     });
 
     let mut write = stream;
+    // A client that stops draining the socket (crashed, SIGSTOPped, or hostile)
+    // must not wedge the daemon: the serve loop is synchronous, so a `write_frame`
+    // blocked forever on a full send buffer would freeze reads, ticks, reaping,
+    // and `accept` — and `--kill` could never get in. Cap how long one event
+    // write may block; a timeout surfaces as an error below and drops the client.
+    let _ = write.set_write_timeout(Some(Duration::from_secs(5)));
     const TICK: Duration = Duration::from_millis(50);
     loop {
         match cmd_rx.recv_timeout(TICK) {
