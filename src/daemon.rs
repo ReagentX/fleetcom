@@ -15,7 +15,7 @@
 //! and invisible to the next (empty) daemon.
 
 use std::fs;
-use std::io::{self, ErrorKind, Read};
+use std::io::{self, ErrorKind, Read, Write};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::os::unix::process::CommandExt;
@@ -28,6 +28,8 @@ use std::thread;
 use std::time::Duration;
 
 use nix::fcntl::{Flock, FlockArg};
+use nix::sys::signal::{Signal, kill};
+use nix::unistd::Pid;
 
 use crate::core::{LoopExit, Wake, run_loop};
 use crate::frame::{read_frame, write_frame};
@@ -124,7 +126,11 @@ pub fn connect_or_autostart() -> io::Result<UnixStream> {
 fn spawn_daemon() -> io::Result<()> {
     let exe = std::env::current_exe()?;
     let dir = runtime_dir();
-    let _ = ensure_runtime_dir(&dir);
+    // Propagate a validation failure instead of discarding it: creating
+    // `daemon.log` inside an unvalidated dir would follow a planted symlink
+    // (shared-`/tmp` attack) and truncate an attacker-chosen file *before* the
+    // daemon's own check aborted anything.
+    ensure_runtime_dir(&dir)?;
     let log = fs::File::create(dir.join("daemon.log")).ok();
     let mut cmd = std::process::Command::new(exe);
     cmd.arg("--daemon")
@@ -136,11 +142,68 @@ fn spawn_daemon() -> io::Result<()> {
     Ok(())
 }
 
-/// `fleetcom --kill`: connect to a running daemon and tell it to group-kill every
-/// job and stop. Blocks until the socket closes: the daemon shuts the
-/// connection once it has killed the jobs and exited, so this returns only when
-/// they're actually gone. A no-op (with a message) if no daemon is running.
+/// `fleetcom --kill`: stop the daemon and every job it owns. Signal path, not
+/// socket: the daemon serves one client at a time, so a `Shutdown` *frame*
+/// would sit in the accept backlog until an attached client detached.
+/// `--kill` must work while someone else is attached. The pid comes from the
+/// lock file (trustworthy while the flock is held: the holder wrote it), and
+/// daemon exit releases the flock, so acquiring it is the completion signal.
+/// A no-op (with a message) if no daemon is running.
 pub fn run_kill() -> io::Result<()> {
+    let lock_path = runtime_dir().join("daemon.lock");
+    let Ok(file) = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&lock_path)
+    else {
+        eprintln!("fleetcom: no daemon running");
+        return Ok(());
+    };
+    // Probe the single-instance lock: acquirable means no daemon holds it.
+    let mut file = match Flock::lock(file, FlockArg::LockExclusiveNonblock) {
+        Ok(_held) => {
+            eprintln!("fleetcom: no daemon running");
+            return Ok(());
+        }
+        Err((file, _)) => file,
+    };
+
+    let mut pid_str = String::new();
+    file.read_to_string(&mut pid_str)?;
+    let Some(pid) = pid_str.trim().parse::<i32>().ok().filter(|p| *p > 0) else {
+        // No pid in the lock file (a daemon predating it, or a torn write):
+        // fall back to a Shutdown frame over the socket. That path blocks while
+        // another client is attached, but it's strictly better than nothing.
+        return kill_via_socket();
+    };
+
+    // ESRCH means the daemon exited between the lock probe and here; the flock
+    // poll below confirms the outcome either way.
+    match kill(Pid::from_raw(pid), Signal::SIGTERM) {
+        Ok(()) | Err(nix::errno::Errno::ESRCH) => {}
+        Err(e) => return Err(io::Error::other(e)),
+    }
+
+    // The daemon notices the flag within ~200 ms, then tears down its jobs.
+    // Its exit releases the flock, so acquiring it is the completion signal:
+    // jobs dead, socket removed. 10 s covers the teardown with slack.
+    for _ in 0..200 {
+        match Flock::lock(file, FlockArg::LockExclusiveNonblock) {
+            Ok(_held) => return Ok(()),
+            Err((f, _)) => file = f,
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    Err(io::Error::new(
+        ErrorKind::TimedOut,
+        "daemon did not exit after SIGTERM",
+    ))
+}
+
+/// Legacy kill path: a `Shutdown` frame over the socket, blocking until the
+/// daemon closes it (jobs dead by then). Only reached when the lock file holds
+/// no pid.
+fn kill_via_socket() -> io::Result<()> {
     let path = socket_path();
     match UnixStream::connect(&path) {
         Ok(mut s) => {
@@ -173,14 +236,20 @@ pub fn run_daemon() -> io::Result<()> {
     let lock_file = fs::OpenOptions::new()
         .create(true)
         .write(true)
-        .truncate(false) // a lock anchor; contents are never used
+        .truncate(false) // rewritten below, only once the lock is ours
         .open(dir.join("daemon.lock"))?;
-    // `_lock` is held (not `_`) for the whole function, so the flock lives until
-    // this daemon exits, then releases on drop.
-    let _lock = match Flock::lock(lock_file, FlockArg::LockExclusiveNonblock) {
+    // `lock` is held for the whole function, so the flock lives until this
+    // daemon exits, then releases on drop.
+    let mut lock = match Flock::lock(lock_file, FlockArg::LockExclusiveNonblock) {
         Ok(l) => l,
         Err(_) => return Ok(()), // another daemon already owns the socket
     };
+    // Sole owner: advertise our pid inside the lock file, the signal target for
+    // `--kill`. Trustworthy only while the flock is held. A stale pid from a
+    // dead daemon sits in an *unlocked* file, which `run_kill` treats as "no
+    // daemon" before it ever reads the pid.
+    lock.set_len(0)?;
+    lock.write_all(std::process::id().to_string().as_bytes())?;
 
     // Sole owner now: safe to reclaim a stale socket and bind it privately.
     let _ = fs::remove_file(&path);
@@ -232,15 +301,37 @@ pub fn run_daemon() -> io::Result<()> {
                 // Otherwise the client merely disconnected; keep the tasks and
                 // accept the next `fleetcom`, which reattaches to them.
             }
-            Err(e) if e.kind() == ErrorKind::WouldBlock => {
+            Err(e) if e.kind() == ErrorKind::WouldBlock || transient_accept_error(&e) => {
                 sup.reap();
                 thread::sleep(IDLE_REAP);
             }
-            Err(_) => break,
+            Err(e) => {
+                // Anything else is a fd-level failure worth dying loudly for;
+                // this lands in daemon.log. The fleet dies with the daemon
+                // (drop → group-kill), which beats leaking it silently.
+                eprintln!("fleetcom: accept failed, shutting down: {e}");
+                break;
+            }
         }
     }
     let _ = fs::remove_file(&path);
     Ok(())
+}
+
+/// Accept errors that clear on their own and must not take down the fleet:
+/// fd exhaustion (`EMFILE`/`ENFILE`, reachable when the fleet itself holds
+/// hundreds of PTY fds), an interrupted syscall, or a peer that vanished
+/// between connect and accept. The daemon reaps and retries the same way it
+/// does for `WouldBlock`.
+fn transient_accept_error(e: &io::Error) -> bool {
+    use nix::errno::Errno;
+    matches!(
+        e.raw_os_error(),
+        Some(code) if code == Errno::EMFILE as i32
+            || code == Errno::ENFILE as i32
+            || code == Errno::EINTR as i32
+            || code == Errno::ECONNABORTED as i32
+    )
 }
 
 #[derive(PartialEq)]
@@ -293,8 +384,82 @@ fn serve_client(sup: &mut Supervisor, stream: UnixStream, stop: &AtomicBool) -> 
         write_frame(&mut write, kind, &payload).is_ok()
     });
     sup.clear_waker();
+    // The watch dies with the connection: the next client must not inherit a
+    // Screen stream it never asked for.
+    sup.clear_watch();
     match outcome {
         LoopExit::Shutdown => ServeOutcome::Shutdown,
         LoopExit::ClientGone => ServeOutcome::Disconnected,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp(tag: &str) -> PathBuf {
+        let d =
+            std::env::temp_dir().join(format!("fleetcom_daemon_test_{tag}_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&d);
+        fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// A symlink at the runtime-dir path is the planted shared-`/tmp` attack:
+    /// it must be rejected even when its target is a real directory, or the
+    /// daemon (and the client's `daemon.log` create) would write through it.
+    #[test]
+    fn ensure_runtime_dir_rejects_symlink() {
+        let base = temp("symlink");
+        let target = base.join("target");
+        fs::create_dir(&target).unwrap();
+        let link = base.join("runtime");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        assert!(ensure_runtime_dir(&link).is_err());
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn ensure_runtime_dir_rejects_plain_file() {
+        let base = temp("file");
+        let path = base.join("runtime");
+        fs::write(&path, b"x").unwrap();
+        assert!(ensure_runtime_dir(&path).is_err());
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    /// The retry whitelist: fd exhaustion, interruption, and an aborted peer
+    /// are survivable; a permanent listener failure is not.
+    #[test]
+    fn transient_accept_errors_are_classified() {
+        use nix::errno::Errno;
+        for errno in [
+            Errno::EMFILE,
+            Errno::ENFILE,
+            Errno::EINTR,
+            Errno::ECONNABORTED,
+        ] {
+            assert!(
+                transient_accept_error(&io::Error::from_raw_os_error(errno as i32)),
+                "{errno} should be transient"
+            );
+        }
+        assert!(!transient_accept_error(&io::Error::from_raw_os_error(
+            Errno::EBADF as i32
+        )));
+        assert!(!transient_accept_error(&io::Error::other("no raw errno")));
+    }
+
+    /// A fresh dir is created private, and revalidating it succeeds (the
+    /// steady-state daemon restart path).
+    #[test]
+    fn ensure_runtime_dir_creates_private_dir() {
+        let base = temp("create");
+        let path = base.join("runtime");
+        ensure_runtime_dir(&path).unwrap();
+        let mode = fs::symlink_metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o700, "dir must be private");
+        ensure_runtime_dir(&path).unwrap();
+        let _ = fs::remove_dir_all(&base);
     }
 }

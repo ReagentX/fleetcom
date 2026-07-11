@@ -53,6 +53,9 @@ pub struct Task {
     pub exit_code: Option<i32>,
     pub started: Instant,
     pub finished: Option<Instant>,
+    /// When SIGTERM was sent (`terminate`): the start of the grace window the
+    /// supervisor measures before escalating to SIGKILL.
+    term_sent: Option<Instant>,
 }
 
 /// Wake the core loop that this task's screen advanced. Best-effort: the slot is
@@ -100,7 +103,10 @@ impl Task {
         cmd.arg(command);
         // Inherit the parent environment explicitly (PATH/HOME/…) and force a
         // TERM the emulator understands, so colour/interactivity are on.
-        for (k, v) in std::env::vars() {
+        // `vars_os`, not `vars`: `vars()` panics on any non-UTF-8 value, and in
+        // the daemon (release `panic = "abort"`) that would kill the whole
+        // fleet on every spawn.
+        for (k, v) in std::env::vars_os() {
             cmd.env(k, v);
         }
         cmd.env("TERM", "xterm-256color");
@@ -164,6 +170,7 @@ impl Task {
             exit_code: None,
             started: Instant::now(),
             finished: None,
+            term_sent: None,
         })
     }
 
@@ -252,23 +259,48 @@ impl Task {
         self.writer.flush()
     }
 
-    /// Kill the whole job: the process *group*, not just the direct child, so
-    /// a shell's foreground children die with it and the PTY slave closes (that
-    /// EOF is what lets the reader thread end).
-    ///
-    /// Non-blocking on purpose: we never `join` the reader. A grandchild that
-    /// escaped the group (its own `setsid`) and kept the PTY open would make the
-    /// read (and thus the whole UI) hang forever, which is exactly the freeze
-    /// this replaces. The detached thread ends on EOF; process exit reaps it.
+    /// Ask the whole job to exit: SIGTERM to the process *group*, not just the
+    /// direct child, so a shell's foreground children get it too. TERM, not
+    /// KILL: the job gets a chance to flush and clean up. The supervisor owns
+    /// the escalation: `overdue` turns true once the grace elapses without an
+    /// exit, and `force_kill` finishes it.
     ///
     /// Gated on `finished.is_none()`: once we've reaped the child, its pid can
     /// be recycled, and signalling a recycled pgid could hit an unrelated group.
     /// The cost is that a process explicitly backgrounded past its parent's exit
     /// (`cmd &`) may survive: an acceptable, arguably-intended outcome.
+    /// Idempotent: the first TERM starts the grace clock; repeats don't reset it.
     pub fn terminate(&mut self) {
-        if self.finished.is_none() {
+        if self.finished.is_none() && self.term_sent.is_none() {
             if let Some(pid) = self.child.process_id() {
                 // portable-pty `setsid`s the child, so its pid == its pgid.
+                let _ = killpg(Pid::from_raw(pid as i32), Signal::SIGTERM);
+            }
+            self.term_sent = Some(Instant::now());
+        }
+    }
+
+    /// Whether the TERM grace has run out: terminated, still not exited, and
+    /// `grace` past the TERM. The supervisor checks this each reap and answers
+    /// with `force_kill`.
+    pub fn overdue(&self, now: Instant, grace: Duration) -> bool {
+        self.finished.is_none()
+            && self
+                .term_sent
+                .is_some_and(|t| now.duration_since(t) >= grace)
+    }
+
+    /// Kill the whole job for real: SIGKILL to the group. The PTY slave closes
+    /// with it; that EOF is what lets the reader thread end.
+    ///
+    /// Non-blocking on purpose: we never `join` the reader. A grandchild that
+    /// escaped the group (its own `setsid`) and kept the PTY open would make the
+    /// read (and thus the whole UI) hang forever, which is exactly the freeze
+    /// this replaces. The detached thread ends on EOF; process exit reaps it.
+    /// Same pid-recycle gate as `terminate`.
+    pub fn force_kill(&mut self) {
+        if self.finished.is_none() {
+            if let Some(pid) = self.child.process_id() {
                 let _ = killpg(Pid::from_raw(pid as i32), Signal::SIGKILL);
             }
             let _ = self.child.kill();
@@ -279,8 +311,10 @@ impl Task {
 
 impl Drop for Task {
     fn drop(&mut self) {
-        // Guarantees no orphaned job tree regardless of how a Task leaves scope.
-        self.terminate();
+        // The last-resort backstop, not the policy point: guarantees no
+        // orphaned job tree regardless of how a Task leaves scope. Graceful
+        // TERM-first teardown happens above this, in the supervisor.
+        self.force_kill();
     }
 }
 

@@ -37,6 +37,12 @@ const MAX_DIM: u16 = 1000;
 /// working limit.
 const MAX_TASKS: usize = 256;
 
+/// How long a SIGTERMed job gets to exit before SIGKILL. TERM-respecting
+/// processes exit in milliseconds, so this is the *ceiling* on quit latency,
+/// not the norm; 2 s is enough for any real flush handler while keeping a
+/// wedged job from making `Q` feel broken.
+const KILL_GRACE: Duration = Duration::from_secs(2);
+
 pub struct Supervisor {
     tasks: Vec<Task>,
     next_id: u64,
@@ -61,6 +67,9 @@ pub struct Supervisor {
     /// (`set_waker`) and drops it on disconnect (`clear_waker`); between clients
     /// it is `None`, so an unattached daemon's task output accumulates cost-free.
     waker: Waker,
+    /// TERM→KILL escalation window. `KILL_GRACE` in production; a field so tests
+    /// shrink it instead of sleeping through real seconds.
+    kill_grace: Duration,
 }
 
 impl Supervisor {
@@ -75,7 +84,14 @@ impl Supervisor {
             base_dir,
             events: Vec::new(),
             waker: Arc::new(Mutex::new(None)),
+            kill_grace: KILL_GRACE,
         }
+    }
+
+    /// Shrink the TERM→KILL grace so escalation tests run in milliseconds.
+    #[cfg(test)]
+    pub fn set_kill_grace(&mut self, grace: Duration) {
+        self.kill_grace = grace;
     }
 
     /// Install the sender the current serving loop waits on, so task reader
@@ -92,6 +108,16 @@ impl Supervisor {
         if let Ok(mut slot) = self.waker.lock() {
             *slot = None;
         }
+    }
+
+    /// Forget the watch target on disconnect. The watch belongs to the
+    /// connection, not the task set: without this, the next client would be
+    /// streamed full `Screen` frames for a task it never asked about. Its own
+    /// watch state starts `None`, so it never sends the `Watch{None}` that
+    /// would stop them.
+    pub fn clear_watch(&mut self) {
+        self.watched = None;
+        self.last_screen = None;
     }
 
     /// Apply one client request. Fire-and-forget: any result (a save/load
@@ -139,7 +165,7 @@ impl Supervisor {
             }
             Command::SaveSession { name } => self.save_session(&name),
             Command::LoadSession { name } => self.load_session(&name),
-            Command::Shutdown => self.tasks.clear(),
+            Command::Shutdown => self.shutdown_all(),
         }
     }
 
@@ -147,13 +173,38 @@ impl Supervisor {
     /// (no snapshotting), so the daemon can call it while **no client is
     /// attached**: otherwise a job that exits after `q` stays a zombie until
     /// someone reconnects and a full `tick` runs.
+    ///
+    /// Also the escalation point: a task that ignored its SIGTERM past the
+    /// grace gets SIGKILLed here. Riding the reap cadence means escalation
+    /// works with no client attached (the daemon's idle loop reaps too).
     pub fn reap(&mut self) {
+        let now = Instant::now();
         for t in &mut self.tasks {
             // Swallow a reap error rather than propagate: the task just isn't
             // reaped this pass and is retried next. try_wait failing is rare and
             // must not take down the loop.
             let _ = t.poll_exit();
+            if t.overdue(now, self.kill_grace) {
+                t.force_kill();
+            }
         }
+    }
+
+    /// Kill every task for the quit path: TERM all groups at once, wait out one
+    /// shared grace (early exit as soon as everything is reaped), SIGKILL the
+    /// stragglers via `Task::drop`. Blocking here is fine (the core is exiting),
+    /// and the wait is bounded by the grace, paid only by jobs that ignore
+    /// their TERM.
+    fn shutdown_all(&mut self) {
+        for t in &mut self.tasks {
+            t.terminate();
+        }
+        let deadline = Instant::now() + self.kill_grace;
+        while self.tasks.iter().any(|t| t.finished.is_none()) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(25));
+            self.reap();
+        }
+        self.tasks.clear(); // Drop force-kills whatever is left
     }
 
     /// One step of the core's own loop: reap exits, then emit a fresh task
@@ -320,6 +371,8 @@ impl Supervisor {
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
     use super::*;
 
     fn here() -> PathBuf {
@@ -421,6 +474,200 @@ mod tests {
         assert!(
             !s.drain().iter().any(|e| matches!(e, Event::Screen(_))),
             "unchanged screen must not be resent"
+        );
+    }
+
+    /// Scratch dir for tests that sync through marker files.
+    fn scratch(tag: &str) -> PathBuf {
+        let d =
+            std::env::temp_dir().join(format!("fleetcom_sup_test_{tag}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// Spawn `command` and block until it has written `ready`: the sync that
+    /// keeps kill-path tests deterministic (no signalling a shell that hasn't
+    /// installed its trap yet).
+    fn spawn_ready(s: &mut Supervisor, command: String, cwd: PathBuf, ready: &Path) -> u64 {
+        s.apply(Command::Spawn { command, cwd });
+        for _ in 0..200 {
+            if ready.exists() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        assert!(ready.exists(), "task never signalled ready");
+        s.tick();
+        match s.drain().first() {
+            Some(Event::Tasks(v)) => v[0].id,
+            _ => panic!("expected a Tasks snapshot"),
+        }
+    }
+
+    /// Poll ticks until the task's lifecycle satisfies `pred`, or fail.
+    fn wait_for_lifecycle(
+        s: &mut Supervisor,
+        id: u64,
+        pred: impl Fn(crate::task::Lifecycle) -> bool,
+    ) {
+        for _ in 0..200 {
+            s.tick();
+            for e in s.drain() {
+                if let Event::Tasks(v) = e
+                    && let Some(t) = v.iter().find(|t| t.id == id)
+                    && pred(t.lifecycle)
+                {
+                    return;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        panic!("task {id} never reached the expected lifecycle");
+    }
+
+    /// `Kill` delivers SIGTERM first: a trap handler gets to run and exit
+    /// cleanly. SIGKILL-first would never execute the trap, so the marker file
+    /// plus the `Ok` lifecycle is proof of TERM-before-KILL.
+    #[test]
+    fn kill_delivers_term_before_kill() {
+        use crate::task::Lifecycle;
+        let dir = scratch("term_first");
+        let (ready, trapped) = (dir.join("ready"), dir.join("trapped"));
+        let mut s = Supervisor::new(24, 80, here());
+        let id = spawn_ready(
+            &mut s,
+            format!(
+                "trap 'echo t > {t}; exit 0' TERM; echo r > {r}; while :; do sleep 0.1; done",
+                t = trapped.display(),
+                r = ready.display()
+            ),
+            dir.clone(),
+            &ready,
+        );
+        s.apply(Command::Kill { id });
+        wait_for_lifecycle(&mut s, id, |l| l == Lifecycle::Ok);
+        assert!(trapped.exists(), "the TERM trap never ran");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A job that ignores SIGTERM is SIGKILLed once the grace elapses, via the
+    /// reap-driven escalation. `Kill` must never leave an immortal task.
+    #[test]
+    fn term_ignoring_task_escalates_to_kill() {
+        use crate::task::Lifecycle;
+        let dir = scratch("escalate");
+        let ready = dir.join("ready");
+        let mut s = Supervisor::new(24, 80, here());
+        s.set_kill_grace(Duration::from_millis(150));
+        let id = spawn_ready(
+            &mut s,
+            format!(
+                "trap '' TERM; echo r > {r}; while :; do sleep 0.1; done",
+                r = ready.display()
+            ),
+            dir.clone(),
+            &ready,
+        );
+        s.apply(Command::Kill { id });
+        wait_for_lifecycle(&mut s, id, |l| l == Lifecycle::Failed);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `Shutdown` exits as soon as TERM-respecting jobs die: well inside the
+    /// grace, not after it.
+    #[test]
+    fn shutdown_returns_early_when_jobs_respect_term() {
+        let mut s = Supervisor::new(24, 80, here());
+        s.apply(Command::Spawn {
+            command: "sleep 300".into(),
+            cwd: here(),
+        });
+        let t0 = Instant::now();
+        s.apply(Command::Shutdown);
+        assert!(
+            t0.elapsed() < Duration::from_secs(1),
+            "shutdown waited the full grace for a TERM-respecting job"
+        );
+        s.tick();
+        assert!(
+            s.drain()
+                .iter()
+                .any(|e| matches!(e, Event::Tasks(v) if v.is_empty()))
+        );
+    }
+
+    /// `Shutdown` with a TERM-ignoring job is bounded by the grace, then
+    /// SIGKILLs it: quit can be slowed, never wedged.
+    #[test]
+    fn shutdown_is_bounded_by_grace() {
+        let dir = scratch("shutdown_bound");
+        let ready = dir.join("ready");
+        let mut s = Supervisor::new(24, 80, here());
+        s.set_kill_grace(Duration::from_millis(200));
+        spawn_ready(
+            &mut s,
+            format!(
+                "trap '' TERM; echo r > {r}; while :; do sleep 0.1; done",
+                r = ready.display()
+            ),
+            dir.clone(),
+            &ready,
+        );
+        let t0 = Instant::now();
+        s.apply(Command::Shutdown);
+        let elapsed = t0.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "shutdown took {elapsed:?}: not bounded by the 200 ms grace"
+        );
+        s.tick();
+        assert!(
+            s.drain()
+                .iter()
+                .any(|e| matches!(e, Event::Tasks(v) if v.is_empty()))
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `clear_watch` (the client-disconnect path) must stop the `Screen` stream
+    /// and reset the send-on-change fingerprint, so a later re-watch gets a
+    /// fresh full screen instead of being skipped as "unchanged".
+    #[test]
+    fn clear_watch_stops_screen_stream_and_resets_dedup() {
+        let mut s = Supervisor::new(24, 80, here());
+        s.apply(Command::Spawn {
+            command: "sleep 30".into(),
+            cwd: here(),
+        });
+        s.tick();
+        let id = match s.drain().first() {
+            Some(Event::Tasks(v)) => v[0].id,
+            _ => panic!("expected a Tasks snapshot"),
+        };
+
+        s.apply(Command::Watch { id: Some(id) });
+        s.tick();
+        assert!(
+            s.drain().iter().any(|e| matches!(e, Event::Screen(_))),
+            "watching should stream a Screen"
+        );
+
+        // Disconnect: no client is watching anymore.
+        s.clear_watch();
+        s.tick();
+        assert!(
+            !s.drain().iter().any(|e| matches!(e, Event::Screen(_))),
+            "a disconnected client's watch must not keep streaming"
+        );
+
+        // A new client watching the same task gets a full screen at once, even
+        // though the screen bytes haven't changed since the last send.
+        s.apply(Command::Watch { id: Some(id) });
+        s.tick();
+        assert!(
+            s.drain().iter().any(|e| matches!(e, Event::Screen(_))),
+            "re-watch after clear_watch must resend the full screen"
         );
     }
 

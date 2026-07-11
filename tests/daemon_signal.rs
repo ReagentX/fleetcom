@@ -3,71 +3,20 @@
 //! process groups, so without the daemon's signal handler they would survive
 //! its death.
 
+mod common;
+
 use std::io::Write;
-use std::os::unix::net::UnixStream;
-use std::process::{Child, Command, Stdio};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use nix::sys::signal::{Signal, kill};
 use nix::unistd::Pid;
 
-/// The crate ships no lib target, so the wire format is restated by hand:
-/// `[u32 len][kind=1][jzon payload]`. Doubling as an independent check of the
-/// framing: drift on either side fails this test.
-fn control_frame(json: &str) -> Vec<u8> {
-    let mut f = Vec::with_capacity(5 + json.len());
-    f.extend_from_slice(&(u32::try_from(json.len()).unwrap()).to_be_bytes());
-    f.push(1);
-    f.extend_from_slice(json.as_bytes());
-    f
-}
-
-/// Poll `ok` until it holds or `budget` elapses; returns the final answer.
-fn wait_until(budget: Duration, mut ok: impl FnMut() -> bool) -> bool {
-    let deadline = Instant::now() + budget;
-    while Instant::now() < deadline {
-        if ok() {
-            return true;
-        }
-        std::thread::sleep(Duration::from_millis(25));
-    }
-    ok()
-}
-
-/// Kill the daemon if the test fails before its clean shutdown, so an
-/// assertion failure never leaks a daemon (and its jobs) onto the host.
-struct KillOnDrop(Child);
-impl Drop for KillOnDrop {
-    fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
-    }
-}
+use common::{control_frame, start_daemon, wait_until};
 
 #[test]
 fn sigterm_kills_daemon_and_its_jobs() {
-    let dir = std::env::temp_dir().join(format!("fleetcom_sigterm_{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-
-    let daemon = Command::new(env!("CARGO_BIN_EXE_fleetcom"))
-        .arg("--daemon")
-        .env("FLEETCOM_RUNTIME_DIR", &dir)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .unwrap();
-    let mut daemon = KillOnDrop(daemon);
-
-    // Wait for the daemon to bind, then connect as a client would.
+    let (dir, mut daemon, mut stream) = start_daemon("sigterm", |_| {});
     let sock = dir.join("default.sock");
-    let mut stream = None;
-    wait_until(Duration::from_secs(5), || {
-        stream = UnixStream::connect(&sock).ok();
-        stream.is_some()
-    });
-    let mut stream = stream.expect("daemon never bound its socket");
 
     // Spawn a job that records its own pid ($$ is the setsid'd shell, so pid ==
     // pgid) and then outlives the test unless killed.
@@ -101,7 +50,7 @@ fn sigterm_kills_daemon_and_its_jobs() {
     // SIGTERM the daemon *while our client is attached*: the flag must
     // interrupt `run_loop` mid-serve, not just the idle accept loop.
     kill(Pid::from_raw(daemon.0.id() as i32), Signal::SIGTERM).unwrap();
-    let exited = wait_until(Duration::from_secs(5), || {
+    let exited = wait_until(Duration::from_secs(10), || {
         daemon.0.try_wait().map(|s| s.is_some()).unwrap_or(false)
     });
     assert!(exited, "daemon did not exit on SIGTERM");
