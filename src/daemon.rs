@@ -10,7 +10,7 @@
 //! up — tmux's model.
 
 use std::fs;
-use std::io::{self, ErrorKind};
+use std::io::{self, ErrorKind, Read};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
@@ -20,7 +20,7 @@ use std::thread;
 use std::time::Duration;
 
 use crate::frame::{read_frame, write_frame};
-use crate::protocol::{Command, decode_command, encode_event};
+use crate::protocol::{Command, decode_command, encode_command, encode_event};
 use crate::supervisor::Supervisor;
 
 /// Per-user directory holding the socket. `MULTI_RUNTIME_DIR` overrides it
@@ -86,6 +86,27 @@ fn spawn_daemon() -> io::Result<()> {
         .process_group(0);
     cmd.spawn()?;
     Ok(())
+}
+
+/// `multi --kill`: connect to a running daemon and tell it to group-kill every
+/// job and stop. Blocks until the socket closes — the daemon shuts the
+/// connection once it has killed the jobs and exited, so this returns only when
+/// they're actually gone. A no-op (with a message) if no daemon is running.
+pub fn run_kill() -> io::Result<()> {
+    let path = socket_path();
+    match UnixStream::connect(&path) {
+        Ok(mut s) => {
+            let (kind, payload) = encode_command(&Command::Shutdown);
+            write_frame(&mut s, kind, &payload)?;
+            let mut buf = [0u8; 256];
+            while s.read(&mut buf).map(|n| n > 0).unwrap_or(false) {}
+            Ok(())
+        }
+        Err(_) => {
+            eprintln!("multi: no daemon running");
+            Ok(())
+        }
+    }
 }
 
 /// The daemon entry point (`multi --daemon`). Binds the socket and serves clients

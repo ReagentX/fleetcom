@@ -1,9 +1,10 @@
 # Phase 2 — Persistence & Reattach
 
 Design doc / resume anchor. Written before starting implementation; decisions
-below are settled. **Milestones 1–2 are landed** (the in-process seam + the
-threaded loopback transport); next action: **milestone 3** (real daemon +
-socket).
+below are settled. **Milestones 1–3 are landed** (the in-process seam, the
+threaded loopback transport, and the real daemon + socket with the
+disconnect/quit split); next action: **milestone 4** (live reattach —
+`ScreenFull`/`ScreenDiff` streaming + scrollback).
 
 ## Status (as of writing)
 
@@ -148,11 +149,13 @@ For jobs to outlive the UI, something other than the UI must own them → a
    kind][payload]`) + `Command`/`Event` serialization (jzon control, raw `Screen`
    tail) + `daemon.rs` (`multi --daemon` owns the one `Supervisor`, persists
    across reconnects) + `SocketTransport` (a third `Transport` impl) + autostart.
-   `ThreadTransport` lives on as `multi --foreground`. **`q` still kills all**, so
-   the 9 UI harnesses (now on `--foreground`) stay green; 3 new daemon harnesses
-   cover spawn/attach/reattach over the socket. *Commit 2 (3b) next:* the
-   disconnect/quit split — `q` disconnects, `Q`/`multi --kill` tears the daemon
-   down, signals disconnect.
+   `ThreadTransport` lives on as `multi --foreground`. *Commit 2 (3b) done:* the
+   disconnect/quit split — `ExitIntent {Disconnect, Quit}` threads through
+   `Transport::shutdown`; `q`/Ctrl-C/signals disconnect (close the socket, daemon
+   survives), `Q` and `multi --kill` quit (Shutdown → daemon kills all + exits).
+   In-process cores kill all on either intent, so the `--foreground` UI harnesses
+   are unchanged. 14 harnesses green (9 UI on `--foreground` + 5 daemon:
+   Q-quit, attach streaming, crash-survival, q-disconnect+reattach, `--kill`).
 4. **Live reattach.** `ScreenFull`/`ScreenDiff` streaming; scrollback retention.
 5. **New-model UX.** Disconnect vs. quit bindings, "daemon status",
    reconnect-on-drop.

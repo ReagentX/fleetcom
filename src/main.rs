@@ -38,6 +38,10 @@ fn main() -> io::Result<()> {
     if args.iter().any(|a| a == "--daemon") {
         return daemon::run_daemon();
     }
+    // `multi --kill`: tell a running daemon to kill everything and exit.
+    if args.iter().any(|a| a == "--kill") {
+        return daemon::run_kill();
+    }
 
     install_panic_hook();
 

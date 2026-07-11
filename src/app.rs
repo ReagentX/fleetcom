@@ -21,7 +21,7 @@ use crate::protocol::{Command, Event, ScreenView, TaskView};
 use crate::session;
 use crate::supervisor::Supervisor;
 use crate::task::Lifecycle;
-use crate::transport::{SocketTransport, ThreadTransport, Transport};
+use crate::transport::{ExitIntent, SocketTransport, ThreadTransport, Transport};
 use crate::ui;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -126,6 +126,10 @@ pub struct App {
     /// teardown runs and the terminal is restored.
     term_signal: Arc<AtomicBool>,
     should_quit: bool,
+    /// How to leave when `should_quit` fires: `q`/Ctrl-C/signals disconnect
+    /// (daemon + jobs survive), `Q` quits and kills. Defaults to the safe
+    /// `Disconnect` so an unexpected exit never reaps the daemon.
+    exit_intent: ExitIntent,
 }
 
 /// Grouping key for the dashboard: user-tagged first, then live, then done.
@@ -203,6 +207,7 @@ impl App {
             status: None,
             term_signal: Arc::new(AtomicBool::new(false)),
             should_quit: false,
+            exit_intent: ExitIntent::Disconnect,
         }
     }
 
@@ -381,6 +386,8 @@ impl App {
             self.sync();
 
             if self.term_signal.load(Ordering::Relaxed) {
+                // A terminating signal detaches — the daemon keeps the jobs.
+                self.exit_intent = ExitIntent::Disconnect;
                 self.should_quit = true;
             }
             if self.should_quit {
@@ -512,10 +519,12 @@ impl App {
         // Any key dismisses a lingering save/load notice.
         self.status = None;
         // Global escape hatch, except while attached (Ctrl-C belongs to the child).
+        // Ctrl-C disconnects — it leaves the daemon and jobs running.
         if self.mode != Mode::Attached
             && k.code == KeyCode::Char('c')
             && k.modifiers.contains(KeyModifiers::CONTROL)
         {
+            self.exit_intent = ExitIntent::Disconnect;
             self.should_quit = true;
             return Ok(());
         }
@@ -534,7 +543,15 @@ impl App {
     fn on_key_dashboard(&mut self, k: KeyEvent) {
         let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
         match k.code {
-            KeyCode::Char('q') => self.should_quit = true,
+            // `q` detaches (daemon + jobs live on); `Q` kills all and stops it.
+            KeyCode::Char('q') => {
+                self.exit_intent = ExitIntent::Disconnect;
+                self.should_quit = true;
+            }
+            KeyCode::Char('Q') => {
+                self.exit_intent = ExitIntent::Quit;
+                self.should_quit = true;
+            }
             KeyCode::Up | KeyCode::Char('k') => self.select_up(),
             KeyCode::Down | KeyCode::Char('j') => self.select_down(),
             KeyCode::Char(' ') => {
@@ -761,13 +778,15 @@ impl App {
         }
     }
 
-    /// v1 policy: quitting the UI kills every job. The core group-kills each
-    /// task (see `Task::drop`). The daemon/reattach model that would outlive the
-    /// UI is phase 2 proper — this command is where "disconnect vs quit" splits.
+    /// Leave, per `exit_intent`: `Disconnect` detaches and the daemon keeps the
+    /// jobs running; `Quit` group-kills every job and stops the daemon. Against
+    /// an in-process core (`--foreground`) both kill everything — there's no
+    /// daemon to outlive the UI.
     fn shutdown(&mut self) {
-        // Blocks until the core has killed the jobs and stopped, so `main`
-        // restores the terminal only after they're gone.
-        self.transport.shutdown();
+        // Blocks until the transport has acted on the intent — on `Quit` the
+        // jobs are dead before `main` restores the terminal; on `Disconnect` the
+        // daemon keeps running.
+        self.transport.shutdown(self.exit_intent);
     }
 }
 

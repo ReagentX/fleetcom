@@ -13,6 +13,7 @@
 //! command, `poll` reads ready event frames — and the client is none the wiser.
 
 use std::io;
+use std::net::Shutdown;
 use std::os::unix::net::UnixStream;
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
 use std::thread::{self, JoinHandle};
@@ -22,6 +23,17 @@ use crate::frame::{read_frame, write_frame};
 use crate::protocol::{Command, Event, decode_event, encode_command};
 use crate::supervisor::Supervisor;
 
+/// How the client is leaving, chosen by the exit key/signal. Only
+/// `SocketTransport` honors the difference: an in-process core has no daemon to
+/// leave running, so both intents kill everything there.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ExitIntent {
+    /// Detach this client; the daemon and its jobs keep running.
+    Disconnect,
+    /// Kill every job and stop the daemon.
+    Quit,
+}
+
 /// The client↔core seam. Deliberately one-way-each: commands never return a
 /// value (results arrive as events), which is exactly what a socket enforces.
 pub trait Transport {
@@ -29,9 +41,10 @@ pub trait Transport {
     fn send(&mut self, cmd: Command);
     /// Return every event ready since the last poll (may be empty).
     fn poll(&mut self) -> Vec<Event>;
-    /// Kill every job and stop the core, blocking until teardown is done — so
-    /// the terminal is restored only after the jobs are actually gone.
-    fn shutdown(&mut self);
+    /// Tear down per `intent`, blocking until it's done — so the client restores
+    /// the terminal only after the core has acted (jobs killed on `Quit`, the
+    /// connection closed on `Disconnect`).
+    fn shutdown(&mut self, intent: ExitIntent);
 }
 
 /// The core on its own thread, behind two channels. The loopback of milestone 2.
@@ -82,7 +95,8 @@ impl Transport for ThreadTransport {
         evs
     }
 
-    fn shutdown(&mut self) {
+    fn shutdown(&mut self, _intent: ExitIntent) {
+        // In-process core: no daemon to leave running, so either intent stops it.
         self.stop();
     }
 }
@@ -145,12 +159,19 @@ impl Transport for SocketTransport {
         evs
     }
 
-    fn shutdown(&mut self) {
-        // Milestone 3 keeps `q` = kill-all: tell the daemon to group-kill every
-        // job and exit, then wait for the socket to close (daemon gone = jobs
-        // killed) before the client restores the terminal. The disconnect-vs-quit
-        // split is the next commit.
-        self.send(Command::Shutdown);
+    fn shutdown(&mut self, intent: ExitIntent) {
+        match intent {
+            // Group-kill every job and stop the daemon; the socket then closes
+            // (daemon gone = jobs killed).
+            ExitIntent::Quit => self.send(Command::Shutdown),
+            // Close the connection without a Shutdown: the daemon sees EOF and
+            // keeps the jobs running for the next client to reattach.
+            ExitIntent::Disconnect => {
+                let _ = self.write.shutdown(Shutdown::Both);
+            }
+        }
+        // Either way, wait for our reader to see the socket close before the
+        // client restores the terminal — on Quit that means the jobs are dead.
         if let Some(h) = self.reader.take() {
             let _ = h.join();
         }
@@ -221,7 +242,7 @@ impl Transport for LocalTransport {
         self.sup.tick();
         self.sup.drain()
     }
-    fn shutdown(&mut self) {
+    fn shutdown(&mut self, _intent: ExitIntent) {
         self.sup.apply(Command::Shutdown);
     }
 }
