@@ -10,6 +10,7 @@ use std::time::Duration;
 
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
+use crate::session::{self, SessionConfig};
 use crate::task::Task;
 use crate::ui;
 
@@ -20,6 +21,10 @@ pub enum Mode {
     Spawn,
     /// Live directory picker (the `@` flow) that sets `spawn_cwd`.
     PickDir,
+    /// Typing a name to save the current tasks as a session.
+    SaveSession,
+    /// Picking a saved session to load.
+    LoadSession,
     /// Overlay preview of the selected task.
     Peek,
     /// Full-screen, keystrokes forwarded to the focused task's PTY.
@@ -90,6 +95,11 @@ pub struct App {
     pub dir_input: String,
     pub dir_candidates: Vec<DirCand>,
     pub dir_sel: usize,
+    // Load-session picker state.
+    pub session_names: Vec<String>,
+    pub session_sel: usize,
+    /// Transient one-line notice (save/load result), dismissed on the next key.
+    pub status: Option<String>,
     /// Set by an external SIGTERM/SIGHUP/SIGINT; the loop treats it as quit so
     /// teardown runs and the terminal is restored.
     term_signal: Arc<AtomicBool>,
@@ -133,10 +143,70 @@ impl App {
             dir_input: String::new(),
             dir_candidates: Vec::new(),
             dir_sel: 0,
+            session_names: Vec::new(),
+            session_sel: 0,
+            status: None,
             term_signal: Arc::new(AtomicBool::new(false)),
             next_id: 1,
             should_quit: false,
         }
+    }
+
+    // --- sessions -------------------------------------------------------------
+
+    /// Snapshot the current tasks as a `{dir: [commands]}` recipe, in spawn
+    /// order within each dir.
+    fn session_config(&self) -> SessionConfig {
+        let mut order: Vec<usize> = (0..self.tasks.len()).collect();
+        order.sort_by_key(|&i| self.tasks[i].id);
+        let mut cfg = SessionConfig::new();
+        for &i in &order {
+            let t = &self.tasks[i];
+            cfg.entry(abbreviate(&t.cwd)).or_default().push(t.command.clone());
+        }
+        cfg
+    }
+
+    fn save_session(&mut self, name: &str) {
+        let cfg = self.session_config();
+        let count: usize = cfg.values().map(Vec::len).sum();
+        self.status = Some(match session::save(name, &cfg) {
+            Ok(_) => format!("saved '{name}' — {count} command(s)"),
+            Err(e) => format!("save failed: {e}"),
+        });
+    }
+
+    /// Spawn every command in the named session, in its (existing) dir. Missing
+    /// dirs are skipped rather than spawning tasks doomed to fail on chdir.
+    pub fn load_session(&mut self, name: &str) {
+        let cfg = match session::load(name) {
+            Ok(c) => c,
+            Err(_) => {
+                self.status = Some(format!("session '{name}' not found"));
+                return;
+            }
+        };
+        let pr = self.pane_rows();
+        let (mut spawned, mut skipped) = (0usize, 0usize);
+        for (dir, cmds) in &cfg {
+            let resolved = self.resolve(dir);
+            if !resolved.is_dir() {
+                skipped += cmds.len();
+                continue;
+            }
+            for cmd in cmds {
+                if let Ok(task) = Task::spawn(self.next_id, cmd, &resolved, pr, self.cols) {
+                    self.next_id += 1;
+                    self.tasks.push(task);
+                    spawned += 1;
+                }
+            }
+        }
+        self.status = Some(if skipped > 0 {
+            format!("loaded '{name}' — {spawned} task(s), {skipped} skipped (missing dir)")
+        } else {
+            format!("loaded '{name}' — {spawned} task(s)")
+        });
     }
 
     /// Hand out the flag for the caller to register OS signals against.
@@ -400,6 +470,8 @@ impl App {
     }
 
     fn on_key(&mut self, out: &mut Stdout, k: KeyEvent) -> io::Result<()> {
+        // Any key dismisses a lingering save/load notice.
+        self.status = None;
         // Global escape hatch, except while attached (Ctrl-C belongs to the child).
         if self.mode != Mode::Attached
             && k.code == KeyCode::Char('c')
@@ -412,6 +484,8 @@ impl App {
             Mode::Dashboard => self.on_key_dashboard(k)?,
             Mode::Spawn => self.on_key_spawn(k)?,
             Mode::PickDir => self.on_key_pickdir(k)?,
+            Mode::SaveSession => self.on_key_savesession(k),
+            Mode::LoadSession => self.on_key_loadsession(k),
             Mode::Peek => self.on_key_peek(k)?,
             Mode::Attached => self.on_key_attached(out, k)?,
         }
@@ -451,10 +525,60 @@ impl App {
                     GroupMode::Dir => GroupMode::State,
                 };
             }
+            KeyCode::Char('w') => {
+                self.input.clear();
+                self.mode = Mode::SaveSession;
+            }
+            KeyCode::Char('o') => {
+                self.session_names = session::list();
+                self.session_sel = 0;
+                self.mode = Mode::LoadSession;
+            }
             KeyCode::Char('x') if ctrl => self.kill_or_remove_selected(),
             _ => {}
         }
         Ok(())
+    }
+
+    fn on_key_savesession(&mut self, k: KeyEvent) {
+        match k.code {
+            KeyCode::Enter => {
+                let name = self.input.trim().to_string();
+                if !name.is_empty() {
+                    self.save_session(&name);
+                }
+                self.input.clear();
+                self.mode = Mode::Dashboard;
+            }
+            KeyCode::Esc => {
+                self.input.clear();
+                self.mode = Mode::Dashboard;
+            }
+            KeyCode::Backspace => {
+                self.input.pop();
+            }
+            KeyCode::Char(c) => self.input.push(c),
+            _ => {}
+        }
+    }
+
+    fn on_key_loadsession(&mut self, k: KeyEvent) {
+        match k.code {
+            KeyCode::Esc => self.mode = Mode::Dashboard,
+            KeyCode::Up => self.session_sel = self.session_sel.saturating_sub(1),
+            KeyCode::Down => {
+                if !self.session_names.is_empty() {
+                    self.session_sel = (self.session_sel + 1).min(self.session_names.len() - 1);
+                }
+            }
+            KeyCode::Enter => {
+                if let Some(name) = self.session_names.get(self.session_sel).cloned() {
+                    self.load_session(&name);
+                }
+                self.mode = Mode::Dashboard;
+            }
+            _ => {}
+        }
     }
 
     fn on_key_pickdir(&mut self, k: KeyEvent) -> io::Result<()> {

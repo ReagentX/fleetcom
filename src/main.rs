@@ -6,6 +6,7 @@
 
 mod app;
 mod format;
+mod session;
 mod task;
 mod ui;
 
@@ -33,6 +34,11 @@ fn main() -> io::Result<()> {
 
     let (cols, rows) = size()?;
     let mut app = App::new(rows, cols);
+    // `multi <session>` loads that session at startup; the result shows in the
+    // status line. `-`-prefixed args are reserved for future flags.
+    if let Some(name) = std::env::args().nth(1).filter(|a| !a.starts_with('-')) {
+        app.load_session(&name);
+    }
     install_signal_handlers(app.signal_flag())?;
     let result = app.run(&mut out);
 

@@ -29,6 +29,10 @@ pub fn render(out: &mut Stdout, app: &mut App) -> io::Result<()> {
             render_dashboard(&mut buf, app)?;
             render_pickdir(&mut buf, app)?;
         }
+        Mode::LoadSession => {
+            render_dashboard(&mut buf, app)?;
+            render_session_picker(&mut buf, app)?;
+        }
         _ => render_dashboard(&mut buf, app)?,
     }
     // Repaint only on change: a stable frame (idle tasks, no input) is a no-op,
@@ -121,12 +125,15 @@ fn render_dashboard(out: &mut impl Write, app: &App) -> io::Result<()> {
         y += 1;
     }
 
-    // Command line.
+    // Command line: input modes show a prompt (with cursor); otherwise a
+    // transient save/load notice, else the key hint.
     let cmd_y = rows.saturating_sub(2);
-    if app.mode == Mode::Spawn {
-        put(out, cmd_y, &spawn_prompt(app), cols)?;
-    } else {
-        dim(out, cmd_y, "  ❯ n run · @ run in dir · s sort", cols)?;
+    match cmdline(app) {
+        Some(line) => put(out, cmd_y, &line, cols)?,
+        None => match &app.status {
+            Some(s) => put(out, cmd_y, &format!("  {s}"), cols)?,
+            None => dim(out, cmd_y, "  ❯ n run · @ dir · s sort · w save · o load", cols)?,
+        },
     }
 
     // Footer hints.
@@ -137,13 +144,24 @@ fn render_dashboard(out: &mut impl Write, app: &App) -> io::Result<()> {
         cols,
     )?;
 
-    if app.mode == Mode::Spawn {
-        let cx = truncate(&spawn_prompt(app), cols).chars().count() as u16;
-        queue!(out, MoveTo(cx, cmd_y), Show)?;
-    } else {
-        queue!(out, Hide)?;
+    match cmdline(app) {
+        Some(line) => {
+            let cx = truncate(&line, cols).chars().count() as u16;
+            queue!(out, MoveTo(cx, cmd_y), Show)?;
+        }
+        None => queue!(out, Hide)?,
     }
     Ok(())
+}
+
+/// The editable bottom line for the text-input modes, or `None` when the command
+/// line should show a hint/status instead.
+fn cmdline(app: &App) -> Option<String> {
+    match app.mode {
+        Mode::Spawn => Some(spawn_prompt(app)),
+        Mode::SaveSession => Some(format!("  save session as: {}", app.input)),
+        _ => None,
+    }
 }
 
 /// The `❯` command line, prefixed with the target directory when it isn't the
@@ -305,6 +323,63 @@ fn render_pickdir(out: &mut impl Write, app: &App) -> io::Result<()> {
 
     let cx = truncate(&format!("  @ {}", app.dir_input), cols).chars().count() as u16;
     queue!(out, MoveTo(cx, top), Show)?;
+    Ok(())
+}
+
+/// The `o` load-session picker: a bottom panel listing saved session names.
+fn render_session_picker(out: &mut impl Write, app: &App) -> io::Result<()> {
+    let cols = app.cols as usize;
+    let rows = app.rows;
+    let total = app.session_names.len();
+
+    let max_list = 10usize.min((rows as usize).saturating_sub(4)).max(1);
+    let (start, visible) = scroll_window(app.session_sel, total, max_list);
+    let body = visible.max(1);
+    let panel_h = (body + 2) as u16;
+    let top = rows.saturating_sub(panel_h).max(2);
+
+    queue!(
+        out,
+        MoveTo(0, top),
+        SetAttribute(Attribute::Reverse),
+        Print(pad("  load session", cols)),
+        SetAttribute(Attribute::Reset)
+    )?;
+
+    if total == 0 {
+        dim(out, top + 1, "    (no saved sessions)", cols)?;
+    } else {
+        for row in 0..visible {
+            let idx = start + row;
+            let y = top + 1 + row as u16;
+            let marker = if idx == app.session_sel { "▸ " } else { "  " };
+            let line = format!("    {marker}{}", app.session_names[idx]);
+            if idx == app.session_sel {
+                queue!(
+                    out,
+                    MoveTo(0, y),
+                    SetAttribute(Attribute::Reverse),
+                    Print(pad(&line, cols)),
+                    SetAttribute(Attribute::Reset)
+                )?;
+            } else {
+                put(out, y, &line, cols)?;
+            }
+        }
+    }
+
+    let pos = if total > visible {
+        format!(" · {}/{}", app.session_sel + 1, total)
+    } else {
+        String::new()
+    };
+    dim(
+        out,
+        top + 1 + body as u16,
+        &format!("  ↑↓ pick · enter load · esc{pos}"),
+        cols,
+    )?;
+    queue!(out, Hide)?;
     Ok(())
 }
 
