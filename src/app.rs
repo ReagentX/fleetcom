@@ -4,9 +4,9 @@
 //! the `TaskView` mirror it gets back as `Event`s. Modes are the `multi`
 //! analogue of Logria's `InputType` handlers.
 //!
-//! In process the supervisor is a direct field and the loop calls its
-//! `apply`/`tick`/`drain` synchronously (milestone 1). Milestone 2 moves it
-//! behind a channel; nothing in this file's shape changes when it does.
+//! The core sits behind a `Transport` (milestone 2: the supervisor on its own
+//! thread over a channel); the loop only ever calls `send`/`poll`/`shutdown`, so
+//! milestone 3's socket swaps in without touching anything here.
 
 use std::io::{self, Stdout};
 use std::path::{Path, PathBuf};
@@ -21,6 +21,7 @@ use crate::protocol::{Command, Event, ScreenView, TaskView};
 use crate::session;
 use crate::supervisor::Supervisor;
 use crate::task::Lifecycle;
+use crate::transport::{ThreadTransport, Transport};
 use crate::ui;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -76,9 +77,11 @@ pub struct DirCand {
 }
 
 pub struct App {
-    /// The task owner. Phase 2 lifts this into `multi --daemon`; here it's a
-    /// direct field the loop drives synchronously.
-    supervisor: Supervisor,
+    /// The link to the core (the task owner). Milestone 2 makes this a
+    /// `ThreadTransport` — the supervisor on its own thread behind a channel —
+    /// but the client only ever calls `send`/`poll`/`shutdown`, so it neither
+    /// knows nor cares. Milestone 3 swaps in a socket-backed transport here.
+    transport: Box<dyn Transport>,
     /// Local mirror of the task set, replaced wholesale by `Event::Tasks`. The
     /// client renders and navigates this, never a live `Task`. `pub` so the
     /// renderer (`ui`) can index it by the row order `sections()` hands back.
@@ -142,6 +145,14 @@ pub fn bucket(v: &TaskView) -> u8 {
 
 impl App {
     pub fn new(rows: u16, cols: u16) -> App {
+        // Production: the supervisor runs on its own thread behind a channel.
+        App::assemble(rows, cols, |sup| Box::new(ThreadTransport::spawn(sup)))
+    }
+
+    /// Build the App around whatever transport `make` wraps the supervisor in —
+    /// a `ThreadTransport` in production, a synchronous `LocalTransport` in
+    /// tests. Everything but the transport is identical.
+    fn assemble(rows: u16, cols: u16, make: impl FnOnce(Supervisor) -> Box<dyn Transport>) -> App {
         let invocation_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         let invocation_label = path::abbreviate(&invocation_dir);
         // The core runs every PTY at the *content* size — full height minus the
@@ -149,7 +160,7 @@ impl App {
         let pane_rows = rows.saturating_sub(1).max(1);
         let supervisor = Supervisor::new(pane_rows, cols, invocation_dir.clone());
         App {
-            supervisor,
+            transport: make(supervisor),
             views: Vec::new(),
             focused_screen: None,
             watched: None,
@@ -180,15 +191,15 @@ impl App {
     /// Save the current task set under `name`. The core enumerates its tasks and
     /// writes the recipe; the result comes back as a `Status` event.
     fn save_session(&mut self, name: &str) {
-        self.supervisor
-            .apply(Command::SaveSession { name: name.to_string() });
+        self.transport
+            .send(Command::SaveSession { name: name.to_string() });
     }
 
     /// Load and run a named session. Public so `main` can trigger a startup load
     /// (`multi <session>`); the outcome shows in the status line one tick later.
     pub fn load_session(&mut self, name: &str) {
-        self.supervisor
-            .apply(Command::LoadSession { name: name.to_string() });
+        self.transport
+            .send(Command::LoadSession { name: name.to_string() });
     }
 
     /// Hand out the flag for the caller to register OS signals against.
@@ -318,16 +329,15 @@ impl App {
             if want.is_none() {
                 self.focused_screen = None;
             }
-            self.supervisor.apply(Command::Watch { id: want });
+            self.transport.send(Command::Watch { id: want });
         }
     }
 
-    /// One synchronization step with the core: run it a tick and fold its events
-    /// into the local mirror. Milestone 2 swaps `tick`+`drain` for a channel
-    /// receive; the fold is unchanged.
+    /// Pull whatever the core has emitted and fold it into the local mirror. The
+    /// transport decides how those events arrive — a threaded channel drain in
+    /// production, an inline supervisor tick in tests — but the fold is the same.
     fn sync(&mut self) {
-        self.supervisor.tick();
-        for ev in self.supervisor.drain() {
+        for ev in self.transport.poll() {
             match ev {
                 Event::Tasks(v) => self.views = v,
                 Event::Screen(s) => self.focused_screen = Some(s),
@@ -389,14 +399,14 @@ impl App {
         self.rows = rows;
         self.cols = cols;
         // Send the *content* size; the core resizes every PTY to it.
-        self.supervisor.apply(Command::Resize {
+        self.transport.send(Command::Resize {
             rows: self.pane_rows(),
             cols,
         });
     }
 
     fn spawn_task(&mut self, command: &str) {
-        self.supervisor.apply(Command::Spawn {
+        self.transport.send(Command::Spawn {
             command: command.to_string(),
             cwd: self.spawn_cwd.clone(),
         });
@@ -516,7 +526,7 @@ impl App {
             KeyCode::Char('m') => {
                 if let Some(i) = self.selected_task() {
                     let (id, tagged) = (self.views[i].id, self.views[i].tagged);
-                    self.supervisor.apply(Command::Tag { id, on: !tagged });
+                    self.transport.send(Command::Tag { id, on: !tagged });
                 }
             }
             KeyCode::Char('n') => {
@@ -692,7 +702,7 @@ impl App {
         if let Some(id) = self.focused_id
             && let Some(bytes) = key_to_bytes(k.code, k.modifiers)
         {
-            self.supervisor.apply(Command::Input { id, bytes });
+            self.transport.send(Command::Input { id, bytes });
         }
         Ok(())
     }
@@ -724,10 +734,10 @@ impl App {
                 .or_else(|| pos.checked_sub(1).and_then(|p| order.get(p)))
                 .map(|&x| self.views[x].id);
             self.selected_id = neighbour;
-            self.supervisor.apply(Command::Remove { id });
+            self.transport.send(Command::Remove { id });
         } else {
             // Kill in place; the next tick reaps it into the Completed bucket.
-            self.supervisor.apply(Command::Kill { id });
+            self.transport.send(Command::Kill { id });
         }
     }
 
@@ -735,7 +745,9 @@ impl App {
     /// task (see `Task::drop`). The daemon/reattach model that would outlive the
     /// UI is phase 2 proper — this command is where "disconnect vs quit" splits.
     fn shutdown(&mut self) {
-        self.supervisor.apply(Command::Shutdown);
+        // Blocks until the core has killed the jobs and stopped, so `main`
+        // restores the terminal only after they're gone.
+        self.transport.shutdown();
     }
 }
 
@@ -827,16 +839,23 @@ pub fn scroll_window(sel: usize, total: usize, max: usize) -> (usize, usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::transport::LocalTransport;
 
     impl App {
-        /// Drive one core sync (tick + drain) so `views` reflects the latest
-        /// spawns and reaps — the test-side equivalent of one run-loop tick.
+        /// A synchronous App: the supervisor ticks inline on `poll`, so `send`
+        /// then `pump` is deterministic with no core-thread timing to race.
+        fn new_local(rows: u16, cols: u16) -> App {
+            App::assemble(rows, cols, |sup| Box::new(LocalTransport::new(sup)))
+        }
+
+        /// Drive one core sync so `views` reflects the latest spawns and reaps —
+        /// the test-side equivalent of one run-loop tick.
         fn pump(&mut self) {
             self.sync();
         }
 
         fn spawn_in(&mut self, cmd: &str, cwd: PathBuf) {
-            self.supervisor.apply(Command::Spawn {
+            self.transport.send(Command::Spawn {
                 command: cmd.to_string(),
                 cwd,
             });
@@ -847,7 +866,7 @@ mod tests {
     /// the "In use" bucket) must not move the highlight to a different task.
     #[test]
     fn selection_follows_task_across_reorder() {
-        let mut app = App::new(30, 100);
+        let mut app = App::new_local(30, 100);
         let dir = app.invocation_dir.clone();
         app.spawn_in("sleep 5", dir.clone()); // id 1
         app.spawn_in("sleep 5", dir); // id 2
@@ -856,7 +875,7 @@ mod tests {
         assert_eq!(app.selected_id, Some(1));
 
         // Tag id 2 -> it sorts into the "In use" bucket, ahead of id 1.
-        app.supervisor.apply(Command::Tag { id: 2, on: true });
+        app.transport.send(Command::Tag { id: 2, on: true });
         app.pump();
 
         let order = app.display_order();
@@ -871,7 +890,7 @@ mod tests {
     /// mode collapses them back into the state buckets.
     #[test]
     fn dir_mode_groups_by_cwd() {
-        let mut app = App::new(30, 100);
+        let mut app = App::new_local(30, 100);
         let inv = app.invocation_dir.clone();
         app.spawn_in("sleep 5", inv); // id 1, invocation dir
         app.spawn_in("sleep 5", PathBuf::from("/tmp")); // id 2, /tmp
@@ -894,7 +913,7 @@ mod tests {
     /// has exited.
     #[test]
     fn tagging_a_finished_task_moves_it_to_in_use() {
-        let mut app = App::new(30, 100);
+        let mut app = App::new_local(30, 100);
         let inv = app.invocation_dir.clone();
         app.spawn_in("true", inv); // exits ~immediately
         for _ in 0..100 {
@@ -913,7 +932,7 @@ mod tests {
         assert_eq!(app.sections()[0].0, "Completed");
 
         let id = app.views[0].id;
-        app.supervisor.apply(Command::Tag { id, on: true });
+        app.transport.send(Command::Tag { id, on: true });
         app.pump();
         assert_eq!(app.sections()[0].0, "In use");
     }
@@ -921,7 +940,7 @@ mod tests {
     /// The `@` recent list is the distinct task cwds, newest first.
     #[test]
     fn recent_dirs_are_distinct_and_newest_first() {
-        let mut app = App::new(30, 100);
+        let mut app = App::new_local(30, 100);
         let inv = app.invocation_dir.clone();
         app.spawn_in("sleep 5", PathBuf::from("/tmp")); // id 1  /tmp
         app.spawn_in("sleep 5", inv.clone()); // id 2  invocation
@@ -936,7 +955,7 @@ mod tests {
 
     #[test]
     fn picker_puts_current_dir_first_and_selected() {
-        let mut app = App::new(30, 100);
+        let mut app = App::new_local(30, 100);
         app.dir_input.clear();
         app.refresh_dir_candidates();
         assert_eq!(app.dir_sel, 0, "current dir selected by default");
@@ -948,7 +967,7 @@ mod tests {
     /// (a lower-id task is removed) and reports gone once it's removed.
     #[test]
     fn focus_by_id_survives_index_shift() {
-        let mut app = App::new(30, 100);
+        let mut app = App::new_local(30, 100);
         let inv = app.invocation_dir.clone();
         app.spawn_in("sleep 5", inv.clone()); // id 1
         app.spawn_in("sleep 5", inv); // id 2
@@ -956,11 +975,11 @@ mod tests {
         app.focused_id = Some(2);
         assert_eq!(app.views[app.focused_task().unwrap()].id, 2);
 
-        app.supervisor.apply(Command::Remove { id: 1 }); // id 2 slides to index 0
+        app.transport.send(Command::Remove { id: 1 }); // id 2 slides to index 0
         app.pump();
         assert_eq!(app.views[app.focused_task().unwrap()].id, 2);
 
-        app.supervisor.apply(Command::Remove { id: 2 });
+        app.transport.send(Command::Remove { id: 2 });
         app.pump();
         assert!(app.focused_task().is_none());
     }

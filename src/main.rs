@@ -11,6 +11,7 @@ mod protocol;
 mod session;
 mod supervisor;
 mod task;
+mod transport;
 mod ui;
 
 use std::io;

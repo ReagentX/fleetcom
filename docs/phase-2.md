@@ -1,8 +1,9 @@
 # Phase 2 — Persistence & Reattach
 
 Design doc / resume anchor. Written before starting implementation; decisions
-below are settled. **Milestone 1 is landed** (the in-process seam); next action:
-**milestone 2** (loopback transport).
+below are settled. **Milestones 1–2 are landed** (the in-process seam + the
+threaded loopback transport); next action: **milestone 3** (real daemon +
+socket).
 
 ## Status (as of writing)
 
@@ -135,8 +136,14 @@ For jobs to outlive the UI, something other than the UI must own them → a
    over a `Vec<TaskView>` mirror, holding no `Task`. Zero IPC. 16 unit tests + 9
    PTY harnesses green (incl. idle-silence, fast group-kill quit, SIGTERM
    restore) — no behavior change.
-2. **Loopback transport.** Route client↔core through those types over an
-   in-process channel. Still one process; proves the message set.
+2. **Loopback transport.** ✅ **Done.** `transport.rs`: a `Transport` trait the
+   client's loop speaks (`send`/`poll`/`shutdown`); `ThreadTransport` runs the
+   `Supervisor` on its own thread behind a pair of mpsc channels (commands out,
+   events back), `LocalTransport` keeps the unit tests synchronous. Still one
+   process; the message set now genuinely crosses a thread boundary. Same 16
+   unit tests + 9 harnesses green (idle still 0 B/2 s, fast group-kill quit,
+   SIGTERM restore). The socket is a third `Transport` impl — the client is
+   already blind to which it holds.
 3. **Real daemon + socket.** Split into `multi` / `multi --daemon`; framing +
    autostart + attach/detach. `q` becomes disconnect; add explicit quit/kill.
 4. **Live reattach.** `ScreenFull`/`ScreenDiff` streaming; scrollback retention.
