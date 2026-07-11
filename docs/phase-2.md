@@ -1,10 +1,13 @@
 # Phase 2 — Persistence & Reattach
 
 Design doc / resume anchor. Written before starting implementation; decisions
-below are settled. **Milestones 1–3 are landed** (the in-process seam, the
-threaded loopback transport, and the real daemon + socket with the
-disconnect/quit split); next action: **milestone 4** (live reattach —
-`ScreenFull`/`ScreenDiff` streaming + scrollback).
+below are settled. **Milestones 1–3 landed**; **M4/M5 done to a focused scope** —
+send-on-change `Screen` (no idle attach churn), reconnect-on-drop, and a
+foreground indicator. Full `ScreenDiff` coalescing and scrollback retention were
+**deferred to v3+** as premature: on a localhost single client the receiver
+already coalesces screens to its render rate, and retained scrollback does
+nothing until a paging UI (also v3+). Phase 2's core is complete; what remains is
+v3+ (below).
 
 ## Status (as of writing)
 
@@ -116,9 +119,14 @@ For jobs to outlive the UI, something other than the UI must own them → a
   polls for the socket (~1s), connects. (tmux's model.)
 - **Shutdown:** manual only. `q`/detach leaves it running. Explicit `ShutdownDaemon`
   (a UI key + `multi --kill`) group-kills all and exits. **No idle-exit.**
-- **Honest limitation:** the daemon is the tasks' parent → **daemon death = task
-  death**. No init-reparenting/systemd handoff; surviving a daemon crash is out of
-  scope. Document, don't pretend.
+- **Honest limitation (corrected in M5):** on a **clean** shutdown the daemon's
+  `Task::drop` group-kills every job, so quit/`--kill`/client-Shutdown kill all.
+  But on a **crash / SIGKILL** `Drop` never runs, and the jobs are `setsid`'d into
+  their own sessions, so they are **orphaned and survive** (reparented to init) —
+  the *opposite* of "task death", and the earlier claim here was wrong. A
+  reconnecting client autostarts a fresh daemon that does **not** adopt those
+  orphans; they run headless until manually killed. Crash-resilient ownership
+  (kill-on-crash via pdeathsig, or adopt-on-reconnect) is v3+.
 
 ## Hard parts (where the risk is)
 
@@ -156,9 +164,15 @@ For jobs to outlive the UI, something other than the UI must own them → a
    In-process cores kill all on either intent, so the `--foreground` UI harnesses
    are unchanged. 14 harnesses green (9 UI on `--foreground` + 5 daemon:
    Q-quit, attach streaming, crash-survival, q-disconnect+reattach, `--kill`).
-4. **Live reattach.** `ScreenFull`/`ScreenDiff` streaming; scrollback retention.
-5. **New-model UX.** Disconnect vs. quit bindings, "daemon status",
-   reconnect-on-drop.
+4. **Live reattach.** *Focused scope done:* send-on-change `Screen` — the daemon
+   skips re-emitting an unchanged watched screen, killing the ~20/s idle-attach
+   churn (`Supervisor::last_screen`). *Deferred to v3+:* full `ScreenDiff`
+   coalescing (needs a client-side vt100 parser to reconstruct) and scrollback
+   retention (pointless without a paging UI).
+5. **New-model UX.** ✅ **Done.** Disconnect/quit bindings (m3b); a foreground
+   indicator in the header; and reconnect-on-drop — `Transport::connected` goes
+   false on socket EOF, the client shows a "daemon connection lost" banner, and
+   `r` autostarts a fresh daemon instead of freezing on a stale mirror.
 
 Doing the seam in-process **first** (1–2) lands the scary IPC work (3) on a
 proven boundary instead of a big-bang rewrite — the architecturally-correct order.

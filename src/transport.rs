@@ -15,7 +15,7 @@
 use std::io;
 use std::net::Shutdown;
 use std::os::unix::net::UnixStream;
-use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, TryRecvError, channel};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
@@ -41,10 +41,32 @@ pub trait Transport {
     fn send(&mut self, cmd: Command);
     /// Return every event ready since the last poll (may be empty).
     fn poll(&mut self) -> Vec<Event>;
+    /// Whether the core is still reachable. Goes false when the event channel
+    /// disconnects — the daemon died, or an in-process core panicked — which the
+    /// client surfaces instead of freezing on a stale mirror.
+    fn connected(&self) -> bool;
     /// Tear down per `intent`, blocking until it's done — so the client restores
     /// the terminal only after the core has acted (jobs killed on `Quit`, the
     /// connection closed on `Disconnect`).
     fn shutdown(&mut self, intent: ExitIntent);
+}
+
+/// Drain every ready event without blocking; flip `dead` if the channel has
+/// disconnected (the core is gone). Shared by the threaded and socket transports
+/// — the client renders at its own cadence and coalesces newer over older.
+fn drain(rx: &Receiver<Event>, dead: &mut bool) -> Vec<Event> {
+    let mut evs = Vec::new();
+    loop {
+        match rx.try_recv() {
+            Ok(ev) => evs.push(ev),
+            Err(TryRecvError::Empty) => break,
+            Err(TryRecvError::Disconnected) => {
+                *dead = true;
+                break;
+            }
+        }
+    }
+    evs
 }
 
 /// The core on its own thread, behind two channels. The loopback of milestone 2.
@@ -52,6 +74,9 @@ pub struct ThreadTransport {
     cmd_tx: Sender<Command>,
     evt_rx: Receiver<Event>,
     handle: Option<JoinHandle<()>>,
+    /// Set when the event channel disconnects — the core thread ended (a normal
+    /// shutdown, or a panic). Only the panic case matters to the client.
+    dead: bool,
 }
 
 impl ThreadTransport {
@@ -63,6 +88,7 @@ impl ThreadTransport {
             cmd_tx,
             evt_rx,
             handle: Some(handle),
+            dead: false,
         }
     }
 
@@ -85,14 +111,11 @@ impl Transport for ThreadTransport {
     }
 
     fn poll(&mut self) -> Vec<Event> {
-        let mut evs = Vec::new();
-        // Drain everything ready without blocking; the client renders at its own
-        // cadence and coalesces (a newer `Tasks`/`Screen` supersedes an older).
-        // Both `Empty` and `Disconnected` are `Err`, so the loop ends on either.
-        while let Ok(ev) = self.evt_rx.try_recv() {
-            evs.push(ev);
-        }
-        evs
+        drain(&self.evt_rx, &mut self.dead)
+    }
+
+    fn connected(&self) -> bool {
+        !self.dead
     }
 
     fn shutdown(&mut self, _intent: ExitIntent) {
@@ -118,6 +141,8 @@ pub struct SocketTransport {
     write: UnixStream,
     evt_rx: Receiver<Event>,
     reader: Option<JoinHandle<()>>,
+    /// Set when the reader thread ends on socket EOF — the daemon is gone.
+    dead: bool,
 }
 
 impl SocketTransport {
@@ -140,6 +165,7 @@ impl SocketTransport {
             write: stream,
             evt_rx,
             reader: Some(reader),
+            dead: false,
         })
     }
 }
@@ -152,11 +178,11 @@ impl Transport for SocketTransport {
     }
 
     fn poll(&mut self) -> Vec<Event> {
-        let mut evs = Vec::new();
-        while let Ok(ev) = self.evt_rx.try_recv() {
-            evs.push(ev);
-        }
-        evs
+        drain(&self.evt_rx, &mut self.dead)
+    }
+
+    fn connected(&self) -> bool {
+        !self.dead
     }
 
     fn shutdown(&mut self, intent: ExitIntent) {
@@ -241,6 +267,9 @@ impl Transport for LocalTransport {
     fn poll(&mut self) -> Vec<Event> {
         self.sup.tick();
         self.sup.drain()
+    }
+    fn connected(&self) -> bool {
+        true
     }
     fn shutdown(&mut self, _intent: ExitIntent) {
         self.sup.apply(Command::Shutdown);

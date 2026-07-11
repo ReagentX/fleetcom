@@ -20,6 +20,10 @@ use crate::task::Task;
 /// the client, computes lifecycle — it holds the clock and the live parser.
 const IDLE_AFTER: Duration = Duration::from_millis(600);
 
+/// The fingerprint of the last `Screen` sent, for send-on-change: the watched
+/// task's id, its formatted bytes, cursor position, and cursor visibility.
+type LastScreen = (u64, Vec<u8>, (u16, u16), bool);
+
 pub struct Supervisor {
     tasks: Vec<Task>,
     next_id: u64,
@@ -29,6 +33,11 @@ pub struct Supervisor {
     cols: u16,
     /// The task whose screen the client is watching (attach/peek), or `None`.
     watched: Option<u64>,
+    /// The last `Screen` we emitted — `(id, formatted, cursor, hide)` — so an
+    /// unchanged screen isn't re-serialized and re-sent every tick. Reset to
+    /// `None` whenever `watched` changes, so re-attaching always gets a fresh
+    /// full screen (the client cleared its copy on detach).
+    last_screen: Option<LastScreen>,
     /// Base for resolving a session recipe's stored dirs — the daemon's cwd; in
     /// process that's the invocation dir. Recipe dirs are absolute, so this only
     /// matters for a hand-edited relative entry.
@@ -44,6 +53,7 @@ impl Supervisor {
             rows,
             cols,
             watched: None,
+            last_screen: None,
             base_dir,
             events: Vec::new(),
         }
@@ -77,7 +87,14 @@ impl Supervisor {
                     let _ = t.resize(rows, cols);
                 }
             }
-            Command::Watch { id } => self.watched = id,
+            Command::Watch { id } => {
+                // A changed target (including detach → None → re-attach) forces
+                // the next tick to send a full screen, not skip it as "unchanged".
+                if id != self.watched {
+                    self.last_screen = None;
+                }
+                self.watched = id;
+            }
             Command::Input { id, bytes } => {
                 if let Some(t) = self.by_id_mut(id) {
                     let _ = t.send_input(&bytes);
@@ -122,13 +139,23 @@ impl Supervisor {
             && let Some(t) = self.tasks.iter().find(|t| t.id == id)
         {
             let (formatted, cursor, hide_cursor) = t.formatted();
-            self.events.push(Event::Screen(ScreenView {
-                id,
-                lines: t.screen_lines(),
-                formatted,
-                cursor,
-                hide_cursor,
-            }));
+            // Skip the send when nothing the client renders has changed — an
+            // idle attached task would otherwise re-ship its whole screen 20x/s.
+            let unchanged = matches!(
+                &self.last_screen,
+                Some((lid, lf, lc, lh))
+                    if *lid == id && *lf == formatted && *lc == cursor && *lh == hide_cursor
+            );
+            if !unchanged {
+                self.last_screen = Some((id, formatted.clone(), cursor, hide_cursor));
+                self.events.push(Event::Screen(ScreenView {
+                    id,
+                    lines: t.screen_lines(),
+                    formatted,
+                    cursor,
+                    hide_cursor,
+                }));
+            }
         }
     }
 
@@ -266,6 +293,42 @@ mod tests {
         assert!(
             evs.iter().any(|e| matches!(e, Event::Screen(sv) if sv.id == id)),
             "watching a task should stream its Screen"
+        );
+    }
+
+    /// A watched task whose screen hasn't changed must not re-emit a `Screen`
+    /// every tick — the send-on-change that kills idle attach churn.
+    #[test]
+    fn watched_screen_not_resent_when_unchanged() {
+        let mut s = Supervisor::new(24, 80, here());
+        s.apply(Command::Spawn { command: "sleep 30".into(), cwd: here() });
+        // Settle: let the silent shell finish any startup writes so the screen
+        // stabilizes before we assert nothing changes.
+        let mut id = 0;
+        for _ in 0..5 {
+            s.tick();
+            for e in s.drain() {
+                if let Event::Tasks(v) = e
+                    && let Some(t) = v.first()
+                {
+                    id = t.id;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(id != 0, "task never appeared");
+
+        s.apply(Command::Watch { id: Some(id) });
+        s.tick();
+        assert!(
+            s.drain().iter().any(|e| matches!(e, Event::Screen(_))),
+            "first watched tick sends a full screen"
+        );
+        // The screen is now stable; further ticks must not re-send it.
+        s.tick();
+        assert!(
+            !s.drain().iter().any(|e| matches!(e, Event::Screen(_))),
+            "unchanged screen must not be resent"
         );
     }
 }

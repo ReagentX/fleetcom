@@ -39,6 +39,8 @@ pub enum Mode {
     Peek,
     /// Full-screen, keystrokes forwarded to the focused task's PTY.
     Attached,
+    /// The daemon connection dropped; a banner offers reconnect or quit.
+    Disconnected,
 }
 
 /// How the dashboard groups tasks into sections. `Custom` is deferred until
@@ -90,6 +92,9 @@ pub struct App {
     focused_screen: Option<ScreenView>,
     /// Last `Watch` target sent to the core, so we don't resend it every tick.
     watched: Option<u64>,
+    /// Whether this client talks to a daemon (vs. an in-process `--foreground`
+    /// core). Only a daemon client can meaningfully reconnect after a drop.
+    pub daemon_backed: bool,
 
     /// The *id* of the selected task — not a row index. Selection sticks to the
     /// task itself, so it can't jump to a neighbour when the list reorders
@@ -154,7 +159,31 @@ impl App {
     pub fn connect(rows: u16, cols: u16) -> io::Result<App> {
         let stream = crate::daemon::connect_or_autostart()?;
         let transport = SocketTransport::connect(stream)?;
-        Ok(App::assemble(rows, cols, move |_, _, _| Box::new(transport)))
+        let mut app = App::assemble(rows, cols, move |_, _, _| Box::new(transport));
+        app.daemon_backed = true;
+        Ok(app)
+    }
+
+    /// Rebuild the daemon connection after a drop (autostarting a fresh daemon if
+    /// needed). The old jobs died with the old daemon — daemon death is task
+    /// death — so the new session starts empty; the mirror is cleared to match.
+    fn reconnect(&mut self) {
+        match crate::daemon::connect_or_autostart().and_then(SocketTransport::connect) {
+            Ok(t) => {
+                self.transport = Box::new(t);
+                self.transport.send(Command::Resize {
+                    rows: self.pane_rows(),
+                    cols: self.cols,
+                });
+                self.views.clear();
+                self.focused_screen = None;
+                self.watched = None;
+                self.selected_id = None;
+                self.mode = Mode::Dashboard;
+                self.status = Some("reconnected — fresh daemon".to_string());
+            }
+            Err(e) => self.status = Some(format!("reconnect failed: {e}")),
+        }
     }
 
     /// `--foreground`: run the core in-process on a thread (no daemon). A
@@ -188,6 +217,7 @@ impl App {
             views: Vec::new(),
             focused_screen: None,
             watched: None,
+            daemon_backed: false,
             selected_id: None,
             mode: Mode::Dashboard,
             group_mode: GroupMode::State,
@@ -385,6 +415,14 @@ impl App {
             self.set_watch(watch);
             self.sync();
 
+            // The daemon vanished mid-session (killed elsewhere, crashed)? Show a
+            // banner instead of freezing on a stale mirror with dead input.
+            if self.mode != Mode::Disconnected && !self.transport.connected() {
+                self.mode = Mode::Disconnected;
+                self.focused_id = None;
+                self.status = None;
+            }
+
             if self.term_signal.load(Ordering::Relaxed) {
                 // A terminating signal detaches — the daemon keeps the jobs.
                 self.exit_intent = ExitIntent::Disconnect;
@@ -536,8 +574,19 @@ impl App {
             Mode::LoadSession => self.on_key_loadsession(k),
             Mode::Peek => self.on_key_peek(k),
             Mode::Attached => self.on_key_attached(out, k)?,
+            Mode::Disconnected => self.on_key_disconnected(k),
         }
         Ok(())
+    }
+
+    fn on_key_disconnected(&mut self, k: KeyEvent) {
+        match k.code {
+            // Reconnect only makes sense against a daemon; a dead in-process core
+            // has nothing to reconnect to, so `--foreground` just quits.
+            KeyCode::Char('r') if self.daemon_backed => self.reconnect(),
+            KeyCode::Char('q') | KeyCode::Char('Q') | KeyCode::Esc => self.should_quit = true,
+            _ => {}
+        }
     }
 
     fn on_key_dashboard(&mut self, k: KeyEvent) {

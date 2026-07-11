@@ -37,6 +37,7 @@ pub fn render(out: &mut Stdout, app: &mut App) -> io::Result<()> {
             render_dashboard(&mut buf, app)?;
             render_session_picker(&mut buf, app)?;
         }
+        Mode::Disconnected => render_disconnected(&mut buf, app)?,
         _ => render_dashboard(&mut buf, app)?,
     }
     // Repaint only on change: a stable frame (idle tasks, no input) is a no-op,
@@ -78,13 +79,15 @@ fn render_dashboard(out: &mut impl Write, app: &App) -> io::Result<()> {
             Lifecycle::Ok | Lifecycle::Failed => done += 1,
         }
     }
+    // Daemon-backed is the unmarked default; call out foreground (ephemeral) mode.
+    let mode_tag = if app.daemon_backed { "" } else { " · foreground" };
     queue!(
         out,
         MoveTo(0, 0),
         SetAttribute(Attribute::Bold),
         Print(pad(
             &format!(
-                "  multi   {running} running · {idle} idle · {done} done      by {}",
+                "  multi   {running} running · {idle} idle · {done} done      by {}{mode_tag}",
                 app.group_mode.label()
             ),
             cols
@@ -387,6 +390,42 @@ fn render_session_picker(out: &mut impl Write, app: &App) -> io::Result<()> {
         cols,
     )?;
     queue!(out, Hide)?;
+    Ok(())
+}
+
+/// Center `s` in `width` columns (a full-width string, so it overwrites the row).
+fn center(s: &str, width: usize) -> String {
+    let len = s.chars().count();
+    if len >= width {
+        return truncate(s, width);
+    }
+    let mut out = " ".repeat((width - len) / 2);
+    out.push_str(s);
+    let cur = out.chars().count();
+    out.push_str(&" ".repeat(width - cur));
+    out
+}
+
+/// Full-screen banner shown when the daemon connection drops: a cleared screen
+/// (the stale task list would lie — those jobs died with the daemon) and the two
+/// things the user needs, what happened and what to do.
+fn render_disconnected(out: &mut impl Write, app: &App) -> io::Result<()> {
+    let cols = app.cols as usize;
+    let rows = app.rows;
+
+    queue!(out, Hide)?;
+    for y in 0..rows {
+        put(out, y, "", cols)?;
+    }
+
+    let hint = if app.daemon_backed {
+        "r  reconnect        q  quit"
+    } else {
+        "core stopped        q  quit"
+    };
+    let mid = rows / 2;
+    put(out, mid.saturating_sub(1), &center("⚠  daemon connection lost", cols), cols)?;
+    dim(out, mid + 1, &center(hint, cols), cols)?;
     Ok(())
 }
 
