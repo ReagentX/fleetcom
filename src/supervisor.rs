@@ -32,6 +32,12 @@ type LastScreen = (u64, Vec<u8>, (u16, u16), bool);
 /// stop against a malicious peer.
 const MAX_DIM: u16 = 1000;
 
+/// Ceiling on live tasks. Each is a PTY (fds) + child + reader thread + a vt100
+/// grid, so an unbounded `Spawn` loop or a huge session recipe could exhaust
+/// file descriptors and memory. Far above any real fleet — a guardrail, not a
+/// working limit.
+const MAX_TASKS: usize = 256;
+
 pub struct Supervisor {
     tasks: Vec<Task>,
     next_id: u64,
@@ -194,6 +200,12 @@ impl Supervisor {
     }
 
     fn spawn(&mut self, command: &str, cwd: PathBuf) {
+        if self.tasks.len() >= MAX_TASKS {
+            self.events.push(Event::Status(format!(
+                "task limit reached ({MAX_TASKS}) — not spawning"
+            )));
+            return;
+        }
         match Task::spawn(self.next_id, command, &cwd, self.rows, self.cols) {
             Ok(task) => {
                 self.next_id += 1;
@@ -250,6 +262,10 @@ impl Supervisor {
                 continue;
             }
             for cmd in cmds {
+                if self.tasks.len() >= MAX_TASKS {
+                    skipped += 1;
+                    continue;
+                }
                 if let Ok(task) = Task::spawn(self.next_id, cmd, &resolved, self.rows, self.cols) {
                     self.next_id += 1;
                     self.tasks.push(task);
@@ -258,7 +274,9 @@ impl Supervisor {
             }
         }
         let status = if skipped > 0 {
-            format!("loaded '{name}' — {spawned} task(s), {skipped} skipped (missing dir)")
+            format!(
+                "loaded '{name}' — {spawned} task(s), {skipped} skipped (missing dir or task limit)"
+            )
         } else {
             format!("loaded '{name}' — {spawned} task(s)")
         };
