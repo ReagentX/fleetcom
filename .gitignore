@@ -3,3 +3,6 @@
 # editor swap files
 *.swp
 .*.swp
+
+# editor config
+.vscode/
