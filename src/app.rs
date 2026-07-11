@@ -736,6 +736,10 @@ impl App {
                 self.session_sel = 0;
                 self.mode = Mode::LoadSession;
             }
+            // Rerun is lowercase because it only acts on *finished* tasks:
+            // nothing gets killed, so it's safe to mash. A rerun that would
+            // have to kill a running task first is `X` territory.
+            KeyCode::Char('r') => self.rerun_selected(),
             // Destroy is Shift-gated, like `Q` vs `q`: plain `X` kills the
             // selected task (or removes a finished one); `x` is a deliberate
             // no-op. It is *not* `^X`: a Ctrl chord can't carry the shift
@@ -861,6 +865,9 @@ impl App {
             KeyCode::Up | KeyCode::Char('k') => self.select_up(),
             KeyCode::Down | KeyCode::Char('j') => self.select_down(),
             KeyCode::Enter => self.attach(),
+            // Peek is where a result is being read, so rerun works here too:
+            // the overlay stays open and streams the fresh run.
+            KeyCode::Char('r') => self.rerun_selected(),
             _ => {}
         }
     }
@@ -902,6 +909,21 @@ impl App {
             // sent from the run loop next tick.
             self.focused_id = Some(self.views[i].id);
             self.mode = Mode::Attached;
+        }
+    }
+
+    /// Send `Restart` for the selected task if it has finished; a running
+    /// selection is ignored here rather than bounced off the supervisor, so
+    /// mashing `r` never costs a round-trip or a status-line complaint. The
+    /// supervisor still enforces the same gate: it owns the task set, and this
+    /// client-side check reads from a snapshot.
+    fn rerun_selected(&mut self) {
+        if let Some(i) = self.selected_task()
+            && matches!(self.views[i].lifecycle, Lifecycle::Ok | Lifecycle::Failed)
+        {
+            self.transport.send(Command::Restart {
+                id: self.views[i].id,
+            });
         }
     }
 
@@ -1134,6 +1156,68 @@ mod tests {
         app.transport.send(Command::Tag { id, on: true });
         app.pump();
         assert_eq!(app.sections()[0].0, "In use");
+    }
+
+    /// `r` sends `Restart` only for a finished selection. On a running task
+    /// the key is a client-side no-op — nothing crosses the transport, so no
+    /// supervisor complaint lands in the status line. On a finished one the
+    /// same row (same id) comes back to life and the command re-executes.
+    #[test]
+    fn rerun_key_is_gated_to_finished_tasks() {
+        let mut app = App::new_local(30, 100);
+        let dir = std::env::temp_dir().join(format!("fleetcom_app_rerun_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let marker = dir.join("marker");
+        app.spawn_in("sleep 30", dir.clone()); // id 1: stays running
+        app.spawn_in(&format!("echo run >> {}", marker.display()), dir.clone()); // id 2
+        for _ in 0..200 {
+            app.pump();
+            let done = app
+                .views
+                .iter()
+                .any(|v| v.id == 2 && matches!(v.lifecycle, Lifecycle::Ok));
+            if done {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        // Running selection: `r` must send nothing (and thus kill nothing).
+        app.selected_id = Some(1);
+        app.on_key_dashboard(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE));
+        app.pump();
+        assert!(app.status.is_none(), "no Restart should have been sent");
+        assert!(
+            app.views
+                .iter()
+                .any(|v| v.id == 1 && matches!(v.lifecycle, Lifecycle::Active | Lifecycle::Idle)),
+            "the running task must be untouched"
+        );
+
+        // Finished selection: `r` reruns it under the same id.
+        app.selected_id = Some(2);
+        app.on_key_dashboard(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE));
+        for _ in 0..200 {
+            app.pump();
+            let reran = std::fs::read_to_string(&marker)
+                .map(|s| s.lines().count() == 2)
+                .unwrap_or(false);
+            if reran {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(
+            std::fs::read_to_string(&marker).unwrap().lines().count(),
+            2,
+            "rerun must re-execute the command"
+        );
+        assert!(
+            app.views.iter().any(|v| v.id == 2),
+            "rerun must keep the id"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The `@` recent list is the distinct task cwds, newest first.

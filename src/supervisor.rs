@@ -135,6 +135,7 @@ impl Supervisor {
                     self.tasks.remove(i); // Drop terminates/cleans up
                 }
             }
+            Command::Restart { id } => self.restart(id),
             Command::Tag { id, on } => {
                 if let Some(t) = self.by_id_mut(id) {
                     t.tagged = on;
@@ -288,6 +289,51 @@ impl Supervisor {
             Ok(task) => {
                 self.next_id += 1;
                 self.tasks.push(task);
+            }
+            Err(e) => self
+                .events
+                .push(Event::Status(format!("spawn failed: {e}"))),
+        }
+    }
+
+    /// Re-run a finished task in place: a fresh spawn of the same command in
+    /// the same cwd, wearing the old id, so selection, watch, tag, and list
+    /// position all survive. Running tasks are refused rather than killed
+    /// first: a rerun that kills is destructive, and destroy already has a
+    /// Shift-gated key (`X`).
+    fn restart(&mut self, id: u64) {
+        let Some(i) = self.index_of(id) else {
+            self.events
+                .push(Event::Status(format!("rerun: no task {id}")));
+            return;
+        };
+        if self.tasks[i].finished.is_none() {
+            self.events
+                .push(Event::Status("rerun: task is still running".into()));
+            return;
+        }
+        // Spawn first, swap only on success: a rerun that fails to launch
+        // (e.g. the cwd was deleted since the original run) must not eat the
+        // finished row it was rerunning.
+        match Task::spawn(
+            id,
+            &self.tasks[i].command,
+            &self.tasks[i].cwd,
+            self.rows,
+            self.cols,
+            Arc::clone(&self.waker),
+        ) {
+            Ok(mut fresh) => {
+                fresh.tagged = self.tasks[i].tagged;
+                // The displaced Task drops here; its `force_kill` is gated on
+                // `finished.is_none()`, so a reaped child is never re-signalled
+                // (no recycled-pgid hazard).
+                self.tasks[i] = fresh;
+                // The fresh screen may byte-match the old one (both start
+                // blank), so drop the fingerprint rather than trust it.
+                if self.watched == Some(id) {
+                    self.last_screen = None;
+                }
             }
             Err(e) => self
                 .events
@@ -668,6 +714,114 @@ mod tests {
         assert!(
             s.drain().iter().any(|e| matches!(e, Event::Screen(_))),
             "re-watch after clear_watch must resend the full screen"
+        );
+    }
+
+    /// `Restart`'s contract: a finished task reruns in place — same id, tag
+    /// carried over — and the command really re-executes (the marker file
+    /// gains one line per run).
+    #[test]
+    fn restart_reruns_finished_task_in_place() {
+        use crate::task::Lifecycle;
+        let dir = scratch("restart");
+        let marker = dir.join("marker");
+        let mut s = Supervisor::new(24, 80, here());
+        s.apply(Command::Spawn {
+            command: format!("echo run >> {}", marker.display()),
+            cwd: dir.clone(),
+        });
+        s.tick();
+        let id = match s.drain().first() {
+            Some(Event::Tasks(v)) => v[0].id,
+            _ => panic!("expected a Tasks snapshot"),
+        };
+        s.apply(Command::Tag { id, on: true });
+        wait_for_lifecycle(&mut s, id, |l| l == Lifecycle::Ok);
+
+        s.apply(Command::Restart { id });
+        wait_for_lifecycle(&mut s, id, |l| l == Lifecycle::Ok);
+        let runs = std::fs::read_to_string(&marker).unwrap().lines().count();
+        assert_eq!(runs, 2, "restart must re-execute the command");
+
+        s.tick();
+        let tagged = s
+            .drain()
+            .iter()
+            .any(|e| matches!(e, Event::Tasks(v) if v.iter().any(|t| t.id == id && t.tagged)));
+        assert!(tagged, "restart must carry the tag over");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `Restart` never kills: a running task is refused with a status notice
+    /// and keeps running. An unknown id gets a notice too, not a panic.
+    #[test]
+    fn restart_refuses_running_task_and_unknown_id() {
+        use crate::task::Lifecycle;
+        let mut s = Supervisor::new(24, 80, here());
+        s.apply(Command::Spawn {
+            command: "sleep 30".into(),
+            cwd: here(),
+        });
+        s.tick();
+        let id = match s.drain().first() {
+            Some(Event::Tasks(v)) => v[0].id,
+            _ => panic!("expected a Tasks snapshot"),
+        };
+
+        s.apply(Command::Restart { id });
+        assert!(
+            s.drain()
+                .iter()
+                .any(|e| matches!(e, Event::Status(m) if m.contains("still running"))),
+            "a running task must be refused"
+        );
+        s.tick();
+        let alive = s.drain().iter().any(|e| {
+            matches!(e, Event::Tasks(v) if v.iter().any(
+                |t| t.id == id && matches!(t.lifecycle, Lifecycle::Active | Lifecycle::Idle)
+            ))
+        });
+        assert!(alive, "the refused task must keep running");
+
+        s.apply(Command::Restart { id: 999 });
+        assert!(
+            s.drain()
+                .iter()
+                .any(|e| matches!(e, Event::Status(m) if m.contains("no task"))),
+        );
+    }
+
+    /// Restarting the watched task must resend a full `Screen` on the next
+    /// tick. Both runs of a silent command leave a byte-identical blank
+    /// screen, so only the fingerprint reset makes this pass: without it the
+    /// fresh screen would be skipped as "unchanged".
+    #[test]
+    fn restart_watched_task_resends_screen() {
+        use crate::task::Lifecycle;
+        let mut s = Supervisor::new(24, 80, here());
+        s.apply(Command::Spawn {
+            command: "true".into(),
+            cwd: here(),
+        });
+        s.tick();
+        let id = match s.drain().first() {
+            Some(Event::Tasks(v)) => v[0].id,
+            _ => panic!("expected a Tasks snapshot"),
+        };
+        wait_for_lifecycle(&mut s, id, |l| l == Lifecycle::Ok);
+
+        s.apply(Command::Watch { id: Some(id) });
+        s.tick();
+        assert!(
+            s.drain().iter().any(|e| matches!(e, Event::Screen(_))),
+            "first watched tick sends a full screen"
+        );
+
+        s.apply(Command::Restart { id });
+        s.tick();
+        assert!(
+            s.drain().iter().any(|e| matches!(e, Event::Screen(_))),
+            "restart of the watched task must resend the screen"
         );
     }
 

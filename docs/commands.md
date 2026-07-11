@@ -26,6 +26,7 @@
 | `@` | New command in a directory you pick |
 | `s` | Toggle grouping: by state / by directory |
 | `m` | Tag the selected task "in use" (toggles) |
+| `r` | Rerun a finished task: same command, same directory, same row |
 | `X` | Kill a running task (`TERM`, then `KILL` after 2 s), or remove a finished one |
 | `w` | Save the current tasks as a session |
 | `o` | Load a saved session |
@@ -56,6 +57,10 @@ While attached, one key is reserved: `Ctrl-\` backgrounds the task and returns y
 
 `X` (capital) kills the selected task if it's running, or removes it from the list if it's finished. Lowercase `x` is a deliberate no-op: the same guard as `Q` vs. `q`. It is *not* `Ctrl-X`: the terminal sends byte `0x18` for both `Ctrl+x` and `Ctrl+Shift+X`, with no shift bit, so a Ctrl chord can't carry the distinction. Only an unmodified capital reliably means "yes, destroy this."
 
+#### Rerun
+
+`r` re-executes a *finished* task's command — the same command string, in the same directory, under the same daemon-captured environment as every spawn — in the same row: the task keeps its id, its `◆` tag, and its list position; only the clock and the screen reset. On a running task `r` is a no-op: a rerun that had to kill first would be destructive, and destroy is `X`'s Shift-gated job. It also works from inside peek, so you can read a result and rerun it without closing the overlay.
+
 #### Detach vs. quit
 
 `q` (and `Ctrl-C`) disconnects the client and leaves the daemon and its jobs running; the next `fleetcom` reattaches. `Q` kills every job (`TERM` to each process group, `KILL` after a 2 s grace for any that ignore it) and stops the daemon. `Ctrl-C` is intercepted only in the dashboard; while attached it belongs to the child.
@@ -76,7 +81,7 @@ Type to filter; `Backspace` climbs back up the typed path; `↑`/`↓` move the 
 
 ## Peek
 
-A centered box over the dashboard showing the selected task's live screen (the last screenful). `↑`/`↓` (or `k`/`j`) switch which task you're peeking at; `Enter` attaches to it; `Space`, `Esc`, or `q` closes.
+A centered box over the dashboard showing the selected task's live screen (the last screenful). `↑`/`↓` (or `k`/`j`) switch which task you're peeking at; `Enter` attaches to it; `r` reruns it if it has finished; `Space`, `Esc`, or `q` closes.
 
 ## Attached
 

@@ -62,7 +62,7 @@ Start it. The first `fleetcom` autostarts the daemon and opens an empty dashboar
   fleetcom   0 running · 0 idle · 0 done      by state
 
   ❯ n run · @ dir · s sort · w save · o load
-  ↑↓ select · enter attach · space peek · n/@ new · s sort · m tag · X kill · q detach · Q quit
+  ↑↓ select · enter attach · space peek · n/@ new · s sort · m tag · r rerun · X kill · q detach · Q quit
 ```
 
 Press `n`, type a command, `Enter`. It runs in its own PTY and shows up under **Running**. Add a second the same way:
@@ -75,7 +75,7 @@ Press `n`, type a command, `Enter`. It runs in its own PTY and shows up under **
   ✻  npm run dev              VITE v5.0  ready in 312 ms         4s
 
   ❯ n run · @ dir · s sort · w save · o load
-  ↑↓ select · enter attach · space peek · n/@ new · s sort · m tag · X kill · q detach · Q quit
+  ↑↓ select · enter attach · space peek · n/@ new · s sort · m tag · r rerun · X kill · q detach · Q quit
 ```
 
 Each row is `glyph · tag · command · latest output · age`. `Space` peeks: a read-only box of the selected task's live screen, without leaving the dashboard:

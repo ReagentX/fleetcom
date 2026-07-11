@@ -170,7 +170,7 @@ fn render_dashboard(out: &mut impl Write, app: &App) -> io::Result<()> {
     dim(
         out,
         rows.saturating_sub(1),
-        "  ↑↓ select · enter attach · space peek · n/@ new · s sort · m tag · X kill · q detach · Q quit",
+        "  ↑↓ select · enter attach · space peek · n/@ new · s sort · m tag · r rerun · X kill · q detach · Q quit",
         cols,
     )?;
 

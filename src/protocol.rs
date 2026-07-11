@@ -24,6 +24,10 @@ pub enum Command {
     Kill { id: u64 },
     /// Drop a task from the set entirely (used on already-finished tasks).
     Remove { id: u64 },
+    /// Re-run a *finished* task in place: a fresh spawn of the same command in
+    /// the same cwd, keeping the id (so selection, watch, tag, and list
+    /// position survive). Refused on a running task.
+    Restart { id: u64 },
     /// Set the manual "in use" tag.
     Tag { id: u64, on: bool },
     /// Client terminal resized: `rows`×`cols` is the PTY *content* size. The
@@ -130,6 +134,10 @@ pub fn encode_command(cmd: &Command) -> (u8, Vec<u8>) {
             let _ = o.insert("t", "remove");
             let _ = o.insert("id", *id);
         }
+        Command::Restart { id } => {
+            let _ = o.insert("t", "restart");
+            let _ = o.insert("id", *id);
+        }
         Command::Tag { id, on } => {
             let _ = o.insert("t", "tag");
             let _ = o.insert("id", *id);
@@ -192,6 +200,9 @@ pub fn decode_command(kind: u8, payload: &[u8]) -> Option<Command> {
             id: v["id"].as_u64()?,
         },
         "remove" => Command::Remove {
+            id: v["id"].as_u64()?,
+        },
+        "restart" => Command::Restart {
             id: v["id"].as_u64()?,
         },
         "tag" => Command::Tag {
@@ -348,6 +359,7 @@ mod tests {
             },
             Command::Kill { id: 7 },
             Command::Remove { id: 3 },
+            Command::Restart { id: 4 },
             Command::Tag { id: 2, on: true },
             Command::Resize {
                 rows: 30,
