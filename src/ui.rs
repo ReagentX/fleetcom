@@ -166,11 +166,21 @@ fn render_dashboard(out: &mut impl Write, app: &App) -> io::Result<()> {
         },
     }
 
-    // Footer hints.
+    // Footer hints. In foreground there is no daemon to detach from: both
+    // intents stop the in-process core (`ThreadTransport::shutdown` ignores
+    // the intent), so advertising `q detach` there would promise survival the
+    // jobs don't have.
+    let exit_hint = if app.daemon_backed {
+        "q detach · Q quit"
+    } else {
+        "q quit"
+    };
     dim(
         out,
         rows.saturating_sub(1),
-        "  ↑↓ select · enter attach · space peek · n/@ new · s sort · m tag · r rerun · X kill · q detach · Q quit",
+        &format!(
+            "  ↑↓ select · enter attach · space peek · n/@ new · s sort · m tag · r rerun · X kill · {exit_hint}"
+        ),
         cols,
     )?;
 

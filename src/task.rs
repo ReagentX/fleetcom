@@ -103,9 +103,9 @@ impl Task {
         cmd.arg(command);
         // Inherit the parent environment explicitly (PATH/HOME/…) and force a
         // TERM the emulator understands, so colour/interactivity are on.
-        // `vars_os`, not `vars`: `vars()` panics on any non-UTF-8 value, and in
-        // the daemon (release `panic = "abort"`) that would kill the whole
-        // fleet on every spawn.
+        // `vars_os`, not `vars`: `vars()` panics on any non-UTF-8 value, and
+        // spawn runs on the daemon's main thread, so that panic would kill the
+        // whole fleet on every spawn.
         for (k, v) in std::env::vars_os() {
             cmd.env(k, v);
         }
