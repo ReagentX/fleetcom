@@ -16,6 +16,7 @@
 
 use std::net::Shutdown;
 use std::os::unix::net::UnixStream;
+use std::sync::atomic::AtomicBool;
 use std::sync::mpsc::{Receiver, Sender, TryRecvError, channel};
 use std::thread::{self, JoinHandle};
 
@@ -94,7 +95,10 @@ impl ThreadTransport {
         sup.set_waker(wake_tx.clone());
         let handle = thread::spawn(move || {
             let mut sup = sup;
-            run_loop(&mut sup, &wake_rx, |ev| {
+            // Never raised: the in-process client routes its signals through
+            // `App::term_signal` (detach semantics), not a core-loop stop.
+            let stop = AtomicBool::new(false);
+            run_loop(&mut sup, &wake_rx, &stop, |ev| {
                 if evt_tx.send(ev.clone()).is_err() {
                     return false; // client dropped the receiver
                 }

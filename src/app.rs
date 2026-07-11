@@ -76,6 +76,13 @@ pub struct DirCand {
     pub kind: DirKind,
 }
 
+/// One dashboard list row: a section header, or the task at a `views` index.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Row {
+    Section(String),
+    Task(usize),
+}
+
 pub struct App {
     /// The link to the core (the task owner): a `ThreadTransport` (in-process)
     /// or `SocketTransport` (daemon). The client only ever calls
@@ -181,8 +188,9 @@ impl App {
     }
 
     /// Rebuild the daemon connection after a drop (autostarting a fresh daemon if
-    /// needed). The old jobs died with the old daemon (daemon death is task
-    /// death), so the new session starts empty; the mirror is cleared to match.
+    /// needed). A cleanly-exiting daemon kills its jobs on the way out (only a
+    /// SIGKILL or a panic can leak them), so the new session starts empty; the
+    /// mirror is cleared to match.
     fn reconnect(&mut self) {
         let wait_tx = self.wait_tx.clone();
         let build = move || -> io::Result<SocketTransport> {
@@ -368,6 +376,26 @@ impl App {
     /// Flattened section order: the sequence the selection cursor moves through.
     pub fn display_order(&self) -> Vec<usize> {
         self.sections().into_iter().flat_map(|(_, v)| v).collect()
+    }
+
+    /// The dashboard list as flat rows, section headers interleaved with their
+    /// tasks: the unit the scroll window slides over. Windowing rows (not tasks)
+    /// is what keeps headers and their tasks aligned when the list is taller
+    /// than the screen.
+    pub fn rows(&self) -> Vec<Row> {
+        let mut out = Vec::new();
+        for (label, idxs) in self.sections() {
+            out.push(Row::Section(label));
+            out.extend(idxs.into_iter().map(Row::Task));
+        }
+        out
+    }
+
+    /// Position of the selected task within `rows`, if present.
+    pub fn selected_row(&self, rows: &[Row]) -> Option<usize> {
+        let id = self.selected_id?;
+        rows.iter()
+            .position(|r| matches!(r, Row::Task(i) if self.views[*i].id == id))
     }
 
     /// The `views` index currently under the selection cursor.
@@ -1153,6 +1181,63 @@ mod tests {
         app.transport.send(Command::Remove { id: 2 });
         app.pump();
         assert!(app.focused_task().is_none());
+    }
+
+    /// The flat row list interleaves each section header with its tasks, in
+    /// section order: what the dashboard's scroll window slides over.
+    #[test]
+    fn rows_interleave_headers_and_tasks() {
+        let mut app = App::new_local(30, 100);
+        let inv = app.invocation_dir.clone();
+        app.spawn_in("a", inv.clone()); // id 1, invocation dir
+        app.spawn_in("b", PathBuf::from("/tmp")); // id 2, /tmp
+        app.pump();
+
+        app.group_mode = GroupMode::Dir;
+        let rows = app.rows();
+        assert_eq!(rows.len(), 4, "two sections, one task each");
+        assert_eq!(rows[0], Row::Section(app.invocation_label.clone()));
+        assert!(matches!(rows[1], Row::Task(i) if app.views[i].id == 1));
+        assert_eq!(rows[2], Row::Section("/tmp".to_string()));
+        assert!(matches!(rows[3], Row::Task(i) if app.views[i].id == 2));
+    }
+
+    /// A fleet taller than the list region must keep the selected row inside
+    /// the scroll window at every step: the dashboard equivalent of the picker
+    /// guarantee, over the composed header+task row list.
+    #[test]
+    fn dashboard_selection_stays_in_scroll_window() {
+        let mut app = App::new_local(30, 100);
+        let inv = app.invocation_dir.clone();
+        for _ in 0..8 {
+            app.spawn_in("sleep 5", inv.clone());
+        }
+        app.pump();
+        app.resolve_selection();
+
+        // A 4-row window over 9 rows (1 header + 8 tasks): walking the whole
+        // list down and back up must never let the selection leave the window.
+        let height = 4;
+        for step in 0..10 {
+            app.select_down();
+            let rows = app.rows();
+            let sel = app.selected_row(&rows).expect("selection always resolves");
+            let (start, count) = scroll_window(sel, rows.len(), height);
+            assert!(
+                sel >= start && sel < start + count,
+                "step {step}: row {sel} outside window ({start}, {count})"
+            );
+        }
+        for step in 0..10 {
+            app.select_up();
+            let rows = app.rows();
+            let sel = app.selected_row(&rows).expect("selection always resolves");
+            let (start, count) = scroll_window(sel, rows.len(), height);
+            assert!(
+                sel >= start && sel < start + count,
+                "step {step}: row {sel} outside window ({start}, {count})"
+            );
+        }
     }
 
     #[test]

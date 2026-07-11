@@ -32,17 +32,102 @@ use crossterm::{
 
 use app::App;
 
+const USAGE: &str = "\
+fleetcom - a fleet-view supervisor for arbitrary shell commands
+
+Usage:
+  fleetcom [<session>]               connect to the daemon (autostarting it),
+                                     optionally loading a saved session
+  fleetcom --foreground [<session>]  run without a daemon; jobs die on quit
+  fleetcom --kill                    kill the daemon and every job it owns
+  fleetcom --daemon                  run the daemon (internal; the first
+                                     fleetcom starts it automatically)
+
+Options:
+  -h, --help     print this help
+  -V, --version  print the version
+";
+
+/// What a command line asks for, one variant per mutually-exclusive mode.
+/// Encoding the modes as variants (not independent bools) makes conflicting
+/// flags unrepresentable past the parser.
+#[derive(Debug, PartialEq, Eq)]
+enum Invocation {
+    Help,
+    Version,
+    Daemon,
+    Kill,
+    Client {
+        foreground: bool,
+        session: Option<String>,
+    },
+}
+
+/// Parse the command line. Errors on an unrecognized flag, a second session
+/// name, or a flag combination with no coherent meaning. `--help`/`--version`
+/// win over everything else, per convention.
+fn parse_args(args: &[String]) -> Result<Invocation, String> {
+    let (mut daemon, mut kill, mut foreground) = (false, false, false);
+    let mut session: Option<String> = None;
+    for a in args {
+        match a.as_str() {
+            "-h" | "--help" => return Ok(Invocation::Help),
+            "-V" | "--version" => return Ok(Invocation::Version),
+            "--daemon" => daemon = true,
+            "--kill" => kill = true,
+            "--foreground" => foreground = true,
+            f if f.starts_with('-') => return Err(format!("unrecognized flag '{f}'")),
+            name => {
+                if session.is_some() {
+                    return Err(format!(
+                        "unexpected argument '{name}' (one session name max)"
+                    ));
+                }
+                session = Some(name.to_string());
+            }
+        }
+    }
+    if daemon && (kill || foreground || session.is_some()) {
+        return Err("--daemon takes no other arguments".to_string());
+    }
+    if kill && (foreground || session.is_some()) {
+        return Err("--kill takes no other arguments".to_string());
+    }
+    match (daemon, kill) {
+        (true, _) => Ok(Invocation::Daemon),
+        (_, true) => Ok(Invocation::Kill),
+        _ => Ok(Invocation::Client {
+            foreground,
+            session,
+        }),
+    }
+}
+
 fn main() -> io::Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
-
-    // Daemon mode is headless: no terminal setup, just serve the socket.
-    if args.iter().any(|a| a == "--daemon") {
-        return daemon::run_daemon();
-    }
-    // `fleetcom --kill`: tell a running daemon to kill everything and exit.
-    if args.iter().any(|a| a == "--kill") {
-        return daemon::run_kill();
-    }
+    let (foreground, session) = match parse_args(&args) {
+        Ok(Invocation::Help) => {
+            print!("{USAGE}");
+            return Ok(());
+        }
+        Ok(Invocation::Version) => {
+            println!("fleetcom {}", env!("CARGO_PKG_VERSION"));
+            return Ok(());
+        }
+        // Daemon mode is headless: no terminal setup, just serve the socket.
+        Ok(Invocation::Daemon) => return daemon::run_daemon(),
+        // `fleetcom --kill`: tell a running daemon to kill everything and exit.
+        Ok(Invocation::Kill) => return daemon::run_kill(),
+        Ok(Invocation::Client {
+            foreground,
+            session,
+        }) => (foreground, session),
+        Err(e) => {
+            eprintln!("fleetcom: {e}");
+            eprintln!("try 'fleetcom --help'");
+            std::process::exit(2);
+        }
+    };
 
     install_panic_hook();
 
@@ -53,7 +138,7 @@ fn main() -> io::Result<()> {
     let (cols, rows) = size()?;
     // Default connects to (or autostarts) the daemon so jobs outlive the UI;
     // `--foreground` runs the core in-process instead.
-    let mut app = if args.iter().any(|a| a == "--foreground") {
+    let mut app = if foreground {
         App::new_foreground(rows, cols)
     } else {
         match App::connect(rows, cols) {
@@ -67,9 +152,9 @@ fn main() -> io::Result<()> {
             }
         }
     };
-    // `fleetcom [--foreground] <session>` loads that session at startup; the result
-    // shows in the status line. `-`-prefixed args are flags, skipped here.
-    if let Some(name) = args.iter().find(|a| !a.starts_with('-')) {
+    // `fleetcom [--foreground] <session>` loads that session at startup; the
+    // result shows in the status line.
+    if let Some(name) = &session {
         app.load_session(name);
     }
     install_signal_handlers(app.signal_flag())?;
@@ -103,4 +188,79 @@ fn install_panic_hook() {
         let _ = execute!(io::stdout(), Show, LeaveAlternateScreen);
         default(info);
     }));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(args: &[&str]) -> Result<Invocation, String> {
+        let owned: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+        parse_args(&owned)
+    }
+
+    #[test]
+    fn plain_and_session_invocations() {
+        assert_eq!(
+            parse(&[]),
+            Ok(Invocation::Client {
+                foreground: false,
+                session: None
+            })
+        );
+        assert_eq!(
+            parse(&["work"]),
+            Ok(Invocation::Client {
+                foreground: false,
+                session: Some("work".into())
+            })
+        );
+        assert_eq!(
+            parse(&["--foreground", "work"]),
+            Ok(Invocation::Client {
+                foreground: true,
+                session: Some("work".into())
+            })
+        );
+    }
+
+    #[test]
+    fn modes_parse() {
+        assert_eq!(parse(&["--daemon"]), Ok(Invocation::Daemon));
+        assert_eq!(parse(&["--kill"]), Ok(Invocation::Kill));
+        assert_eq!(parse(&["-h"]), Ok(Invocation::Help));
+        assert_eq!(parse(&["--help"]), Ok(Invocation::Help));
+        assert_eq!(parse(&["-V"]), Ok(Invocation::Version));
+        assert_eq!(parse(&["--version"]), Ok(Invocation::Version));
+    }
+
+    /// A flag typo must be an error, never silently ignored: `--foregroud`
+    /// silently connecting to the daemon changes what `Q` kills.
+    #[test]
+    fn unknown_flags_are_rejected() {
+        assert!(parse(&["--foregroud"]).is_err());
+        assert!(parse(&["-x"]).is_err());
+        assert!(parse(&["--daemonize"]).is_err());
+    }
+
+    /// Help/version win even alongside other (even invalid) mode flags.
+    #[test]
+    fn help_and_version_win() {
+        assert_eq!(parse(&["--daemon", "--help"]), Ok(Invocation::Help));
+        assert_eq!(parse(&["--kill", "-V"]), Ok(Invocation::Version));
+    }
+
+    #[test]
+    fn conflicting_modes_are_rejected() {
+        assert!(parse(&["--daemon", "--kill"]).is_err());
+        assert!(parse(&["--daemon", "work"]).is_err());
+        assert!(parse(&["--daemon", "--foreground"]).is_err());
+        assert!(parse(&["--kill", "--foreground"]).is_err());
+        assert!(parse(&["--kill", "work"]).is_err());
+    }
+
+    #[test]
+    fn second_session_name_is_rejected() {
+        assert!(parse(&["one", "two"]).is_err());
+    }
 }

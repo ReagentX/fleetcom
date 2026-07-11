@@ -5,7 +5,7 @@
 //! skips work entirely when nothing changed.
 //!
 //! The renderer reads only the client's mirror (the `TaskView` list and the
-//! watched `ScreenView`), never a live `Task` — everything it needs is a plain
+//! watched `ScreenView`), never a live `Task`. Everything it needs is a plain
 //! snapshot.
 
 use std::io::{self, Stdout, Write};
@@ -16,7 +16,7 @@ use crossterm::{
     style::{Attribute, Print, SetAttribute},
 };
 
-use crate::app::{App, DirKind, Mode, scroll_window};
+use crate::app::{App, DirKind, Mode, Row, scroll_window};
 use crate::format::{pad, rel_time, truncate};
 use crate::protocol::TaskView;
 use crate::task::Lifecycle;
@@ -79,11 +79,34 @@ fn render_dashboard(out: &mut impl Write, app: &App) -> io::Result<()> {
             Lifecycle::Ok | Lifecycle::Failed => done += 1,
         }
     }
+    // List region: rows 2..=list_bottom. Command line and footer sit below.
+    // The section/task rows come pre-flattened from `app.rows()`; the scroll
+    // window slides over them, so the selected row is always drawn however many
+    // tasks the fleet holds.
+    let list_top = 2u16;
+    let list_bottom = rows.saturating_sub(3);
+    let height = (usize::from(list_bottom) + 1).saturating_sub(usize::from(list_top));
+    let list = app.rows();
+    let sel_row = app.selected_row(&list);
+    let (start, count) = scroll_window(sel_row.unwrap_or(0), list.len(), height);
+
     // Daemon-backed is the unmarked default; call out foreground (ephemeral) mode.
     let mode_tag = if app.daemon_backed {
         ""
     } else {
         " · foreground"
+    };
+    // When the list is clipped, say where the selection sits in the fleet (task
+    // position, not row position: section headers don't count).
+    let scroll_tag = match sel_row {
+        Some(s) if list.len() > height => {
+            let pos = list[..=s]
+                .iter()
+                .filter(|r| matches!(r, Row::Task(_)))
+                .count();
+            format!(" · {pos}/{}", app.views.len())
+        }
+        _ => String::new(),
     };
     queue!(
         out,
@@ -91,7 +114,7 @@ fn render_dashboard(out: &mut impl Write, app: &App) -> io::Result<()> {
         SetAttribute(Attribute::Bold),
         Print(pad(
             &format!(
-                "  fleetcom   {running} running · {idle} idle · {done} done      by {}{mode_tag}",
+                "  fleetcom   {running} running · {idle} idle · {done} done      by {}{mode_tag}{scroll_tag}",
                 app.group_mode.label()
             ),
             cols
@@ -100,36 +123,27 @@ fn render_dashboard(out: &mut impl Write, app: &App) -> io::Result<()> {
     )?;
     put(out, 1, "", cols)?;
 
-    // List region: rows 2..=list_bottom. Command line and footer sit below.
-    // Sections come straight from the grouping mode; a header per section.
-    let list_bottom = rows.saturating_sub(3);
-    let mut y = 2u16;
-
-    'sections: for (label, idxs) in app.sections() {
-        if y > list_bottom {
-            break;
+    let mut y = list_top;
+    for row in &list[start..start + count] {
+        match row {
+            Row::Section(label) => dim(out, y, &format!("  {label}"), cols)?,
+            Row::Task(ti) => {
+                let v = &app.views[*ti];
+                let line = task_row(v, cols);
+                if app.selected_id == Some(v.id) {
+                    queue!(
+                        out,
+                        MoveTo(0, y),
+                        SetAttribute(Attribute::Reverse),
+                        Print(pad(&line, cols)),
+                        SetAttribute(Attribute::Reset)
+                    )?;
+                } else {
+                    put(out, y, &line, cols)?;
+                }
+            }
         }
-        dim(out, y, &format!("  {label}"), cols)?;
         y += 1;
-        for ti in idxs {
-            if y > list_bottom {
-                break 'sections;
-            }
-            let v = &app.views[ti];
-            let row = task_row(v, cols);
-            if app.selected_id == Some(v.id) {
-                queue!(
-                    out,
-                    MoveTo(0, y),
-                    SetAttribute(Attribute::Reverse),
-                    Print(pad(&row, cols)),
-                    SetAttribute(Attribute::Reset)
-                )?;
-            } else {
-                put(out, y, &row, cols)?;
-            }
-            y += 1;
-        }
     }
     while y <= list_bottom {
         put(out, y, "", cols)?;

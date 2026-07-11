@@ -8,6 +8,11 @@
 //! Autostart lives here too: a plain `fleetcom` connects to a running daemon, or
 //! spawns one (detached, its own process group) and polls the socket until it's
 //! up.
+//!
+//! SIGTERM/SIGINT/SIGHUP mean "shut down cleanly": group-kill every job, remove
+//! the socket, exit, matching the `tmux kill-server` model. The jobs live in their own
+//! process groups, so a daemon that just died would orphan them all, running
+//! and invisible to the next (empty) daemon.
 
 use std::fs;
 use std::io::{self, ErrorKind, Read};
@@ -16,6 +21,8 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::channel;
 use std::thread;
 use std::time::Duration;
@@ -184,6 +191,23 @@ pub fn run_daemon() -> io::Result<()> {
     // 24x80 until the first client's Resize, which arrives before any Spawn.
     let mut sup = Supervisor::new(24, 80, base_dir);
 
+    // A signalled daemon must shut down cleanly (group-kill its jobs, remove the
+    // socket) rather than die and orphan them: the tasks live in their own
+    // process groups, so daemon death alone leaves them running, unowned and
+    // invisible to the next (empty) daemon. The flag is checked in the idle
+    // branch below and inside `run_loop` while a client is being served; both
+    // observe it within ~200 ms.
+    let term = Arc::new(AtomicBool::new(false));
+    {
+        use signal_hook::consts::{SIGHUP, SIGINT, SIGTERM};
+        signal_hook::flag::register(SIGTERM, Arc::clone(&term))?;
+        signal_hook::flag::register(SIGINT, Arc::clone(&term))?;
+        // The daemon is detached in its own process group, so a SIGHUP here is
+        // someone's explicit `kill -HUP`: there is no reload semantic, treat it
+        // as shutdown like the rest.
+        signal_hook::flag::register(SIGHUP, Arc::clone(&term))?;
+    }
+
     // Non-blocking accept so the daemon reaps exited jobs while idle (#3):
     // between clients it would otherwise block in accept() and never call
     // poll_exit, so a job that finished after `q` would linger as a zombie until
@@ -191,12 +215,18 @@ pub fn run_daemon() -> io::Result<()> {
     listener.set_nonblocking(true)?;
     const IDLE_REAP: Duration = Duration::from_millis(100);
     loop {
+        if term.load(Ordering::Relaxed) {
+            // Kill the jobs now, not via drop at the end of `main`: explicit at
+            // the one place the loop decides to stop.
+            sup.apply(Command::Shutdown);
+            break;
+        }
         match listener.accept() {
             Ok((stream, _)) => {
                 // serve_client does blocking reads; force the accepted stream
                 // blocking regardless of the listener's mode (BSD would inherit).
                 stream.set_nonblocking(false)?;
-                if serve_client(&mut sup, stream) == ServeOutcome::Shutdown {
+                if serve_client(&mut sup, stream, &term) == ServeOutcome::Shutdown {
                     break;
                 }
                 // Otherwise the client merely disconnected; keep the tasks and
@@ -224,8 +254,10 @@ enum ServeOutcome {
 /// Serve one client to completion. A reader thread turns inbound frames into
 /// `Wake::Cmd`s on the channel the core loop waits on; task output arrives on the
 /// same channel as `Wake::Output` (via the supervisor's waker), so `run_loop`
-/// reacts to a keystroke's echo the instant the child emits it.
-fn serve_client(sup: &mut Supervisor, stream: UnixStream) -> ServeOutcome {
+/// reacts to a keystroke's echo the instant the child emits it. `stop` is the
+/// daemon's signal flag: raised, it ends the loop as a `Shutdown` even while a
+/// client is attached.
+fn serve_client(sup: &mut Supervisor, stream: UnixStream, stop: &AtomicBool) -> ServeOutcome {
     let Ok(read) = stream.try_clone() else {
         return ServeOutcome::Disconnected;
     };
@@ -256,7 +288,7 @@ fn serve_client(sup: &mut Supervisor, stream: UnixStream) -> ServeOutcome {
     // and `accept`, and `--kill` could never get in. Cap how long one event
     // write may block; a timeout surfaces as an error below and drops the client.
     let _ = write.set_write_timeout(Some(Duration::from_secs(5)));
-    let outcome = run_loop(sup, &wake_rx, |ev| {
+    let outcome = run_loop(sup, &wake_rx, stop, |ev| {
         let (kind, payload) = encode_event(ev);
         write_frame(&mut write, kind, &payload).is_ok()
     });

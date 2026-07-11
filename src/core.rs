@@ -16,6 +16,7 @@
 //!   (`started_ago`, the Active→Idle edge) that no wake announces, and the ceiling
 //!   on how long a missed wake could stall a repaint. A self-heal, not the norm.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -81,9 +82,15 @@ fn ready_to_tick(dirty: bool, since_last_tick: Duration) -> bool {
 /// Drive `sup` until shutdown or the client leaves, shipping events through
 /// `emit` (returns `false` when its sink is gone, e.g. a closed socket): the
 /// signal that ends the loop with `ClientGone`.
+///
+/// `stop` is an external stop request (the daemon's signal flag): checked once
+/// per wake/timeout, so a raised flag ends the loop within one `FALLBACK` even
+/// when nothing else is happening. It shuts down exactly like a `Shutdown`
+/// command: jobs killed, `LoopExit::Shutdown` returned.
 pub fn run_loop(
     sup: &mut Supervisor,
     wake_rx: &Receiver<Wake>,
+    stop: &AtomicBool,
     mut emit: impl FnMut(&Event) -> bool,
 ) -> LoopExit {
     // `dirty` = state changed since the last tick (a command applied, or a task
@@ -95,6 +102,10 @@ pub fn run_loop(
         .unwrap_or_else(Instant::now);
 
     loop {
+        if stop.load(Ordering::Relaxed) {
+            sup.apply(Command::Shutdown);
+            return LoopExit::Shutdown;
+        }
         match wake_rx.recv_timeout(wait_for(dirty, last_tick.elapsed())) {
             Ok(w) => {
                 if let Some(exit) = apply(sup, w, &mut dirty) {
@@ -192,7 +203,10 @@ mod tests {
         let (evt_tx, evt_rx) = channel::<Event>();
         sup.set_waker(wake_tx.clone());
         let core = thread::spawn(move || {
-            run_loop(&mut sup, &wake_rx, |ev| evt_tx.send(ev.clone()).is_ok());
+            let stop = AtomicBool::new(false);
+            run_loop(&mut sup, &wake_rx, &stop, |ev| {
+                evt_tx.send(ev.clone()).is_ok()
+            });
         });
 
         // `cat` echoes stdin (and the PTY line discipline does too). Either way
@@ -237,6 +251,38 @@ mod tests {
 
         wake_tx.send(Wake::Cmd(Command::Shutdown)).unwrap();
         core.join().unwrap();
+    }
+
+    /// A raised stop flag ends the loop as `Shutdown` (killing the jobs) without
+    /// any command arriving: the path a signalled daemon takes.
+    #[test]
+    fn stop_flag_ends_loop_with_shutdown() {
+        let cwd = std::env::current_dir().unwrap();
+        let mut sup = Supervisor::new(24, 80, cwd.clone());
+        let (wake_tx, wake_rx) = std::sync::mpsc::channel::<Wake>();
+        sup.set_waker(wake_tx);
+        // Spawn synchronously so a live task exists *before* the loop runs: the
+        // flag is checked ahead of the wake queue, so a queued Spawn would never
+        // apply and the kill assertion below would be vacuous.
+        sup.apply(Command::Spawn {
+            command: "sleep 30".into(),
+            cwd,
+        });
+
+        let stop = AtomicBool::new(true);
+        let started = Instant::now();
+        let exit = run_loop(&mut sup, &wake_rx, &stop, |_| true);
+        assert!(matches!(exit, LoopExit::Shutdown));
+        // The flag is checked before blocking, so the return is immediate: well
+        // under the FALLBACK a wake-starved loop would otherwise sleep.
+        assert!(started.elapsed() < FALLBACK);
+        // Shutdown cleared the task set: a tick emits an empty snapshot.
+        sup.tick();
+        assert!(
+            sup.drain()
+                .iter()
+                .any(|e| matches!(e, Event::Tasks(v) if v.is_empty()))
+        );
     }
 
     /// Drain `evt_rx` until a `Screen` event satisfies `pred` or `budget` elapses.
