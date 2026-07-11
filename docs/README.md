@@ -115,4 +115,5 @@ Each row is `glyph · tag · command · latest output · age`. `Space` peeks: a 
 - **The daemon serves one client at a time.** A second `fleetcom` connects but waits until the first disconnects (`q`).
 - **`Q` signals each job's _process group_.** A job that re-backgrounds itself past its own shell's exit (`cmd &`, then the shell exits) leaves that group and survives. Kill it by hand. This is deliberate: once the shell is reaped its PID can be recycled, so signalling the old group could hit an unrelated process.
 - **`--foreground` is ephemeral.** It runs the core in-process with no daemon, so the jobs die when you quit and there is nothing to reattach to.
-- **Crash-resilient ownership is out of scope.** Adopting jobs after a daemon _crash_ (as opposed to a clean shutdown) is not supported.
+- **Signalling the daemon is a clean shutdown.** `SIGTERM`/`SIGINT`/`SIGHUP` to the daemon group-kill every job, remove the socket, and exit. This is the same teardown as `Q` or `fleetcom --kill`.
+- **Crash-resilient ownership is out of scope.** Adopting jobs after a daemon _crash_ (as opposed to a clean shutdown) is not supported. `SIGKILL` (or a panic) skips the shutdown path entirely: the jobs keep running, unowned, and the next `fleetcom` starts an empty daemon that knows nothing about them.

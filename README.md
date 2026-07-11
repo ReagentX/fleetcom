@@ -43,9 +43,12 @@ There are a few ways to invoke `fleetcom`:
   - Runs everything in-process, without a daemon (jobs die when you quit)
 - `fleetcom --kill`
   - Kills the daemon and its running jobs
+- `fleetcom --help` / `--version`
+  - Print usage / the version and exit
 
-The daemon starts itself the first time you run `fleetcom`; you never invoke
-`fleetcom --daemon` directly.
+Unrecognized flags are an error, not a shrug: a typo can't silently change
+which mode you're in. The daemon starts itself the first time you run
+`fleetcom`; you never invoke `fleetcom --daemon` directly.
 
 ## Key Commands
 
@@ -86,9 +89,10 @@ backgrounding an attached task never tells the child it lost the foreground.
 
 A per-user daemon owns the processes and their terminals. `q` disconnects the
 client and leaves everything running; the next `fleetcom` reattaches. `Q` (or
-`fleetcom --kill`) group-kills the running jobs and stops the daemon. If the daemon
-dies, the client says so and offers to reconnect rather than freezing on a stale
-view.
+`fleetcom --kill`) group-kills the running jobs and stops the daemon. Signalling
+the daemon itself (`SIGTERM`/`SIGINT`/`SIGHUP`) is the same clean shutdown:
+jobs killed, socket removed. If the daemon dies, the client says so and offers
+to reconnect rather than freezing on a stale view.
 
 Teardown caveat: `Q` signals each job's *process group*. A job that
 re-backgrounds itself past its own shell's exit (`cmd &`, then the shell exits)
@@ -141,3 +145,6 @@ that sit idle awaiting input.
   against the first terminal's environment, not its own.
 - The daemon serves **one client at a time**; a second `fleetcom` connects but
   waits until the first disconnects (`q`).
+- The daemon can only clean up when it gets the chance: `SIGKILL` (or a crash)
+  skips its shutdown path, and the jobs keep running, unowned. The next
+  `fleetcom` starts an empty daemon that knows nothing about them.
