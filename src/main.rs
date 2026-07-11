@@ -6,7 +6,10 @@
 
 mod app;
 mod format;
+mod path;
+mod protocol;
 mod session;
+mod supervisor;
 mod task;
 mod ui;
 

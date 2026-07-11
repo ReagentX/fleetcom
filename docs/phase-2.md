@@ -1,7 +1,8 @@
 # Phase 2 — Persistence & Reattach
 
 Design doc / resume anchor. Written before starting implementation; decisions
-below are settled. Next action: **milestone 1**.
+below are settled. **Milestone 1 is landed** (the in-process seam); next action:
+**milestone 2** (loopback transport).
 
 ## Status (as of writing)
 
@@ -128,10 +129,12 @@ For jobs to outlive the UI, something other than the UI must own them → a
 
 ## Milestones (each independently shippable & harness-tested)
 
-1. **Define the seam in-process.** Introduce `TaskView` + `Command`/`Event`
-   enums; make the *current* single-process UI drive the task-set through them.
-   Zero IPC. Proves the boundary before splitting. No behavior change; existing
-   harnesses stay green.
+1. **Define the seam in-process.** ✅ **Done.** `protocol.rs` (`Command`/`Event`/
+   `TaskView`/`ScreenView`), `supervisor.rs` (the task owner — `apply`/`tick`/
+   `drain`), `path.rs` (shared path helpers); `app.rs`/`ui.rs` are now a client
+   over a `Vec<TaskView>` mirror, holding no `Task`. Zero IPC. 16 unit tests + 9
+   PTY harnesses green (incl. idle-silence, fast group-kill quit, SIGTERM
+   restore) — no behavior change.
 2. **Loopback transport.** Route client↔core through those types over an
    in-process channel. Still one process; proves the message set.
 3. **Real daemon + socket.** Split into `multi` / `multi --daemon`; framing +

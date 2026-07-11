@@ -1,17 +1,26 @@
-//! App state and the single-threaded event loop. All process I/O happens on the
-//! per-task reader threads; this loop only reaps exits, dispatches keys, and
-//! redraws. Modes are the `multi` analogue of Logria's `InputType` handlers.
+//! The client half of the phase-2 seam: UI state (modes, selection, pickers)
+//! and the single-threaded event loop. It owns **no** processes — the
+//! `Supervisor` does — and drives the task set only through `Command`s, painting
+//! the `TaskView` mirror it gets back as `Event`s. Modes are the `multi`
+//! analogue of Logria's `InputType` handlers.
+//!
+//! In process the supervisor is a direct field and the loop calls its
+//! `apply`/`tick`/`drain` synchronously (milestone 1). Milestone 2 moves it
+//! behind a channel; nothing in this file's shape changes when it does.
 
 use std::io::{self, Stdout};
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{self, Event as CtEvent, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
-use crate::session::{self, SessionConfig};
-use crate::task::Task;
+use crate::path;
+use crate::protocol::{Command, Event, ScreenView, TaskView};
+use crate::session;
+use crate::supervisor::Supervisor;
+use crate::task::Lifecycle;
 use crate::ui;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -67,7 +76,18 @@ pub struct DirCand {
 }
 
 pub struct App {
-    pub tasks: Vec<Task>,
+    /// The task owner. Phase 2 lifts this into `multi --daemon`; here it's a
+    /// direct field the loop drives synchronously.
+    supervisor: Supervisor,
+    /// Local mirror of the task set, replaced wholesale by `Event::Tasks`. The
+    /// client renders and navigates this, never a live `Task`. `pub` so the
+    /// renderer (`ui`) can index it by the row order `sections()` hands back.
+    pub views: Vec<TaskView>,
+    /// The watched task's screen (attach/peek), from `Event::Screen`.
+    focused_screen: Option<ScreenView>,
+    /// Last `Watch` target sent to the core, so we don't resend it every tick.
+    watched: Option<u64>,
+
     /// The *id* of the selected task — not a row index. Selection sticks to the
     /// task itself, so it can't jump to a neighbour when the list reorders
     /// (a task exits, or gets tagged into another bucket).
@@ -83,7 +103,6 @@ pub struct App {
     pub focused_id: Option<u64>,
     pub rows: u16,
     pub cols: u16,
-    pub idle_after: Duration,
     /// Bytes of the last painted frame; the renderer skips the write when the
     /// next frame is identical.
     pub last_frame: Vec<u8>,
@@ -103,7 +122,6 @@ pub struct App {
     /// Set by an external SIGTERM/SIGHUP/SIGINT; the loop treats it as quit so
     /// teardown runs and the terminal is restored.
     term_signal: Arc<AtomicBool>,
-    next_id: u64,
     should_quit: bool,
 }
 
@@ -112,10 +130,10 @@ pub struct App {
 /// finished process — so tagging pulls a task out of Completed into In use.
 /// That is how the tag rebuilds the fleet-view buckets without pretending to
 /// detect "awaiting input".
-pub fn bucket(t: &Task) -> u8 {
-    if t.tagged {
+pub fn bucket(v: &TaskView) -> u8 {
+    if v.tagged {
         0
-    } else if t.finished.is_some() {
+    } else if matches!(v.lifecycle, Lifecycle::Ok | Lifecycle::Failed) {
         2
     } else {
         1
@@ -125,9 +143,16 @@ pub fn bucket(t: &Task) -> u8 {
 impl App {
     pub fn new(rows: u16, cols: u16) -> App {
         let invocation_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-        let invocation_label = abbreviate(&invocation_dir);
+        let invocation_label = path::abbreviate(&invocation_dir);
+        // The core runs every PTY at the *content* size — full height minus the
+        // one row attached mode reserves for its status bar.
+        let pane_rows = rows.saturating_sub(1).max(1);
+        let supervisor = Supervisor::new(pane_rows, cols, invocation_dir.clone());
         App {
-            tasks: Vec::new(),
+            supervisor,
+            views: Vec::new(),
+            focused_screen: None,
+            watched: None,
             selected_id: None,
             mode: Mode::Dashboard,
             group_mode: GroupMode::State,
@@ -136,7 +161,6 @@ impl App {
             focused_id: None,
             rows,
             cols,
-            idle_after: Duration::from_millis(600),
             last_frame: Vec::new(),
             invocation_dir,
             invocation_label,
@@ -147,66 +171,24 @@ impl App {
             session_sel: 0,
             status: None,
             term_signal: Arc::new(AtomicBool::new(false)),
-            next_id: 1,
             should_quit: false,
         }
     }
 
     // --- sessions -------------------------------------------------------------
 
-    /// Snapshot the current tasks as a `{dir: [commands]}` recipe, in spawn
-    /// order within each dir.
-    fn session_config(&self) -> SessionConfig {
-        let mut order: Vec<usize> = (0..self.tasks.len()).collect();
-        order.sort_by_key(|&i| self.tasks[i].id);
-        let mut cfg = SessionConfig::new();
-        for &i in &order {
-            let t = &self.tasks[i];
-            cfg.entry(abbreviate(&t.cwd)).or_default().push(t.command.clone());
-        }
-        cfg
-    }
-
+    /// Save the current task set under `name`. The core enumerates its tasks and
+    /// writes the recipe; the result comes back as a `Status` event.
     fn save_session(&mut self, name: &str) {
-        let cfg = self.session_config();
-        let count: usize = cfg.values().map(Vec::len).sum();
-        self.status = Some(match session::save(name, &cfg) {
-            Ok(_) => format!("saved '{name}' — {count} command(s)"),
-            Err(e) => format!("save failed: {e}"),
-        });
+        self.supervisor
+            .apply(Command::SaveSession { name: name.to_string() });
     }
 
-    /// Spawn every command in the named session, in its (existing) dir. Missing
-    /// dirs are skipped rather than spawning tasks doomed to fail on chdir.
+    /// Load and run a named session. Public so `main` can trigger a startup load
+    /// (`multi <session>`); the outcome shows in the status line one tick later.
     pub fn load_session(&mut self, name: &str) {
-        let cfg = match session::load(name) {
-            Ok(c) => c,
-            Err(_) => {
-                self.status = Some(format!("session '{name}' not found"));
-                return;
-            }
-        };
-        let pr = self.pane_rows();
-        let (mut spawned, mut skipped) = (0usize, 0usize);
-        for (dir, cmds) in &cfg {
-            let resolved = self.resolve(dir);
-            if !resolved.is_dir() {
-                skipped += cmds.len();
-                continue;
-            }
-            for cmd in cmds {
-                if let Ok(task) = Task::spawn(self.next_id, cmd, &resolved, pr, self.cols) {
-                    self.next_id += 1;
-                    self.tasks.push(task);
-                    spawned += 1;
-                }
-            }
-        }
-        self.status = Some(if skipped > 0 {
-            format!("loaded '{name}' — {spawned} task(s), {skipped} skipped (missing dir)")
-        } else {
-            format!("loaded '{name}' — {spawned} task(s)")
-        });
+        self.supervisor
+            .apply(Command::LoadSession { name: name.to_string() });
     }
 
     /// Hand out the flag for the caller to register OS signals against.
@@ -214,14 +196,21 @@ impl App {
         Arc::clone(&self.term_signal)
     }
 
-    /// The `tasks` index of the attached task, resolved from its id.
+    /// The `views` index of the attached task, resolved from its id.
     pub fn focused_task(&self) -> Option<usize> {
         let id = self.focused_id?;
-        self.tasks.iter().position(|t| t.id == id)
+        self.views.iter().position(|v| v.id == id)
+    }
+
+    /// The watched task's screen, but only if it's the one `id` expects — guards
+    /// against painting a stale screen for the wrong task on the frame a watch
+    /// switches (a real race once the core is across a socket).
+    pub fn screen_for(&self, id: u64) -> Option<&ScreenView> {
+        self.focused_screen.as_ref().filter(|s| s.id == id)
     }
 
     pub fn dir_label(&self, path: &Path) -> String {
-        abbreviate(path)
+        path::abbreviate(path)
     }
 
     /// Height of a task's PTY grid: full screen minus the one-row status bar
@@ -230,19 +219,19 @@ impl App {
         self.rows.saturating_sub(1).max(1)
     }
 
-    /// Grouped view of the tasks: `(section label, task indices)` in render
+    /// Grouped view of the tasks: `(section label, view indices)` in render
     /// order. Both grouping modes sub-sort by state bucket then spawn order, so
     /// "nesting" is uniform. This is the single source of order — `display_order`
     /// is just its flattening, so navigation and rendering can't disagree.
     pub fn sections(&self) -> Vec<(String, Vec<usize>)> {
         let mut labeled: Vec<(u8, String, u8, u64, usize)> = self
-            .tasks
+            .views
             .iter()
             .enumerate()
-            .map(|(i, t)| {
+            .map(|(i, v)| {
                 let (rank, label) = match self.group_mode {
                     GroupMode::State => {
-                        let b = bucket(t);
+                        let b = bucket(v);
                         let l = match b {
                             0 => "In use",
                             1 => "Running",
@@ -251,13 +240,13 @@ impl App {
                         (b, l.to_string())
                     }
                     GroupMode::Dir => {
-                        let label = self.dir_label(&t.cwd);
+                        let label = self.dir_label(&v.cwd);
                         // Invocation dir sorts first; everything else alphabetical.
                         let rank = if label == self.invocation_label { 0 } else { 1 };
                         (rank, label)
                     }
                 };
-                (rank, label, bucket(t), t.id, i)
+                (rank, label, bucket(v), v.id, i)
             })
             .collect();
         labeled.sort();
@@ -277,24 +266,24 @@ impl App {
         self.sections().into_iter().flat_map(|(_, v)| v).collect()
     }
 
-    /// The `tasks` index currently under the selection cursor.
+    /// The `views` index currently under the selection cursor.
     pub fn selected_task(&self) -> Option<usize> {
         let id = self.selected_id?;
-        self.tasks.iter().position(|t| t.id == id)
+        self.views.iter().position(|v| v.id == id)
     }
 
     /// Row of the selected id within `order`, if present.
     fn selected_pos(&self, order: &[usize]) -> Option<usize> {
         let id = self.selected_id?;
-        order.iter().position(|&i| self.tasks[i].id == id)
+        order.iter().position(|&i| self.views[i].id == id)
     }
 
     /// Keep selection valid: if nothing is selected or the selected task is
     /// gone, fall back to the first row. Runs each tick before rendering.
     fn resolve_selection(&mut self) {
-        let present = matches!(self.selected_id, Some(id) if self.tasks.iter().any(|t| t.id == id));
+        let present = matches!(self.selected_id, Some(id) if self.views.iter().any(|v| v.id == id));
         if !present {
-            self.selected_id = self.display_order().first().map(|&i| self.tasks[i].id);
+            self.selected_id = self.display_order().first().map(|&i| self.views[i].id);
         }
     }
 
@@ -305,7 +294,7 @@ impl App {
             return;
         }
         let pos = self.selected_pos(&order).unwrap_or(0);
-        self.selected_id = Some(self.tasks[order[pos.saturating_sub(1)]].id);
+        self.selected_id = Some(self.views[order[pos.saturating_sub(1)]].id);
     }
 
     fn select_down(&mut self) {
@@ -316,17 +305,51 @@ impl App {
         }
         let pos = self.selected_pos(&order).unwrap_or(0);
         let next = (pos + 1).min(order.len() - 1);
-        self.selected_id = Some(self.tasks[order[next]].id);
+        self.selected_id = Some(self.views[order[next]].id);
+    }
+
+    /// Tell the core which task's screen we need (attach/peek), sending `Watch`
+    /// only when the target actually changes.
+    fn set_watch(&mut self, want: Option<u64>) {
+        if want != self.watched {
+            self.watched = want;
+            // Drop the now-irrelevant screen so a stale one can't flash before
+            // the new target's first frame arrives.
+            if want.is_none() {
+                self.focused_screen = None;
+            }
+            self.supervisor.apply(Command::Watch { id: want });
+        }
+    }
+
+    /// One synchronization step with the core: run it a tick and fold its events
+    /// into the local mirror. Milestone 2 swaps `tick`+`drain` for a channel
+    /// receive; the fold is unchanged.
+    fn sync(&mut self) {
+        self.supervisor.tick();
+        for ev in self.supervisor.drain() {
+            match ev {
+                Event::Tasks(v) => self.views = v,
+                Event::Screen(s) => self.focused_screen = Some(s),
+                Event::Status(s) => self.status = Some(s),
+            }
+        }
     }
 
     pub fn run(&mut self, out: &mut Stdout) -> io::Result<()> {
         loop {
-            for t in &mut self.tasks {
-                t.poll_exit()?;
-            }
-            // An external SIGTERM/SIGHUP/SIGINT quits. Check and break *before*
-            // rendering: on SIGHUP the terminal is already gone, so a render
-            // would error and skip `shutdown()`, orphaning the jobs.
+            // Reconcile with the core: declare the watched task, then pull a
+            // fresh snapshot (+ its screen). Both are terminal-free, so they run
+            // *before* the quit check — on SIGHUP the terminal is already gone
+            // and a render would error and skip teardown, orphaning the jobs.
+            let watch = match self.mode {
+                Mode::Peek => self.selected_id,
+                Mode::Attached => self.focused_id,
+                _ => None,
+            };
+            self.set_watch(watch);
+            self.sync();
+
             if self.term_signal.load(Ordering::Relaxed) {
                 self.should_quit = true;
             }
@@ -348,12 +371,12 @@ impl App {
             if event::poll(Duration::from_millis(80))? {
                 match event::read()? {
                     // Accept Repeat too, so a held key still forwards when attached.
-                    Event::Key(k)
+                    CtEvent::Key(k)
                         if matches!(k.kind, KeyEventKind::Press | KeyEventKind::Repeat) =>
                     {
                         self.on_key(out, k)?;
                     }
-                    Event::Resize(cols, rows) => self.on_resize(rows, cols),
+                    CtEvent::Resize(cols, rows) => self.on_resize(rows, cols),
                     _ => {}
                 }
             }
@@ -365,23 +388,18 @@ impl App {
     fn on_resize(&mut self, rows: u16, cols: u16) {
         self.rows = rows;
         self.cols = cols;
-        let pr = self.pane_rows();
-        for t in &mut self.tasks {
-            let _ = t.resize(pr, cols);
-        }
+        // Send the *content* size; the core resizes every PTY to it.
+        self.supervisor.apply(Command::Resize {
+            rows: self.pane_rows(),
+            cols,
+        });
     }
 
-    fn spawn_task(&mut self, command: &str) -> io::Result<()> {
-        let task = Task::spawn(
-            self.next_id,
-            command,
-            &self.spawn_cwd,
-            self.pane_rows(),
-            self.cols,
-        )?;
-        self.next_id += 1;
-        self.tasks.push(task);
-        Ok(())
+    fn spawn_task(&mut self, command: &str) {
+        self.supervisor.apply(Command::Spawn {
+            command: command.to_string(),
+            cwd: self.spawn_cwd.clone(),
+        });
     }
 
     // --- `@` directory picker -------------------------------------------------
@@ -394,7 +412,7 @@ impl App {
         let base = self.resolve(base_str);
 
         let mut cands = vec![DirCand {
-            label: abbreviate(&base),
+            label: path::abbreviate(&base),
             path: base.clone(),
             kind: DirKind::Use,
         }];
@@ -403,7 +421,7 @@ impl App {
             for p in self.in_use_dirs() {
                 if p != base {
                     cands.push(DirCand {
-                        label: abbreviate(&p),
+                        label: path::abbreviate(&p),
                         path: p,
                         kind: DirKind::Jump,
                     });
@@ -429,12 +447,12 @@ impl App {
     /// Distinct working directories of current tasks, most-recently-spawned
     /// first — the "recent" quick-pick list.
     fn in_use_dirs(&self) -> Vec<PathBuf> {
-        let mut order: Vec<usize> = (0..self.tasks.len()).collect();
-        order.sort_by_key(|&i| std::cmp::Reverse(self.tasks[i].id));
+        let mut order: Vec<usize> = (0..self.views.len()).collect();
+        order.sort_by_key(|&i| std::cmp::Reverse(self.views[i].id));
         let mut seen = std::collections::HashSet::new();
         order
             .into_iter()
-            .map(|i| self.tasks[i].cwd.clone())
+            .map(|i| self.views[i].cwd.clone())
             .filter(|d| seen.insert(d.clone()))
             .collect()
     }
@@ -448,25 +466,15 @@ impl App {
     }
 
     /// Turn a typed path fragment into a fully-qualified, lexically-clean
-    /// absolute path: `~`/relative are resolved against the invocation dir, then
-    /// `lexical_clean` collapses `.`/`..` and trailing slashes so a stored cwd
-    /// reads as `~/a/c`, never `~/a/b/../c` or `~/test//`.
+    /// absolute path (see `path::resolve`), resolved against the invocation dir.
     fn resolve(&self, s: &str) -> PathBuf {
-        let expanded = expand_tilde(s);
-        let p = if expanded.is_empty() {
-            self.invocation_dir.clone()
-        } else if Path::new(&expanded).is_absolute() {
-            PathBuf::from(expanded)
-        } else {
-            self.invocation_dir.join(expanded)
-        };
-        lexical_clean(&p)
+        path::resolve(&self.invocation_dir, s)
     }
 
     /// Navigate into `dir`: retype the input as its path (trailing slash) so
     /// completion continues inside it, with the dir itself selected as row 0.
     fn enter_dir(&mut self, dir: PathBuf) {
-        self.dir_input = format!("{}/", abbreviate(&dir));
+        self.dir_input = format!("{}/", path::abbreviate(&dir));
         self.refresh_dir_candidates();
     }
 
@@ -482,18 +490,18 @@ impl App {
             return Ok(());
         }
         match self.mode {
-            Mode::Dashboard => self.on_key_dashboard(k)?,
-            Mode::Spawn => self.on_key_spawn(k)?,
-            Mode::PickDir => self.on_key_pickdir(k)?,
+            Mode::Dashboard => self.on_key_dashboard(k),
+            Mode::Spawn => self.on_key_spawn(k),
+            Mode::PickDir => self.on_key_pickdir(k),
             Mode::SaveSession => self.on_key_savesession(k),
             Mode::LoadSession => self.on_key_loadsession(k),
-            Mode::Peek => self.on_key_peek(k)?,
+            Mode::Peek => self.on_key_peek(k),
             Mode::Attached => self.on_key_attached(out, k)?,
         }
         Ok(())
     }
 
-    fn on_key_dashboard(&mut self, k: KeyEvent) -> io::Result<()> {
+    fn on_key_dashboard(&mut self, k: KeyEvent) {
         let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
         match k.code {
             KeyCode::Char('q') => self.should_quit = true,
@@ -504,10 +512,11 @@ impl App {
                     self.mode = Mode::Peek;
                 }
             }
-            KeyCode::Enter => self.attach()?,
+            KeyCode::Enter => self.attach(),
             KeyCode::Char('m') => {
                 if let Some(i) = self.selected_task() {
-                    self.tasks[i].tagged = !self.tasks[i].tagged;
+                    let (id, tagged) = (self.views[i].id, self.views[i].tagged);
+                    self.supervisor.apply(Command::Tag { id, on: !tagged });
                 }
             }
             KeyCode::Char('n') => {
@@ -538,7 +547,6 @@ impl App {
             KeyCode::Char('x') if ctrl => self.kill_or_remove_selected(),
             _ => {}
         }
-        Ok(())
     }
 
     fn on_key_savesession(&mut self, k: KeyEvent) {
@@ -582,7 +590,7 @@ impl App {
         }
     }
 
-    fn on_key_pickdir(&mut self, k: KeyEvent) -> io::Result<()> {
+    fn on_key_pickdir(&mut self, k: KeyEvent) {
         match k.code {
             KeyCode::Esc => {
                 self.dir_input.clear();
@@ -625,15 +633,14 @@ impl App {
             }
             _ => {}
         }
-        Ok(())
     }
 
-    fn on_key_spawn(&mut self, k: KeyEvent) -> io::Result<()> {
+    fn on_key_spawn(&mut self, k: KeyEvent) {
         match k.code {
             KeyCode::Enter => {
                 let cmd = self.input.trim().to_string();
                 if !cmd.is_empty() {
-                    self.spawn_task(&cmd)?;
+                    self.spawn_task(&cmd);
                 }
                 self.input.clear();
                 self.mode = Mode::Dashboard;
@@ -648,18 +655,16 @@ impl App {
             KeyCode::Char(c) => self.input.push(c),
             _ => {}
         }
-        Ok(())
     }
 
-    fn on_key_peek(&mut self, k: KeyEvent) -> io::Result<()> {
+    fn on_key_peek(&mut self, k: KeyEvent) {
         match k.code {
             KeyCode::Char(' ') | KeyCode::Esc | KeyCode::Char('q') => self.mode = Mode::Dashboard,
             KeyCode::Up | KeyCode::Char('k') => self.select_up(),
             KeyCode::Down | KeyCode::Char('j') => self.select_down(),
-            KeyCode::Enter => self.attach()?,
+            KeyCode::Enter => self.attach(),
             _ => {}
         }
-        Ok(())
     }
 
     fn on_key_attached(&mut self, out: &mut Stdout, k: KeyEvent) -> io::Result<()> {
@@ -676,53 +681,61 @@ impl App {
             self.mode = Mode::Dashboard;
             self.focused_id = None;
             // Repaint from scratch next tick; wipe the child's screen now.
-            use crossterm::{cursor::MoveTo, execute, terminal::{Clear, ClearType}};
+            use crossterm::{
+                cursor::MoveTo,
+                execute,
+                terminal::{Clear, ClearType},
+            };
             let _ = execute!(out, Clear(ClearType::All), MoveTo(0, 0));
             return Ok(());
         }
-        if let Some(i) = self.focused_task()
+        if let Some(id) = self.focused_id
             && let Some(bytes) = key_to_bytes(k.code, k.modifiers)
         {
-            let _ = self.tasks[i].send_input(&bytes);
+            self.supervisor.apply(Command::Input { id, bytes });
         }
         Ok(())
     }
 
-    fn attach(&mut self) -> io::Result<()> {
+    fn attach(&mut self) {
         if let Some(i) = self.selected_task() {
-            let pr = self.pane_rows();
-            self.tasks[i].resize(pr, self.cols)?;
-            self.focused_id = Some(self.tasks[i].id);
+            // All tasks already run at the client's content size, so there's no
+            // resize to do — just take focus. The screen arrives via `Watch`,
+            // sent from the run loop next tick.
+            self.focused_id = Some(self.views[i].id);
             self.mode = Mode::Attached;
         }
-        Ok(())
     }
 
     fn kill_or_remove_selected(&mut self) {
         let Some(i) = self.selected_task() else {
             return;
         };
-        if self.tasks[i].finished.is_some() {
-            // Remember the row so selection lands on the neighbour, not the top.
+        let id = self.views[i].id;
+        let finished = matches!(self.views[i].lifecycle, Lifecycle::Ok | Lifecycle::Failed);
+        if finished {
+            // Drop it, landing selection on the neighbour (not the top). The
+            // removal reflects next tick, so pick the neighbour id from the
+            // *current* order now and pin selection to it.
             let order = self.display_order();
             let pos = order.iter().position(|&x| x == i).unwrap_or(0);
-            self.tasks.remove(i); // Drop terminates/cleans up
-            let order = self.display_order();
-            self.selected_id = order
-                .get(pos.min(order.len().saturating_sub(1)))
-                .map(|&x| self.tasks[x].id);
+            let neighbour = order
+                .get(pos + 1)
+                .or_else(|| pos.checked_sub(1).and_then(|p| order.get(p)))
+                .map(|&x| self.views[x].id);
+            self.selected_id = neighbour;
+            self.supervisor.apply(Command::Remove { id });
         } else {
             // Kill in place; the next tick reaps it into the Completed bucket.
-            self.tasks[i].terminate();
+            self.supervisor.apply(Command::Kill { id });
         }
     }
 
-    /// v1 policy: quitting the UI kills every job. Dropping each Task terminates
-    /// its process group (see `Task::drop`). The daemon/reattach model that
-    /// would outlive the UI is deliberately v2 — this thread-per-task boundary
-    /// is the seam where it would be cut.
+    /// v1 policy: quitting the UI kills every job. The core group-kills each
+    /// task (see `Task::drop`). The daemon/reattach model that would outlive the
+    /// UI is phase 2 proper — this command is where "disconnect vs quit" splits.
     fn shutdown(&mut self) {
-        self.tasks.clear();
+        self.supervisor.apply(Command::Shutdown);
     }
 }
 
@@ -764,59 +777,6 @@ fn key_to_bytes(code: KeyCode, mods: KeyModifiers) -> Option<Vec<u8>> {
         KeyCode::Insert => Some(b"\x1b[2~".to_vec()),
         _ => None,
     }
-}
-
-/// Shorten a path for display: `$HOME` collapses to `~`. Everything else stays
-/// absolute, so two directories never render as the same label.
-fn abbreviate(path: &Path) -> String {
-    let s = path.to_string_lossy();
-    if let Ok(home) = std::env::var("HOME")
-        && !home.is_empty()
-        && let Some(rest) = s.strip_prefix(&home)
-    {
-        if rest.is_empty() {
-            return "~".to_string();
-        } else if rest.starts_with('/') {
-            return format!("~{rest}");
-        }
-    }
-    s.into_owned()
-}
-
-/// Expand a leading `~` (alone or `~/…`) to `$HOME`.
-fn expand_tilde(s: &str) -> String {
-    if let Some(rest) = s.strip_prefix('~')
-        && (rest.is_empty() || rest.starts_with('/'))
-        && let Ok(home) = std::env::var("HOME")
-    {
-        return format!("{home}{rest}");
-    }
-    s.to_string()
-}
-
-/// Collapse `.` and `..` lexically (no filesystem access, no symlink
-/// resolution): `/a/b/../c` → `/a/c`. Kept lexical rather than
-/// `fs::canonicalize` so `/tmp` stays `/tmp` (not `/private/tmp`) and the path
-/// need not exist yet — this only tidies what the user typed.
-fn lexical_clean(p: &Path) -> PathBuf {
-    let mut out = PathBuf::new();
-    for comp in p.components() {
-        match comp {
-            Component::CurDir => {}
-            Component::ParentDir => match out.components().next_back() {
-                Some(Component::Normal(_)) => {
-                    out.pop();
-                }
-                Some(Component::RootDir) => {} // `/..` stays `/`
-                _ => out.push(Component::ParentDir), // leading `..` in a relative path
-            },
-            other => out.push(other.as_os_str()),
-        }
-    }
-    if out.as_os_str().is_empty() {
-        out.push(".");
-    }
-    out
 }
 
 /// Split a typed path into (directory-so-far, trailing fragment). The fragment
@@ -868,26 +828,43 @@ pub fn scroll_window(sel: usize, total: usize, max: usize) -> (usize, usize) {
 mod tests {
     use super::*;
 
+    impl App {
+        /// Drive one core sync (tick + drain) so `views` reflects the latest
+        /// spawns and reaps — the test-side equivalent of one run-loop tick.
+        fn pump(&mut self) {
+            self.sync();
+        }
+
+        fn spawn_in(&mut self, cmd: &str, cwd: PathBuf) {
+            self.supervisor.apply(Command::Spawn {
+                command: cmd.to_string(),
+                cwd,
+            });
+        }
+    }
+
     /// Selection is bound to a task id, so a reorder (here: tagging a task into
     /// the "In use" bucket) must not move the highlight to a different task.
     #[test]
     fn selection_follows_task_across_reorder() {
         let mut app = App::new(30, 100);
-        app.spawn_task("sleep 5").unwrap(); // id 1
-        app.spawn_task("sleep 5").unwrap(); // id 2
+        let dir = app.invocation_dir.clone();
+        app.spawn_in("sleep 5", dir.clone()); // id 1
+        app.spawn_in("sleep 5", dir); // id 2
+        app.pump();
         app.resolve_selection();
         assert_eq!(app.selected_id, Some(1));
 
         // Tag id 2 -> it sorts into the "In use" bucket, ahead of id 1.
-        let i2 = app.tasks.iter().position(|t| t.id == 2).unwrap();
-        app.tasks[i2].tagged = true;
+        app.supervisor.apply(Command::Tag { id: 2, on: true });
+        app.pump();
 
         let order = app.display_order();
-        assert_eq!(app.tasks[order[0]].id, 2, "tagged task should sort first");
+        assert_eq!(app.views[order[0]].id, 2, "tagged task should sort first");
 
         // Still on id 1, even though it is now the second row.
         assert_eq!(app.selected_id, Some(1));
-        assert_eq!(app.tasks[app.selected_task().unwrap()].id, 1);
+        assert_eq!(app.views[app.selected_task().unwrap()].id, 1);
     }
 
     /// Dir mode makes one section per distinct cwd (invocation dir first); state
@@ -895,10 +872,10 @@ mod tests {
     #[test]
     fn dir_mode_groups_by_cwd() {
         let mut app = App::new(30, 100);
-        app.spawn_cwd = app.invocation_dir.clone();
-        app.spawn_task("sleep 5").unwrap(); // id 1, invocation dir
-        app.spawn_cwd = PathBuf::from("/tmp");
-        app.spawn_task("sleep 5").unwrap(); // id 2, /tmp
+        let inv = app.invocation_dir.clone();
+        app.spawn_in("sleep 5", inv); // id 1, invocation dir
+        app.spawn_in("sleep 5", PathBuf::from("/tmp")); // id 2, /tmp
+        app.pump();
 
         app.group_mode = GroupMode::State;
         let s = app.sections();
@@ -918,20 +895,26 @@ mod tests {
     #[test]
     fn tagging_a_finished_task_moves_it_to_in_use() {
         let mut app = App::new(30, 100);
-        app.spawn_task("true").unwrap(); // exits ~immediately
+        let inv = app.invocation_dir.clone();
+        app.spawn_in("true", inv); // exits ~immediately
         for _ in 0..100 {
-            for t in &mut app.tasks {
-                t.poll_exit().unwrap();
-            }
-            if app.tasks[0].finished.is_some() {
+            app.pump();
+            let done = app
+                .views
+                .first()
+                .map(|v| matches!(v.lifecycle, Lifecycle::Ok | Lifecycle::Failed))
+                .unwrap_or(false);
+            if done {
                 break;
             }
             std::thread::sleep(Duration::from_millis(20));
         }
-        assert!(app.tasks[0].finished.is_some());
+        assert!(matches!(app.views[0].lifecycle, Lifecycle::Ok | Lifecycle::Failed));
         assert_eq!(app.sections()[0].0, "Completed");
 
-        app.tasks[0].tagged = true;
+        let id = app.views[0].id;
+        app.supervisor.apply(Command::Tag { id, on: true });
+        app.pump();
         assert_eq!(app.sections()[0].0, "In use");
     }
 
@@ -939,38 +922,16 @@ mod tests {
     #[test]
     fn recent_dirs_are_distinct_and_newest_first() {
         let mut app = App::new(30, 100);
-        app.spawn_cwd = PathBuf::from("/tmp");
-        app.spawn_task("sleep 5").unwrap(); // id 1  /tmp
-        app.spawn_cwd = app.invocation_dir.clone();
-        app.spawn_task("sleep 5").unwrap(); // id 2  invocation
-        app.spawn_cwd = PathBuf::from("/tmp");
-        app.spawn_task("sleep 5").unwrap(); // id 3  /tmp (dup)
+        let inv = app.invocation_dir.clone();
+        app.spawn_in("sleep 5", PathBuf::from("/tmp")); // id 1  /tmp
+        app.spawn_in("sleep 5", inv.clone()); // id 2  invocation
+        app.spawn_in("sleep 5", PathBuf::from("/tmp")); // id 3  /tmp (dup)
+        app.pump();
 
         let dirs = app.in_use_dirs();
         assert_eq!(dirs.len(), 2, "duplicate dirs collapse");
         assert_eq!(dirs[0], PathBuf::from("/tmp"), "newest first");
-        assert_eq!(dirs[1], app.invocation_dir);
-    }
-
-    #[test]
-    fn resolve_normalizes_trailing_slash() {
-        let app = App::new(30, 100);
-        assert_eq!(app.resolve("/tmp/"), PathBuf::from("/tmp"));
-        assert_eq!(app.resolve("/tmp"), PathBuf::from("/tmp"));
-    }
-
-    #[test]
-    fn resolve_collapses_dotdot() {
-        let app = App::new(30, 100);
-        assert_eq!(app.resolve("/a/b/../c"), PathBuf::from("/a/c"));
-        assert_eq!(app.resolve("/a/b/../../c"), PathBuf::from("/c"));
-        assert_eq!(app.resolve("/../x"), PathBuf::from("/x")); // can't climb past root
-        assert_eq!(
-            app.resolve("/Users/x/Code/Rust/multi/../imessage-exporter"),
-            PathBuf::from("/Users/x/Code/Rust/imessage-exporter")
-        );
-        // relative input resolves against the invocation dir, then collapses
-        assert_eq!(app.resolve("sub/.."), app.invocation_dir);
+        assert_eq!(dirs[1], inv);
     }
 
     #[test]
@@ -984,19 +945,23 @@ mod tests {
     }
 
     /// Focus is by id, so it points at the same task even after the list shifts
-    /// (a lower-indexed task is removed) and reports gone once it's removed.
+    /// (a lower-id task is removed) and reports gone once it's removed.
     #[test]
     fn focus_by_id_survives_index_shift() {
         let mut app = App::new(30, 100);
-        app.spawn_task("sleep 5").unwrap(); // id 1
-        app.spawn_task("sleep 5").unwrap(); // id 2
+        let inv = app.invocation_dir.clone();
+        app.spawn_in("sleep 5", inv.clone()); // id 1
+        app.spawn_in("sleep 5", inv); // id 2
+        app.pump();
         app.focused_id = Some(2);
-        assert_eq!(app.tasks[app.focused_task().unwrap()].id, 2);
+        assert_eq!(app.views[app.focused_task().unwrap()].id, 2);
 
-        app.tasks.remove(0); // id 2 slides from index 1 to 0
-        assert_eq!(app.tasks[app.focused_task().unwrap()].id, 2);
+        app.supervisor.apply(Command::Remove { id: 1 }); // id 2 slides to index 0
+        app.pump();
+        assert_eq!(app.views[app.focused_task().unwrap()].id, 2);
 
-        app.tasks.clear();
+        app.supervisor.apply(Command::Remove { id: 2 });
+        app.pump();
         assert!(app.focused_task().is_none());
     }
 

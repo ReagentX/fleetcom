@@ -3,9 +3,12 @@
 //! `render` writes that buffer to the terminal in a single `write_all` and only
 //! when it differs from the last frame. That makes each frame atomic (no
 //! half-painted tearing) and skips work entirely when nothing changed.
+//!
+//! The renderer reads only the client's mirror — the `TaskView` list and the
+//! watched `ScreenView` — never a live `Task`. Everything it needs is already a
+//! plain snapshot, which is why the same code will paint socket data unchanged.
 
 use std::io::{self, Stdout, Write};
-use std::time::{Duration, Instant};
 
 use crossterm::{
     cursor::{Hide, MoveTo, Show},
@@ -15,7 +18,8 @@ use crossterm::{
 
 use crate::app::{App, DirKind, Mode, scroll_window};
 use crate::format::{pad, rel_time, truncate};
-use crate::task::{Lifecycle, Task};
+use crate::protocol::TaskView;
+use crate::task::Lifecycle;
 
 pub fn render(out: &mut Stdout, app: &mut App) -> io::Result<()> {
     let mut buf: Vec<u8> = Vec::with_capacity(app.cols as usize * app.rows as usize * 3 + 128);
@@ -62,13 +66,13 @@ fn dim(out: &mut impl Write, y: u16, s: &str, cols: usize) -> io::Result<()> {
 fn render_dashboard(out: &mut impl Write, app: &App) -> io::Result<()> {
     let cols = app.cols as usize;
     let rows = app.rows;
-    let now = Instant::now();
 
     queue!(out, Hide, MoveTo(0, 0))?;
 
+    // Lifecycle is pre-computed by the core, so the header just tallies it.
     let (mut running, mut idle, mut done) = (0u32, 0u32, 0u32);
-    for t in &app.tasks {
-        match t.lifecycle(now, app.idle_after) {
+    for v in &app.views {
+        match v.lifecycle {
             Lifecycle::Active => running += 1,
             Lifecycle::Idle => idle += 1,
             Lifecycle::Ok | Lifecycle::Failed => done += 1,
@@ -104,9 +108,9 @@ fn render_dashboard(out: &mut impl Write, app: &App) -> io::Result<()> {
             if y > list_bottom {
                 break 'sections;
             }
-            let t = &app.tasks[ti];
-            let row = task_row(t, now, app.idle_after, cols);
-            if app.selected_id == Some(t.id) {
+            let v = &app.views[ti];
+            let row = task_row(v, cols);
+            if app.selected_id == Some(v.id) {
                 queue!(
                     out,
                     MoveTo(0, y),
@@ -174,22 +178,22 @@ fn spawn_prompt(app: &App) -> String {
     }
 }
 
-fn task_row(t: &Task, now: Instant, idle_after: Duration, cols: usize) -> String {
-    let glyph = match t.lifecycle(now, idle_after) {
+fn task_row(v: &TaskView, cols: usize) -> String {
+    let glyph = match v.lifecycle {
         Lifecycle::Active => "✻",
         Lifecycle::Idle => "∙",
         Lifecycle::Ok => "✓",
         Lifecycle::Failed => "✗",
     };
-    let tag = if t.tagged { "◆" } else { " " };
-    let time = rel_time(now.duration_since(t.started));
+    let tag = if v.tagged { "◆" } else { " " };
+    let time = rel_time(v.started_ago);
     let title_w = 26.min(cols / 3);
-    let title = truncate(&t.command, title_w);
+    let title = truncate(&v.command, title_w);
 
     // prefix(2) glyph+sp(2) tag+sp(2) title(title_w) sp(1) preview(prev_w) sp(1) time
     let used = 2 + 2 + 2 + title_w + 1 + 1 + time.chars().count();
     let prev_w = cols.saturating_sub(used);
-    let preview = truncate(&t.preview(), prev_w);
+    let preview = truncate(&v.preview, prev_w);
     format!(
         "  {g} {tg}{t:<tw$} {p:<pw$} {tm}",
         g = glyph,
@@ -206,7 +210,7 @@ fn render_peek(out: &mut impl Write, app: &App) -> io::Result<()> {
     let Some(i) = app.selected_task() else {
         return Ok(());
     };
-    let t = &app.tasks[i];
+    let v = &app.views[i];
     let cols = app.cols as usize;
     let rows = app.rows as usize;
 
@@ -217,12 +221,15 @@ fn render_peek(out: &mut impl Write, app: &App) -> io::Result<()> {
     let inner_w = bw.saturating_sub(2);
     let inner_h = bh.saturating_sub(2);
 
-    let lines = t.screen_lines();
+    // Screen lines for the selected task, once the core has streamed them. Empty
+    // until then (or if the watch just switched); the box still frames cleanly.
+    let empty: Vec<String> = Vec::new();
+    let lines = app.screen_for(v.id).map(|s| &s.lines).unwrap_or(&empty);
     let start = lines.len().saturating_sub(inner_h);
     let tail = &lines[start..];
 
     // Top border with the command title inlined.
-    let mut top_mid = format!("─ {} ", truncate(&t.command, inner_w.saturating_sub(4)));
+    let mut top_mid = format!("─ {} ", truncate(&v.command, inner_w.saturating_sub(4)));
     let tl = top_mid.chars().count();
     if tl < inner_w {
         top_mid.extend(std::iter::repeat_n('─', inner_w - tl));
@@ -387,14 +394,16 @@ fn render_attached(out: &mut impl Write, app: &App) -> io::Result<()> {
     let Some(i) = app.focused_task() else {
         return Ok(());
     };
-    let t = &app.tasks[i];
-    let (formatted, cursor, hide_cursor) = t.formatted();
+    let v = &app.views[i];
+    let screen = app.screen_for(v.id);
 
     queue!(out, Hide, MoveTo(0, 0))?;
-    out.write_all(&formatted)?;
+    if let Some(s) = screen {
+        out.write_all(&s.formatted)?;
+    }
 
     let cols = app.cols as usize;
-    let bar = format!("  [attached] {}    Ctrl-\\ background", t.command);
+    let bar = format!("  [attached] {}    Ctrl-\\ background", v.command);
     queue!(
         out,
         MoveTo(0, app.rows.saturating_sub(1)),
@@ -404,10 +413,9 @@ fn render_attached(out: &mut impl Write, app: &App) -> io::Result<()> {
     )?;
 
     // Place the real cursor where the child's is, so typing feels native.
-    if hide_cursor {
-        queue!(out, Hide)?;
-    } else {
-        queue!(out, MoveTo(cursor.1, cursor.0), Show)?;
+    match screen {
+        Some(s) if !s.hide_cursor => queue!(out, MoveTo(s.cursor.1, s.cursor.0), Show)?,
+        _ => queue!(out, Hide)?,
     }
     Ok(())
 }
