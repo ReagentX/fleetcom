@@ -8,7 +8,7 @@ crossterm = "0.29.0"
 dirs = "6"
 jzon = "0.12.5"
 # Pinned to portable-pty's nix so the tree carries one copy, not two.
-nix = { version = "0.28", features = ["signal", "user"] }
+nix = { version = "0.28", features = ["signal", "user", "fs"] }
 portable-pty = "0.9.0"
 signal-hook = { version = "0.3", default-features = false }
 vt100 = "0.16.2"

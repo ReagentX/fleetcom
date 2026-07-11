@@ -11,13 +11,16 @@
 
 use std::fs;
 use std::io::{self, ErrorKind, Read};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::os::unix::process::CommandExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::mpsc::{RecvTimeoutError, channel};
 use std::thread;
 use std::time::Duration;
+
+use nix::fcntl::{Flock, FlockArg};
 
 use crate::frame::{read_frame, write_frame};
 use crate::protocol::{Command, decode_command, encode_command, encode_event};
@@ -43,6 +46,40 @@ fn runtime_dir() -> PathBuf {
 
 fn socket_path() -> PathBuf {
     runtime_dir().join("default.sock")
+}
+
+/// Create (or validate) the runtime dir with private `0700` perms, so the socket
+/// and control channel inside it are unreachable by other local users. If it
+/// already exists it must be a real directory this user owns — a symlink or a
+/// dir planted by someone else (the classic shared-`/tmp` attack) is rejected,
+/// and loose perms are tightened. `0700` on the leaf is enough: no one can
+/// traverse into it even from a world-writable parent.
+fn ensure_runtime_dir(dir: &Path) -> io::Result<()> {
+    match fs::symlink_metadata(dir) {
+        Ok(md) => {
+            if !md.file_type().is_dir() {
+                return Err(io::Error::new(
+                    ErrorKind::AlreadyExists,
+                    "runtime path exists but is not a directory",
+                ));
+            }
+            if md.uid() != nix::unistd::getuid().as_raw() {
+                return Err(io::Error::new(
+                    ErrorKind::PermissionDenied,
+                    "runtime dir is not owned by this user",
+                ));
+            }
+            if md.permissions().mode() & 0o077 != 0 {
+                fs::set_permissions(dir, fs::Permissions::from_mode(0o700))?;
+            }
+            Ok(())
+        }
+        Err(e) if e.kind() == ErrorKind::NotFound => fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(dir),
+        Err(e) => Err(e),
+    }
 }
 
 /// Connect to the running daemon, autostarting one if absent. A live socket
@@ -79,7 +116,7 @@ pub fn connect_or_autostart() -> io::Result<UnixStream> {
 fn spawn_daemon() -> io::Result<()> {
     let exe = std::env::current_exe()?;
     let dir = runtime_dir();
-    let _ = fs::create_dir_all(&dir);
+    let _ = ensure_runtime_dir(&dir);
     let log = fs::File::create(dir.join("daemon.log")).ok();
     let mut cmd = std::process::Command::new(exe);
     cmd.arg("--daemon")
@@ -116,12 +153,31 @@ pub fn run_kill() -> io::Result<()> {
 /// until an explicit shutdown. The supervisor is created once and persists across
 /// reconnects — jobs outlive any single client.
 pub fn run_daemon() -> io::Result<()> {
-    let path = socket_path();
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let _ = fs::remove_file(&path); // clear a stale socket before binding
+    let dir = runtime_dir();
+    ensure_runtime_dir(&dir)?; // private 0700 dir; reject a planted one (#1)
+    let path = dir.join("default.sock");
+
+    // Single-instance lock (#5): only the holder of `daemon.lock` may own the
+    // socket. A concurrent autostart (two clients racing to spawn a daemon) or a
+    // spurious respawn fails this lock and exits, instead of unlinking a live
+    // daemon's socket out from under it. flock releases automatically when this
+    // process dies, so a crash leaves no stale lock — the next daemon reclaims.
+    let lock_file = fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false) // a lock anchor; contents are never used
+        .open(dir.join("daemon.lock"))?;
+    // `_lock` is held (not `_`) for the whole function, so the flock lives until
+    // this daemon exits, then releases on drop.
+    let _lock = match Flock::lock(lock_file, FlockArg::LockExclusiveNonblock) {
+        Ok(l) => l,
+        Err(_) => return Ok(()), // another daemon already owns the socket
+    };
+
+    // Sole owner now — safe to reclaim a stale socket and bind it privately.
+    let _ = fs::remove_file(&path);
     let listener = UnixListener::bind(&path)?;
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?; // #1
 
     let base_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     // 24x80 until the first client's Resize, which arrives before any Spawn.
