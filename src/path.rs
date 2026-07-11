@@ -46,7 +46,7 @@ pub fn lexical_clean(p: &Path) -> PathBuf {
                 Some(Component::Normal(_)) => {
                     out.pop();
                 }
-                Some(Component::RootDir) => {} // `/..` stays `/`
+                Some(Component::RootDir) => {}       // `/..` stays `/`
                 _ => out.push(Component::ParentDir), // leading `..` in a relative path
             },
             other => out.push(other.as_os_str()),

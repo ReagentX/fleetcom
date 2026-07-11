@@ -195,8 +195,12 @@ pub fn decode_command(kind: u8, payload: &[u8]) -> Option<Command> {
             command: v["command"].as_str()?.to_string(),
             cwd: PathBuf::from(v["cwd"].as_str()?),
         },
-        "kill" => Command::Kill { id: v["id"].as_u64()? },
-        "remove" => Command::Remove { id: v["id"].as_u64()? },
+        "kill" => Command::Kill {
+            id: v["id"].as_u64()?,
+        },
+        "remove" => Command::Remove {
+            id: v["id"].as_u64()?,
+        },
         "tag" => Command::Tag {
             id: v["id"].as_u64()?,
             on: v["on"].as_bool()?,
@@ -214,10 +218,17 @@ pub fn decode_command(kind: u8, payload: &[u8]) -> Option<Command> {
         },
         "input" => Command::Input {
             id: v["id"].as_u64()?,
-            bytes: v["bytes"].members().filter_map(|m| m.as_u64().map(|n| n as u8)).collect(),
+            bytes: v["bytes"]
+                .members()
+                .filter_map(|m| m.as_u64().map(|n| n as u8))
+                .collect(),
         },
-        "save" => Command::SaveSession { name: v["name"].as_str()?.to_string() },
-        "load" => Command::LoadSession { name: v["name"].as_str()?.to_string() },
+        "save" => Command::SaveSession {
+            name: v["name"].as_str()?.to_string(),
+        },
+        "load" => Command::LoadSession {
+            name: v["name"].as_str()?.to_string(),
+        },
         "shutdown" => Command::Shutdown,
         _ => return None,
     };
@@ -308,7 +319,10 @@ pub fn decode_event(kind: u8, payload: &[u8]) -> Option<Event> {
             let header_bytes = payload.get(4..4 + hlen)?;
             let formatted = payload.get(4 + hlen..)?.to_vec();
             let h = jzon::parse(std::str::from_utf8(header_bytes).ok()?).ok()?;
-            let cursor = (h["cursor"][0].as_u64()? as u16, h["cursor"][1].as_u64()? as u16);
+            let cursor = (
+                h["cursor"][0].as_u64()? as u16,
+                h["cursor"][1].as_u64()? as u16,
+            );
             let lines = h["lines"]
                 .members()
                 .filter_map(|m| m.as_str().map(str::to_string))
@@ -335,16 +349,29 @@ mod tests {
     #[test]
     fn command_round_trips() {
         let cases = [
-            Command::Spawn { command: "echo hi".into(), cwd: PathBuf::from("/tmp") },
+            Command::Spawn {
+                command: "echo hi".into(),
+                cwd: PathBuf::from("/tmp"),
+            },
             Command::Kill { id: 7 },
             Command::Remove { id: 3 },
             Command::Tag { id: 2, on: true },
-            Command::Resize { rows: 30, cols: 100 },
+            Command::Resize {
+                rows: 30,
+                cols: 100,
+            },
             Command::Watch { id: Some(5) },
             Command::Watch { id: None },
-            Command::Input { id: 1, bytes: vec![0, 27, 91, 255] },
-            Command::SaveSession { name: "work".into() },
-            Command::LoadSession { name: "home".into() },
+            Command::Input {
+                id: 1,
+                bytes: vec![0, 27, 91, 255],
+            },
+            Command::SaveSession {
+                name: "work".into(),
+            },
+            Command::LoadSession {
+                name: "home".into(),
+            },
             Command::Shutdown,
         ];
         for c in cases {

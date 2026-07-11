@@ -28,7 +28,11 @@ pub fn truncate(s: &str, max: usize) -> String {
         return String::new();
     }
     let clean = s.chars().map(|c| if c.is_control() { ' ' } else { c });
-    let count = s.chars().filter(|c| !c.is_control()).count().max(s.chars().count());
+    let count = s
+        .chars()
+        .filter(|c| !c.is_control())
+        .count()
+        .max(s.chars().count());
     if count <= max {
         return clean.collect();
     }

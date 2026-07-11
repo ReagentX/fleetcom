@@ -80,7 +80,11 @@ fn render_dashboard(out: &mut impl Write, app: &App) -> io::Result<()> {
         }
     }
     // Daemon-backed is the unmarked default; call out foreground (ephemeral) mode.
-    let mode_tag = if app.daemon_backed { "" } else { " · foreground" };
+    let mode_tag = if app.daemon_backed {
+        ""
+    } else {
+        " · foreground"
+    };
     queue!(
         out,
         MoveTo(0, 0),
@@ -139,7 +143,12 @@ fn render_dashboard(out: &mut impl Write, app: &App) -> io::Result<()> {
         Some(line) => put(out, cmd_y, &line, cols)?,
         None => match &app.status {
             Some(s) => put(out, cmd_y, &format!("  {s}"), cols)?,
-            None => dim(out, cmd_y, "  ❯ n run · @ dir · s sort · w save · o load", cols)?,
+            None => dim(
+                out,
+                cmd_y,
+                "  ❯ n run · @ dir · s sort · w save · o load",
+                cols,
+            )?,
         },
     }
 
@@ -237,7 +246,11 @@ fn render_peek(out: &mut impl Write, app: &App) -> io::Result<()> {
     if tl < inner_w {
         top_mid.extend(std::iter::repeat_n('─', inner_w - tl));
     }
-    queue!(out, MoveTo(x0 as u16, y0 as u16), Print(format!("┌{top_mid}┐")))?;
+    queue!(
+        out,
+        MoveTo(x0 as u16, y0 as u16),
+        Print(format!("┌{top_mid}┐"))
+    )?;
 
     for k in 0..inner_h {
         let line = tail.get(k).map(String::as_str).unwrap_or("");
@@ -331,7 +344,9 @@ fn render_pickdir(out: &mut impl Write, app: &App) -> io::Result<()> {
         cols,
     )?;
 
-    let cx = truncate(&format!("  @ {}", app.dir_input), cols).chars().count() as u16;
+    let cx = truncate(&format!("  @ {}", app.dir_input), cols)
+        .chars()
+        .count() as u16;
     queue!(out, MoveTo(cx, top), Show)?;
     Ok(())
 }
@@ -424,7 +439,12 @@ fn render_disconnected(out: &mut impl Write, app: &App) -> io::Result<()> {
         "core stopped        q  quit"
     };
     let mid = rows / 2;
-    put(out, mid.saturating_sub(1), &center("⚠  daemon connection lost", cols), cols)?;
+    put(
+        out,
+        mid.saturating_sub(1),
+        &center("⚠  daemon connection lost", cols),
+        cols,
+    )?;
     dim(out, mid + 1, &center(hint, cols), cols)?;
     Ok(())
 }

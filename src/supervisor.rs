@@ -180,7 +180,9 @@ impl Supervisor {
                 self.next_id += 1;
                 self.tasks.push(task);
             }
-            Err(e) => self.events.push(Event::Status(format!("spawn failed: {e}"))),
+            Err(e) => self
+                .events
+                .push(Event::Status(format!("spawn failed: {e}"))),
         }
     }
 
@@ -258,12 +260,24 @@ mod tests {
     #[test]
     fn session_config_groups_by_dir_in_spawn_order() {
         let mut s = Supervisor::new(24, 80, here());
-        s.apply(Command::Spawn { command: "a".into(), cwd: here() });
-        s.apply(Command::Spawn { command: "b".into(), cwd: PathBuf::from("/tmp") });
-        s.apply(Command::Spawn { command: "c".into(), cwd: here() });
+        s.apply(Command::Spawn {
+            command: "a".into(),
+            cwd: here(),
+        });
+        s.apply(Command::Spawn {
+            command: "b".into(),
+            cwd: PathBuf::from("/tmp"),
+        });
+        s.apply(Command::Spawn {
+            command: "c".into(),
+            cwd: here(),
+        });
 
         let cfg = s.session_config();
-        assert_eq!(cfg[&path::abbreviate(&here())], vec!["a".to_string(), "c".to_string()]);
+        assert_eq!(
+            cfg[&path::abbreviate(&here())],
+            vec!["a".to_string(), "c".to_string()]
+        );
         assert_eq!(cfg["/tmp"], vec!["b".to_string()]);
     }
 
@@ -273,7 +287,10 @@ mod tests {
     #[test]
     fn tick_emits_snapshot_and_watched_screen() {
         let mut s = Supervisor::new(24, 80, here());
-        s.apply(Command::Spawn { command: "sleep 30".into(), cwd: here() });
+        s.apply(Command::Spawn {
+            command: "sleep 30".into(),
+            cwd: here(),
+        });
 
         s.tick();
         let evs = s.drain();
@@ -291,7 +308,8 @@ mod tests {
         let evs = s.drain();
         assert!(evs.iter().any(|e| matches!(e, Event::Tasks(_))));
         assert!(
-            evs.iter().any(|e| matches!(e, Event::Screen(sv) if sv.id == id)),
+            evs.iter()
+                .any(|e| matches!(e, Event::Screen(sv) if sv.id == id)),
             "watching a task should stream its Screen"
         );
     }
@@ -301,7 +319,10 @@ mod tests {
     #[test]
     fn watched_screen_not_resent_when_unchanged() {
         let mut s = Supervisor::new(24, 80, here());
-        s.apply(Command::Spawn { command: "sleep 30".into(), cwd: here() });
+        s.apply(Command::Spawn {
+            command: "sleep 30".into(),
+            cwd: here(),
+        });
         // Settle: let the silent shell finish any startup writes so the screen
         // stabilizes before we assert nothing changes.
         let mut id = 0;

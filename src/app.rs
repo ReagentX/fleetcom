@@ -190,7 +190,11 @@ impl App {
     /// non-daemon escape hatch, and the deterministic target the UI harnesses use.
     pub fn new_foreground(rows: u16, cols: u16) -> App {
         App::assemble(rows, cols, |pr, c, dir| {
-            Box::new(ThreadTransport::spawn(Supervisor::new(pr, c, dir.to_path_buf())))
+            Box::new(ThreadTransport::spawn(Supervisor::new(
+                pr,
+                c,
+                dir.to_path_buf(),
+            )))
         })
     }
 
@@ -211,7 +215,10 @@ impl App {
         // one row attached mode reserves for its status bar.
         let pane_rows = rows.saturating_sub(1).max(1);
         let mut transport = make(pane_rows, cols, &invocation_dir);
-        transport.send(Command::Resize { rows: pane_rows, cols });
+        transport.send(Command::Resize {
+            rows: pane_rows,
+            cols,
+        });
         App {
             transport,
             views: Vec::new(),
@@ -246,15 +253,17 @@ impl App {
     /// Save the current task set under `name`. The core enumerates its tasks and
     /// writes the recipe; the result comes back as a `Status` event.
     fn save_session(&mut self, name: &str) {
-        self.transport
-            .send(Command::SaveSession { name: name.to_string() });
+        self.transport.send(Command::SaveSession {
+            name: name.to_string(),
+        });
     }
 
     /// Load and run a named session. Public so `main` can trigger a startup load
     /// (`multi <session>`); the outcome shows in the status line one tick later.
     pub fn load_session(&mut self, name: &str) {
-        self.transport
-            .send(Command::LoadSession { name: name.to_string() });
+        self.transport.send(Command::LoadSession {
+            name: name.to_string(),
+        });
     }
 
     /// Hand out the flag for the caller to register OS signals against.
@@ -515,7 +524,11 @@ impl App {
 
         // Nothing typed → keep the current dir selected (row 0). Filtering →
         // jump to the first match so Tab/Enter drills straight in.
-        self.dir_sel = if partial.is_empty() || cands.len() < 2 { 0 } else { 1 };
+        self.dir_sel = if partial.is_empty() || cands.len() < 2 {
+            0
+        } else {
+            1
+        };
         self.dir_candidates = cands;
     }
 
@@ -934,7 +947,11 @@ mod tests {
         /// then `pump` is deterministic with no core-thread timing to race.
         fn new_local(rows: u16, cols: u16) -> App {
             App::assemble(rows, cols, |pr, c, dir| {
-                Box::new(LocalTransport::new(Supervisor::new(pr, c, dir.to_path_buf())))
+                Box::new(LocalTransport::new(Supervisor::new(
+                    pr,
+                    c,
+                    dir.to_path_buf(),
+                )))
             })
         }
 
@@ -1018,7 +1035,10 @@ mod tests {
             }
             std::thread::sleep(Duration::from_millis(20));
         }
-        assert!(matches!(app.views[0].lifecycle, Lifecycle::Ok | Lifecycle::Failed));
+        assert!(matches!(
+            app.views[0].lifecycle,
+            Lifecycle::Ok | Lifecycle::Failed
+        ));
         assert_eq!(app.sections()[0].0, "Completed");
 
         let id = app.views[0].id;

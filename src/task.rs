@@ -57,11 +57,22 @@ impl Task {
     /// Spawn `command` under `$SHELL -c` in `cwd`, in a fresh PTY sized `rows`×`cols`.
     pub fn spawn(id: u64, command: &str, cwd: &Path, rows: u16, cols: u16) -> io::Result<Task> {
         let pair = native_pty_system()
-            .openpty(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 })
+            .openpty(PtySize {
+                rows,
+                cols,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
             .map_err(io_err)?;
 
         let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
         let mut cmd = CommandBuilder::new(shell);
+        // Non-interactive `-c`: fast and clean. It does NOT source the user's
+        // interactive rc (~/.zshrc), so shell functions/aliases like `br` won't
+        // resolve — running each command through an interactive shell (`-i`) would
+        // fix that, but it sources the full rc on *every* spawn, which is slow and
+        // triggers a pyenv/plugin thundering-herd when several launch at once. An
+        // opt-in interactive mode is the intended fix; see the README.
         cmd.arg("-c");
         cmd.arg(command);
         // Inherit the parent environment explicitly (PATH/HOME/…) and force a
@@ -149,7 +160,11 @@ impl Task {
             .lock()
             .map(|t| now.duration_since(*t) > idle_after)
             .unwrap_or(false);
-        if idle { Lifecycle::Idle } else { Lifecycle::Active }
+        if idle {
+            Lifecycle::Idle
+        } else {
+            Lifecycle::Active
+        }
     }
 
     /// The dashboard preview line: the last non-blank row of the live screen.
@@ -188,7 +203,12 @@ impl Task {
 
     pub fn resize(&mut self, rows: u16, cols: u16) -> io::Result<()> {
         self.master
-            .resize(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 })
+            .resize(PtySize {
+                rows,
+                cols,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
             .map_err(io_err)?;
         if let Ok(mut p) = self.parser.lock() {
             p.screen_mut().set_size(rows, cols);
@@ -271,7 +291,10 @@ mod tests {
             thread::sleep(Duration::from_millis(20));
         }
         assert_eq!(t.exit_code, Some(3));
-        assert_eq!(t.lifecycle(Instant::now(), Duration::from_millis(600)), Lifecycle::Failed);
+        assert_eq!(
+            t.lifecycle(Instant::now(), Duration::from_millis(600)),
+            Lifecycle::Failed
+        );
         t.terminate();
     }
 

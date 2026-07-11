@@ -67,7 +67,10 @@ pub fn connect_or_autostart() -> io::Result<UnixStream> {
         }
         thread::sleep(Duration::from_millis(10));
     }
-    Err(io::Error::new(ErrorKind::TimedOut, "daemon did not come up"))
+    Err(io::Error::new(
+        ErrorKind::TimedOut,
+        "daemon did not come up",
+    ))
 }
 
 /// Spawn `multi --daemon` detached: its own process group (so a terminal SIGHUP

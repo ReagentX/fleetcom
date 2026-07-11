@@ -38,7 +38,10 @@ pub fn read_frame(r: &mut impl Read) -> io::Result<(u8, Vec<u8>)> {
     r.read_exact(&mut len_buf)?;
     let len = u32::from_be_bytes(len_buf);
     if len > MAX_FRAME {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "frame too large"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "frame too large",
+        ));
     }
     let mut kind = [0u8; 1];
     r.read_exact(&mut kind)?;
@@ -62,9 +65,15 @@ mod tests {
         write_frame(&mut buf, KIND_CONTROL, &[0u8, 255, 7, 128]).unwrap();
 
         let mut cur = Cursor::new(buf);
-        assert_eq!(read_frame(&mut cur).unwrap(), (KIND_CONTROL, b"hello".to_vec()));
+        assert_eq!(
+            read_frame(&mut cur).unwrap(),
+            (KIND_CONTROL, b"hello".to_vec())
+        );
         assert_eq!(read_frame(&mut cur).unwrap(), (KIND_SCREEN, Vec::new()));
-        assert_eq!(read_frame(&mut cur).unwrap(), (KIND_CONTROL, vec![0, 255, 7, 128]));
+        assert_eq!(
+            read_frame(&mut cur).unwrap(),
+            (KIND_CONTROL, vec![0, 255, 7, 128])
+        );
         // Nothing left → clean EOF.
         assert!(read_frame(&mut cur).is_err());
     }
@@ -88,6 +97,9 @@ mod tests {
             }
         }
         let mut t = Trickle(&whole, 0);
-        assert_eq!(read_frame(&mut t).unwrap(), (KIND_CONTROL, b"split me".to_vec()));
+        assert_eq!(
+            read_frame(&mut t).unwrap(),
+            (KIND_CONTROL, b"split me".to_vec())
+        );
     }
 }
