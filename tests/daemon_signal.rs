@@ -1,7 +1,6 @@
 //! End-to-end daemon signal handling: SIGTERM to a serving daemon must
 //! group-kill its jobs, remove its socket, and exit. The jobs live in their own
-//! process groups, so without the daemon's signal handler they would survive
-//! its death.
+//! process groups and must be terminated explicitly during daemon shutdown.
 
 mod common;
 

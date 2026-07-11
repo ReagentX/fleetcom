@@ -1,7 +1,5 @@
-//! `fleetcom --kill` must work while another client is attached. The daemon
-//! serves one client at a time, so the old socket-based kill sat in the accept
-//! backlog until the attached client detached: a hang. The signal path (pid
-//! from the lock file, SIGTERM, wait on the flock) is what this test pins down.
+//! `fleetcom --kill` must stop the daemon and its jobs while another client is
+//! attached.
 
 mod common;
 
@@ -43,8 +41,7 @@ fn kill_works_while_a_client_is_attached() {
             .unwrap(),
     );
 
-    // Run `fleetcom --kill` with our client still attached (`stream` stays
-    // open). The old socket-based kill would block here indefinitely.
+    // Keep `stream` open while `fleetcom --kill` runs.
     let mut killer = Command::new(env!("CARGO_BIN_EXE_fleetcom"))
         .arg("--kill")
         .env("FLEETCOM_RUNTIME_DIR", &dir)

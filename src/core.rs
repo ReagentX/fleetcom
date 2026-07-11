@@ -243,7 +243,7 @@ mod tests {
         eprintln!("echo latency: {latency:?}");
         // Event-driven: the echo rides the output-wake within a frame (~8 ms). If
         // the waker were broken it would wait the 200 ms backstop; 50 ms leaves
-        // slack for CI jitter while still catching that regression.
+        // slack for CI jitter while distinguishing it from the backstop path.
         assert!(
             latency < Duration::from_millis(50),
             "echo took {latency:?}: expected an event-driven wake, not a poll"

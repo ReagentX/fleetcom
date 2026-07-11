@@ -41,8 +41,7 @@ pub enum Mode {
     Disconnected,
 }
 
-/// How the dashboard groups tasks into sections. `Custom` is deferred until
-/// tasks persist across restarts (see the `sections()` machinery it will reuse).
+/// How the dashboard groups tasks into sections.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum GroupMode {
     State,
@@ -965,7 +964,7 @@ impl App {
 
 /// Translate a key event into the bytes a PTY expects. Covers interactive use
 /// (typing, control chars, arrows, navigation); function keys and kitty-protocol
-/// extras are v2. Ctrl-letter → 0x01..=0x1a via the classic `& 0x1f` fold.
+/// extras are ignored. Ctrl-letter → 0x01..=0x1a via the classic `& 0x1f` fold.
 fn key_to_bytes(code: KeyCode, mods: KeyModifiers) -> Option<Vec<u8>> {
     let ctrl = mods.contains(KeyModifiers::CONTROL);
     match code {

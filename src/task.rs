@@ -93,19 +93,13 @@ impl Task {
 
         let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
         let mut cmd = CommandBuilder::new(shell);
-        // Non-interactive `-c`: fast and clean. It does NOT source the user's
-        // interactive rc (~/.zshrc), so shell functions/aliases like `br` won't
-        // resolve. Running each command through an interactive shell (`-i`) would
-        // fix that, but it sources the full rc on *every* spawn, which is slow and
-        // triggers a pyenv/plugin thundering-herd when several launch at once. An
-        // opt-in interactive mode is the intended fix; see the README.
+        // Use a non-interactive shell. Interactive startup files, aliases, and
+        // shell functions are not loaded.
         cmd.arg("-c");
         cmd.arg(command);
         // Inherit the parent environment explicitly (PATH/HOME/…) and force a
-        // TERM the emulator understands, so colour/interactivity are on.
-        // `vars_os`, not `vars`: `vars()` panics on any non-UTF-8 value, and
-        // spawn runs on the daemon's main thread, so that panic would kill the
-        // whole fleet on every spawn.
+        // TERM the emulator understands, so color/interactivity are on.
+        // `vars_os` preserves non-UTF-8 environment keys and values.
         for (k, v) in std::env::vars_os() {
             cmd.env(k, v);
         }
@@ -295,8 +289,8 @@ impl Task {
     ///
     /// Non-blocking on purpose: we never `join` the reader. A grandchild that
     /// escaped the group (its own `setsid`) and kept the PTY open would make the
-    /// read (and thus the whole UI) hang forever, which is exactly the freeze
-    /// this replaces. The detached thread ends on EOF; process exit reaps it.
+    /// read and block shutdown indefinitely. The detached thread ends on EOF;
+    /// process exit reaps it.
     /// Same pid-recycle gate as `terminate`.
     pub fn force_kill(&mut self) {
         if self.finished.is_none() {

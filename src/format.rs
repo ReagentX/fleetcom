@@ -21,8 +21,7 @@ pub fn rel_time(d: Duration) -> String {
 ///
 /// Control chars are flattened to spaces so a stray escape/newline from a
 /// child's output can't corrupt a dashboard row. Width is counted per-char
-/// (one column each): a known approximation that undercounts CJK/wide
-/// glyphs; the real width table is a v2 concern (Logria's `LengthFinder`).
+/// (one column each), so CJK and other wide glyphs may exceed the limit.
 pub fn truncate(s: &str, max: usize) -> String {
     if max == 0 {
         return String::new();

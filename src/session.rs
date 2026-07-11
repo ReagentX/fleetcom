@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 /// dir is preserved by the `Vec`.
 pub type SessionConfig = BTreeMap<String, Vec<String>>;
 
-/// Disallowed in a session filename → replaced with `_` (mirrors Logria).
+/// Characters replaced with `_` in session filenames.
 const DISALLOWED: &[char] = &['*', '"', '/', '\\', '<', '>', ':', '|', '?', '.'];
 
 /// Make `name` safe as a bare filename.

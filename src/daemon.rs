@@ -10,9 +10,8 @@
 //! up.
 //!
 //! SIGTERM/SIGINT/SIGHUP mean "shut down cleanly": group-kill every job, remove
-//! the socket, exit, matching the `tmux kill-server` model. The jobs live in their own
-//! process groups, so a daemon that just died would orphan them all, running
-//! and invisible to the next (empty) daemon.
+//! the socket, and exit. Jobs run in separate process groups so shutdown can
+//! terminate each complete job tree.
 
 use std::fs;
 use std::io::{self, ErrorKind, Read, Write};
@@ -92,21 +91,18 @@ fn ensure_runtime_dir(dir: &Path) -> io::Result<()> {
     }
 }
 
-/// Connect to the running daemon, autostarting one if absent. A live socket
-/// connects straight through. `ECONNREFUSED` means a stale socket file with no
-/// listener → remove it. Either way (that or `ENOENT`) spawn `fleetcom --daemon`
-/// and poll ~1s for it to bind.
+/// Connect to the running daemon, spawning one on any connection failure and
+/// polling for up to one second for it to accept connections. The daemon lock
+/// serializes concurrent starts and lets the lock holder reclaim a stale socket.
 pub fn connect_or_autostart() -> io::Result<UnixStream> {
     let path = socket_path();
     if let Ok(s) = UnixStream::connect(&path) {
         return Ok(s);
     }
-    // Any failure is handled the same way, and we NEVER unlink the socket here.
-    // `ECONNREFUSED` on AF_UNIX also means a live daemon's accept backlog is
-    // momentarily full (not a dead socket), so removing it could displace a
-    // running daemon. Just (auto)start a daemon: its flock ensures only one
-    // binds, and that sole daemon safely reclaims a genuinely stale socket under
-    // the lock (see `run_daemon`).
+    // Never unlink the socket here: `ECONNREFUSED` on AF_UNIX can also mean a
+    // live daemon's accept backlog is momentarily full.
+    // Starting another daemon is safe because the lock permits only one daemon
+    // to bind or reclaim a stale socket.
     spawn_daemon()?;
     for _ in 0..100 {
         if let Ok(s) = UnixStream::connect(&path) {
@@ -171,9 +167,8 @@ pub fn run_kill() -> io::Result<()> {
     let mut pid_str = String::new();
     file.read_to_string(&mut pid_str)?;
     let Some(pid) = pid_str.trim().parse::<i32>().ok().filter(|p| *p > 0) else {
-        // No pid in the lock file (a daemon predating it, or a torn write):
-        // fall back to a Shutdown frame over the socket. That path blocks while
-        // another client is attached, but it's strictly better than nothing.
+        // Without a usable pid, fall back to a Shutdown frame over the socket.
+        // This path waits until any attached client disconnects.
         return kill_via_socket();
     };
 
@@ -200,9 +195,8 @@ pub fn run_kill() -> io::Result<()> {
     ))
 }
 
-/// Legacy kill path: a `Shutdown` frame over the socket, blocking until the
-/// daemon closes it (jobs dead by then). Only reached when the lock file holds
-/// no pid.
+/// Send a `Shutdown` frame when the lock file contains no usable pid, blocking
+/// until the daemon closes the socket after stopping its jobs.
 fn kill_via_socket() -> io::Result<()> {
     let path = socket_path();
     match UnixStream::connect(&path) {
@@ -225,10 +219,10 @@ fn kill_via_socket() -> io::Result<()> {
 /// reconnects: jobs outlive any single client.
 pub fn run_daemon() -> io::Result<()> {
     let dir = runtime_dir();
-    ensure_runtime_dir(&dir)?; // private 0700 dir; reject a planted one (#1)
+    ensure_runtime_dir(&dir)?; // private 0700 directory
     let path = dir.join("default.sock");
 
-    // Single-instance lock (#5): only the holder of `daemon.lock` may own the
+    // Only the holder of `daemon.lock` may own the
     // socket. A concurrent autostart (two clients racing to spawn a daemon) or a
     // spurious respawn fails this lock and exits, instead of unlinking a live
     // daemon's socket out from under it. flock releases automatically when this
@@ -254,7 +248,7 @@ pub fn run_daemon() -> io::Result<()> {
     // Sole owner now: safe to reclaim a stale socket and bind it privately.
     let _ = fs::remove_file(&path);
     let listener = UnixListener::bind(&path)?;
-    fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?; // #1
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
 
     let base_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     // 24x80 until the first client's Resize, which arrives before any Spawn.
@@ -277,7 +271,7 @@ pub fn run_daemon() -> io::Result<()> {
         signal_hook::flag::register(SIGHUP, Arc::clone(&term))?;
     }
 
-    // Non-blocking accept so the daemon reaps exited jobs while idle (#3):
+    // Non-blocking accept lets the daemon reap exited jobs while idle:
     // between clients it would otherwise block in accept() and never call
     // poll_exit, so a job that finished after `q` would linger as a zombie until
     // a reconnect.
