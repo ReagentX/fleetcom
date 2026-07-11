@@ -125,6 +125,14 @@ that sit idle awaiting input.
 - It is not a full process manager: crash-resilient ownership (adopting jobs
   after a daemon *crash*, as opposed to a clean shutdown) is out of scope
 
-Commands run through a non-interactive shell (`$SHELL -c`), so functions and
-aliases defined in your `~/.zshrc` are not available — an opt-in interactive
-mode for that is planned.
+### Known limitations
+
+- Commands run through a non-interactive shell (`$SHELL -c`), so functions and
+  aliases defined in your `~/.zshrc` are not available — an opt-in interactive
+  mode for that is planned.
+- The daemon captures the environment of the client that **first** starts it and
+  runs every job under that environment. A second terminal with a different
+  `PATH` or virtualenv attaches to the same daemon, and its commands resolve
+  against the first terminal's environment, not its own.
+- The daemon serves **one client at a time**; a second `multi` connects but
+  waits until the first disconnects (`q`).
