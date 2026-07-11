@@ -664,7 +664,6 @@ impl App {
     }
 
     fn on_key_dashboard(&mut self, k: KeyEvent) {
-        let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
         match k.code {
             // `q` detaches (daemon + jobs live on); `Q` kills all and stops it.
             KeyCode::Char('q') => {
@@ -714,7 +713,13 @@ impl App {
                 self.session_sel = 0;
                 self.mode = Mode::LoadSession;
             }
-            KeyCode::Char('x') if ctrl => self.kill_or_remove_selected(),
+            // Destroy is Shift-gated, like `Q` vs `q`: plain `X` kills the
+            // selected task (or removes a finished one); `x` is a deliberate
+            // no-op. It is *not* `^X` — a Ctrl chord can't carry the shift
+            // distinction: the tty sends 0x18 for both Ctrl+x and Ctrl+Shift+X
+            // (no shift bit), so only an unmodified capital reliably means
+            // "yes, destroy this".
+            KeyCode::Char('X') => self.kill_or_remove_selected(),
             _ => {}
         }
     }

@@ -47,7 +47,7 @@ The daemon starts itself the first time you run `multi`; you never invoke
 ### Dashboard
 
 | Key | Command |
-|--|--|
+| -- | -- |
 | ↑ ↓ / `k` `j` | move the selection |
 | `Enter` | attach to the selected task |
 | `Space` | peek at the selected task |
@@ -55,7 +55,7 @@ The daemon starts itself the first time you run `multi`; you never invoke
 | `@` | new command in a directory you pick (with completion) |
 | `s` | toggle grouping: by state / by directory |
 | `m` | tag the task "in use" (pins it to the top) |
-| `^X` | kill a running task, or remove a finished one |
+| `X` | kill a running task, or remove a finished one (Shift-gated) |
 | `w` | save the current tasks as a session |
 | `o` | load a saved session |
 | `q` | disconnect — leave the daemon and jobs running |
@@ -64,7 +64,7 @@ The daemon starts itself the first time you run `multi`; you never invoke
 ### Attached
 
 | Key | Command |
-|--|--|
+| -- | -- |
 | `Ctrl-\` | background the task and return to the dashboard |
 | anything else | forwarded to the task's PTY |
 
