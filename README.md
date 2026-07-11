@@ -3,26 +3,26 @@
 A fleet-view supervisor for arbitrary shell commands.
 
 Run any number of commands, each in its own PTY, and watch them from one live
-dashboard — grouped by status, ready to peek at, attach to, or leave running in
-the background. A daemon owns the jobs, so they outlive the UI: disconnect from
-one terminal and reattach from another.
+dashboard. Tasks are grouped by status; peek at them, attach, or leave them
+running in the background. A daemon owns the jobs, so they outlive the UI:
+disconnect from one terminal and reattach from another.
 
 ## tl;dr
 
 - Run each command in its own PTY; a live dashboard groups them by status
 - Peek at any task, attach to drive it, background it again with a keystroke
-- A background daemon keeps jobs running after you disconnect — reattach any time
+- A background daemon keeps jobs running after you disconnect; reattach any time
 - Save and reload `{directory: [commands]}` sessions
 - Group by state or working directory; pick a directory to launch in with `@`
 
 ## Documentation
 
-Deeper reference — configuration and on-disk layout, the session format, every
-command, and a first-run walkthrough — lives in [`docs/`](docs/README.md).
+Configuration, on-disk layout, the session format, every command, and a first-run
+walkthrough live in [`docs/`](docs/README.md).
 
 ## Installation
 
-Unix only — it relies on PTYs and process-group signals (`killpg`).
+Unix only: it relies on PTYs and process-group signals (`killpg`).
 
 ### From source (recommended)
 
@@ -63,8 +63,8 @@ The daemon starts itself the first time you run `fleetcom`; you never invoke
 | `X` | kill a running task, or remove a finished one (Shift-gated) |
 | `w` | save the current tasks as a session |
 | `o` | load a saved session |
-| `q` | disconnect — leave the daemon and jobs running |
-| `Q` | quit — kill the jobs and stop the daemon |
+| `q` | disconnect; leave the daemon and jobs running |
+| `Q` | quit; kill the jobs and stop the daemon |
 
 ### Attached
 
@@ -79,7 +79,7 @@ The daemon starts itself the first time you run `fleetcom`; you never invoke
 
 Every task runs in its own pseudo-terminal, emulated with `vt100`. The same
 screen grid powers the dashboard preview, the peek overlay, and full attached
-rendering — so a mid-run `vim` or `htop` shows its real, live screen, and
+rendering. A mid-run `vim` or `htop` shows its real, live screen, and
 backgrounding an attached task never tells the child it lost the foreground.
 
 ### Jobs outlive the UI
@@ -92,22 +92,22 @@ view.
 
 Teardown caveat: `Q` signals each job's *process group*. A job that
 re-backgrounds itself past its own shell's exit (`cmd &`, then the shell exits)
-leaves that group and survives — kill it by hand. This is deliberate: once the
+leaves that group and survives. Kill it by hand. This is deliberate: once the
 shell is reaped its PID can be recycled, so signalling the old group could hit
 an unrelated process.
 
 ### Grouping and the `@` picker
 
 Group the fleet by state (In use / Running / Completed) or by working directory.
-`@` opens a live directory picker — the current dir first, recently used dirs
-next, matching subdirectories below — so you can launch a command anywhere
-without leaving the dashboard.
+`@` opens a live directory picker: the current dir first, recently used dirs
+next, matching subdirectories below. Launch a command anywhere without leaving
+the dashboard.
 
 ### Sessions
 
 Save the current set of `{directory: [commands]}` as a named recipe and reload
 it later (`w` / `o`, or `fleetcom <name>`). Loading re-runs the commands; it does
-not resurrect live processes — that is the daemon's job.
+not resurrect live processes. That is the daemon's job.
 
 ## Notes
 
@@ -125,7 +125,7 @@ that sit idle awaiting input.
 
 ### When to avoid it
 
-- For interactive multiplexing of shells you drive by hand, use `tmux` — `fleetcom`
+- For interactive multiplexing of shells you drive by hand, use `tmux`. `fleetcom`
   runs one command per pane, not a shell session
 - It is not a full process manager: crash-resilient ownership (adopting jobs
   after a daemon *crash*, as opposed to a clean shutdown) is out of scope
@@ -133,7 +133,7 @@ that sit idle awaiting input.
 ### Known limitations
 
 - Commands run through a non-interactive shell (`$SHELL -c`), so functions and
-  aliases defined in your `~/.zshrc` are not available — an opt-in interactive
+  aliases defined in your `~/.zshrc` are not available. An opt-in interactive
   mode for that is planned.
 - The daemon captures the environment of the client that **first** starts it and
   runs every job under that environment. A second terminal with a different
