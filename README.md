@@ -2,10 +2,7 @@
 
 A fleet-view supervisor for arbitrary shell commands.
 
-Run any number of commands, each in its own PTY, and watch them from one live
-dashboard. Tasks are grouped by status; peek at them, attach, or leave them
-running in the background. A daemon owns the jobs, so they outlive the UI:
-disconnect from one terminal and reattach from another.
+Run any number of commands, each in its own PTY, and watch them from one live dashboard. Tasks are grouped by status; peek at them, attach, or leave them running in the background. A daemon owns the jobs, so they outlive the UI: disconnect from one terminal and reattach from another.
 
 ## tl;dr
 
@@ -17,8 +14,7 @@ disconnect from one terminal and reattach from another.
 
 ## Documentation
 
-Configuration, on-disk layout, the session format, every command, and a first-run
-walkthrough live in [`docs/`](docs/README.md).
+Configuration, on-disk layout, the session format, every command, and a first-run walkthrough live in [`docs/`](docs/README.md).
 
 ## Installation
 
@@ -46,9 +42,7 @@ There are a few ways to invoke `fleetcom`:
 - `fleetcom --help` / `--version`
   - Print usage / the version and exit
 
-Unrecognized flags are an error, not a shrug: a typo can't silently change
-which mode you're in. The daemon starts itself the first time you run
-`fleetcom`; you never invoke `fleetcom --daemon` directly.
+The daemon starts itself the first time you run `fleetcom`; you never invoke `fleetcom --daemon` directly.
 
 ## Key Commands
 
@@ -63,7 +57,7 @@ which mode you're in. The daemon starts itself the first time you run
 | `@` | new command in a directory you pick (with completion) |
 | `s` | toggle grouping: by state / by directory |
 | `m` | tag the task "in use" (pins it to the top) |
-| `X` | kill a running task, or remove a finished one (Shift-gated) |
+| `X` | kill a running task (`TERM`, then `KILL` after 2 s), or remove a finished one (Shift-gated) |
 | `w` | save the current tasks as a session |
 | `o` | load a saved session |
 | `q` | disconnect; leave the daemon and jobs running |
@@ -80,71 +74,41 @@ which mode you're in. The daemon starts itself the first time you run
 
 ### One PTY per command
 
-Every task runs in its own pseudo-terminal, emulated with `vt100`. The same
-screen grid powers the dashboard preview, the peek overlay, and full attached
-rendering. A mid-run `vim` or `htop` shows its real, live screen, and
-backgrounding an attached task never tells the child it lost the foreground.
+Every task runs in its own pseudo-terminal, emulated with `vt100`. The same screen grid powers the dashboard preview, the peek overlay, and full attached rendering. A mid-run `vim` or `htop` shows its real, live screen, and backgrounding an attached task never tells the child it lost the foreground.
 
 ### Jobs outlive the UI
 
-A per-user daemon owns the processes and their terminals. `q` disconnects the
-client and leaves everything running; the next `fleetcom` reattaches. `Q` (or
-`fleetcom --kill`) group-kills the running jobs and stops the daemon. Signalling
-the daemon itself (`SIGTERM`/`SIGINT`/`SIGHUP`) is the same clean shutdown:
-jobs killed, socket removed. If the daemon dies, the client says so and offers
-to reconnect rather than freezing on a stale view.
+A per-user daemon owns the processes and their terminals. `q` disconnects the client and leaves everything running; the next `fleetcom` reattaches. `Q` (or `fleetcom --kill`) stops the daemon and kills the jobs: each job's process group gets `SIGTERM`, and anything still running after a 2-second grace gets `SIGKILL`. Jobs that handle `TERM` exit in milliseconds, so quitting is only ever slowed by a job that ignores it. Signalling the daemon itself (`SIGTERM`/`SIGINT`/`SIGHUP`) is the same clean shutdown, and `fleetcom --kill` works even while another client is attached (it signals the daemon rather than queueing behind the socket). If the daemon dies, the client says so and offers to reconnect rather than freezing on a stale view.
 
-Teardown caveat: `Q` signals each job's *process group*. A job that
-re-backgrounds itself past its own shell's exit (`cmd &`, then the shell exits)
-leaves that group and survives. Kill it by hand. This is deliberate: once the
-shell is reaped its PID can be recycled, so signalling the old group could hit
-an unrelated process.
+Teardown caveat: signals go to each job's *process group*. A job that re-backgrounds itself past its own shell's exit (`cmd &`, then the shell exits) leaves that group and survives. Kill it by hand. This is deliberate: once the shell is reaped its PID can be recycled, so signalling the old group could hit an unrelated process.
 
 ### Grouping and the `@` picker
 
-Group the fleet by state (In use / Running / Completed) or by working directory.
-`@` opens a live directory picker: the current dir first, recently used dirs
-next, matching subdirectories below. Launch a command anywhere without leaving
-the dashboard.
+Group the fleet by state (In use / Running / Completed) or by working directory. `@` opens a live directory picker: the current dir first, recently used dirs next, matching subdirectories below. Launch a command anywhere without leaving the dashboard.
 
 ### Sessions
 
-Save the current set of `{directory: [commands]}` as a named recipe and reload
-it later (`w` / `o`, or `fleetcom <name>`). Loading re-runs the commands; it does
-not resurrect live processes. That is the daemon's job.
+Save the current set of `{directory: [commands]}` as a named recipe and reload it later (`w` / `o`, or `fleetcom <name>`). Loading re-runs the commands; it does not resurrect live processes. That is the daemon's job.
 
 ## Notes
 
-`fleetcom` mimics the multi-pane "fleet view" of an agentic coding session, but for
-any shell command. It is built for supervising several concurrent, long-running
-commands at once: build/test/watch loops, servers, and interactive agent CLIs
-that sit idle awaiting input.
+`fleetcom` mimics the multi-pane "fleet view" of an agentic coding session, but for any shell command. It is built for supervising several concurrent, long-running commands at once: build/test/watch loops, servers, and interactive agent CLIs that sit idle awaiting input.
 
 ### When to use it
 
-- You run several long-lived commands and want one place to watch, tag, and
-  attach to them
+- You run several long-lived commands and want one place to watch, tag, and attach to them
 - You want those jobs to survive closing your terminal, and to reattach later
 - You launch the same commands often and want them saved as a session
 
 ### When to avoid it
 
-- For interactive multiplexing of shells you drive by hand, use `tmux`. `fleetcom`
-  runs one command per pane, not a shell session
+- For interactive multiplexing of shells you drive by hand, use `tmux`. `fleetcom` runs one command per pane, not a shell session
 - It is not a full process manager: crash-resilient ownership (adopting jobs
   after a daemon *crash*, as opposed to a clean shutdown) is out of scope
 
 ### Known limitations
 
-- Commands run through a non-interactive shell (`$SHELL -c`), so functions and
-  aliases defined in your `~/.zshrc` are not available. An opt-in interactive
-  mode for that is planned.
-- The daemon captures the environment of the client that **first** starts it and
-  runs every job under that environment. A second terminal with a different
-  `PATH` or virtualenv attaches to the same daemon, and its commands resolve
-  against the first terminal's environment, not its own.
-- The daemon serves **one client at a time**; a second `fleetcom` connects but
-  waits until the first disconnects (`q`).
-- The daemon can only clean up when it gets the chance: `SIGKILL` (or a crash)
-  skips its shutdown path, and the jobs keep running, unowned. The next
-  `fleetcom` starts an empty daemon that knows nothing about them.
+- Commands run through a non-interactive shell (`$SHELL -c`), so functions and aliases defined in your `~/.zshrc` are not available. An opt-in interactive mode for that is planned.
+- The daemon captures the environment of the client that **first** starts it and runs every job under that environment. A second terminal with a different `PATH` or virtualenv attaches to the same daemon, and its commands resolve against the first terminal's environment, not its own.
+- The daemon serves **one client at a time**; a second `fleetcom` connects but waits until the first disconnects (`q`).
+- The daemon can only clean up when it gets the chance: `SIGKILL` (or a crash) skips its shutdown path, and the jobs keep running, unowned. The next `fleetcom` starts an empty daemon that knows nothing about them.

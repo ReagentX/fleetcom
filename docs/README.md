@@ -28,7 +28,7 @@ sessions) is durable.
 
 ### Runtime directory (socket + lock)
 
-Holds `default.sock` (the client↔daemon socket, mode `0600`) and `daemon.lock` (the single-instance `flock`). The directory is created `0700` and validated: if it already exists it must be a real directory this user owns. A symlink or a directory planted by someone else is rejected, so a shared `/tmp` can't be used to hijack the socket.
+Holds `default.sock` (the client↔daemon socket, mode `0600`) and `daemon.lock` (the single-instance `flock`; the running daemon writes its pid inside, which is what `--kill` signals). The directory is created `0700` and validated: if it already exists it must be a real directory this user owns. A symlink or a directory planted by someone else is rejected, so a shared `/tmp` can't be used to hijack the socket.
 
 Resolved in this order:
 
@@ -106,14 +106,14 @@ Each row is `glyph · tag · command · latest output · age`. `Space` peeks: a 
   ✻  npm run dev              VITE v5.0  ready in 312 ms        1m
 ```
 
-`w`, a name, `Enter` saves the fleet as a [session](sessions.md). Now `q` disconnects: the daemon and both jobs keep running without you. Run `fleetcom` again and you reattach to exactly this dashboard. `Q` (or `fleetcom --kill`) group-kills the jobs and stops the daemon.
+`w`, a name, `Enter` saves the fleet as a [session](sessions.md). Now `q` disconnects: the daemon and both jobs keep running without you. Run `fleetcom` again and you reattach to exactly this dashboard. `Q` (or `fleetcom --kill`) kills the jobs (`TERM`, then `KILL` after a 2 s grace) and stops the daemon.
 
 ## Notes & Caveats
 
 - **Commands run through a non-interactive shell** (`$SHELL -c`), so functions and aliases from your `~/.zshrc` aren't available. An opt-in interactive mode is planned.
 - **The daemon captures the environment of the client that _first_ starts it** and runs every job under that environment. A second terminal with a different `PATH` or virtualenv attaches to the same daemon, and its commands resolve against the first terminal's environment, not its own.
 - **The daemon serves one client at a time.** A second `fleetcom` connects but waits until the first disconnects (`q`).
-- **`Q` signals each job's _process group_.** A job that re-backgrounds itself past its own shell's exit (`cmd &`, then the shell exits) leaves that group and survives. Kill it by hand. This is deliberate: once the shell is reaped its PID can be recycled, so signalling the old group could hit an unrelated process.
+- **Kills are graceful-first.** `X`, `Q`, `--kill`, and daemon signals all send `SIGTERM` to the job's _process group_ and escalate to `SIGKILL` only after a 2-second grace, so a `TERM` handler gets its chance to flush and exit cleanly. A job that re-backgrounds itself past its own shell's exit (`cmd &`, then the shell exits) leaves that group and survives either signal. Kill it by hand. This is deliberate: once the shell is reaped its PID can be recycled, so signalling the old group could hit an unrelated process.
 - **`--foreground` is ephemeral.** It runs the core in-process with no daemon, so the jobs die when you quit and there is nothing to reattach to.
 - **Signalling the daemon is a clean shutdown.** `SIGTERM`/`SIGINT`/`SIGHUP` to the daemon group-kill every job, remove the socket, and exit. This is the same teardown as `Q` or `fleetcom --kill`.
 - **Crash-resilient ownership is out of scope.** Adopting jobs after a daemon _crash_ (as opposed to a clean shutdown) is not supported. `SIGKILL` (or a panic) skips the shutdown path entirely: the jobs keep running, unowned, and the next `fleetcom` starts an empty daemon that knows nothing about them.

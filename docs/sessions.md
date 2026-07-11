@@ -30,16 +30,16 @@ A session is a JSON object mapping a working directory to the commands to run th
 }
 ```
 
-- **Keys** are directory paths: each task's working directory.
-- **Values** are ordered lists of shell command strings. Order is preserved, and each command runs in its own PTY under that directory.
-- **Directories serialize alphabetically** (the on-disk form is a `BTreeMap`), so a session's file is stable no matter what order you added the tasks in: clean diffs, git-friendly.
+- Keys are directory paths: each task's working directory.
+- Values are ordered lists of shell command strings. Order is preserved, and each command runs in its own PTY under that directory.
+- Directories serialize alphabetically (the on-disk form is a `BTreeMap`), so a session's file is stable no matter what order you added the tasks in: clean diffs, git-friendly.
 
-Hand-editing is fine. The schema is a flat map: no version field, no metadata. An unparseable file is an error at load; anything that isn't a `string → [string]` entry is skipped.
+Hand-editing is fine. The schema is a flat map: no version field, no metadata. An unparsable file is an error at load; anything that isn't a `string → [string]` entry is skipped.
 
 ## Saving and loading
 
-- **Save**: `w` in the dashboard, type a name, `Enter`. Writes the current task set (each task's directory and command) to `<name>.json`.
-- **Load in-app**: `o`, pick from the list, `Enter`.
-- **Load at launch**: `fleetcom <name>`.
+- Save: `w` in the dashboard, type a name, `Enter`. Writes the current task set (each task's directory and command) to `<name>.json`.
+- Load in-app: `o`, pick from the list, `Enter`.
+- Load at launch: `fleetcom <name>`.
 
 Loading spawns every command fresh: it's a *replay*, not a restore. You get new processes running the same commands, not the exact processes you had when you saved. (Live jobs already outlive a disconnect on their own; that's the daemon, not the session.)

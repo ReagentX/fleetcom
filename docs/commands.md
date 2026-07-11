@@ -9,7 +9,7 @@
 | `fleetcom` | Connect to the daemon (autostarting it if needed) and open the dashboard |
 | `fleetcom <session>` | Load a saved [session](sessions.md) at startup, then open the dashboard |
 | `fleetcom --foreground` | Run the core in-process, no daemon; jobs die when you quit |
-| `fleetcom --kill` | Tell a running daemon to group-kill every job and stop |
+| `fleetcom --kill` | Stop the daemon and kill every job it owns; works even while another client is attached (it signals the daemon rather than queueing behind the socket) |
 | `fleetcom --help` / `-h` | Print usage and exit |
 | `fleetcom --version` / `-V` | Print the version and exit |
 
@@ -26,7 +26,7 @@
 | `@` | New command in a directory you pick |
 | `s` | Toggle grouping: by state / by directory |
 | `m` | Tag the selected task "in use" (toggles) |
-| `X` | Kill a running task, or remove a finished one |
+| `X` | Kill a running task (`TERM`, then `KILL` after 2 s), or remove a finished one |
 | `w` | Save the current tasks as a session |
 | `o` | Load a saved session |
 | `q` (or `Ctrl-C`) | Disconnect; leave the daemon and jobs running |
@@ -44,23 +44,33 @@
 
 ### Mechanics
 
-**Peek vs. attach.** `Space` opens a read-only overlay: the selected task's live screen, framed in a box and updating as it runs. `↑`/`↓` move between tasks *without leaving peek*, so you can flip through the fleet; `Space`, `Esc`, or `q` closes it. `Enter` (from the dashboard or from peek) *attaches*: the task takes the whole terminal and your keystrokes go to it, cursor and all, so a live `vim` or `htop` behaves exactly as it would on its own.
+#### Peek vs. attach
 
-**Attach and background.** While attached, one key is reserved: `Ctrl-\` backgrounds the task and returns you to the dashboard. Everything else (including `Ctrl-C`, `Ctrl-Z`, `Ctrl-D`) is forwarded verbatim to the child, so the program never learns it lost the foreground. (`Ctrl-\` is the physical chord; it works whether the terminal reports it as `Ctrl-\` or, under crossterm's legacy decoder, `Ctrl-4`.)
+`Space` opens a read-only overlay: the selected task's live screen, framed in a box and updating as it runs. `↑`/`↓` move between tasks *without leaving peek*, so you can flip through the fleet; `Space`, `Esc`, or `q` closes it. `Enter` (from the dashboard or from peek) *attaches*: the task takes the whole terminal and your keystrokes go to it, cursor and all, so a live `vim` or `htop` behaves exactly as it would on its own.
 
-**Destroy is Shift-gated.** `X` (capital) kills the selected task if it's running, or removes it from the list if it's finished. Lowercase `x` is a deliberate no-op: the same guard as `Q` vs. `q`. It is *not* `Ctrl-X`: the terminal sends byte `0x18` for both `Ctrl+x` and `Ctrl+Shift+X`, with no shift bit, so a Ctrl chord can't carry the distinction. Only an unmodified capital reliably means "yes, destroy this."
+#### Attach and background
 
-**Detach vs. quit.** `q` (and `Ctrl-C`) disconnects the client and leaves the daemon and its jobs running; the next `fleetcom` reattaches. `Q` group-kills every job and stops the daemon. `Ctrl-C` is intercepted only in the dashboard; while attached it belongs to the child.
+While attached, one key is reserved: `Ctrl-\` backgrounds the task and returns you to the dashboard. Everything else (including `Ctrl-C`, `Ctrl-Z`, `Ctrl-D`) is forwarded verbatim to the child, so the program never learns it lost the foreground. (`Ctrl-\` is the physical chord; it works whether the terminal reports it as `Ctrl-\` or, under crossterm's legacy decoder, `Ctrl-4`.)
 
-**Grouping and tagging.** `s` toggles between grouping by state (In use / Running / Completed) and by working directory. `m` toggles the "in use" tag on the selected task; tagged tasks are marked `◆` and pinned to the top, so the handful you're actively steering stay reachable as the list grows.
+#### Destroy is Shift-gated
+
+`X` (capital) kills the selected task if it's running, or removes it from the list if it's finished. Lowercase `x` is a deliberate no-op: the same guard as `Q` vs. `q`. It is *not* `Ctrl-X`: the terminal sends byte `0x18` for both `Ctrl+x` and `Ctrl+Shift+X`, with no shift bit, so a Ctrl chord can't carry the distinction. Only an unmodified capital reliably means "yes, destroy this."
+
+#### Detach vs. quit
+
+`q` (and `Ctrl-C`) disconnects the client and leaves the daemon and its jobs running; the next `fleetcom` reattaches. `Q` kills every job (`TERM` to each process group, `KILL` after a 2 s grace for any that ignore it) and stops the daemon. `Ctrl-C` is intercepted only in the dashboard; while attached it belongs to the child.
+
+#### Grouping and tagging
+
+`s` toggles between grouping by state (In use / Running / Completed) and by working directory. `m` toggles the "in use" tag on the selected task; tagged tasks are marked `◆` and pinned to the top, so the handful you're actively steering stay reachable as the list grows.
 
 ## The `@` directory picker
 
 `@` opens a bottom panel: a typed-path field, plus the directories that match it. There are three kinds of row, and `Enter` does the right thing for each:
 
-- **Current directory**: run the command right here (`Enter`).
-- **Recent directories**: ones you've launched in before; `Enter` runs there, `Tab`/`→` browses into them.
-- **Subdirectories** of the current path: `Enter` or `Tab`/`→` descends into one.
+- Current directory: run the command right here (`Enter`).
+- Recent directories: ones you've launched in before; `Enter` runs there, `Tab`/`→` browses into them.
+- Subdirectories of the current path: `Enter` or `Tab`/`→` descends into one.
 
 Type to filter; `Backspace` climbs back up the typed path; `↑`/`↓` move the highlight; `Esc` cancels. It's live completion, so you can walk anywhere in the tree and launch there without leaving the dashboard.
 
