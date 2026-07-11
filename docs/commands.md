@@ -59,7 +59,7 @@ While attached, one key is reserved: `Ctrl-\` backgrounds the task and returns y
 
 #### Rerun
 
-`r` re-executes a *finished* task's command — the same command string, in the same directory, under the same daemon-captured environment as every spawn — in the same row: the task keeps its id, its `◆` tag, and its list position; only the clock and the screen reset. On a running task `r` is a no-op: a rerun that had to kill first would be destructive, and destroy is `X`'s Shift-gated job. It also works from inside peek, so you can read a result and rerun it without closing the overlay.
+`r` re-executes a *finished* task's command (same command string, same directory, same daemon-captured environment as every spawn) in the same row: the task keeps its id, its `◆` tag, and its list position; only the clock and the screen reset. On a running task `r` is a no-op: a rerun that had to kill first would be destructive, and destroy is `X`'s Shift-gated job. It also works from inside peek, so you can read a result and rerun it without closing the overlay.
 
 #### Detach vs. quit
 

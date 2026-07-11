@@ -717,8 +717,8 @@ mod tests {
         );
     }
 
-    /// `Restart`'s contract: a finished task reruns in place — same id, tag
-    /// carried over — and the command really re-executes (the marker file
+    /// `Restart`'s contract: a finished task reruns in place (same id, tag
+    /// carried over), and the command really re-executes (the marker file
     /// gains one line per run).
     #[test]
     fn restart_reruns_finished_task_in_place() {

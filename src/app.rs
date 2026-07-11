@@ -1159,7 +1159,7 @@ mod tests {
     }
 
     /// `r` sends `Restart` only for a finished selection. On a running task
-    /// the key is a client-side no-op — nothing crosses the transport, so no
+    /// the key is a client-side no-op: nothing crosses the transport, so no
     /// supervisor complaint lands in the status line. On a finished one the
     /// same row (same id) comes back to life and the command re-executes.
     #[test]
