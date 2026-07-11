@@ -117,19 +117,27 @@ impl Supervisor {
         }
     }
 
+    /// Reap any exited children — latch their exit code and finish time. Cheap
+    /// (no snapshotting), so the daemon can call it while **no client is
+    /// attached**: otherwise a job that exits after `q` stays a zombie until
+    /// someone reconnects and a full `tick` runs.
+    pub fn reap(&mut self) {
+        for t in &mut self.tasks {
+            // Swallow a reap error rather than propagate: the task just isn't
+            // reaped this pass and is retried next. try_wait failing is rare and
+            // must not take down the loop.
+            let _ = t.poll_exit();
+        }
+    }
+
     /// One step of the core's own loop: reap exits, then emit a fresh task
     /// snapshot (plus the watched task's screen). In process the client calls
     /// this each UI tick; in the daemon it runs on the core's thread and the
     /// events flow over the socket. Either way the client only ever sees
     /// `drain`ed events, never a `Task`.
     pub fn tick(&mut self) {
+        self.reap();
         let now = Instant::now();
-        for t in &mut self.tasks {
-            // Swallow a reap error rather than propagate: the task just isn't
-            // reaped this tick and is retried next. try_wait failing is rare and
-            // must not take down the whole loop.
-            let _ = t.poll_exit();
-        }
 
         let views = self
             .tasks

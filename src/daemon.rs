@@ -183,13 +183,30 @@ pub fn run_daemon() -> io::Result<()> {
     // 24x80 until the first client's Resize, which arrives before any Spawn.
     let mut sup = Supervisor::new(24, 80, base_dir);
 
-    for conn in listener.incoming() {
-        let Ok(stream) = conn else { break };
-        if serve_client(&mut sup, stream) == ServeOutcome::Shutdown {
-            break;
+    // Non-blocking accept so the daemon reaps exited jobs while idle (#3):
+    // between clients it would otherwise block in accept() and never call
+    // poll_exit, so a job that finished after `q` would linger as a zombie until
+    // a reconnect.
+    listener.set_nonblocking(true)?;
+    const IDLE_REAP: Duration = Duration::from_millis(100);
+    loop {
+        match listener.accept() {
+            Ok((stream, _)) => {
+                // serve_client does blocking reads; force the accepted stream
+                // blocking regardless of the listener's mode (BSD would inherit).
+                stream.set_nonblocking(false)?;
+                if serve_client(&mut sup, stream) == ServeOutcome::Shutdown {
+                    break;
+                }
+                // Otherwise the client merely disconnected; keep the tasks and
+                // accept the next `multi`, which reattaches to them.
+            }
+            Err(e) if e.kind() == ErrorKind::WouldBlock => {
+                sup.reap();
+                thread::sleep(IDLE_REAP);
+            }
+            Err(_) => break,
         }
-        // Otherwise the client merely disconnected; loop to accept the next one.
-        // Tasks live on in `sup` — the next `multi` reattaches to them.
     }
     let _ = fs::remove_file(&path);
     Ok(())
