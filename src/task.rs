@@ -13,6 +13,7 @@ use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system}
 use rustix::process::{WaitId, WaitIdOptions, waitid};
 
 use crate::core::{Wake, Waker};
+use crate::protocol::MouseKind;
 
 /// Map a dependency error (portable-pty returns `anyhow`) into `io::Error` so
 /// the whole crate speaks stdlib `io::Result` and never grows an `anyhow` dep.
@@ -61,25 +62,45 @@ pub fn paste_bytes(bracketed: bool, content: &[u8]) -> Vec<u8> {
     }
 }
 
-/// Encode one wheel notch for a child, routed by the state its own escape
-/// sequences put the screen in. Three tiers: a child that requested a mouse
-/// protocol gets a real wheel event in its negotiated encoding; a full-screen
-/// child (vim, less) gets the three arrow presses "alternate scroll" mode
-/// would send, in its cursor-key encoding; an inline child that asked for
-/// neither gets `None` — forwarding arrows there is exactly the wheel-spam
-/// this routing exists to stop.
-pub fn scroll_bytes(screen: &vt100::Screen, up: bool, col: u16, row: u16) -> Option<Vec<u8>> {
+/// Encode a mouse action using the child's current terminal mode. Mouse
+/// protocols determine supported actions and encoding. Without one,
+/// full-screen children receive wheel actions as alternate-scroll arrows;
+/// unsupported actions return `None`.
+pub fn mouse_bytes(screen: &vt100::Screen, kind: MouseKind, col: u16, row: u16) -> Option<Vec<u8>> {
     use vt100::{MouseProtocolEncoding, MouseProtocolMode};
-    if screen.mouse_protocol_mode() != MouseProtocolMode::None {
-        let button: u16 = if up { 64 } else { 65 };
+    let mode = screen.mouse_protocol_mode();
+    if mode != MouseProtocolMode::None {
+        // The mode determines supported event classes.
+        let wanted = match kind {
+            MouseKind::WheelUp | MouseKind::WheelDown | MouseKind::Press(_) => true,
+            MouseKind::Release(_) => mode != MouseProtocolMode::Press,
+            MouseKind::Drag(_) => matches!(
+                mode,
+                MouseProtocolMode::ButtonMotion | MouseProtocolMode::AnyMotion
+            ),
+        };
+        if !wanted {
+            return None;
+        }
+        // xterm button codes: wheel 64/65; drag adds 32.
+        let code: u16 = match kind {
+            MouseKind::WheelUp => 64,
+            MouseKind::WheelDown => 65,
+            MouseKind::Press(b) | MouseKind::Release(b) => b as u16,
+            MouseKind::Drag(b) => 32 + b as u16,
+        };
+        let release = matches!(kind, MouseKind::Release(_));
         return Some(match screen.mouse_protocol_encoding() {
+            // SGR releases use the `m` suffix.
             MouseProtocolEncoding::Sgr => {
-                format!("\x1b[<{};{};{}M", button, col + 1, row + 1).into_bytes()
+                let suffix = if release { 'm' } else { 'M' };
+                format!("\x1b[<{};{};{}{}", code, col + 1, row + 1, suffix).into_bytes()
             }
-            // UTF-8 mouse fields encode `32 + value` up to 2047.
+            // UTF-8 fields encode `32 + value` up to 2047; releases use code 3.
             MouseProtocolEncoding::Utf8 => {
+                let code = if release { 3 } else { code };
                 let mut out = b"\x1b[M".to_vec();
-                for v in [32 + button, 33 + col.min(2014), 33 + row.min(2014)] {
+                for v in [32 + code, 33 + col.min(2014), 33 + row.min(2014)] {
                     let mut buf = [0u8; 4];
                     // Values are bounded to valid UTF-8 scalar values.
                     let c = char::from_u32(u32::from(v)).unwrap_or(' ');
@@ -87,18 +108,27 @@ pub fn scroll_bytes(screen: &vt100::Screen, up: bool, col: u16, row: u16) -> Opt
                 }
                 out
             }
-            // Default mouse fields are single bytes and cap at 255.
-            MouseProtocolEncoding::Default => vec![
-                0x1b,
-                b'[',
-                b'M',
-                32 + button as u8,
-                (33 + col.min(222)) as u8,
-                (33 + row.min(222)) as u8,
-            ],
+            // Default fields are single bytes capped at 255; releases use code 3.
+            MouseProtocolEncoding::Default => {
+                let code = if release { 3 } else { code };
+                vec![
+                    0x1b,
+                    b'[',
+                    b'M',
+                    32 + code as u8,
+                    (33 + col.min(222)) as u8,
+                    (33 + row.min(222)) as u8,
+                ]
+            }
         });
     }
     if screen.alternate_screen() {
+        let up = match kind {
+            MouseKind::WheelUp => true,
+            MouseKind::WheelDown => false,
+            // Only wheel actions map to alternate-scroll arrows.
+            _ => return None,
+        };
         let arrow: &[u8] = match (screen.application_cursor(), up) {
             (true, true) => b"\x1bOA",
             (true, false) => b"\x1bOB",
@@ -420,17 +450,28 @@ impl Task {
         self.send_input(&paste_bytes(bracketed, content))
     }
 
-    /// Forward one wheel notch, routed by the child's own screen state; see
-    /// [`scroll_bytes`]. A child that gets `None` receives nothing at all.
-    pub fn send_scroll(&mut self, up: bool, col: u16, row: u16) -> io::Result<()> {
+    /// Forward one mouse action, routed by the child's own screen state; see
+    /// [`mouse_bytes`]. A child that gets `None` receives nothing at all.
+    pub fn send_mouse(&mut self, kind: MouseKind, col: u16, row: u16) -> io::Result<()> {
         let bytes = {
             let p = grid(&self.parser);
-            scroll_bytes(p.screen(), up, col, row)
+            mouse_bytes(p.screen(), kind, col, row)
         };
         match bytes {
             Some(b) => self.send_input(&b),
             None => Ok(()),
         }
+    }
+
+    /// Return whether the child requests mouse input and uses the alternate
+    /// screen. The client receives these values in each `ScreenView`.
+    pub fn input_hints(&self) -> (bool, bool) {
+        let p = grid(&self.parser);
+        let s = p.screen();
+        (
+            s.mouse_protocol_mode() != vt100::MouseProtocolMode::None,
+            s.alternate_screen(),
+        )
     }
 
     /// Ask the whole job to exit: SIGTERM to the process *group*, not just the
@@ -487,6 +528,7 @@ impl Drop for Task {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::protocol::MouseBtn;
 
     fn here() -> PathBuf {
         std::env::current_dir().unwrap()
@@ -677,49 +719,111 @@ mod tests {
     /// inline child, alternate-scroll arrows for a full-screen one, real mouse
     /// events once a protocol is requested — in the negotiated encoding.
     #[test]
-    fn scroll_routes_by_child_state() {
+    fn wheel_routes_by_child_state() {
+        let up = MouseKind::WheelUp;
+        let down = MouseKind::WheelDown;
         let mut p = vt100::Parser::new(24, 80, 0);
         // Inline child, no mouse: dropped, not translated into arrow spam.
-        assert_eq!(scroll_bytes(p.screen(), true, 0, 0), None);
+        assert_eq!(mouse_bytes(p.screen(), up, 0, 0), None);
         // Full-screen child: three arrows per notch, normal cursor keys.
         p.process(b"\x1b[?1049h");
         assert_eq!(
-            scroll_bytes(p.screen(), true, 0, 0),
+            mouse_bytes(p.screen(), up, 0, 0),
             Some(b"\x1b[A\x1b[A\x1b[A".to_vec())
+        );
+        // Clicks mean nothing to a full-screen child without a mouse mode.
+        assert_eq!(
+            mouse_bytes(p.screen(), MouseKind::Press(MouseBtn::Left), 0, 0),
+            None
         );
         // Application cursor keys switch the arrows to SS3 form.
         p.process(b"\x1b[?1h");
         assert_eq!(
-            scroll_bytes(p.screen(), false, 0, 0),
+            mouse_bytes(p.screen(), down, 0, 0),
             Some(b"\x1bOB\x1bOB\x1bOB".to_vec())
         );
         // SGR mouse protocol: a real wheel event, 1-based coordinates.
         p.process(b"\x1b[?1000h\x1b[?1006h");
         assert_eq!(
-            scroll_bytes(p.screen(), true, 4, 2),
+            mouse_bytes(p.screen(), up, 4, 2),
             Some(b"\x1b[<64;5;3M".to_vec())
         );
         // Default encoding: single-byte cells, clamped to fit.
         p.process(b"\x1b[?1006l");
         assert_eq!(
-            scroll_bytes(p.screen(), false, 0, 0),
+            mouse_bytes(p.screen(), down, 0, 0),
             Some(vec![0x1b, b'[', b'M', 32 + 65, 33, 33])
         );
         assert_eq!(
-            scroll_bytes(p.screen(), false, 500, 500),
+            mouse_bytes(p.screen(), down, 500, 500),
             Some(vec![0x1b, b'[', b'M', 32 + 65, 255, 255])
         );
         // UTF-8 mouse coordinates can use multiple bytes.
         p.process(b"\x1b[?1005h");
         assert_eq!(
-            scroll_bytes(p.screen(), true, 200, 2),
+            mouse_bytes(p.screen(), up, 200, 2),
             Some(vec![0x1b, b'[', b'M', 32 + 64, 0xc3, 0xa9, 33 + 2])
         );
         // UTF-8 mouse coordinates cap at the protocol limit.
         assert_eq!(
-            scroll_bytes(p.screen(), true, 5000, 5000),
+            mouse_bytes(p.screen(), up, 5000, 5000),
             Some(vec![0x1b, b'[', b'M', 32 + 64, 0xdf, 0xbf, 0xdf, 0xbf])
         );
+    }
+
+    /// Verify mode-specific button delivery and encoding.
+    #[test]
+    fn buttons_respect_mode_granularity_and_encoding() {
+        let press = MouseKind::Press(MouseBtn::Left);
+        let drag = MouseKind::Drag(MouseBtn::Left);
+        let release = MouseKind::Release(MouseBtn::Left);
+
+        // X10 mode: presses only.
+        let mut p = vt100::Parser::new(24, 80, 0);
+        p.process(b"\x1b[?9h");
+        assert_eq!(
+            mouse_bytes(p.screen(), press, 4, 2),
+            Some(vec![0x1b, b'[', b'M', 32, 33 + 4, 33 + 2])
+        );
+        assert_eq!(mouse_bytes(p.screen(), release, 4, 2), None);
+        assert_eq!(mouse_bytes(p.screen(), drag, 4, 2), None);
+
+        // 1000 with SGR: releases use `m`; drags remain disabled.
+        p.process(b"\x1b[?9l\x1b[?1000h\x1b[?1006h");
+        assert_eq!(
+            mouse_bytes(p.screen(), press, 4, 2),
+            Some(b"\x1b[<0;5;3M".to_vec())
+        );
+        assert_eq!(
+            mouse_bytes(p.screen(), release, 4, 2),
+            Some(b"\x1b[<0;5;3m".to_vec())
+        );
+        assert_eq!(mouse_bytes(p.screen(), drag, 4, 2), None);
+
+        // 1002 enables drag events.
+        p.process(b"\x1b[?1002h");
+        assert_eq!(
+            mouse_bytes(p.screen(), drag, 4, 2),
+            Some(b"\x1b[<32;5;3M".to_vec())
+        );
+        // Non-SGR releases use code 3.
+        p.process(b"\x1b[?1006l");
+        assert_eq!(
+            mouse_bytes(p.screen(), release, 4, 2),
+            Some(vec![0x1b, b'[', b'M', 32 + 3, 33 + 4, 33 + 2])
+        );
+    }
+
+    /// Input hints track child terminal-mode changes.
+    #[test]
+    fn input_hints_track_child_modes() {
+        let mut t = spawn(8, "sleep 5");
+        assert_eq!(t.input_hints(), (false, false));
+        grid(&t.parser).process(b"\x1b[?1000h");
+        assert_eq!(t.input_hints(), (true, false));
+        grid(&t.parser).process(b"\x1b[?1000l\x1b[?1049h");
+        assert_eq!(t.input_hints(), (false, true));
+        t.terminate();
     }
 
     /// A poisoned grid mutex (a vt100 panic inside the guard) must degrade to

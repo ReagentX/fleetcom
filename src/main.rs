@@ -24,10 +24,11 @@ use std::sync::atomic::AtomicBool;
 use crossterm::{
     cursor::{Hide, Show},
     event::{
-        DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-        KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+        DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, KeyboardEnhancementFlags,
+        PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
     },
     execute,
+    style::Print,
     terminal::{
         Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode,
         enable_raw_mode, size, supports_keyboard_enhancement,
@@ -160,21 +161,18 @@ fn main() -> io::Result<()> {
     // any error: degrade to plain Enter, never to broken input.
     let kitty = supports_keyboard_enhancement().unwrap_or(false);
     execute!(out, EnterAlternateScreen, Clear(ClearType::All), Hide)?;
-    // The input modes the client depends on: kitty "disambiguate" makes
-    // modified Enter visible at all (a legacy terminal sends a bare CR for
-    // Shift+Enter and Enter alike); bracketed paste turns a clipboard into one
-    // `Paste` event instead of a keystroke flood; mouse capture turns the
-    // wheel into wheel events instead of the arrow keys terminals synthesize
-    // on the alternate screen. The kitty push comes after EnterAlternateScreen
-    // because the flag stack is per screen buffer: flags pushed on the main
-    // screen would not apply here.
+    // Keyboard enhancement distinguishes modified Enter; bracketed paste
+    // delivers the clipboard as one event. Keyboard flags are screen-specific,
+    // so enable them after entering the alternate screen. Mouse capture is
+    // managed by `App::sync_input_modes`. Save and enable alternate scroll;
+    // restoration occurs in `restore_terminal`.
     if kitty {
         execute!(
             out,
             PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
         )?;
     }
-    execute!(out, EnableBracketedPaste, EnableMouseCapture)?;
+    execute!(out, EnableBracketedPaste, Print("\x1b[?1007s\x1b[?1007h"))?;
     // `fleetcom [--foreground] <session>` loads that session at startup; the
     // result shows in the status line.
     if let Some(name) = &session {
@@ -187,17 +185,15 @@ fn main() -> io::Result<()> {
     result
 }
 
-/// Undo every terminal mode `main` set. Best-effort throughout: on SIGHUP the
-/// terminal is already gone, and a failed escape write must not short-circuit
-/// `disable_raw_mode`. The kitty pop is unconditional — popping an empty stack
-/// is a no-op, and terminals without the protocol discard the unknown
-/// sequence — so this needs no record of whether the push happened.
+/// Restore terminal modes changed by the application. Cleanup is best-effort
+/// so a failed terminal write does not prevent raw mode from being disabled.
 fn restore_terminal(out: &mut io::Stdout) {
     let _ = execute!(
         out,
         PopKeyboardEnhancementFlags,
         DisableMouseCapture,
         DisableBracketedPaste,
+        Print("\x1b[?1007r"),
         Show,
         LeaveAlternateScreen
     );

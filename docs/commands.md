@@ -59,9 +59,7 @@ Three inputs are richer than a keypress, and each is routed by state rather than
 
 - Shift+Enter and Alt+Enter are sent as `ESC CR`, which is distinct from plain Enter. Shift requires a terminal that reports modified keys; terminals that do not report it send plain `CR`.
 - Paste travels as one message. Bracketed-paste-aware children receive paste markers with embedded terminators removed; other children receive line endings as `CR`. Fleetcom text fields strip control characters.
-- The wheel moves selection on the dashboard and in peek. Attached tasks receive wheel events, alternate-screen arrows, or nothing according to their terminal state.
-
-One cost: with the mouse captured, drag-to-select belongs to fleetcom's terminal only via the shift override (`Shift`+drag in most emulators, `Option`+drag in iTerm2/Terminal.app), same as tmux.
+- The client captures the mouse only while the attached child requests a mouse protocol, then forwards clicks, drags, releases, and wheel events in the negotiated encoding. In that mode, use the terminal's selection override chord. Otherwise, native click-drag selection remains available; the wheel scrolls full-screen children and moves dashboard selection. It is disabled for attached inline children so arrow keys are not sent to their standard input.
 
 #### Destroy is Shift-gated
 

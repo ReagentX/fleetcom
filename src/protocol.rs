@@ -48,12 +48,14 @@ pub enum Command {
     /// knows whether the child enabled bracketed paste (DECSET 2004), which
     /// decides between wrapping in paste markers and newline conversion.
     Paste { id: u64, bytes: Vec<u8> },
-    /// Mouse wheel over an attached task, one notch. `col`/`row` are 0-based
-    /// pane cells. Routing is core-side for the same reason as `Paste`: the
-    /// child's mouse-protocol and alt-screen state live in its vt100 screen.
-    Scroll {
+    /// One mouse action over an attached task. `col`/`row` are 0-based pane
+    /// cells. Routing is core-side for the same reason as `Paste`: the child's
+    /// mouse-protocol mode, encoding, and alt-screen state live in its vt100
+    /// screen, and they decide both whether the child hears about the action
+    /// at all and in which byte encoding.
+    Mouse {
         id: u64,
-        up: bool,
+        kind: MouseKind,
         col: u16,
         row: u16,
     },
@@ -63,6 +65,25 @@ pub enum Command {
     LoadSession { name: String },
     /// Kill every task (the quit path).
     Shutdown,
+}
+
+/// A mouse button in a `Command::Mouse`. Values match xterm button codes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MouseBtn {
+    Left = 0,
+    Middle = 1,
+    Right = 2,
+}
+
+/// What a `Command::Mouse` reports. Wheel notches carry no button; presses,
+/// drags, and releases carry the button they happened with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MouseKind {
+    WheelUp,
+    WheelDown,
+    Press(MouseBtn),
+    Drag(MouseBtn),
+    Release(MouseBtn),
 }
 
 /// A core→client message. The client keeps a local mirror of the task set and
@@ -105,6 +126,11 @@ pub struct ScreenView {
     pub formatted: Vec<u8>,
     pub cursor: (u16, u16),
     pub hide_cursor: bool,
+    /// Whether the child requested a mouse protocol.
+    pub wants_mouse: bool,
+    /// Whether the child is on the alternate screen. Without mouse capture,
+    /// this determines whether alternate scroll is enabled.
+    pub alt_screen: bool,
 }
 
 // --- wire format -------------------------------------------------------------
@@ -248,10 +274,20 @@ pub fn encode_command(cmd: &Command) -> (u8, Vec<u8>) {
             }
             let _ = o.insert("bytes", arr);
         }
-        Command::Scroll { id, up, col, row } => {
-            let _ = o.insert("t", "scroll");
+        Command::Mouse { id, kind, col, row } => {
+            let _ = o.insert("t", "mouse");
             let _ = o.insert("id", *id);
-            let _ = o.insert("up", *up);
+            let (k, btn) = match kind {
+                MouseKind::WheelUp => ("wu", None),
+                MouseKind::WheelDown => ("wd", None),
+                MouseKind::Press(b) => ("p", Some(*b)),
+                MouseKind::Drag(b) => ("d", Some(*b)),
+                MouseKind::Release(b) => ("r", Some(*b)),
+            };
+            let _ = o.insert("k", k);
+            if let Some(b) = btn {
+                let _ = o.insert("b", b as u64);
+            }
             let _ = o.insert("col", *col as u64);
             let _ = o.insert("row", *row as u64);
         }
@@ -332,12 +368,29 @@ pub fn decode_command(kind: u8, payload: &[u8]) -> Option<Command> {
                 .filter_map(|m| m.as_u64().map(|n| n as u8))
                 .collect(),
         },
-        "scroll" => Command::Scroll {
-            id: v["id"].as_u64()?,
-            up: v["up"].as_bool()?,
-            col: v["col"].as_u64()? as u16,
-            row: v["row"].as_u64()? as u16,
-        },
+        "mouse" => {
+            let btn = || -> Option<MouseBtn> {
+                match v["b"].as_u64()? {
+                    0 => Some(MouseBtn::Left),
+                    1 => Some(MouseBtn::Middle),
+                    2 => Some(MouseBtn::Right),
+                    _ => None,
+                }
+            };
+            Command::Mouse {
+                id: v["id"].as_u64()?,
+                kind: match v["k"].as_str()? {
+                    "wu" => MouseKind::WheelUp,
+                    "wd" => MouseKind::WheelDown,
+                    "p" => MouseKind::Press(btn()?),
+                    "d" => MouseKind::Drag(btn()?),
+                    "r" => MouseKind::Release(btn()?),
+                    _ => return None,
+                },
+                col: v["col"].as_u64()? as u16,
+                row: v["row"].as_u64()? as u16,
+            }
+        }
         "save" => Command::SaveSession {
             name: v["name"].as_str()?.to_string(),
         },
@@ -392,6 +445,8 @@ pub fn encode_event(ev: &Event) -> (u8, Vec<u8>) {
             let _ = cur.push(sv.cursor.1 as u64);
             let _ = header.insert("cursor", cur);
             let _ = header.insert("hide", sv.hide_cursor);
+            let _ = header.insert("mouse", sv.wants_mouse);
+            let _ = header.insert("alt", sv.alt_screen);
             let mut lines = jzon::JsonValue::new_array();
             for l in &sv.lines {
                 let _ = lines.push(l.as_str());
@@ -454,6 +509,8 @@ pub fn decode_event(kind: u8, payload: &[u8]) -> Option<Event> {
                 formatted,
                 cursor,
                 hide_cursor: h["hide"].as_bool()?,
+                wants_mouse: h["mouse"].as_bool()?,
+                alt_screen: h["alt"].as_bool()?,
             }))
         }
         _ => None,
@@ -512,11 +569,29 @@ mod tests {
                 id: 6,
                 bytes: b"line1\nline2\x1b[201~\xff".to_vec(),
             },
-            Command::Scroll {
+            Command::Mouse {
                 id: 8,
-                up: false,
+                kind: MouseKind::WheelDown,
                 col: 79,
                 row: 23,
+            },
+            Command::Mouse {
+                id: 8,
+                kind: MouseKind::Press(MouseBtn::Left),
+                col: 0,
+                row: 0,
+            },
+            Command::Mouse {
+                id: 8,
+                kind: MouseKind::Drag(MouseBtn::Middle),
+                col: 10,
+                row: 5,
+            },
+            Command::Mouse {
+                id: 8,
+                kind: MouseKind::Release(MouseBtn::Right),
+                col: 10,
+                row: 5,
             },
             Command::SaveSession {
                 name: "work".into(),
@@ -592,6 +667,8 @@ mod tests {
             formatted: vec![0x1b, b'[', b'm', 0, 255, b'x'],
             cursor: (3, 12),
             hide_cursor: false,
+            wants_mouse: true,
+            alt_screen: false,
         });
         let (k, p) = encode_event(&screen);
         assert_eq!(k, KIND_SCREEN);

@@ -84,7 +84,7 @@ Every task runs in its own pseudo-terminal, emulated with `vt100`. The same scre
 
 ### Input fidelity
 
-Attached input follows the child's terminal state. Modified Enter is sent as `ESC CR` when the terminal reports it; paste uses bracketed-paste markers only when the child enables them; and wheel events follow the child's mouse and alternate-screen settings. Mouse capture requires the terminal's selection override chord. Details are in [`docs/commands.md`](docs/commands.md).
+Attached input follows the child's terminal state. Modified Enter is sent as `ESC CR` when reported, and paste uses bracketed-paste markers only when enabled by the child. The client captures the mouse only for attached children using a mouse protocol; elsewhere, native selection remains available and the wheel uses alternate scroll for full-screen children. Details are in [`docs/commands.md`](docs/commands.md).
 
 ### Jobs outlive the UI
 

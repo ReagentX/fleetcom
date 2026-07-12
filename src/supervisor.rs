@@ -20,9 +20,8 @@ use crate::task::Task;
 /// the client, computes lifecycle. It holds the clock and the live parser.
 const IDLE_AFTER: Duration = Duration::from_millis(600);
 
-/// The fingerprint of the last `Screen` sent, for send-on-change: the watched
-/// task's id, its formatted bytes, cursor position, and cursor visibility.
-type LastScreen = (u64, Vec<u8>, (u16, u16), bool);
+/// Send-on-change fingerprint for the watched screen and its input hints.
+type LastScreen = (u64, Vec<u8>, (u16, u16), bool, (bool, bool));
 
 /// Ceiling for PTY dimensions accepted from a (possibly crafted) `Resize`. A 0
 /// dimension underflows vt100 (`grid.rs` does `size.rows - 1`): panic in debug,
@@ -191,9 +190,9 @@ impl Supervisor {
                     let _ = t.send_paste(&bytes);
                 }
             }
-            Command::Scroll { id, up, col, row } => {
+            Command::Mouse { id, kind, col, row } => {
                 if let Some(t) = self.by_id_mut(id) {
-                    let _ = t.send_scroll(up, col, row);
+                    let _ = t.send_mouse(kind, col, row);
                 }
             }
             Command::SaveSession { name } => self.save_session(&name),
@@ -265,21 +264,24 @@ impl Supervisor {
             && let Some(t) = self.tasks.iter().find(|t| t.id == id)
         {
             let (formatted, cursor, hide_cursor) = t.formatted();
-            // Skip the send when nothing the client renders has changed. An
-            // idle attached task would otherwise re-ship its whole screen 20x/s.
+            let hints = t.input_hints();
+            // Send only when rendering or input-policy state changes.
             let unchanged = matches!(
                 &self.last_screen,
-                Some((lid, lf, lc, lh))
-                    if *lid == id && *lf == formatted && *lc == cursor && *lh == hide_cursor
+                Some((lid, lf, lc, lh, lhints))
+                    if *lid == id && *lf == formatted && *lc == cursor
+                        && *lh == hide_cursor && *lhints == hints
             );
             if !unchanged {
-                self.last_screen = Some((id, formatted.clone(), cursor, hide_cursor));
+                self.last_screen = Some((id, formatted.clone(), cursor, hide_cursor, hints));
                 self.events.push(Event::Screen(ScreenView {
                     id,
                     lines: t.screen_lines(),
                     formatted,
                     cursor,
                     hide_cursor,
+                    wants_mouse: hints.0,
+                    alt_screen: hints.1,
                 }));
             }
         }

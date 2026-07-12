@@ -10,12 +10,13 @@ use std::thread;
 use std::time::Duration;
 
 use crossterm::event::{
-    self, Event as CtEvent, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent,
-    MouseEventKind,
+    self, DisableMouseCapture, EnableMouseCapture, Event as CtEvent, KeyCode, KeyEvent,
+    KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
+use crossterm::{execute, style::Print};
 
 use crate::path;
-use crate::protocol::{Command, Event, ScreenView, TaskView};
+use crate::protocol::{Command, Event, MouseBtn, MouseKind, ScreenView, TaskView};
 use crate::session;
 use crate::supervisor::Supervisor;
 use crate::task::Lifecycle;
@@ -149,6 +150,23 @@ pub struct App {
     /// (daemon + jobs survive), `Q` quits and kills. Defaults to the safe
     /// `Disconnect` so an unexpected exit never reaps the daemon.
     exit_intent: ExitIntent,
+    /// Whether the client currently captures terminal mouse events.
+    mouse_captured: bool,
+    /// The alternate-scroll state last applied to the terminal.
+    alt_scroll: bool,
+}
+
+/// Return `(mouse_capture, alt_scroll)` for the attached child's screen.
+/// Without an attached screen, preserve native selection and enable wheel
+/// navigation through alternate scroll.
+fn desired_input_modes(attached: Option<&ScreenView>) -> (bool, bool) {
+    match attached {
+        // Capture and forward mouse events requested by the child.
+        Some(s) if s.wants_mouse => (true, true),
+        // Scroll full-screen children; disable wheel-generated arrows inline.
+        Some(s) => (false, s.alt_screen),
+        None => (false, true),
+    }
 }
 
 /// Dashboard grouping bucket: tagged tasks first, then live, then completed.
@@ -263,6 +281,8 @@ impl App {
             wait_tx,
             term_signal: Arc::new(AtomicBool::new(false)),
             should_quit: false,
+            mouse_captured: false,
+            alt_scroll: true,
             exit_intent: ExitIntent::Disconnect,
         }
     }
@@ -495,6 +515,7 @@ impl App {
                 self.focused_id = None;
             }
 
+            self.sync_input_modes(out)?;
             ui::render(out, self)?;
 
             // Wake for input or core events; the timeout observes termination.
@@ -893,32 +914,67 @@ impl App {
         }
     }
 
-    /// Handle wheel input locally or forward it to the attached task.
+    /// Forward attached mouse events to the supervisor. Wheel events queued
+    /// during a mode transition still move dashboard and peek selection.
     fn on_mouse(&mut self, m: MouseEvent) {
-        let up = match m.kind {
-            MouseEventKind::ScrollUp => true,
-            MouseEventKind::ScrollDown => false,
+        let btn = |b: MouseButton| match b {
+            MouseButton::Left => MouseBtn::Left,
+            MouseButton::Middle => MouseBtn::Middle,
+            MouseButton::Right => MouseBtn::Right,
+        };
+        let kind = match m.kind {
+            MouseEventKind::ScrollUp => MouseKind::WheelUp,
+            MouseEventKind::ScrollDown => MouseKind::WheelDown,
+            MouseEventKind::Down(b) => MouseKind::Press(btn(b)),
+            MouseEventKind::Up(b) => MouseKind::Release(btn(b)),
+            MouseEventKind::Drag(b) => MouseKind::Drag(btn(b)),
+            // Ignore unsupported mouse events.
             _ => return,
         };
         match self.mode {
-            Mode::Dashboard | Mode::Peek => {
-                if up {
-                    self.select_up()
-                } else {
-                    self.select_down()
-                }
-            }
+            Mode::Dashboard | Mode::Peek => match kind {
+                MouseKind::WheelUp => self.select_up(),
+                MouseKind::WheelDown => self.select_down(),
+                _ => {}
+            },
             Mode::Attached => {
                 if let Some(id) = self.focused_id {
-                    // Clamp into the pane: the bottom row is fleetcom's status
-                    // Keep the pointer coordinate within the child pane.
+                    // Keep the pointer coordinate within the child pane: the
+                    // bottom row is fleetcom's status bar, not the child's.
                     let row = m.row.min(self.pane_rows().saturating_sub(1));
                     let col = m.column.min(self.cols.saturating_sub(1));
-                    self.transport.send(Command::Scroll { id, up, col, row });
+                    self.transport.send(Command::Mouse { id, kind, col, row });
                 }
             }
             _ => {}
         }
+    }
+
+    /// Apply input-mode changes for the current focus.
+    fn sync_input_modes(&mut self, out: &mut Stdout) -> io::Result<()> {
+        let attached = match self.mode {
+            Mode::Attached => self.focused_id.and_then(|id| self.screen_for(id)),
+            _ => None,
+        };
+        let (capture, alt_scroll) = desired_input_modes(attached);
+        if capture != self.mouse_captured {
+            if capture {
+                execute!(out, EnableMouseCapture)?;
+            } else {
+                execute!(out, DisableMouseCapture)?;
+            }
+            self.mouse_captured = capture;
+        }
+        if alt_scroll != self.alt_scroll {
+            let seq = if alt_scroll {
+                "\x1b[?1007h"
+            } else {
+                "\x1b[?1007l"
+            };
+            execute!(out, Print(seq))?;
+            self.alt_scroll = alt_scroll;
+        }
+        Ok(())
     }
 
     fn attach(&mut self) {
@@ -1437,6 +1493,39 @@ mod tests {
         app.on_paste("cargo\ttest\r\n --all");
         assert_eq!(app.input, "cargotest --all");
         assert!(app.mode == Mode::Spawn, "paste must not submit");
+    }
+
+    /// Capture mouse events only for children that request them; disable
+    /// alternate scroll for attached inline children.
+    #[test]
+    fn capture_only_for_mouse_hungry_children() {
+        let screen = |wants_mouse, alt_screen| ScreenView {
+            id: 1,
+            lines: Vec::new(),
+            formatted: Vec::new(),
+            cursor: (0, 0),
+            hide_cursor: false,
+            wants_mouse,
+            alt_screen,
+        };
+        // No attached screen: keep native selection available.
+        assert_eq!(desired_input_modes(None), (false, true));
+        // Mouse-aware child: capture.
+        assert_eq!(desired_input_modes(Some(&screen(true, true))), (true, true));
+        assert_eq!(
+            desired_input_modes(Some(&screen(true, false))),
+            (true, true)
+        );
+        // Full-screen child without mouse mode: alternate scroll.
+        assert_eq!(
+            desired_input_modes(Some(&screen(false, true))),
+            (false, true)
+        );
+        // Inline child: wheel silenced, selection native.
+        assert_eq!(
+            desired_input_modes(Some(&screen(false, false))),
+            (false, false)
+        );
     }
 
     /// A wheel notch on the dashboard moves the selection like an arrow key.
