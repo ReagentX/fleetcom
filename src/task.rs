@@ -24,10 +24,8 @@ fn io_err(e: impl std::fmt::Display) -> io::Error {
     io::Error::other(e.to_string())
 }
 
-/// Derived lifecycle state: a fact about the process, kept separate from the
-/// user's `tagged` intent. "Idle" is honest: it means no output for a while,
-/// **not** "blocked on stdin read" (which is not observable for arbitrary
-/// commands). The user's manual tag is the signal for "I need to act on this."
+/// Process-derived lifecycle state, independent of the user's `tagged` intent.
+/// `Idle` means no recent output, not that the process is waiting for input.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Lifecycle {
     Active,
@@ -62,18 +60,10 @@ pub struct Task {
     /// When SIGTERM was sent (`terminate`): the start of the grace window the
     /// supervisor measures before escalating to SIGKILL.
     term_sent: Option<Instant>,
-    /// SIGKILL already sent to the group: the escalate-once latch `overdue`
-    /// checks. A latch rather than a group-liveness probe because there is no
-    /// portable probe: `killpg(pgid, 0)` on a zombie-only group succeeds on
-    /// Linux and fails `EPERM` on macOS.
+    /// Whether the group has received the one SIGKILL escalation.
     kill_sent: bool,
-    /// The leader's zombie has been collected (a real, reaping wait). Until
-    /// then the exited leader stays a zombie on purpose: an unreaped pid cannot
-    /// be recycled, and a pgid can only come into existence equal to the pid of
-    /// a live process calling `setsid`/`setpgid`, so holding the zombie
-    /// reserves the pgid and makes `killpg` safe at any time — even if the
-    /// leader had moved itself to another group before exiting. After this
-    /// flips, the pid/pgid may belong to anyone: never signal again.
+    /// Whether the leader has been reaped; its process group must not be
+    /// signalled afterward because the ID may have been reused.
     reaped: bool,
 }
 
@@ -358,15 +348,7 @@ impl Task {
         }
     }
 
-    /// Whether the TERM grace has run out without the KILL having gone out yet.
-    /// The supervisor checks this each reap and answers with `force_kill`.
-    ///
-    /// An escalate-once latch, deliberately not conditioned on `finished` or on
-    /// group liveness: the leader exiting promptly says nothing about TERM-
-    /// ignoring stragglers still in the group, and there is no portable probe
-    /// for "live members remain" (see `kill_sent`). So every `terminate` is
-    /// followed by exactly one group KILL at grace end — a no-op against a
-    /// group that already died, a sweep for one that didn't.
+    /// Whether a TERM request has exceeded its grace period without SIGKILL.
     pub fn overdue(&self, now: Instant, grace: Duration) -> bool {
         !self.kill_sent
             && self
@@ -517,8 +499,7 @@ mod tests {
         assert!(kill(pid, None).is_err(), "Drop did not collect the zombie");
     }
 
-    /// `terminate` after the leader has exited must still reach live group
-    /// members: the straggler case the old `finished.is_none()` gate leaked.
+    /// `terminate` reaches live group members after the leader exits.
     #[test]
     fn terminate_reaches_stragglers_after_leader_exit() {
         use nix::sys::signal::kill;

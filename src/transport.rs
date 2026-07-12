@@ -53,9 +53,7 @@ pub trait Transport {
     fn shutdown(&mut self, intent: ExitIntent);
 }
 
-/// Drain every ready event without blocking; flip `dead` if the channel has
-/// disconnected (the core is gone). Shared by the threaded and socket transports.
-/// The client renders at its own cadence and coalesces newer over older.
+/// Drain ready events without blocking and mark a disconnected channel as dead.
 fn drain(rx: &Receiver<Event>, dead: &mut bool) -> Vec<Event> {
     let mut evs = Vec::new();
     loop {

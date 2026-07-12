@@ -168,12 +168,7 @@ impl Supervisor {
                 }
             }
             Command::Remove { id } => {
-                // TERM-first even here: the row is gone at once, but the group
-                // may still hold stragglers (`cmd &` never leaves it), and they
-                // get the same grace-then-KILL as an explicit kill, via the
-                // graveyard sweep in `reap`. Straight-to-Drop would SIGKILL
-                // them with no warning from a key documented as "remove a
-                // finished task".
+                // Keep removed tasks for TERM→KILL escalation and reaping.
                 if let Some(i) = self.index_of(id) {
                     let mut t = self.tasks.remove(i);
                     t.terminate();
@@ -187,9 +182,7 @@ impl Supervisor {
                 }
             }
             Command::Resize { rows, cols } => {
-                // Clamp at the trust boundary: the dimensions arrive as untrusted
-                // `u64`s truncated to `u16` in `decode_command`, and go straight
-                // to the PTY and vt100. Nonzero, capped; see `MAX_DIM`.
+                // Keep untrusted dimensions nonzero and within `MAX_DIM`.
                 self.rows = rows.clamp(1, MAX_DIM);
                 self.cols = cols.clamp(1, MAX_DIM);
                 for t in &mut self.tasks {
@@ -197,8 +190,7 @@ impl Supervisor {
                 }
             }
             Command::Watch { id } => {
-                // A changed target (including detach → None → re-attach) forces
-                // the next tick to send a full screen, not skip it as "unchanged".
+                // A new target must receive a complete screen.
                 if id != self.watched {
                     self.last_screen = None;
                 }
@@ -215,16 +207,7 @@ impl Supervisor {
         }
     }
 
-    /// Poll every child for exit: latch exit codes and finish times (without
-    /// reaping — see `Task::poll_exit`). Cheap (no snapshotting), so the daemon
-    /// can call it while **no client is attached**.
-    ///
-    /// Also the escalation point: `overdue` tasks get their one group SIGKILL
-    /// here. Riding the reap cadence means escalation works with no client
-    /// attached (the daemon's idle loop reaps too). The graveyard gets the same
-    /// escalation plus collection: once a removed task's KILL is out and its
-    /// leader's zombie is collected, the entry is dropped — with nothing left
-    /// to signal, `Drop` is a no-op.
+    /// Latch exits, escalate overdue TERM requests, and collect removed tasks.
     pub fn reap(&mut self) {
         let now = Instant::now();
         for t in self.tasks.iter_mut().chain(self.graveyard.iter_mut()) {
@@ -348,11 +331,7 @@ impl Supervisor {
         }
     }
 
-    /// Re-run a finished task in place: a fresh spawn of the same command in
-    /// the same cwd, wearing the old id, so selection, watch, tag, and list
-    /// position all survive. Running tasks are refused rather than killed
-    /// first: a rerun that kills is destructive, and destroy already has a
-    /// Shift-gated key (`X`).
+    /// Re-run a finished task in place while preserving its ID and tag.
     fn restart(&mut self, id: u64) {
         let Some(i) = self.index_of(id) else {
             self.events
@@ -364,10 +343,7 @@ impl Supervisor {
                 .push(Event::Status("rerun: task is still running".into()));
             return;
         }
-        // Spawn first, swap only on success: a rerun that fails to launch
-        // (e.g. the cwd was deleted since the original run) must not eat the
-        // finished row it was rerunning. The rerun uses the *current* client's
-        // env: launch context belongs to whoever requests the launch.
+        // Preserve the finished task if its replacement cannot start.
         match Task::spawn(
             id,
             &self.tasks[i].command,
@@ -379,14 +355,8 @@ impl Supervisor {
         ) {
             Ok(mut fresh) => {
                 fresh.tagged = self.tasks[i].tagged;
-                // The displaced Task drops here: its group gets the KILL
-                // backstop and its leader's zombie is collected. Safe against
-                // pid recycling because the leader stayed unreaped until this
-                // moment (see `Task`), and it sweeps any stragglers of the old
-                // run — the rerun replaces the whole job, not just the shell.
                 self.tasks[i] = fresh;
-                // The fresh screen may byte-match the old one (both start
-                // blank), so drop the fingerprint rather than trust it.
+                // Reset the fingerprint for the replacement task's screen.
                 if self.watched == Some(id) {
                     self.last_screen = None;
                 }

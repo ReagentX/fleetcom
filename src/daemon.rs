@@ -5,20 +5,15 @@
 //! supervisor **outlives each client connection**: `q` disconnects, the jobs
 //! keep running, and the next `fleetcom` reattaches.
 //!
-//! Autostart lives here too: a plain `fleetcom` connects to a running daemon, or
-//! spawns one (detached, its own process group) and polls the socket until it's
-//! up.
+//! It also autostarts a detached daemon when no socket is available.
 //!
 //! The fleet's lifetime is bounded by the daemon's. The daemon holds every
 //! task's PTY master, so daemon death of any kind closes them, and the kernel
 //! hangs up each task's controlling terminal: SIGHUP to its foreground process
 //! group, which (job control being off under `$SHELL -c`) is the whole job.
-//! Process-group isolation does not change this — it guards against signals
-//! aimed at the daemon's *group*, not against the tty hangup. What "shut down
-//! cleanly" (SIGTERM/SIGINT/SIGHUP) buys is the *manner* of death: TERM to each
-//! job's group with a KILL after the grace, plus socket/lock cleanup. A crash
-//! or SIGKILL skips that and the jobs get the bare HUP; only HUP-immune jobs
-//! (`nohup`, `trap '' HUP`) survive it — unowned, invisible to the next daemon.
+//! A normal shutdown sends SIGTERM to each job group, then SIGKILL after a
+//! grace period, and removes the socket and lock. A crash or SIGKILL only
+//! closes the PTYs; HUP-immune jobs can survive without a supervisor.
 
 use std::fs;
 use std::io::{self, ErrorKind, Read, Write};
@@ -46,10 +41,7 @@ use crate::protocol::{
 };
 use crate::supervisor::Supervisor;
 
-/// How long each side waits on the other during the hello exchange. Generous:
-/// a healthy daemon acks in microseconds; this only bounds a hung or
-/// pre-handshake peer so neither side wedges (the daemon's accept/reap loop
-/// waits behind its read).
+/// Maximum duration of the hello handshake.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Per-user directory holding the socket. `FLEETCOM_RUNTIME_DIR` overrides it
@@ -66,10 +58,7 @@ fn runtime_dir() -> PathBuf {
     )
 }
 
-/// The pure resolver behind [`runtime_dir`], with every input a parameter so
-/// tests can drive all three branches directly: env mutation is process-global
-/// and races parallel tests, and CI runners set `XDG_RUNTIME_DIR` on neither
-/// OS, so the lower branches would otherwise never execute anywhere.
+/// Resolve the runtime directory from explicit inputs.
 fn resolve_runtime_dir(
     override_dir: Option<String>,
     xdg: Option<String>,
@@ -91,12 +80,7 @@ fn socket_path() -> PathBuf {
     runtime_dir().join("default.sock")
 }
 
-/// Create (or validate) the runtime dir with private `0700` perms, so the socket
-/// and control channel inside it are unreachable by other local users. If it
-/// already exists it must be a real directory this user owns. A symlink or a
-/// dir planted by someone else (the classic shared-`/tmp` attack) is rejected,
-/// and loose perms are tightened. `0700` on the leaf is enough: no one can
-/// traverse into it even from a world-writable parent.
+/// Create or validate a user-owned runtime directory with `0700` permissions.
 fn ensure_runtime_dir(dir: &Path) -> io::Result<()> {
     match fs::symlink_metadata(dir) {
         Ok(md) => {
@@ -148,8 +132,7 @@ pub fn connect_ready() -> io::Result<UnixStream> {
         Some(Event::HelloOk { .. }) => Ok(stream),
         // The daemon's refusal names both versions; pass it through verbatim.
         Some(Event::Status(msg)) => Err(io::Error::other(msg)),
-        // Anything else is a pre-handshake daemon: it ignored the hello it
-        // couldn't decode and opened with its first `Tasks` tick.
+        // A non-handshake response indicates an incompatible daemon.
         _ => Err(io::Error::other(
             "daemon predates the protocol handshake (stale daemon from an older \
              fleetcom); run 'fleetcom --kill' and retry",
@@ -157,9 +140,7 @@ pub fn connect_ready() -> io::Result<UnixStream> {
     }
 }
 
-/// Connect to the running daemon, spawning one on any connection failure and
-/// polling for up to one second for it to accept connections. The daemon lock
-/// serializes concurrent starts and lets the lock holder reclaim a stale socket.
+/// Connect to the daemon or start one, then wait up to one second for its socket.
 pub fn connect_or_autostart() -> io::Result<UnixStream> {
     let path = socket_path();
     if let Ok(s) = UnixStream::connect(&path) {
@@ -182,9 +163,7 @@ pub fn connect_or_autostart() -> io::Result<UnixStream> {
     ))
 }
 
-/// Spawn `fleetcom --daemon` detached: its own process group (so a terminal SIGHUP
-/// to the client's group never reaches it; the safe `process_group(0)`, not an
-/// `unsafe` `setsid`), stdio off the terminal, stderr to a log for debugging.
+/// Spawn a detached daemon with terminal I/O disconnected.
 fn spawn_daemon() -> io::Result<()> {
     let exe = std::env::current_exe()?;
     let dir = runtime_dir();
@@ -432,9 +411,7 @@ fn handshake(stream: &mut UnixStream) -> Result<Command, String> {
             env!("CARGO_PKG_VERSION"),
         )),
         // A recognizable command that isn't a Hello is a pre-handshake client.
-        // Refusing (not serving) is deliberate: an old daemon silently strips
-        // fields it doesn't know from a new client's commands, and the same
-        // degradation must not be tolerated in the other direction.
+        // Refuse requests before the required handshake.
         _ => Err(format!(
             "daemon {} requires a hello handshake (older client?); upgrade the \
              client or run 'fleetcom --kill' and retry",
@@ -451,15 +428,7 @@ fn handshake(stream: &mut UnixStream) -> Result<Command, String> {
 /// daemon's signal flag: raised, it ends the loop as a `Shutdown` even while a
 /// client is attached.
 ///
-/// The serve loop runs under `catch_unwind`: a panic while serving (protocol,
-/// vt100, UI-facing encoding) must cost one connection, not the fleet — daemon
-/// death would close every PTY master and HUP every job (see the module docs).
-/// The guarantee is exactly that and no more: `apply` is not transactional, so
-/// after a panic the supervisor's *state* is best-effort while every `Task`
-/// (and the accept loop) stays intact. Re-exec-style recovery that would also
-/// preserve state was considered and deferred: `catch_unwind` removes the
-/// dominant crash source at a fraction of the complexity, and the residual
-/// (a panic outside the serve path) is small.
+/// Panics while serving end the connection without terminating the daemon.
 fn serve_client(sup: &mut Supervisor, stream: UnixStream, stop: &AtomicBool) -> ServeOutcome {
     let mut stream = stream;
     match handshake(&mut stream) {

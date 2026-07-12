@@ -1,7 +1,4 @@
-//! The hello handshake refuses rather than degrades: a version-mismatched or
-//! pre-handshake client gets one explanatory `Status` and a closed connection,
-//! never silent service under the wrong semantics (`decode_command` drops what
-//! it can't parse, so "serve anyway" would strip newer fields with no error).
+//! The hello handshake rejects version-mismatched and pre-handshake clients.
 
 mod common;
 
@@ -38,14 +35,14 @@ fn version_mismatch_is_refused_with_both_versions_named() {
     let mut retry = std::os::unix::net::UnixStream::connect(&sock).unwrap();
     common::shake_hands(&mut retry, &cwd);
 
-    drop(daemon); // KillOnDrop: SIGKILL is fine, nothing was spawned
+    drop(daemon);
     let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
 fn pre_handshake_command_is_refused() {
     let (dir, daemon, mut stream) = start_daemon_raw("nohello", |_| {});
-    // An old client opens with Resize, not hello.
+    // A command before `Hello` is rejected.
     stream
         .write_all(&control_frame(r#"{"t":"resize","rows":40,"cols":120}"#))
         .unwrap();

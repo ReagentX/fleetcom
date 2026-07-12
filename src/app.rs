@@ -457,9 +457,7 @@ impl App {
     fn sync(&mut self) {
         for ev in self.transport.poll() {
             match ev {
-                // The handshake consumed the ack before the transport existed;
-                // one arriving here (an in-process core echoing nothing today)
-                // carries no state to fold.
+                // The handshake is handled before the transport is created.
                 Event::HelloOk { .. } => {}
                 Event::Tasks(v) => self.views = v,
                 Event::Screen(s) => self.focused_screen = Some(s),
@@ -469,12 +467,7 @@ impl App {
     }
 
     pub fn run(&mut self, out: &mut Stdout) -> io::Result<()> {
-        // Spawn the stdin reader once. crossterm owns the tty and buffers parsed
-        // events internally, so rather than fight it with an external `poll(2)`
-        // (also barred by `#![forbid(unsafe_code)]`), a dedicated thread blocks on
-        // `event::read()` and forwards each event, poking the wake channel.
-        // Detached: it dies at process exit while parked in `read()`, exactly like
-        // the daemon's reader threads.
+        // Read terminal events on a dedicated thread and wake the UI loop.
         if let Some(input_tx) = self.input_tx.take() {
             let wait_tx = self.wait_tx.clone();
             thread::spawn(move || {
@@ -489,10 +482,8 @@ impl App {
             });
         }
         loop {
-            // Reconcile with the core: declare the watched task, then pull a
-            // fresh snapshot (+ its screen). Both are terminal-free, so they run
-            // *before* the quit check. On SIGHUP the terminal is already gone
-            // and a render would error and skip teardown, orphaning the jobs.
+            // Synchronize before checking for exit so teardown still runs if the
+            // terminal has gone away.
             let watch = match self.mode {
                 Mode::Peek => self.selected_id,
                 Mode::Attached => self.focused_id,
@@ -527,11 +518,7 @@ impl App {
 
             ui::render(out, self)?;
 
-            // Block until input arrives, the core pushes an event, or the backstop
-            // fires. The token is only "go look"; the payload waits in the
-            // channels drained below and by `sync()` at the top of the next turn.
-            // The 100 ms backstop bounds how long a `term_signal` goes unnoticed.
-            // The hot path (keystroke, echo) wakes immediately, never on it.
+            // Wake for input or core events; the timeout observes termination.
             let _ = self.wait_rx.recv_timeout(Duration::from_millis(100));
             while self.wait_rx.try_recv().is_ok() {} // coalesce wake tokens
 
@@ -737,16 +724,9 @@ impl App {
                 self.session_sel = 0;
                 self.mode = Mode::LoadSession;
             }
-            // Rerun is lowercase because it only acts on *finished* tasks:
-            // nothing gets killed, so it's safe to mash. A rerun that would
-            // have to kill a running task first is `X` territory.
+            // Restart only finished tasks.
             KeyCode::Char('r') => self.rerun_selected(),
-            // Destroy is Shift-gated, like `Q` vs `q`: plain `X` kills the
-            // selected task (or removes a finished one); `x` is a deliberate
-            // no-op. It is *not* `^X`: a Ctrl chord can't carry the shift
-            // distinction: the tty sends 0x18 for both Ctrl+x and Ctrl+Shift+X
-            // (no shift bit), so only an unmodified capital reliably means
-            // "yes, destroy this".
+            // Only an unmodified `X` is a destructive command.
             KeyCode::Char('X') => self.kill_or_remove_selected(),
             _ => {}
         }
@@ -877,10 +857,7 @@ impl App {
         // The one key `fleetcom` steals from the child: Ctrl-\ backgrounds it.
         // Everything else (including Ctrl-C/Z/D) is forwarded verbatim.
         //
-        // Ctrl-\ sends byte 0x1C, which crossterm's legacy decoder reports as
-        // Ctrl+'4' (it maps 0x1C..=0x1F → '4'..='7'); only under the kitty
-        // keyboard protocol does it arrive as Ctrl+'\'. We don't enable kitty,
-        // so match both and the physical chord works either way.
+        // Crossterm may decode Ctrl-\\ as Ctrl-4 without the kitty protocol.
         let detach = k.modifiers.contains(KeyModifiers::CONTROL)
             && matches!(k.code, KeyCode::Char('\\') | KeyCode::Char('4'));
         if detach {
@@ -913,11 +890,7 @@ impl App {
         }
     }
 
-    /// Send `Restart` for the selected task if it has finished; a running
-    /// selection is ignored here rather than bounced off the supervisor, so
-    /// mashing `r` never costs a round-trip or a status-line complaint. The
-    /// supervisor still enforces the same gate: it owns the task set, and this
-    /// client-side check reads from a snapshot.
+    /// Restart the selected task only when the local snapshot marks it finished.
     fn rerun_selected(&mut self) {
         if let Some(i) = self.selected_task()
             && matches!(self.views[i].lifecycle, Lifecycle::Ok | Lifecycle::Failed)

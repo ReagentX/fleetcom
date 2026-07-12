@@ -15,11 +15,7 @@ use std::time::Duration;
 use crate::frame::{KIND_CONTROL, KIND_SCREEN};
 use crate::task::Lifecycle;
 
-/// Wire-protocol version. Bumped on any change an old peer would silently
-/// misread: `decode_command` drops what it can't parse, so without this check a
-/// stale daemon would strip fields a newer client depends on (a `Spawn` losing
-/// its launch context) with no error anywhere. The daemon refuses a mismatch at
-/// the handshake instead.
+/// Wire-protocol version. The handshake rejects peers using a different version.
 pub const PROTOCOL_VERSION: u32 = 1;
 
 /// A client→core request. Every mutation of the task set is one of these; the

@@ -14,21 +14,17 @@ version = "0.0.0"
 crossterm = "=0.29.0"
 dirs = "=6.0.0"
 jzon = "=0.12.5"
-# Held to portable-pty's nix (^0.28): one copy in the tree, not two. Caret, not
-# `=`, so it tracks 0.28 patch releases. crates.io shows a newer nix (0.31);
-# bumping past portable-pty splits the tree into two copies. Same as signal-hook.
+# Match portable-pty's `nix` requirement to avoid duplicate versions.
 nix = { version = "0.28", features = ["signal", "user", "fs"] }
 portable-pty = "=0.9.0"
 rustix = { version = "=1.1.4", features = ["process"] }
-# Held to crossterm's signal-hook (^0.3.17): one copy in the tree, not two.
-# Caret, not `=`, so it tracks 0.3 patch releases. crates.io shows a newer
-# signal-hook (0.4); bumping past crossterm splits the tree. Same as nix.
+# Match crossterm's `signal-hook` requirement to avoid duplicate versions.
 signal-hook = { version = "0.3", default-features = false }
 vt100 = "=0.16.2"
 
 [profile.release]
-# Perform Link Time Optimization
+# Enable link-time optimization.
 lto = true
-# Use a single codegen unit for the entire crate
+# Use one code-generation unit.
 codegen-units = 1
 panic = "unwind"
