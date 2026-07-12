@@ -19,7 +19,7 @@ mod ui;
 
 use std::io;
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crossterm::{
     cursor::{Hide, Show},
@@ -36,6 +36,13 @@ use crossterm::{
 };
 
 use app::App;
+
+/// Whether `PushKeyboardEnhancementFlags` actually executed, so restore pops
+/// only what setup pushed. A static atomic because the panic hook is installed
+/// before the terminal is touched and can fire on any thread; the hook and
+/// `TerminalGuard` read the same source of truth. Only atomicity matters here
+/// (the flag orders nothing else), so `Relaxed` suffices.
+static KITTY_PUSHED: AtomicBool = AtomicBool::new(false);
 
 const USAGE: &str = "\
 fleetcom - a fleet-view supervisor for arbitrary shell commands
@@ -155,6 +162,11 @@ fn main() -> io::Result<()> {
 
     let mut out = io::stdout();
     enable_raw_mode()?;
+    // Armed the moment raw mode is on: every exit past this point — the `?`s
+    // below, a panic unwind, the normal return — must restore the terminal,
+    // or the shell is left in raw mode with a hidden cursor. The panic hook
+    // covers panics only, not `Err` returns.
+    let guard = TerminalGuard;
     // Probe for the kitty keyboard protocol before entering the alternate
     // screen: the query round-trips through the tty, and raw mode (just
     // enabled) is what keeps the reply out of the line discipline. `false` on
@@ -171,6 +183,9 @@ fn main() -> io::Result<()> {
             out,
             PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
         )?;
+        // Recorded only after the execute succeeds: restore mirrors what
+        // setup actually did, not what it attempted.
+        KITTY_PUSHED.store(true, Ordering::Relaxed);
     }
     execute!(out, EnableBracketedPaste, Print("\x1b[?1007s\x1b[?1007h"))?;
     // `fleetcom [--foreground] <session>` loads that session at startup; the
@@ -181,23 +196,52 @@ fn main() -> io::Result<()> {
     install_signal_handlers(app.signal_flag())?;
     let result = app.run(&mut out);
 
-    restore_terminal(&mut out);
+    // Consuming the guard restores here, at the same point the happy path
+    // always restored; the drop-on-unwind path exists for the `?`s above.
+    drop(guard);
     result
+}
+
+/// Restores the terminal when dropped. Constructed only after
+/// `enable_raw_mode` succeeds — before that there is nothing to undo.
+struct TerminalGuard;
+
+impl Drop for TerminalGuard {
+    fn drop(&mut self) {
+        restore_terminal(&mut io::stdout());
+    }
 }
 
 /// Restore terminal modes changed by the application. Cleanup is best-effort
 /// so a failed terminal write does not prevent raw mode from being disabled.
+///
+/// May run twice: on a panic the hook restores first (so the message prints
+/// on the normal screen), then `TerminalGuard`'s drop restores again during
+/// unwind. Every step tolerates the repeat — leaving the alternate screen
+/// twice, disabling raw mode twice, and popping past an empty kitty stack are
+/// all no-ops or ignored — so don't "fix" the double restore by dropping one.
 fn restore_terminal(out: &mut io::Stdout) {
-    let _ = execute!(
+    let _ = emit_restore_sequences(out, KITTY_PUSHED.load(Ordering::Relaxed));
+    let _ = disable_raw_mode();
+}
+
+/// Emit the escape sequences that undo terminal setup, mirroring what setup
+/// actually did: the keyboard-enhancement pop only if the flags were pushed.
+/// `disable_raw_mode` lives in `restore_terminal`, not here — it mutates
+/// process-global tty state, and this function stays a pure emission so tests
+/// can drive it against a buffer.
+fn emit_restore_sequences(out: &mut impl io::Write, kitty_pushed: bool) -> io::Result<()> {
+    if kitty_pushed {
+        execute!(out, PopKeyboardEnhancementFlags)?;
+    }
+    execute!(
         out,
-        PopKeyboardEnhancementFlags,
         DisableMouseCapture,
         DisableBracketedPaste,
         Print("\x1b[?1007r"),
         Show,
         LeaveAlternateScreen
-    );
-    let _ = disable_raw_mode();
+    )
 }
 
 /// Route external termination signals into the app's quit flag so the loop
@@ -213,7 +257,9 @@ fn install_signal_handlers(flag: Arc<AtomicBool>) -> io::Result<()> {
 }
 
 /// Restore the terminal on panic. Otherwise a crash leaves the user in raw
-/// mode on the alternate screen with no cursor.
+/// mode on the alternate screen with no cursor. Restoring *before* the
+/// default hook is what puts the panic message on the normal screen instead
+/// of the vanishing alternate screen.
 fn install_panic_hook() {
     let default = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
@@ -294,5 +340,43 @@ mod tests {
     #[test]
     fn second_session_name_is_rejected() {
         assert!(parse(&["one", "two"]).is_err());
+    }
+
+    fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+        haystack.windows(needle.len()).any(|w| w == needle)
+    }
+
+    /// Render a single crossterm command to bytes, so the assertions below
+    /// track crossterm's actual encoding instead of hardcoding it.
+    fn encode(cmd: impl crossterm::Command) -> Vec<u8> {
+        let mut buf = Vec::new();
+        execute!(buf, cmd).unwrap();
+        buf
+    }
+
+    /// Restore must mirror setup: the keyboard-enhancement pop is emitted
+    /// only when the flags were pushed, and its absence must not take the
+    /// rest of the restore down with it.
+    #[test]
+    fn restore_pops_kitty_flags_only_when_pushed() {
+        let pop = encode(PopKeyboardEnhancementFlags);
+
+        let mut pushed = Vec::new();
+        emit_restore_sequences(&mut pushed, true).unwrap();
+        let mut unpushed = Vec::new();
+        emit_restore_sequences(&mut unpushed, false).unwrap();
+
+        assert!(contains(&pushed, &pop));
+        assert!(!contains(&unpushed, &pop));
+
+        // Both variants still emit the full remaining restore.
+        let leave = encode(LeaveAlternateScreen);
+        let show = encode(Show);
+        for out in [&pushed, &unpushed] {
+            assert!(contains(out, &leave));
+            assert!(contains(out, &show));
+            // Alternate-scroll restore is a raw Print, not a crossterm command.
+            assert!(contains(out, b"\x1b[?1007r"));
+        }
     }
 }
