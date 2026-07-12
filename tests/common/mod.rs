@@ -31,8 +31,7 @@ pub fn control_frame(json: &str) -> Vec<u8> {
     frame(1, json.as_bytes())
 }
 
-/// Standard base64 with padding, restated by hand: the hello env encoding,
-/// independent of the `base64` crate the binary itself uses.
+/// Encode bytes as padded standard base64.
 pub fn b64(bytes: &[u8]) -> String {
     const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
@@ -69,10 +68,7 @@ pub fn read_frame(stream: &mut UnixStream) -> std::io::Result<(u8, Vec<u8>)> {
     Ok((kind[0], payload))
 }
 
-/// A `KIND_HELLO` (kind=3) frame carrying `env` (byte-exact key/value pairs)
-/// and the client cwd. Env values ride as base64 JSON strings: byte-lossless
-/// for non-UTF-8, and compact enough that a real env stays under the 8 KB
-/// macOS AF_UNIX buffer where v2's number arrays did not.
+/// A `KIND_HELLO` frame carrying the client environment and working directory.
 pub fn hello_frame(version: u32, env: &[(&[u8], &[u8])], cwd: &str) -> Vec<u8> {
     let pairs: Vec<String> = env
         .iter()

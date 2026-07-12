@@ -1222,7 +1222,7 @@ mod tests {
     impl App {
         /// A synchronous App: the supervisor ticks inline on `poll`, so `send`
         /// then `pump` is deterministic with no core-thread timing to race.
-        /// The launch context is this process's own, as in `--foreground`.
+        /// Uses this process's launch context.
         fn new_local(rows: u16, cols: u16) -> App {
             App::assemble(rows, cols, |pr, c, _wait_tx| {
                 let mut sup = Supervisor::new(pr, c);

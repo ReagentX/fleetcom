@@ -162,10 +162,7 @@ pub struct Task {
     /// Kept for resize (`TIOCSWINSZ`); `try_clone_reader`/`take_writer` borrow it.
     master: Box<dyn MasterPty + Send>,
     writer: Box<dyn Write + Send>,
-    /// The leader's pid, cached at spawn — the job's only process handle (the
-    /// spawn drops portable-pty's `Child` after reading it). portable-pty
-    /// `setsid`s the child, so this is also the job's pgid: the target for
-    /// group signals, the `WNOWAIT` status latch, and the teardown reap.
+    /// Session-leader PID, also used as the process-group ID.
     pid: Option<u32>,
     /// Shared with the reader thread: it writes (process bytes), the UI reads
     /// (render/preview). Contention is trivial: writes are per output chunk.
@@ -205,11 +202,7 @@ fn grid(parser: &Mutex<vt100::Parser>) -> std::sync::MutexGuard<'_, vt100::Parse
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-/// Reduce a wait status to the shell convention: the exit status verbatim, or
-/// 128+signum for a signal death, so a KILLed job reads as 137 in the
-/// dashboard rather than masquerading as a clean (or generic-failure) exit.
-/// The one decoder for both latch sites — `poll_exit` and `collect` — so the
-/// two can never disagree about the same corpse.
+/// Convert a wait status to a shell-style exit code.
 fn wait_code(status: &rustix::process::WaitIdStatus) -> i32 {
     status
         .exit_status()
@@ -311,12 +304,7 @@ impl Task {
             })
         };
 
-        // The pid is the job's only handle from here on. portable-pty's boxed
-        // `Child` is a plain `std::process::Child` underneath, which has no
-        // `Drop` impl: dropping it neither kills nor reaps. Its two methods
-        // are both wrong for a job managed by process group — `kill()`
-        // signals only the leader, and `try_wait()` reaps the zombie whose
-        // existence reserves the pgid — so nothing keeps it.
+        // Process-group signalling and `waitid` use the leader PID directly.
         let pid = child.process_id();
         drop(child);
         Ok(Task {
@@ -362,10 +350,7 @@ impl Task {
         Ok(())
     }
 
-    /// Reap the exited session leader without blocking: `poll_exit`'s primitive
-    /// and decoder minus `NOWAIT`, so the zombie is consumed and the pid (and
-    /// with it the pgid reservation) freed. After this, `reaped` gates every
-    /// group signal.
+    /// Reap the exited session leader without blocking.
     fn collect(&mut self) {
         if self.reaped {
             return;
@@ -389,26 +374,14 @@ impl Task {
                     self.finished = Some(Instant::now());
                 }
             }
-            // ECHILD: the leader is no longer our child (nothing here reaps it
-            // elsewhere, but the state is conceivable after a fork bug or a
-            // hostile wait). Treat as collected so a graveyard entry can't
-            // become immortal.
+            // Treat an already-reaped leader as collected.
             Err(rustix::io::Errno::CHILD) => self.reaped = true,
             // Still running, or a transient failure: retry next reap pass.
             Ok(None) | Err(_) => {}
         }
     }
 
-    /// Graveyard step: once the KILL has gone out, try to collect the leader's
-    /// zombie. Returns true when collected — nothing left to signal, so the
-    /// caller can drop this task silently. Never blocks: a leader wedged in
-    /// uninterruptible sleep (dead NFS/FUSE) stays uncollected and the caller
-    /// retries next reap pass instead of hanging the daemon.
-    ///
-    /// The `kill_sent` gate is why every graveyard entry resides the full
-    /// grace, stragglers or none: `kill_sent` only turns true when the grace
-    /// expires, and no earlier exit is sound because "the group is empty" is
-    /// undetectable — see the graveyard field's docs for the accounting.
+    /// After SIGKILL, try to collect the leader without blocking.
     pub fn try_collect(&mut self) -> bool {
         if self.kill_sent {
             self.collect();
@@ -416,12 +389,8 @@ impl Task {
         self.reaped
     }
 
-    /// Release the PTY writer once no client can reach this task again (it
-    /// entered the graveyard): nothing routes input to a removed task, and the
-    /// writer is one of the two fds a graveyard entry would otherwise hold for
-    /// its whole residency. The master stays — closing it hangs up the
-    /// terminal and HUPs the group, pre-empting the TERM grace the graveyard
-    /// exists to honor.
+    /// Release the PTY writer after removal while retaining the master for
+    /// process-group teardown.
     pub fn shed_writer(&mut self) {
         self.writer = Box::new(io::sink());
     }
@@ -754,10 +723,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A leader whose exit is latched by `collect` (the graveyard/teardown
-    /// path) and not by `poll_exit` must still decode signal death as
-    /// 128+signum: both latch sites share `wait_code`, so a KILLed job reads
-    /// 137, never a generic 1.
+    /// `collect` reports SIGKILL as shell exit code 137.
     #[test]
     fn killed_leader_latches_137_via_collect() {
         let mut t = spawn(8, "sleep 300");

@@ -49,19 +49,8 @@ pub struct Supervisor {
     /// leader's zombie is collected. Invisible to `tick` snapshots, so the row
     /// disappears instantly while the sweep runs behind it.
     ///
-    /// Residency is the full `kill_grace` for *every* entry — including the
-    /// common one, removing a long-finished task whose group holds nothing but
-    /// the leader's zombie — because collection is gated on the end-of-grace
-    /// KILL and no earlier exit is sound: a zombie is still a group member, so
-    /// `killpg(pgid, 0)` succeeds on a dead group and can't probe emptiness;
-    /// reader-thread EOF misses stragglers that redirected their stdio off the
-    /// PTY (`nohup cmd >/dev/null &`); and dropping the PTY master would hang
-    /// up the terminal and HUP the group, pre-empting the very grace being
-    /// honored. What an entry actually holds for those ≤2 s: the master fd and
-    /// the vt100 grid (the writer is shed on entry, and a finished leader's
-    /// reader thread has already exited with its cloned fd, so clearing twenty
-    /// finished rows parks ≈20 fds, not threads). `shutdown_all` waits the
-    /// graveyard out, so this residency is also the quit-after-remove ceiling.
+    /// Entries remain through `kill_grace` because group emptiness cannot be
+    /// reliably observed before escalation. `shutdown_all` waits for them.
     graveyard: Vec<Task>,
     next_id: u64,
     /// PTY content size (rows already minus the client's status bar). Every task
@@ -75,13 +64,8 @@ pub struct Supervisor {
     /// `None` whenever `watched` changes, so re-attaching always gets a fresh
     /// full screen (the client cleared its copy on detach).
     last_screen: Option<LastScreen>,
-    /// The current client's launch context: every spawn (including rerun and
-    /// session load) uses its env, and session-recipe dirs resolve against its
-    /// cwd. Starts `None` — a daemon has no client env of its own to offer,
-    /// and its process env (the first autostarting client's, frozen) is
-    /// exactly the wrong default — so `spawn` refuses until a context arrives:
-    /// from the connection handshake in the daemon, or `LaunchContext::here()`
-    /// in `--foreground`, where this process *is* the client.
+    /// The current client's launch context, used for spawns and session paths.
+    /// Spawning is refused until one is installed.
     launch: Option<LaunchContext>,
     events: Vec<Event>,
     /// Handed to every `Task` so its reader thread can wake the core loop when the
@@ -111,10 +95,7 @@ impl Supervisor {
         }
     }
 
-    /// Install the launch context every subsequent spawn runs under. Called at
-    /// the connection seam (daemon handshake) or at construction time
-    /// (`--foreground`, tests) — never from the command stream, where a
-    /// context reset has no representation.
+    /// Install the launch context used by subsequent spawns.
     pub fn set_launch_context(&mut self, ctx: LaunchContext) {
         self.launch = Some(ctx);
     }
@@ -241,18 +222,9 @@ impl Supervisor {
     }
 
     /// Kill every task for the quit path: TERM all groups at once, wait out one
-    /// shared grace (early exit as soon as every leader has exited *and* the
-    /// graveyard has drained), SIGKILL the stragglers via `Task::drop`. The
-    /// graveyard is part of the predicate because its entries hold live TERM
-    /// grace windows: dropping them here would straight-SIGKILL stragglers of a
-    /// just-removed task — the exact failure the graveyard exists to prevent.
-    /// The shared deadline still bounds them: an entry's `term_sent` predates
-    /// this call, so its escalation fires no later than `deadline`. The cost is
-    /// that quit-after-remove can block for the entry's *remaining* grace even
-    /// when its group is already empty — emptiness is undetectable (see the
-    /// graveyard docs), so the wait is the price of the grace being real.
-    /// Blocking here is fine (the core is exiting), and the wait is bounded by
-    /// the grace. Anything the final KILLs don't collect (a leader in
+    /// shared grace (exiting early after all leaders and graveyard entries are
+    /// collected), then SIGKILL the stragglers. Blocking is bounded by the
+    /// grace. Anything the final KILLs don't collect (a leader in
     /// uninterruptible sleep) reparents to init when the daemon exits moments
     /// later; blocking on it here could wedge shutdown forever.
     fn shutdown_all(&mut self) {
@@ -339,13 +311,7 @@ impl Supervisor {
         self.tasks.iter_mut().find(|t| t.id == id)
     }
 
-    /// The launch context, or queue the refusal explaining a launch with no
-    /// client behind it. `None` is unreachable through a served connection —
-    /// the handshake precedes every command — so this is the type-level
-    /// backstop for any future path that forgets one, replacing the old
-    /// silent fallback to the daemon's own frozen env. Cloned because the
-    /// callers mutate `self` while spawning; one env copy per user-initiated
-    /// launch is noise next to the process spawn itself.
+    /// Return the launch context, or report that spawning is unavailable.
     fn launch_or_refuse(&mut self) -> Option<LaunchContext> {
         if self.launch.is_none() {
             self.events.push(Event::Status(
@@ -517,9 +483,7 @@ mod tests {
         std::env::current_dir().unwrap()
     }
 
-    /// A supervisor with this process's own launch context installed — what
-    /// `--foreground` builds, and the baseline every spawning test needs now
-    /// that a context-less supervisor refuses to launch.
+    /// Build a supervisor with this process's launch context.
     fn sup(rows: u16, cols: u16) -> Supervisor {
         let mut s = Supervisor::new(rows, cols);
         s.set_launch_context(LaunchContext::here());
@@ -967,10 +931,7 @@ mod tests {
         pred(s)
     }
 
-    /// Pin the launch shell to `/bin/sh` in the launch context: the straggler
-    /// tests assert POSIX group mechanics, and zsh kills a `-c` shell's
-    /// background jobs on exit (even under `trap '' HUP`), which would end the
-    /// straggler before the sweep under test ran.
+    /// Use `/bin/sh` so background-process tests have consistent semantics.
     fn hello_with_sh(s: &mut Supervisor, cwd: PathBuf) {
         let mut env: Vec<(std::ffi::OsString, std::ffi::OsString)> = std::env::vars_os().collect();
         env.retain(|(k, _)| k != "SHELL");
@@ -1115,10 +1076,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// `Shutdown` right after `Remove` must wait out the graveyard entry's
-    /// TERM grace instead of dropping it into an instant SIGKILL (the
-    /// remove-then-quit path): the TERM-ignoring straggler is still alive at
-    /// mid-grace while `shutdown_all` blocks, and dead once it returns.
+    /// Shutdown after removal preserves the removed task's TERM grace.
     #[test]
     fn shutdown_waits_for_graveyard_grace() {
         use nix::sys::signal::kill;
@@ -1127,9 +1085,7 @@ mod tests {
         let mut s = sup(24, 80);
         s.set_kill_grace(Duration::from_millis(400));
         hello_with_sh(&mut s, dir.clone());
-        // Same straggler recipe as the kill-escalation test: HUP-immune so it
-        // survives the leader, TERM-immune so only the end-of-grace KILL can
-        // end it.
+        // The background process ignores HUP and TERM.
         let id = spawn_ready(
             &mut s,
             format!(
@@ -1146,9 +1102,7 @@ mod tests {
         }));
 
         s.apply(Command::Remove { id }); // graveyard: TERM sent, grace running
-        // Sample mid-grace from a watcher thread while `apply` below blocks in
-        // `shutdown_all`. The pre-fix code SIGKILLed the straggler at t≈0 by
-        // dropping the graveyard, so aliveness here is the whole assertion.
+        // Check that the background process remains alive during the grace.
         let alive_mid_grace = std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(200));
             kill(straggler, None).is_ok()
@@ -1166,11 +1120,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A spawn runs under the installed launch context's environment, not the
-    /// daemon process's: the client's marker is visible, and a var only this
-    /// process has (`USER` — chosen because no shell synthesizes it, unlike
-    /// `HOME`, which zsh fills from passwd when unset) is absent because the
-    /// builder's captured base env is cleared.
+    /// Spawns inherit only the installed launch-context environment.
     #[test]
     fn spawn_uses_the_launch_context_env_not_the_process_env() {
         assert!(
@@ -1200,11 +1150,7 @@ mod tests {
     }
 
     /// A supervisor with no launch context refuses to launch — spawn, rerun,
-    /// and session load alike — with a status notice instead of silently
-    /// falling back to this process's own (wrong) environment. This is the
-    /// invariant the `Option` carries: the old code held it by control flow
-    /// alone, with `std::env::vars_os()` sitting in the constructor as the
-    /// default that one forgotten handshake would have shipped.
+    /// and session load alike — with a status notice.
     #[test]
     fn launch_without_context_is_refused() {
         let mut s = Supervisor::new(24, 80);

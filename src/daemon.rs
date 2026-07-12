@@ -202,13 +202,7 @@ pub fn connect_ready() -> io::Result<UnixStream> {
     Ok(stream)
 }
 
-/// Map a handshake deadline to its actual meaning: the daemon serves one
-/// client at a time, so a timeout is "busy", not "broken". Both bounded
-/// branches route through here — the read (a fitting hello sent, no ack
-/// while another client is served) *and* the write (a hello too big for the
-/// unaccepted connection's socket buffer, which on macOS is 8 KB; the write
-/// is where an oversized handshake actually stalls). Non-timeout errors pass
-/// through unchanged.
+/// Convert handshake timeouts to a busy-daemon error; preserve other errors.
 fn busy_daemon_error(e: io::Error) -> io::Error {
     if is_timeout(&e) {
         io::Error::new(
@@ -225,9 +219,8 @@ fn busy_daemon_error(e: io::Error) -> io::Error {
 /// printed notice would land on the alternate screen. A busy daemon surfaces
 /// as a status-line error instead; the user retries once the other client
 /// detaches. Write is bounded too: a full send buffer (large env, unaccepted
-/// connection) must not wedge the UI either. A timed-out write can leave a
-/// partial frame, but never a corrupt stream: the connection is dropped with
-/// the error, so nothing reads past it.
+/// connection) must not wedge the UI either. A timed-out write drops the
+/// connection, so a partial frame is never read.
 pub fn connect_ready_bounded() -> io::Result<UnixStream> {
     let mut stream = connect_or_autostart()?;
     stream.set_write_timeout(Some(HANDSHAKE_TIMEOUT))?;
@@ -401,7 +394,7 @@ pub fn run_daemon() -> io::Result<()> {
     fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
 
     // 24x80 until the first client's Resize, which arrives before any Spawn.
-    // Launch context (env, session base dir) arrives per-connection via Hello.
+    // Each connection supplies its launch context in the hello frame.
     let mut sup = Supervisor::new(24, 80);
 
     // A signalled daemon shuts down *cleanly*: TERM each job's group with a
@@ -487,10 +480,7 @@ enum ServeOutcome {
     Shutdown,
 }
 
-/// Whether a frame is a *v2* hello: a control frame whose jzon payload is
-/// tagged `"t":"hello"`. v3 moved the handshake to its own frame kind, so this
-/// exists only to tell an outdated client "version mismatch" instead of the
-/// less actionable "no handshake".
+/// Return the version from a v2 control-frame hello.
 fn is_v2_hello(kind: u8, payload: &[u8]) -> Option<u32> {
     if kind != crate::frame::KIND_CONTROL {
         return None;
@@ -503,11 +493,8 @@ fn is_v2_hello(kind: u8, payload: &[u8]) -> Option<u32> {
     }
 }
 
-/// Read and validate the connection-opening hello frame. `Ok` carries the
-/// client's launch context for `set_launch_context`; `Err` carries the refusal
-/// text for the client's status line. Bounded read: a peer that connects and
-/// sends nothing must not wedge the daemon — accept, reap, and `--kill` all
-/// wait behind this.
+/// Read and validate the connection-opening hello frame.
+/// The bounded read prevents an idle peer from blocking the daemon.
 fn handshake(stream: &mut UnixStream) -> Result<LaunchContext, String> {
     let (kind, payload) = read_frame_bounded(stream, HANDSHAKE_TIMEOUT)
         .map_err(|e| format!("no valid hello received: {e}"))?;
@@ -518,8 +505,7 @@ fn handshake(stream: &mut UnixStream) -> Result<LaunchContext, String> {
              v{version}; run 'fleetcom --kill' and retry",
             env!("CARGO_PKG_VERSION"),
         )),
-        // A v2 client's hello arrives as a control-frame command: name the
-        // version gap rather than accusing it of skipping the handshake.
+        // Report a v2 hello as a version mismatch.
         None => match is_v2_hello(kind, &payload) {
             Some(version) => Err(format!(
                 "protocol mismatch: daemon {} speaks v{PROTOCOL_VERSION}, client speaks \

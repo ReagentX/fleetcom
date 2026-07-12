@@ -39,9 +39,7 @@ fn version_mismatch_is_refused_with_both_versions_named() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// A v2 client's hello — a `"t":"hello"` control-frame command carrying
-/// number-array env — is refused with the version gap named, not the generic
-/// "requires a hello handshake": the client did handshake, just in v2.
+/// A v2 control-frame hello is reported as a version mismatch.
 #[test]
 fn v2_hello_is_refused_as_a_version_mismatch() {
     let (dir, daemon, mut stream) = start_daemon_raw("v2hello", |_| {});
