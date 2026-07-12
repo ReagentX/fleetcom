@@ -53,9 +53,7 @@ pub trait Transport {
     fn shutdown(&mut self, intent: ExitIntent);
 }
 
-/// Drain every ready event without blocking; flip `dead` if the channel has
-/// disconnected (the core is gone). Shared by the threaded and socket transports.
-/// The client renders at its own cadence and coalesces newer over older.
+/// Drain ready events without blocking and mark a disconnected channel as dead.
 fn drain(rx: &Receiver<Event>, dead: &mut bool) -> Vec<Event> {
     let mut evs = Vec::new();
     loop {
@@ -87,9 +85,13 @@ pub struct ThreadTransport {
 impl ThreadTransport {
     /// Run `sup` on its own thread. `wait_tx` wakes the *client's* run loop when
     /// an event is produced, so the loop reacts without polling.
-    pub fn spawn(sup: Supervisor, wait_tx: Sender<()>) -> ThreadTransport {
+    pub fn spawn(mut sup: Supervisor, wait_tx: Sender<()>) -> ThreadTransport {
         let (wake_tx, wake_rx) = channel::<Wake>();
         let (evt_tx, evt_rx) = channel::<Event>();
+        // The in-process "connection": client and core are the same process, so
+        // its own env/cwd *is* the launch context. The daemon path receives the
+        // same Hello over the socket handshake instead.
+        sup.apply(crate::protocol::hello_here());
         // Install the waker before the thread starts, so tasks spawned on the core
         // can signal output back to this same loop.
         sup.set_waker(wake_tx.clone());

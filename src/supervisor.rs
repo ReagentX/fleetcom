@@ -4,6 +4,7 @@
 //! a task snapshot plus the watched screen), and `drain` (take the queued
 //! `Event`s).
 
+use std::ffi::OsString;
 use std::path::PathBuf;
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
@@ -45,6 +46,11 @@ const KILL_GRACE: Duration = Duration::from_secs(2);
 
 pub struct Supervisor {
     tasks: Vec<Task>,
+    /// Removed tasks whose process groups may still be winding down: TERMed at
+    /// removal, escalated to KILL by `reap` at grace end, and dropped once the
+    /// leader's zombie is collected. Invisible to `tick` snapshots, so the row
+    /// disappears instantly while the sweep runs behind it.
+    graveyard: Vec<Task>,
     next_id: u64,
     /// PTY content size (rows already minus the client's status bar). Every task
     /// runs at this size, so attach never reflows.
@@ -57,10 +63,14 @@ pub struct Supervisor {
     /// `None` whenever `watched` changes, so re-attaching always gets a fresh
     /// full screen (the client cleared its copy on detach).
     last_screen: Option<LastScreen>,
-    /// Base for resolving a session recipe's stored dirs: the daemon's cwd; in
-    /// process that's the invocation dir. Recipe dirs are absolute, so this only
-    /// matters for a hand-edited relative entry.
-    base_dir: PathBuf,
+    /// The current client's launch context, from its `Hello`: every spawn
+    /// (including rerun and session load) uses this env, and session-recipe
+    /// dirs resolve against this cwd. Initialized to this process's own
+    /// context, which is the real thing for `--foreground` (client and core
+    /// share the process) and unreachable in the daemon: the handshake applies
+    /// the client's `Hello` before any command is served.
+    client_env: Vec<(OsString, OsString)>,
+    client_cwd: PathBuf,
     events: Vec<Event>,
     /// Handed to every `Task` so its reader thread can wake the core loop when the
     /// PTY produces output. The serving loop installs its sender on connect
@@ -73,15 +83,17 @@ pub struct Supervisor {
 }
 
 impl Supervisor {
-    pub fn new(rows: u16, cols: u16, base_dir: PathBuf) -> Supervisor {
+    pub fn new(rows: u16, cols: u16) -> Supervisor {
         Supervisor {
             tasks: Vec::new(),
+            graveyard: Vec::new(),
             next_id: 1,
             rows,
             cols,
             watched: None,
             last_screen: None,
-            base_dir,
+            client_env: std::env::vars_os().collect(),
+            client_cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
             events: Vec::new(),
             waker: Arc::new(Mutex::new(None)),
             kill_grace: KILL_GRACE,
@@ -124,6 +136,13 @@ impl Supervisor {
     /// notice, a spawn failure) is queued as `Event::Status`, never returned.
     pub fn apply(&mut self, cmd: Command) {
         match cmd {
+            // Version checking happens at the connection seam (the daemon's
+            // handshake, before anything reaches `apply`); here a Hello is
+            // purely the launch context taking effect.
+            Command::Hello { env, cwd, .. } => {
+                self.client_env = env;
+                self.client_cwd = cwd;
+            }
             Command::Spawn { command, cwd } => self.spawn(&command, cwd),
             Command::Kill { id } => {
                 if let Some(t) = self.by_id_mut(id) {
@@ -131,8 +150,11 @@ impl Supervisor {
                 }
             }
             Command::Remove { id } => {
+                // Keep removed tasks for TERM→KILL escalation and reaping.
                 if let Some(i) = self.index_of(id) {
-                    self.tasks.remove(i); // Drop terminates/cleans up
+                    let mut t = self.tasks.remove(i);
+                    t.terminate();
+                    self.graveyard.push(t);
                 }
             }
             Command::Restart { id } => self.restart(id),
@@ -142,9 +164,7 @@ impl Supervisor {
                 }
             }
             Command::Resize { rows, cols } => {
-                // Clamp at the trust boundary: the dimensions arrive as untrusted
-                // `u64`s truncated to `u16` in `decode_command`, and go straight
-                // to the PTY and vt100. Nonzero, capped; see `MAX_DIM`.
+                // Keep untrusted dimensions nonzero and within `MAX_DIM`.
                 self.rows = rows.clamp(1, MAX_DIM);
                 self.cols = cols.clamp(1, MAX_DIM);
                 for t in &mut self.tasks {
@@ -152,8 +172,7 @@ impl Supervisor {
                 }
             }
             Command::Watch { id } => {
-                // A changed target (including detach → None → re-attach) forces
-                // the next tick to send a full screen, not skip it as "unchanged".
+                // A new target must receive a complete screen.
                 if id != self.watched {
                     self.last_screen = None;
                 }
@@ -170,32 +189,28 @@ impl Supervisor {
         }
     }
 
-    /// Reap any exited children: latch their exit code and finish time. Cheap
-    /// (no snapshotting), so the daemon can call it while **no client is
-    /// attached**: otherwise a job that exits after `q` stays a zombie until
-    /// someone reconnects and a full `tick` runs.
-    ///
-    /// Also the escalation point: a task that ignored its SIGTERM past the
-    /// grace gets SIGKILLed here. Riding the reap cadence means escalation
-    /// works with no client attached (the daemon's idle loop reaps too).
+    /// Latch exits, escalate overdue TERM requests, and collect removed tasks.
     pub fn reap(&mut self) {
         let now = Instant::now();
-        for t in &mut self.tasks {
-            // Swallow a reap error rather than propagate: the task just isn't
-            // reaped this pass and is retried next. try_wait failing is rare and
+        for t in self.tasks.iter_mut().chain(self.graveyard.iter_mut()) {
+            // Swallow a poll error rather than propagate: the task just isn't
+            // latched this pass and is retried next. waitid failing is rare and
             // must not take down the loop.
             let _ = t.poll_exit();
             if t.overdue(now, self.kill_grace) {
                 t.force_kill();
             }
         }
+        self.graveyard.retain_mut(|t| !t.try_collect());
     }
 
     /// Kill every task for the quit path: TERM all groups at once, wait out one
-    /// shared grace (early exit as soon as everything is reaped), SIGKILL the
-    /// stragglers via `Task::drop`. Blocking here is fine (the core is exiting),
-    /// and the wait is bounded by the grace, paid only by jobs that ignore
-    /// their TERM.
+    /// shared grace (early exit as soon as every leader has exited), SIGKILL
+    /// the stragglers via `Task::drop`. Blocking here is fine (the core is
+    /// exiting), and the wait is bounded by the grace, paid only by jobs that
+    /// ignore their TERM. Anything the final KILLs don't collect (a leader in
+    /// uninterruptible sleep) reparents to init when the daemon exits moments
+    /// later; blocking on it here could wedge shutdown forever.
     fn shutdown_all(&mut self) {
         for t in &mut self.tasks {
             t.terminate();
@@ -206,6 +221,7 @@ impl Supervisor {
             self.reap();
         }
         self.tasks.clear(); // Drop force-kills whatever is left
+        self.graveyard.clear();
     }
 
     /// One step of the core's own loop: reap exits, then emit a fresh task
@@ -284,6 +300,7 @@ impl Supervisor {
             &cwd,
             self.rows,
             self.cols,
+            &self.client_env,
             Arc::clone(&self.waker),
         ) {
             Ok(task) => {
@@ -296,11 +313,7 @@ impl Supervisor {
         }
     }
 
-    /// Re-run a finished task in place: a fresh spawn of the same command in
-    /// the same cwd, wearing the old id, so selection, watch, tag, and list
-    /// position all survive. Running tasks are refused rather than killed
-    /// first: a rerun that kills is destructive, and destroy already has a
-    /// Shift-gated key (`X`).
+    /// Re-run a finished task in place while preserving its ID and tag.
     fn restart(&mut self, id: u64) {
         let Some(i) = self.index_of(id) else {
             self.events
@@ -312,25 +325,25 @@ impl Supervisor {
                 .push(Event::Status("rerun: task is still running".into()));
             return;
         }
-        // Spawn first, swap only on success: a rerun that fails to launch
-        // (e.g. the cwd was deleted since the original run) must not eat the
-        // finished row it was rerunning.
+        // Preserve the finished task if its replacement cannot start.
         match Task::spawn(
             id,
             &self.tasks[i].command,
             &self.tasks[i].cwd,
             self.rows,
             self.cols,
+            &self.client_env,
             Arc::clone(&self.waker),
         ) {
             Ok(mut fresh) => {
                 fresh.tagged = self.tasks[i].tagged;
-                // The displaced Task drops here; its `force_kill` is gated on
-                // `finished.is_none()`, so a reaped child is never re-signalled
-                // (no recycled-pgid hazard).
-                self.tasks[i] = fresh;
-                // The fresh screen may byte-match the old one (both start
-                // blank), so drop the fingerprint rather than trust it.
+                // The displaced job exits like a Remove: TERM now, the
+                // graveyard's grace-then-KILL behind it. Dropping it here
+                // would straight-SIGKILL stragglers of the old run.
+                let mut old = std::mem::replace(&mut self.tasks[i], fresh);
+                old.terminate();
+                self.graveyard.push(old);
+                // Reset the fingerprint for the replacement task's screen.
                 if self.watched == Some(id) {
                     self.last_screen = None;
                 }
@@ -380,7 +393,7 @@ impl Supervisor {
         };
         let (mut spawned, mut skipped) = (0usize, 0usize);
         for (dir, cmds) in &cfg {
-            let resolved = path::resolve(&self.base_dir, dir);
+            let resolved = path::resolve(&self.client_cwd, dir);
             if !resolved.is_dir() {
                 skipped += cmds.len();
                 continue;
@@ -396,6 +409,7 @@ impl Supervisor {
                     &resolved,
                     self.rows,
                     self.cols,
+                    &self.client_env,
                     Arc::clone(&self.waker),
                 ) {
                     self.next_id += 1;
@@ -429,7 +443,7 @@ mod tests {
     /// `a`/`c` share the invocation dir; `b` is off in `/tmp`.
     #[test]
     fn session_config_groups_by_dir_in_spawn_order() {
-        let mut s = Supervisor::new(24, 80, here());
+        let mut s = Supervisor::new(24, 80);
         s.apply(Command::Spawn {
             command: "a".into(),
             cwd: here(),
@@ -456,7 +470,7 @@ mod tests {
     /// the client's render loop depends on.
     #[test]
     fn tick_emits_snapshot_and_watched_screen() {
-        let mut s = Supervisor::new(24, 80, here());
+        let mut s = Supervisor::new(24, 80);
         s.apply(Command::Spawn {
             command: "sleep 30".into(),
             cwd: here(),
@@ -488,7 +502,7 @@ mod tests {
     /// every tick: the send-on-change that kills idle attach churn.
     #[test]
     fn watched_screen_not_resent_when_unchanged() {
-        let mut s = Supervisor::new(24, 80, here());
+        let mut s = Supervisor::new(24, 80);
         s.apply(Command::Spawn {
             command: "sleep 30".into(),
             cwd: here(),
@@ -580,7 +594,7 @@ mod tests {
         use crate::task::Lifecycle;
         let dir = scratch("term_first");
         let (ready, trapped) = (dir.join("ready"), dir.join("trapped"));
-        let mut s = Supervisor::new(24, 80, here());
+        let mut s = Supervisor::new(24, 80);
         let id = spawn_ready(
             &mut s,
             format!(
@@ -604,7 +618,7 @@ mod tests {
         use crate::task::Lifecycle;
         let dir = scratch("escalate");
         let ready = dir.join("ready");
-        let mut s = Supervisor::new(24, 80, here());
+        let mut s = Supervisor::new(24, 80);
         s.set_kill_grace(Duration::from_millis(150));
         let id = spawn_ready(
             &mut s,
@@ -624,7 +638,7 @@ mod tests {
     /// grace, not after it.
     #[test]
     fn shutdown_returns_early_when_jobs_respect_term() {
-        let mut s = Supervisor::new(24, 80, here());
+        let mut s = Supervisor::new(24, 80);
         s.apply(Command::Spawn {
             command: "sleep 300".into(),
             cwd: here(),
@@ -649,7 +663,7 @@ mod tests {
     fn shutdown_is_bounded_by_grace() {
         let dir = scratch("shutdown_bound");
         let ready = dir.join("ready");
-        let mut s = Supervisor::new(24, 80, here());
+        let mut s = Supervisor::new(24, 80);
         s.set_kill_grace(Duration::from_millis(200));
         spawn_ready(
             &mut s,
@@ -681,7 +695,7 @@ mod tests {
     /// fresh full screen instead of being skipped as "unchanged".
     #[test]
     fn clear_watch_stops_screen_stream_and_resets_dedup() {
-        let mut s = Supervisor::new(24, 80, here());
+        let mut s = Supervisor::new(24, 80);
         s.apply(Command::Spawn {
             command: "sleep 30".into(),
             cwd: here(),
@@ -725,7 +739,7 @@ mod tests {
         use crate::task::Lifecycle;
         let dir = scratch("restart");
         let marker = dir.join("marker");
-        let mut s = Supervisor::new(24, 80, here());
+        let mut s = Supervisor::new(24, 80);
         s.apply(Command::Spawn {
             command: format!("echo run >> {}", marker.display()),
             cwd: dir.clone(),
@@ -757,7 +771,7 @@ mod tests {
     #[test]
     fn restart_refuses_running_task_and_unknown_id() {
         use crate::task::Lifecycle;
-        let mut s = Supervisor::new(24, 80, here());
+        let mut s = Supervisor::new(24, 80);
         s.apply(Command::Spawn {
             command: "sleep 30".into(),
             cwd: here(),
@@ -798,7 +812,7 @@ mod tests {
     #[test]
     fn restart_watched_task_resends_screen() {
         use crate::task::Lifecycle;
-        let mut s = Supervisor::new(24, 80, here());
+        let mut s = Supervisor::new(24, 80);
         s.apply(Command::Spawn {
             command: "true".into(),
             cwd: here(),
@@ -831,7 +845,7 @@ mod tests {
     /// without a panic/OOM is the assertion.
     #[test]
     fn resize_clamps_hostile_dimensions() {
-        let mut s = Supervisor::new(24, 80, here());
+        let mut s = Supervisor::new(24, 80);
         s.apply(Command::Spawn {
             command: "sleep 30".into(),
             cwd: here(),
@@ -845,5 +859,210 @@ mod tests {
         });
         s.tick(); // clamped to MAX_DIM² cells, not u16::MAX²: no OOM
         let _ = s.drain();
+    }
+
+    /// Poll `reap` until `pred` holds or the deadline passes. The sweep paths
+    /// are all reap-driven, so tests must go through `reap()` — a `Drop`-driven
+    /// test would pass while the reap-side escalation was broken.
+    fn reap_until(
+        s: &mut Supervisor,
+        budget: Duration,
+        mut pred: impl FnMut(&mut Supervisor) -> bool,
+    ) -> bool {
+        let deadline = Instant::now() + budget;
+        while Instant::now() < deadline {
+            s.reap();
+            if pred(s) {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        pred(s)
+    }
+
+    /// Pin the launch shell to `/bin/sh` via a `Hello`: the straggler tests
+    /// assert POSIX group mechanics, and zsh kills a `-c` shell's background
+    /// jobs on exit (even under `trap '' HUP`), which would end the straggler
+    /// before the sweep under test ran.
+    fn hello_with_sh(s: &mut Supervisor, cwd: PathBuf) {
+        let mut env: Vec<(std::ffi::OsString, std::ffi::OsString)> = std::env::vars_os().collect();
+        env.retain(|(k, _)| k != "SHELL");
+        env.push(("SHELL".into(), "/bin/sh".into()));
+        s.apply(Command::Hello {
+            version: crate::protocol::PROTOCOL_VERSION,
+            env,
+            cwd,
+        });
+    }
+
+    /// Read a pid a test job wrote, waiting for the write to land.
+    fn read_pid(path: &Path) -> nix::unistd::Pid {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(pid) = std::fs::read_to_string(path)
+                .ok()
+                .and_then(|s| s.trim().parse::<i32>().ok())
+            {
+                return nix::unistd::Pid::from_raw(pid);
+            }
+            assert!(Instant::now() < deadline, "pid file never appeared");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// `Remove` must sweep group members the exited leader left behind (a
+    /// non-interactive shell's `&` child never leaves the group): TERM at
+    /// removal, delivered through the graveyard. This is the leak the old
+    /// `finished.is_none()` gate guaranteed.
+    #[test]
+    fn remove_sweeps_stragglers_of_an_exited_leader() {
+        use nix::sys::signal::kill;
+        let dir = scratch("remove_sweep");
+        let (spid, ready) = (dir.join("spid"), dir.join("ready"));
+        let mut s = Supervisor::new(24, 80);
+        hello_with_sh(&mut s, dir.clone());
+        let id = spawn_ready(
+            &mut s,
+            format!(
+                "trap '' HUP; sleep 300 & echo $! > {sp}; echo r > {r}",
+                sp = spid.display(),
+                r = ready.display()
+            ),
+            dir.clone(),
+            &ready,
+        );
+        let straggler = read_pid(&spid);
+        // The leader exits on its own; the straggler stays.
+        assert!(reap_until(&mut s, Duration::from_secs(5), |s| {
+            s.tasks.iter().all(|t| t.id != id || t.finished.is_some())
+        }));
+        assert!(kill(straggler, None).is_ok(), "straggler should be alive");
+
+        s.apply(Command::Remove { id });
+        assert!(
+            reap_until(&mut s, Duration::from_secs(5), |_| kill(straggler, None)
+                .is_err()),
+            "Remove never swept the straggler"
+        );
+        assert!(
+            reap_until(&mut s, Duration::from_secs(5), |s| s.graveyard.is_empty()),
+            "graveyard entry was never collected"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Rerun must give the displaced job the same graceful exit as Remove:
+    /// TERM through the graveyard, not the straight SIGKILL a `Drop` delivers.
+    /// The old run's HUP-immune straggler dies of the TERM while the fresh run
+    /// (same id) is already up.
+    #[test]
+    fn restart_sweeps_stragglers_of_the_old_run() {
+        use nix::sys::signal::kill;
+        let dir = scratch("restart_sweep");
+        let (spid, ready) = (dir.join("spid"), dir.join("ready"));
+        let mut s = Supervisor::new(24, 80);
+        hello_with_sh(&mut s, dir.clone());
+        let id = spawn_ready(
+            &mut s,
+            format!(
+                "trap '' HUP; sleep 300 & echo $! > {sp}; echo r > {r}",
+                sp = spid.display(),
+                r = ready.display()
+            ),
+            dir.clone(),
+            &ready,
+        );
+        let old_straggler = read_pid(&spid);
+        assert!(reap_until(&mut s, Duration::from_secs(5), |s| {
+            s.tasks.iter().all(|t| t.id != id || t.finished.is_some())
+        }));
+        assert!(kill(old_straggler, None).is_ok());
+
+        // The rerun overwrites the pid file with the *new* run's straggler.
+        s.apply(Command::Restart { id });
+        assert!(
+            reap_until(&mut s, Duration::from_secs(5), |_| kill(
+                old_straggler,
+                None
+            )
+            .is_err()),
+            "restart never swept the old run's straggler"
+        );
+        // The fresh run exists under the same id; its own straggler dies with
+        // the supervisor (Task::drop backstop).
+        assert!(s.tasks.iter().any(|t| t.id == id));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The escalation must reach a TERM-ignoring straggler *after the leader
+    /// exited*: `overdue` may not be gated on the leader's exit. This is the
+    /// exact case a `finished.is_none()` gate silently no-ops.
+    #[test]
+    fn kill_escalation_reaches_term_ignoring_straggler_after_leader_exit() {
+        use nix::sys::signal::kill;
+        let dir = scratch("kill_escalate_straggler");
+        let (spid, ready) = (dir.join("spid"), dir.join("ready"));
+        let mut s = Supervisor::new(24, 80);
+        s.set_kill_grace(Duration::from_millis(150));
+        hello_with_sh(&mut s, dir.clone());
+        // The leader ignores HUP (inherited by the `&` child, so it survives
+        // the leader's exit); the subshell ignores TERM, then execs sleep,
+        // which inherits both. Only the KILL can end it.
+        let id = spawn_ready(
+            &mut s,
+            format!(
+                "trap '' HUP; (trap '' TERM; exec sleep 300) & echo $! > {sp}; echo r > {r}",
+                sp = spid.display(),
+                r = ready.display()
+            ),
+            dir.clone(),
+            &ready,
+        );
+        let straggler = read_pid(&spid);
+        assert!(reap_until(&mut s, Duration::from_secs(5), |s| {
+            s.tasks.iter().all(|t| t.id != id || t.finished.is_some())
+        }));
+
+        s.apply(Command::Kill { id }); // TERM: ignored by the straggler
+        assert!(
+            reap_until(&mut s, Duration::from_secs(5), |_| kill(straggler, None)
+                .is_err()),
+            "reap-driven escalation never KILLed the straggler"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A spawn runs under the `Hello` client's environment, not the daemon
+    /// process's: the client's marker is visible, and a var only this process
+    /// has (`USER` — chosen because no shell synthesizes it, unlike `HOME`,
+    /// which zsh fills from passwd when unset) is absent because the builder's
+    /// captured base env is cleared.
+    #[test]
+    fn spawn_uses_the_hello_env_not_the_process_env() {
+        assert!(
+            std::env::var_os("USER").is_some(),
+            "test needs USER set in the process env to prove it doesn't leak"
+        );
+        let dir = scratch("hello_env");
+        let out = dir.join("out");
+        let mut s = Supervisor::new(24, 80);
+        s.apply(Command::Hello {
+            version: crate::protocol::PROTOCOL_VERSION,
+            env: vec![("FLEETCOM_MARKER".into(), "xyzzy".into())],
+            cwd: dir.clone(),
+        });
+        s.apply(Command::Spawn {
+            command: format!(
+                "printf '%s:%s' \"$FLEETCOM_MARKER\" \"${{USER:-unset}}\" > {}",
+                out.display()
+            ),
+            cwd: dir.clone(),
+        });
+        let ok = reap_until(&mut s, Duration::from_secs(5), |_| {
+            std::fs::read_to_string(&out).is_ok_and(|c| !c.is_empty())
+        });
+        assert!(ok, "the marker job never wrote its output");
+        assert_eq!(std::fs::read_to_string(&out).unwrap(), "xyzzy:unset");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

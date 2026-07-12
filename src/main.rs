@@ -131,27 +131,26 @@ fn main() -> io::Result<()> {
 
     install_panic_hook();
 
-    let mut out = io::stdout();
-    enable_raw_mode()?;
-    execute!(out, EnterAlternateScreen, Clear(ClearType::All), Hide)?;
-
     let (cols, rows) = size()?;
-    // Default connects to (or autostarts) the daemon so jobs outlive the UI;
-    // `--foreground` runs the core in-process instead.
+    // Connect *before* raw mode / alternate screen: the handshake can wait for
+    // another client to detach, and the plain terminal is where its waiting
+    // notice prints readably and Ctrl-C still aborts. Failures report without
+    // any restore dance. `--foreground` runs the core in-process instead.
     let mut app = if foreground {
         App::new_foreground(rows, cols)
     } else {
         match App::connect(rows, cols) {
             Ok(a) => a,
             Err(e) => {
-                // Still in raw/alt-screen: restore before reporting the failure.
-                let _ = execute!(out, Show, LeaveAlternateScreen);
-                let _ = disable_raw_mode();
                 eprintln!("fleetcom: could not reach the daemon: {e}");
                 return Err(e);
             }
         }
     };
+
+    let mut out = io::stdout();
+    enable_raw_mode()?;
+    execute!(out, EnterAlternateScreen, Clear(ClearType::All), Hide)?;
     // `fleetcom [--foreground] <session>` loads that session at startup; the
     // result shows in the status line.
     if let Some(name) = &session {

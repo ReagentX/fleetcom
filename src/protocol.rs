@@ -7,17 +7,34 @@
 //! `Instant`: a socket peer could interpret neither, so the types stay
 //! wire-shaped.
 
+use std::ffi::{OsStr, OsString};
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::frame::{KIND_CONTROL, KIND_SCREEN};
 use crate::task::Lifecycle;
 
+/// Wire-protocol version. The handshake rejects peers using a different version.
+pub const PROTOCOL_VERSION: u32 = 1;
+
 /// A client→core request. Every mutation of the task set is one of these; the
 /// client never touches a `Task` directly. Fire-and-forget: results come back
 /// as `Event`s, never as return values.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Command {
+    /// The connection opener: the client's protocol version and launch context.
+    /// Env and cwd are per-*connection*, not per-spawn — nothing mutates a
+    /// client's environment while it runs, so sending it once is equivalent to
+    /// sending it with every launch, and it prices the env payload once. Env
+    /// rides as bytes: environment variables need not be UTF-8.
+    Hello {
+        version: u32,
+        env: Vec<(OsString, OsString)>,
+        /// Base for resolving a session recipe's relative dirs: the client's
+        /// invocation dir, not the daemon's (frozen, first-client) cwd.
+        cwd: PathBuf,
+    },
     /// Run `command` under `$SHELL -c` in `cwd`.
     Spawn { command: String, cwd: PathBuf },
     /// Signal-kill a live task's process group; it reaps into Completed.
@@ -49,6 +66,13 @@ pub enum Command {
 /// the watched screen, updated only by these.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Event {
+    /// The daemon accepted the client's `Hello`: versions match, launch context
+    /// stored. The client blocks on this before building its transport, so a
+    /// pre-handshake daemon (which answers with its first `Tasks` tick instead)
+    /// is detected rather than silently served with the wrong environment.
+    /// Carries no version: the daemon only acks an exact match, so a field
+    /// would always equal the client's own constant.
+    HelloOk,
     /// Full task-set snapshot; replaces the client's mirror wholesale.
     Tasks(Vec<TaskView>),
     /// The watched task's current screen (attach/peek source).
@@ -93,8 +117,53 @@ pub struct ScreenView {
 // raw tail after a small jzon header rather than bloating into a JSON number
 // array. A socket peer is just `decode_*(read_frame(...))`.
 
+/// Paths ride the wire as lossy UTF-8 strings — protocol-wide (`Spawn`,
+/// `Hello`, `TaskView`): a non-UTF-8 path arrives mangled. Accepted rather
+/// than byte-encoded like env: non-UTF-8 paths are rare, a wrong path fails
+/// visibly at spawn/resolve time (unlike a silently wrong env), and fixing it
+/// would touch every message for marginal gain.
 fn ps(p: &Path) -> String {
     p.to_string_lossy().into_owned()
+}
+
+/// The `Hello` for this process: its own env and cwd at `PROTOCOL_VERSION`.
+/// The socket client sends it as the handshake; the in-process transport
+/// applies it directly — either way a launch context always comes from the
+/// process that asked for the launch.
+pub fn hello_here() -> Command {
+    Command::Hello {
+        version: PROTOCOL_VERSION,
+        env: std::env::vars_os().collect(),
+        cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+    }
+}
+
+/// An `OsStr` as a jzon byte array. JSON strings are UTF-8, so non-UTF-8 env
+/// bytes can't ride as a string; a number array is lossless and paid once per
+/// connection (the `Hello`), never per spawn.
+fn os_arr(s: &OsStr) -> jzon::JsonValue {
+    let mut a = jzon::JsonValue::new_array();
+    for b in s.as_bytes() {
+        let _ = a.push(*b as u64);
+    }
+    a
+}
+
+/// Inverse of [`os_arr`]. `None` unless `v` is an array of bytes: a malformed
+/// pair rejects the whole command (the daemon must not guess at an
+/// environment). The explicit array check is load-bearing — jzon's `members()`
+/// on a non-array (including the `Null` that indexing a malformed pair yields)
+/// is an *empty* iterator, which would otherwise decode as an empty string and
+/// let a wrong-shape hello through with an empty-pair environment.
+fn os_from(v: &jzon::JsonValue) -> Option<OsString> {
+    if !v.is_array() {
+        return None;
+    }
+    let mut bytes = Vec::with_capacity(v.len());
+    for m in v.members() {
+        bytes.push(u8::try_from(m.as_u64()?).ok()?);
+    }
+    Some(OsString::from_vec(bytes))
 }
 
 fn lifecycle_str(l: Lifecycle) -> &'static str {
@@ -121,6 +190,19 @@ fn lifecycle_from(s: &str) -> Option<Lifecycle> {
 pub fn encode_command(cmd: &Command) -> (u8, Vec<u8>) {
     let mut o = jzon::JsonValue::new_object();
     match cmd {
+        Command::Hello { version, env, cwd } => {
+            let _ = o.insert("t", "hello");
+            let _ = o.insert("v", *version);
+            let _ = o.insert("cwd", ps(cwd));
+            let mut pairs = jzon::JsonValue::new_array();
+            for (k, v) in env {
+                let mut pair = jzon::JsonValue::new_array();
+                let _ = pair.push(os_arr(k));
+                let _ = pair.push(os_arr(v));
+                let _ = pairs.push(pair);
+            }
+            let _ = o.insert("env", pairs);
+        }
         Command::Spawn { command, cwd } => {
             let _ = o.insert("t", "spawn");
             let _ = o.insert("command", command.as_str());
@@ -192,6 +274,17 @@ pub fn decode_command(kind: u8, payload: &[u8]) -> Option<Command> {
     }
     let v = jzon::parse(std::str::from_utf8(payload).ok()?).ok()?;
     let cmd = match v["t"].as_str()? {
+        "hello" => {
+            let mut env = Vec::new();
+            for pair in v["env"].members() {
+                env.push((os_from(&pair[0])?, os_from(&pair[1])?));
+            }
+            Command::Hello {
+                version: v["v"].as_u32()?,
+                env,
+                cwd: PathBuf::from(v["cwd"].as_str()?),
+            }
+        }
         "spawn" => Command::Spawn {
             command: v["command"].as_str()?.to_string(),
             cwd: PathBuf::from(v["cwd"].as_str()?),
@@ -244,6 +337,11 @@ pub fn decode_command(kind: u8, payload: &[u8]) -> Option<Command> {
 /// [raw formatted bytes]`), so the formatted firehose stays raw.
 pub fn encode_event(ev: &Event) -> (u8, Vec<u8>) {
     match ev {
+        Event::HelloOk => {
+            let mut o = jzon::JsonValue::new_object();
+            let _ = o.insert("t", "hello_ok");
+            (KIND_CONTROL, o.dump().into_bytes())
+        }
         Event::Tasks(views) => {
             let mut arr = jzon::JsonValue::new_array();
             for tv in views {
@@ -299,6 +397,7 @@ pub fn decode_event(kind: u8, payload: &[u8]) -> Option<Event> {
         KIND_CONTROL => {
             let v = jzon::parse(std::str::from_utf8(payload).ok()?).ok()?;
             match v["t"].as_str()? {
+                "hello_ok" => Some(Event::HelloOk),
                 "tasks" => {
                     let mut views = Vec::new();
                     for tv in v["tasks"].members() {
@@ -353,6 +452,24 @@ mod tests {
     #[test]
     fn command_round_trips() {
         let cases = [
+            Command::Hello {
+                version: PROTOCOL_VERSION,
+                // 0xFF/0xFE are invalid UTF-8 anywhere in a sequence: the env
+                // encoding must be byte-exact, not string-shaped.
+                env: vec![
+                    ("PATH".into(), "/usr/bin:/bin".into()),
+                    (
+                        OsString::from_vec(b"BAD\xff\xfe".to_vec()),
+                        OsString::from_vec(b"v\xff".to_vec()),
+                    ),
+                ],
+                cwd: PathBuf::from("/home/x"),
+            },
+            Command::Hello {
+                version: 0,
+                env: Vec::new(),
+                cwd: PathBuf::from("/"),
+            },
             Command::Spawn {
                 command: "echo hi".into(),
                 cwd: PathBuf::from("/tmp"),
@@ -383,6 +500,36 @@ mod tests {
             let (k, p) = encode_command(&c);
             assert_eq!(decode_command(k, &p).as_ref(), Some(&c), "round-trip {c:?}");
         }
+    }
+
+    #[test]
+    fn hello_ok_round_trips() {
+        let ack = Event::HelloOk;
+        let (k, p) = encode_event(&ack);
+        assert_eq!(k, KIND_CONTROL);
+        assert_eq!(decode_event(k, &p), Some(ack));
+    }
+
+    /// A malformed env pair (a non-byte element) rejects the whole `Hello`:
+    /// the daemon must never launch jobs under a guessed environment.
+    #[test]
+    fn hello_with_malformed_env_is_rejected() {
+        let json = r#"{"t":"hello","v":1,"cwd":"/","env":[[[300],[65]]]}"#;
+        assert_eq!(decode_command(KIND_CONTROL, json.as_bytes()), None);
+    }
+
+    /// Wrong-*shape* pairs must reject too, not decode as empty strings: a
+    /// client that encodes env entries as JSON strings would otherwise pass
+    /// the handshake and spawn PATH-less jobs with nothing pointing back at
+    /// the malformed hello.
+    #[test]
+    fn hello_with_string_env_pairs_is_rejected() {
+        // Pair elements as strings instead of byte arrays.
+        let strings = r#"{"t":"hello","v":1,"cwd":"/","env":[["PATH","/bin"]]}"#;
+        assert_eq!(decode_command(KIND_CONTROL, strings.as_bytes()), None);
+        // Pair itself as a string: indexing it yields Null for both elements.
+        let flat = r#"{"t":"hello","v":1,"cwd":"/","env":["PATH=/bin"]}"#;
+        assert_eq!(decode_command(KIND_CONTROL, flat.as_bytes()), None);
     }
 
     #[test]

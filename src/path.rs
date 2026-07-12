@@ -1,7 +1,4 @@
-//! Pure path helpers shared by the client (the `@` picker, dir labels) and the
-//! supervisor (resolving a session recipe's stored dirs). No filesystem access:
-//! `resolve`/`lexical_clean` are lexical, so a path need not exist to be tidied
-//! and `/tmp` never becomes `/private/tmp`.
+//! Filesystem-independent path helpers for display and session resolution.
 
 use std::path::{Component, Path, PathBuf};
 
@@ -33,10 +30,7 @@ pub fn expand_tilde(s: &str) -> String {
     s.to_string()
 }
 
-/// Collapse `.` and `..` lexically (no filesystem access, no symlink
-/// resolution): `/a/b/../c` → `/a/c`. Kept lexical rather than
-/// `fs::canonicalize` so `/tmp` stays `/tmp` (not `/private/tmp`) and the path
-/// need not exist yet. This only tidies what the user typed.
+/// Collapse `.` and `..` without resolving symlinks: `/a/b/../c` becomes `/a/c`.
 pub fn lexical_clean(p: &Path) -> PathBuf {
     let mut out = PathBuf::new();
     for comp in p.components() {
@@ -58,12 +52,7 @@ pub fn lexical_clean(p: &Path) -> PathBuf {
     out
 }
 
-/// Turn a typed path fragment into a fully-qualified, lexically-clean absolute
-/// path: `~`/relative are resolved against `base`, then `lexical_clean`
-/// collapses `.`/`..` and trailing slashes so a stored cwd reads as `~/a/c`,
-/// never `~/a/b/../c` or `~/test//`. `base` is the invocation dir for the `@`
-/// picker and the daemon cwd for session load. Both absolute, so a recipe's
-/// stored `~/a` or `/tmp` never actually needs it.
+/// Resolve `~` and relative paths against `base`, then clean them lexically.
 pub fn resolve(base: &Path, s: &str) -> PathBuf {
     let expanded = expand_tilde(s);
     let p = if expanded.is_empty() {

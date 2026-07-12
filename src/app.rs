@@ -171,15 +171,16 @@ pub fn bucket(v: &TaskView) -> u8 {
 }
 
 impl App {
-    /// Default client: connect to the daemon (autostarting it if needed), so
-    /// jobs outlive the UI. The core lives in `fleetcom --daemon`, reached over the
-    /// socket.
+    /// Default client: connect to the daemon (autostarting it if needed) and
+    /// complete the hello handshake, so jobs outlive the UI and run under
+    /// *this* client's env. The core lives in `fleetcom --daemon`, reached over
+    /// the socket.
     pub fn connect(rows: u16, cols: u16) -> io::Result<App> {
-        let stream = crate::daemon::connect_or_autostart()?;
+        let stream = crate::daemon::connect_ready()?;
         // Split the stream here (the fallible part) so the transport factory in
         // `assemble` (which owns the wake sender) stays infallible.
         let read = stream.try_clone()?;
-        let mut app = App::assemble(rows, cols, move |_, _, _, wait_tx| {
+        let mut app = App::assemble(rows, cols, move |_, _, wait_tx| {
             Box::new(SocketTransport::from_halves(stream, read, wait_tx))
         });
         app.daemon_backed = true;
@@ -187,13 +188,16 @@ impl App {
     }
 
     /// Rebuild the daemon connection after a drop (autostarting a fresh daemon if
-    /// needed). A cleanly-exiting daemon kills its jobs on the way out (only a
-    /// SIGKILL or a panic can leak them), so the new session starts empty; the
-    /// mirror is cleared to match.
+    /// needed). A cleanly-exiting daemon kills its jobs on the way out (a
+    /// SIGKILL or a crash kills them rudely, via the PTY hangup), so the new
+    /// session starts empty; the mirror is cleared to match.
     fn reconnect(&mut self) {
         let wait_tx = self.wait_tx.clone();
         let build = move || -> io::Result<SocketTransport> {
-            let stream = crate::daemon::connect_or_autostart()?;
+            // Bounded handshake: this runs inside the live UI, where the
+            // startup variant's indefinite wait (and printed notice) would
+            // freeze the client. A busy daemon lands in the status line.
+            let stream = crate::daemon::connect_ready_bounded()?;
             let read = stream.try_clone()?;
             Ok(SocketTransport::from_halves(stream, read, wait_tx))
         };
@@ -218,24 +222,21 @@ impl App {
     /// `--foreground`: run the core in-process on a thread (no daemon). A
     /// non-daemon escape hatch, and the deterministic target the UI harnesses use.
     pub fn new_foreground(rows: u16, cols: u16) -> App {
-        App::assemble(rows, cols, |pr, c, dir, wait_tx| {
-            Box::new(ThreadTransport::spawn(
-                Supervisor::new(pr, c, dir.to_path_buf()),
-                wait_tx,
-            ))
+        App::assemble(rows, cols, |pr, c, wait_tx| {
+            Box::new(ThreadTransport::spawn(Supervisor::new(pr, c), wait_tx))
         })
     }
 
     /// Build the App around whatever transport `make` returns. The in-process
     /// transports (`ThreadTransport`, test `LocalTransport`) build a `Supervisor`
-    /// from `(pane_rows, cols, invocation_dir)`; `SocketTransport` ignores those
-    /// and talks to the daemon's supervisor instead. Either way the client then
-    /// declares its content size up front. Essential for the daemon, which
-    /// otherwise sizes PTYs at its 24x80 default; a harmless no-op in-process.
+    /// from `(pane_rows, cols)`; `SocketTransport` ignores those and talks to
+    /// the daemon's supervisor instead. Either way the client then declares its
+    /// content size up front. Essential for the daemon, which otherwise sizes
+    /// PTYs at its 24x80 default; a harmless no-op in-process.
     fn assemble(
         rows: u16,
         cols: u16,
-        make: impl FnOnce(u16, u16, &Path, Sender<()>) -> Box<dyn Transport>,
+        make: impl FnOnce(u16, u16, Sender<()>) -> Box<dyn Transport>,
     ) -> App {
         let invocation_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         let invocation_label = path::abbreviate(&invocation_dir);
@@ -246,7 +247,7 @@ impl App {
         // reader alike; one input channel from the stdin thread.
         let (wait_tx, wait_rx) = channel::<()>();
         let (input_tx, input_rx) = channel::<CtEvent>();
-        let mut transport = make(pane_rows, cols, &invocation_dir, wait_tx.clone());
+        let mut transport = make(pane_rows, cols, wait_tx.clone());
         transport.send(Command::Resize {
             rows: pane_rows,
             cols,
@@ -459,6 +460,8 @@ impl App {
     fn sync(&mut self) {
         for ev in self.transport.poll() {
             match ev {
+                // The handshake is handled before the transport is created.
+                Event::HelloOk => {}
                 Event::Tasks(v) => self.views = v,
                 Event::Screen(s) => self.focused_screen = Some(s),
                 Event::Status(s) => self.status = Some(s),
@@ -467,12 +470,7 @@ impl App {
     }
 
     pub fn run(&mut self, out: &mut Stdout) -> io::Result<()> {
-        // Spawn the stdin reader once. crossterm owns the tty and buffers parsed
-        // events internally, so rather than fight it with an external `poll(2)`
-        // (also barred by `#![forbid(unsafe_code)]`), a dedicated thread blocks on
-        // `event::read()` and forwards each event, poking the wake channel.
-        // Detached: it dies at process exit while parked in `read()`, exactly like
-        // the daemon's reader threads.
+        // Read terminal events on a dedicated thread and wake the UI loop.
         if let Some(input_tx) = self.input_tx.take() {
             let wait_tx = self.wait_tx.clone();
             thread::spawn(move || {
@@ -487,10 +485,8 @@ impl App {
             });
         }
         loop {
-            // Reconcile with the core: declare the watched task, then pull a
-            // fresh snapshot (+ its screen). Both are terminal-free, so they run
-            // *before* the quit check. On SIGHUP the terminal is already gone
-            // and a render would error and skip teardown, orphaning the jobs.
+            // Synchronize before checking for exit so teardown still runs if the
+            // terminal has gone away.
             let watch = match self.mode {
                 Mode::Peek => self.selected_id,
                 Mode::Attached => self.focused_id,
@@ -525,11 +521,7 @@ impl App {
 
             ui::render(out, self)?;
 
-            // Block until input arrives, the core pushes an event, or the backstop
-            // fires. The token is only "go look"; the payload waits in the
-            // channels drained below and by `sync()` at the top of the next turn.
-            // The 100 ms backstop bounds how long a `term_signal` goes unnoticed.
-            // The hot path (keystroke, echo) wakes immediately, never on it.
+            // Wake for input or core events; the timeout observes termination.
             let _ = self.wait_rx.recv_timeout(Duration::from_millis(100));
             while self.wait_rx.try_recv().is_ok() {} // coalesce wake tokens
 
@@ -735,16 +727,9 @@ impl App {
                 self.session_sel = 0;
                 self.mode = Mode::LoadSession;
             }
-            // Rerun is lowercase because it only acts on *finished* tasks:
-            // nothing gets killed, so it's safe to mash. A rerun that would
-            // have to kill a running task first is `X` territory.
+            // Restart only finished tasks.
             KeyCode::Char('r') => self.rerun_selected(),
-            // Destroy is Shift-gated, like `Q` vs `q`: plain `X` kills the
-            // selected task (or removes a finished one); `x` is a deliberate
-            // no-op. It is *not* `^X`: a Ctrl chord can't carry the shift
-            // distinction: the tty sends 0x18 for both Ctrl+x and Ctrl+Shift+X
-            // (no shift bit), so only an unmodified capital reliably means
-            // "yes, destroy this".
+            // Only an unmodified `X` is a destructive command.
             KeyCode::Char('X') => self.kill_or_remove_selected(),
             _ => {}
         }
@@ -875,10 +860,7 @@ impl App {
         // The one key `fleetcom` steals from the child: Ctrl-\ backgrounds it.
         // Everything else (including Ctrl-C/Z/D) is forwarded verbatim.
         //
-        // Ctrl-\ sends byte 0x1C, which crossterm's legacy decoder reports as
-        // Ctrl+'4' (it maps 0x1C..=0x1F → '4'..='7'); only under the kitty
-        // keyboard protocol does it arrive as Ctrl+'\'. We don't enable kitty,
-        // so match both and the physical chord works either way.
+        // Crossterm may decode Ctrl-\\ as Ctrl-4 without the kitty protocol.
         let detach = k.modifiers.contains(KeyModifiers::CONTROL)
             && matches!(k.code, KeyCode::Char('\\') | KeyCode::Char('4'));
         if detach {
@@ -911,11 +893,7 @@ impl App {
         }
     }
 
-    /// Send `Restart` for the selected task if it has finished; a running
-    /// selection is ignored here rather than bounced off the supervisor, so
-    /// mashing `r` never costs a round-trip or a status-line complaint. The
-    /// supervisor still enforces the same gate: it owns the task set, and this
-    /// client-side check reads from a snapshot.
+    /// Restart the selected task only when the local snapshot marks it finished.
     fn rerun_selected(&mut self) {
         if let Some(i) = self.selected_task()
             && matches!(self.views[i].lifecycle, Lifecycle::Ok | Lifecycle::Failed)
@@ -1056,12 +1034,8 @@ mod tests {
         /// A synchronous App: the supervisor ticks inline on `poll`, so `send`
         /// then `pump` is deterministic with no core-thread timing to race.
         fn new_local(rows: u16, cols: u16) -> App {
-            App::assemble(rows, cols, |pr, c, dir, _wait_tx| {
-                Box::new(LocalTransport::new(Supervisor::new(
-                    pr,
-                    c,
-                    dir.to_path_buf(),
-                )))
+            App::assemble(rows, cols, |pr, c, _wait_tx| {
+                Box::new(LocalTransport::new(Supervisor::new(pr, c)))
             })
         }
 
