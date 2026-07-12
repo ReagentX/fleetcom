@@ -334,12 +334,8 @@ pub fn run_kill() -> io::Result<()> {
     ))
 }
 
-/// Send a `Shutdown` frame when the lock file contains no usable pid, blocking
-/// until the daemon closes the socket after stopping its jobs. Hellos first:
-/// the daemon refuses commands before the handshake — and the ack must be
-/// checked, because the socket can belong to a stale older-version daemon that
-/// refuses the hello and drops the `Shutdown` unread. Returning `Ok` there
-/// would report a kill that never happened.
+/// Send `Shutdown` when the lock file has no usable pid. Complete the handshake
+/// first, then wait for the daemon to close the socket after stopping its jobs.
 fn kill_via_socket() -> io::Result<()> {
     let path = socket_path();
     match UnixStream::connect(&path) {

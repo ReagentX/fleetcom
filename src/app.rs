@@ -386,10 +386,8 @@ impl App {
         self.sections().into_iter().flat_map(|(_, v)| v).collect()
     }
 
-    /// The dashboard list as flat rows, section headers interleaved with their
-    /// tasks: the unit the scroll window slides over. Windowing rows (not tasks)
-    /// is what keeps headers and their tasks aligned when the list is taller
-    /// than the screen.
+    /// Dashboard rows in render order, with section headers interleaved.
+    /// Scrolling over rows keeps each header aligned with its tasks.
     pub fn list_rows(&self) -> Vec<Row> {
         let mut out = Vec::new();
         for (label, idxs) in self.sections() {
@@ -1676,14 +1674,20 @@ mod tests {
         let mut out = io::stdout();
 
         let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
-        app.on_key_attached(&mut out, KeyEvent::new(KeyCode::PageUp, KeyModifiers::SHIFT))
-            .unwrap();
+        app.on_key_attached(
+            &mut out,
+            KeyEvent::new(KeyCode::PageUp, KeyModifiers::SHIFT),
+        )
+        .unwrap();
         assert!(app.view_scroll, "Shift+PageUp must enter the scroll view");
         app.on_key_attached(&mut out, key(KeyCode::Esc)).unwrap();
         assert!(!app.view_scroll, "Esc must return to live");
 
-        app.on_key_attached(&mut out, KeyEvent::new(KeyCode::PageUp, KeyModifiers::CONTROL))
-            .unwrap();
+        app.on_key_attached(
+            &mut out,
+            KeyEvent::new(KeyCode::PageUp, KeyModifiers::CONTROL),
+        )
+        .unwrap();
         assert!(app.view_scroll, "Ctrl+PageUp is an entry fallback");
         app.on_key_attached(&mut out, key(KeyCode::Char('x')))
             .unwrap();

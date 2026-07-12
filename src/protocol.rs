@@ -1,4 +1,4 @@
-//! Client-to-core commands and core-to-client snapshots for the Unix socket.
+//! Messages shared by the client and core, including their Unix-socket encoding.
 
 use std::ffi::{OsStr, OsString};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};

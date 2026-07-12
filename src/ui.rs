@@ -72,9 +72,7 @@ fn render_dashboard(out: &mut impl Write, app: &App) -> io::Result<()> {
         }
     }
     // List region: rows 2..=list_bottom. Command line and footer sit below.
-    // The section/task rows come pre-flattened from `app.list_rows()`; the scroll
-    // window slides over them, so the selected row is always drawn however many
-    // tasks the fleet holds.
+    // Scroll over section and task rows together to keep the selection visible.
     let list_top = 2u16;
     let list_bottom = rows.saturating_sub(3);
     let height = (usize::from(list_bottom) + 1).saturating_sub(usize::from(list_top));
