@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use nix::sys::signal::{Signal, killpg};
 use nix::unistd::Pid;
-use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
+use portable_pty::{CommandBuilder, MasterPty, PtySize, native_pty_system};
 use rustix::process::{WaitId, WaitIdOptions, waitid};
 
 use crate::core::{Wake, Waker};
@@ -162,10 +162,10 @@ pub struct Task {
     /// Kept for resize (`TIOCSWINSZ`); `try_clone_reader`/`take_writer` borrow it.
     master: Box<dyn MasterPty + Send>,
     writer: Box<dyn Write + Send>,
-    child: Box<dyn Child + Send + Sync>,
-    /// The leader's pid, cached at spawn. portable-pty `setsid`s the child, so
-    /// this is also the job's pgid: the target for group signals and the
-    /// `WNOWAIT` status latch.
+    /// The leader's pid, cached at spawn — the job's only process handle (the
+    /// spawn drops portable-pty's `Child` after reading it). portable-pty
+    /// `setsid`s the child, so this is also the job's pgid: the target for
+    /// group signals, the `WNOWAIT` status latch, and the teardown reap.
     pid: Option<u32>,
     /// Shared with the reader thread: it writes (process bytes), the UI reads
     /// (render/preview). Contention is trivial: writes are per output chunk.
@@ -203,6 +203,18 @@ fn grid(parser: &Mutex<vt100::Parser>) -> std::sync::MutexGuard<'_, vt100::Parse
     parser
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Reduce a wait status to the shell convention: the exit status verbatim, or
+/// 128+signum for a signal death, so a KILLed job reads as 137 in the
+/// dashboard rather than masquerading as a clean (or generic-failure) exit.
+/// The one decoder for both latch sites — `poll_exit` and `collect` — so the
+/// two can never disagree about the same corpse.
+fn wait_code(status: &rustix::process::WaitIdStatus) -> i32 {
+    status
+        .exit_status()
+        .or_else(|| status.terminating_signal().map(|s| 128 + s))
+        .unwrap_or(1)
 }
 
 impl Task {
@@ -299,14 +311,20 @@ impl Task {
             })
         };
 
+        // The pid is the job's only handle from here on. portable-pty's boxed
+        // `Child` is a plain `std::process::Child` underneath, which has no
+        // `Drop` impl: dropping it neither kills nor reaps. Its two methods
+        // are both wrong for a job managed by process group — `kill()`
+        // signals only the leader, and `try_wait()` reaps the zombie whose
+        // existence reserves the pgid — so nothing keeps it.
         let pid = child.process_id();
+        drop(child);
         Ok(Task {
             id,
             command: command.to_string(),
             cwd: cwd.to_path_buf(),
             master: pair.master,
             writer,
-            child,
             pid,
             parser,
             last_activity,
@@ -338,29 +356,46 @@ impl Task {
         };
         let flags = WaitIdOptions::EXITED | WaitIdOptions::NOWAIT | WaitIdOptions::NOHANG;
         if let Some(status) = waitid(WaitId::Pid(pid), flags)? {
-            // 128+signal mirrors the shell convention, so a KILLed job reads as
-            // 137 in the dashboard rather than masquerading as a clean exit.
-            let code = status
-                .exit_status()
-                .or_else(|| status.terminating_signal().map(|s| 128 + s))
-                .unwrap_or(1);
-            self.exit_code = Some(code);
+            self.exit_code = Some(wait_code(&status));
             self.finished = Some(Instant::now());
         }
         Ok(())
     }
 
-    /// Reap the exited session leader without blocking.
+    /// Reap the exited session leader without blocking: `poll_exit`'s primitive
+    /// and decoder minus `NOWAIT`, so the zombie is consumed and the pid (and
+    /// with it the pgid reservation) freed. After this, `reaped` gates every
+    /// group signal.
     fn collect(&mut self) {
         if self.reaped {
             return;
         }
-        if let Ok(Some(status)) = self.child.try_wait() {
+        let Some(pid) = self
+            .pid
+            .and_then(|p| rustix::process::Pid::from_raw(p as i32))
+        else {
+            // No pid was ever known: nothing waitable or signalable exists.
             self.reaped = true;
-            if self.finished.is_none() {
-                self.exit_code = Some(status.exit_code() as i32);
-                self.finished = Some(Instant::now());
+            return;
+        };
+        match waitid(
+            WaitId::Pid(pid),
+            WaitIdOptions::EXITED | WaitIdOptions::NOHANG,
+        ) {
+            Ok(Some(status)) => {
+                self.reaped = true;
+                if self.finished.is_none() {
+                    self.exit_code = Some(wait_code(&status));
+                    self.finished = Some(Instant::now());
+                }
             }
+            // ECHILD: the leader is no longer our child (nothing here reaps it
+            // elsewhere, but the state is conceivable after a fork bug or a
+            // hostile wait). Treat as collected so a graveyard entry can't
+            // become immortal.
+            Err(rustix::io::Errno::CHILD) => self.reaped = true,
+            // Still running, or a transient failure: retry next reap pass.
+            Ok(None) | Err(_) => {}
         }
     }
 
@@ -702,6 +737,22 @@ mod tests {
             "TERM after leader exit never reached the straggler"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A leader whose exit is latched by `collect` (the graveyard/teardown
+    /// path) and not by `poll_exit` must still decode signal death as
+    /// 128+signum: both latch sites share `wait_code`, so a KILLed job reads
+    /// 137, never a generic 1.
+    #[test]
+    fn killed_leader_latches_137_via_collect() {
+        let mut t = spawn(8, "sleep 300");
+        t.force_kill(); // sets kill_sent, so try_collect may reap
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !t.try_collect() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(t.try_collect(), "KILLed leader was never collected");
+        assert_eq!(t.exit_code, Some(137));
     }
 
     /// Paste encoding follows the child's DECSET 2004 opt-in: markers only
