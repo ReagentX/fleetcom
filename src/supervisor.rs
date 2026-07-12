@@ -177,21 +177,26 @@ impl Supervisor {
                 self.watched = id;
             }
             Command::Input { id, bytes } => {
-                if let Some(t) = self.by_id_mut(id) {
-                    let _ = t.send_input(&bytes);
+                let refused = self.by_id_mut(id).and_then(|t| t.send_input(&bytes).err());
+                if let Some(r) = refused {
+                    self.notice_refused(id, "input", r.len);
                 }
             }
             // Paste and scroll land here (not as pre-encoded `Input`) because
             // their encoding depends on the child's vt100 state, which only
             // this side of the socket can see.
             Command::Paste { id, bytes } => {
-                if let Some(t) = self.by_id_mut(id) {
-                    let _ = t.send_paste(&bytes);
+                let refused = self.by_id_mut(id).and_then(|t| t.send_paste(&bytes).err());
+                if let Some(r) = refused {
+                    self.notice_refused(id, "paste", r.len);
                 }
             }
             Command::Mouse { id, kind, col, row } => {
-                if let Some(t) = self.by_id_mut(id) {
-                    let _ = t.send_mouse(kind, col, row);
+                let refused = self
+                    .by_id_mut(id)
+                    .and_then(|t| t.send_mouse(kind, col, row).err());
+                if let Some(r) = refused {
+                    self.notice_refused(id, "mouse input", r.len);
                 }
             }
             Command::Scrollback { id, action } => {
@@ -301,6 +306,14 @@ impl Supervisor {
     }
 
     // --- internals ------------------------------------------------------------
+
+    /// Report the task and message size for a bounded writer-queue refusal.
+    fn notice_refused(&mut self, id: u64, what: &str, len: usize) {
+        self.events.push(Event::Status(format!(
+            "task {id} is not reading input; dropped {} {what}",
+            crate::format::bytes(len)
+        )));
+    }
 
     fn index_of(&self, id: u64) -> Option<usize> {
         self.tasks.iter().position(|t| t.id == id)
@@ -703,6 +716,83 @@ mod tests {
             s.drain()
                 .iter()
                 .any(|e| matches!(e, Event::Tasks(v) if v.is_empty()))
+        );
+    }
+
+    /// A blocked PTY write runs off the core thread, so shutdown remains bounded
+    /// when a child does not read stdin.
+    #[test]
+    fn shutdown_survives_a_child_that_never_reads_stdin() {
+        let mut s = sup(24, 80);
+        s.set_kill_grace(Duration::from_millis(200));
+        s.apply(Command::Spawn {
+            command: "sleep 300".into(),
+            cwd: here(),
+        });
+        s.tick();
+        let id = match s.drain().first() {
+            Some(Event::Tasks(v)) => v[0].id,
+            _ => panic!("expected a Tasks snapshot"),
+        };
+        // Newline-terminated input fills the canonical-mode PTY queue and
+        // blocks the writer worker while the child is not reading.
+        s.apply(Command::Paste {
+            id,
+            bytes: b"x\n".repeat(1 << 19),
+        });
+        let t0 = Instant::now();
+        s.apply(Command::Shutdown);
+        assert!(
+            t0.elapsed() < Duration::from_secs(2),
+            "shutdown blocked behind a PTY write to a non-reading child"
+        );
+        s.tick();
+        assert!(
+            s.drain()
+                .iter()
+                .any(|e| matches!(e, Event::Tasks(v) if v.is_empty()))
+        );
+    }
+
+    /// A message that would exceed the writer-queue limit is refused whole,
+    /// reported with the task ID and size, and does not block the supervisor.
+    #[test]
+    fn overfull_writer_queue_refuses_message_with_notice() {
+        let mut s = sup(24, 80);
+        s.set_kill_grace(Duration::from_millis(200));
+        s.apply(Command::Spawn {
+            command: "sleep 300".into(),
+            cwd: here(),
+        });
+        s.tick();
+        let id = match s.drain().first() {
+            Some(Event::Tasks(v)) => v[0].id,
+            _ => panic!("expected a Tasks snapshot"),
+        };
+        // Newline-terminated input keeps the worker blocked and its admitted
+        // byte count pending while the child does not read.
+        let big = b"x\n".repeat(4 << 20);
+        s.apply(Command::Input {
+            id,
+            bytes: big.clone(),
+        });
+        s.apply(Command::Input {
+            id,
+            bytes: big.clone(),
+        });
+        s.apply(Command::Input { id, bytes: big });
+        let evs = s.drain();
+        assert!(
+            evs.iter().any(|e| matches!(e, Event::Status(m)
+                if m.contains(&format!("task {id}")) && m.contains("8 MiB"))),
+            "no refusal notice for the overflowing message; got {evs:?}"
+        );
+        // Shutdown remains bounded after the refusal.
+        let t0 = Instant::now();
+        s.apply(Command::Shutdown);
+        assert!(
+            t0.elapsed() < Duration::from_secs(2),
+            "supervisor wedged after a writer-queue refusal"
         );
     }
 

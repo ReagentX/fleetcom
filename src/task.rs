@@ -3,6 +3,8 @@
 use std::ffi::OsString;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::mpsc::{Sender, channel};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -17,6 +19,18 @@ use crate::protocol::{Lifecycle, MouseKind, ScrollAction};
 
 /// Number of history rows retained by each task's terminal grid.
 const SCROLLBACK: usize = 2000;
+
+/// Maximum bytes admitted to one task's writer queue but not yet written to the
+/// PTY. This admits one maximum-size paste with headroom while bounding queued
+/// input when a child stops reading.
+const MAX_PENDING_WRITE: usize = 16 * 1024 * 1024;
+
+/// A whole-message refusal from the bounded writer queue.
+#[derive(Debug)]
+pub struct WriteRefused {
+    /// Size of the refused message, for the client-facing notice.
+    pub len: usize,
+}
 
 /// Map a dependency error (portable-pty returns `anyhow`) into `io::Error` so
 /// the whole crate speaks stdlib `io::Result` and never grows an `anyhow` dep.
@@ -151,7 +165,13 @@ pub struct Task {
     pub cwd: PathBuf,
     /// Kept for resize (`TIOCSWINSZ`); `try_clone_reader`/`take_writer` borrow it.
     master: Box<dyn MasterPty + Send>,
-    writer: Box<dyn Write + Send>,
+    /// Sender for the detached PTY writer worker. `None` after `force_kill`.
+    /// Queuing keeps a blocked PTY write off the core thread.
+    input_tx: Option<Sender<Vec<u8>>>,
+    /// Bytes admitted to the writer queue but not yet fully written. Only the
+    /// core thread admits (single producer), so `queue_write`'s check-then-add
+    /// cannot over-admit; the worker subtracts after each completed write.
+    pending_write: Arc<AtomicUsize>,
     /// Session-leader PID, also used as the process-group ID.
     pid: Option<u32>,
     /// Shared with the reader thread: it writes (process bytes), the UI reads
@@ -294,6 +314,26 @@ impl Task {
             })
         };
 
+        // Drain whole queued messages on a detached worker. The worker is not
+        // joined because a PTY write can block until the slave side closes.
+        let (input_tx, input_rx) = channel::<Vec<u8>>();
+        let pending_write = Arc::new(AtomicUsize::new(0));
+        {
+            let pending = Arc::clone(&pending_write);
+            let mut writer = writer;
+            thread::spawn(move || {
+                while let Ok(msg) = input_rx.recv() {
+                    let res = writer.write_all(&msg).and_then(|()| writer.flush());
+                    pending.fetch_sub(msg.len(), Ordering::Release);
+                    if res.is_err() {
+                        // The slave side closed (child gone): nothing more can
+                        // be delivered. Queued messages drop with the receiver.
+                        break;
+                    }
+                }
+            });
+        }
+
         // Process-group signalling and `waitid` use the leader PID directly.
         let pid = child.process_id();
         drop(child);
@@ -302,7 +342,8 @@ impl Task {
             command: command.to_string(),
             cwd: cwd.to_path_buf(),
             master: pair.master,
-            writer,
+            input_tx: Some(input_tx),
+            pending_write,
             pid,
             parser,
             last_activity,
@@ -442,16 +483,37 @@ impl Task {
         Ok(())
     }
 
-    pub fn send_input(&mut self, bytes: &[u8]) -> io::Result<()> {
-        // Input returns the viewport to live before writing to the PTY.
-        {
-            let mut p = grid(&self.parser);
-            if p.screen().scrollback() > 0 {
-                p.screen_mut().set_scrollback(0);
-            }
+    /// Queue `bytes` for the PTY as one message without blocking the caller.
+    /// Refuse it whole if admission would exceed `MAX_PENDING_WRITE`.
+    pub fn send_input(&mut self, bytes: &[u8]) -> Result<(), WriteRefused> {
+        self.snap_live();
+        self.queue_write(bytes.to_vec())
+    }
+
+    /// Input returns the viewport to live before the bytes are queued.
+    fn snap_live(&mut self) {
+        let mut p = grid(&self.parser);
+        if p.screen().scrollback() > 0 {
+            p.screen_mut().set_scrollback(0);
         }
-        self.writer.write_all(bytes)?;
-        self.writer.flush()
+    }
+
+    /// Admit one whole message to the writer queue, or refuse it whole.
+    fn queue_write(&self, msg: Vec<u8>) -> Result<(), WriteRefused> {
+        // A force-killed task has no writer queue; discard subsequent input.
+        let Some(tx) = &self.input_tx else {
+            return Ok(());
+        };
+        let len = msg.len();
+        if self.pending_write.load(Ordering::Acquire) + len > MAX_PENDING_WRITE {
+            return Err(WriteRefused { len });
+        }
+        self.pending_write.fetch_add(len, Ordering::Release);
+        if tx.send(msg).is_err() {
+            // The worker has exited; remove the failed admission from the count.
+            self.pending_write.fetch_sub(len, Ordering::Release);
+        }
+        Ok(())
     }
 
     /// Move the scrollback viewport, clamped to retained history.
@@ -473,17 +535,19 @@ impl Task {
     }
 
     /// Forward a clipboard paste in whichever shape the child negotiated; see
-    /// [`paste_bytes`]. The grid lock is released before the PTY write: the
-    /// write can block on a full PTY buffer, and the reader thread needs the
-    /// lock to drain it.
-    pub fn send_paste(&mut self, content: &[u8]) -> io::Result<()> {
+    /// [`paste_bytes`]. Encoded under the grid lock (the DECSET 2004 read stays
+    /// on this thread), then queued whole: the PTY write itself happens on the
+    /// writer worker.
+    pub fn send_paste(&mut self, content: &[u8]) -> Result<(), WriteRefused> {
         let bracketed = grid(&self.parser).screen().bracketed_paste();
-        self.send_input(&paste_bytes(bracketed, content))
+        let msg = paste_bytes(bracketed, content);
+        self.snap_live();
+        self.queue_write(msg)
     }
 
     /// Forward one mouse action, routed by the child's own screen state; see
     /// [`mouse_bytes`]. A child that gets `None` receives nothing at all.
-    pub fn send_mouse(&mut self, kind: MouseKind, col: u16, row: u16) -> io::Result<()> {
+    pub fn send_mouse(&mut self, kind: MouseKind, col: u16, row: u16) -> Result<(), WriteRefused> {
         let bytes = {
             let p = grid(&self.parser);
             mouse_bytes(p.screen(), kind, col, row)
@@ -541,6 +605,9 @@ impl Task {
         }
         self.kill_sent = true;
         self.handle.take(); // drop the JoinHandle -> detach, never block
+        // Close the queue without joining a worker that may still be in a PTY
+        // write. Killing the process group closes the slave side and unblocks it.
+        self.input_tx.take();
     }
 }
 
@@ -886,6 +953,29 @@ mod tests {
         // Input returns the viewport to live output.
         t.send_input(b"x").unwrap();
         assert_eq!(t.scroll_offset(), 0);
+        t.terminate();
+    }
+
+    /// The per-task writer worker delivers queued messages in FIFO order.
+    #[test]
+    fn queued_writes_reach_the_child_in_order() {
+        let mut t = spawn(10, "cat");
+        t.send_input(b"zqfirstqz\n").unwrap();
+        t.send_input(b"zqsecondqz\n").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut contents = String::new();
+        while Instant::now() < deadline {
+            contents = grid(&t.parser).screen().contents();
+            if contents.contains("zqsecondqz") {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        let first = contents.find("zqfirstqz").expect("first message never echoed");
+        let second = contents
+            .find("zqsecondqz")
+            .expect("second message never echoed");
+        assert!(first < second, "queued writes reordered: {contents:?}");
         t.terminate();
     }
 

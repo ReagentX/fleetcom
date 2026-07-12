@@ -5,6 +5,10 @@ use std::os::unix::net::UnixStream;
 use std::sync::atomic::AtomicBool;
 use std::sync::mpsc::{Receiver, Sender, TryRecvError, channel};
 use std::thread::{self, JoinHandle};
+use std::time::Duration;
+
+/// Maximum time allowed for one command-frame write to the daemon.
+const SEND_TIMEOUT: Duration = Duration::from_secs(5);
 
 use crate::core::{Wake, run_loop};
 use crate::frame::{read_frame, write_frame};
@@ -149,7 +153,8 @@ pub struct SocketTransport {
     write: UnixStream,
     evt_rx: Receiver<Event>,
     reader: Option<JoinHandle<()>>,
-    /// Set when the reader thread ends on socket EOF: the daemon is gone.
+    /// Set when the reader thread ends on socket EOF (the daemon is gone), or
+    /// when a `send` fails (the connection is unrecoverable; see `send`).
     dead: bool,
 }
 
@@ -163,6 +168,9 @@ impl SocketTransport {
         read: UnixStream,
         wait_tx: Sender<()>,
     ) -> SocketTransport {
+        // Keep construction infallible; if this best-effort setup fails, the
+        // stream retains its existing write-timeout setting.
+        let _ = write.set_write_timeout(Some(SEND_TIMEOUT));
         let (evt_tx, evt_rx) = channel();
         let reader = thread::spawn(move || {
             let mut read = read;
@@ -191,9 +199,18 @@ impl SocketTransport {
 
 impl Transport for SocketTransport {
     fn send(&mut self, cmd: Command) {
+        if self.dead {
+            // Already unrecoverable; nothing can deliver the command.
+            return;
+        }
         let (kind, payload) = encode_command(&cmd);
-        // A broken pipe means the daemon is gone; we're tearing down anyway.
-        let _ = write_frame(&mut self.write, kind, &payload);
+        if write_frame(&mut self.write, kind, &payload).is_err() {
+            // A failed frame write may leave a partial frame on the stream.
+            // Mark the connection dead and close both halves so the reader
+            // exits and the client can reconnect.
+            self.dead = true;
+            let _ = self.write.shutdown(Shutdown::Both);
+        }
     }
 
     fn poll(&mut self) -> Vec<Event> {
@@ -252,5 +269,30 @@ impl Transport for LocalTransport {
     }
     fn shutdown(&mut self, _intent: ExitIntent) {
         self.sup.apply(Command::Shutdown);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A failed send marks the transport disconnected and stops its reader.
+    #[test]
+    fn failed_send_marks_the_transport_dead() {
+        let (ours, theirs) = UnixStream::pair().unwrap();
+        let write = ours.try_clone().unwrap();
+        let (wait_tx, _wait_rx) = channel();
+        let mut t = SocketTransport::from_halves(write, ours, wait_tx);
+        assert!(t.connected());
+
+        drop(theirs); // the daemon is gone
+        t.send(Command::Watch { id: None });
+        assert!(
+            !t.connected(),
+            "a failed send must mark the transport dead"
+        );
+        // The stream was shut down with it, so the reader thread saw EOF and
+        // exited: joining it cannot hang.
+        t.reader.take().unwrap().join().unwrap();
     }
 }
