@@ -82,11 +82,15 @@ The first ordinary invocation starts the daemon when necessary. `--daemon` is an
 
 Every task runs in its own pseudo-terminal, emulated with `vt100`. The same screen grid powers the dashboard preview, the peek overlay, and full attached rendering. A mid-run `vim` or `htop` therefore renders from the same terminal state as any other task. Backgrounding changes client focus; it does not notify the child.
 
+### Input fidelity
+
+Attached input follows the child's terminal state. Modified Enter is sent as `ESC CR` when reported, and paste uses bracketed-paste markers only when enabled by the child. The client captures the mouse only for attached children using a mouse protocol; elsewhere, native selection remains available and the wheel uses alternate scroll for full-screen children. Details are in [`docs/commands.md`](docs/commands.md).
+
 ### Jobs outlive the UI
 
 A per-user daemon owns the processes and their terminals. `q` disconnects the client and leaves everything running; the next `fleetcom` reattaches. Each launch runs under the environment and working directory of the client that requested it: connect from a venv terminal and your jobs see that venv, whichever client started the daemon. `Q` and `fleetcom --kill` stop the daemon and terminate each job's process group with `SIGTERM`, escalating to `SIGKILL` after a two-second grace period. `SIGTERM`, `SIGINT`, and `SIGHUP` sent directly to the daemon use the same shutdown path. Because `fleetcom --kill` signals the daemon through its lock-file PID, it also works while another client occupies the socket. If the connection drops, the client discards its stale view and offers to reconnect.
 
-Teardown caveat: signals go to each job's *process group*, and the group stays signalable for the task's whole life: the exited leader is held unreaped until after the final sweep, which keeps its group id reserved. A `cmd &` child never leaves the group (a non-interactive shell's `&` creates no new process group), so kills and removals reach it too. What *does* escape is a job that `setsid`s or double-forks itself out of the group: that one is on its own; kill it by hand.
+Signals target each task's process group. The exited leader remains unreaped until final cleanup so background children in that group can still be signalled. Processes that create a new session or double-fork are outside fleetcom's control.
 
 ### Grouping and the `@` picker
 

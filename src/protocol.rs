@@ -1,11 +1,4 @@
-//! The seam between the client (UI) and the supervisor (task owner): the types
-//! that cross the Unix-domain socket to the daemon.
-//!
-//! `Command` is client→core, `Event` is core→client, and `TaskView`/`ScreenView`
-//! are the read-only snapshots the client renders instead of reaching into a
-//! live `Task`. Nothing here holds a process handle or a process-local
-//! `Instant`: a socket peer could interpret neither, so the types stay
-//! wire-shaped.
+//! Client-to-core commands and core-to-client snapshots for the Unix socket.
 
 use std::ffi::{OsStr, OsString};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
@@ -15,19 +8,15 @@ use std::time::Duration;
 use crate::frame::{KIND_CONTROL, KIND_SCREEN};
 use crate::task::Lifecycle;
 
-/// Wire-protocol version. The handshake rejects peers using a different version.
-pub const PROTOCOL_VERSION: u32 = 1;
+/// Wire-protocol version; the handshake rejects mismatched peers.
+pub const PROTOCOL_VERSION: u32 = 2;
 
 /// A client→core request. Every mutation of the task set is one of these; the
 /// client never touches a `Task` directly. Fire-and-forget: results come back
 /// as `Event`s, never as return values.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Command {
-    /// The connection opener: the client's protocol version and launch context.
-    /// Env and cwd are per-*connection*, not per-spawn — nothing mutates a
-    /// client's environment while it runs, so sending it once is equivalent to
-    /// sending it with every launch, and it prices the env payload once. Env
-    /// rides as bytes: environment variables need not be UTF-8.
+    /// The client's protocol version, environment, and working directory.
     Hello {
         version: u32,
         env: Vec<(OsString, OsString)>,
@@ -54,6 +43,22 @@ pub enum Command {
     Watch { id: Option<u64> },
     /// Forward raw keystroke bytes to a task's PTY.
     Input { id: u64, bytes: Vec<u8> },
+    /// Clipboard paste for a task. Kept distinct from `Input` because the
+    /// encoding depends on state only the core can see: the task's vt100 screen
+    /// knows whether the child enabled bracketed paste (DECSET 2004), which
+    /// decides between wrapping in paste markers and newline conversion.
+    Paste { id: u64, bytes: Vec<u8> },
+    /// One mouse action over an attached task. `col`/`row` are 0-based pane
+    /// cells. Routing is core-side for the same reason as `Paste`: the child's
+    /// mouse-protocol mode, encoding, and alt-screen state live in its vt100
+    /// screen, and they decide both whether the child hears about the action
+    /// at all and in which byte encoding.
+    Mouse {
+        id: u64,
+        kind: MouseKind,
+        col: u16,
+        row: u16,
+    },
     /// Write the current task set as a named `{dir: [cmds]}` recipe.
     SaveSession { name: String },
     /// Spawn every command in a named recipe, each in its (existing) dir.
@@ -62,16 +67,30 @@ pub enum Command {
     Shutdown,
 }
 
+/// A mouse button in a `Command::Mouse`. Values match xterm button codes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MouseBtn {
+    Left = 0,
+    Middle = 1,
+    Right = 2,
+}
+
+/// What a `Command::Mouse` reports. Wheel notches carry no button; presses,
+/// drags, and releases carry the button they happened with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MouseKind {
+    WheelUp,
+    WheelDown,
+    Press(MouseBtn),
+    Drag(MouseBtn),
+    Release(MouseBtn),
+}
+
 /// A core→client message. The client keeps a local mirror of the task set and
 /// the watched screen, updated only by these.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Event {
-    /// The daemon accepted the client's `Hello`: versions match, launch context
-    /// stored. The client blocks on this before building its transport, so a
-    /// pre-handshake daemon (which answers with its first `Tasks` tick instead)
-    /// is detected rather than silently served with the wrong environment.
-    /// Carries no version: the daemon only acks an exact match, so a field
-    /// would always equal the client's own constant.
+    /// The daemon accepted a compatible `Hello` and stored its launch context.
     HelloOk,
     /// Full task-set snapshot; replaces the client's mirror wholesale.
     Tasks(Vec<TaskView>),
@@ -107,6 +126,11 @@ pub struct ScreenView {
     pub formatted: Vec<u8>,
     pub cursor: (u16, u16),
     pub hide_cursor: bool,
+    /// Whether the child requested a mouse protocol.
+    pub wants_mouse: bool,
+    /// Whether the child is on the alternate screen. Without mouse capture,
+    /// this determines whether alternate scroll is enabled.
+    pub alt_screen: bool,
 }
 
 // --- wire format -------------------------------------------------------------
@@ -117,11 +141,7 @@ pub struct ScreenView {
 // raw tail after a small jzon header rather than bloating into a JSON number
 // array. A socket peer is just `decode_*(read_frame(...))`.
 
-/// Paths ride the wire as lossy UTF-8 strings — protocol-wide (`Spawn`,
-/// `Hello`, `TaskView`): a non-UTF-8 path arrives mangled. Accepted rather
-/// than byte-encoded like env: non-UTF-8 paths are rare, a wrong path fails
-/// visibly at spawn/resolve time (unlike a silently wrong env), and fixing it
-/// would touch every message for marginal gain.
+/// Encode paths as lossy UTF-8 strings for the protocol.
 fn ps(p: &Path) -> String {
     p.to_string_lossy().into_owned()
 }
@@ -149,12 +169,7 @@ fn os_arr(s: &OsStr) -> jzon::JsonValue {
     a
 }
 
-/// Inverse of [`os_arr`]. `None` unless `v` is an array of bytes: a malformed
-/// pair rejects the whole command (the daemon must not guess at an
-/// environment). The explicit array check is load-bearing — jzon's `members()`
-/// on a non-array (including the `Null` that indexing a malformed pair yields)
-/// is an *empty* iterator, which would otherwise decode as an empty string and
-/// let a wrong-shape hello through with an empty-pair environment.
+/// Decode a JSON byte array as an `OsString`.
 fn os_from(v: &jzon::JsonValue) -> Option<OsString> {
     if !v.is_array() {
         return None;
@@ -250,6 +265,32 @@ pub fn encode_command(cmd: &Command) -> (u8, Vec<u8>) {
             }
             let _ = o.insert("bytes", arr);
         }
+        Command::Paste { id, bytes } => {
+            let _ = o.insert("t", "paste");
+            let _ = o.insert("id", *id);
+            let mut arr = jzon::JsonValue::new_array();
+            for b in bytes {
+                let _ = arr.push(*b as u64);
+            }
+            let _ = o.insert("bytes", arr);
+        }
+        Command::Mouse { id, kind, col, row } => {
+            let _ = o.insert("t", "mouse");
+            let _ = o.insert("id", *id);
+            let (k, btn) = match kind {
+                MouseKind::WheelUp => ("wu", None),
+                MouseKind::WheelDown => ("wd", None),
+                MouseKind::Press(b) => ("p", Some(*b)),
+                MouseKind::Drag(b) => ("d", Some(*b)),
+                MouseKind::Release(b) => ("r", Some(*b)),
+            };
+            let _ = o.insert("k", k);
+            if let Some(b) = btn {
+                let _ = o.insert("b", b as u64);
+            }
+            let _ = o.insert("col", *col as u64);
+            let _ = o.insert("row", *row as u64);
+        }
         Command::SaveSession { name } => {
             let _ = o.insert("t", "save");
             let _ = o.insert("name", name.as_str());
@@ -320,6 +361,36 @@ pub fn decode_command(kind: u8, payload: &[u8]) -> Option<Command> {
                 .filter_map(|m| m.as_u64().map(|n| n as u8))
                 .collect(),
         },
+        "paste" => Command::Paste {
+            id: v["id"].as_u64()?,
+            bytes: v["bytes"]
+                .members()
+                .filter_map(|m| m.as_u64().map(|n| n as u8))
+                .collect(),
+        },
+        "mouse" => {
+            let btn = || -> Option<MouseBtn> {
+                match v["b"].as_u64()? {
+                    0 => Some(MouseBtn::Left),
+                    1 => Some(MouseBtn::Middle),
+                    2 => Some(MouseBtn::Right),
+                    _ => None,
+                }
+            };
+            Command::Mouse {
+                id: v["id"].as_u64()?,
+                kind: match v["k"].as_str()? {
+                    "wu" => MouseKind::WheelUp,
+                    "wd" => MouseKind::WheelDown,
+                    "p" => MouseKind::Press(btn()?),
+                    "d" => MouseKind::Drag(btn()?),
+                    "r" => MouseKind::Release(btn()?),
+                    _ => return None,
+                },
+                col: v["col"].as_u64()? as u16,
+                row: v["row"].as_u64()? as u16,
+            }
+        }
         "save" => Command::SaveSession {
             name: v["name"].as_str()?.to_string(),
         },
@@ -374,6 +445,8 @@ pub fn encode_event(ev: &Event) -> (u8, Vec<u8>) {
             let _ = cur.push(sv.cursor.1 as u64);
             let _ = header.insert("cursor", cur);
             let _ = header.insert("hide", sv.hide_cursor);
+            let _ = header.insert("mouse", sv.wants_mouse);
+            let _ = header.insert("alt", sv.alt_screen);
             let mut lines = jzon::JsonValue::new_array();
             for l in &sv.lines {
                 let _ = lines.push(l.as_str());
@@ -436,6 +509,8 @@ pub fn decode_event(kind: u8, payload: &[u8]) -> Option<Event> {
                 formatted,
                 cursor,
                 hide_cursor: h["hide"].as_bool()?,
+                wants_mouse: h["mouse"].as_bool()?,
+                alt_screen: h["alt"].as_bool()?,
             }))
         }
         _ => None,
@@ -487,6 +562,36 @@ mod tests {
             Command::Input {
                 id: 1,
                 bytes: vec![0, 27, 91, 255],
+            },
+            Command::Paste {
+                // Non-UTF-8 and marker-shaped bytes must survive: the core, not
+                // the client, decides what the child receives.
+                id: 6,
+                bytes: b"line1\nline2\x1b[201~\xff".to_vec(),
+            },
+            Command::Mouse {
+                id: 8,
+                kind: MouseKind::WheelDown,
+                col: 79,
+                row: 23,
+            },
+            Command::Mouse {
+                id: 8,
+                kind: MouseKind::Press(MouseBtn::Left),
+                col: 0,
+                row: 0,
+            },
+            Command::Mouse {
+                id: 8,
+                kind: MouseKind::Drag(MouseBtn::Middle),
+                col: 10,
+                row: 5,
+            },
+            Command::Mouse {
+                id: 8,
+                kind: MouseKind::Release(MouseBtn::Right),
+                col: 10,
+                row: 5,
             },
             Command::SaveSession {
                 name: "work".into(),
@@ -562,6 +667,8 @@ mod tests {
             formatted: vec![0x1b, b'[', b'm', 0, 255, b'x'],
             cursor: (3, 12),
             hide_cursor: false,
+            wants_mouse: true,
+            alt_screen: false,
         });
         let (k, p) = encode_event(&screen);
         assert_eq!(k, KIND_SCREEN);

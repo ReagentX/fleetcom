@@ -6,3 +6,6 @@
 
 # editor config
 .vscode/
+
+# tooling
+.claude/

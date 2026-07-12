@@ -1,8 +1,5 @@
-//! The client: UI state (modes, selection, pickers) and the single-threaded
-//! event loop. It owns **no** processes (the `Supervisor` does) and drives the
-//! task set only through `Command`s, painting the `TaskView` mirror it gets back
-//! as `Event`s. The loop only ever calls `send`/`poll`/`shutdown` on its
-//! `Transport`, never touching the machinery underneath.
+//! Client UI state and event loop. Tasks are owned by the supervisor and exposed
+//! here through `Command`s and `Event` snapshots over a `Transport`.
 
 use std::io::{self, Stdout};
 use std::path::{Path, PathBuf};
@@ -12,15 +9,22 @@ use std::sync::mpsc::{Receiver, Sender, channel};
 use std::thread;
 use std::time::Duration;
 
-use crossterm::event::{self, Event as CtEvent, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    self, DisableMouseCapture, EnableMouseCapture, Event as CtEvent, KeyCode, KeyEvent,
+    KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
+use crossterm::{execute, style::Print};
 
 use crate::path;
-use crate::protocol::{Command, Event, ScreenView, TaskView};
+use crate::protocol::{Command, Event, MouseBtn, MouseKind, ScreenView, TaskView};
 use crate::session;
 use crate::supervisor::Supervisor;
 use crate::task::Lifecycle;
 use crate::transport::{ExitIntent, SocketTransport, ThreadTransport, Transport};
 use crate::ui;
+
+/// Maximum attached paste size, leaving headroom below the frame limit.
+const MAX_PASTE: usize = 8 * 1024 * 1024;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
@@ -83,13 +87,9 @@ pub enum Row {
 }
 
 pub struct App {
-    /// The link to the core (the task owner): a `ThreadTransport` (in-process)
-    /// or `SocketTransport` (daemon). The client only ever calls
-    /// `send`/`poll`/`shutdown`, so it neither knows nor cares which.
+    /// Connection to the task-owning core.
     transport: Box<dyn Transport>,
-    /// Local mirror of the task set, replaced wholesale by `Event::Tasks`. The
-    /// client renders and navigates this, never a live `Task`. `pub` so the
-    /// renderer (`ui`) can index it by the row order `sections()` hands back.
+    /// Task snapshot received from `Event::Tasks`.
     pub views: Vec<TaskView>,
     /// The watched task's screen (attach/peek), from `Event::Screen`.
     focused_screen: Option<ScreenView>,
@@ -137,10 +137,7 @@ pub struct App {
     /// The stdin thread's sender, taken by `run` when it spawns that thread, so
     /// tests that never call `run` never start it.
     input_tx: Option<Sender<CtEvent>>,
-    /// Woken by *both* the stdin thread and the transport's event reader (each
-    /// pokes a `()` after enqueuing). The run loop blocks here, so it reacts to a
-    /// keystroke or a fresh screen at once; the payload waits in `input_rx` /
-    /// `transport.poll()`. This is the client half of the event-driven path.
+    /// Wake notifications from the input and transport reader threads.
     wait_rx: Receiver<()>,
     /// Kept so `run` can hand the stdin thread a poker, and `reconnect` a fresh
     /// transport one.
@@ -153,13 +150,26 @@ pub struct App {
     /// (daemon + jobs survive), `Q` quits and kills. Defaults to the safe
     /// `Disconnect` so an unexpected exit never reaps the daemon.
     exit_intent: ExitIntent,
+    /// Whether the client currently captures terminal mouse events.
+    mouse_captured: bool,
+    /// The alternate-scroll state last applied to the terminal.
+    alt_scroll: bool,
 }
 
-/// Grouping key for the dashboard: user-tagged first, then live, then done.
-/// The manual tag ("I'm using this") overrides everything, *including* a
-/// finished process. Tagging pulls a task out of Completed into In use.
-/// That is how the tag rebuilds the fleet-view buckets without pretending to
-/// detect "awaiting input".
+/// Return `(mouse_capture, alt_scroll)` for the attached child's screen.
+/// Without an attached screen, preserve native selection and enable wheel
+/// navigation through alternate scroll.
+fn desired_input_modes(attached: Option<&ScreenView>) -> (bool, bool) {
+    match attached {
+        // Capture and forward mouse events requested by the child.
+        Some(s) if s.wants_mouse => (true, true),
+        // Scroll full-screen children; disable wheel-generated arrows inline.
+        Some(s) => (false, s.alt_screen),
+        None => (false, true),
+    }
+}
+
+/// Dashboard grouping bucket: tagged tasks first, then live, then completed.
 pub fn bucket(v: &TaskView) -> u8 {
     if v.tagged {
         0
@@ -187,16 +197,11 @@ impl App {
         Ok(app)
     }
 
-    /// Rebuild the daemon connection after a drop (autostarting a fresh daemon if
-    /// needed). A cleanly-exiting daemon kills its jobs on the way out (a
-    /// SIGKILL or a crash kills them rudely, via the PTY hangup), so the new
-    /// session starts empty; the mirror is cleared to match.
+    /// Reconnect to the daemon and clear the stale task snapshot.
     fn reconnect(&mut self) {
         let wait_tx = self.wait_tx.clone();
         let build = move || -> io::Result<SocketTransport> {
-            // Bounded handshake: this runs inside the live UI, where the
-            // startup variant's indefinite wait (and printed notice) would
-            // freeze the client. A busy daemon lands in the status line.
+            // Reconnection must not block the active UI indefinitely.
             let stream = crate::daemon::connect_ready_bounded()?;
             let read = stream.try_clone()?;
             Ok(SocketTransport::from_halves(stream, read, wait_tx))
@@ -227,12 +232,7 @@ impl App {
         })
     }
 
-    /// Build the App around whatever transport `make` returns. The in-process
-    /// transports (`ThreadTransport`, test `LocalTransport`) build a `Supervisor`
-    /// from `(pane_rows, cols)`; `SocketTransport` ignores those and talks to
-    /// the daemon's supervisor instead. Either way the client then declares its
-    /// content size up front. Essential for the daemon, which otherwise sizes
-    /// PTYs at its 24x80 default; a harmless no-op in-process.
+    /// Build an app with the requested transport and initial PTY size.
     fn assemble(
         rows: u16,
         cols: u16,
@@ -281,6 +281,8 @@ impl App {
             wait_tx,
             term_signal: Arc::new(AtomicBool::new(false)),
             should_quit: false,
+            mouse_captured: false,
+            alt_scroll: true,
             exit_intent: ExitIntent::Disconnect,
         }
     }
@@ -331,10 +333,7 @@ impl App {
         self.rows.saturating_sub(1).max(1)
     }
 
-    /// Grouped view of the tasks: `(section label, view indices)` in render
-    /// order. Both grouping modes sub-sort by state bucket then spawn order, so
-    /// "nesting" is uniform. This is the single source of order: `display_order`
-    /// is just its flattening, so navigation and rendering can't disagree.
+    /// Task sections in render order. Navigation uses their flattened order.
     pub fn sections(&self) -> Vec<(String, Vec<usize>)> {
         let mut labeled: Vec<(u8, String, u8, u64, usize)> = self
             .views
@@ -454,9 +453,7 @@ impl App {
         }
     }
 
-    /// Pull whatever the core has emitted and fold it into the local mirror. The
-    /// transport decides how those events arrive (a threaded channel drain in
-    /// production, an inline supervisor tick in tests), but the fold is the same.
+    /// Apply ready core events to the local snapshot.
     fn sync(&mut self) {
         for ev in self.transport.poll() {
             match ev {
@@ -495,8 +492,7 @@ impl App {
             self.set_watch(watch);
             self.sync();
 
-            // The daemon vanished mid-session (killed elsewhere, crashed)? Show a
-            // banner instead of freezing on a stale mirror with dead input.
+            // Replace an unreachable daemon's snapshot with the reconnect banner.
             if self.mode != Mode::Disconnected && !self.transport.connected() {
                 self.mode = Mode::Disconnected;
                 self.focused_id = None;
@@ -519,6 +515,7 @@ impl App {
                 self.focused_id = None;
             }
 
+            self.sync_input_modes(out)?;
             ui::render(out, self)?;
 
             // Wake for input or core events; the timeout observes termination.
@@ -536,6 +533,8 @@ impl App {
                         self.on_key(out, k)?;
                     }
                     CtEvent::Resize(cols, rows) => self.on_resize(rows, cols),
+                    CtEvent::Paste(s) => self.on_paste(&s),
+                    CtEvent::Mouse(m) => self.on_mouse(m),
                     _ => {}
                 }
             }
@@ -849,18 +848,14 @@ impl App {
             KeyCode::Up | KeyCode::Char('k') => self.select_up(),
             KeyCode::Down | KeyCode::Char('j') => self.select_down(),
             KeyCode::Enter => self.attach(),
-            // Peek is where a result is being read, so rerun works here too:
-            // the overlay stays open and streams the fresh run.
+            // Keep the peek overlay open while the restarted task streams output.
             KeyCode::Char('r') => self.rerun_selected(),
             _ => {}
         }
     }
 
     fn on_key_attached(&mut self, out: &mut Stdout, k: KeyEvent) -> io::Result<()> {
-        // The one key `fleetcom` steals from the child: Ctrl-\ backgrounds it.
-        // Everything else (including Ctrl-C/Z/D) is forwarded verbatim.
-        //
-        // Crossterm may decode Ctrl-\\ as Ctrl-4 without the kitty protocol.
+        // Ctrl-\ backgrounds the task; crossterm may report it as Ctrl-4.
         let detach = k.modifiers.contains(KeyModifiers::CONTROL)
             && matches!(k.code, KeyCode::Char('\\') | KeyCode::Char('4'));
         if detach {
@@ -879,6 +874,105 @@ impl App {
             && let Some(bytes) = key_to_bytes(k.code, k.modifiers)
         {
             self.transport.send(Command::Input { id, bytes });
+        }
+        Ok(())
+    }
+
+    /// Clipboard paste, routed by mode. Attached: shipped whole to the core,
+    /// which encodes it against the child's negotiated paste state — pushing
+    /// it through `key_to_bytes` would turn every newline into a submit.
+    /// Text-entry modes: inserted as one string with control characters
+    /// stripped, so a multi-line clipboard can't fake an Enter press.
+    fn on_paste(&mut self, s: &str) {
+        self.status = None;
+        match self.mode {
+            Mode::Attached => {
+                // Avoid closing the client connection with an oversized frame.
+                if s.len() > MAX_PASTE {
+                    self.status = Some(format!(
+                        "paste dropped: {} MiB exceeds the {} MiB limit",
+                        s.len() >> 20,
+                        MAX_PASTE >> 20
+                    ));
+                    return;
+                }
+                if let Some(id) = self.focused_id {
+                    self.transport.send(Command::Paste {
+                        id,
+                        bytes: s.as_bytes().to_vec(),
+                    });
+                }
+            }
+            Mode::Spawn | Mode::SaveSession => {
+                self.input.extend(s.chars().filter(|c| !c.is_control()));
+            }
+            Mode::PickDir => {
+                self.dir_input.extend(s.chars().filter(|c| !c.is_control()));
+                self.refresh_dir_candidates();
+            }
+            _ => {}
+        }
+    }
+
+    /// Forward attached mouse events to the supervisor. Wheel events queued
+    /// during a mode transition still move dashboard and peek selection.
+    fn on_mouse(&mut self, m: MouseEvent) {
+        let btn = |b: MouseButton| match b {
+            MouseButton::Left => MouseBtn::Left,
+            MouseButton::Middle => MouseBtn::Middle,
+            MouseButton::Right => MouseBtn::Right,
+        };
+        let kind = match m.kind {
+            MouseEventKind::ScrollUp => MouseKind::WheelUp,
+            MouseEventKind::ScrollDown => MouseKind::WheelDown,
+            MouseEventKind::Down(b) => MouseKind::Press(btn(b)),
+            MouseEventKind::Up(b) => MouseKind::Release(btn(b)),
+            MouseEventKind::Drag(b) => MouseKind::Drag(btn(b)),
+            // Ignore unsupported mouse events.
+            _ => return,
+        };
+        match self.mode {
+            Mode::Dashboard | Mode::Peek => match kind {
+                MouseKind::WheelUp => self.select_up(),
+                MouseKind::WheelDown => self.select_down(),
+                _ => {}
+            },
+            Mode::Attached => {
+                if let Some(id) = self.focused_id {
+                    // Keep the pointer coordinate within the child pane: the
+                    // bottom row is fleetcom's status bar, not the child's.
+                    let row = m.row.min(self.pane_rows().saturating_sub(1));
+                    let col = m.column.min(self.cols.saturating_sub(1));
+                    self.transport.send(Command::Mouse { id, kind, col, row });
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Apply input-mode changes for the current focus.
+    fn sync_input_modes(&mut self, out: &mut Stdout) -> io::Result<()> {
+        let attached = match self.mode {
+            Mode::Attached => self.focused_id.and_then(|id| self.screen_for(id)),
+            _ => None,
+        };
+        let (capture, alt_scroll) = desired_input_modes(attached);
+        if capture != self.mouse_captured {
+            if capture {
+                execute!(out, EnableMouseCapture)?;
+            } else {
+                execute!(out, DisableMouseCapture)?;
+            }
+            self.mouse_captured = capture;
+        }
+        if alt_scroll != self.alt_scroll {
+            let seq = if alt_scroll {
+                "\x1b[?1007h"
+            } else {
+                "\x1b[?1007l"
+            };
+            execute!(out, Print(seq))?;
+            self.alt_scroll = alt_scroll;
         }
         Ok(())
     }
@@ -940,29 +1034,44 @@ impl App {
     }
 }
 
-/// Translate a key event into the bytes a PTY expects. Covers interactive use
-/// (typing, control chars, arrows, navigation); function keys and kitty-protocol
-/// extras are ignored. Ctrl-letter → 0x01..=0x1a via the classic `& 0x1f` fold.
+/// Translate supported key events to legacy PTY byte sequences.
 fn key_to_bytes(code: KeyCode, mods: KeyModifiers) -> Option<Vec<u8>> {
     let ctrl = mods.contains(KeyModifiers::CONTROL);
+    let alt = mods.contains(KeyModifiers::ALT);
+    // Alt prefixes the encoded key with ESC.
+    let meta = |alt: bool, mut bytes: Vec<u8>| {
+        if alt {
+            bytes.insert(0, 0x1b);
+        }
+        bytes
+    };
     match code {
         KeyCode::Char(c) => {
-            if ctrl {
+            let base = if ctrl {
                 let b = c.to_ascii_uppercase() as u8;
                 if c == '?' {
-                    Some(vec![0x7f])
+                    vec![0x7f]
                 } else if (b'@'..=b'_').contains(&b) {
-                    Some(vec![b - b'@'])
+                    vec![b - b'@']
                 } else {
-                    Some(vec![(c as u8) & 0x1f])
+                    vec![(c as u8) & 0x1f]
                 }
             } else {
                 let mut buf = [0u8; 4];
-                Some(c.encode_utf8(&mut buf).as_bytes().to_vec())
+                c.encode_utf8(&mut buf).as_bytes().to_vec()
+            };
+            Some(meta(alt, base))
+        }
+        KeyCode::Enter => {
+            // Modified Enter uses the meta-prefix sequence, ESC CR.
+            if mods.intersects(KeyModifiers::SHIFT | KeyModifiers::ALT) {
+                Some(b"\x1b\r".to_vec())
+            } else {
+                Some(vec![b'\r'])
             }
         }
-        KeyCode::Enter => Some(vec![b'\r']),
-        KeyCode::Backspace => Some(vec![0x7f]),
+        // Preserve Alt on Backspace.
+        KeyCode::Backspace => Some(meta(alt, vec![0x7f])),
         KeyCode::Tab => Some(vec![b'\t']),
         KeyCode::BackTab => Some(b"\x1b[Z".to_vec()),
         KeyCode::Esc => Some(vec![0x1b]),
@@ -1013,9 +1122,7 @@ fn list_dirs(base: &Path, partial: &str) -> Vec<String> {
     out
 }
 
-/// The slice `(start, count)` of a `total`-length list to draw in `max` rows so
-/// the selected index stays on screen. Without this the cursor scrolls past the
-/// bottom of the visible window and the highlighted row vanishes.
+/// Visible `(start, count)` window that includes the selected list item.
 pub fn scroll_window(sel: usize, total: usize, max: usize) -> (usize, usize) {
     if total == 0 || max == 0 {
         return (0, 0);
@@ -1308,5 +1415,139 @@ mod tests {
             let (start, count) = scroll_window(sel, 20, 8);
             assert!(sel >= start && sel < start + count, "sel {sel} off-window");
         }
+    }
+
+    /// Modified Enter must stay distinguishable on the wire: `\x1b\r` (the
+    /// meta-prefix encoding), never flattened to the bare `\r` that submits.
+    #[test]
+    fn modified_enter_keeps_its_modifier() {
+        assert_eq!(
+            key_to_bytes(KeyCode::Enter, KeyModifiers::NONE),
+            Some(vec![b'\r'])
+        );
+        assert_eq!(
+            key_to_bytes(KeyCode::Enter, KeyModifiers::SHIFT),
+            Some(b"\x1b\r".to_vec())
+        );
+        assert_eq!(
+            key_to_bytes(KeyCode::Enter, KeyModifiers::ALT),
+            Some(b"\x1b\r".to_vec())
+        );
+        // Ctrl+Enter has no distinct legacy encoding: plain CR.
+        assert_eq!(
+            key_to_bytes(KeyCode::Enter, KeyModifiers::CONTROL),
+            Some(vec![b'\r'])
+        );
+    }
+
+    /// Alt prefixes supported character and Backspace encodings with ESC.
+    #[test]
+    fn alt_chords_get_the_meta_prefix() {
+        assert_eq!(
+            key_to_bytes(KeyCode::Char('f'), KeyModifiers::ALT),
+            Some(b"\x1bf".to_vec())
+        );
+        assert_eq!(
+            key_to_bytes(
+                KeyCode::Char('f'),
+                KeyModifiers::ALT | KeyModifiers::CONTROL
+            ),
+            Some(vec![0x1b, 0x06])
+        );
+        // Alt prefixes Backspace too.
+        assert_eq!(
+            key_to_bytes(KeyCode::Backspace, KeyModifiers::ALT),
+            Some(vec![0x1b, 0x7f])
+        );
+        assert_eq!(
+            key_to_bytes(KeyCode::Char('f'), KeyModifiers::NONE),
+            Some(b"f".to_vec())
+        );
+        assert_eq!(
+            key_to_bytes(KeyCode::Char('f'), KeyModifiers::CONTROL),
+            Some(vec![0x06])
+        );
+    }
+
+    /// An oversized attached paste is refused before it closes the connection.
+    #[test]
+    fn oversized_paste_is_refused_with_a_notice() {
+        let mut app = App::new_local(30, 100);
+        app.mode = Mode::Attached;
+        app.focused_id = Some(1);
+        app.on_paste(&"x".repeat(MAX_PASTE + 1));
+        let status = app.status.clone().unwrap_or_default();
+        assert!(status.contains("paste dropped"), "status was {status:?}");
+        // The boundary value is accepted.
+        app.on_paste(&"x".repeat(MAX_PASTE));
+        assert!(app.status.is_none(), "boundary paste must not be refused");
+    }
+
+    /// A paste into a text-entry mode lands as one string with control
+    /// characters stripped: a multi-line clipboard must not fake the Enter
+    /// press that would launch a half-pasted command.
+    #[test]
+    fn paste_into_text_entry_strips_controls() {
+        let mut app = App::new_local(30, 100);
+        app.mode = Mode::Spawn;
+        app.on_paste("cargo\ttest\r\n --all");
+        assert_eq!(app.input, "cargotest --all");
+        assert!(app.mode == Mode::Spawn, "paste must not submit");
+    }
+
+    /// Capture mouse events only for children that request them; disable
+    /// alternate scroll for attached inline children.
+    #[test]
+    fn capture_only_for_mouse_hungry_children() {
+        let screen = |wants_mouse, alt_screen| ScreenView {
+            id: 1,
+            lines: Vec::new(),
+            formatted: Vec::new(),
+            cursor: (0, 0),
+            hide_cursor: false,
+            wants_mouse,
+            alt_screen,
+        };
+        // No attached screen: keep native selection available.
+        assert_eq!(desired_input_modes(None), (false, true));
+        // Mouse-aware child: capture.
+        assert_eq!(desired_input_modes(Some(&screen(true, true))), (true, true));
+        assert_eq!(
+            desired_input_modes(Some(&screen(true, false))),
+            (true, true)
+        );
+        // Full-screen child without mouse mode: alternate scroll.
+        assert_eq!(
+            desired_input_modes(Some(&screen(false, true))),
+            (false, true)
+        );
+        // Inline child: wheel silenced, selection native.
+        assert_eq!(
+            desired_input_modes(Some(&screen(false, false))),
+            (false, false)
+        );
+    }
+
+    /// A wheel notch on the dashboard moves the selection like an arrow key.
+    #[test]
+    fn wheel_moves_dashboard_selection() {
+        let mut app = App::new_local(30, 100);
+        let dir = app.invocation_dir.clone();
+        app.spawn_in("sleep 5", dir.clone()); // id 1
+        app.spawn_in("sleep 5", dir); // id 2
+        app.pump();
+        app.resolve_selection();
+        assert_eq!(app.selected_id, Some(1));
+
+        let wheel = |kind| MouseEvent {
+            kind,
+            column: 0,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        };
+        app.on_mouse(wheel(MouseEventKind::ScrollDown));
+        assert_eq!(app.selected_id, Some(2));
+        app.on_mouse(wheel(MouseEventKind::ScrollUp));
+        assert_eq!(app.selected_id, Some(1));
     }
 }

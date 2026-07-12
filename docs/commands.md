@@ -53,9 +53,17 @@
 
 While attached, `Ctrl-\` returns to the dashboard. Every other key, including `Ctrl-C`, `Ctrl-Z`, and `Ctrl-D`, is forwarded to the child. `Ctrl-\` refers to the physical chord; the input handler accepts both `Ctrl-\` and the `Ctrl-4` representation produced by crossterm's legacy decoder.
 
+#### Shift+Enter, paste, and the wheel
+
+Three inputs are richer than a keypress, and each is routed by state rather than forwarded blind:
+
+- Shift+Enter and Alt+Enter are sent as `ESC CR`, which is distinct from plain Enter. Shift requires a terminal that reports modified keys; terminals that do not report it send plain `CR`.
+- Paste travels as one message. Bracketed-paste-aware children receive paste markers with embedded terminators removed; other children receive line endings as `CR`. Fleetcom text fields strip control characters.
+- The client captures the mouse only while the attached child requests a mouse protocol, then forwards clicks, drags, releases, and wheel events in the negotiated encoding. In that mode, use the terminal's selection override chord. Otherwise, native click-drag selection remains available; the wheel scrolls full-screen children and moves dashboard selection. It is disabled for attached inline children so arrow keys are not sent to their standard input.
+
 #### Destroy is Shift-gated
 
-`X` (capital) kills the selected task if it's running, or removes it from the list if it's finished. Removal also sweeps anything the job left in its process group (a `cmd &` child, for instance): `TERM` at removal, `KILL` after the 2 s grace, behind the already-gone row. Lowercase `x` is a deliberate no-op: the same guard as `Q` vs. `q`. It is *not* `Ctrl-X`: the terminal sends byte `0x18` for both `Ctrl+x` and `Ctrl+Shift+X`, with no shift bit, so a Ctrl chord can't carry the distinction. Only an unmodified capital reliably means "yes, destroy this."
+`X` kills a running task or removes a finished one. Removal also terminates remaining processes in the task's process group, escalating from `TERM` to `KILL` after two seconds. Lowercase `x` and Ctrl-X do nothing.
 
 #### Rerun
 

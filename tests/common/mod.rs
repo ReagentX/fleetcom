@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 
 /// The protocol version this test suite speaks; must track
 /// `protocol::PROTOCOL_VERSION` (drift fails the handshake, loudly).
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 
 /// One `KIND_CONTROL` frame: `[u32 len][kind=1][jzon payload]`.
 pub fn control_frame(json: &str) -> Vec<u8> {

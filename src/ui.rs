@@ -1,12 +1,5 @@
-//! Hand-rolled crossterm rendering (move, print padded, clear the tail), no
-//! ratatui. Every view renders into an in-memory buffer; `render` writes that
-//! buffer to the terminal in a single `write_all` and only when it differs from
-//! the last frame. That makes each frame atomic (no half-painted tearing) and
-//! skips work entirely when nothing changed.
-//!
-//! The renderer reads only the client's mirror (the `TaskView` list and the
-//! watched `ScreenView`), never a live `Task`. Everything it needs is a plain
-//! snapshot.
+//! Terminal rendering from the client's task and screen snapshots. Frames are
+//! buffered and written only when they differ from the previous frame.
 
 use std::io::{self, Stdout, Write};
 
@@ -309,7 +302,7 @@ fn render_pickdir(out: &mut impl Write, app: &App) -> io::Result<()> {
     let total = app.dir_candidates.len();
 
     let max_list = 8usize.min((rows as usize).saturating_sub(4)).max(1);
-    // Window the list so the selection is always drawn (bug: could scroll off).
+    // Keep the selected directory visible.
     let (start, visible) = scroll_window(app.dir_sel, total, max_list);
     let body = visible.max(1);
     let panel_h = (body + 2) as u16;
@@ -445,9 +438,7 @@ fn center(s: &str, width: usize) -> String {
     out
 }
 
-/// Full-screen banner shown when the daemon connection drops: a cleared screen
-/// (the stale task list would lie: those jobs died with the daemon) and the two
-/// things the user needs, what happened and what to do.
+/// Full-screen reconnect prompt shown after a daemon connection drops.
 fn render_disconnected(out: &mut impl Write, app: &App) -> io::Result<()> {
     let cols = app.cols as usize;
     let rows = app.rows;

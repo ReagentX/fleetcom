@@ -1,8 +1,4 @@
-//! A single supervised command: a PTY, its child, and a background thread that
-//! pumps the master into a `vt100` screen. Everything the UI shows is derived
-//! from that screen, so peek/attach/preview are all the same grid at different
-//! sizes, and "backgrounding" an attached task is a pure focus change. The
-//! child never learns it lost the foreground.
+//! PTY-backed task ownership and process-group teardown.
 
 use std::ffi::OsString;
 use std::io::{self, Read, Write};
@@ -17,11 +13,131 @@ use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system}
 use rustix::process::{WaitId, WaitIdOptions, waitid};
 
 use crate::core::{Wake, Waker};
+use crate::protocol::MouseKind;
 
 /// Map a dependency error (portable-pty returns `anyhow`) into `io::Error` so
 /// the whole crate speaks stdlib `io::Result` and never grows an `anyhow` dep.
 fn io_err(e: impl std::fmt::Display) -> io::Error {
     io::Error::other(e.to_string())
+}
+
+/// The bracketed-paste terminator. Stripped from paste *content* before
+/// wrapping: a clipboard that contains this sequence would otherwise end the
+/// paste early and smuggle the remainder in as live keystrokes.
+const PASTE_END: &[u8] = b"\x1b[201~";
+
+/// Encode a clipboard paste for a child whose DECSET 2004 state is
+/// `bracketed`. Opted in: wrap in `200~`/`201~` markers with embedded
+/// terminators stripped, content otherwise verbatim. Legacy: no markers, and
+/// line endings (`\r\n` and bare `\n`) become `\r` — the byte Enter sends —
+/// because a legacy line editor reads `\n` as ^J, not as end-of-line.
+pub fn paste_bytes(bracketed: bool, content: &[u8]) -> Vec<u8> {
+    if bracketed {
+        let mut out = Vec::with_capacity(content.len() + 2 * PASTE_END.len() + 6);
+        out.extend_from_slice(b"\x1b[200~");
+        let mut rest = content;
+        while let Some(pos) = rest.windows(PASTE_END.len()).position(|w| w == PASTE_END) {
+            out.extend_from_slice(&rest[..pos]);
+            rest = &rest[pos + PASTE_END.len()..];
+        }
+        out.extend_from_slice(rest);
+        out.extend_from_slice(PASTE_END);
+        out
+    } else {
+        let mut out = Vec::with_capacity(content.len());
+        let mut i = 0;
+        while i < content.len() {
+            if content[i] == b'\r' && content.get(i + 1) == Some(&b'\n') {
+                out.push(b'\r');
+                i += 2;
+            } else if content[i] == b'\n' {
+                out.push(b'\r');
+                i += 1;
+            } else {
+                out.push(content[i]);
+                i += 1;
+            }
+        }
+        out
+    }
+}
+
+/// Encode a mouse action using the child's current terminal mode. Mouse
+/// protocols determine supported actions and encoding. Without one,
+/// full-screen children receive wheel actions as alternate-scroll arrows;
+/// unsupported actions return `None`.
+pub fn mouse_bytes(screen: &vt100::Screen, kind: MouseKind, col: u16, row: u16) -> Option<Vec<u8>> {
+    use vt100::{MouseProtocolEncoding, MouseProtocolMode};
+    let mode = screen.mouse_protocol_mode();
+    if mode != MouseProtocolMode::None {
+        // The mode determines supported event classes.
+        let wanted = match kind {
+            MouseKind::WheelUp | MouseKind::WheelDown | MouseKind::Press(_) => true,
+            MouseKind::Release(_) => mode != MouseProtocolMode::Press,
+            MouseKind::Drag(_) => matches!(
+                mode,
+                MouseProtocolMode::ButtonMotion | MouseProtocolMode::AnyMotion
+            ),
+        };
+        if !wanted {
+            return None;
+        }
+        // xterm button codes: wheel 64/65; drag adds 32.
+        let code: u16 = match kind {
+            MouseKind::WheelUp => 64,
+            MouseKind::WheelDown => 65,
+            MouseKind::Press(b) | MouseKind::Release(b) => b as u16,
+            MouseKind::Drag(b) => 32 + b as u16,
+        };
+        let release = matches!(kind, MouseKind::Release(_));
+        return Some(match screen.mouse_protocol_encoding() {
+            // SGR releases use the `m` suffix.
+            MouseProtocolEncoding::Sgr => {
+                let suffix = if release { 'm' } else { 'M' };
+                format!("\x1b[<{};{};{}{}", code, col + 1, row + 1, suffix).into_bytes()
+            }
+            // UTF-8 fields encode `32 + value` up to 2047; releases use code 3.
+            MouseProtocolEncoding::Utf8 => {
+                let code = if release { 3 } else { code };
+                let mut out = b"\x1b[M".to_vec();
+                for v in [32 + code, 33 + col.min(2014), 33 + row.min(2014)] {
+                    let mut buf = [0u8; 4];
+                    // Values are bounded to valid UTF-8 scalar values.
+                    let c = char::from_u32(u32::from(v)).unwrap_or(' ');
+                    out.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
+                }
+                out
+            }
+            // Default fields are single bytes capped at 255; releases use code 3.
+            MouseProtocolEncoding::Default => {
+                let code = if release { 3 } else { code };
+                vec![
+                    0x1b,
+                    b'[',
+                    b'M',
+                    32 + code as u8,
+                    (33 + col.min(222)) as u8,
+                    (33 + row.min(222)) as u8,
+                ]
+            }
+        });
+    }
+    if screen.alternate_screen() {
+        let up = match kind {
+            MouseKind::WheelUp => true,
+            MouseKind::WheelDown => false,
+            // Only wheel actions map to alternate-scroll arrows.
+            _ => return None,
+        };
+        let arrow: &[u8] = match (screen.application_cursor(), up) {
+            (true, true) => b"\x1bOA",
+            (true, false) => b"\x1bOB",
+            (false, true) => b"\x1b[A",
+            (false, false) => b"\x1b[B",
+        };
+        return Some(arrow.repeat(3));
+    }
+    None
 }
 
 /// Process-derived lifecycle state, independent of the user's `tagged` intent.
@@ -79,13 +195,7 @@ fn signal(waker: &Waker) {
     }
 }
 
-/// Lock the shared vt100 grid, recovering from poisoning. A vt100 panic inside
-/// the guard (the daemon survives one: `serve_client` catches it) poisons the
-/// mutex, and treating that as fatal would silently blank the task forever —
-/// the reader thread would discard all further PTY output and every render
-/// would return empty. The worst a recovered lock can hold is a mid-mutation
-/// grid: garbled cells until the next output or full repaint replaces them.
-/// Strictly better than permanently dead.
+/// Lock the shared vt100 grid, recovering from a poisoned mutex.
 fn grid(parser: &Mutex<vt100::Parser>) -> std::sync::MutexGuard<'_, vt100::Parser> {
     parser
         .lock()
@@ -237,13 +347,7 @@ impl Task {
         Ok(())
     }
 
-    /// Collect the leader's zombie: the one real, reaping wait. After this the
-    /// OS may recycle the pid/pgid, so it runs only where no further signal can
-    /// follow — `Drop`, and the graveyard sweep via `try_collect`. Non-blocking
-    /// (`try_wait` is `WNOHANG`): a leader still dying from its KILL just isn't
-    /// collected this pass and reparents to init at daemon exit in the worst
-    /// case. `finished`/`exit_code` are normally latched already; the KILL path
-    /// can get here first, so latch them from the collected status too.
+    /// Reap the exited session leader without blocking.
     fn collect(&mut self) {
         if self.reaped {
             return;
@@ -337,6 +441,39 @@ impl Task {
         self.writer.flush()
     }
 
+    /// Forward a clipboard paste in whichever shape the child negotiated; see
+    /// [`paste_bytes`]. The grid lock is released before the PTY write: the
+    /// write can block on a full PTY buffer, and the reader thread needs the
+    /// lock to drain it.
+    pub fn send_paste(&mut self, content: &[u8]) -> io::Result<()> {
+        let bracketed = grid(&self.parser).screen().bracketed_paste();
+        self.send_input(&paste_bytes(bracketed, content))
+    }
+
+    /// Forward one mouse action, routed by the child's own screen state; see
+    /// [`mouse_bytes`]. A child that gets `None` receives nothing at all.
+    pub fn send_mouse(&mut self, kind: MouseKind, col: u16, row: u16) -> io::Result<()> {
+        let bytes = {
+            let p = grid(&self.parser);
+            mouse_bytes(p.screen(), kind, col, row)
+        };
+        match bytes {
+            Some(b) => self.send_input(&b),
+            None => Ok(()),
+        }
+    }
+
+    /// Return whether the child requests mouse input and uses the alternate
+    /// screen. The client receives these values in each `ScreenView`.
+    pub fn input_hints(&self) -> (bool, bool) {
+        let p = grid(&self.parser);
+        let s = p.screen();
+        (
+            s.mouse_protocol_mode() != vt100::MouseProtocolMode::None,
+            s.alternate_screen(),
+        )
+    }
+
     /// Ask the whole job to exit: SIGTERM to the process *group*, not just the
     /// direct child, so every group member gets it — including background
     /// children a `cmd &` left behind (a non-interactive shell's `&` creates no
@@ -364,19 +501,7 @@ impl Task {
                 .is_some_and(|t| now.duration_since(t) >= grace)
     }
 
-    /// Kill the whole job for real: SIGKILL to the group. The PTY slave closes
-    /// with it; that EOF is what lets the reader thread end.
-    ///
-    /// Non-blocking on purpose, twice over: we never `join` the reader (a
-    /// grandchild that escaped the group via its own `setsid` and kept the PTY
-    /// open would wedge the join), and we never block waiting for the corpses —
-    /// `killpg` returns when the signals are *queued*, not when the targets are
-    /// dead, and SIGKILL itself cannot kill a process stuck in uninterruptible
-    /// sleep. Collection happens later and non-blockingly (`collect`).
-    /// `killpg` only, never `child.kill()`: the leader is in the group by
-    /// definition, and portable-pty's `ChildKiller::kill` is a trap here — it
-    /// SIGHUPs, then loops `try_wait` for up to 250 ms: a *blocking reap* that
-    /// would collect the zombie mid-flight and destroy the pgid reservation.
+    /// Send SIGKILL to the task's process group without waiting for it to exit.
     pub fn force_kill(&mut self) {
         if !self.reaped
             && let Some(pid) = self.pid
@@ -403,6 +528,7 @@ impl Drop for Task {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::protocol::MouseBtn;
 
     fn here() -> PathBuf {
         std::env::current_dir().unwrap()
@@ -414,11 +540,8 @@ mod tests {
         std::env::vars_os().collect()
     }
 
-    /// `env_here` with `SHELL` pinned to `/bin/sh`. The straggler tests assert
-    /// POSIX process-group mechanics, and zsh (a developer's likely `$SHELL`)
-    /// adds its own policy on top: it kills a `-c` shell's background jobs on
-    /// exit even under `trap '' HUP`, so the straggler would be dead before
-    /// the code under test ever ran.
+    /// `env_here` with `SHELL` pinned to `/bin/sh` for portable background-job
+    /// behavior in process-group tests.
     fn sh_env() -> Vec<(OsString, OsString)> {
         let mut env = env_here();
         env.retain(|(k, _)| k != "SHELL");
@@ -551,6 +674,156 @@ mod tests {
             "TERM after leader exit never reached the straggler"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Paste encoding follows the child's DECSET 2004 opt-in: markers only
+    /// when asked for, newline→CR conversion only when not.
+    #[test]
+    fn paste_wraps_only_when_child_opted_in() {
+        assert_eq!(
+            paste_bytes(true, b"hello"),
+            b"\x1b[200~hello\x1b[201~".to_vec()
+        );
+        // Inside brackets the content rides verbatim: the child's own paste
+        // handling decides what a newline means.
+        assert_eq!(
+            paste_bytes(true, b"a\nb"),
+            b"\x1b[200~a\nb\x1b[201~".to_vec()
+        );
+        assert_eq!(paste_bytes(false, b"hello"), b"hello".to_vec());
+    }
+
+    /// A clipboard containing the end marker must not terminate the paste
+    /// early: the remainder would arrive as live keystrokes.
+    #[test]
+    fn paste_strips_embedded_terminator() {
+        assert_eq!(
+            paste_bytes(true, b"safe\x1b[201~rm -rf /\n"),
+            b"\x1b[200~saferm -rf /\n\x1b[201~".to_vec()
+        );
+        // Multiple embedded markers all go.
+        assert_eq!(
+            paste_bytes(true, b"\x1b[201~a\x1b[201~b\x1b[201~"),
+            b"\x1b[200~ab\x1b[201~".to_vec()
+        );
+    }
+
+    /// Legacy paste converts both `\r\n` and bare `\n` to the `\r` Enter sends,
+    /// without doubling a CRLF into two returns.
+    #[test]
+    fn legacy_paste_converts_line_endings() {
+        assert_eq!(paste_bytes(false, b"a\r\nb\nc\r"), b"a\rb\rc\r".to_vec());
+    }
+
+    /// Wheel routing follows the child's own escape sequences: nothing for an
+    /// inline child, alternate-scroll arrows for a full-screen one, real mouse
+    /// events once a protocol is requested — in the negotiated encoding.
+    #[test]
+    fn wheel_routes_by_child_state() {
+        let up = MouseKind::WheelUp;
+        let down = MouseKind::WheelDown;
+        let mut p = vt100::Parser::new(24, 80, 0);
+        // Inline child, no mouse: dropped, not translated into arrow spam.
+        assert_eq!(mouse_bytes(p.screen(), up, 0, 0), None);
+        // Full-screen child: three arrows per notch, normal cursor keys.
+        p.process(b"\x1b[?1049h");
+        assert_eq!(
+            mouse_bytes(p.screen(), up, 0, 0),
+            Some(b"\x1b[A\x1b[A\x1b[A".to_vec())
+        );
+        // Clicks mean nothing to a full-screen child without a mouse mode.
+        assert_eq!(
+            mouse_bytes(p.screen(), MouseKind::Press(MouseBtn::Left), 0, 0),
+            None
+        );
+        // Application cursor keys switch the arrows to SS3 form.
+        p.process(b"\x1b[?1h");
+        assert_eq!(
+            mouse_bytes(p.screen(), down, 0, 0),
+            Some(b"\x1bOB\x1bOB\x1bOB".to_vec())
+        );
+        // SGR mouse protocol: a real wheel event, 1-based coordinates.
+        p.process(b"\x1b[?1000h\x1b[?1006h");
+        assert_eq!(
+            mouse_bytes(p.screen(), up, 4, 2),
+            Some(b"\x1b[<64;5;3M".to_vec())
+        );
+        // Default encoding: single-byte cells, clamped to fit.
+        p.process(b"\x1b[?1006l");
+        assert_eq!(
+            mouse_bytes(p.screen(), down, 0, 0),
+            Some(vec![0x1b, b'[', b'M', 32 + 65, 33, 33])
+        );
+        assert_eq!(
+            mouse_bytes(p.screen(), down, 500, 500),
+            Some(vec![0x1b, b'[', b'M', 32 + 65, 255, 255])
+        );
+        // UTF-8 mouse coordinates can use multiple bytes.
+        p.process(b"\x1b[?1005h");
+        assert_eq!(
+            mouse_bytes(p.screen(), up, 200, 2),
+            Some(vec![0x1b, b'[', b'M', 32 + 64, 0xc3, 0xa9, 33 + 2])
+        );
+        // UTF-8 mouse coordinates cap at the protocol limit.
+        assert_eq!(
+            mouse_bytes(p.screen(), up, 5000, 5000),
+            Some(vec![0x1b, b'[', b'M', 32 + 64, 0xdf, 0xbf, 0xdf, 0xbf])
+        );
+    }
+
+    /// Verify mode-specific button delivery and encoding.
+    #[test]
+    fn buttons_respect_mode_granularity_and_encoding() {
+        let press = MouseKind::Press(MouseBtn::Left);
+        let drag = MouseKind::Drag(MouseBtn::Left);
+        let release = MouseKind::Release(MouseBtn::Left);
+
+        // X10 mode: presses only.
+        let mut p = vt100::Parser::new(24, 80, 0);
+        p.process(b"\x1b[?9h");
+        assert_eq!(
+            mouse_bytes(p.screen(), press, 4, 2),
+            Some(vec![0x1b, b'[', b'M', 32, 33 + 4, 33 + 2])
+        );
+        assert_eq!(mouse_bytes(p.screen(), release, 4, 2), None);
+        assert_eq!(mouse_bytes(p.screen(), drag, 4, 2), None);
+
+        // 1000 with SGR: releases use `m`; drags remain disabled.
+        p.process(b"\x1b[?9l\x1b[?1000h\x1b[?1006h");
+        assert_eq!(
+            mouse_bytes(p.screen(), press, 4, 2),
+            Some(b"\x1b[<0;5;3M".to_vec())
+        );
+        assert_eq!(
+            mouse_bytes(p.screen(), release, 4, 2),
+            Some(b"\x1b[<0;5;3m".to_vec())
+        );
+        assert_eq!(mouse_bytes(p.screen(), drag, 4, 2), None);
+
+        // 1002 enables drag events.
+        p.process(b"\x1b[?1002h");
+        assert_eq!(
+            mouse_bytes(p.screen(), drag, 4, 2),
+            Some(b"\x1b[<32;5;3M".to_vec())
+        );
+        // Non-SGR releases use code 3.
+        p.process(b"\x1b[?1006l");
+        assert_eq!(
+            mouse_bytes(p.screen(), release, 4, 2),
+            Some(vec![0x1b, b'[', b'M', 32 + 3, 33 + 4, 33 + 2])
+        );
+    }
+
+    /// Input hints track child terminal-mode changes.
+    #[test]
+    fn input_hints_track_child_modes() {
+        let mut t = spawn(8, "sleep 5");
+        assert_eq!(t.input_hints(), (false, false));
+        grid(&t.parser).process(b"\x1b[?1000h");
+        assert_eq!(t.input_hints(), (true, false));
+        grid(&t.parser).process(b"\x1b[?1000l\x1b[?1049h");
+        assert_eq!(t.input_hints(), (false, true));
+        t.terminate();
     }
 
     /// A poisoned grid mutex (a vt100 panic inside the guard) must degrade to

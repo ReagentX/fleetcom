@@ -1,4 +1,4 @@
-//! The hello handshake rejects version-mismatched and pre-handshake clients.
+//! The hello handshake rejects version-mismatched clients and commands sent before it.
 
 mod common;
 

@@ -23,10 +23,15 @@ use std::sync::atomic::AtomicBool;
 
 use crossterm::{
     cursor::{Hide, Show},
+    event::{
+        DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, KeyboardEnhancementFlags,
+        PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+    },
     execute,
+    style::Print,
     terminal::{
         Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode,
-        enable_raw_mode, size,
+        enable_raw_mode, size, supports_keyboard_enhancement,
     },
 };
 
@@ -150,7 +155,24 @@ fn main() -> io::Result<()> {
 
     let mut out = io::stdout();
     enable_raw_mode()?;
+    // Probe for the kitty keyboard protocol before entering the alternate
+    // screen: the query round-trips through the tty, and raw mode (just
+    // enabled) is what keeps the reply out of the line discipline. `false` on
+    // any error: degrade to plain Enter, never to broken input.
+    let kitty = supports_keyboard_enhancement().unwrap_or(false);
     execute!(out, EnterAlternateScreen, Clear(ClearType::All), Hide)?;
+    // Keyboard enhancement distinguishes modified Enter; bracketed paste
+    // delivers the clipboard as one event. Keyboard flags are screen-specific,
+    // so enable them after entering the alternate screen. Mouse capture is
+    // managed by `App::sync_input_modes`. Save and enable alternate scroll;
+    // restoration occurs in `restore_terminal`.
+    if kitty {
+        execute!(
+            out,
+            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+        )?;
+    }
+    execute!(out, EnableBracketedPaste, Print("\x1b[?1007s\x1b[?1007h"))?;
     // `fleetcom [--foreground] <session>` loads that session at startup; the
     // result shows in the status line.
     if let Some(name) = &session {
@@ -159,11 +181,23 @@ fn main() -> io::Result<()> {
     install_signal_handlers(app.signal_flag())?;
     let result = app.run(&mut out);
 
-    // Best-effort restore: on SIGHUP the terminal is already gone, so don't let
-    // a failed escape write short-circuit `disable_raw_mode`.
-    let _ = execute!(out, Show, LeaveAlternateScreen);
-    let _ = disable_raw_mode();
+    restore_terminal(&mut out);
     result
+}
+
+/// Restore terminal modes changed by the application. Cleanup is best-effort
+/// so a failed terminal write does not prevent raw mode from being disabled.
+fn restore_terminal(out: &mut io::Stdout) {
+    let _ = execute!(
+        out,
+        PopKeyboardEnhancementFlags,
+        DisableMouseCapture,
+        DisableBracketedPaste,
+        Print("\x1b[?1007r"),
+        Show,
+        LeaveAlternateScreen
+    );
+    let _ = disable_raw_mode();
 }
 
 /// Route external termination signals into the app's quit flag so the loop
@@ -183,8 +217,7 @@ fn install_signal_handlers(flag: Arc<AtomicBool>) -> io::Result<()> {
 fn install_panic_hook() {
     let default = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        let _ = disable_raw_mode();
-        let _ = execute!(io::stdout(), Show, LeaveAlternateScreen);
+        restore_terminal(&mut io::stdout());
         default(info);
     }));
 }

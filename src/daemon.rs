@@ -154,8 +154,7 @@ fn check_hello_ack(kind: u8, payload: &[u8]) -> io::Result<()> {
         Some(Event::HelloOk) => Ok(()),
         // The daemon's refusal names both versions; pass it through verbatim.
         Some(Event::Status(msg)) => Err(io::Error::other(msg)),
-        // Anything else is a pre-handshake daemon answering with its first
-        // `Tasks` tick. Here — and only here — killing it is the right advice.
+        // A non-handshake reply indicates an incompatible daemon.
         _ => Err(io::Error::other(
             "daemon predates the protocol handshake (stale daemon from an older \
              fleetcom); run 'fleetcom --kill' and retry",
@@ -331,7 +330,7 @@ pub fn run_kill() -> io::Result<()> {
 
 /// Send a `Shutdown` frame when the lock file contains no usable pid, blocking
 /// until the daemon closes the socket after stopping its jobs. Hellos first:
-/// the daemon refuses pre-handshake commands, and this path is same-binary so
+/// the daemon refuses commands before the handshake, and this path is same-binary so
 /// the versions always match.
 fn kill_via_socket() -> io::Result<()> {
     let path = socket_path();
@@ -495,7 +494,7 @@ fn handshake(stream: &mut UnixStream) -> Result<Command, String> {
              v{version}; run 'fleetcom --kill' and retry",
             env!("CARGO_PKG_VERSION"),
         )),
-        // A recognizable command that isn't a Hello is a pre-handshake client.
+        // Reject commands received before `Hello`.
         // Refuse requests before the required handshake.
         _ => Err(format!(
             "daemon {} requires a hello handshake (older client?); upgrade the \

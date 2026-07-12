@@ -1,18 +1,4 @@
-//! How the client reaches the core. The client's run loop speaks only `send`
-//! (a `Command` out) and `poll` (the `Event`s back), so the transport underneath
-//! is swappable without touching `app.rs`:
-//!
-//! - `ThreadTransport` runs the `Supervisor` on its own thread, reached over a
-//!   pair of mpsc channels: commands one way, events the other.
-//! - `SocketTransport` reaches a `fleetcom --daemon` over a Unix socket: `send`
-//!   writes a framed command, `poll` reads ready event frames.
-//! - `LocalTransport` keeps the supervisor in-thread and ticks it inline, so the
-//!   unit tests stay deterministic: `send` then `poll` sees the result at once.
-//!
-//! Both live transports carry a `wait_tx: Sender<()>` into their event-reader:
-//! after delivering an `Event` to the client's mirror, they poke it to wake the
-//! client's run loop (which blocks on the matching receiver), so the loop reacts
-//! to a fresh screen the instant it arrives, with no polling delay.
+//! Client transports for an in-process core, a daemon socket, and unit tests.
 
 use std::net::Shutdown;
 use std::os::unix::net::UnixStream;
@@ -152,8 +138,7 @@ impl Transport for ThreadTransport {
 
 impl Drop for ThreadTransport {
     fn drop(&mut self) {
-        // Belt-and-suspenders: if the loop exited without an explicit shutdown
-        // (a panic path), still stop the core so no thread is left running.
+        // Stop the core if the loop ended without an explicit shutdown.
         self.stop();
     }
 }
