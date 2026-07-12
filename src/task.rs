@@ -389,12 +389,6 @@ impl Task {
         self.reaped
     }
 
-    /// Release the PTY writer after removal while retaining the master for
-    /// process-group teardown.
-    pub fn shed_writer(&mut self) {
-        self.writer = Box::new(io::sink());
-    }
-
     pub fn lifecycle(&self, now: Instant, idle_after: Duration) -> Lifecycle {
         if self.finished.is_some() {
             return if self.exit_code == Some(0) {
