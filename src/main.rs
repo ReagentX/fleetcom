@@ -148,7 +148,7 @@ fn main() -> io::Result<()> {
             Ok(a) => a,
             Err(e) => {
                 eprintln!("fleetcom: could not reach the daemon: {e}");
-                return Err(e);
+                std::process::exit(1);
             }
         }
     };

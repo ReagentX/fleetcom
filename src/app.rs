@@ -226,7 +226,7 @@ impl App {
                 self.watched = None;
                 self.selected_id = None;
                 self.mode = Mode::Dashboard;
-                self.status = Some("reconnected to fresh daemon".to_string());
+                self.status = Some("reconnected".to_string());
             }
             Err(e) => self.status = Some(format!("reconnect failed: {e}")),
         }
