@@ -11,7 +11,7 @@ use nix::sys::signal::{Signal, kill};
 use nix::unistd::Pid;
 
 use common::{
-    PROTOCOL_VERSION, control_frame, hello_frame, read_frame, start_daemon_raw, wait_until,
+    PROTOCOL_VERSION, b64, control_frame, hello_frame, read_frame, start_daemon_raw, wait_until,
 };
 
 #[test]
@@ -46,6 +46,7 @@ fn spawn_runs_under_the_hello_env() {
     let spawn = format!(
         r#"{{"t":"spawn","command":"printf '%s:%s' \"$FLEETCOM_MARKER\" \"${{FLEETCOM_DAEMON_ONLY:-absent}}\" > {out}","cwd":"{cwd}"}}"#,
         out = out.display(),
+        cwd = b64(cwd.as_bytes()),
     );
     stream.write_all(&control_frame(&spawn)).unwrap();
 

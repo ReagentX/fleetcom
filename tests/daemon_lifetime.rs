@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 use nix::sys::signal::{Signal, kill, killpg};
 use nix::unistd::Pid;
 
-use common::{control_frame, start_daemon, wait_until};
+use common::{b64, control_frame, start_daemon, wait_until};
 
 /// Spawn `command` (which must write its own `$$` to `pidfile`) and return the
 /// job's leader pid (== pgid: portable-pty `setsid`s it).
@@ -23,7 +23,7 @@ fn spawn_job(
 ) -> Pid {
     let spawn = format!(
         r#"{{"t":"spawn","command":"{command}","cwd":"{cwd}"}}"#,
-        cwd = cwd.display(),
+        cwd = b64(cwd.display().to_string().as_bytes()),
     );
     stream.write_all(&control_frame(&spawn)).unwrap();
     assert!(

@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 
 /// The protocol version this test suite speaks; must track
 /// `protocol::PROTOCOL_VERSION` (drift fails the handshake, loudly).
-pub const PROTOCOL_VERSION: u32 = 3;
+pub const PROTOCOL_VERSION: u32 = 4;
 
 /// One frame of the given kind: `[u32 len][kind][payload]`.
 pub fn frame(kind: u8, payload: &[u8]) -> Vec<u8> {
@@ -69,13 +69,15 @@ pub fn read_frame(stream: &mut UnixStream) -> std::io::Result<(u8, Vec<u8>)> {
 }
 
 /// A `KIND_HELLO` frame carrying the client environment and working directory.
+/// v4 sends the cwd as lossless base64, like the env pairs.
 pub fn hello_frame(version: u32, env: &[(&[u8], &[u8])], cwd: &str) -> Vec<u8> {
     let pairs: Vec<String> = env
         .iter()
         .map(|(k, v)| format!(r#"["{}","{}"]"#, b64(k), b64(v)))
         .collect();
     let json = format!(
-        r#"{{"v":{version},"cwd":"{cwd}","env":[{}]}}"#,
+        r#"{{"v":{version},"cwd":"{}","env":[{}]}}"#,
+        b64(cwd.as_bytes()),
         pairs.join(",")
     );
     frame(3, json.as_bytes())

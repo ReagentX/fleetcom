@@ -10,7 +10,7 @@ use std::time::Duration;
 use nix::sys::signal::{Signal, kill};
 use nix::unistd::Pid;
 
-use common::{control_frame, start_daemon, wait_until};
+use common::{b64, control_frame, start_daemon, wait_until};
 
 #[test]
 fn sigterm_kills_daemon_and_its_jobs() {
@@ -23,7 +23,7 @@ fn sigterm_kills_daemon_and_its_jobs() {
     let spawn = format!(
         r#"{{"t":"spawn","command":"echo $$ > {pf} && sleep 300","cwd":"{cwd}"}}"#,
         pf = pidfile.display(),
-        cwd = dir.display()
+        cwd = b64(dir.display().to_string().as_bytes())
     );
     stream.write_all(&control_frame(&spawn)).unwrap();
 
