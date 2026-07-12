@@ -9,7 +9,6 @@ use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as B64;
 
 use crate::frame::{KIND_CONTROL, KIND_HELLO, KIND_SCREEN};
-use crate::task::Lifecycle;
 
 /// Wire-protocol version; the handshake rejects mismatched peers.
 pub const PROTOCOL_VERSION: u32 = 3;
@@ -123,6 +122,16 @@ pub enum Event {
     Screen(ScreenView),
     /// A one-line notice for the status line (save/load result, spawn error).
     Status(String),
+}
+
+/// Process-derived lifecycle state, independent of the user's `tagged` intent.
+/// `Idle` means no recent output, not that the process is waiting for input.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Lifecycle {
+    Active,
+    Idle,
+    Ok,
+    Failed,
 }
 
 /// A read-only snapshot of one task: everything a dashboard row needs, with no

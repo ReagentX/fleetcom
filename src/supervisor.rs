@@ -618,7 +618,7 @@ mod tests {
     fn wait_for_lifecycle(
         s: &mut Supervisor,
         id: u64,
-        pred: impl Fn(crate::task::Lifecycle) -> bool,
+        pred: impl Fn(crate::protocol::Lifecycle) -> bool,
     ) {
         for _ in 0..200 {
             s.tick();
@@ -640,7 +640,7 @@ mod tests {
     /// plus the `Ok` lifecycle is proof of TERM-before-KILL.
     #[test]
     fn kill_delivers_term_before_kill() {
-        use crate::task::Lifecycle;
+        use crate::protocol::Lifecycle;
         let dir = scratch("term_first");
         let (ready, trapped) = (dir.join("ready"), dir.join("trapped"));
         let mut s = sup(24, 80);
@@ -664,7 +664,7 @@ mod tests {
     /// reap-driven escalation. `Kill` must never leave an immortal task.
     #[test]
     fn term_ignoring_task_escalates_to_kill() {
-        use crate::task::Lifecycle;
+        use crate::protocol::Lifecycle;
         let dir = scratch("escalate");
         let ready = dir.join("ready");
         let mut s = sup(24, 80);
@@ -785,7 +785,7 @@ mod tests {
     /// gains one line per run).
     #[test]
     fn restart_reruns_finished_task_in_place() {
-        use crate::task::Lifecycle;
+        use crate::protocol::Lifecycle;
         let dir = scratch("restart");
         let marker = dir.join("marker");
         let mut s = sup(24, 80);
@@ -819,7 +819,7 @@ mod tests {
     /// and keeps running. An unknown id gets a notice too, not a panic.
     #[test]
     fn restart_refuses_running_task_and_unknown_id() {
-        use crate::task::Lifecycle;
+        use crate::protocol::Lifecycle;
         let mut s = sup(24, 80);
         s.apply(Command::Spawn {
             command: "sleep 30".into(),
@@ -860,7 +860,7 @@ mod tests {
     /// fresh screen would be skipped as "unchanged".
     #[test]
     fn restart_watched_task_resends_screen() {
-        use crate::task::Lifecycle;
+        use crate::protocol::Lifecycle;
         let mut s = sup(24, 80);
         s.apply(Command::Spawn {
             command: "true".into(),

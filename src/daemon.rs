@@ -235,7 +235,7 @@ pub fn connect_ready_bounded() -> io::Result<UnixStream> {
 }
 
 /// Connect to the daemon or start one, then wait up to one second for its socket.
-pub fn connect_or_autostart() -> io::Result<UnixStream> {
+fn connect_or_autostart() -> io::Result<UnixStream> {
     let path = socket_path();
     if let Ok(s) = UnixStream::connect(&path) {
         return Ok(s);
