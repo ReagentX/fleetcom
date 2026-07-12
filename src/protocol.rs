@@ -1,11 +1,4 @@
-//! The seam between the client (UI) and the supervisor (task owner): the types
-//! that cross the Unix-domain socket to the daemon.
-//!
-//! `Command` is client→core, `Event` is core→client, and `TaskView`/`ScreenView`
-//! are the read-only snapshots the client renders instead of reaching into a
-//! live `Task`. Nothing here holds a process handle or a process-local
-//! `Instant`: a socket peer could interpret neither, so the types stay
-//! wire-shaped.
+//! Client-to-core commands and core-to-client snapshots for the Unix socket.
 
 use std::ffi::{OsStr, OsString};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
@@ -15,10 +8,7 @@ use std::time::Duration;
 use crate::frame::{KIND_CONTROL, KIND_SCREEN};
 use crate::task::Lifecycle;
 
-/// Wire-protocol version. The handshake rejects peers using a different version.
-/// v2 added `Paste`/`Scroll`: a v1 daemon would silently drop both (unknown
-/// discriminants decode to `None`), so the bump turns "paste does nothing" into
-/// a visible version-mismatch rejection.
+/// Wire-protocol version; the handshake rejects mismatched peers.
 pub const PROTOCOL_VERSION: u32 = 2;
 
 /// A client→core request. Every mutation of the task set is one of these; the
@@ -26,11 +16,7 @@ pub const PROTOCOL_VERSION: u32 = 2;
 /// as `Event`s, never as return values.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Command {
-    /// The connection opener: the client's protocol version and launch context.
-    /// Env and cwd are per-*connection*, not per-spawn — nothing mutates a
-    /// client's environment while it runs, so sending it once is equivalent to
-    /// sending it with every launch, and it prices the env payload once. Env
-    /// rides as bytes: environment variables need not be UTF-8.
+    /// The client's protocol version, environment, and working directory.
     Hello {
         version: u32,
         env: Vec<(OsString, OsString)>,
@@ -83,12 +69,7 @@ pub enum Command {
 /// the watched screen, updated only by these.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Event {
-    /// The daemon accepted the client's `Hello`: versions match, launch context
-    /// stored. The client blocks on this before building its transport, so a
-    /// pre-handshake daemon (which answers with its first `Tasks` tick instead)
-    /// is detected rather than silently served with the wrong environment.
-    /// Carries no version: the daemon only acks an exact match, so a field
-    /// would always equal the client's own constant.
+    /// The daemon accepted a compatible `Hello` and stored its launch context.
     HelloOk,
     /// Full task-set snapshot; replaces the client's mirror wholesale.
     Tasks(Vec<TaskView>),
@@ -134,11 +115,7 @@ pub struct ScreenView {
 // raw tail after a small jzon header rather than bloating into a JSON number
 // array. A socket peer is just `decode_*(read_frame(...))`.
 
-/// Paths ride the wire as lossy UTF-8 strings — protocol-wide (`Spawn`,
-/// `Hello`, `TaskView`): a non-UTF-8 path arrives mangled. Accepted rather
-/// than byte-encoded like env: non-UTF-8 paths are rare, a wrong path fails
-/// visibly at spawn/resolve time (unlike a silently wrong env), and fixing it
-/// would touch every message for marginal gain.
+/// Encode paths as lossy UTF-8 strings for the protocol.
 fn ps(p: &Path) -> String {
     p.to_string_lossy().into_owned()
 }
@@ -166,12 +143,7 @@ fn os_arr(s: &OsStr) -> jzon::JsonValue {
     a
 }
 
-/// Inverse of [`os_arr`]. `None` unless `v` is an array of bytes: a malformed
-/// pair rejects the whole command (the daemon must not guess at an
-/// environment). The explicit array check is load-bearing — jzon's `members()`
-/// on a non-array (including the `Null` that indexing a malformed pair yields)
-/// is an *empty* iterator, which would otherwise decode as an empty string and
-/// let a wrong-shape hello through with an empty-pair environment.
+/// Decode a JSON byte array as an `OsString`.
 fn os_from(v: &jzon::JsonValue) -> Option<OsString> {
     if !v.is_array() {
         return None;

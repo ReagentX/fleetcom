@@ -1,18 +1,12 @@
-//! Session save/load: a `{dir: [command, ...]}` recipe, JSON on disk, one file
-//! per session name under the user's config dir.
-//!
-//! A session is a *recipe*: loading it re-runs the commands; it does not
-//! resurrect live processes (that's the daemon's job). Uses `jzon`, not serde:
-//! the schema is a flat map that needs no derive.
+//! JSON session recipes stored one file per name in the user's config directory.
+//! Loading a recipe starts new commands; it does not restore live processes.
 
 use std::collections::BTreeMap;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-/// A session recipe: working directory → the commands to run there. `BTreeMap`
-/// so dirs serialize in a stable (alphabetical) order; command order within a
-/// dir is preserved by the `Vec`.
+/// Session recipe mapping directories to ordered commands.
 pub type SessionConfig = BTreeMap<String, Vec<String>>;
 
 /// Characters replaced with `_` in session filenames.

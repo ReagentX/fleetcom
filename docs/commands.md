@@ -57,15 +57,15 @@ While attached, `Ctrl-\` returns to the dashboard. Every other key, including `C
 
 Three inputs are richer than a keypress, and each is routed by state rather than forwarded blind:
 
-- **Shift+Enter** (and Alt+Enter) reaches the child as `ESC CR`, the meta-prefix encoding — distinguishable from plain Enter by children that care (Claude Code reads it as "insert newline"), harmless to line editors that don't. Seeing Shift at all requires a terminal that speaks the kitty keyboard protocol (iTerm2, kitty, Ghostty, WezTerm, Alacritty); elsewhere the terminal sends a bare `CR` for both chords and nothing downstream can recover the difference. On such terminals, bind Shift+Enter to send `ESC CR` directly (Claude Code's `/terminal-setup` does exactly this) — it arrives as Alt+Enter and forwards identically.
-- **Paste** travels as one message, not a keystroke flood. A child that enabled bracketed paste gets the content wrapped in paste markers, verbatim (embedded end-markers stripped — a clipboard must not be able to end its own paste early and run the remainder as keystrokes). A child that didn't gets line endings converted to the `CR` Enter sends. In fleetcom's own text fields, a paste inserts as one string with control characters stripped, so a multi-line clipboard can't fake an Enter press.
-- **The wheel** is captured as wheel events (this is what stops terminals from synthesizing arrow-key spam on the alternate screen — the "scroll wheel is sending arrow keys" complaint). On the dashboard and in peek it moves the selection. Attached, it's routed by what the child asked its terminal for: a mouse-protocol subscriber gets real wheel events in its negotiated encoding, a full-screen child (`vim`, `less`) gets the three-arrows-per-notch of alternate-scroll mode, and an inline child that asked for neither gets nothing.
+- Shift+Enter and Alt+Enter are sent as `ESC CR`, which is distinct from plain Enter. Shift requires a terminal that reports modified keys; terminals that do not report it send plain `CR`.
+- Paste travels as one message. Bracketed-paste-aware children receive paste markers with embedded terminators removed; other children receive line endings as `CR`. Fleetcom text fields strip control characters.
+- The wheel moves selection on the dashboard and in peek. Attached tasks receive wheel events, alternate-screen arrows, or nothing according to their terminal state.
 
 One cost: with the mouse captured, drag-to-select belongs to fleetcom's terminal only via the shift override (`Shift`+drag in most emulators, `Option`+drag in iTerm2/Terminal.app), same as tmux.
 
 #### Destroy is Shift-gated
 
-`X` (capital) kills the selected task if it's running, or removes it from the list if it's finished. Removal also sweeps anything the job left in its process group (a `cmd &` child, for instance): `TERM` at removal, `KILL` after the 2 s grace, behind the already-gone row. Lowercase `x` is a deliberate no-op: the same guard as `Q` vs. `q`. It is *not* `Ctrl-X`: the terminal sends byte `0x18` for both `Ctrl+x` and `Ctrl+Shift+X`, with no shift bit, so a Ctrl chord can't carry the distinction. Only an unmodified capital reliably means "yes, destroy this."
+`X` kills a running task or removes a finished one. Removal also terminates remaining processes in the task's process group, escalating from `TERM` to `KILL` after two seconds. Lowercase `x` and Ctrl-X do nothing.
 
 #### Rerun
 

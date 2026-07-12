@@ -1,8 +1,4 @@
-//! A single supervised command: a PTY, its child, and a background thread that
-//! pumps the master into a `vt100` screen. Everything the UI shows is derived
-//! from that screen, so peek/attach/preview are all the same grid at different
-//! sizes, and "backgrounding" an attached task is a pure focus change. The
-//! child never learns it lost the foreground.
+//! PTY-backed task ownership and process-group teardown.
 
 use std::ffi::OsString;
 use std::io::{self, Read, Write};
@@ -160,13 +156,7 @@ fn signal(waker: &Waker) {
     }
 }
 
-/// Lock the shared vt100 grid, recovering from poisoning. A vt100 panic inside
-/// the guard (the daemon survives one: `serve_client` catches it) poisons the
-/// mutex, and treating that as fatal would silently blank the task forever —
-/// the reader thread would discard all further PTY output and every render
-/// would return empty. The worst a recovered lock can hold is a mid-mutation
-/// grid: garbled cells until the next output or full repaint replaces them.
-/// Strictly better than permanently dead.
+/// Lock the shared vt100 grid, recovering from a poisoned mutex.
 fn grid(parser: &Mutex<vt100::Parser>) -> std::sync::MutexGuard<'_, vt100::Parser> {
     parser
         .lock()
@@ -318,13 +308,7 @@ impl Task {
         Ok(())
     }
 
-    /// Collect the leader's zombie: the one real, reaping wait. After this the
-    /// OS may recycle the pid/pgid, so it runs only where no further signal can
-    /// follow — `Drop`, and the graveyard sweep via `try_collect`. Non-blocking
-    /// (`try_wait` is `WNOHANG`): a leader still dying from its KILL just isn't
-    /// collected this pass and reparents to init at daemon exit in the worst
-    /// case. `finished`/`exit_code` are normally latched already; the KILL path
-    /// can get here first, so latch them from the collected status too.
+    /// Reap the exited session leader without blocking.
     fn collect(&mut self) {
         if self.reaped {
             return;
@@ -467,19 +451,7 @@ impl Task {
                 .is_some_and(|t| now.duration_since(t) >= grace)
     }
 
-    /// Kill the whole job for real: SIGKILL to the group. The PTY slave closes
-    /// with it; that EOF is what lets the reader thread end.
-    ///
-    /// Non-blocking on purpose, twice over: we never `join` the reader (a
-    /// grandchild that escaped the group via its own `setsid` and kept the PTY
-    /// open would wedge the join), and we never block waiting for the corpses —
-    /// `killpg` returns when the signals are *queued*, not when the targets are
-    /// dead, and SIGKILL itself cannot kill a process stuck in uninterruptible
-    /// sleep. Collection happens later and non-blockingly (`collect`).
-    /// `killpg` only, never `child.kill()`: the leader is in the group by
-    /// definition, and portable-pty's `ChildKiller::kill` is a trap here — it
-    /// SIGHUPs, then loops `try_wait` for up to 250 ms: a *blocking reap* that
-    /// would collect the zombie mid-flight and destroy the pgid reservation.
+    /// Send SIGKILL to the task's process group without waiting for it to exit.
     pub fn force_kill(&mut self) {
         if !self.reaped
             && let Some(pid) = self.pid
@@ -517,11 +489,8 @@ mod tests {
         std::env::vars_os().collect()
     }
 
-    /// `env_here` with `SHELL` pinned to `/bin/sh`. The straggler tests assert
-    /// POSIX process-group mechanics, and zsh (a developer's likely `$SHELL`)
-    /// adds its own policy on top: it kills a `-c` shell's background jobs on
-    /// exit even under `trap '' HUP`, so the straggler would be dead before
-    /// the code under test ever ran.
+    /// `env_here` with `SHELL` pinned to `/bin/sh` for portable background-job
+    /// behavior in process-group tests.
     fn sh_env() -> Vec<(OsString, OsString)> {
         let mut env = env_here();
         env.retain(|(k, _)| k != "SHELL");

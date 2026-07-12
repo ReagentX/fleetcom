@@ -32,7 +32,7 @@ A session is a JSON object mapping a working directory to the commands to run th
 
 - Keys are directory paths: each task's working directory.
 - Values are ordered lists of shell command strings. Order is preserved, and each command runs in its own PTY under that directory.
-- Directories serialize alphabetically because the in-memory representation is a `BTreeMap`. Command order remains stable within each directory.
+- Directories serialize alphabetically. Command order remains stable within each directory.
 
 The schema is a flat map with no version field or metadata, so files can be edited directly. Invalid JSON fails the load. Within valid JSON, entries that do not produce string command values are omitted.
 

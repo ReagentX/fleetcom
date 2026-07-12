@@ -1,8 +1,5 @@
-//! The client: UI state (modes, selection, pickers) and the single-threaded
-//! event loop. It owns **no** processes (the `Supervisor` does) and drives the
-//! task set only through `Command`s, painting the `TaskView` mirror it gets back
-//! as `Event`s. The loop only ever calls `send`/`poll`/`shutdown` on its
-//! `Transport`, never touching the machinery underneath.
+//! Client UI state and event loop. Tasks are owned by the supervisor and exposed
+//! here through `Command`s and `Event` snapshots over a `Transport`.
 
 use std::io::{self, Stdout};
 use std::path::{Path, PathBuf};
@@ -86,13 +83,9 @@ pub enum Row {
 }
 
 pub struct App {
-    /// The link to the core (the task owner): a `ThreadTransport` (in-process)
-    /// or `SocketTransport` (daemon). The client only ever calls
-    /// `send`/`poll`/`shutdown`, so it neither knows nor cares which.
+    /// Connection to the task-owning core.
     transport: Box<dyn Transport>,
-    /// Local mirror of the task set, replaced wholesale by `Event::Tasks`. The
-    /// client renders and navigates this, never a live `Task`. `pub` so the
-    /// renderer (`ui`) can index it by the row order `sections()` hands back.
+    /// Task snapshot received from `Event::Tasks`.
     pub views: Vec<TaskView>,
     /// The watched task's screen (attach/peek), from `Event::Screen`.
     focused_screen: Option<ScreenView>,
@@ -140,10 +133,7 @@ pub struct App {
     /// The stdin thread's sender, taken by `run` when it spawns that thread, so
     /// tests that never call `run` never start it.
     input_tx: Option<Sender<CtEvent>>,
-    /// Woken by *both* the stdin thread and the transport's event reader (each
-    /// pokes a `()` after enqueuing). The run loop blocks here, so it reacts to a
-    /// keystroke or a fresh screen at once; the payload waits in `input_rx` /
-    /// `transport.poll()`. This is the client half of the event-driven path.
+    /// Wake notifications from the input and transport reader threads.
     wait_rx: Receiver<()>,
     /// Kept so `run` can hand the stdin thread a poker, and `reconnect` a fresh
     /// transport one.
@@ -158,11 +148,7 @@ pub struct App {
     exit_intent: ExitIntent,
 }
 
-/// Grouping key for the dashboard: user-tagged first, then live, then done.
-/// The manual tag ("I'm using this") overrides everything, *including* a
-/// finished process. Tagging pulls a task out of Completed into In use.
-/// That is how the tag rebuilds the fleet-view buckets without pretending to
-/// detect "awaiting input".
+/// Dashboard grouping bucket: tagged tasks first, then live, then completed.
 pub fn bucket(v: &TaskView) -> u8 {
     if v.tagged {
         0
@@ -190,16 +176,11 @@ impl App {
         Ok(app)
     }
 
-    /// Rebuild the daemon connection after a drop (autostarting a fresh daemon if
-    /// needed). A cleanly-exiting daemon kills its jobs on the way out (a
-    /// SIGKILL or a crash kills them rudely, via the PTY hangup), so the new
-    /// session starts empty; the mirror is cleared to match.
+    /// Reconnect to the daemon and clear the stale task snapshot.
     fn reconnect(&mut self) {
         let wait_tx = self.wait_tx.clone();
         let build = move || -> io::Result<SocketTransport> {
-            // Bounded handshake: this runs inside the live UI, where the
-            // startup variant's indefinite wait (and printed notice) would
-            // freeze the client. A busy daemon lands in the status line.
+            // Reconnection must not block the active UI indefinitely.
             let stream = crate::daemon::connect_ready_bounded()?;
             let read = stream.try_clone()?;
             Ok(SocketTransport::from_halves(stream, read, wait_tx))
@@ -230,12 +211,7 @@ impl App {
         })
     }
 
-    /// Build the App around whatever transport `make` returns. The in-process
-    /// transports (`ThreadTransport`, test `LocalTransport`) build a `Supervisor`
-    /// from `(pane_rows, cols)`; `SocketTransport` ignores those and talks to
-    /// the daemon's supervisor instead. Either way the client then declares its
-    /// content size up front. Essential for the daemon, which otherwise sizes
-    /// PTYs at its 24x80 default; a harmless no-op in-process.
+    /// Build an app with the requested transport and initial PTY size.
     fn assemble(
         rows: u16,
         cols: u16,
@@ -334,10 +310,7 @@ impl App {
         self.rows.saturating_sub(1).max(1)
     }
 
-    /// Grouped view of the tasks: `(section label, view indices)` in render
-    /// order. Both grouping modes sub-sort by state bucket then spawn order, so
-    /// "nesting" is uniform. This is the single source of order: `display_order`
-    /// is just its flattening, so navigation and rendering can't disagree.
+    /// Task sections in render order. Navigation uses their flattened order.
     pub fn sections(&self) -> Vec<(String, Vec<usize>)> {
         let mut labeled: Vec<(u8, String, u8, u64, usize)> = self
             .views
@@ -457,9 +430,7 @@ impl App {
         }
     }
 
-    /// Pull whatever the core has emitted and fold it into the local mirror. The
-    /// transport decides how those events arrive (a threaded channel drain in
-    /// production, an inline supervisor tick in tests), but the fold is the same.
+    /// Apply ready core events to the local snapshot.
     fn sync(&mut self) {
         for ev in self.transport.poll() {
             match ev {
@@ -498,8 +469,7 @@ impl App {
             self.set_watch(watch);
             self.sync();
 
-            // The daemon vanished mid-session (killed elsewhere, crashed)? Show a
-            // banner instead of freezing on a stale mirror with dead input.
+            // Replace an unreachable daemon's snapshot with the reconnect banner.
             if self.mode != Mode::Disconnected && !self.transport.connected() {
                 self.mode = Mode::Disconnected;
                 self.focused_id = None;
@@ -854,18 +824,14 @@ impl App {
             KeyCode::Up | KeyCode::Char('k') => self.select_up(),
             KeyCode::Down | KeyCode::Char('j') => self.select_down(),
             KeyCode::Enter => self.attach(),
-            // Peek is where a result is being read, so rerun works here too:
-            // the overlay stays open and streams the fresh run.
+            // Keep the peek overlay open while the restarted task streams output.
             KeyCode::Char('r') => self.rerun_selected(),
             _ => {}
         }
     }
 
     fn on_key_attached(&mut self, out: &mut Stdout, k: KeyEvent) -> io::Result<()> {
-        // The one key `fleetcom` steals from the child: Ctrl-\ backgrounds it.
-        // Everything else (including Ctrl-C/Z/D) is forwarded verbatim.
-        //
-        // Crossterm may decode Ctrl-\\ as Ctrl-4 without the kitty protocol.
+        // Ctrl-\ backgrounds the task; crossterm may report it as Ctrl-4.
         let detach = k.modifiers.contains(KeyModifiers::CONTROL)
             && matches!(k.code, KeyCode::Char('\\') | KeyCode::Char('4'));
         if detach {
@@ -915,10 +881,7 @@ impl App {
         }
     }
 
-    /// Mouse input; only wheel notches are acted on. Dashboard/peek: move the
-    /// selection. Attached: forward to the core, which routes by the child's
-    /// own state — the fix for terminals whose alternate-scroll mode would
-    /// otherwise turn the wheel into arrow-key spam at the child.
+    /// Handle wheel input locally or forward it to the attached task.
     fn on_mouse(&mut self, m: MouseEvent) {
         let up = match m.kind {
             MouseEventKind::ScrollUp => true,
@@ -1007,12 +970,7 @@ impl App {
     }
 }
 
-/// Translate a key event into the bytes a PTY expects. Covers interactive use
-/// (typing, control chars, arrows, navigation) plus modified Enter; function
-/// keys and the remaining kitty-protocol extras are ignored. Always emits
-/// legacy encodings: the kitty flags `main` pushes shape what the *outer*
-/// terminal reports, never what the child receives. Ctrl-letter →
-/// 0x01..=0x1a via the classic `& 0x1f` fold.
+/// Translate supported key events to legacy PTY byte sequences.
 fn key_to_bytes(code: KeyCode, mods: KeyModifiers) -> Option<Vec<u8>> {
     let ctrl = mods.contains(KeyModifiers::CONTROL);
     match code {
@@ -1032,12 +990,7 @@ fn key_to_bytes(code: KeyCode, mods: KeyModifiers) -> Option<Vec<u8>> {
             }
         }
         KeyCode::Enter => {
-            // Shift/Alt+Enter → ESC CR, the meta-prefix encoding: children
-            // that distinguish it (Claude Code reads it as newline-insert)
-            // get the distinction, line editors that don't treat it as a
-            // harmless meta chord. Shift is only visible at all under the
-            // kitty disambiguate flag `main` pushes; Alt also covers
-            // terminals bound to send `\x1b\r` for Shift+Enter directly.
+            // Modified Enter uses the meta-prefix sequence, ESC CR.
             if mods.intersects(KeyModifiers::SHIFT | KeyModifiers::ALT) {
                 Some(b"\x1b\r".to_vec())
             } else {
@@ -1095,9 +1048,7 @@ fn list_dirs(base: &Path, partial: &str) -> Vec<String> {
     out
 }
 
-/// The slice `(start, count)` of a `total`-length list to draw in `max` rows so
-/// the selected index stays on screen. Without this the cursor scrolls past the
-/// bottom of the visible window and the highlighted row vanishes.
+/// Visible `(start, count)` window that includes the selected list item.
 pub fn scroll_window(sel: usize, total: usize, max: usize) -> (usize, usize) {
     if total == 0 || max == 0 {
         return (0, 0);
