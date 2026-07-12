@@ -147,7 +147,6 @@ impl Supervisor {
                 if let Some(i) = self.index_of(id) {
                     let mut t = self.tasks.remove(i);
                     t.terminate();
-                    t.shed_writer();
                     self.graveyard.push(t);
                 }
             }
@@ -382,7 +381,6 @@ impl Supervisor {
                 // would straight-SIGKILL stragglers of the old run.
                 let mut old = std::mem::replace(&mut self.tasks[i], fresh);
                 old.terminate();
-                old.shed_writer();
                 self.graveyard.push(old);
                 // Reset the fingerprint for the replacement task's screen.
                 if self.watched == Some(id) {
