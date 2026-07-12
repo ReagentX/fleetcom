@@ -46,7 +46,7 @@ const PASTE_END: &[u8] = b"\x1b[201~";
 /// Encode a clipboard paste for a child whose DECSET 2004 state is
 /// `bracketed`. Opted in: wrap in `200~`/`201~` markers with embedded
 /// terminators stripped, content otherwise verbatim. Legacy: no markers, and
-/// line endings (`\r\n` and bare `\n`) become `\r` — the byte Enter sends —
+/// line endings (`\r\n` and bare `\n`) become `\r` (the byte Enter sends),
 /// because a legacy line editor reads `\n` as ^J, not as end-of-line.
 pub fn paste_bytes(bracketed: bool, content: &[u8]) -> Vec<u8> {
     if bracketed {
@@ -246,7 +246,7 @@ impl Task {
 
         // The launch context's shell, not the daemon's: a zsh client attached
         // to a bash-started daemon still gets zsh word-splitting. No fallback
-        // through this process's own SHELL — for an autostarted daemon that is
+        // through this process's own SHELL: for an autostarted daemon that is
         // the *first* client's env, the exact coupling per-connection context
         // exists to remove. A client env without SHELL gets the portable
         // default.
@@ -261,7 +261,7 @@ impl Task {
         cmd.arg("-c");
         cmd.arg(command);
         // The job runs under the *client's* environment, verbatim: clear the
-        // builder's captured base (the daemon's own env — whatever the client
+        // builder's captured base (the daemon's own env, whatever the client
         // that first autostarted it happened to have) so nothing leaks through
         // where the client's env lacks a key.
         cmd.env_clear();
@@ -358,7 +358,7 @@ impl Task {
         })
     }
 
-    /// Latch the exit code and finish time if the leader has exited — without
+    /// Latch the exit code and finish time if the leader has exited, without
     /// reaping it. `WNOWAIT` leaves the zombie in place, which is what keeps
     /// the pid (and therefore the pgid) reserved so the group stays signalable
     /// for the task's whole life; see the `reaped` field. The zombie is
@@ -570,7 +570,7 @@ impl Task {
     }
 
     /// Ask the whole job to exit: SIGTERM to the process *group*, not just the
-    /// direct child, so every group member gets it — including background
+    /// direct child, so every group member gets it, including background
     /// children a `cmd &` left behind (a non-interactive shell's `&` creates no
     /// new group, so they never leave this one). TERM, not KILL: the job gets a
     /// chance to flush and clean up. The supervisor owns the escalation:
@@ -828,7 +828,7 @@ mod tests {
 
     /// Wheel routing follows the child's own escape sequences: nothing for an
     /// inline child, alternate-scroll arrows for a full-screen one, real mouse
-    /// events once a protocol is requested — in the negotiated encoding.
+    /// events once a protocol is requested, in the negotiated encoding.
     #[test]
     fn wheel_routes_by_child_state() {
         let up = MouseKind::WheelUp;
@@ -971,7 +971,9 @@ mod tests {
             }
             thread::sleep(Duration::from_millis(10));
         }
-        let first = contents.find("zqfirstqz").expect("first message never echoed");
+        let first = contents
+            .find("zqfirstqz")
+            .expect("first message never echoed");
         let second = contents
             .find("zqsecondqz")
             .expect("second message never echoed");

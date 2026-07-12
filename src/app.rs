@@ -948,7 +948,7 @@ impl App {
     }
 
     /// Clipboard paste, routed by mode. Attached: shipped whole to the core,
-    /// which encodes it against the child's negotiated paste state — pushing
+    /// which encodes it against the child's negotiated paste state. Pushing
     /// it through `key_to_bytes` would turn every newline into a submit.
     /// Text-entry modes: inserted as one string with control characters
     /// stripped, so a multi-line clipboard can't fake an Enter press.
@@ -1452,7 +1452,10 @@ mod tests {
             app.session_names.is_empty(),
             "the picker opens empty until the reply lands"
         );
-        assert_eq!(app.session_sel, 0, "opening the picker resets the selection");
+        assert_eq!(
+            app.session_sel, 0,
+            "opening the picker resets the selection"
+        );
 
         app.pump();
         assert_eq!(

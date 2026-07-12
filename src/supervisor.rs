@@ -1036,7 +1036,7 @@ mod tests {
     }
 
     /// Poll `reap` until `pred` holds or the deadline passes. The sweep paths
-    /// are all reap-driven, so tests must go through `reap()` — a `Drop`-driven
+    /// are all reap-driven, so tests must go through `reap()`: a `Drop`-driven
     /// test would pass while the reap-side escalation was broken.
     fn reap_until(
         s: &mut Supervisor,
@@ -1318,8 +1318,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A supervisor with no launch context refuses to launch — spawn, rerun,
-    /// and session load alike — with a status notice.
+    /// A supervisor with no launch context refuses every launch path (spawn,
+    /// rerun, session load) with a status notice.
     #[test]
     fn launch_without_context_is_refused() {
         let mut s = Supervisor::new(24, 80);

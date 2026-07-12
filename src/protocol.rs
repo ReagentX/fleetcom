@@ -367,7 +367,7 @@ pub fn encode_command(cmd: &Command) -> (u8, Vec<u8>) {
 }
 
 /// Parse a command from a received frame. `None` on a wrong kind, non-UTF-8/
-/// non-JSON payload, unknown discriminant, or a missing/mistyped field —
+/// non-JSON payload, unknown discriminant, or a missing/mistyped field,
 /// including out-of-range numerics and invalid base64. The daemon drops a
 /// malformed command rather than trusting it.
 pub fn decode_command(kind: u8, payload: &[u8]) -> Option<Command> {

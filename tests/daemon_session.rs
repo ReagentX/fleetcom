@@ -1,5 +1,5 @@
 //! Session-recipe dirs resolve against the *loading client's* cwd (from its
-//! hello), not the daemon's own working directory — the daemon's cwd is
+//! hello), not the daemon's own working directory: the daemon's cwd is
 //! whatever the first client's happened to be, frozen for its lifetime.
 
 mod common;
@@ -55,7 +55,7 @@ fn load_session_resolves_relative_dirs_against_the_client_cwd() {
 
 /// The session root follows the *hello's* env, not the daemon's: with the
 /// daemon's own `FLEETCOM_CONFIG_DIR` pointing elsewhere, save must land under
-/// the dir the connecting client sent, and list must answer from it — a decoy
+/// the dir the connecting client sent, and list must answer from it. A decoy
 /// recipe only the daemon's env can see must never surface.
 #[test]
 fn session_commands_follow_the_hello_config_dir() {
@@ -74,10 +74,8 @@ fn session_commands_follow_the_hello_config_dir() {
     // Hand-rolled hello whose env carries the client-side config override.
     let cwd = dir.display().to_string();
     let client_cfg_str = client_cfg.display().to_string();
-    let env: Vec<(&[u8], &[u8])> = vec![(
-        b"FLEETCOM_CONFIG_DIR".as_slice(),
-        client_cfg_str.as_bytes(),
-    )];
+    let env: Vec<(&[u8], &[u8])> =
+        vec![(b"FLEETCOM_CONFIG_DIR".as_slice(), client_cfg_str.as_bytes())];
     stream
         .write_all(&hello_frame(PROTOCOL_VERSION, &env, &cwd))
         .unwrap();

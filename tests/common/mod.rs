@@ -126,7 +126,7 @@ impl Drop for KillOnDrop {
 }
 
 /// Start a `fleetcom --daemon` against an isolated runtime dir and connect a
-/// raw socket to it — no handshake, for tests that exercise the handshake
+/// raw socket to it with no handshake, for tests that exercise the handshake
 /// itself. `configure` tweaks the daemon's `Command` (extra env vars) before
 /// spawn.
 pub fn start_daemon_raw(

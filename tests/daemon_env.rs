@@ -1,5 +1,5 @@
 //! Launch environment is per-connection, not per-daemon: a spawn runs under
-//! the env the client sent in its hello — including non-UTF-8 entries — and
+//! the env the client sent in its hello (including non-UTF-8 entries), and
 //! the daemon's own (first-client) environment does not leak through.
 
 mod common;

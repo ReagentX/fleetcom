@@ -134,7 +134,7 @@ fn is_timeout(e: &io::Error) -> bool {
 
 /// Map a failed hello-reply read to an actionable error. EOF means the daemon
 /// went away mid-handshake (a racing `--kill` or shutdown): rerunning
-/// autostarts a fresh one, so say that — not "kill and retry", which would be
+/// autostarts a fresh one, so say that, not "kill and retry", which would be
 /// advice to destroy a fleet the next paragraph says no longer exists.
 fn hello_read_error(e: io::Error) -> io::Error {
     if e.kind() == ErrorKind::UnexpectedEof {
@@ -170,7 +170,7 @@ fn check_hello_ack(kind: u8, payload: &[u8]) -> io::Result<()> {
 ///
 /// The daemon serves one client at a time, so a slow handshake means "queued
 /// behind another client", not failure: announce it and wait without a
-/// deadline — the documented behavior. The announcement comes from a one-shot
+/// deadline (the documented behavior). The announcement comes from a one-shot
 /// timer thread rather than a read timeout because the stall can be in the
 /// *write*: a large env can overfill the unaccepted connection's buffer, and a
 /// timed-out partial `write_all` would corrupt the framing. Callers run this
@@ -399,8 +399,8 @@ pub fn run_daemon() -> io::Result<()> {
 
     // A signalled daemon shuts down *cleanly*: TERM each job's group with a
     // KILL after the grace, remove the socket. Dying without that cleanup
-    // would still kill the fleet — closing the PTY masters hangs up every
-    // job's terminal (see the module docs) — but rudely: no TERM, no grace,
+    // would still kill the fleet (closing the PTY masters hangs up every
+    // job's terminal; see the module docs), but rudely: no TERM, no grace,
     // and HUP-immune jobs would leak unowned. The flag is checked in the idle
     // branch below and inside `run_loop` while a client is being served; both
     // observe it within ~200 ms.
@@ -587,7 +587,7 @@ fn serve_client(sup: &mut Supervisor, stream: UnixStream, stop: &AtomicBool) -> 
             write_frame(&mut write, kind, &payload).is_ok()
         })
     }));
-    // Cleanup sits *after* the catch so every exit — return or panic — passes
+    // Cleanup sits *after* the catch so every exit (return or panic) passes
     // through it: a stale waker points task reader threads at a dead channel,
     // and a stale watch would stream the next client Screen frames it never
     // asked for.
