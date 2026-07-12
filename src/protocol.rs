@@ -59,12 +59,23 @@ pub enum Command {
         col: u16,
         row: u16,
     },
+    /// Move a task's scrollback viewport.
+    Scrollback { id: u64, action: ScrollAction },
     /// Write the current task set as a named `{dir: [cmds]}` recipe.
     SaveSession { name: String },
     /// Spawn every command in a named recipe, each in its (existing) dir.
     LoadSession { name: String },
     /// Kill every task (the quit path).
     Shutdown,
+}
+
+/// A `Command::Scrollback` movement in history rows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScrollAction {
+    Up(u16),
+    Down(u16),
+    Top,
+    Live,
 }
 
 /// A mouse button in a `Command::Mouse`. Values match xterm button codes.
@@ -131,6 +142,8 @@ pub struct ScreenView {
     /// Whether the child is on the alternate screen. Without mouse capture,
     /// this determines whether alternate scroll is enabled.
     pub alt_screen: bool,
+    /// Rows the viewport is scrolled back from live output.
+    pub scrollback: usize,
 }
 
 // --- wire format -------------------------------------------------------------
@@ -291,6 +304,20 @@ pub fn encode_command(cmd: &Command) -> (u8, Vec<u8>) {
             let _ = o.insert("col", *col as u64);
             let _ = o.insert("row", *row as u64);
         }
+        Command::Scrollback { id, action } => {
+            let _ = o.insert("t", "sb");
+            let _ = o.insert("id", *id);
+            let (a, n) = match action {
+                ScrollAction::Up(n) => ("u", Some(*n)),
+                ScrollAction::Down(n) => ("d", Some(*n)),
+                ScrollAction::Top => ("t", None),
+                ScrollAction::Live => ("l", None),
+            };
+            let _ = o.insert("a", a);
+            if let Some(n) = n {
+                let _ = o.insert("n", n as u64);
+            }
+        }
         Command::SaveSession { name } => {
             let _ = o.insert("t", "save");
             let _ = o.insert("name", name.as_str());
@@ -391,6 +418,16 @@ pub fn decode_command(kind: u8, payload: &[u8]) -> Option<Command> {
                 row: v["row"].as_u64()? as u16,
             }
         }
+        "sb" => Command::Scrollback {
+            id: v["id"].as_u64()?,
+            action: match v["a"].as_str()? {
+                "u" => ScrollAction::Up(v["n"].as_u64()? as u16),
+                "d" => ScrollAction::Down(v["n"].as_u64()? as u16),
+                "t" => ScrollAction::Top,
+                "l" => ScrollAction::Live,
+                _ => return None,
+            },
+        },
         "save" => Command::SaveSession {
             name: v["name"].as_str()?.to_string(),
         },
@@ -447,6 +484,7 @@ pub fn encode_event(ev: &Event) -> (u8, Vec<u8>) {
             let _ = header.insert("hide", sv.hide_cursor);
             let _ = header.insert("mouse", sv.wants_mouse);
             let _ = header.insert("alt", sv.alt_screen);
+            let _ = header.insert("sb", sv.scrollback as u64);
             let mut lines = jzon::JsonValue::new_array();
             for l in &sv.lines {
                 let _ = lines.push(l.as_str());
@@ -511,6 +549,7 @@ pub fn decode_event(kind: u8, payload: &[u8]) -> Option<Event> {
                 hide_cursor: h["hide"].as_bool()?,
                 wants_mouse: h["mouse"].as_bool()?,
                 alt_screen: h["alt"].as_bool()?,
+                scrollback: h["sb"].as_u64()? as usize,
             }))
         }
         _ => None,
@@ -593,6 +632,22 @@ mod tests {
                 col: 10,
                 row: 5,
             },
+            Command::Scrollback {
+                id: 3,
+                action: ScrollAction::Up(23),
+            },
+            Command::Scrollback {
+                id: 3,
+                action: ScrollAction::Down(1),
+            },
+            Command::Scrollback {
+                id: 3,
+                action: ScrollAction::Top,
+            },
+            Command::Scrollback {
+                id: 3,
+                action: ScrollAction::Live,
+            },
             Command::SaveSession {
                 name: "work".into(),
             },
@@ -669,6 +724,7 @@ mod tests {
             hide_cursor: false,
             wants_mouse: true,
             alt_screen: false,
+            scrollback: 42,
         });
         let (k, p) = encode_event(&screen);
         assert_eq!(k, KIND_SCREEN);

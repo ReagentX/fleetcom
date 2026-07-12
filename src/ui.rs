@@ -477,7 +477,14 @@ fn render_attached(out: &mut impl Write, app: &App) -> io::Result<()> {
     }
 
     let cols = app.cols as usize;
-    let bar = format!("  [attached] {}    Ctrl-\\ background", v.command);
+    // Display the scrollback offset when viewing history.
+    let bar = match screen.map_or(0, |s| s.scrollback) {
+        0 => format!("  [attached] {}    Ctrl-\\ background", v.command),
+        n => format!(
+            "  [scroll ↑{n}] {}    Esc live · PgUp/PgDn move · Ctrl-\\ background",
+            v.command
+        ),
+    };
     queue!(
         out,
         MoveTo(0, app.rows.saturating_sub(1)),

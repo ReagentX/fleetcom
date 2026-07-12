@@ -16,7 +16,7 @@ use crossterm::event::{
 use crossterm::{execute, style::Print};
 
 use crate::path;
-use crate::protocol::{Command, Event, MouseBtn, MouseKind, ScreenView, TaskView};
+use crate::protocol::{Command, Event, MouseBtn, MouseKind, ScreenView, ScrollAction, TaskView};
 use crate::session;
 use crate::supervisor::Supervisor;
 use crate::task::Lifecycle;
@@ -154,17 +154,24 @@ pub struct App {
     mouse_captured: bool,
     /// The alternate-scroll state last applied to the terminal.
     alt_scroll: bool,
+    /// Whether the attached task is displaying scrollback.
+    view_scroll: bool,
 }
 
 /// Return `(mouse_capture, alt_scroll)` for the attached child's screen.
-/// Without an attached screen, preserve native selection and enable wheel
-/// navigation through alternate scroll.
-fn desired_input_modes(attached: Option<&ScreenView>) -> (bool, bool) {
+/// Scrollback and inline children capture the mouse; mouse-aware children
+/// receive events, while full-screen children use alternate scroll.
+fn desired_input_modes(attached: Option<&ScreenView>, view_scroll: bool) -> (bool, bool) {
+    if view_scroll {
+        return (true, true);
+    }
     match attached {
         // Capture and forward mouse events requested by the child.
         Some(s) if s.wants_mouse => (true, true),
-        // Scroll full-screen children; disable wheel-generated arrows inline.
-        Some(s) => (false, s.alt_screen),
+        // Scroll full-screen children through alternate-scroll arrows.
+        Some(s) if s.alt_screen => (false, true),
+        // Capture wheel-up to enter scrollback for inline children.
+        Some(_) => (true, true),
         None => (false, true),
     }
 }
@@ -283,6 +290,7 @@ impl App {
             should_quit: false,
             mouse_captured: false,
             alt_scroll: true,
+            view_scroll: false,
             exit_intent: ExitIntent::Disconnect,
         }
     }
@@ -460,7 +468,15 @@ impl App {
                 // The handshake is handled before the transport is created.
                 Event::HelloOk => {}
                 Event::Tasks(v) => self.views = v,
-                Event::Screen(s) => self.focused_screen = Some(s),
+                Event::Screen(s) => {
+                    // Exit only after a nonzero offset returns to live, so a
+                    // pre-entry screen update cannot immediately exit the view.
+                    let prev = self.focused_screen.as_ref().map_or(0, |p| p.scrollback);
+                    if self.view_scroll && prev > 0 && s.scrollback == 0 {
+                        self.view_scroll = false;
+                    }
+                    self.focused_screen = Some(s);
+                }
                 Event::Status(s) => self.status = Some(s),
             }
         }
@@ -861,6 +877,8 @@ impl App {
         if detach {
             self.mode = Mode::Dashboard;
             self.focused_id = None;
+            // The watch change resets the task viewport.
+            self.view_scroll = false;
             // Repaint from scratch next tick; wipe the child's screen now.
             use crossterm::{
                 cursor::MoveTo,
@@ -868,6 +886,41 @@ impl App {
                 terminal::{Clear, ClearType},
             };
             let _ = execute!(out, Clear(ClearType::All), MoveTo(0, 0));
+            return Ok(());
+        }
+        // Keep one row of overlap between pages.
+        let page = self.pane_rows().saturating_sub(1).max(1);
+        if self.view_scroll {
+            // Scrollback navigation is not forwarded to the child.
+            match k.code {
+                KeyCode::PageUp => self.send_scrollback(ScrollAction::Up(page)),
+                KeyCode::PageDown => self.send_scrollback(ScrollAction::Down(page)),
+                KeyCode::Up => self.send_scrollback(ScrollAction::Up(1)),
+                KeyCode::Down => self.send_scrollback(ScrollAction::Down(1)),
+                KeyCode::Home => self.send_scrollback(ScrollAction::Top),
+                KeyCode::End | KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') => {
+                    self.view_scroll = false;
+                    self.send_scrollback(ScrollAction::Live);
+                }
+                // Other input returns to live and is forwarded immediately.
+                _ => {
+                    self.view_scroll = false;
+                    if let Some(id) = self.focused_id
+                        && let Some(bytes) = key_to_bytes(k.code, k.modifiers)
+                    {
+                        self.transport.send(Command::Input { id, bytes });
+                    }
+                }
+            }
+            return Ok(());
+        }
+        // Ctrl/Alt provide alternatives when the terminal intercepts Shift.
+        if k.code == KeyCode::PageUp
+            && k.modifiers
+                .intersects(KeyModifiers::SHIFT | KeyModifiers::CONTROL | KeyModifiers::ALT)
+        {
+            self.view_scroll = true;
+            self.send_scrollback(ScrollAction::Up(page));
             return Ok(());
         }
         if let Some(id) = self.focused_id
@@ -938,7 +991,27 @@ impl App {
                 _ => {}
             },
             Mode::Attached => {
+                // The wheel navigates scrollback instead of the child.
+                if self.view_scroll {
+                    match kind {
+                        MouseKind::WheelUp => self.send_scrollback(ScrollAction::Up(3)),
+                        MouseKind::WheelDown => self.send_scrollback(ScrollAction::Down(3)),
+                        _ => {}
+                    }
+                    return;
+                }
                 if let Some(id) = self.focused_id {
+                    // Wheel-up enters scrollback for inline children that do
+                    // not receive mouse events.
+                    let inline = matches!(
+                        self.screen_for(id),
+                        Some(s) if !s.wants_mouse && !s.alt_screen
+                    );
+                    if inline && kind == MouseKind::WheelUp {
+                        self.view_scroll = true;
+                        self.send_scrollback(ScrollAction::Up(3));
+                        return;
+                    }
                     // Keep the pointer coordinate within the child pane: the
                     // bottom row is fleetcom's status bar, not the child's.
                     let row = m.row.min(self.pane_rows().saturating_sub(1));
@@ -950,13 +1023,21 @@ impl App {
         }
     }
 
+    /// Move the attached task's scrollback viewport.
+    fn send_scrollback(&mut self, action: ScrollAction) {
+        if let Some(id) = self.focused_id {
+            self.transport.send(Command::Scrollback { id, action });
+        }
+    }
+
     /// Apply input-mode changes for the current focus.
     fn sync_input_modes(&mut self, out: &mut Stdout) -> io::Result<()> {
         let attached = match self.mode {
             Mode::Attached => self.focused_id.and_then(|id| self.screen_for(id)),
             _ => None,
         };
-        let (capture, alt_scroll) = desired_input_modes(attached);
+        let view = self.mode == Mode::Attached && self.view_scroll;
+        let (capture, alt_scroll) = desired_input_modes(attached, view);
         if capture != self.mouse_captured {
             if capture {
                 execute!(out, EnableMouseCapture)?;
@@ -984,6 +1065,7 @@ impl App {
             // sent from the run loop next tick.
             self.focused_id = Some(self.views[i].id);
             self.mode = Mode::Attached;
+            self.view_scroll = false;
         }
     }
 
@@ -1495,10 +1577,9 @@ mod tests {
         assert!(app.mode == Mode::Spawn, "paste must not submit");
     }
 
-    /// Capture mouse events only for children that request them; disable
-    /// alternate scroll for attached inline children.
+    /// Select capture and alternate-scroll modes by screen type.
     #[test]
-    fn capture_only_for_mouse_hungry_children() {
+    fn input_modes_match_screen_type() {
         let screen = |wants_mouse, alt_screen| ScreenView {
             id: 1,
             lines: Vec::new(),
@@ -1507,25 +1588,106 @@ mod tests {
             hide_cursor: false,
             wants_mouse,
             alt_screen,
+            scrollback: 0,
         };
         // No attached screen: keep native selection available.
-        assert_eq!(desired_input_modes(None), (false, true));
+        assert_eq!(desired_input_modes(None, false), (false, true));
         // Mouse-aware child: capture.
-        assert_eq!(desired_input_modes(Some(&screen(true, true))), (true, true));
         assert_eq!(
-            desired_input_modes(Some(&screen(true, false))),
+            desired_input_modes(Some(&screen(true, true)), false),
+            (true, true)
+        );
+        assert_eq!(
+            desired_input_modes(Some(&screen(true, false)), false),
             (true, true)
         );
         // Full-screen child without mouse mode: alternate scroll.
         assert_eq!(
-            desired_input_modes(Some(&screen(false, true))),
+            desired_input_modes(Some(&screen(false, true)), false),
             (false, true)
         );
-        // Inline child: wheel silenced, selection native.
+        // Inline child: capture wheel-up to enter scrollback.
         assert_eq!(
-            desired_input_modes(Some(&screen(false, false))),
-            (false, false)
+            desired_input_modes(Some(&screen(false, false)), false),
+            (true, true)
         );
+        // The scroll view overrides everything: the wheel must scroll it.
+        assert_eq!(
+            desired_input_modes(Some(&screen(false, false)), true),
+            (true, true)
+        );
+        assert_eq!(desired_input_modes(None, true), (true, true));
+    }
+
+    /// Wheel-up enters scrollback for inline children, but forwards for
+    /// mouse-aware children.
+    #[test]
+    fn wheel_up_enters_scroll_view_for_inline_children() {
+        let mut app = App::new_local(30, 100);
+        let dir = app.invocation_dir.clone();
+        app.spawn_in("sleep 5", dir);
+        app.pump();
+        app.resolve_selection();
+        app.attach();
+        let id = app.focused_id.expect("attached");
+        let screen = |wants_mouse| ScreenView {
+            id,
+            lines: Vec::new(),
+            formatted: Vec::new(),
+            cursor: (0, 0),
+            hide_cursor: false,
+            wants_mouse,
+            alt_screen: false,
+            scrollback: 0,
+        };
+        let wheel_up = MouseEvent {
+            kind: MouseEventKind::ScrollUp,
+            column: 0,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        };
+
+        // Inline child: wheel-up enters scrollback.
+        app.focused_screen = Some(screen(false));
+        app.on_mouse(wheel_up);
+        assert!(app.view_scroll, "wheel-up must open the scroll view");
+
+        // Mouse-aware child: wheel-up forwards instead.
+        app.view_scroll = false;
+        app.focused_screen = Some(screen(true));
+        app.on_mouse(wheel_up);
+        assert!(!app.view_scroll, "mouse-aware children keep their wheel");
+    }
+
+    /// Scrollback opens with modified PageUp and closes on Esc or typing.
+    #[test]
+    fn scroll_view_entry_and_exit() {
+        let mut app = App::new_local(30, 100);
+        let dir = app.invocation_dir.clone();
+        app.spawn_in("sleep 5", dir);
+        app.pump();
+        app.resolve_selection();
+        app.attach();
+        assert!(app.mode == Mode::Attached);
+        let mut out = io::stdout();
+
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        app.on_key_attached(&mut out, KeyEvent::new(KeyCode::PageUp, KeyModifiers::SHIFT))
+            .unwrap();
+        assert!(app.view_scroll, "Shift+PageUp must enter the scroll view");
+        app.on_key_attached(&mut out, key(KeyCode::Esc)).unwrap();
+        assert!(!app.view_scroll, "Esc must return to live");
+
+        app.on_key_attached(&mut out, KeyEvent::new(KeyCode::PageUp, KeyModifiers::CONTROL))
+            .unwrap();
+        assert!(app.view_scroll, "Ctrl+PageUp is an entry fallback");
+        app.on_key_attached(&mut out, key(KeyCode::Char('x')))
+            .unwrap();
+        assert!(!app.view_scroll, "typing must snap back to live");
+
+        // Plain PageUp is forwarded to the child.
+        app.on_key_attached(&mut out, key(KeyCode::PageUp)).unwrap();
+        assert!(!app.view_scroll);
     }
 
     /// A wheel notch on the dashboard moves the selection like an arrow key.
