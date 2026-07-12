@@ -17,9 +17,13 @@ mod task;
 mod transport;
 mod ui;
 
-use std::io;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::{
+    io,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+};
 
 use crossterm::{
     cursor::{Hide, Show},
@@ -162,8 +166,8 @@ fn main() -> io::Result<()> {
 
     let mut out = io::stdout();
     enable_raw_mode()?;
-    // Armed the moment raw mode is on: every exit past this point — the `?`s
-    // below, a panic unwind, the normal return — must restore the terminal,
+    // Armed the moment raw mode is on: every exit past this point (the `?`s
+    // below, a panic unwind, the normal return) must restore the terminal,
     // or the shell is left in raw mode with a hidden cursor. The panic hook
     // covers panics only, not `Err` returns.
     let guard = TerminalGuard;
@@ -203,7 +207,7 @@ fn main() -> io::Result<()> {
 }
 
 /// Restores the terminal when dropped. Constructed only after
-/// `enable_raw_mode` succeeds — before that there is nothing to undo.
+/// `enable_raw_mode` succeeds: before that there is nothing to undo.
 struct TerminalGuard;
 
 impl Drop for TerminalGuard {
@@ -217,9 +221,9 @@ impl Drop for TerminalGuard {
 ///
 /// May run twice: on a panic the hook restores first (so the message prints
 /// on the normal screen), then `TerminalGuard`'s drop restores again during
-/// unwind. Every step tolerates the repeat — leaving the alternate screen
+/// unwind. Every step tolerates the repeat (leaving the alternate screen
 /// twice, disabling raw mode twice, and popping past an empty kitty stack are
-/// all no-ops or ignored — so don't "fix" the double restore by dropping one.
+/// all no-ops or ignored), so don't "fix" the double restore by dropping one.
 fn restore_terminal(out: &mut io::Stdout) {
     let _ = emit_restore_sequences(out, KITTY_PUSHED.load(Ordering::Relaxed));
     let _ = disable_raw_mode();
@@ -227,7 +231,7 @@ fn restore_terminal(out: &mut io::Stdout) {
 
 /// Emit the escape sequences that undo terminal setup, mirroring what setup
 /// actually did: the keyboard-enhancement pop only if the flags were pushed.
-/// `disable_raw_mode` lives in `restore_terminal`, not here — it mutates
+/// `disable_raw_mode` lives in `restore_terminal`, not here: it mutates
 /// process-global tty state, and this function stays a pure emission so tests
 /// can drive it against a buffer.
 fn emit_restore_sequences(out: &mut impl io::Write, kitty_pushed: bool) -> io::Result<()> {
