@@ -15,31 +15,41 @@
 //! grace period, and removes the socket and lock. A crash or SIGKILL only
 //! closes the PTYs; HUP-immune jobs can survive without a supervisor.
 
-use std::fs;
-use std::io::{self, ErrorKind, Read, Write};
-use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
-use std::os::unix::net::{UnixListener, UnixStream};
-use std::os::unix::process::CommandExt;
-use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::path::{Path, PathBuf};
-use std::process::Stdio;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::channel;
-use std::thread;
-use std::time::Duration;
-
-use nix::fcntl::{Flock, FlockArg};
-use nix::sys::signal::{Signal, kill};
-use nix::unistd::Pid;
-
-use crate::core::{LoopExit, Wake, run_loop};
-use crate::frame::{read_frame, write_frame};
-use crate::protocol::{
-    Command, Event, LaunchContext, PROTOCOL_VERSION, decode_command, decode_event, decode_hello,
-    encode_command, encode_event, encode_hello,
+use std::{
+    fs,
+    io::{self, ErrorKind, Read, Write},
+    os::unix::{
+        fs::{DirBuilderExt, MetadataExt, PermissionsExt},
+        net::{UnixListener, UnixStream},
+        process::CommandExt,
+    },
+    panic::{AssertUnwindSafe, catch_unwind},
+    path::{Path, PathBuf},
+    process::Stdio,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+        mpsc::channel,
+    },
+    thread,
+    time::Duration,
 };
-use crate::supervisor::Supervisor;
+
+use nix::{
+    fcntl::{Flock, FlockArg},
+    sys::signal::{Signal, kill},
+    unistd::Pid,
+};
+
+use crate::{
+    core::{LoopExit, Wake, run_loop},
+    frame::{read_frame, write_frame},
+    protocol::{
+        Command, Event, LaunchContext, PROTOCOL_VERSION, decode_command, decode_event,
+        decode_hello, encode_command, encode_event, encode_hello,
+    },
+    supervisor::Supervisor,
+};
 
 /// Maximum duration of the hello handshake, on the daemon side and the
 /// client's bounded (`reconnect`) side.

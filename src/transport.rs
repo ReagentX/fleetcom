@@ -1,19 +1,25 @@
 //! Client transports for an in-process core, a daemon socket, and unit tests.
 
-use std::net::Shutdown;
-use std::os::unix::net::UnixStream;
-use std::sync::atomic::AtomicBool;
-use std::sync::mpsc::{Receiver, Sender, TryRecvError, channel};
-use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::{
+    net::Shutdown,
+    os::unix::net::UnixStream,
+    sync::{
+        atomic::AtomicBool,
+        mpsc::{Receiver, Sender, TryRecvError, channel},
+    },
+    thread::{self, JoinHandle},
+    time::Duration,
+};
 
 /// Maximum time allowed for one command-frame write to the daemon.
 const SEND_TIMEOUT: Duration = Duration::from_secs(5);
 
-use crate::core::{Wake, run_loop};
-use crate::frame::{read_frame, write_frame};
-use crate::protocol::{Command, Event, decode_event, encode_command};
-use crate::supervisor::Supervisor;
+use crate::{
+    core::{Wake, run_loop},
+    frame::{read_frame, write_frame},
+    protocol::{Command, Event, decode_event, encode_command},
+    supervisor::Supervisor,
+};
 
 /// How the client is leaving, chosen by the exit key/signal. Only
 /// `SocketTransport` honors the difference: an in-process core has no daemon to
@@ -287,10 +293,7 @@ mod tests {
 
         drop(theirs); // the daemon is gone
         t.send(Command::Watch { id: None });
-        assert!(
-            !t.connected(),
-            "a failed send must mark the transport dead"
-        );
+        assert!(!t.connected(), "a failed send must mark the transport dead");
         // The stream was shut down with it, so the reader thread saw EOF and
         // exited: joining it cannot hang.
         t.reader.take().unwrap().join().unwrap();

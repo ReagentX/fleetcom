@@ -4,8 +4,10 @@
 
 mod common;
 
-use std::io::Write;
-use std::time::{Duration, Instant};
+use std::{
+    io::Write,
+    time::{Duration, Instant},
+};
 
 use common::{
     PROTOCOL_VERSION, control_frame, hello_frame, read_frame, start_daemon, start_daemon_raw,

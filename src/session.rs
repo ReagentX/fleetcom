@@ -1,10 +1,11 @@
 //! JSON session recipes stored one file per name in the user's config directory.
 //! Loading a recipe starts new commands; it does not restore live processes.
 
-use std::collections::BTreeMap;
-use std::fs;
-use std::io;
-use std::path::{Path, PathBuf};
+use std::{
+    collections::BTreeMap,
+    fs, io,
+    path::{Path, PathBuf},
+};
 
 /// Session recipe mapping directories to ordered commands.
 pub type SessionConfig = BTreeMap<String, Vec<String>>;

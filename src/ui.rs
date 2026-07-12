@@ -9,9 +9,11 @@ use crossterm::{
     style::{Attribute, Print, SetAttribute},
 };
 
-use crate::app::{App, DirKind, Mode, Row, scroll_window};
-use crate::format::{pad, rel_time, truncate};
-use crate::protocol::{Lifecycle, TaskView};
+use crate::{
+    app::{App, DirKind, Mode, Row, scroll_window},
+    format::{pad, rel_time, truncate},
+    protocol::{Lifecycle, TaskView},
+};
 
 pub fn render(out: &mut Stdout, app: &mut App) -> io::Result<()> {
     let mut buf: Vec<u8> = Vec::with_capacity(app.cols as usize * app.rows as usize * 3 + 128);

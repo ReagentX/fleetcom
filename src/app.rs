@@ -1,27 +1,36 @@
 //! Client UI state and event loop. Tasks are owned by the supervisor and exposed
 //! here through `Command`s and `Event` snapshots over a `Transport`.
 
-use std::io::{self, Stdout};
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{Receiver, Sender, channel};
-use std::thread;
-use std::time::Duration;
-
-use crossterm::event::{
-    self, DisableMouseCapture, EnableMouseCapture, Event as CtEvent, KeyCode, KeyEvent,
-    KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+use std::{
+    io::{self, Stdout},
+    path::{Path, PathBuf},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+        mpsc::{Receiver, Sender, channel},
+    },
+    thread,
+    time::Duration,
 };
-use crossterm::{execute, style::Print};
 
-use crate::path;
-use crate::protocol::{
-    Command, Event, Lifecycle, MouseBtn, MouseKind, ScreenView, ScrollAction, TaskView,
+use crossterm::{
+    event::{
+        self, DisableMouseCapture, EnableMouseCapture, Event as CtEvent, KeyCode, KeyEvent,
+        KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+    },
+    execute,
+    style::Print,
 };
-use crate::supervisor::Supervisor;
-use crate::transport::{ExitIntent, SocketTransport, ThreadTransport, Transport};
-use crate::ui;
+
+use crate::{
+    path,
+    protocol::{
+        Command, Event, Lifecycle, MouseBtn, MouseKind, ScreenView, ScrollAction, TaskView,
+    },
+    supervisor::Supervisor,
+    transport::{ExitIntent, SocketTransport, ThreadTransport, Transport},
+    ui,
+};
 
 /// Maximum attached paste size, leaving headroom below the frame limit.
 const MAX_PASTE: usize = 8 * 1024 * 1024;
