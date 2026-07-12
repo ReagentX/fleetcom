@@ -480,12 +480,9 @@ enum ServeOutcome {
     Shutdown,
 }
 
-/// Extract the claimed version from a hello the strict decoder rejected,
-/// purely for error reporting: a v2 control-frame hello (`{"t":"hello",...}`)
-/// or a later hello frame whose body no longer parses (v3 sent `cwd` as a
-/// plain string where v4 requires base64). Without this an old client would
-/// get the generic "requires a hello handshake" message instead of the
-/// actionable version mismatch.
+/// Extract a claimed protocol version for mismatch reporting.
+/// Accepts hello-kind frames and control frames with a `hello` discriminant,
+/// even when the remaining fields do not satisfy [`decode_hello`].
 fn hello_version(kind: u8, payload: &[u8]) -> Option<u32> {
     let v = jzon::parse(std::str::from_utf8(payload).ok()?).ok()?;
     match kind {
@@ -510,10 +507,8 @@ fn handshake(stream: &mut UnixStream) -> Result<LaunchContext, String> {
     match decode_hello(kind, &payload) {
         Some((PROTOCOL_VERSION, ctx)) => Ok(ctx),
         Some((version, _)) => Err(mismatch(version)),
-        // Strict decode failed: report a mismatch when the payload still names
-        // a *different* version (an older client's hello). A claimed
-        // v{PROTOCOL_VERSION} that failed decode is a malformed same-version
-        // frame, not a mismatch — telling that client to `--kill` won't help.
+        // When strict decoding fails, a different claimed version is still a
+        // protocol mismatch. A same-version payload is malformed instead.
         None => match hello_version(kind, &payload) {
             Some(version) if version != PROTOCOL_VERSION => Err(mismatch(version)),
             // Refuse anything else sent before the required handshake.

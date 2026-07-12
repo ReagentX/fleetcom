@@ -187,8 +187,7 @@ fn os_from_b64(v: &jzon::JsonValue) -> Option<OsString> {
     Some(OsString::from_vec(B64.decode(v.as_str()?).ok()?))
 }
 
-/// Encode a path as lossless base64: a legal Unix path need not be UTF-8, and
-/// `to_string_lossy` would corrupt such a path to U+FFFD in transit.
+/// Encode a path's Unix bytes as base64 without requiring UTF-8.
 fn path_b64(p: &Path) -> String {
     os_b64(p.as_os_str())
 }
@@ -198,8 +197,7 @@ fn path_from_b64(v: &jzon::JsonValue) -> Option<PathBuf> {
     Some(PathBuf::from(os_from_b64(v)?))
 }
 
-/// Decode a JSON number as a `u16`, rejecting out-of-range values: an
-/// unchecked `as u16` would wrap 65537 to 1 instead of dropping the frame.
+/// Decode a JSON number as a `u16`, rejecting out-of-range values.
 fn u16_from(v: &jzon::JsonValue) -> Option<u16> {
     u16::try_from(v.as_u64()?).ok()
 }
@@ -302,10 +300,8 @@ pub fn encode_command(cmd: &Command) -> (u8, Vec<u8>) {
                 }
             }
         }
-        // Base64, not a JSON number array, for both byte-carrying commands: a
-        // `Paste` can be MiBs, and the array form inflates it up to 4x where
-        // base64 costs 4/3 (`app::MAX_PASTE` keeps the encoded worst case
-        // under the frame limit).
+        // Encode both byte-carrying commands as base64. The paste-size bound in
+        // `app` accounts for base64 expansion and the frame limit.
         Command::Input { id, bytes } => {
             let _ = o.insert("t", "input");
             let _ = o.insert("id", *id);
@@ -547,8 +543,8 @@ pub fn decode_event(kind: u8, payload: &[u8]) -> Option<Event> {
             let formatted = payload.get(4 + hlen..)?.to_vec();
             let h = jzon::parse(std::str::from_utf8(header_bytes).ok()?).ok()?;
             let cursor = (u16_from(&h["cursor"][0])?, u16_from(&h["cursor"][1])?);
-            // Any mistyped member rejects the whole event; `filter_map` would
-            // silently drop rows and misalign the peek overlay.
+            // Preserve the one-to-one mapping between encoded and decoded rows.
+            // A non-string row invalidates the event.
             let mut lines = Vec::with_capacity(h["lines"].len());
             for l in h["lines"].members() {
                 lines.push(l.as_str()?.to_string());
@@ -583,8 +579,7 @@ mod tests {
                 cwd: PathBuf::from("/tmp"),
             },
             Command::Spawn {
-                // A legal Unix path need not be UTF-8; it must cross the wire
-                // byte-for-byte, not as U+FFFD replacements.
+                // Exercise byte-preserving serialization of a non-UTF-8 path.
                 command: "ls".into(),
                 cwd: PathBuf::from(OsString::from_vec(b"/tmp/\xff\xfe dir".to_vec())),
             },
@@ -714,11 +709,10 @@ mod tests {
             r#"[["P@TH","L2Jpbg=="]]"#,    // invalid base64 character
             r#"[["QUFBQUE","L2Jpbg=="]]"#, // truncated: missing padding
             r#"[["UEFUSA==","AAAA="]]"#,   // bad padding length
-            r#"[[[80],[65]]]"#,            // v2 number arrays are not v4
+            r#"[[[80],[65]]]"#,            // env pairs must contain base64 strings
             r#"["PATH=/bin"]"#,            // flat string pair
         ] {
-            // "Lw==" is base64 for "/": the cwd must be valid so the env
-            // alone decides the rejection.
+            // Keep the cwd valid so each case isolates env validation.
             let json = format!(r#"{{"v":4,"cwd":"Lw==","env":{env}}}"#);
             assert_eq!(
                 decode_hello(KIND_HELLO, json.as_bytes()),
@@ -728,16 +722,14 @@ mod tests {
         }
     }
 
-    /// A hello whose cwd is not valid base64 — notably a v3 client's plain
-    /// path string — rejects the whole frame.
+    /// A hello with a non-base64 cwd is rejected.
     #[test]
     fn hello_with_malformed_cwd_is_rejected() {
         let json = r#"{"v":3,"cwd":"/home/user","env":[]}"#;
         assert_eq!(decode_hello(KIND_HELLO, json.as_bytes()), None);
     }
 
-    /// Out-of-range numerics reject the whole command: an unchecked `as u16`
-    /// would wrap 65536 to 0 and execute a command the client never sent.
+    /// Out-of-range numeric fields reject the whole command.
     #[test]
     fn out_of_range_numerics_are_rejected() {
         for json in [
@@ -756,13 +748,12 @@ mod tests {
         }
     }
 
-    /// Invalid base64 in `bytes` or `cwd` rejects the whole command; so do the
-    /// retired v3 encodings (number arrays, plain path strings).
+    /// Invalid base64 and non-string byte or path fields reject the command.
     #[test]
     fn invalid_base64_is_rejected() {
         for json in [
             r#"{"t":"input","id":1,"bytes":"!!!"}"#,
-            r#"{"t":"input","id":1,"bytes":[0,27]}"#, // v3 number array
+            r#"{"t":"input","id":1,"bytes":[0,27]}"#, // bytes must be a base64 string
             r#"{"t":"paste","id":1,"bytes":"AAAA="}"#, // bad padding length
             r#"{"t":"spawn","command":"ls","cwd":"/tmp/x"}"#, // plain path
         ] {
@@ -783,8 +774,8 @@ mod tests {
         p
     }
 
-    /// A mistyped member in `lines` or `tasks` rejects the whole event —
-    /// silently dropping it would misalign the peek overlay or the dashboard.
+    /// A mistyped member in `lines` or `tasks` rejects the whole event, keeping
+    /// decoded rows aligned with their encoded positions.
     #[test]
     fn mistyped_event_members_are_rejected() {
         for header in [
@@ -801,7 +792,7 @@ mod tests {
         }
         for json in [
             r#"{"t":"tasks","tasks":[{"id":"nope"}]}"#,
-            // cwd not base64
+            // The cwd must be a base64 string.
             r#"{"t":"tasks","tasks":[{"id":1,"command":"x","cwd":"/x","tagged":true,"life":"ok","preview":"","started_ms":0}]}"#,
             r#"{"t":"tasks","tasks":["flat"]}"#,
         ] {
@@ -828,7 +819,7 @@ mod tests {
             TaskView {
                 id: 2,
                 command: "make".into(),
-                // A non-UTF-8 cwd must survive the snapshot unmangled.
+                // Exercise byte-preserving task-path serialization.
                 cwd: PathBuf::from(OsString::from_vec(b"/srv/\xff\xfe".to_vec())),
                 tagged: false,
                 lifecycle: Lifecycle::Active,

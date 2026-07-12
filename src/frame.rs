@@ -15,12 +15,9 @@ pub const KIND_SCREEN: u8 = 2;
 /// context. Handshakes are not command frames.
 pub const KIND_HELLO: u8 = 3;
 
-/// Reject an absurd length prefix (corrupt or hostile peer) before allocating.
-/// 64 MiB is far above any real frame. A full 8K screen's formatted bytes are
-/// a few hundred KiB at most. Both directions enforce it — `write_frame`
-/// refuses to emit what `read_frame` would refuse to accept — and it is public
-/// so upstream size limits (`app::MAX_PASTE`) can compile-check that their
-/// worst-case encoding fits.
+/// Maximum frame payload size accepted from readers and emitted by writers.
+/// This bounds allocations from untrusted length prefixes and lets producers
+/// verify that their maximum encoded payload fits.
 pub const MAX_FRAME: u32 = 64 * 1024 * 1024;
 
 /// Write one frame and flush. Flushing per frame keeps latency low: the peer sees
@@ -28,9 +25,7 @@ pub const MAX_FRAME: u32 = 64 * 1024 * 1024;
 /// core loop already coalesces screen emission to one frame per `FRAME_MIN` (see
 /// `core::run_loop`). The flush here is per *emitted* frame, not per output byte.
 pub fn write_frame(w: &mut impl Write, kind: u8, payload: &[u8]) -> io::Result<()> {
-    // Mirror `read_frame`'s limit: an oversized frame written here would fail
-    // at the *peer* as `InvalidData` and a dead connection. Failing before any
-    // byte hits the stream keeps the error local to the source.
+    // Reject an oversized payload before writing any part of the frame.
     let len = u32::try_from(payload.len())
         .ok()
         .filter(|len| *len <= MAX_FRAME)
@@ -114,8 +109,7 @@ mod tests {
         );
     }
 
-    /// An oversized payload fails at the writer, before any byte hits the
-    /// stream — not at the peer as `InvalidData` and a dead connection.
+    /// An oversized payload fails without writing a partial frame.
     #[test]
     fn oversized_write_fails_locally() {
         let payload = vec![0u8; MAX_FRAME as usize + 1];

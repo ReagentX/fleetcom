@@ -41,14 +41,12 @@ fn version_mismatch_is_refused_with_both_versions_named() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// A v3 hello frame (plain-string cwd, where v4 requires base64) fails the
-/// strict decode; the refusal must still name the version mismatch, not the
-/// generic "requires a hello handshake" message.
+/// A hello that claims version 3 but fails strict field decoding is still
+/// reported as a version mismatch.
 #[test]
 fn v3_hello_is_refused_as_a_version_mismatch() {
     let (dir, daemon, mut stream) = start_daemon_raw("v3hello", |_| {});
-    // The runtime dir path contains `_`, which is not standard base64, so the
-    // strict cwd decode cannot accidentally succeed.
+    // The underscore in the runtime path makes this cwd invalid standard base64.
     let v3 = format!(r#"{{"v":3,"cwd":"{}","env":[]}}"#, dir.display());
     stream.write_all(&frame(3, v3.as_bytes())).unwrap();
     expect_refusal(&mut stream, "v3");

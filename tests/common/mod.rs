@@ -69,7 +69,7 @@ pub fn read_frame(stream: &mut UnixStream) -> std::io::Result<(u8, Vec<u8>)> {
 }
 
 /// A `KIND_HELLO` frame carrying the client environment and working directory.
-/// v4 sends the cwd as lossless base64, like the env pairs.
+/// The cwd and environment strings are base64-encoded Unix bytes.
 pub fn hello_frame(version: u32, env: &[(&[u8], &[u8])], cwd: &str) -> Vec<u8> {
     let pairs: Vec<String> = env
         .iter()
