@@ -17,6 +17,18 @@ pub fn rel_time(d: Duration) -> String {
     }
 }
 
+/// Compact byte size for status notices: `312 B` / `14 KiB` / `8 MiB`. One
+/// unit, no decimals — the reader needs the magnitude, not accounting.
+pub fn bytes(n: usize) -> String {
+    if n < 1024 {
+        format!("{n} B")
+    } else if n < 1024 * 1024 {
+        format!("{} KiB", n / 1024)
+    } else {
+        format!("{} MiB", n / (1024 * 1024))
+    }
+}
+
 /// Truncate to at most `max` display columns, appending `…` when cut.
 ///
 /// Control chars are flattened to spaces so a stray escape/newline from a
