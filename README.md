@@ -20,6 +20,10 @@ Configuration, on-disk layout, the session format, every command, and a first-ru
 
 Unix only: it relies on PTYs and process-group signals (`killpg`).
 
+### From crates.io
+
+- `cargo install fleetcom`
+
 ### From source
 
 From the project root:
