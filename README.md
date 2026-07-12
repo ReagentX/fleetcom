@@ -82,6 +82,10 @@ The first ordinary invocation starts the daemon when necessary. `--daemon` is an
 
 Every task runs in its own pseudo-terminal, emulated with `vt100`. The same screen grid powers the dashboard preview, the peek overlay, and full attached rendering. A mid-run `vim` or `htop` therefore renders from the same terminal state as any other task. Backgrounding changes client focus; it does not notify the child.
 
+### Input fidelity
+
+Attached input is routed by the child's own terminal state, not forwarded blind. Shift+Enter reaches the child as `ESC CR` rather than collapsing into plain Enter (requires a kitty-protocol terminal — iTerm2, kitty, Ghostty, WezTerm, Alacritty — or a Shift+Enter → `ESC CR` binding elsewhere). Pastes arrive as a single event: wrapped in bracketed-paste markers for children that enabled them, newline-converted for children that didn't. The scroll wheel is captured as wheel events — no more arrow-key spam into inline children — and forwarded as real mouse events, alternate-scroll arrows, or nothing, per what the child requested. Mouse capture means drag-to-select needs the terminal's override chord (`Shift`+drag in most emulators, `Option`+drag in iTerm2/Terminal.app), as in tmux. Details in [`docs/commands.md`](docs/commands.md).
+
 ### Jobs outlive the UI
 
 A per-user daemon owns the processes and their terminals. `q` disconnects the client and leaves everything running; the next `fleetcom` reattaches. Each launch runs under the environment and working directory of the client that requested it: connect from a venv terminal and your jobs see that venv, whichever client started the daemon. `Q` and `fleetcom --kill` stop the daemon and terminate each job's process group with `SIGTERM`, escalating to `SIGKILL` after a two-second grace period. `SIGTERM`, `SIGINT`, and `SIGHUP` sent directly to the daemon use the same shutdown path. Because `fleetcom --kill` signals the daemon through its lock-file PID, it also works while another client occupies the socket. If the connection drops, the client discards its stale view and offers to reconnect.

@@ -12,7 +12,10 @@ use std::sync::mpsc::{Receiver, Sender, channel};
 use std::thread;
 use std::time::Duration;
 
-use crossterm::event::{self, Event as CtEvent, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    self, Event as CtEvent, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent,
+    MouseEventKind,
+};
 
 use crate::path;
 use crate::protocol::{Command, Event, ScreenView, TaskView};
@@ -536,6 +539,8 @@ impl App {
                         self.on_key(out, k)?;
                     }
                     CtEvent::Resize(cols, rows) => self.on_resize(rows, cols),
+                    CtEvent::Paste(s) => self.on_paste(&s),
+                    CtEvent::Mouse(m) => self.on_mouse(m),
                     _ => {}
                 }
             }
@@ -883,6 +888,68 @@ impl App {
         Ok(())
     }
 
+    /// Clipboard paste, routed by mode. Attached: shipped whole to the core,
+    /// which encodes it against the child's negotiated paste state — pushing
+    /// it through `key_to_bytes` would turn every newline into a submit.
+    /// Text-entry modes: inserted as one string with control characters
+    /// stripped, so a multi-line clipboard can't fake an Enter press.
+    fn on_paste(&mut self, s: &str) {
+        self.status = None;
+        match self.mode {
+            Mode::Attached => {
+                if let Some(id) = self.focused_id {
+                    self.transport.send(Command::Paste {
+                        id,
+                        bytes: s.as_bytes().to_vec(),
+                    });
+                }
+            }
+            Mode::Spawn | Mode::SaveSession => {
+                self.input.extend(s.chars().filter(|c| !c.is_control()));
+            }
+            Mode::PickDir => {
+                self.dir_input.extend(s.chars().filter(|c| !c.is_control()));
+                self.refresh_dir_candidates();
+            }
+            _ => {}
+        }
+    }
+
+    /// Mouse input; only wheel notches are acted on. Dashboard/peek: move the
+    /// selection. Attached: forward to the core, which routes by the child's
+    /// own state — the fix for terminals whose alternate-scroll mode would
+    /// otherwise turn the wheel into arrow-key spam at the child.
+    fn on_mouse(&mut self, m: MouseEvent) {
+        let up = match m.kind {
+            MouseEventKind::ScrollUp => true,
+            MouseEventKind::ScrollDown => false,
+            _ => return,
+        };
+        match self.mode {
+            Mode::Dashboard | Mode::Peek => {
+                if up {
+                    self.select_up()
+                } else {
+                    self.select_down()
+                }
+            }
+            Mode::Attached => {
+                if let Some(id) = self.focused_id {
+                    // Clamp into the pane: the bottom row is fleetcom's status
+                    // bar, not a cell the child owns.
+                    let row = m.row.min(self.pane_rows().saturating_sub(1));
+                    self.transport.send(Command::Scroll {
+                        id,
+                        up,
+                        col: m.column,
+                        row,
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+
     fn attach(&mut self) {
         if let Some(i) = self.selected_task() {
             // All tasks already run at the client's content size, so there's no
@@ -941,8 +1008,11 @@ impl App {
 }
 
 /// Translate a key event into the bytes a PTY expects. Covers interactive use
-/// (typing, control chars, arrows, navigation); function keys and kitty-protocol
-/// extras are ignored. Ctrl-letter → 0x01..=0x1a via the classic `& 0x1f` fold.
+/// (typing, control chars, arrows, navigation) plus modified Enter; function
+/// keys and the remaining kitty-protocol extras are ignored. Always emits
+/// legacy encodings: the kitty flags `main` pushes shape what the *outer*
+/// terminal reports, never what the child receives. Ctrl-letter →
+/// 0x01..=0x1a via the classic `& 0x1f` fold.
 fn key_to_bytes(code: KeyCode, mods: KeyModifiers) -> Option<Vec<u8>> {
     let ctrl = mods.contains(KeyModifiers::CONTROL);
     match code {
@@ -961,7 +1031,19 @@ fn key_to_bytes(code: KeyCode, mods: KeyModifiers) -> Option<Vec<u8>> {
                 Some(c.encode_utf8(&mut buf).as_bytes().to_vec())
             }
         }
-        KeyCode::Enter => Some(vec![b'\r']),
+        KeyCode::Enter => {
+            // Shift/Alt+Enter → ESC CR, the meta-prefix encoding: children
+            // that distinguish it (Claude Code reads it as newline-insert)
+            // get the distinction, line editors that don't treat it as a
+            // harmless meta chord. Shift is only visible at all under the
+            // kitty disambiguate flag `main` pushes; Alt also covers
+            // terminals bound to send `\x1b\r` for Shift+Enter directly.
+            if mods.intersects(KeyModifiers::SHIFT | KeyModifiers::ALT) {
+                Some(b"\x1b\r".to_vec())
+            } else {
+                Some(vec![b'\r'])
+            }
+        }
         KeyCode::Backspace => Some(vec![0x7f]),
         KeyCode::Tab => Some(vec![b'\t']),
         KeyCode::BackTab => Some(b"\x1b[Z".to_vec()),
@@ -1308,5 +1390,63 @@ mod tests {
             let (start, count) = scroll_window(sel, 20, 8);
             assert!(sel >= start && sel < start + count, "sel {sel} off-window");
         }
+    }
+
+    /// Modified Enter must stay distinguishable on the wire: `\x1b\r` (the
+    /// meta-prefix encoding), never flattened to the bare `\r` that submits.
+    #[test]
+    fn modified_enter_keeps_its_modifier() {
+        assert_eq!(
+            key_to_bytes(KeyCode::Enter, KeyModifiers::NONE),
+            Some(vec![b'\r'])
+        );
+        assert_eq!(
+            key_to_bytes(KeyCode::Enter, KeyModifiers::SHIFT),
+            Some(b"\x1b\r".to_vec())
+        );
+        assert_eq!(
+            key_to_bytes(KeyCode::Enter, KeyModifiers::ALT),
+            Some(b"\x1b\r".to_vec())
+        );
+        // Ctrl+Enter has no distinct legacy encoding: plain CR.
+        assert_eq!(
+            key_to_bytes(KeyCode::Enter, KeyModifiers::CONTROL),
+            Some(vec![b'\r'])
+        );
+    }
+
+    /// A paste into a text-entry mode lands as one string with control
+    /// characters stripped: a multi-line clipboard must not fake the Enter
+    /// press that would launch a half-pasted command.
+    #[test]
+    fn paste_into_text_entry_strips_controls() {
+        let mut app = App::new_local(30, 100);
+        app.mode = Mode::Spawn;
+        app.on_paste("cargo\ttest\r\n --all");
+        assert_eq!(app.input, "cargotest --all");
+        assert!(app.mode == Mode::Spawn, "paste must not submit");
+    }
+
+    /// A wheel notch on the dashboard moves the selection like an arrow key.
+    #[test]
+    fn wheel_moves_dashboard_selection() {
+        let mut app = App::new_local(30, 100);
+        let dir = app.invocation_dir.clone();
+        app.spawn_in("sleep 5", dir.clone()); // id 1
+        app.spawn_in("sleep 5", dir); // id 2
+        app.pump();
+        app.resolve_selection();
+        assert_eq!(app.selected_id, Some(1));
+
+        let wheel = |kind| MouseEvent {
+            kind,
+            column: 0,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        };
+        app.on_mouse(wheel(MouseEventKind::ScrollDown));
+        assert_eq!(app.selected_id, Some(2));
+        app.on_mouse(wheel(MouseEventKind::ScrollUp));
+        assert_eq!(app.selected_id, Some(1));
     }
 }

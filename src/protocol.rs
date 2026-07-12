@@ -16,7 +16,10 @@ use crate::frame::{KIND_CONTROL, KIND_SCREEN};
 use crate::task::Lifecycle;
 
 /// Wire-protocol version. The handshake rejects peers using a different version.
-pub const PROTOCOL_VERSION: u32 = 1;
+/// v2 added `Paste`/`Scroll`: a v1 daemon would silently drop both (unknown
+/// discriminants decode to `None`), so the bump turns "paste does nothing" into
+/// a visible version-mismatch rejection.
+pub const PROTOCOL_VERSION: u32 = 2;
 
 /// A client→core request. Every mutation of the task set is one of these; the
 /// client never touches a `Task` directly. Fire-and-forget: results come back
@@ -54,6 +57,20 @@ pub enum Command {
     Watch { id: Option<u64> },
     /// Forward raw keystroke bytes to a task's PTY.
     Input { id: u64, bytes: Vec<u8> },
+    /// Clipboard paste for a task. Kept distinct from `Input` because the
+    /// encoding depends on state only the core can see: the task's vt100 screen
+    /// knows whether the child enabled bracketed paste (DECSET 2004), which
+    /// decides between wrapping in paste markers and newline conversion.
+    Paste { id: u64, bytes: Vec<u8> },
+    /// Mouse wheel over an attached task, one notch. `col`/`row` are 0-based
+    /// pane cells. Routing is core-side for the same reason as `Paste`: the
+    /// child's mouse-protocol and alt-screen state live in its vt100 screen.
+    Scroll {
+        id: u64,
+        up: bool,
+        col: u16,
+        row: u16,
+    },
     /// Write the current task set as a named `{dir: [cmds]}` recipe.
     SaveSession { name: String },
     /// Spawn every command in a named recipe, each in its (existing) dir.
@@ -250,6 +267,22 @@ pub fn encode_command(cmd: &Command) -> (u8, Vec<u8>) {
             }
             let _ = o.insert("bytes", arr);
         }
+        Command::Paste { id, bytes } => {
+            let _ = o.insert("t", "paste");
+            let _ = o.insert("id", *id);
+            let mut arr = jzon::JsonValue::new_array();
+            for b in bytes {
+                let _ = arr.push(*b as u64);
+            }
+            let _ = o.insert("bytes", arr);
+        }
+        Command::Scroll { id, up, col, row } => {
+            let _ = o.insert("t", "scroll");
+            let _ = o.insert("id", *id);
+            let _ = o.insert("up", *up);
+            let _ = o.insert("col", *col as u64);
+            let _ = o.insert("row", *row as u64);
+        }
         Command::SaveSession { name } => {
             let _ = o.insert("t", "save");
             let _ = o.insert("name", name.as_str());
@@ -319,6 +352,19 @@ pub fn decode_command(kind: u8, payload: &[u8]) -> Option<Command> {
                 .members()
                 .filter_map(|m| m.as_u64().map(|n| n as u8))
                 .collect(),
+        },
+        "paste" => Command::Paste {
+            id: v["id"].as_u64()?,
+            bytes: v["bytes"]
+                .members()
+                .filter_map(|m| m.as_u64().map(|n| n as u8))
+                .collect(),
+        },
+        "scroll" => Command::Scroll {
+            id: v["id"].as_u64()?,
+            up: v["up"].as_bool()?,
+            col: v["col"].as_u64()? as u16,
+            row: v["row"].as_u64()? as u16,
         },
         "save" => Command::SaveSession {
             name: v["name"].as_str()?.to_string(),
@@ -487,6 +533,18 @@ mod tests {
             Command::Input {
                 id: 1,
                 bytes: vec![0, 27, 91, 255],
+            },
+            Command::Paste {
+                // Non-UTF-8 and marker-shaped bytes must survive: the core, not
+                // the client, decides what the child receives.
+                id: 6,
+                bytes: b"line1\nline2\x1b[201~\xff".to_vec(),
+            },
+            Command::Scroll {
+                id: 8,
+                up: false,
+                col: 79,
+                row: 23,
             },
             Command::SaveSession {
                 name: "work".into(),

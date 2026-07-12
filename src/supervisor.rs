@@ -183,6 +183,19 @@ impl Supervisor {
                     let _ = t.send_input(&bytes);
                 }
             }
+            // Paste and scroll land here (not as pre-encoded `Input`) because
+            // their encoding depends on the child's vt100 state, which only
+            // this side of the socket can see.
+            Command::Paste { id, bytes } => {
+                if let Some(t) = self.by_id_mut(id) {
+                    let _ = t.send_paste(&bytes);
+                }
+            }
+            Command::Scroll { id, up, col, row } => {
+                if let Some(t) = self.by_id_mut(id) {
+                    let _ = t.send_scroll(up, col, row);
+                }
+            }
             Command::SaveSession { name } => self.save_session(&name),
             Command::LoadSession { name } => self.load_session(&name),
             Command::Shutdown => self.shutdown_all(),

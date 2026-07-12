@@ -24,6 +24,87 @@ fn io_err(e: impl std::fmt::Display) -> io::Error {
     io::Error::other(e.to_string())
 }
 
+/// The bracketed-paste terminator. Stripped from paste *content* before
+/// wrapping: a clipboard that contains this sequence would otherwise end the
+/// paste early and smuggle the remainder in as live keystrokes.
+const PASTE_END: &[u8] = b"\x1b[201~";
+
+/// Encode a clipboard paste for a child whose DECSET 2004 state is
+/// `bracketed`. Opted in: wrap in `200~`/`201~` markers with embedded
+/// terminators stripped, content otherwise verbatim. Legacy: no markers, and
+/// line endings (`\r\n` and bare `\n`) become `\r` — the byte Enter sends —
+/// because a legacy line editor reads `\n` as ^J, not as end-of-line.
+pub fn paste_bytes(bracketed: bool, content: &[u8]) -> Vec<u8> {
+    if bracketed {
+        let mut out = Vec::with_capacity(content.len() + 2 * PASTE_END.len() + 6);
+        out.extend_from_slice(b"\x1b[200~");
+        let mut rest = content;
+        while let Some(pos) = rest.windows(PASTE_END.len()).position(|w| w == PASTE_END) {
+            out.extend_from_slice(&rest[..pos]);
+            rest = &rest[pos + PASTE_END.len()..];
+        }
+        out.extend_from_slice(rest);
+        out.extend_from_slice(PASTE_END);
+        out
+    } else {
+        let mut out = Vec::with_capacity(content.len());
+        let mut i = 0;
+        while i < content.len() {
+            if content[i] == b'\r' && content.get(i + 1) == Some(&b'\n') {
+                out.push(b'\r');
+                i += 2;
+            } else if content[i] == b'\n' {
+                out.push(b'\r');
+                i += 1;
+            } else {
+                out.push(content[i]);
+                i += 1;
+            }
+        }
+        out
+    }
+}
+
+/// Encode one wheel notch for a child, routed by the state its own escape
+/// sequences put the screen in. Three tiers: a child that requested a mouse
+/// protocol gets a real wheel event in its negotiated encoding; a full-screen
+/// child (vim, less) gets the three arrow presses "alternate scroll" mode
+/// would send, in its cursor-key encoding; an inline child that asked for
+/// neither gets `None` — forwarding arrows there is exactly the wheel-spam
+/// this routing exists to stop.
+pub fn scroll_bytes(screen: &vt100::Screen, up: bool, col: u16, row: u16) -> Option<Vec<u8>> {
+    use vt100::{MouseProtocolEncoding, MouseProtocolMode};
+    if screen.mouse_protocol_mode() != MouseProtocolMode::None {
+        let button: u16 = if up { 64 } else { 65 };
+        return Some(match screen.mouse_protocol_encoding() {
+            MouseProtocolEncoding::Sgr => {
+                format!("\x1b[<{};{};{}M", button, col + 1, row + 1).into_bytes()
+            }
+            // Default/UTF-8: single-byte cells, `32 + 1-based coordinate`.
+            // Clamp at 222 so the byte never exceeds 255; a wheel event right
+            // of column 223 arrives clamped rather than corrupted.
+            _ => vec![
+                0x1b,
+                b'[',
+                b'M',
+                32 + button as u8,
+                (33 + col.min(222)) as u8,
+                (33 + row.min(222)) as u8,
+            ],
+        });
+    }
+    if screen.alternate_screen() {
+        let arrow: &[u8] = match (screen.application_cursor(), up) {
+            (true, true) => b"\x1bOA",
+            (true, false) => b"\x1bOB",
+            (false, true) => b"\x1b[A",
+            (false, false) => b"\x1b[B",
+        };
+        return Some(arrow.repeat(3));
+    }
+    None
+}
+
 /// Process-derived lifecycle state, independent of the user's `tagged` intent.
 /// `Idle` means no recent output, not that the process is waiting for input.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -337,6 +418,28 @@ impl Task {
         self.writer.flush()
     }
 
+    /// Forward a clipboard paste in whichever shape the child negotiated; see
+    /// [`paste_bytes`]. The grid lock is released before the PTY write: the
+    /// write can block on a full PTY buffer, and the reader thread needs the
+    /// lock to drain it.
+    pub fn send_paste(&mut self, content: &[u8]) -> io::Result<()> {
+        let bracketed = grid(&self.parser).screen().bracketed_paste();
+        self.send_input(&paste_bytes(bracketed, content))
+    }
+
+    /// Forward one wheel notch, routed by the child's own screen state; see
+    /// [`scroll_bytes`]. A child that gets `None` receives nothing at all.
+    pub fn send_scroll(&mut self, up: bool, col: u16, row: u16) -> io::Result<()> {
+        let bytes = {
+            let p = grid(&self.parser);
+            scroll_bytes(p.screen(), up, col, row)
+        };
+        match bytes {
+            Some(b) => self.send_input(&b),
+            None => Ok(()),
+        }
+    }
+
     /// Ask the whole job to exit: SIGTERM to the process *group*, not just the
     /// direct child, so every group member gets it — including background
     /// children a `cmd &` left behind (a non-interactive shell's `&` creates no
@@ -551,6 +654,83 @@ mod tests {
             "TERM after leader exit never reached the straggler"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Paste encoding follows the child's DECSET 2004 opt-in: markers only
+    /// when asked for, newline→CR conversion only when not.
+    #[test]
+    fn paste_wraps_only_when_child_opted_in() {
+        assert_eq!(
+            paste_bytes(true, b"hello"),
+            b"\x1b[200~hello\x1b[201~".to_vec()
+        );
+        // Inside brackets the content rides verbatim: the child's own paste
+        // handling decides what a newline means.
+        assert_eq!(
+            paste_bytes(true, b"a\nb"),
+            b"\x1b[200~a\nb\x1b[201~".to_vec()
+        );
+        assert_eq!(paste_bytes(false, b"hello"), b"hello".to_vec());
+    }
+
+    /// A clipboard containing the end marker must not terminate the paste
+    /// early: the remainder would arrive as live keystrokes.
+    #[test]
+    fn paste_strips_embedded_terminator() {
+        assert_eq!(
+            paste_bytes(true, b"safe\x1b[201~rm -rf /\n"),
+            b"\x1b[200~saferm -rf /\n\x1b[201~".to_vec()
+        );
+        // Multiple embedded markers all go.
+        assert_eq!(
+            paste_bytes(true, b"\x1b[201~a\x1b[201~b\x1b[201~"),
+            b"\x1b[200~ab\x1b[201~".to_vec()
+        );
+    }
+
+    /// Legacy paste converts both `\r\n` and bare `\n` to the `\r` Enter sends,
+    /// without doubling a CRLF into two returns.
+    #[test]
+    fn legacy_paste_converts_line_endings() {
+        assert_eq!(paste_bytes(false, b"a\r\nb\nc\r"), b"a\rb\rc\r".to_vec());
+    }
+
+    /// Wheel routing follows the child's own escape sequences: nothing for an
+    /// inline child, alternate-scroll arrows for a full-screen one, real mouse
+    /// events once a protocol is requested — in the negotiated encoding.
+    #[test]
+    fn scroll_routes_by_child_state() {
+        let mut p = vt100::Parser::new(24, 80, 0);
+        // Inline child, no mouse: dropped, not translated into arrow spam.
+        assert_eq!(scroll_bytes(p.screen(), true, 0, 0), None);
+        // Full-screen child: three arrows per notch, normal cursor keys.
+        p.process(b"\x1b[?1049h");
+        assert_eq!(
+            scroll_bytes(p.screen(), true, 0, 0),
+            Some(b"\x1b[A\x1b[A\x1b[A".to_vec())
+        );
+        // Application cursor keys switch the arrows to SS3 form.
+        p.process(b"\x1b[?1h");
+        assert_eq!(
+            scroll_bytes(p.screen(), false, 0, 0),
+            Some(b"\x1bOB\x1bOB\x1bOB".to_vec())
+        );
+        // SGR mouse protocol: a real wheel event, 1-based coordinates.
+        p.process(b"\x1b[?1000h\x1b[?1006h");
+        assert_eq!(
+            scroll_bytes(p.screen(), true, 4, 2),
+            Some(b"\x1b[<64;5;3M".to_vec())
+        );
+        // Default encoding: single-byte cells, clamped to fit.
+        p.process(b"\x1b[?1006l");
+        assert_eq!(
+            scroll_bytes(p.screen(), false, 0, 0),
+            Some(vec![0x1b, b'[', b'M', 32 + 65, 33, 33])
+        );
+        assert_eq!(
+            scroll_bytes(p.screen(), false, 500, 500),
+            Some(vec![0x1b, b'[', b'M', 32 + 65, 255, 255])
+        );
     }
 
     /// A poisoned grid mutex (a vt100 panic inside the guard) must degrade to

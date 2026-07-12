@@ -23,10 +23,14 @@ use std::sync::atomic::AtomicBool;
 
 use crossterm::{
     cursor::{Hide, Show},
+    event::{
+        DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+        KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+    },
     execute,
     terminal::{
         Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode,
-        enable_raw_mode, size,
+        enable_raw_mode, size, supports_keyboard_enhancement,
     },
 };
 
@@ -150,7 +154,27 @@ fn main() -> io::Result<()> {
 
     let mut out = io::stdout();
     enable_raw_mode()?;
+    // Probe for the kitty keyboard protocol before entering the alternate
+    // screen: the query round-trips through the tty, and raw mode (just
+    // enabled) is what keeps the reply out of the line discipline. `false` on
+    // any error: degrade to plain Enter, never to broken input.
+    let kitty = supports_keyboard_enhancement().unwrap_or(false);
     execute!(out, EnterAlternateScreen, Clear(ClearType::All), Hide)?;
+    // The input modes the client depends on: kitty "disambiguate" makes
+    // modified Enter visible at all (a legacy terminal sends a bare CR for
+    // Shift+Enter and Enter alike); bracketed paste turns a clipboard into one
+    // `Paste` event instead of a keystroke flood; mouse capture turns the
+    // wheel into wheel events instead of the arrow keys terminals synthesize
+    // on the alternate screen. The kitty push comes after EnterAlternateScreen
+    // because the flag stack is per screen buffer: flags pushed on the main
+    // screen would not apply here.
+    if kitty {
+        execute!(
+            out,
+            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+        )?;
+    }
+    execute!(out, EnableBracketedPaste, EnableMouseCapture)?;
     // `fleetcom [--foreground] <session>` loads that session at startup; the
     // result shows in the status line.
     if let Some(name) = &session {
@@ -159,11 +183,25 @@ fn main() -> io::Result<()> {
     install_signal_handlers(app.signal_flag())?;
     let result = app.run(&mut out);
 
-    // Best-effort restore: on SIGHUP the terminal is already gone, so don't let
-    // a failed escape write short-circuit `disable_raw_mode`.
-    let _ = execute!(out, Show, LeaveAlternateScreen);
-    let _ = disable_raw_mode();
+    restore_terminal(&mut out);
     result
+}
+
+/// Undo every terminal mode `main` set. Best-effort throughout: on SIGHUP the
+/// terminal is already gone, and a failed escape write must not short-circuit
+/// `disable_raw_mode`. The kitty pop is unconditional — popping an empty stack
+/// is a no-op, and terminals without the protocol discard the unknown
+/// sequence — so this needs no record of whether the push happened.
+fn restore_terminal(out: &mut io::Stdout) {
+    let _ = execute!(
+        out,
+        PopKeyboardEnhancementFlags,
+        DisableMouseCapture,
+        DisableBracketedPaste,
+        Show,
+        LeaveAlternateScreen
+    );
+    let _ = disable_raw_mode();
 }
 
 /// Route external termination signals into the app's quit flag so the loop
@@ -183,8 +221,7 @@ fn install_signal_handlers(flag: Arc<AtomicBool>) -> io::Result<()> {
 fn install_panic_hook() {
     let default = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        let _ = disable_raw_mode();
-        let _ = execute!(io::stdout(), Show, LeaveAlternateScreen);
+        restore_terminal(&mut io::stdout());
         default(info);
     }));
 }
