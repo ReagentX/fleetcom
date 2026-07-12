@@ -480,16 +480,15 @@ enum ServeOutcome {
     Shutdown,
 }
 
-/// Return the version from a v2 control-frame hello.
-fn is_v2_hello(kind: u8, payload: &[u8]) -> Option<u32> {
-    if kind != crate::frame::KIND_CONTROL {
-        return None;
-    }
+/// Extract a claimed protocol version for mismatch reporting.
+/// Accepts hello-kind frames and control frames with a `hello` discriminant,
+/// even when the remaining fields do not satisfy [`decode_hello`].
+fn hello_version(kind: u8, payload: &[u8]) -> Option<u32> {
     let v = jzon::parse(std::str::from_utf8(payload).ok()?).ok()?;
-    if v["t"].as_str()? == "hello" {
-        v["v"].as_u32()
-    } else {
-        None
+    match kind {
+        crate::frame::KIND_HELLO => v["v"].as_u32(),
+        crate::frame::KIND_CONTROL if v["t"].as_str() == Some("hello") => v["v"].as_u32(),
+        _ => None,
     }
 }
 
@@ -498,22 +497,22 @@ fn is_v2_hello(kind: u8, payload: &[u8]) -> Option<u32> {
 fn handshake(stream: &mut UnixStream) -> Result<LaunchContext, String> {
     let (kind, payload) = read_frame_bounded(stream, HANDSHAKE_TIMEOUT)
         .map_err(|e| format!("no valid hello received: {e}"))?;
-    match decode_hello(kind, &payload) {
-        Some((PROTOCOL_VERSION, ctx)) => Ok(ctx),
-        Some((version, _)) => Err(format!(
+    let mismatch = |version: u32| {
+        format!(
             "protocol mismatch: daemon {} speaks v{PROTOCOL_VERSION}, client speaks \
              v{version}; run 'fleetcom --kill' and retry",
             env!("CARGO_PKG_VERSION"),
-        )),
-        // Report a v2 hello as a version mismatch.
-        None => match is_v2_hello(kind, &payload) {
-            Some(version) => Err(format!(
-                "protocol mismatch: daemon {} speaks v{PROTOCOL_VERSION}, client speaks \
-                 v{version}; run 'fleetcom --kill' and retry",
-                env!("CARGO_PKG_VERSION"),
-            )),
+        )
+    };
+    match decode_hello(kind, &payload) {
+        Some((PROTOCOL_VERSION, ctx)) => Ok(ctx),
+        Some((version, _)) => Err(mismatch(version)),
+        // When strict decoding fails, a different claimed version is still a
+        // protocol mismatch. A same-version payload is malformed instead.
+        None => match hello_version(kind, &payload) {
+            Some(version) if version != PROTOCOL_VERSION => Err(mismatch(version)),
             // Refuse anything else sent before the required handshake.
-            None => Err(format!(
+            _ => Err(format!(
                 "daemon {} requires a hello handshake (older client?); upgrade the \
                  client or run 'fleetcom --kill' and retry",
                 env!("CARGO_PKG_VERSION"),

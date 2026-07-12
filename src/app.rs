@@ -27,6 +27,13 @@ use crate::ui;
 /// Maximum attached paste size, leaving headroom below the frame limit.
 const MAX_PASTE: usize = 8 * 1024 * 1024;
 
+// A maximum-size paste expands to this base64 bound in `encode_command`.
+// Reserve 64 KiB for the command envelope and keep the result within one frame.
+const _: () = assert!(
+    MAX_PASTE.div_ceil(3) * 4 + 64 * 1024 <= crate::frame::MAX_FRAME as usize,
+    "MAX_PASTE must base64-encode to under frame::MAX_FRAME"
+);
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
     Dashboard,

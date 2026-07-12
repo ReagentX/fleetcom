@@ -5,7 +5,9 @@ mod common;
 use std::io::Write;
 use std::time::Duration;
 
-use common::{control_frame, hello_frame, read_frame, start_daemon, start_daemon_raw, wait_until};
+use common::{
+    control_frame, frame, hello_frame, read_frame, start_daemon, start_daemon_raw, wait_until,
+};
 
 /// Read the refusal `Status`, assert `needle` appears, then require EOF: the
 /// daemon must close, not serve.
@@ -35,6 +37,19 @@ fn version_mismatch_is_refused_with_both_versions_named() {
     let mut retry = std::os::unix::net::UnixStream::connect(&sock).unwrap();
     common::shake_hands(&mut retry, &cwd);
 
+    drop(daemon);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A hello that claims version 3 but fails strict field decoding is still
+/// reported as a version mismatch.
+#[test]
+fn v3_hello_is_refused_as_a_version_mismatch() {
+    let (dir, daemon, mut stream) = start_daemon_raw("v3hello", |_| {});
+    // The underscore in the runtime path makes this cwd invalid standard base64.
+    let v3 = format!(r#"{{"v":3,"cwd":"{}","env":[]}}"#, dir.display());
+    stream.write_all(&frame(3, v3.as_bytes())).unwrap();
+    expect_refusal(&mut stream, "v3");
     drop(daemon);
     let _ = std::fs::remove_dir_all(&dir);
 }

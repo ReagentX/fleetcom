@@ -11,7 +11,7 @@ use base64::engine::general_purpose::STANDARD as B64;
 use crate::frame::{KIND_CONTROL, KIND_HELLO, KIND_SCREEN};
 
 /// Wire-protocol version; the handshake rejects mismatched peers.
-pub const PROTOCOL_VERSION: u32 = 3;
+pub const PROTOCOL_VERSION: u32 = 4;
 
 /// Environment and working directory supplied by the launching client.
 #[derive(Debug, Clone, PartialEq)]
@@ -177,11 +177,6 @@ pub struct ScreenView {
 // raw tail after a small jzon header rather than bloating into a JSON number
 // array. A socket peer is just `decode_*(read_frame(...))`.
 
-/// Encode paths as lossy UTF-8 strings for the protocol.
-fn ps(p: &Path) -> String {
-    p.to_string_lossy().into_owned()
-}
-
 /// Encode an `OsStr` as lossless base64 for a JSON string.
 fn os_b64(s: &OsStr) -> String {
     B64.encode(s.as_bytes())
@@ -190,6 +185,21 @@ fn os_b64(s: &OsStr) -> String {
 /// Decode a strictly valid base64 JSON string as an `OsString`.
 fn os_from_b64(v: &jzon::JsonValue) -> Option<OsString> {
     Some(OsString::from_vec(B64.decode(v.as_str()?).ok()?))
+}
+
+/// Encode a path's Unix bytes as base64 without requiring UTF-8.
+fn path_b64(p: &Path) -> String {
+    os_b64(p.as_os_str())
+}
+
+/// Decode a strictly valid base64 JSON string as a `PathBuf`.
+fn path_from_b64(v: &jzon::JsonValue) -> Option<PathBuf> {
+    Some(PathBuf::from(os_from_b64(v)?))
+}
+
+/// Decode a JSON number as a `u16`, rejecting out-of-range values.
+fn u16_from(v: &jzon::JsonValue) -> Option<u16> {
+    u16::try_from(v.as_u64()?).ok()
 }
 
 fn lifecycle_str(l: Lifecycle) -> &'static str {
@@ -215,7 +225,7 @@ fn lifecycle_from(s: &str) -> Option<Lifecycle> {
 pub fn encode_hello(ctx: &LaunchContext) -> (u8, Vec<u8>) {
     let mut o = jzon::JsonValue::new_object();
     let _ = o.insert("v", PROTOCOL_VERSION);
-    let _ = o.insert("cwd", ps(&ctx.cwd));
+    let _ = o.insert("cwd", path_b64(&ctx.cwd));
     let mut pairs = jzon::JsonValue::new_array();
     for (k, v) in &ctx.env {
         let mut pair = jzon::JsonValue::new_array();
@@ -242,7 +252,7 @@ pub fn decode_hello(kind: u8, payload: &[u8]) -> Option<(u32, LaunchContext)> {
         v["v"].as_u32()?,
         LaunchContext {
             env,
-            cwd: PathBuf::from(v["cwd"].as_str()?),
+            cwd: path_from_b64(&v["cwd"])?,
         },
     ))
 }
@@ -255,7 +265,7 @@ pub fn encode_command(cmd: &Command) -> (u8, Vec<u8>) {
         Command::Spawn { command, cwd } => {
             let _ = o.insert("t", "spawn");
             let _ = o.insert("command", command.as_str());
-            let _ = o.insert("cwd", ps(cwd));
+            let _ = o.insert("cwd", path_b64(cwd));
         }
         Command::Kill { id } => {
             let _ = o.insert("t", "kill");
@@ -290,23 +300,17 @@ pub fn encode_command(cmd: &Command) -> (u8, Vec<u8>) {
                 }
             }
         }
+        // Encode both byte-carrying commands as base64. The paste-size bound in
+        // `app` accounts for base64 expansion and the frame limit.
         Command::Input { id, bytes } => {
             let _ = o.insert("t", "input");
             let _ = o.insert("id", *id);
-            let mut arr = jzon::JsonValue::new_array();
-            for b in bytes {
-                let _ = arr.push(*b as u64);
-            }
-            let _ = o.insert("bytes", arr);
+            let _ = o.insert("bytes", B64.encode(bytes));
         }
         Command::Paste { id, bytes } => {
             let _ = o.insert("t", "paste");
             let _ = o.insert("id", *id);
-            let mut arr = jzon::JsonValue::new_array();
-            for b in bytes {
-                let _ = arr.push(*b as u64);
-            }
-            let _ = o.insert("bytes", arr);
+            let _ = o.insert("bytes", B64.encode(bytes));
         }
         Command::Mouse { id, kind, col, row } => {
             let _ = o.insert("t", "mouse");
@@ -355,8 +359,9 @@ pub fn encode_command(cmd: &Command) -> (u8, Vec<u8>) {
 }
 
 /// Parse a command from a received frame. `None` on a wrong kind, non-UTF-8/
-/// non-JSON payload, unknown discriminant, or a missing/mistyped field. The
-/// daemon drops a malformed command rather than trusting it.
+/// non-JSON payload, unknown discriminant, or a missing/mistyped field —
+/// including out-of-range numerics and invalid base64. The daemon drops a
+/// malformed command rather than trusting it.
 pub fn decode_command(kind: u8, payload: &[u8]) -> Option<Command> {
     if kind != KIND_CONTROL {
         return None;
@@ -365,7 +370,7 @@ pub fn decode_command(kind: u8, payload: &[u8]) -> Option<Command> {
     let cmd = match v["t"].as_str()? {
         "spawn" => Command::Spawn {
             command: v["command"].as_str()?.to_string(),
-            cwd: PathBuf::from(v["cwd"].as_str()?),
+            cwd: path_from_b64(&v["cwd"])?,
         },
         "kill" => Command::Kill {
             id: v["id"].as_u64()?,
@@ -381,8 +386,8 @@ pub fn decode_command(kind: u8, payload: &[u8]) -> Option<Command> {
             on: v["on"].as_bool()?,
         },
         "resize" => Command::Resize {
-            rows: v["rows"].as_u64()? as u16,
-            cols: v["cols"].as_u64()? as u16,
+            rows: u16_from(&v["rows"])?,
+            cols: u16_from(&v["cols"])?,
         },
         "watch" => Command::Watch {
             id: if v["id"].is_null() {
@@ -393,17 +398,11 @@ pub fn decode_command(kind: u8, payload: &[u8]) -> Option<Command> {
         },
         "input" => Command::Input {
             id: v["id"].as_u64()?,
-            bytes: v["bytes"]
-                .members()
-                .filter_map(|m| m.as_u64().map(|n| n as u8))
-                .collect(),
+            bytes: B64.decode(v["bytes"].as_str()?).ok()?,
         },
         "paste" => Command::Paste {
             id: v["id"].as_u64()?,
-            bytes: v["bytes"]
-                .members()
-                .filter_map(|m| m.as_u64().map(|n| n as u8))
-                .collect(),
+            bytes: B64.decode(v["bytes"].as_str()?).ok()?,
         },
         "mouse" => {
             let btn = || -> Option<MouseBtn> {
@@ -424,15 +423,15 @@ pub fn decode_command(kind: u8, payload: &[u8]) -> Option<Command> {
                     "r" => MouseKind::Release(btn()?),
                     _ => return None,
                 },
-                col: v["col"].as_u64()? as u16,
-                row: v["row"].as_u64()? as u16,
+                col: u16_from(&v["col"])?,
+                row: u16_from(&v["row"])?,
             }
         }
         "sb" => Command::Scrollback {
             id: v["id"].as_u64()?,
             action: match v["a"].as_str()? {
-                "u" => ScrollAction::Up(v["n"].as_u64()? as u16),
-                "d" => ScrollAction::Down(v["n"].as_u64()? as u16),
+                "u" => ScrollAction::Up(u16_from(&v["n"])?),
+                "d" => ScrollAction::Down(u16_from(&v["n"])?),
                 "t" => ScrollAction::Top,
                 "l" => ScrollAction::Live,
                 _ => return None,
@@ -466,7 +465,7 @@ pub fn encode_event(ev: &Event) -> (u8, Vec<u8>) {
                 let mut o = jzon::JsonValue::new_object();
                 let _ = o.insert("id", tv.id);
                 let _ = o.insert("command", tv.command.as_str());
-                let _ = o.insert("cwd", ps(&tv.cwd));
+                let _ = o.insert("cwd", path_b64(&tv.cwd));
                 let _ = o.insert("tagged", tv.tagged);
                 let _ = o.insert("life", lifecycle_str(tv.lifecycle));
                 let _ = o.insert("preview", tv.preview.as_str());
@@ -525,7 +524,7 @@ pub fn decode_event(kind: u8, payload: &[u8]) -> Option<Event> {
                         views.push(TaskView {
                             id: tv["id"].as_u64()?,
                             command: tv["command"].as_str()?.to_string(),
-                            cwd: PathBuf::from(tv["cwd"].as_str()?),
+                            cwd: path_from_b64(&tv["cwd"])?,
                             tagged: tv["tagged"].as_bool()?,
                             lifecycle: lifecycle_from(tv["life"].as_str()?)?,
                             preview: tv["preview"].as_str()?.to_string(),
@@ -543,14 +542,13 @@ pub fn decode_event(kind: u8, payload: &[u8]) -> Option<Event> {
             let header_bytes = payload.get(4..4 + hlen)?;
             let formatted = payload.get(4 + hlen..)?.to_vec();
             let h = jzon::parse(std::str::from_utf8(header_bytes).ok()?).ok()?;
-            let cursor = (
-                h["cursor"][0].as_u64()? as u16,
-                h["cursor"][1].as_u64()? as u16,
-            );
-            let lines = h["lines"]
-                .members()
-                .filter_map(|m| m.as_str().map(str::to_string))
-                .collect();
+            let cursor = (u16_from(&h["cursor"][0])?, u16_from(&h["cursor"][1])?);
+            // Preserve the one-to-one mapping between encoded and decoded rows.
+            // A non-string row invalidates the event.
+            let mut lines = Vec::with_capacity(h["lines"].len());
+            for l in h["lines"].members() {
+                lines.push(l.as_str()?.to_string());
+            }
             Some(Event::Screen(ScreenView {
                 id: h["id"].as_u64()?,
                 lines,
@@ -559,7 +557,7 @@ pub fn decode_event(kind: u8, payload: &[u8]) -> Option<Event> {
                 hide_cursor: h["hide"].as_bool()?,
                 wants_mouse: h["mouse"].as_bool()?,
                 alt_screen: h["alt"].as_bool()?,
-                scrollback: h["sb"].as_u64()? as usize,
+                scrollback: usize::try_from(h["sb"].as_u64()?).ok()?,
             }))
         }
         _ => None,
@@ -579,6 +577,11 @@ mod tests {
             Command::Spawn {
                 command: "echo hi".into(),
                 cwd: PathBuf::from("/tmp"),
+            },
+            Command::Spawn {
+                // Exercise byte-preserving serialization of a non-UTF-8 path.
+                command: "ls".into(),
+                cwd: PathBuf::from(OsString::from_vec(b"/tmp/\xff\xfe dir".to_vec())),
             },
             Command::Kill { id: 7 },
             Command::Remove { id: 3 },
@@ -662,7 +665,8 @@ mod tests {
         assert_eq!(decode_event(k, &p), Some(ack));
     }
 
-    /// Handshake environment entries round-trip byte-for-byte.
+    /// Handshake environment entries and the cwd round-trip byte-for-byte,
+    /// including non-UTF-8 bytes in both.
     #[test]
     fn hello_round_trips() {
         let ctx = LaunchContext {
@@ -673,7 +677,7 @@ mod tests {
                     OsString::from_vec(b"v\xff".to_vec()),
                 ),
             ],
-            cwd: PathBuf::from("/home/x"),
+            cwd: PathBuf::from(OsString::from_vec(b"/home/x\xff\xfe".to_vec())),
         };
         let (k, p) = encode_hello(&ctx);
         assert_eq!(k, KIND_HELLO);
@@ -705,10 +709,11 @@ mod tests {
             r#"[["P@TH","L2Jpbg=="]]"#,    // invalid base64 character
             r#"[["QUFBQUE","L2Jpbg=="]]"#, // truncated: missing padding
             r#"[["UEFUSA==","AAAA="]]"#,   // bad padding length
-            r#"[[[80],[65]]]"#,            // v2 number arrays are not v3
+            r#"[[[80],[65]]]"#,            // env pairs must contain base64 strings
             r#"["PATH=/bin"]"#,            // flat string pair
         ] {
-            let json = format!(r#"{{"v":3,"cwd":"/","env":{env}}}"#);
+            // Keep the cwd valid so each case isolates env validation.
+            let json = format!(r#"{{"v":4,"cwd":"Lw==","env":{env}}}"#);
             assert_eq!(
                 decode_hello(KIND_HELLO, json.as_bytes()),
                 None,
@@ -717,17 +722,111 @@ mod tests {
         }
     }
 
+    /// A hello with a non-base64 cwd is rejected.
+    #[test]
+    fn hello_with_malformed_cwd_is_rejected() {
+        let json = r#"{"v":3,"cwd":"/home/user","env":[]}"#;
+        assert_eq!(decode_hello(KIND_HELLO, json.as_bytes()), None);
+    }
+
+    /// Out-of-range numeric fields reject the whole command.
+    #[test]
+    fn out_of_range_numerics_are_rejected() {
+        for json in [
+            r#"{"t":"resize","rows":65536,"cols":100}"#,
+            r#"{"t":"resize","rows":30,"cols":65536}"#,
+            r#"{"t":"mouse","id":1,"k":"wu","col":65536,"row":0}"#,
+            r#"{"t":"mouse","id":1,"k":"wu","col":0,"row":65536}"#,
+            r#"{"t":"sb","id":1,"a":"u","n":65536}"#,
+            r#"{"t":"sb","id":1,"a":"d","n":-1}"#,
+        ] {
+            assert_eq!(
+                decode_command(KIND_CONTROL, json.as_bytes()),
+                None,
+                "should reject {json}"
+            );
+        }
+    }
+
+    /// Invalid base64 and non-string byte or path fields reject the command.
+    #[test]
+    fn invalid_base64_is_rejected() {
+        for json in [
+            r#"{"t":"input","id":1,"bytes":"!!!"}"#,
+            r#"{"t":"input","id":1,"bytes":[0,27]}"#, // bytes must be a base64 string
+            r#"{"t":"paste","id":1,"bytes":"AAAA="}"#, // bad padding length
+            r#"{"t":"spawn","command":"ls","cwd":"/tmp/x"}"#, // plain path
+        ] {
+            assert_eq!(
+                decode_command(KIND_CONTROL, json.as_bytes()),
+                None,
+                "should reject {json}"
+            );
+        }
+    }
+
+    /// Build a `KIND_SCREEN` payload (`[u32 header_len][header]`, empty tail)
+    /// from a raw header string, for malformed-header tests.
+    fn screen_payload(header: &str) -> Vec<u8> {
+        let mut p = Vec::with_capacity(4 + header.len());
+        p.extend_from_slice(&(header.len() as u32).to_be_bytes());
+        p.extend_from_slice(header.as_bytes());
+        p
+    }
+
+    /// A mistyped member in `lines` or `tasks` rejects the whole event, keeping
+    /// decoded rows aligned with their encoded positions.
+    #[test]
+    fn mistyped_event_members_are_rejected() {
+        for header in [
+            // Numeric member in `lines`.
+            r#"{"id":1,"cursor":[0,0],"hide":false,"mouse":false,"alt":false,"sb":0,"lines":["ok",5]}"#,
+            // Out-of-range cursor cell.
+            r#"{"id":1,"cursor":[65536,0],"hide":false,"mouse":false,"alt":false,"sb":0,"lines":[]}"#,
+        ] {
+            assert_eq!(
+                decode_event(KIND_SCREEN, &screen_payload(header)),
+                None,
+                "should reject header {header}"
+            );
+        }
+        for json in [
+            r#"{"t":"tasks","tasks":[{"id":"nope"}]}"#,
+            // The cwd must be a base64 string.
+            r#"{"t":"tasks","tasks":[{"id":1,"command":"x","cwd":"/x","tagged":true,"life":"ok","preview":"","started_ms":0}]}"#,
+            r#"{"t":"tasks","tasks":["flat"]}"#,
+        ] {
+            assert_eq!(
+                decode_event(KIND_CONTROL, json.as_bytes()),
+                None,
+                "should reject {json}"
+            );
+        }
+    }
+
     #[test]
     fn tasks_and_status_round_trip() {
-        let tasks = Event::Tasks(vec![TaskView {
-            id: 1,
-            command: "vim".into(),
-            cwd: PathBuf::from("/home/x"),
-            tagged: true,
-            lifecycle: Lifecycle::Idle,
-            preview: "~ line".into(),
-            started_ago: Duration::from_millis(4200),
-        }]);
+        let tasks = Event::Tasks(vec![
+            TaskView {
+                id: 1,
+                command: "vim".into(),
+                cwd: PathBuf::from("/home/x"),
+                tagged: true,
+                lifecycle: Lifecycle::Idle,
+                preview: "~ line".into(),
+                started_ago: Duration::from_millis(4200),
+            },
+            TaskView {
+                id: 2,
+                command: "make".into(),
+                // Exercise byte-preserving task-path serialization.
+                cwd: PathBuf::from(OsString::from_vec(b"/srv/\xff\xfe".to_vec())),
+                tagged: false,
+                lifecycle: Lifecycle::Active,
+                preview: String::new(),
+                started_ago: Duration::from_millis(10),
+            },
+        ]);
         let (k, p) = encode_event(&tasks);
         assert_eq!(k, KIND_CONTROL);
         assert_eq!(decode_event(k, &p), Some(tasks));
