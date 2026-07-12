@@ -4,7 +4,6 @@
 //! a task snapshot plus the watched screen), and `drain` (take the queued
 //! `Event`s).
 
-use std::ffi::OsString;
 use std::path::PathBuf;
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
@@ -12,7 +11,7 @@ use std::time::{Duration, Instant};
 
 use crate::core::{Wake, Waker};
 use crate::path;
-use crate::protocol::{Command, Event, ScreenView, ScrollAction, TaskView};
+use crate::protocol::{Command, Event, LaunchContext, ScreenView, ScrollAction, TaskView};
 use crate::session::{self, SessionConfig};
 use crate::task::Task;
 
@@ -49,6 +48,9 @@ pub struct Supervisor {
     /// removal, escalated to KILL by `reap` at grace end, and dropped once the
     /// leader's zombie is collected. Invisible to `tick` snapshots, so the row
     /// disappears instantly while the sweep runs behind it.
+    ///
+    /// Entries remain through `kill_grace` because group emptiness cannot be
+    /// reliably observed before escalation. `shutdown_all` waits for them.
     graveyard: Vec<Task>,
     next_id: u64,
     /// PTY content size (rows already minus the client's status bar). Every task
@@ -62,14 +64,9 @@ pub struct Supervisor {
     /// `None` whenever `watched` changes, so re-attaching always gets a fresh
     /// full screen (the client cleared its copy on detach).
     last_screen: Option<LastScreen>,
-    /// The current client's launch context, from its `Hello`: every spawn
-    /// (including rerun and session load) uses this env, and session-recipe
-    /// dirs resolve against this cwd. Initialized to this process's own
-    /// context, which is the real thing for `--foreground` (client and core
-    /// share the process) and unreachable in the daemon: the handshake applies
-    /// the client's `Hello` before any command is served.
-    client_env: Vec<(OsString, OsString)>,
-    client_cwd: PathBuf,
+    /// The current client's launch context, used for spawns and session paths.
+    /// Spawning is refused until one is installed.
+    launch: Option<LaunchContext>,
     events: Vec<Event>,
     /// Handed to every `Task` so its reader thread can wake the core loop when the
     /// PTY produces output. The serving loop installs its sender on connect
@@ -91,12 +88,16 @@ impl Supervisor {
             cols,
             watched: None,
             last_screen: None,
-            client_env: std::env::vars_os().collect(),
-            client_cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+            launch: None,
             events: Vec::new(),
             waker: Arc::new(Mutex::new(None)),
             kill_grace: KILL_GRACE,
         }
+    }
+
+    /// Install the launch context used by subsequent spawns.
+    pub fn set_launch_context(&mut self, ctx: LaunchContext) {
+        self.launch = Some(ctx);
     }
 
     /// Shrink the TERM→KILL grace so escalation tests run in milliseconds.
@@ -135,13 +136,6 @@ impl Supervisor {
     /// notice, a spawn failure) is queued as `Event::Status`, never returned.
     pub fn apply(&mut self, cmd: Command) {
         match cmd {
-            // Version checking happens at the connection seam (the daemon's
-            // handshake, before anything reaches `apply`); here a Hello is
-            // purely the launch context taking effect.
-            Command::Hello { env, cwd, .. } => {
-                self.client_env = env;
-                self.client_cwd = cwd;
-            }
             Command::Spawn { command, cwd } => self.spawn(&command, cwd),
             Command::Kill { id } => {
                 if let Some(t) = self.by_id_mut(id) {
@@ -153,6 +147,7 @@ impl Supervisor {
                 if let Some(i) = self.index_of(id) {
                     let mut t = self.tasks.remove(i);
                     t.terminate();
+                    t.shed_writer();
                     self.graveyard.push(t);
                 }
             }
@@ -227,10 +222,9 @@ impl Supervisor {
     }
 
     /// Kill every task for the quit path: TERM all groups at once, wait out one
-    /// shared grace (early exit as soon as every leader has exited), SIGKILL
-    /// the stragglers via `Task::drop`. Blocking here is fine (the core is
-    /// exiting), and the wait is bounded by the grace, paid only by jobs that
-    /// ignore their TERM. Anything the final KILLs don't collect (a leader in
+    /// shared grace (exiting early after all leaders and graveyard entries are
+    /// collected), then SIGKILL the stragglers. Blocking is bounded by the
+    /// grace. Anything the final KILLs don't collect (a leader in
     /// uninterruptible sleep) reparents to init when the daemon exits moments
     /// later; blocking on it here could wedge shutdown forever.
     fn shutdown_all(&mut self) {
@@ -238,7 +232,9 @@ impl Supervisor {
             t.terminate();
         }
         let deadline = Instant::now() + self.kill_grace;
-        while self.tasks.iter().any(|t| t.finished.is_none()) && Instant::now() < deadline {
+        while (self.tasks.iter().any(|t| t.finished.is_none()) || !self.graveyard.is_empty())
+            && Instant::now() < deadline
+        {
             std::thread::sleep(Duration::from_millis(25));
             self.reap();
         }
@@ -315,6 +311,16 @@ impl Supervisor {
         self.tasks.iter_mut().find(|t| t.id == id)
     }
 
+    /// Return the launch context, or report that spawning is unavailable.
+    fn launch_or_refuse(&mut self) -> Option<LaunchContext> {
+        if self.launch.is_none() {
+            self.events.push(Event::Status(
+                "no launch context; reconnect and retry".into(),
+            ));
+        }
+        self.launch.clone()
+    }
+
     fn spawn(&mut self, command: &str, cwd: PathBuf) {
         if self.tasks.len() >= MAX_TASKS {
             self.events.push(Event::Status(format!(
@@ -322,13 +328,16 @@ impl Supervisor {
             )));
             return;
         }
+        let Some(launch) = self.launch_or_refuse() else {
+            return;
+        };
         match Task::spawn(
             self.next_id,
             command,
             &cwd,
             self.rows,
             self.cols,
-            &self.client_env,
+            &launch.env,
             Arc::clone(&self.waker),
         ) {
             Ok(task) => {
@@ -353,6 +362,9 @@ impl Supervisor {
                 .push(Event::Status("rerun: task is still running".into()));
             return;
         }
+        let Some(launch) = self.launch_or_refuse() else {
+            return;
+        };
         // Preserve the finished task if its replacement cannot start.
         match Task::spawn(
             id,
@@ -360,7 +372,7 @@ impl Supervisor {
             &self.tasks[i].cwd,
             self.rows,
             self.cols,
-            &self.client_env,
+            &launch.env,
             Arc::clone(&self.waker),
         ) {
             Ok(mut fresh) => {
@@ -370,6 +382,7 @@ impl Supervisor {
                 // would straight-SIGKILL stragglers of the old run.
                 let mut old = std::mem::replace(&mut self.tasks[i], fresh);
                 old.terminate();
+                old.shed_writer();
                 self.graveyard.push(old);
                 // Reset the fingerprint for the replacement task's screen.
                 if self.watched == Some(id) {
@@ -419,9 +432,12 @@ impl Supervisor {
                 return;
             }
         };
+        let Some(launch) = self.launch_or_refuse() else {
+            return;
+        };
         let (mut spawned, mut skipped) = (0usize, 0usize);
         for (dir, cmds) in &cfg {
-            let resolved = path::resolve(&self.client_cwd, dir);
+            let resolved = path::resolve(&launch.cwd, dir);
             if !resolved.is_dir() {
                 skipped += cmds.len();
                 continue;
@@ -437,7 +453,7 @@ impl Supervisor {
                     &resolved,
                     self.rows,
                     self.cols,
-                    &self.client_env,
+                    &launch.env,
                     Arc::clone(&self.waker),
                 ) {
                     self.next_id += 1;
@@ -467,11 +483,18 @@ mod tests {
         std::env::current_dir().unwrap()
     }
 
+    /// Build a supervisor with this process's launch context.
+    fn sup(rows: u16, cols: u16) -> Supervisor {
+        let mut s = Supervisor::new(rows, cols);
+        s.set_launch_context(LaunchContext::here());
+        s
+    }
+
     /// The recipe groups commands by dir and preserves spawn order within a dir.
     /// `a`/`c` share the invocation dir; `b` is off in `/tmp`.
     #[test]
     fn session_config_groups_by_dir_in_spawn_order() {
-        let mut s = Supervisor::new(24, 80);
+        let mut s = sup(24, 80);
         s.apply(Command::Spawn {
             command: "a".into(),
             cwd: here(),
@@ -498,7 +521,7 @@ mod tests {
     /// the client's render loop depends on.
     #[test]
     fn tick_emits_snapshot_and_watched_screen() {
-        let mut s = Supervisor::new(24, 80);
+        let mut s = sup(24, 80);
         s.apply(Command::Spawn {
             command: "sleep 30".into(),
             cwd: here(),
@@ -530,7 +553,7 @@ mod tests {
     /// every tick: the send-on-change that kills idle attach churn.
     #[test]
     fn watched_screen_not_resent_when_unchanged() {
-        let mut s = Supervisor::new(24, 80);
+        let mut s = sup(24, 80);
         s.apply(Command::Spawn {
             command: "sleep 30".into(),
             cwd: here(),
@@ -622,7 +645,7 @@ mod tests {
         use crate::task::Lifecycle;
         let dir = scratch("term_first");
         let (ready, trapped) = (dir.join("ready"), dir.join("trapped"));
-        let mut s = Supervisor::new(24, 80);
+        let mut s = sup(24, 80);
         let id = spawn_ready(
             &mut s,
             format!(
@@ -646,7 +669,7 @@ mod tests {
         use crate::task::Lifecycle;
         let dir = scratch("escalate");
         let ready = dir.join("ready");
-        let mut s = Supervisor::new(24, 80);
+        let mut s = sup(24, 80);
         s.set_kill_grace(Duration::from_millis(150));
         let id = spawn_ready(
             &mut s,
@@ -666,7 +689,7 @@ mod tests {
     /// grace, not after it.
     #[test]
     fn shutdown_returns_early_when_jobs_respect_term() {
-        let mut s = Supervisor::new(24, 80);
+        let mut s = sup(24, 80);
         s.apply(Command::Spawn {
             command: "sleep 300".into(),
             cwd: here(),
@@ -691,7 +714,7 @@ mod tests {
     fn shutdown_is_bounded_by_grace() {
         let dir = scratch("shutdown_bound");
         let ready = dir.join("ready");
-        let mut s = Supervisor::new(24, 80);
+        let mut s = sup(24, 80);
         s.set_kill_grace(Duration::from_millis(200));
         spawn_ready(
             &mut s,
@@ -723,7 +746,7 @@ mod tests {
     /// fresh full screen instead of being skipped as "unchanged".
     #[test]
     fn clear_watch_stops_screen_stream_and_resets_dedup() {
-        let mut s = Supervisor::new(24, 80);
+        let mut s = sup(24, 80);
         s.apply(Command::Spawn {
             command: "sleep 30".into(),
             cwd: here(),
@@ -767,7 +790,7 @@ mod tests {
         use crate::task::Lifecycle;
         let dir = scratch("restart");
         let marker = dir.join("marker");
-        let mut s = Supervisor::new(24, 80);
+        let mut s = sup(24, 80);
         s.apply(Command::Spawn {
             command: format!("echo run >> {}", marker.display()),
             cwd: dir.clone(),
@@ -799,7 +822,7 @@ mod tests {
     #[test]
     fn restart_refuses_running_task_and_unknown_id() {
         use crate::task::Lifecycle;
-        let mut s = Supervisor::new(24, 80);
+        let mut s = sup(24, 80);
         s.apply(Command::Spawn {
             command: "sleep 30".into(),
             cwd: here(),
@@ -840,7 +863,7 @@ mod tests {
     #[test]
     fn restart_watched_task_resends_screen() {
         use crate::task::Lifecycle;
-        let mut s = Supervisor::new(24, 80);
+        let mut s = sup(24, 80);
         s.apply(Command::Spawn {
             command: "true".into(),
             cwd: here(),
@@ -873,7 +896,7 @@ mod tests {
     /// without a panic/OOM is the assertion.
     #[test]
     fn resize_clamps_hostile_dimensions() {
-        let mut s = Supervisor::new(24, 80);
+        let mut s = sup(24, 80);
         s.apply(Command::Spawn {
             command: "sleep 30".into(),
             cwd: here(),
@@ -908,19 +931,12 @@ mod tests {
         pred(s)
     }
 
-    /// Pin the launch shell to `/bin/sh` via a `Hello`: the straggler tests
-    /// assert POSIX group mechanics, and zsh kills a `-c` shell's background
-    /// jobs on exit (even under `trap '' HUP`), which would end the straggler
-    /// before the sweep under test ran.
+    /// Use `/bin/sh` so background-process tests have consistent semantics.
     fn hello_with_sh(s: &mut Supervisor, cwd: PathBuf) {
         let mut env: Vec<(std::ffi::OsString, std::ffi::OsString)> = std::env::vars_os().collect();
         env.retain(|(k, _)| k != "SHELL");
         env.push(("SHELL".into(), "/bin/sh".into()));
-        s.apply(Command::Hello {
-            version: crate::protocol::PROTOCOL_VERSION,
-            env,
-            cwd,
-        });
+        s.set_launch_context(LaunchContext { env, cwd });
     }
 
     /// Read a pid a test job wrote, waiting for the write to land.
@@ -947,7 +963,7 @@ mod tests {
         use nix::sys::signal::kill;
         let dir = scratch("remove_sweep");
         let (spid, ready) = (dir.join("spid"), dir.join("ready"));
-        let mut s = Supervisor::new(24, 80);
+        let mut s = sup(24, 80);
         hello_with_sh(&mut s, dir.clone());
         let id = spawn_ready(
             &mut s,
@@ -988,7 +1004,7 @@ mod tests {
         use nix::sys::signal::kill;
         let dir = scratch("restart_sweep");
         let (spid, ready) = (dir.join("spid"), dir.join("ready"));
-        let mut s = Supervisor::new(24, 80);
+        let mut s = sup(24, 80);
         hello_with_sh(&mut s, dir.clone());
         let id = spawn_ready(
             &mut s,
@@ -1030,7 +1046,7 @@ mod tests {
         use nix::sys::signal::kill;
         let dir = scratch("kill_escalate_straggler");
         let (spid, ready) = (dir.join("spid"), dir.join("ready"));
-        let mut s = Supervisor::new(24, 80);
+        let mut s = sup(24, 80);
         s.set_kill_grace(Duration::from_millis(150));
         hello_with_sh(&mut s, dir.clone());
         // The leader ignores HUP (inherited by the `&` child, so it survives
@@ -1060,13 +1076,53 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A spawn runs under the `Hello` client's environment, not the daemon
-    /// process's: the client's marker is visible, and a var only this process
-    /// has (`USER` — chosen because no shell synthesizes it, unlike `HOME`,
-    /// which zsh fills from passwd when unset) is absent because the builder's
-    /// captured base env is cleared.
+    /// Shutdown after removal preserves the removed task's TERM grace.
     #[test]
-    fn spawn_uses_the_hello_env_not_the_process_env() {
+    fn shutdown_waits_for_graveyard_grace() {
+        use nix::sys::signal::kill;
+        let dir = scratch("shutdown_graveyard");
+        let (spid, ready) = (dir.join("spid"), dir.join("ready"));
+        let mut s = sup(24, 80);
+        s.set_kill_grace(Duration::from_millis(400));
+        hello_with_sh(&mut s, dir.clone());
+        // The background process ignores HUP and TERM.
+        let id = spawn_ready(
+            &mut s,
+            format!(
+                "trap '' HUP; (trap '' TERM; exec sleep 300) & echo $! > {sp}; echo r > {r}",
+                sp = spid.display(),
+                r = ready.display()
+            ),
+            dir.clone(),
+            &ready,
+        );
+        let straggler = read_pid(&spid);
+        assert!(reap_until(&mut s, Duration::from_secs(5), |s| {
+            s.tasks.iter().all(|t| t.id != id || t.finished.is_some())
+        }));
+
+        s.apply(Command::Remove { id }); // graveyard: TERM sent, grace running
+        // Check that the background process remains alive during the grace.
+        let alive_mid_grace = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(200));
+            kill(straggler, None).is_ok()
+        });
+        s.apply(Command::Shutdown);
+        assert!(
+            alive_mid_grace.join().unwrap(),
+            "straggler was KILLed before its grace elapsed"
+        );
+        assert!(
+            reap_until(&mut s, Duration::from_secs(5), |_| kill(straggler, None)
+                .is_err()),
+            "straggler survived shutdown"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Spawns inherit only the installed launch-context environment.
+    #[test]
+    fn spawn_uses_the_launch_context_env_not_the_process_env() {
         assert!(
             std::env::var_os("USER").is_some(),
             "test needs USER set in the process env to prove it doesn't leak"
@@ -1074,8 +1130,7 @@ mod tests {
         let dir = scratch("hello_env");
         let out = dir.join("out");
         let mut s = Supervisor::new(24, 80);
-        s.apply(Command::Hello {
-            version: crate::protocol::PROTOCOL_VERSION,
+        s.set_launch_context(LaunchContext {
             env: vec![("FLEETCOM_MARKER".into(), "xyzzy".into())],
             cwd: dir.clone(),
         });
@@ -1092,5 +1147,37 @@ mod tests {
         assert!(ok, "the marker job never wrote its output");
         assert_eq!(std::fs::read_to_string(&out).unwrap(), "xyzzy:unset");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A supervisor with no launch context refuses to launch — spawn, rerun,
+    /// and session load alike — with a status notice.
+    #[test]
+    fn launch_without_context_is_refused() {
+        let mut s = Supervisor::new(24, 80);
+        s.apply(Command::Spawn {
+            command: "true".into(),
+            cwd: here(),
+        });
+        assert!(
+            s.drain()
+                .iter()
+                .any(|e| matches!(e, Event::Status(m) if m.contains("no launch context"))),
+            "context-less spawn must be refused with a status notice"
+        );
+        s.tick();
+        assert!(
+            s.drain()
+                .iter()
+                .any(|e| matches!(e, Event::Tasks(v) if v.is_empty())),
+            "no task may exist after a refused spawn"
+        );
+
+        s.apply(Command::LoadSession { name: "any".into() });
+        let evs = s.drain();
+        assert!(
+            evs.iter().any(|e| matches!(e, Event::Status(m)
+                if m.contains("no launch context") || m.contains("not found"))),
+            "context-less load must not spawn; got {evs:?}"
+        );
     }
 }

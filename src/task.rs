@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use nix::sys::signal::{Signal, killpg};
 use nix::unistd::Pid;
-use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
+use portable_pty::{CommandBuilder, MasterPty, PtySize, native_pty_system};
 use rustix::process::{WaitId, WaitIdOptions, waitid};
 
 use crate::core::{Wake, Waker};
@@ -162,10 +162,7 @@ pub struct Task {
     /// Kept for resize (`TIOCSWINSZ`); `try_clone_reader`/`take_writer` borrow it.
     master: Box<dyn MasterPty + Send>,
     writer: Box<dyn Write + Send>,
-    child: Box<dyn Child + Send + Sync>,
-    /// The leader's pid, cached at spawn. portable-pty `setsid`s the child, so
-    /// this is also the job's pgid: the target for group signals and the
-    /// `WNOWAIT` status latch.
+    /// Session-leader PID, also used as the process-group ID.
     pid: Option<u32>,
     /// Shared with the reader thread: it writes (process bytes), the UI reads
     /// (render/preview). Contention is trivial: writes are per output chunk.
@@ -203,6 +200,14 @@ fn grid(parser: &Mutex<vt100::Parser>) -> std::sync::MutexGuard<'_, vt100::Parse
     parser
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Convert a wait status to a shell-style exit code.
+fn wait_code(status: &rustix::process::WaitIdStatus) -> i32 {
+    status
+        .exit_status()
+        .or_else(|| status.terminating_signal().map(|s| 128 + s))
+        .unwrap_or(1)
 }
 
 impl Task {
@@ -299,14 +304,15 @@ impl Task {
             })
         };
 
+        // Process-group signalling and `waitid` use the leader PID directly.
         let pid = child.process_id();
+        drop(child);
         Ok(Task {
             id,
             command: command.to_string(),
             cwd: cwd.to_path_buf(),
             master: pair.master,
             writer,
-            child,
             pid,
             parser,
             last_activity,
@@ -338,13 +344,7 @@ impl Task {
         };
         let flags = WaitIdOptions::EXITED | WaitIdOptions::NOWAIT | WaitIdOptions::NOHANG;
         if let Some(status) = waitid(WaitId::Pid(pid), flags)? {
-            // 128+signal mirrors the shell convention, so a KILLed job reads as
-            // 137 in the dashboard rather than masquerading as a clean exit.
-            let code = status
-                .exit_status()
-                .or_else(|| status.terminating_signal().map(|s| 128 + s))
-                .unwrap_or(1);
-            self.exit_code = Some(code);
+            self.exit_code = Some(wait_code(&status));
             self.finished = Some(Instant::now());
         }
         Ok(())
@@ -355,25 +355,44 @@ impl Task {
         if self.reaped {
             return;
         }
-        if let Ok(Some(status)) = self.child.try_wait() {
+        let Some(pid) = self
+            .pid
+            .and_then(|p| rustix::process::Pid::from_raw(p as i32))
+        else {
+            // No pid was ever known: nothing waitable or signalable exists.
             self.reaped = true;
-            if self.finished.is_none() {
-                self.exit_code = Some(status.exit_code() as i32);
-                self.finished = Some(Instant::now());
+            return;
+        };
+        match waitid(
+            WaitId::Pid(pid),
+            WaitIdOptions::EXITED | WaitIdOptions::NOHANG,
+        ) {
+            Ok(Some(status)) => {
+                self.reaped = true;
+                if self.finished.is_none() {
+                    self.exit_code = Some(wait_code(&status));
+                    self.finished = Some(Instant::now());
+                }
             }
+            // Treat an already-reaped leader as collected.
+            Err(rustix::io::Errno::CHILD) => self.reaped = true,
+            // Still running, or a transient failure: retry next reap pass.
+            Ok(None) | Err(_) => {}
         }
     }
 
-    /// Graveyard step: once the KILL has gone out, try to collect the leader's
-    /// zombie. Returns true when collected — nothing left to signal, so the
-    /// caller can drop this task silently. Never blocks: a leader wedged in
-    /// uninterruptible sleep (dead NFS/FUSE) stays uncollected and the caller
-    /// retries next reap pass instead of hanging the daemon.
+    /// After SIGKILL, try to collect the leader without blocking.
     pub fn try_collect(&mut self) -> bool {
         if self.kill_sent {
             self.collect();
         }
         self.reaped
+    }
+
+    /// Release the PTY writer after removal while retaining the master for
+    /// process-group teardown.
+    pub fn shed_writer(&mut self) {
+        self.writer = Box::new(io::sink());
     }
 
     pub fn lifecycle(&self, now: Instant, idle_after: Duration) -> Lifecycle {
@@ -702,6 +721,19 @@ mod tests {
             "TERM after leader exit never reached the straggler"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `collect` reports SIGKILL as shell exit code 137.
+    #[test]
+    fn killed_leader_latches_137_via_collect() {
+        let mut t = spawn(8, "sleep 300");
+        t.force_kill(); // sets kill_sent, so try_collect may reap
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !t.try_collect() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(t.try_collect(), "KILLed leader was never collected");
+        assert_eq!(t.exit_code, Some(137));
     }
 
     /// Paste encoding follows the child's DECSET 2004 opt-in: markers only

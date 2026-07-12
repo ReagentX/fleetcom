@@ -1222,9 +1222,12 @@ mod tests {
     impl App {
         /// A synchronous App: the supervisor ticks inline on `poll`, so `send`
         /// then `pump` is deterministic with no core-thread timing to race.
+        /// Uses this process's launch context.
         fn new_local(rows: u16, cols: u16) -> App {
             App::assemble(rows, cols, |pr, c, _wait_tx| {
-                Box::new(LocalTransport::new(Supervisor::new(pr, c)))
+                let mut sup = Supervisor::new(pr, c);
+                sup.set_launch_context(crate::protocol::LaunchContext::here());
+                Box::new(LocalTransport::new(sup))
             })
         }
 

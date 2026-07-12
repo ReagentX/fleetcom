@@ -36,8 +36,8 @@ use nix::unistd::Pid;
 use crate::core::{LoopExit, Wake, run_loop};
 use crate::frame::{read_frame, write_frame};
 use crate::protocol::{
-    Command, Event, PROTOCOL_VERSION, decode_command, decode_event, encode_command, encode_event,
-    hello_here,
+    Command, Event, LaunchContext, PROTOCOL_VERSION, decode_command, decode_event, decode_hello,
+    encode_command, encode_event, encode_hello,
 };
 use crate::supervisor::Supervisor;
 
@@ -193,7 +193,7 @@ pub fn connect_ready() -> io::Result<UnixStream> {
         });
     }
 
-    let (kind, payload) = encode_command(&hello_here());
+    let (kind, payload) = encode_hello(&LaunchContext::here());
     write_frame(&mut stream, kind, &payload)?;
     let reply = read_frame(&mut stream);
     done.store(true, Ordering::Relaxed);
@@ -202,28 +202,34 @@ pub fn connect_ready() -> io::Result<UnixStream> {
     Ok(stream)
 }
 
+/// Convert handshake timeouts to a busy-daemon error; preserve other errors.
+fn busy_daemon_error(e: io::Error) -> io::Error {
+    if is_timeout(&e) {
+        io::Error::new(
+            ErrorKind::TimedOut,
+            "the daemon is serving another client; retry after it detaches",
+        )
+    } else {
+        e
+    }
+}
+
 /// The handshake for `reconnect`: called from inside the live UI (raw mode,
 /// alternate screen), where an unbounded wait would freeze the client and a
 /// printed notice would land on the alternate screen. A busy daemon surfaces
 /// as a status-line error instead; the user retries once the other client
 /// detaches. Write is bounded too: a full send buffer (large env, unaccepted
-/// connection) must not wedge the UI either.
+/// connection) must not wedge the UI either. A timed-out write drops the
+/// connection, so a partial frame is never read.
 pub fn connect_ready_bounded() -> io::Result<UnixStream> {
     let mut stream = connect_or_autostart()?;
     stream.set_write_timeout(Some(HANDSHAKE_TIMEOUT))?;
-    let (kind, payload) = encode_command(&hello_here());
-    write_frame(&mut stream, kind, &payload)?;
+    let (kind, payload) = encode_hello(&LaunchContext::here());
+    write_frame(&mut stream, kind, &payload).map_err(busy_daemon_error)?;
     stream.set_write_timeout(None)?;
 
-    let (kind, payload) = match read_frame_bounded(&mut stream, HANDSHAKE_TIMEOUT) {
-        Err(e) if is_timeout(&e) => {
-            return Err(io::Error::new(
-                ErrorKind::TimedOut,
-                "the daemon is serving another client; retry after it detaches",
-            ));
-        }
-        other => other.map_err(hello_read_error)?,
-    };
+    let (kind, payload) = read_frame_bounded(&mut stream, HANDSHAKE_TIMEOUT)
+        .map_err(|e| hello_read_error(busy_daemon_error(e)))?;
     check_hello_ack(kind, &payload)?;
     Ok(stream)
 }
@@ -336,7 +342,7 @@ fn kill_via_socket() -> io::Result<()> {
     let path = socket_path();
     match UnixStream::connect(&path) {
         Ok(mut s) => {
-            let (kind, payload) = encode_command(&hello_here());
+            let (kind, payload) = encode_hello(&LaunchContext::here());
             write_frame(&mut s, kind, &payload)?;
             let (kind, payload) = encode_command(&Command::Shutdown);
             write_frame(&mut s, kind, &payload)?;
@@ -388,7 +394,7 @@ pub fn run_daemon() -> io::Result<()> {
     fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
 
     // 24x80 until the first client's Resize, which arrives before any Spawn.
-    // Launch context (env, session base dir) arrives per-connection via Hello.
+    // Each connection supplies its launch context in the hello frame.
     let mut sup = Supervisor::new(24, 80);
 
     // A signalled daemon shuts down *cleanly*: TERM each job's group with a
@@ -474,33 +480,45 @@ enum ServeOutcome {
     Shutdown,
 }
 
-/// Read and validate the connection-opening `Hello`. `Ok` carries the decoded
-/// command for `apply` (it sets the client's launch context); `Err` carries the
-/// refusal text for the client's status line. Bounded read: a peer that
-/// connects and sends nothing must not wedge the daemon — accept, reap, and
-/// `--kill` all wait behind this.
-fn handshake(stream: &mut UnixStream) -> Result<Command, String> {
+/// Return the version from a v2 control-frame hello.
+fn is_v2_hello(kind: u8, payload: &[u8]) -> Option<u32> {
+    if kind != crate::frame::KIND_CONTROL {
+        return None;
+    }
+    let v = jzon::parse(std::str::from_utf8(payload).ok()?).ok()?;
+    if v["t"].as_str()? == "hello" {
+        v["v"].as_u32()
+    } else {
+        None
+    }
+}
+
+/// Read and validate the connection-opening hello frame.
+/// The bounded read prevents an idle peer from blocking the daemon.
+fn handshake(stream: &mut UnixStream) -> Result<LaunchContext, String> {
     let (kind, payload) = read_frame_bounded(stream, HANDSHAKE_TIMEOUT)
         .map_err(|e| format!("no valid hello received: {e}"))?;
-    match decode_command(kind, &payload) {
-        Some(
-            hello @ Command::Hello {
-                version: PROTOCOL_VERSION,
-                ..
-            },
-        ) => Ok(hello),
-        Some(Command::Hello { version, .. }) => Err(format!(
+    match decode_hello(kind, &payload) {
+        Some((PROTOCOL_VERSION, ctx)) => Ok(ctx),
+        Some((version, _)) => Err(format!(
             "protocol mismatch: daemon {} speaks v{PROTOCOL_VERSION}, client speaks \
              v{version}; run 'fleetcom --kill' and retry",
             env!("CARGO_PKG_VERSION"),
         )),
-        // Reject commands received before `Hello`.
-        // Refuse requests before the required handshake.
-        _ => Err(format!(
-            "daemon {} requires a hello handshake (older client?); upgrade the \
-             client or run 'fleetcom --kill' and retry",
-            env!("CARGO_PKG_VERSION"),
-        )),
+        // Report a v2 hello as a version mismatch.
+        None => match is_v2_hello(kind, &payload) {
+            Some(version) => Err(format!(
+                "protocol mismatch: daemon {} speaks v{PROTOCOL_VERSION}, client speaks \
+                 v{version}; run 'fleetcom --kill' and retry",
+                env!("CARGO_PKG_VERSION"),
+            )),
+            // Refuse anything else sent before the required handshake.
+            None => Err(format!(
+                "daemon {} requires a hello handshake (older client?); upgrade the \
+                 client or run 'fleetcom --kill' and retry",
+                env!("CARGO_PKG_VERSION"),
+            )),
+        },
     }
 }
 
@@ -519,8 +537,8 @@ fn handshake(stream: &mut UnixStream) -> Result<Command, String> {
 fn serve_client(sup: &mut Supervisor, stream: UnixStream, stop: &AtomicBool) -> ServeOutcome {
     let mut stream = stream;
     match handshake(&mut stream) {
-        Ok(hello) => {
-            sup.apply(hello);
+        Ok(ctx) => {
+            sup.set_launch_context(ctx);
             let (kind, payload) = encode_event(&Event::HelloOk);
             if write_frame(&mut stream, kind, &payload).is_err() {
                 return ServeOutcome::Disconnected;

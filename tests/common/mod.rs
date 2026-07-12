@@ -15,15 +15,45 @@ use std::time::{Duration, Instant};
 
 /// The protocol version this test suite speaks; must track
 /// `protocol::PROTOCOL_VERSION` (drift fails the handshake, loudly).
-pub const PROTOCOL_VERSION: u32 = 2;
+pub const PROTOCOL_VERSION: u32 = 3;
+
+/// One frame of the given kind: `[u32 len][kind][payload]`.
+pub fn frame(kind: u8, payload: &[u8]) -> Vec<u8> {
+    let mut f = Vec::with_capacity(5 + payload.len());
+    f.extend_from_slice(&(u32::try_from(payload.len()).unwrap()).to_be_bytes());
+    f.push(kind);
+    f.extend_from_slice(payload);
+    f
+}
 
 /// One `KIND_CONTROL` frame: `[u32 len][kind=1][jzon payload]`.
 pub fn control_frame(json: &str) -> Vec<u8> {
-    let mut f = Vec::with_capacity(5 + json.len());
-    f.extend_from_slice(&(u32::try_from(json.len()).unwrap()).to_be_bytes());
-    f.push(1);
-    f.extend_from_slice(json.as_bytes());
-    f
+    frame(1, json.as_bytes())
+}
+
+/// Encode bytes as padded standard base64.
+pub fn b64(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let n = (u32::from(chunk[0]) << 16)
+            | (u32::from(*chunk.get(1).unwrap_or(&0)) << 8)
+            | u32::from(*chunk.get(2).unwrap_or(&0));
+        let idx = [(n >> 18) & 63, (n >> 12) & 63, (n >> 6) & 63, n & 63];
+        out.push(ALPHABET[idx[0] as usize] as char);
+        out.push(ALPHABET[idx[1] as usize] as char);
+        out.push(if chunk.len() > 1 {
+            ALPHABET[idx[2] as usize] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            ALPHABET[idx[3] as usize] as char
+        } else {
+            '='
+        });
+    }
+    out
 }
 
 /// Read one frame, blocking: `(kind, payload)`. Mirrors `frame::read_frame`.
@@ -38,22 +68,17 @@ pub fn read_frame(stream: &mut UnixStream) -> std::io::Result<(u8, Vec<u8>)> {
     Ok((kind[0], payload))
 }
 
-/// A `hello` control frame carrying `env` (byte-exact key/value pairs) and the
-/// client cwd. Env values ride as JSON byte arrays: they need not be UTF-8.
+/// A `KIND_HELLO` frame carrying the client environment and working directory.
 pub fn hello_frame(version: u32, env: &[(&[u8], &[u8])], cwd: &str) -> Vec<u8> {
-    let arr = |bytes: &[u8]| {
-        let nums: Vec<String> = bytes.iter().map(|b| b.to_string()).collect();
-        format!("[{}]", nums.join(","))
-    };
     let pairs: Vec<String> = env
         .iter()
-        .map(|(k, v)| format!("[{},{}]", arr(k), arr(v)))
+        .map(|(k, v)| format!(r#"["{}","{}"]"#, b64(k), b64(v)))
         .collect();
     let json = format!(
-        r#"{{"t":"hello","v":{version},"cwd":"{cwd}","env":[{}]}}"#,
+        r#"{{"v":{version},"cwd":"{cwd}","env":[{}]}}"#,
         pairs.join(",")
     );
-    control_frame(&json)
+    frame(3, json.as_bytes())
 }
 
 /// Complete the client side of the handshake: send a well-formed hello (this

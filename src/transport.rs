@@ -74,10 +74,8 @@ impl ThreadTransport {
     pub fn spawn(mut sup: Supervisor, wait_tx: Sender<()>) -> ThreadTransport {
         let (wake_tx, wake_rx) = channel::<Wake>();
         let (evt_tx, evt_rx) = channel::<Event>();
-        // The in-process "connection": client and core are the same process, so
-        // its own env/cwd *is* the launch context. The daemon path receives the
-        // same Hello over the socket handshake instead.
-        sup.apply(crate::protocol::hello_here());
+        // The in-process core uses this process's launch context.
+        sup.set_launch_context(crate::protocol::LaunchContext::here());
         // Install the waker before the thread starts, so tasks spawned on the core
         // can signal output back to this same loop.
         sup.set_waker(wake_tx.clone());
