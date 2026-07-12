@@ -162,6 +162,7 @@ dependencies = [
  "jzon",
  "nix",
  "portable-pty",
+ "rustix",
  "signal-hook",
  "vt100",
 ]
