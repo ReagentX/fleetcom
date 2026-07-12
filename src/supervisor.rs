@@ -307,8 +307,7 @@ impl Supervisor {
 
     // --- internals ------------------------------------------------------------
 
-    /// Report a writer-queue refusal (`task::WriteRefused`): the child owns the
-    /// stall, so name the task that stopped reading and what was dropped.
+    /// Report the task and message size for a bounded writer-queue refusal.
     fn notice_refused(&mut self, id: u64, what: &str, len: usize) {
         self.events.push(Event::Status(format!(
             "task {id} is not reading input; dropped {} {what}",
@@ -720,13 +719,8 @@ mod tests {
         );
     }
 
-    /// The core-thread wedge regression: a child that never reads stdin fills
-    /// the kernel PTY input buffer (KiBs), and the old synchronous `write_all`
-    /// then blocked `apply` — and with it the whole core loop — forever:
-    /// `Shutdown`, SIGTERM (registered with `SA_RESTART`, so it never
-    /// interrupts the write), and `--kill` all dead while the child ran on.
-    /// With the writer worker the paste parks off-thread and `Shutdown` stays
-    /// bounded by the grace. Pre-fix, the `Paste` apply below never returns.
+    /// A blocked PTY write runs off the core thread, so shutdown remains bounded
+    /// when a child does not read stdin.
     #[test]
     fn shutdown_survives_a_child_that_never_reads_stdin() {
         let mut s = sup(24, 80);
@@ -740,11 +734,8 @@ mod tests {
             Some(Event::Tasks(v)) => v[0].id,
             _ => panic!("expected a Tasks snapshot"),
         };
-        // 1 MiB of newline-terminated lines: orders of magnitude more than the
-        // PTY input queue holds. The newlines matter — the slave is in
-        // canonical mode, where an over-long *unterminated* line is silently
-        // discarded (macOS line discipline) instead of blocking the writer, so
-        // an all-`x` paste never reproduced the wedge.
+        // Newline-terminated input fills the canonical-mode PTY queue and
+        // blocks the writer worker while the child is not reading.
         s.apply(Command::Paste {
             id,
             bytes: b"x\n".repeat(1 << 19),
@@ -763,10 +754,8 @@ mod tests {
         );
     }
 
-    /// Overfilling the bounded writer queue refuses the whole message with a
-    /// `Status` notice naming the task, and the supervisor stays responsive.
-    /// The child never reads, so admitted messages pin `pending_write`: two
-    /// 8 MiB inputs fill the 16 MiB bound exactly and the third must bounce.
+    /// A message that would exceed the writer-queue limit is refused whole,
+    /// reported with the task ID and size, and does not block the supervisor.
     #[test]
     fn overfull_writer_queue_refuses_message_with_notice() {
         let mut s = sup(24, 80);
@@ -780,9 +769,8 @@ mod tests {
             Some(Event::Tasks(v)) => v[0].id,
             _ => panic!("expected a Tasks snapshot"),
         };
-        // Newline-terminated so the worker's write genuinely blocks (canonical
-        // mode discards over-long unterminated lines; see the wedge test) and
-        // the pending counter stays pinned for the whole test.
+        // Newline-terminated input keeps the worker blocked and its admitted
+        // byte count pending while the child does not read.
         let big = b"x\n".repeat(4 << 20);
         s.apply(Command::Input {
             id,
@@ -799,7 +787,7 @@ mod tests {
                 if m.contains(&format!("task {id}")) && m.contains("8 MiB"))),
             "no refusal notice for the overflowing message; got {evs:?}"
         );
-        // Refusal must leave the supervisor responsive: shutdown stays bounded.
+        // Shutdown remains bounded after the refusal.
         let t0 = Instant::now();
         s.apply(Command::Shutdown);
         assert!(

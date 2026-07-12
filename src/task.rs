@@ -20,16 +20,12 @@ use crate::protocol::{Lifecycle, MouseKind, ScrollAction};
 /// Number of history rows retained by each task's terminal grid.
 const SCROLLBACK: usize = 2000;
 
-/// Ceiling on bytes admitted to one task's writer queue but not yet written to
-/// the PTY. Sized at 2× the largest single message — an `app::MAX_PASTE`
-/// (8 MiB) paste plus its bracketed-paste markers — so one maximum-size paste
-/// is always admitted with headroom, while a child that stops draining stdin
-/// caps the daemon's memory instead of growing it without bound.
+/// Maximum bytes admitted to one task's writer queue but not yet written to the
+/// PTY. This admits one maximum-size paste with headroom while bounding queued
+/// input when a child stops reading.
 const MAX_PENDING_WRITE: usize = 16 * 1024 * 1024;
 
-/// Refusal from the bounded writer queue: the whole `len`-byte message was
-/// dropped. Whole messages only, never a split or truncation — a sheared
-/// escape sequence would corrupt the child's input-state machine.
+/// A whole-message refusal from the bounded writer queue.
 #[derive(Debug)]
 pub struct WriteRefused {
     /// Size of the refused message, for the client-facing notice.
@@ -169,12 +165,8 @@ pub struct Task {
     pub cwd: PathBuf,
     /// Kept for resize (`TIOCSWINSZ`); `try_clone_reader`/`take_writer` borrow it.
     master: Box<dyn MasterPty + Send>,
-    /// Feed to the detached writer worker, which owns the PTY writer. `None`
-    /// after `force_kill` (sender dropped, worker exits once its current write
-    /// errors). Writes go through this queue because a child that stops
-    /// draining stdin fills the kernel PTY input buffer (KiBs) and blocks the
-    /// writer forever — synchronously, that wedged the core thread and with it
-    /// Shutdown, SIGTERM, and `--kill`.
+    /// Sender for the detached PTY writer worker. `None` after `force_kill`.
+    /// Queuing keeps a blocked PTY write off the core thread.
     input_tx: Option<Sender<Vec<u8>>>,
     /// Bytes admitted to the writer queue but not yet fully written. Only the
     /// core thread admits (single producer), so `queue_write`'s check-then-add
@@ -322,12 +314,8 @@ impl Task {
             })
         };
 
-        // Writer worker: drains whole queued messages into the PTY master, so
-        // a blocking write parks this thread, never the core loop. Detached by
-        // dropping the JoinHandle — joining it anywhere would let a blocked
-        // write wedge teardown, recreating the bug one layer down. A blocked
-        // `write_all` unblocks with an error once the child's slave side
-        // closes; until then the thread parks harmlessly.
+        // Drain whole queued messages on a detached worker. The worker is not
+        // joined because a PTY write can block until the slave side closes.
         let (input_tx, input_rx) = channel::<Vec<u8>>();
         let pending_write = Arc::new(AtomicUsize::new(0));
         {
@@ -495,10 +483,8 @@ impl Task {
         Ok(())
     }
 
-    /// Queue `bytes` for the PTY as one indivisible message. Non-blocking: the
-    /// write happens on the writer worker, so a child that stops draining
-    /// stdin can never block the calling (core) thread. Refused whole when the
-    /// queue is over `MAX_PENDING_WRITE`.
+    /// Queue `bytes` for the PTY as one message without blocking the caller.
+    /// Refuse it whole if admission would exceed `MAX_PENDING_WRITE`.
     pub fn send_input(&mut self, bytes: &[u8]) -> Result<(), WriteRefused> {
         self.snap_live();
         self.queue_write(bytes.to_vec())
@@ -514,8 +500,7 @@ impl Task {
 
     /// Admit one whole message to the writer queue, or refuse it whole.
     fn queue_write(&self, msg: Vec<u8>) -> Result<(), WriteRefused> {
-        // A force-killed task has no queue: drop silently, exactly like the
-        // swallowed write error a dead PTY produced under synchronous writes.
+        // A force-killed task has no writer queue; discard subsequent input.
         let Some(tx) = &self.input_tx else {
             return Ok(());
         };
@@ -525,8 +510,7 @@ impl Task {
         }
         self.pending_write.fetch_add(len, Ordering::Release);
         if tx.send(msg).is_err() {
-            // The worker exited on a write error (child gone): count the bytes
-            // back out and drop the message the way a dead PTY always did.
+            // The worker has exited; remove the failed admission from the count.
             self.pending_write.fetch_sub(len, Ordering::Release);
         }
         Ok(())
@@ -621,9 +605,8 @@ impl Task {
         }
         self.kill_sent = true;
         self.handle.take(); // drop the JoinHandle -> detach, never block
-        // Same treatment for the writer worker: drop its sender, never join.
-        // It exits once its blocked write errors (the KILLed child's slave
-        // side closes) and the drained queue reports the closed channel.
+        // Close the queue without joining a worker that may still be in a PTY
+        // write. Killing the process group closes the slave side and unblocks it.
         self.input_tx.take();
     }
 }
@@ -973,9 +956,7 @@ mod tests {
         t.terminate();
     }
 
-    /// Two queued messages to a draining child arrive in order: one writer
-    /// worker per task drains a FIFO, so moving the write off-thread cannot
-    /// reorder input.
+    /// The per-task writer worker delivers queued messages in FIFO order.
     #[test]
     fn queued_writes_reach_the_child_in_order() {
         let mut t = spawn(10, "cat");
