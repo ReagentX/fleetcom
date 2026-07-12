@@ -71,7 +71,7 @@ Press `n`, enter a command, and press `Enter`. The command runs in its own PTY a
   fleetcom   2 running · 0 idle · 0 done      by state
 
   Running
-  ✻  cargo watch -x test      test result: ok. 42 passed       9s
+  ✻  cargo watch -x test      test result: ok. 42 passed         9s
   ✻  npm run dev              VITE v5.0  ready in 312 ms         4s
 
   ❯ n run · @ dir · s sort · w save · o load
@@ -82,9 +82,9 @@ Each row is `glyph · tag · command · latest output · age`. `Space` peeks: a 
 
 ```text
   ┌─ cargo watch -x test ───────────────────────────────┐
-  │ running 3 tests                                      │
-  │ test result: ok. 42 passed; 0 failed                 │
-  │                                                      │
+  │ running 3 tests                                     │
+  │ test result: ok. 42 passed; 0 failed                │
+  │                                                     │
   └ space/esc close · enter attach ─────────────────────┘
 ```
 
@@ -100,7 +100,7 @@ Each row is `glyph · tag · command · latest output · age`. `Space` peeks: a 
   fleetcom   2 running · 0 idle · 0 done      by state
 
   In use
-  ✻ ◆cargo watch -x test      test result: ok. 42 passed      1m
+  ✻ ◆cargo watch -x test      test result: ok. 42 passed        1m
 
   Running
   ✻  npm run dev              VITE v5.0  ready in 312 ms        1m
