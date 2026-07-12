@@ -4,11 +4,12 @@
 
 mod common;
 
-use std::io::Write;
-use std::time::Duration;
+use std::{io::Write, time::Duration};
 
-use nix::sys::signal::{Signal, kill};
-use nix::unistd::Pid;
+use nix::{
+    sys::signal::{Signal, kill},
+    unistd::Pid,
+};
 
 use common::{
     PROTOCOL_VERSION, b64, control_frame, hello_frame, read_frame, start_daemon_raw, wait_until,

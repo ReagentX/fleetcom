@@ -3,12 +3,13 @@
 
 mod common;
 
-use std::io::Write;
-use std::process::{Command, Stdio};
-use std::time::Duration;
+use std::{
+    io::Write,
+    process::{Command, Stdio},
+    time::Duration,
+};
 
-use nix::sys::signal::kill;
-use nix::unistd::Pid;
+use nix::{sys::signal::kill, unistd::Pid};
 
 use common::{b64, control_frame, start_daemon, wait_until};
 

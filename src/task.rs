@@ -1,21 +1,29 @@
 //! PTY-backed task ownership and process-group teardown.
 
-use std::ffi::OsString;
-use std::io::{self, Read, Write};
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::mpsc::{Sender, channel};
-use std::sync::{Arc, Mutex};
-use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant};
+use std::{
+    ffi::OsString,
+    io::{self, Read, Write},
+    path::{Path, PathBuf},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+        mpsc::{Sender, channel},
+    },
+    thread::{self, JoinHandle},
+    time::{Duration, Instant},
+};
 
-use nix::sys::signal::{Signal, killpg};
-use nix::unistd::Pid;
+use nix::{
+    sys::signal::{Signal, killpg},
+    unistd::Pid,
+};
 use portable_pty::{CommandBuilder, MasterPty, PtySize, native_pty_system};
 use rustix::process::{WaitId, WaitIdOptions, waitid};
 
-use crate::core::{Wake, Waker};
-use crate::protocol::{Lifecycle, MouseKind, ScrollAction};
+use crate::{
+    core::{Wake, Waker},
+    protocol::{Lifecycle, MouseKind, ScrollAction},
+};
 
 /// Number of history rows retained by each task's terminal grid.
 const SCROLLBACK: usize = 2000;

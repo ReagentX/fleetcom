@@ -5,11 +5,15 @@
 
 mod common;
 
-use std::io::Write;
-use std::time::{Duration, Instant};
+use std::{
+    io::Write,
+    time::{Duration, Instant},
+};
 
-use nix::sys::signal::{Signal, kill, killpg};
-use nix::unistd::Pid;
+use nix::{
+    sys::signal::{Signal, kill, killpg},
+    unistd::Pid,
+};
 
 use common::{b64, control_frame, start_daemon, wait_until};
 

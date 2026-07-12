@@ -2,8 +2,7 @@
 
 mod common;
 
-use std::io::Write;
-use std::time::Duration;
+use std::{io::Write, time::Duration};
 
 use common::{
     control_frame, frame, hello_frame, read_frame, start_daemon, start_daemon_raw, wait_until,

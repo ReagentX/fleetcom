@@ -4,16 +4,19 @@
 //! a task snapshot plus the watched screen), and `drain` (take the queued
 //! `Event`s).
 
-use std::path::PathBuf;
-use std::sync::mpsc::Sender;
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::{
+    path::PathBuf,
+    sync::{Arc, Mutex, mpsc::Sender},
+    time::{Duration, Instant},
+};
 
-use crate::core::{Wake, Waker};
-use crate::path;
-use crate::protocol::{Command, Event, LaunchContext, ScreenView, ScrollAction, TaskView};
-use crate::session::{self, SessionConfig};
-use crate::task::Task;
+use crate::{
+    core::{Wake, Waker},
+    path,
+    protocol::{Command, Event, LaunchContext, ScreenView, ScrollAction, TaskView},
+    session::{self, SessionConfig},
+    task::Task,
+};
 
 /// No output for this long ⇒ `Lifecycle::Idle`. Owned here because the core, not
 /// the client, computes lifecycle. It holds the clock and the live parser.

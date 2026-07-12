@@ -16,13 +16,19 @@
 //!   (`started_ago`, the Active→Idle edge) that no wake announces, and the ceiling
 //!   on how long a missed wake could stall a repaint. A self-heal, not the norm.
 
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::{
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+        mpsc::{Receiver, RecvTimeoutError, Sender},
+    },
+    time::{Duration, Instant},
+};
 
-use crate::protocol::{Command, Event};
-use crate::supervisor::Supervisor;
+use crate::{
+    protocol::{Command, Event},
+    supervisor::Supervisor,
+};
 
 /// What woke the core loop. The command source (the daemon's socket reader
 /// thread, or the in-process `ThreadTransport::send`) and every task's PTY reader
@@ -194,8 +200,7 @@ mod tests {
     /// the 200 ms backstop).
     #[test]
     fn watched_input_echoes_without_polling_delay() {
-        use std::sync::mpsc::channel;
-        use std::thread;
+        use std::{sync::mpsc::channel, thread};
 
         let cwd = std::env::current_dir().unwrap();
         let mut sup = Supervisor::new(24, 80);
