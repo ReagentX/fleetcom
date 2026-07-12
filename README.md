@@ -20,9 +20,11 @@ Configuration, on-disk layout, the session format, every command, and a first-ru
 
 Unix only: it relies on PTYs and process-group signals (`killpg`).
 
-### From crates.io
+### Cargo (recommended)
 
-- `cargo install fleetcom`
+This binary is available on [crates.io](https://crates.io/crates/fleetcom):
+
+`cargo install fleetcom` is the best way to install the app for normal use.
 
 ### From source
 
