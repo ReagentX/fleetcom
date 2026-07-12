@@ -22,6 +22,9 @@ use crate::task::Lifecycle;
 use crate::transport::{ExitIntent, SocketTransport, ThreadTransport, Transport};
 use crate::ui;
 
+/// Maximum attached paste size, leaving headroom below the frame limit.
+const MAX_PASTE: usize = 8 * 1024 * 1024;
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
     Dashboard,
@@ -863,6 +866,15 @@ impl App {
         self.status = None;
         match self.mode {
             Mode::Attached => {
+                // Avoid closing the client connection with an oversized frame.
+                if s.len() > MAX_PASTE {
+                    self.status = Some(format!(
+                        "paste dropped: {} MiB exceeds the {} MiB limit",
+                        s.len() >> 20,
+                        MAX_PASTE >> 20
+                    ));
+                    return;
+                }
                 if let Some(id) = self.focused_id {
                     self.transport.send(Command::Paste {
                         id,
@@ -899,14 +911,10 @@ impl App {
             Mode::Attached => {
                 if let Some(id) = self.focused_id {
                     // Clamp into the pane: the bottom row is fleetcom's status
-                    // bar, not a cell the child owns.
+                    // Keep the pointer coordinate within the child pane.
                     let row = m.row.min(self.pane_rows().saturating_sub(1));
-                    self.transport.send(Command::Scroll {
-                        id,
-                        up,
-                        col: m.column,
-                        row,
-                    });
+                    let col = m.column.min(self.cols.saturating_sub(1));
+                    self.transport.send(Command::Scroll { id, up, col, row });
                 }
             }
             _ => {}
@@ -973,21 +981,30 @@ impl App {
 /// Translate supported key events to legacy PTY byte sequences.
 fn key_to_bytes(code: KeyCode, mods: KeyModifiers) -> Option<Vec<u8>> {
     let ctrl = mods.contains(KeyModifiers::CONTROL);
+    let alt = mods.contains(KeyModifiers::ALT);
+    // Alt prefixes the encoded key with ESC.
+    let meta = |alt: bool, mut bytes: Vec<u8>| {
+        if alt {
+            bytes.insert(0, 0x1b);
+        }
+        bytes
+    };
     match code {
         KeyCode::Char(c) => {
-            if ctrl {
+            let base = if ctrl {
                 let b = c.to_ascii_uppercase() as u8;
                 if c == '?' {
-                    Some(vec![0x7f])
+                    vec![0x7f]
                 } else if (b'@'..=b'_').contains(&b) {
-                    Some(vec![b - b'@'])
+                    vec![b - b'@']
                 } else {
-                    Some(vec![(c as u8) & 0x1f])
+                    vec![(c as u8) & 0x1f]
                 }
             } else {
                 let mut buf = [0u8; 4];
-                Some(c.encode_utf8(&mut buf).as_bytes().to_vec())
-            }
+                c.encode_utf8(&mut buf).as_bytes().to_vec()
+            };
+            Some(meta(alt, base))
         }
         KeyCode::Enter => {
             // Modified Enter uses the meta-prefix sequence, ESC CR.
@@ -997,7 +1014,8 @@ fn key_to_bytes(code: KeyCode, mods: KeyModifiers) -> Option<Vec<u8>> {
                 Some(vec![b'\r'])
             }
         }
-        KeyCode::Backspace => Some(vec![0x7f]),
+        // Preserve Alt on Backspace.
+        KeyCode::Backspace => Some(meta(alt, vec![0x7f])),
         KeyCode::Tab => Some(vec![b'\t']),
         KeyCode::BackTab => Some(b"\x1b[Z".to_vec()),
         KeyCode::Esc => Some(vec![0x1b]),
@@ -1364,6 +1382,49 @@ mod tests {
             key_to_bytes(KeyCode::Enter, KeyModifiers::CONTROL),
             Some(vec![b'\r'])
         );
+    }
+
+    /// Alt prefixes supported character and Backspace encodings with ESC.
+    #[test]
+    fn alt_chords_get_the_meta_prefix() {
+        assert_eq!(
+            key_to_bytes(KeyCode::Char('f'), KeyModifiers::ALT),
+            Some(b"\x1bf".to_vec())
+        );
+        assert_eq!(
+            key_to_bytes(
+                KeyCode::Char('f'),
+                KeyModifiers::ALT | KeyModifiers::CONTROL
+            ),
+            Some(vec![0x1b, 0x06])
+        );
+        // Alt prefixes Backspace too.
+        assert_eq!(
+            key_to_bytes(KeyCode::Backspace, KeyModifiers::ALT),
+            Some(vec![0x1b, 0x7f])
+        );
+        assert_eq!(
+            key_to_bytes(KeyCode::Char('f'), KeyModifiers::NONE),
+            Some(b"f".to_vec())
+        );
+        assert_eq!(
+            key_to_bytes(KeyCode::Char('f'), KeyModifiers::CONTROL),
+            Some(vec![0x06])
+        );
+    }
+
+    /// An oversized attached paste is refused before it closes the connection.
+    #[test]
+    fn oversized_paste_is_refused_with_a_notice() {
+        let mut app = App::new_local(30, 100);
+        app.mode = Mode::Attached;
+        app.focused_id = Some(1);
+        app.on_paste(&"x".repeat(MAX_PASTE + 1));
+        let status = app.status.clone().unwrap_or_default();
+        assert!(status.contains("paste dropped"), "status was {status:?}");
+        // The boundary value is accepted.
+        app.on_paste(&"x".repeat(MAX_PASTE));
+        assert!(app.status.is_none(), "boundary paste must not be refused");
     }
 
     /// A paste into a text-entry mode lands as one string with control

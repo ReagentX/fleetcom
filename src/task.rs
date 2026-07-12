@@ -76,10 +76,19 @@ pub fn scroll_bytes(screen: &vt100::Screen, up: bool, col: u16, row: u16) -> Opt
             MouseProtocolEncoding::Sgr => {
                 format!("\x1b[<{};{};{}M", button, col + 1, row + 1).into_bytes()
             }
-            // Default/UTF-8: single-byte cells, `32 + 1-based coordinate`.
-            // Clamp at 222 so the byte never exceeds 255; a wheel event right
-            // of column 223 arrives clamped rather than corrupted.
-            _ => vec![
+            // UTF-8 mouse fields encode `32 + value` up to 2047.
+            MouseProtocolEncoding::Utf8 => {
+                let mut out = b"\x1b[M".to_vec();
+                for v in [32 + button, 33 + col.min(2014), 33 + row.min(2014)] {
+                    let mut buf = [0u8; 4];
+                    // Values are bounded to valid UTF-8 scalar values.
+                    let c = char::from_u32(u32::from(v)).unwrap_or(' ');
+                    out.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
+                }
+                out
+            }
+            // Default mouse fields are single bytes and cap at 255.
+            MouseProtocolEncoding::Default => vec![
                 0x1b,
                 b'[',
                 b'M',
@@ -699,6 +708,17 @@ mod tests {
         assert_eq!(
             scroll_bytes(p.screen(), false, 500, 500),
             Some(vec![0x1b, b'[', b'M', 32 + 65, 255, 255])
+        );
+        // UTF-8 mouse coordinates can use multiple bytes.
+        p.process(b"\x1b[?1005h");
+        assert_eq!(
+            scroll_bytes(p.screen(), true, 200, 2),
+            Some(vec![0x1b, b'[', b'M', 32 + 64, 0xc3, 0xa9, 33 + 2])
+        );
+        // UTF-8 mouse coordinates cap at the protocol limit.
+        assert_eq!(
+            scroll_bytes(p.screen(), true, 5000, 5000),
+            Some(vec![0x1b, b'[', b'M', 32 + 64, 0xdf, 0xbf, 0xdf, 0xbf])
         );
     }
 
