@@ -59,11 +59,11 @@ Three inputs are richer than a keypress, and each is routed by state rather than
 
 - Shift+Enter and Alt+Enter are sent as `ESC CR`, which is distinct from plain Enter. Shift requires a terminal that reports modified keys; terminals that do not report it send plain `CR`.
 - Paste travels as one message. Bracketed-paste-aware children receive paste markers with embedded terminators removed; other children receive line endings as `CR`. Fleetcom text fields strip control characters.
-- The client captures the mouse only while the attached child requests a mouse protocol, then forwards clicks, drags, releases, and wheel events in the negotiated encoding. In that mode, use the terminal's selection override chord. Otherwise, native click-drag selection remains available; the wheel scrolls full-screen children and moves dashboard selection. It is disabled for attached inline children so arrow keys are not sent to their standard input.
+- Mouse-protocol children receive clicks, drags, releases, and wheel events in the negotiated encoding. Full-screen children without a mouse protocol use alternate scroll. For inline children without a mouse protocol, wheel-up enters Fleetcom's scrollback view. When Fleetcom captures the mouse (for mouse-protocol children, inline children, or scrollback), terminal selection requires the terminal's selection-override modifier. Otherwise, drag selects normally.
 
 #### Scrollback
 
-Tasks retain 2,000 lines of scrollback. While attached, `Shift+PageUp` opens the scroll view; `Ctrl+PageUp` and `Alt+PageUp` are alternatives for terminals that intercept Shift. The status bar shows `[scroll ↑N]`. `PageUp`/`PageDown` move by pages, `↑`/`↓` by lines, `Home` jumps to the oldest row, and the wheel scrolls. `Esc`, `Enter`, `q`, `End`, or reaching the bottom returns to live output. Typing also returns to live and forwards the key. Detaching or switching tasks resets the view.
+Tasks retain 2,000 lines of scrollback. While attached to an inline child, wheel-up over its output enters scrollback; `Shift+PageUp` also enters it (`Ctrl+PageUp` and `Alt+PageUp` work when Shift is intercepted). The status bar shows `[scroll ↑N]`. The wheel scrolls, `PageUp`/`PageDown` move by pages, `↑`/`↓` by lines, and `Home` jumps to the oldest row. `Esc`, `Enter`, `q`, `End`, or reaching the bottom returns to live output. Typing also returns to live and forwards the key. Detaching or switching tasks resets the view.
 
 #### Destroy is Shift-gated
 

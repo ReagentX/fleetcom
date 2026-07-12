@@ -84,7 +84,7 @@ Every task runs in its own pseudo-terminal, emulated with `vt100`. The same scre
 
 ### Input fidelity
 
-Attached input follows the child's terminal state. Modified Enter is sent as `ESC CR` when reported, and paste uses bracketed-paste markers only when enabled by the child. The client captures the mouse only for attached children using a mouse protocol; elsewhere, native selection remains available and the wheel uses alternate scroll for full-screen children. Tasks retain 2,000 lines of scrollback. While attached, `Shift+PageUp` opens it; paging keys and the wheel navigate, and `Esc` or typing returns to live output. Details are in [`docs/commands.md`](docs/commands.md).
+Attached input follows the child's terminal state. Modified Enter is sent as `ESC CR` when reported, and paste uses bracketed-paste markers only when enabled by the child. Mouse-protocol children receive mouse events, and full-screen children use alternate scroll. Tasks retain 2,000 lines of scrollback: for inline children, wheel-up over output enters scrollback; `Shift+PageUp` also enters it, paging keys navigate, and `Esc` or typing returns to live output. Details are in [`docs/commands.md`](docs/commands.md).
 
 ### Jobs outlive the UI
 

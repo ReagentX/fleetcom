@@ -159,8 +159,8 @@ pub struct App {
 }
 
 /// Return `(mouse_capture, alt_scroll)` for the attached child's screen.
-/// Without an attached screen, preserve native selection and enable wheel
-/// navigation through alternate scroll. Scrollback always captures the wheel.
+/// Scrollback and inline children capture the mouse; mouse-aware children
+/// receive events, while full-screen children use alternate scroll.
 fn desired_input_modes(attached: Option<&ScreenView>, view_scroll: bool) -> (bool, bool) {
     if view_scroll {
         return (true, true);
@@ -168,8 +168,10 @@ fn desired_input_modes(attached: Option<&ScreenView>, view_scroll: bool) -> (boo
     match attached {
         // Capture and forward mouse events requested by the child.
         Some(s) if s.wants_mouse => (true, true),
-        // Scroll full-screen children; disable wheel-generated arrows inline.
-        Some(s) => (false, s.alt_screen),
+        // Scroll full-screen children through alternate-scroll arrows.
+        Some(s) if s.alt_screen => (false, true),
+        // Capture wheel-up to enter scrollback for inline children.
+        Some(_) => (true, true),
         None => (false, true),
     }
 }
@@ -999,6 +1001,17 @@ impl App {
                     return;
                 }
                 if let Some(id) = self.focused_id {
+                    // Wheel-up enters scrollback for inline children that do
+                    // not receive mouse events.
+                    let inline = matches!(
+                        self.screen_for(id),
+                        Some(s) if !s.wants_mouse && !s.alt_screen
+                    );
+                    if inline && kind == MouseKind::WheelUp {
+                        self.view_scroll = true;
+                        self.send_scrollback(ScrollAction::Up(3));
+                        return;
+                    }
                     // Keep the pointer coordinate within the child pane: the
                     // bottom row is fleetcom's status bar, not the child's.
                     let row = m.row.min(self.pane_rows().saturating_sub(1));
@@ -1564,10 +1577,9 @@ mod tests {
         assert!(app.mode == Mode::Spawn, "paste must not submit");
     }
 
-    /// Capture mouse events only for children that request them; disable
-    /// alternate scroll for attached inline children.
+    /// Select capture and alternate-scroll modes by screen type.
     #[test]
-    fn capture_only_for_mouse_hungry_children() {
+    fn input_modes_match_screen_type() {
         let screen = |wants_mouse, alt_screen| ScreenView {
             id: 1,
             lines: Vec::new(),
@@ -1594,10 +1606,10 @@ mod tests {
             desired_input_modes(Some(&screen(false, true)), false),
             (false, true)
         );
-        // Inline child: wheel silenced, selection native.
+        // Inline child: capture wheel-up to enter scrollback.
         assert_eq!(
             desired_input_modes(Some(&screen(false, false)), false),
-            (false, false)
+            (true, true)
         );
         // The scroll view overrides everything: the wheel must scroll it.
         assert_eq!(
@@ -1605,6 +1617,46 @@ mod tests {
             (true, true)
         );
         assert_eq!(desired_input_modes(None, true), (true, true));
+    }
+
+    /// Wheel-up enters scrollback for inline children, but forwards for
+    /// mouse-aware children.
+    #[test]
+    fn wheel_up_enters_scroll_view_for_inline_children() {
+        let mut app = App::new_local(30, 100);
+        let dir = app.invocation_dir.clone();
+        app.spawn_in("sleep 5", dir);
+        app.pump();
+        app.resolve_selection();
+        app.attach();
+        let id = app.focused_id.expect("attached");
+        let screen = |wants_mouse| ScreenView {
+            id,
+            lines: Vec::new(),
+            formatted: Vec::new(),
+            cursor: (0, 0),
+            hide_cursor: false,
+            wants_mouse,
+            alt_screen: false,
+            scrollback: 0,
+        };
+        let wheel_up = MouseEvent {
+            kind: MouseEventKind::ScrollUp,
+            column: 0,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        };
+
+        // Inline child: wheel-up enters scrollback.
+        app.focused_screen = Some(screen(false));
+        app.on_mouse(wheel_up);
+        assert!(app.view_scroll, "wheel-up must open the scroll view");
+
+        // Mouse-aware child: wheel-up forwards instead.
+        app.view_scroll = false;
+        app.focused_screen = Some(screen(true));
+        app.on_mouse(wheel_up);
+        assert!(!app.view_scroll, "mouse-aware children keep their wheel");
     }
 
     /// Scrollback opens with modified PageUp and closes on Esc or typing.
