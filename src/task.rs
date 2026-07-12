@@ -13,7 +13,10 @@ use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system}
 use rustix::process::{WaitId, WaitIdOptions, waitid};
 
 use crate::core::{Wake, Waker};
-use crate::protocol::MouseKind;
+use crate::protocol::{MouseKind, ScrollAction};
+
+/// Number of history rows retained by each task's terminal grid.
+const SCROLLBACK: usize = 2000;
 
 /// Map a dependency error (portable-pty returns `anyhow`) into `io::Error` so
 /// the whole crate speaks stdlib `io::Result` and never grows an `anyhow` dep.
@@ -265,7 +268,7 @@ impl Task {
         let mut reader = pair.master.try_clone_reader().map_err(io_err)?;
         let writer = pair.master.take_writer().map_err(io_err)?;
 
-        let parser = Arc::new(Mutex::new(vt100::Parser::new(rows, cols, 0)));
+        let parser = Arc::new(Mutex::new(vt100::Parser::new(rows, cols, SCROLLBACK)));
         let last_activity = Arc::new(Mutex::new(Instant::now()));
 
         let handle = {
@@ -437,8 +440,33 @@ impl Task {
     }
 
     pub fn send_input(&mut self, bytes: &[u8]) -> io::Result<()> {
+        // Input returns the viewport to live before writing to the PTY.
+        {
+            let mut p = grid(&self.parser);
+            if p.screen().scrollback() > 0 {
+                p.screen_mut().set_scrollback(0);
+            }
+        }
         self.writer.write_all(bytes)?;
         self.writer.flush()
+    }
+
+    /// Move the scrollback viewport, clamped to retained history.
+    pub fn scroll_view(&mut self, action: ScrollAction) {
+        let mut p = grid(&self.parser);
+        let cur = p.screen().scrollback();
+        let target = match action {
+            ScrollAction::Up(n) => cur.saturating_add(n as usize),
+            ScrollAction::Down(n) => cur.saturating_sub(n as usize),
+            ScrollAction::Top => usize::MAX,
+            ScrollAction::Live => 0,
+        };
+        p.screen_mut().set_scrollback(target);
+    }
+
+    /// Rows the viewport is scrolled back from live output.
+    pub fn scroll_offset(&self) -> usize {
+        grid(&self.parser).screen().scrollback()
     }
 
     /// Forward a clipboard paste in whichever shape the child negotiated; see
@@ -812,6 +840,37 @@ mod tests {
             mouse_bytes(p.screen(), release, 4, 2),
             Some(vec![0x1b, b'[', b'M', 32 + 3, 33 + 4, 33 + 2])
         );
+    }
+
+    /// Scrollback clamps at both ends and input returns to live output.
+    #[test]
+    fn viewport_scrolls_and_snaps_live_on_input() {
+        let mut t = spawn(9, "cat");
+        // Feed enough rows to create scrollback.
+        for i in 0..50 {
+            grid(&t.parser).process(format!("line{i}\r\n").as_bytes());
+        }
+        assert_eq!(t.scroll_offset(), 0);
+        t.scroll_view(ScrollAction::Up(10));
+        assert_eq!(t.scroll_offset(), 10);
+        t.scroll_view(ScrollAction::Down(4));
+        assert_eq!(t.scroll_offset(), 6);
+        t.scroll_view(ScrollAction::Top);
+        let top = t.scroll_offset();
+        assert!(top > 0);
+        assert!(
+            t.screen_lines()[0].starts_with("line0"),
+            "Top must show the oldest stored row, got {:?}",
+            t.screen_lines()[0]
+        );
+        // Large upward movement clamps at the oldest row.
+        t.scroll_view(ScrollAction::Live);
+        t.scroll_view(ScrollAction::Up(10_000));
+        assert_eq!(t.scroll_offset(), top);
+        // Input returns the viewport to live output.
+        t.send_input(b"x").unwrap();
+        assert_eq!(t.scroll_offset(), 0);
+        t.terminate();
     }
 
     /// Input hints track child terminal-mode changes.

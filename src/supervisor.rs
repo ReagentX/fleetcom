@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 
 use crate::core::{Wake, Waker};
 use crate::path;
-use crate::protocol::{Command, Event, ScreenView, TaskView};
+use crate::protocol::{Command, Event, ScreenView, ScrollAction, TaskView};
 use crate::session::{self, SessionConfig};
 use crate::task::Task;
 
@@ -20,8 +20,8 @@ use crate::task::Task;
 /// the client, computes lifecycle. It holds the clock and the live parser.
 const IDLE_AFTER: Duration = Duration::from_millis(600);
 
-/// Send-on-change fingerprint for the watched screen and its input hints.
-type LastScreen = (u64, Vec<u8>, (u16, u16), bool, (bool, bool));
+/// Send-on-change fingerprint for the watched screen and scrollback offset.
+type LastScreen = (u64, Vec<u8>, (u16, u16), bool, (bool, bool), usize);
 
 /// Ceiling for PTY dimensions accepted from a (possibly crafted) `Resize`. A 0
 /// dimension underflows vt100 (`grid.rs` does `size.rows - 1`): panic in debug,
@@ -171,8 +171,13 @@ impl Supervisor {
                 }
             }
             Command::Watch { id } => {
-                // A new target must receive a complete screen.
+                // Reset the previous task's viewport before changing targets.
                 if id != self.watched {
+                    if let Some(old) = self.watched
+                        && let Some(t) = self.by_id_mut(old)
+                    {
+                        t.scroll_view(ScrollAction::Live);
+                    }
                     self.last_screen = None;
                 }
                 self.watched = id;
@@ -193,6 +198,11 @@ impl Supervisor {
             Command::Mouse { id, kind, col, row } => {
                 if let Some(t) = self.by_id_mut(id) {
                     let _ = t.send_mouse(kind, col, row);
+                }
+            }
+            Command::Scrollback { id, action } => {
+                if let Some(t) = self.by_id_mut(id) {
+                    t.scroll_view(action);
                 }
             }
             Command::SaveSession { name } => self.save_session(&name),
@@ -265,23 +275,26 @@ impl Supervisor {
         {
             let (formatted, cursor, hide_cursor) = t.formatted();
             let hints = t.input_hints();
+            let sb = t.scroll_offset();
             // Send only when rendering or input-policy state changes.
             let unchanged = matches!(
                 &self.last_screen,
-                Some((lid, lf, lc, lh, lhints))
+                Some((lid, lf, lc, lh, lhints, lsb))
                     if *lid == id && *lf == formatted && *lc == cursor
-                        && *lh == hide_cursor && *lhints == hints
+                        && *lh == hide_cursor && *lhints == hints && *lsb == sb
             );
             if !unchanged {
-                self.last_screen = Some((id, formatted.clone(), cursor, hide_cursor, hints));
+                self.last_screen = Some((id, formatted.clone(), cursor, hide_cursor, hints, sb));
                 self.events.push(Event::Screen(ScreenView {
                     id,
                     lines: t.screen_lines(),
                     formatted,
                     cursor,
-                    hide_cursor,
+                    // Hide the live cursor while displaying scrollback.
+                    hide_cursor: hide_cursor || sb > 0,
                     wants_mouse: hints.0,
                     alt_screen: hints.1,
+                    scrollback: sb,
                 }));
             }
         }

@@ -61,6 +61,10 @@ Three inputs are richer than a keypress, and each is routed by state rather than
 - Paste travels as one message. Bracketed-paste-aware children receive paste markers with embedded terminators removed; other children receive line endings as `CR`. Fleetcom text fields strip control characters.
 - The client captures the mouse only while the attached child requests a mouse protocol, then forwards clicks, drags, releases, and wheel events in the negotiated encoding. In that mode, use the terminal's selection override chord. Otherwise, native click-drag selection remains available; the wheel scrolls full-screen children and moves dashboard selection. It is disabled for attached inline children so arrow keys are not sent to their standard input.
 
+#### Scrollback
+
+Tasks retain 2,000 lines of scrollback. While attached, `Shift+PageUp` opens the scroll view; `Ctrl+PageUp` and `Alt+PageUp` are alternatives for terminals that intercept Shift. The status bar shows `[scroll ↑N]`. `PageUp`/`PageDown` move by pages, `↑`/`↓` by lines, `Home` jumps to the oldest row, and the wheel scrolls. `Esc`, `Enter`, `q`, `End`, or reaching the bottom returns to live output. Typing also returns to live and forwards the key. Detaching or switching tasks resets the view.
+
 #### Destroy is Shift-gated
 
 `X` kills a running task or removes a finished one. Removal also terminates remaining processes in the task's process group, escalating from `TERM` to `KILL` after two seconds. Lowercase `x` and Ctrl-X do nothing.
