@@ -13,7 +13,7 @@ use portable_pty::{CommandBuilder, MasterPty, PtySize, native_pty_system};
 use rustix::process::{WaitId, WaitIdOptions, waitid};
 
 use crate::core::{Wake, Waker};
-use crate::protocol::{MouseKind, ScrollAction};
+use crate::protocol::{Lifecycle, MouseKind, ScrollAction};
 
 /// Number of history rows retained by each task's terminal grid.
 const SCROLLBACK: usize = 2000;
@@ -141,16 +141,6 @@ pub fn mouse_bytes(screen: &vt100::Screen, kind: MouseKind, col: u16, row: u16) 
         return Some(arrow.repeat(3));
     }
     None
-}
-
-/// Process-derived lifecycle state, independent of the user's `tagged` intent.
-/// `Idle` means no recent output, not that the process is waiting for input.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Lifecycle {
-    Active,
-    Idle,
-    Ok,
-    Failed,
 }
 
 pub struct Task {

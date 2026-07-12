@@ -11,8 +11,7 @@ use crossterm::{
 
 use crate::app::{App, DirKind, Mode, Row, scroll_window};
 use crate::format::{pad, rel_time, truncate};
-use crate::protocol::TaskView;
-use crate::task::Lifecycle;
+use crate::protocol::{Lifecycle, TaskView};
 
 pub fn render(out: &mut Stdout, app: &mut App) -> io::Result<()> {
     let mut buf: Vec<u8> = Vec::with_capacity(app.cols as usize * app.rows as usize * 3 + 128);
@@ -31,7 +30,7 @@ pub fn render(out: &mut Stdout, app: &mut App) -> io::Result<()> {
             render_session_picker(&mut buf, app)?;
         }
         Mode::Disconnected => render_disconnected(&mut buf, app)?,
-        _ => render_dashboard(&mut buf, app)?,
+        Mode::Dashboard | Mode::Spawn | Mode::SaveSession => render_dashboard(&mut buf, app)?,
     }
     // Repaint only on change: a stable frame (idle tasks, no input) is a no-op,
     // so there is nothing to flicker and nothing to burn CPU on.
@@ -73,13 +72,11 @@ fn render_dashboard(out: &mut impl Write, app: &App) -> io::Result<()> {
         }
     }
     // List region: rows 2..=list_bottom. Command line and footer sit below.
-    // The section/task rows come pre-flattened from `app.rows()`; the scroll
-    // window slides over them, so the selected row is always drawn however many
-    // tasks the fleet holds.
+    // Scroll over section and task rows together to keep the selection visible.
     let list_top = 2u16;
     let list_bottom = rows.saturating_sub(3);
     let height = (usize::from(list_bottom) + 1).saturating_sub(usize::from(list_top));
-    let list = app.rows();
+    let list = app.list_rows();
     let sel_row = app.selected_row(&list);
     let (start, count) = scroll_window(sel_row.unwrap_or(0), list.len(), height);
 

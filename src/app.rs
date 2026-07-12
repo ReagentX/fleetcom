@@ -16,10 +16,11 @@ use crossterm::event::{
 use crossterm::{execute, style::Print};
 
 use crate::path;
-use crate::protocol::{Command, Event, MouseBtn, MouseKind, ScreenView, ScrollAction, TaskView};
+use crate::protocol::{
+    Command, Event, Lifecycle, MouseBtn, MouseKind, ScreenView, ScrollAction, TaskView,
+};
 use crate::session;
 use crate::supervisor::Supervisor;
-use crate::task::Lifecycle;
 use crate::transport::{ExitIntent, SocketTransport, ThreadTransport, Transport};
 use crate::ui;
 
@@ -177,7 +178,7 @@ fn desired_input_modes(attached: Option<&ScreenView>, view_scroll: bool) -> (boo
 }
 
 /// Dashboard grouping bucket: tagged tasks first, then live, then completed.
-pub fn bucket(v: &TaskView) -> u8 {
+fn bucket(v: &TaskView) -> u8 {
     if v.tagged {
         0
     } else if matches!(v.lifecycle, Lifecycle::Ok | Lifecycle::Failed) {
@@ -225,7 +226,7 @@ impl App {
                 self.watched = None;
                 self.selected_id = None;
                 self.mode = Mode::Dashboard;
-                self.status = Some("reconnected to fresh daemon".to_string());
+                self.status = Some("reconnected".to_string());
             }
             Err(e) => self.status = Some(format!("reconnect failed: {e}")),
         }
@@ -385,11 +386,9 @@ impl App {
         self.sections().into_iter().flat_map(|(_, v)| v).collect()
     }
 
-    /// The dashboard list as flat rows, section headers interleaved with their
-    /// tasks: the unit the scroll window slides over. Windowing rows (not tasks)
-    /// is what keeps headers and their tasks aligned when the list is taller
-    /// than the screen.
-    pub fn rows(&self) -> Vec<Row> {
+    /// Dashboard rows in render order, with section headers interleaved.
+    /// Scrolling over rows keeps each header aligned with its tasks.
+    pub fn list_rows(&self) -> Vec<Row> {
         let mut out = Vec::new();
         for (label, idxs) in self.sections() {
             out.push(Row::Section(label));
@@ -1443,7 +1442,7 @@ mod tests {
         app.pump();
 
         app.group_mode = GroupMode::Dir;
-        let rows = app.rows();
+        let rows = app.list_rows();
         assert_eq!(rows.len(), 4, "two sections, one task each");
         assert_eq!(rows[0], Row::Section(app.invocation_label.clone()));
         assert!(matches!(rows[1], Row::Task(i) if app.views[i].id == 1));
@@ -1469,7 +1468,7 @@ mod tests {
         let height = 4;
         for step in 0..10 {
             app.select_down();
-            let rows = app.rows();
+            let rows = app.list_rows();
             let sel = app.selected_row(&rows).expect("selection always resolves");
             let (start, count) = scroll_window(sel, rows.len(), height);
             assert!(
@@ -1479,7 +1478,7 @@ mod tests {
         }
         for step in 0..10 {
             app.select_up();
-            let rows = app.rows();
+            let rows = app.list_rows();
             let sel = app.selected_row(&rows).expect("selection always resolves");
             let (start, count) = scroll_window(sel, rows.len(), height);
             assert!(
@@ -1675,14 +1674,20 @@ mod tests {
         let mut out = io::stdout();
 
         let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
-        app.on_key_attached(&mut out, KeyEvent::new(KeyCode::PageUp, KeyModifiers::SHIFT))
-            .unwrap();
+        app.on_key_attached(
+            &mut out,
+            KeyEvent::new(KeyCode::PageUp, KeyModifiers::SHIFT),
+        )
+        .unwrap();
         assert!(app.view_scroll, "Shift+PageUp must enter the scroll view");
         app.on_key_attached(&mut out, key(KeyCode::Esc)).unwrap();
         assert!(!app.view_scroll, "Esc must return to live");
 
-        app.on_key_attached(&mut out, KeyEvent::new(KeyCode::PageUp, KeyModifiers::CONTROL))
-            .unwrap();
+        app.on_key_attached(
+            &mut out,
+            KeyEvent::new(KeyCode::PageUp, KeyModifiers::CONTROL),
+        )
+        .unwrap();
         assert!(app.view_scroll, "Ctrl+PageUp is an entry fallback");
         app.on_key_attached(&mut out, key(KeyCode::Char('x')))
             .unwrap();

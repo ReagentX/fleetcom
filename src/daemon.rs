@@ -235,7 +235,7 @@ pub fn connect_ready_bounded() -> io::Result<UnixStream> {
 }
 
 /// Connect to the daemon or start one, then wait up to one second for its socket.
-pub fn connect_or_autostart() -> io::Result<UnixStream> {
+fn connect_or_autostart() -> io::Result<UnixStream> {
     let path = socket_path();
     if let Ok(s) = UnixStream::connect(&path) {
         return Ok(s);
@@ -334,16 +334,16 @@ pub fn run_kill() -> io::Result<()> {
     ))
 }
 
-/// Send a `Shutdown` frame when the lock file contains no usable pid, blocking
-/// until the daemon closes the socket after stopping its jobs. Hellos first:
-/// the daemon refuses commands before the handshake, and this path is same-binary so
-/// the versions always match.
+/// Send `Shutdown` when the lock file has no usable pid. Complete the handshake
+/// first, then wait for the daemon to close the socket after stopping its jobs.
 fn kill_via_socket() -> io::Result<()> {
     let path = socket_path();
     match UnixStream::connect(&path) {
         Ok(mut s) => {
             let (kind, payload) = encode_hello(&LaunchContext::here());
             write_frame(&mut s, kind, &payload)?;
+            let (kind, payload) = read_frame(&mut s)?;
+            check_hello_ack(kind, &payload)?;
             let (kind, payload) = encode_command(&Command::Shutdown);
             write_frame(&mut s, kind, &payload)?;
             let mut buf = [0u8; 256];
