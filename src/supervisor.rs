@@ -48,6 +48,20 @@ pub struct Supervisor {
     /// removal, escalated to KILL by `reap` at grace end, and dropped once the
     /// leader's zombie is collected. Invisible to `tick` snapshots, so the row
     /// disappears instantly while the sweep runs behind it.
+    ///
+    /// Residency is the full `kill_grace` for *every* entry — including the
+    /// common one, removing a long-finished task whose group holds nothing but
+    /// the leader's zombie — because collection is gated on the end-of-grace
+    /// KILL and no earlier exit is sound: a zombie is still a group member, so
+    /// `killpg(pgid, 0)` succeeds on a dead group and can't probe emptiness;
+    /// reader-thread EOF misses stragglers that redirected their stdio off the
+    /// PTY (`nohup cmd >/dev/null &`); and dropping the PTY master would hang
+    /// up the terminal and HUP the group, pre-empting the very grace being
+    /// honored. What an entry actually holds for those ≤2 s: the master fd and
+    /// the vt100 grid (the writer is shed on entry, and a finished leader's
+    /// reader thread has already exited with its cloned fd, so clearing twenty
+    /// finished rows parks ≈20 fds, not threads). `shutdown_all` waits the
+    /// graveyard out, so this residency is also the quit-after-remove ceiling.
     graveyard: Vec<Task>,
     next_id: u64,
     /// PTY content size (rows already minus the client's status bar). Every task
@@ -152,6 +166,7 @@ impl Supervisor {
                 if let Some(i) = self.index_of(id) {
                     let mut t = self.tasks.remove(i);
                     t.terminate();
+                    t.shed_writer();
                     self.graveyard.push(t);
                 }
             }
@@ -401,6 +416,7 @@ impl Supervisor {
                 // would straight-SIGKILL stragglers of the old run.
                 let mut old = std::mem::replace(&mut self.tasks[i], fresh);
                 old.terminate();
+                old.shed_writer();
                 self.graveyard.push(old);
                 // Reset the fingerprint for the replacement task's screen.
                 if self.watched == Some(id) {

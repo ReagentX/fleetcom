@@ -404,11 +404,26 @@ impl Task {
     /// caller can drop this task silently. Never blocks: a leader wedged in
     /// uninterruptible sleep (dead NFS/FUSE) stays uncollected and the caller
     /// retries next reap pass instead of hanging the daemon.
+    ///
+    /// The `kill_sent` gate is why every graveyard entry resides the full
+    /// grace, stragglers or none: `kill_sent` only turns true when the grace
+    /// expires, and no earlier exit is sound because "the group is empty" is
+    /// undetectable — see the graveyard field's docs for the accounting.
     pub fn try_collect(&mut self) -> bool {
         if self.kill_sent {
             self.collect();
         }
         self.reaped
+    }
+
+    /// Release the PTY writer once no client can reach this task again (it
+    /// entered the graveyard): nothing routes input to a removed task, and the
+    /// writer is one of the two fds a graveyard entry would otherwise hold for
+    /// its whole residency. The master stays — closing it hangs up the
+    /// terminal and HUPs the group, pre-empting the TERM grace the graveyard
+    /// exists to honor.
+    pub fn shed_writer(&mut self) {
+        self.writer = Box::new(io::sink());
     }
 
     pub fn lifecycle(&self, now: Instant, idle_after: Duration) -> Lifecycle {
