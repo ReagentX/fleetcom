@@ -108,5 +108,5 @@ Save the current set of `{directory: [commands]}` as a named recipe and reload i
 ### Known limitations
 
 - The fleet dies with the daemon. The daemon holds every task's PTY master, so daemon death of any kind closes them and the kernel hangs up each task's terminal: SIGHUP to its process group. A clean shutdown (`Q`, `--kill`, SIGTERM) delivers TERM first with a KILL after a two-second grace; a crash or SIGKILL skips that and the jobs get the bare HUP. Only HUP-immune jobs (`nohup`, `trap '' HUP`) survive a daemon crash: unowned and invisible to the next daemon, which starts empty. A panic while serving a client is contained (the connection drops, the fleet keeps running), but the daemon process itself is the fleet's single point of failure.
-- Commands run through a non-interactive shell (`$SHELL -c`), so functions and aliases defined in `~/.zshrc` are not available.
-- The daemon serves one client at a time; a second `fleetcom` connects but waits until the first disconnects (`q`).
+- Commands run through the client's non-interactive shell (`$SHELL -c`, or `/bin/sh` when `SHELL` is unset), so functions and aliases defined in `~/.zshrc` are not available.
+- The daemon serves one client at a time. A second `fleetcom` prints a waiting notice, then attaches when the active client disconnects (`q`).

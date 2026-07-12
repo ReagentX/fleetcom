@@ -70,7 +70,9 @@ pub enum Event {
     /// stored. The client blocks on this before building its transport, so a
     /// pre-handshake daemon (which answers with its first `Tasks` tick instead)
     /// is detected rather than silently served with the wrong environment.
-    HelloOk { version: u32 },
+    /// Carries no version: the daemon only acks an exact match, so a field
+    /// would always equal the client's own constant.
+    HelloOk,
     /// Full task-set snapshot; replaces the client's mirror wholesale.
     Tasks(Vec<TaskView>),
     /// The watched task's current screen (attach/peek source).
@@ -115,6 +117,11 @@ pub struct ScreenView {
 // raw tail after a small jzon header rather than bloating into a JSON number
 // array. A socket peer is just `decode_*(read_frame(...))`.
 
+/// Paths ride the wire as lossy UTF-8 strings — protocol-wide (`Spawn`,
+/// `Hello`, `TaskView`): a non-UTF-8 path arrives mangled. Accepted rather
+/// than byte-encoded like env: non-UTF-8 paths are rare, a wrong path fails
+/// visibly at spawn/resolve time (unlike a silently wrong env), and fixing it
+/// would touch every message for marginal gain.
 fn ps(p: &Path) -> String {
     p.to_string_lossy().into_owned()
 }
@@ -142,9 +149,16 @@ fn os_arr(s: &OsStr) -> jzon::JsonValue {
     a
 }
 
-/// Inverse of [`os_arr`]. `None` on any non-byte element: a malformed pair
-/// rejects the whole command (the daemon must not guess at an environment).
+/// Inverse of [`os_arr`]. `None` unless `v` is an array of bytes: a malformed
+/// pair rejects the whole command (the daemon must not guess at an
+/// environment). The explicit array check is load-bearing — jzon's `members()`
+/// on a non-array (including the `Null` that indexing a malformed pair yields)
+/// is an *empty* iterator, which would otherwise decode as an empty string and
+/// let a wrong-shape hello through with an empty-pair environment.
 fn os_from(v: &jzon::JsonValue) -> Option<OsString> {
+    if !v.is_array() {
+        return None;
+    }
     let mut bytes = Vec::with_capacity(v.len());
     for m in v.members() {
         bytes.push(u8::try_from(m.as_u64()?).ok()?);
@@ -323,10 +337,9 @@ pub fn decode_command(kind: u8, payload: &[u8]) -> Option<Command> {
 /// [raw formatted bytes]`), so the formatted firehose stays raw.
 pub fn encode_event(ev: &Event) -> (u8, Vec<u8>) {
     match ev {
-        Event::HelloOk { version } => {
+        Event::HelloOk => {
             let mut o = jzon::JsonValue::new_object();
             let _ = o.insert("t", "hello_ok");
-            let _ = o.insert("v", *version);
             (KIND_CONTROL, o.dump().into_bytes())
         }
         Event::Tasks(views) => {
@@ -384,9 +397,7 @@ pub fn decode_event(kind: u8, payload: &[u8]) -> Option<Event> {
         KIND_CONTROL => {
             let v = jzon::parse(std::str::from_utf8(payload).ok()?).ok()?;
             match v["t"].as_str()? {
-                "hello_ok" => Some(Event::HelloOk {
-                    version: v["v"].as_u32()?,
-                }),
+                "hello_ok" => Some(Event::HelloOk),
                 "tasks" => {
                     let mut views = Vec::new();
                     for tv in v["tasks"].members() {
@@ -493,9 +504,7 @@ mod tests {
 
     #[test]
     fn hello_ok_round_trips() {
-        let ack = Event::HelloOk {
-            version: PROTOCOL_VERSION,
-        };
+        let ack = Event::HelloOk;
         let (k, p) = encode_event(&ack);
         assert_eq!(k, KIND_CONTROL);
         assert_eq!(decode_event(k, &p), Some(ack));
@@ -507,6 +516,20 @@ mod tests {
     fn hello_with_malformed_env_is_rejected() {
         let json = r#"{"t":"hello","v":1,"cwd":"/","env":[[[300],[65]]]}"#;
         assert_eq!(decode_command(KIND_CONTROL, json.as_bytes()), None);
+    }
+
+    /// Wrong-*shape* pairs must reject too, not decode as empty strings: a
+    /// client that encodes env entries as JSON strings would otherwise pass
+    /// the handshake and spawn PATH-less jobs with nothing pointing back at
+    /// the malformed hello.
+    #[test]
+    fn hello_with_string_env_pairs_is_rejected() {
+        // Pair elements as strings instead of byte arrays.
+        let strings = r#"{"t":"hello","v":1,"cwd":"/","env":[["PATH","/bin"]]}"#;
+        assert_eq!(decode_command(KIND_CONTROL, strings.as_bytes()), None);
+        // Pair itself as a string: indexing it yields Null for both elements.
+        let flat = r#"{"t":"hello","v":1,"cwd":"/","env":["PATH=/bin"]}"#;
+        assert_eq!(decode_command(KIND_CONTROL, flat.as_bytes()), None);
     }
 
     #[test]

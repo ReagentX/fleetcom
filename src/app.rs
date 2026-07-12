@@ -194,7 +194,10 @@ impl App {
     fn reconnect(&mut self) {
         let wait_tx = self.wait_tx.clone();
         let build = move || -> io::Result<SocketTransport> {
-            let stream = crate::daemon::connect_ready()?;
+            // Bounded handshake: this runs inside the live UI, where the
+            // startup variant's indefinite wait (and printed notice) would
+            // freeze the client. A busy daemon lands in the status line.
+            let stream = crate::daemon::connect_ready_bounded()?;
             let read = stream.try_clone()?;
             Ok(SocketTransport::from_halves(stream, read, wait_tx))
         };
@@ -458,7 +461,7 @@ impl App {
         for ev in self.transport.poll() {
             match ev {
                 // The handshake is handled before the transport is created.
-                Event::HelloOk { .. } => {}
+                Event::HelloOk => {}
                 Event::Tasks(v) => self.views = v,
                 Event::Screen(s) => self.focused_screen = Some(s),
                 Event::Status(s) => self.status = Some(s),

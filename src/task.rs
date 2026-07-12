@@ -79,6 +79,19 @@ fn signal(waker: &Waker) {
     }
 }
 
+/// Lock the shared vt100 grid, recovering from poisoning. A vt100 panic inside
+/// the guard (the daemon survives one: `serve_client` catches it) poisons the
+/// mutex, and treating that as fatal would silently blank the task forever —
+/// the reader thread would discard all further PTY output and every render
+/// would return empty. The worst a recovered lock can hold is a mid-mutation
+/// grid: garbled cells until the next output or full repaint replaces them.
+/// Strictly better than permanently dead.
+fn grid(parser: &Mutex<vt100::Parser>) -> std::sync::MutexGuard<'_, vt100::Parser> {
+    parser
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 impl Task {
     /// Spawn `command` under `$SHELL -c` in `cwd`, in a fresh PTY sized `rows`×`cols`,
     /// with exactly `env` as the environment (the launching client's; the caller
@@ -104,12 +117,15 @@ impl Task {
             .map_err(io_err)?;
 
         // The launch context's shell, not the daemon's: a zsh client attached
-        // to a bash-started daemon still gets zsh word-splitting.
+        // to a bash-started daemon still gets zsh word-splitting. No fallback
+        // through this process's own SHELL — for an autostarted daemon that is
+        // the *first* client's env, the exact coupling per-connection context
+        // exists to remove. A client env without SHELL gets the portable
+        // default.
         let shell = env
             .iter()
             .find(|(k, _)| k == "SHELL")
             .map(|(_, v)| v.clone())
-            .or_else(|| std::env::var_os("SHELL"))
             .unwrap_or_else(|| "/bin/sh".into());
         let mut cmd = CommandBuilder::new(shell);
         // Use a non-interactive shell. Interactive startup files, aliases, and
@@ -158,9 +174,7 @@ impl Task {
                             break;
                         }
                         Ok(n) => {
-                            if let Ok(mut p) = parser.lock() {
-                                p.process(&buf[..n]);
-                            }
+                            grid(&parser).process(&buf[..n]);
                             if let Ok(mut t) = last_activity.lock() {
                                 *t = Instant::now();
                             }
@@ -277,10 +291,8 @@ impl Task {
 
     /// The dashboard preview line: the last non-blank row of the live screen.
     pub fn preview(&self) -> String {
-        let Ok(p) = self.parser.lock() else {
-            return String::new();
-        };
-        p.screen()
+        grid(&self.parser)
+            .screen()
             .contents()
             .lines()
             .rev()
@@ -292,21 +304,19 @@ impl Task {
     /// Full screen as ANSI bytes for attached mode, plus cursor state so we can
     /// place the real cursor where the child put it.
     pub fn formatted(&self) -> (Vec<u8>, (u16, u16), bool) {
-        match self.parser.lock() {
-            Ok(p) => {
-                let s = p.screen();
-                (s.contents_formatted(), s.cursor_position(), s.hide_cursor())
-            }
-            Err(_) => (Vec::new(), (0, 0), true),
-        }
+        let p = grid(&self.parser);
+        let s = p.screen();
+        (s.contents_formatted(), s.cursor_position(), s.hide_cursor())
     }
 
     /// Snapshot of visible rows for the peek overlay.
     pub fn screen_lines(&self) -> Vec<String> {
-        match self.parser.lock() {
-            Ok(p) => p.screen().contents().lines().map(str::to_string).collect(),
-            Err(_) => Vec::new(),
-        }
+        grid(&self.parser)
+            .screen()
+            .contents()
+            .lines()
+            .map(str::to_string)
+            .collect()
     }
 
     pub fn resize(&mut self, rows: u16, cols: u16) -> io::Result<()> {
@@ -318,9 +328,7 @@ impl Task {
                 pixel_height: 0,
             })
             .map_err(io_err)?;
-        if let Ok(mut p) = self.parser.lock() {
-            p.screen_mut().set_size(rows, cols);
-        }
+        grid(&self.parser).screen_mut().set_size(rows, cols);
         Ok(())
     }
 
@@ -543,5 +551,39 @@ mod tests {
             "TERM after leader exit never reached the straggler"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A poisoned grid mutex (a vt100 panic inside the guard) must degrade to
+    /// a recovered lock, not a permanently blank task: renders keep working
+    /// and the reader thread keeps feeding new output through the poison.
+    #[test]
+    fn poisoned_grid_recovers_instead_of_blanking() {
+        let mut t = spawn(7, "sleep 1; printf 'aftermath\\n'");
+        // Poison the mutex the way a mid-render panic would.
+        let parser = Arc::clone(&t.parser);
+        let _ = thread::spawn(move || {
+            let _guard = parser.lock().unwrap();
+            panic!("simulated vt100 panic");
+        })
+        .join();
+        assert!(t.parser.is_poisoned());
+
+        let _ = t.preview(); // render side must not panic or wedge
+        // Output produced *after* the poison must still reach the screen.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut preview = String::new();
+        while Instant::now() < deadline {
+            t.poll_exit().unwrap();
+            preview = t.preview();
+            if preview.contains("aftermath") {
+                break;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            preview.contains("aftermath"),
+            "reader thread stopped feeding the grid after poison; preview: {preview:?}"
+        );
+        t.terminate();
     }
 }

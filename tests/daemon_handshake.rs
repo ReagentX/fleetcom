@@ -5,7 +5,7 @@ mod common;
 use std::io::Write;
 use std::time::Duration;
 
-use common::{control_frame, hello_frame, read_frame, start_daemon_raw, wait_until};
+use common::{control_frame, hello_frame, read_frame, start_daemon, start_daemon_raw, wait_until};
 
 /// Read the refusal `Status`, assert `needle` appears, then require EOF: the
 /// daemon must close, not serve.
@@ -72,6 +72,56 @@ fn silent_client_cannot_wedge_the_daemon() {
     });
     assert!(served_next, "daemon wedged behind a silent connection");
     drop(stream);
+    drop(daemon);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The documented single-client semantics: a second client's hello gets no
+/// reply while the first is attached (it queues — the client side waits, it
+/// must never be told to `--kill` a healthy daemon), and is served the moment
+/// the first detaches.
+#[test]
+fn second_client_queues_until_first_detaches() {
+    let (dir, daemon, first) = start_daemon("queued", |_| {});
+    let sock = dir.join("default.sock");
+    let cwd = dir.display().to_string();
+
+    let mut second = std::os::unix::net::UnixStream::connect(&sock).unwrap();
+    second
+        .write_all(&hello_frame(common::PROTOCOL_VERSION, &[], &cwd))
+        .unwrap();
+    // While the first client is attached the daemon cannot even accept: the
+    // read must sit on its deadline, not fail or get an answer.
+    second
+        .set_read_timeout(Some(Duration::from_millis(1500)))
+        .unwrap();
+    match read_frame(&mut second) {
+        Err(e) => assert!(
+            matches!(
+                e.kind(),
+                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+            ),
+            "expected a queued (timed-out) read, got error {e:?}"
+        ),
+        Ok((_, p)) => panic!(
+            "daemon answered the second client while serving the first: {}",
+            String::from_utf8_lossy(&p)
+        ),
+    }
+
+    // First client detaches: the daemon returns to accept() and serves the
+    // queued hello (already sitting in the socket buffer).
+    drop(first);
+    second
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    let (_, payload) = read_frame(&mut second).expect("queued client was never served");
+    assert!(
+        String::from_utf8_lossy(&payload).contains("hello_ok"),
+        "queued client got a non-ack: {}",
+        String::from_utf8_lossy(&payload)
+    );
+
     drop(daemon);
     let _ = std::fs::remove_dir_all(&dir);
 }

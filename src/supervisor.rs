@@ -65,11 +65,12 @@ pub struct Supervisor {
     last_screen: Option<LastScreen>,
     /// The current client's launch context, from its `Hello`: every spawn
     /// (including rerun and session load) uses this env, and session-recipe
-    /// dirs resolve against this cwd. `None` until a `Hello` arrives — the
-    /// pre-handshake fallback is this process's own env/cwd, which is exactly
-    /// right in-process (`--foreground`) and merely honest in tests.
-    client_env: Option<Vec<(OsString, OsString)>>,
-    client_cwd: Option<PathBuf>,
+    /// dirs resolve against this cwd. Initialized to this process's own
+    /// context, which is the real thing for `--foreground` (client and core
+    /// share the process) and unreachable in the daemon: the handshake applies
+    /// the client's `Hello` before any command is served.
+    client_env: Vec<(OsString, OsString)>,
+    client_cwd: PathBuf,
     events: Vec<Event>,
     /// Handed to every `Task` so its reader thread can wake the core loop when the
     /// PTY produces output. The serving loop installs its sender on connect
@@ -91,31 +92,12 @@ impl Supervisor {
             cols,
             watched: None,
             last_screen: None,
-            client_env: None,
-            client_cwd: None,
+            client_env: std::env::vars_os().collect(),
+            client_cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
             events: Vec::new(),
             waker: Arc::new(Mutex::new(None)),
             kill_grace: KILL_GRACE,
         }
-    }
-
-    /// The environment for a launch: the connected client's, else this
-    /// process's own (the `--foreground` case, where client and core are the
-    /// same process).
-    fn launch_env(&self) -> Vec<(OsString, OsString)> {
-        self.client_env
-            .clone()
-            .unwrap_or_else(|| std::env::vars_os().collect())
-    }
-
-    /// Base for resolving a session recipe's relative/`~` dirs: the loading
-    /// client's cwd. Recipe dirs are absolute in practice, so this only matters
-    /// for a hand-edited entry.
-    fn launch_base(&self) -> PathBuf {
-        self.client_cwd
-            .clone()
-            .or_else(|| std::env::current_dir().ok())
-            .unwrap_or_else(|| PathBuf::from("."))
     }
 
     /// Shrink the TERM→KILL grace so escalation tests run in milliseconds.
@@ -158,8 +140,8 @@ impl Supervisor {
             // handshake, before anything reaches `apply`); here a Hello is
             // purely the launch context taking effect.
             Command::Hello { env, cwd, .. } => {
-                self.client_env = Some(env);
-                self.client_cwd = Some(cwd);
+                self.client_env = env;
+                self.client_cwd = cwd;
             }
             Command::Spawn { command, cwd } => self.spawn(&command, cwd),
             Command::Kill { id } => {
@@ -318,7 +300,7 @@ impl Supervisor {
             &cwd,
             self.rows,
             self.cols,
-            &self.launch_env(),
+            &self.client_env,
             Arc::clone(&self.waker),
         ) {
             Ok(task) => {
@@ -350,12 +332,17 @@ impl Supervisor {
             &self.tasks[i].cwd,
             self.rows,
             self.cols,
-            &self.launch_env(),
+            &self.client_env,
             Arc::clone(&self.waker),
         ) {
             Ok(mut fresh) => {
                 fresh.tagged = self.tasks[i].tagged;
-                self.tasks[i] = fresh;
+                // The displaced job exits like a Remove: TERM now, the
+                // graveyard's grace-then-KILL behind it. Dropping it here
+                // would straight-SIGKILL stragglers of the old run.
+                let mut old = std::mem::replace(&mut self.tasks[i], fresh);
+                old.terminate();
+                self.graveyard.push(old);
                 // Reset the fingerprint for the replacement task's screen.
                 if self.watched == Some(id) {
                     self.last_screen = None;
@@ -405,10 +392,8 @@ impl Supervisor {
             }
         };
         let (mut spawned, mut skipped) = (0usize, 0usize);
-        let base = self.launch_base();
-        let env = self.launch_env();
         for (dir, cmds) in &cfg {
-            let resolved = path::resolve(&base, dir);
+            let resolved = path::resolve(&self.client_cwd, dir);
             if !resolved.is_dir() {
                 skipped += cmds.len();
                 continue;
@@ -424,7 +409,7 @@ impl Supervisor {
                     &resolved,
                     self.rows,
                     self.cols,
-                    &env,
+                    &self.client_env,
                     Arc::clone(&self.waker),
                 ) {
                     self.next_id += 1;
@@ -963,6 +948,49 @@ mod tests {
             reap_until(&mut s, Duration::from_secs(5), |s| s.graveyard.is_empty()),
             "graveyard entry was never collected"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Rerun must give the displaced job the same graceful exit as Remove:
+    /// TERM through the graveyard, not the straight SIGKILL a `Drop` delivers.
+    /// The old run's HUP-immune straggler dies of the TERM while the fresh run
+    /// (same id) is already up.
+    #[test]
+    fn restart_sweeps_stragglers_of_the_old_run() {
+        use nix::sys::signal::kill;
+        let dir = scratch("restart_sweep");
+        let (spid, ready) = (dir.join("spid"), dir.join("ready"));
+        let mut s = Supervisor::new(24, 80);
+        hello_with_sh(&mut s, dir.clone());
+        let id = spawn_ready(
+            &mut s,
+            format!(
+                "trap '' HUP; sleep 300 & echo $! > {sp}; echo r > {r}",
+                sp = spid.display(),
+                r = ready.display()
+            ),
+            dir.clone(),
+            &ready,
+        );
+        let old_straggler = read_pid(&spid);
+        assert!(reap_until(&mut s, Duration::from_secs(5), |s| {
+            s.tasks.iter().all(|t| t.id != id || t.finished.is_some())
+        }));
+        assert!(kill(old_straggler, None).is_ok());
+
+        // The rerun overwrites the pid file with the *new* run's straggler.
+        s.apply(Command::Restart { id });
+        assert!(
+            reap_until(&mut s, Duration::from_secs(5), |_| kill(
+                old_straggler,
+                None
+            )
+            .is_err()),
+            "restart never swept the old run's straggler"
+        );
+        // The fresh run exists under the same id; its own straggler dies with
+        // the supervisor (Task::drop backstop).
+        assert!(s.tasks.iter().any(|t| t.id == id));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

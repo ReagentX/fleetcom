@@ -41,8 +41,14 @@ use crate::protocol::{
 };
 use crate::supervisor::Supervisor;
 
-/// Maximum duration of the hello handshake.
+/// Maximum duration of the hello handshake, on the daemon side and the
+/// client's bounded (`reconnect`) side.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How long the startup client gives the daemon to ack before concluding it
+/// is busy serving another client and announcing the wait. A free daemon acks
+/// in microseconds.
+const HELLO_PROBE: Duration = Duration::from_secs(1);
 
 /// Per-user directory holding the socket. `FLEETCOM_RUNTIME_DIR` overrides it
 /// (tests point it at an isolated temp dir); else `$XDG_RUNTIME_DIR/fleetcom`
@@ -109,35 +115,118 @@ fn ensure_runtime_dir(dir: &Path) -> io::Result<()> {
     }
 }
 
-/// Connect (autostarting if needed) and complete the hello handshake: send
-/// this process's protocol version and launch context, require the daemon's
-/// ack. Every launch this connection makes then runs under *this* client's
-/// env, and a version mismatch surfaces as one actionable error here instead
-/// of a silently wrong environment later.
-pub fn connect_ready() -> io::Result<UnixStream> {
-    let mut stream = connect_or_autostart()?;
-    let (kind, payload) = encode_command(&hello_here());
-    write_frame(&mut stream, kind, &payload)?;
-
-    stream.set_read_timeout(Some(HANDSHAKE_TIMEOUT))?;
-    let reply = read_frame(&mut stream);
+/// Read one frame under a deadline, restoring the unbounded default after.
+/// Propagates `set_read_timeout` failures: silently proceeding would leave an
+/// unbounded read exactly where the deadline is load-bearing (the daemon's
+/// accept path, the client's in-UI reconnect).
+fn read_frame_bounded(stream: &mut UnixStream, timeout: Duration) -> io::Result<(u8, Vec<u8>)> {
+    stream.set_read_timeout(Some(timeout))?;
+    let res = read_frame(stream);
     stream.set_read_timeout(None)?;
-    let (kind, payload) = reply.map_err(|_| {
+    res
+}
+
+/// Whether a read failed on its deadline. macOS reports a socket timeout as
+/// `WouldBlock`, Linux as `TimedOut`.
+fn is_timeout(e: &io::Error) -> bool {
+    matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut)
+}
+
+/// Map a failed hello-reply read to an actionable error. EOF means the daemon
+/// went away mid-handshake (a racing `--kill` or shutdown): rerunning
+/// autostarts a fresh one, so say that — not "kill and retry", which would be
+/// advice to destroy a fleet the next paragraph says no longer exists.
+fn hello_read_error(e: io::Error) -> io::Error {
+    if e.kind() == ErrorKind::UnexpectedEof {
         io::Error::new(
-            ErrorKind::TimedOut,
-            "daemon did not answer the hello; run 'fleetcom --kill' and retry",
+            ErrorKind::ConnectionAborted,
+            "the daemon closed the connection during the handshake (it may be \
+             shutting down); rerun fleetcom to start a fresh one",
         )
-    })?;
-    match decode_event(kind, &payload) {
-        Some(Event::HelloOk { .. }) => Ok(stream),
+    } else {
+        e
+    }
+}
+
+/// Interpret the first frame the daemon sends after our hello.
+fn check_hello_ack(kind: u8, payload: &[u8]) -> io::Result<()> {
+    match decode_event(kind, payload) {
+        Some(Event::HelloOk) => Ok(()),
         // The daemon's refusal names both versions; pass it through verbatim.
         Some(Event::Status(msg)) => Err(io::Error::other(msg)),
-        // A non-handshake response indicates an incompatible daemon.
+        // Anything else is a pre-handshake daemon answering with its first
+        // `Tasks` tick. Here — and only here — killing it is the right advice.
         _ => Err(io::Error::other(
             "daemon predates the protocol handshake (stale daemon from an older \
              fleetcom); run 'fleetcom --kill' and retry",
         )),
     }
+}
+
+/// Connect (autostarting if needed) and complete the hello handshake: send
+/// this process's protocol version and launch context, require the daemon's
+/// ack. Every launch this connection makes then runs under *this* client's
+/// env, and a version mismatch surfaces as one actionable error here instead
+/// of a silently wrong environment later.
+///
+/// The daemon serves one client at a time, so a slow handshake means "queued
+/// behind another client", not failure: announce it and wait without a
+/// deadline — the documented behavior. The announcement comes from a one-shot
+/// timer thread rather than a read timeout because the stall can be in the
+/// *write*: a large env can overfill the unaccepted connection's buffer, and a
+/// timed-out partial `write_all` would corrupt the framing. Callers run this
+/// *before* touching terminal state (raw mode, alternate screen), so the
+/// notice prints normally and Ctrl-C aborts cleanly while waiting.
+pub fn connect_ready() -> io::Result<UnixStream> {
+    let mut stream = connect_or_autostart()?;
+
+    let done = Arc::new(AtomicBool::new(false));
+    {
+        let done = Arc::clone(&done);
+        thread::spawn(move || {
+            thread::sleep(HELLO_PROBE);
+            if !done.load(Ordering::Relaxed) {
+                eprintln!(
+                    "fleetcom: the daemon is serving another client; waiting \
+                     to attach (Ctrl-C to abort)"
+                );
+            }
+        });
+    }
+
+    let (kind, payload) = encode_command(&hello_here());
+    write_frame(&mut stream, kind, &payload)?;
+    let reply = read_frame(&mut stream);
+    done.store(true, Ordering::Relaxed);
+    let (kind, payload) = reply.map_err(hello_read_error)?;
+    check_hello_ack(kind, &payload)?;
+    Ok(stream)
+}
+
+/// The handshake for `reconnect`: called from inside the live UI (raw mode,
+/// alternate screen), where an unbounded wait would freeze the client and a
+/// printed notice would land on the alternate screen. A busy daemon surfaces
+/// as a status-line error instead; the user retries once the other client
+/// detaches. Write is bounded too: a full send buffer (large env, unaccepted
+/// connection) must not wedge the UI either.
+pub fn connect_ready_bounded() -> io::Result<UnixStream> {
+    let mut stream = connect_or_autostart()?;
+    stream.set_write_timeout(Some(HANDSHAKE_TIMEOUT))?;
+    let (kind, payload) = encode_command(&hello_here());
+    write_frame(&mut stream, kind, &payload)?;
+    stream.set_write_timeout(None)?;
+
+    let (kind, payload) = match read_frame_bounded(&mut stream, HANDSHAKE_TIMEOUT) {
+        Err(e) if is_timeout(&e) => {
+            return Err(io::Error::new(
+                ErrorKind::TimedOut,
+                "the daemon is serving another client; retry after it detaches",
+            ));
+        }
+        other => other.map_err(hello_read_error)?,
+    };
+    check_hello_ack(kind, &payload)?;
+    Ok(stream)
 }
 
 /// Connect to the daemon or start one, then wait up to one second for its socket.
@@ -392,12 +481,8 @@ enum ServeOutcome {
 /// connects and sends nothing must not wedge the daemon — accept, reap, and
 /// `--kill` all wait behind this.
 fn handshake(stream: &mut UnixStream) -> Result<Command, String> {
-    let _ = stream.set_read_timeout(Some(HANDSHAKE_TIMEOUT));
-    let frame = read_frame(stream);
-    let _ = stream.set_read_timeout(None);
-    let Ok((kind, payload)) = frame else {
-        return Err("no hello received".to_string());
-    };
+    let (kind, payload) = read_frame_bounded(stream, HANDSHAKE_TIMEOUT)
+        .map_err(|e| format!("no valid hello received: {e}"))?;
     match decode_command(kind, &payload) {
         Some(
             hello @ Command::Hello {
@@ -429,14 +514,15 @@ fn handshake(stream: &mut UnixStream) -> Result<Command, String> {
 /// client is attached.
 ///
 /// Panics while serving end the connection without terminating the daemon.
+/// Supervisor state is best-effort afterwards (`apply` is not transactional);
+/// a panic mid-render at worst garbles one task's grid until its next repaint
+/// (`task::grid` recovers the poisoned lock rather than blanking the screen).
 fn serve_client(sup: &mut Supervisor, stream: UnixStream, stop: &AtomicBool) -> ServeOutcome {
     let mut stream = stream;
     match handshake(&mut stream) {
         Ok(hello) => {
             sup.apply(hello);
-            let (kind, payload) = encode_event(&Event::HelloOk {
-                version: PROTOCOL_VERSION,
-            });
+            let (kind, payload) = encode_event(&Event::HelloOk);
             if write_frame(&mut stream, kind, &payload).is_err() {
                 return ServeOutcome::Disconnected;
             }
