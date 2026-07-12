@@ -57,7 +57,7 @@ The first ordinary invocation starts the daemon when necessary. `--daemon` is an
 | `@` | new command in a directory you pick (with completion) |
 | `s` | toggle grouping: by state / by directory |
 | `m` | tag the task "in use" (pins it to the top) |
-| `X` | kill a running task (`TERM`, then `KILL` after 2 s), or remove a finished one (Shift-gated) |
+| `X` | kill a running task (`TERM`, then `KILL` after 2 s), or remove a finished one (Shift-gated); removal sweeps any background processes the job left in its group, with the same `TERM`-then-`KILL` grace |
 | `w` | save the current tasks as a session |
 | `o` | load a saved session |
 | `q` | disconnect; leave the daemon and jobs running |
@@ -78,9 +78,9 @@ Every task runs in its own pseudo-terminal, emulated with `vt100`. The same scre
 
 ### Jobs outlive the UI
 
-A per-user daemon owns the processes and their terminals. `q` disconnects the client and leaves everything running; the next `fleetcom` reattaches. `Q` and `fleetcom --kill` stop the daemon and terminate each job's process group with `SIGTERM`, escalating to `SIGKILL` after a two-second grace period. `SIGTERM`, `SIGINT`, and `SIGHUP` sent directly to the daemon use the same shutdown path. Because `fleetcom --kill` signals the daemon through its lock-file PID, it also works while another client occupies the socket. If the connection drops, the client discards its stale view and offers to reconnect.
+A per-user daemon owns the processes and their terminals. `q` disconnects the client and leaves everything running; the next `fleetcom` reattaches. Each launch runs under the environment and working directory of the client that requested it — connect from a venv terminal and your jobs see that venv, whichever client started the daemon. `Q` and `fleetcom --kill` stop the daemon and terminate each job's process group with `SIGTERM`, escalating to `SIGKILL` after a two-second grace period. `SIGTERM`, `SIGINT`, and `SIGHUP` sent directly to the daemon use the same shutdown path. Because `fleetcom --kill` signals the daemon through its lock-file PID, it also works while another client occupies the socket. If the connection drops, the client discards its stale view and offers to reconnect.
 
-Teardown caveat: signals go to each job's *process group*. A job that re-backgrounds itself past its own shell's exit (`cmd &`, then the shell exits) leaves that group and survives. Kill it by hand. This is deliberate: once the shell is reaped its PID can be recycled, so signalling the old group could hit an unrelated process.
+Teardown caveat: signals go to each job's *process group*, and the group stays signalable for the task's whole life — the exited leader is held unreaped until after the final sweep, which keeps its group id reserved. A `cmd &` child never leaves the group (a non-interactive shell's `&` creates no new process group), so kills and removals reach it too. What *does* escape is a job that `setsid`s or double-forks itself out of the group: that one is on its own — kill it by hand.
 
 ### Grouping and the `@` picker
 
@@ -103,12 +103,10 @@ Save the current set of `{directory: [commands]}` as a named recipe and reload i
 ### When to avoid it
 
 - For interactive multiplexing of persistent shells, use `tmux`. `fleetcom` runs one command per pane, not a shell session.
-- It is not a full process manager: crash-resilient ownership (adopting jobs
-  after a daemon *crash*, as opposed to a clean shutdown) is out of scope
+- It is not a full process manager: the fleet's lifetime is bounded by the daemon's (see the first limitation below).
 
 ### Known limitations
 
+- **The fleet dies with the daemon.** The daemon holds every task's PTY master, so daemon death of any kind closes them and the kernel hangs up each task's terminal: SIGHUP to its process group. A clean shutdown (`Q`, `--kill`, SIGTERM) delivers TERM first with a KILL after a two-second grace; a crash or SIGKILL skips that and the jobs get the bare HUP. Only HUP-immune jobs (`nohup`, `trap '' HUP`) survive a daemon crash — unowned and invisible to the next daemon, which starts empty. A panic while serving a client is contained (the connection drops, the fleet keeps running), but the daemon process itself is the fleet's single point of failure.
 - Commands run through a non-interactive shell (`$SHELL -c`), so functions and aliases defined in `~/.zshrc` are not available.
-- The daemon captures the environment of the client that **first** starts it and runs every job under that environment. A second terminal with a different `PATH` or virtualenv attaches to the same daemon, and its commands resolve against the first terminal's environment, not its own.
 - The daemon serves **one client at a time**; a second `fleetcom` connects but waits until the first disconnects (`q`).
-- The daemon can only clean up when it gets the chance: `SIGKILL` (or a crash) skips its shutdown path, and the jobs keep running, unowned. The next `fleetcom` starts an empty daemon that knows nothing about them.

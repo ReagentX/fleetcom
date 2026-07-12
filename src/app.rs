@@ -171,15 +171,16 @@ pub fn bucket(v: &TaskView) -> u8 {
 }
 
 impl App {
-    /// Default client: connect to the daemon (autostarting it if needed), so
-    /// jobs outlive the UI. The core lives in `fleetcom --daemon`, reached over the
-    /// socket.
+    /// Default client: connect to the daemon (autostarting it if needed) and
+    /// complete the hello handshake, so jobs outlive the UI and run under
+    /// *this* client's env. The core lives in `fleetcom --daemon`, reached over
+    /// the socket.
     pub fn connect(rows: u16, cols: u16) -> io::Result<App> {
-        let stream = crate::daemon::connect_or_autostart()?;
+        let stream = crate::daemon::connect_ready()?;
         // Split the stream here (the fallible part) so the transport factory in
         // `assemble` (which owns the wake sender) stays infallible.
         let read = stream.try_clone()?;
-        let mut app = App::assemble(rows, cols, move |_, _, _, wait_tx| {
+        let mut app = App::assemble(rows, cols, move |_, _, wait_tx| {
             Box::new(SocketTransport::from_halves(stream, read, wait_tx))
         });
         app.daemon_backed = true;
@@ -187,13 +188,13 @@ impl App {
     }
 
     /// Rebuild the daemon connection after a drop (autostarting a fresh daemon if
-    /// needed). A cleanly-exiting daemon kills its jobs on the way out (only a
-    /// SIGKILL or a panic can leak them), so the new session starts empty; the
-    /// mirror is cleared to match.
+    /// needed). A cleanly-exiting daemon kills its jobs on the way out (a
+    /// SIGKILL or a crash kills them rudely, via the PTY hangup), so the new
+    /// session starts empty; the mirror is cleared to match.
     fn reconnect(&mut self) {
         let wait_tx = self.wait_tx.clone();
         let build = move || -> io::Result<SocketTransport> {
-            let stream = crate::daemon::connect_or_autostart()?;
+            let stream = crate::daemon::connect_ready()?;
             let read = stream.try_clone()?;
             Ok(SocketTransport::from_halves(stream, read, wait_tx))
         };
@@ -218,24 +219,21 @@ impl App {
     /// `--foreground`: run the core in-process on a thread (no daemon). A
     /// non-daemon escape hatch, and the deterministic target the UI harnesses use.
     pub fn new_foreground(rows: u16, cols: u16) -> App {
-        App::assemble(rows, cols, |pr, c, dir, wait_tx| {
-            Box::new(ThreadTransport::spawn(
-                Supervisor::new(pr, c, dir.to_path_buf()),
-                wait_tx,
-            ))
+        App::assemble(rows, cols, |pr, c, wait_tx| {
+            Box::new(ThreadTransport::spawn(Supervisor::new(pr, c), wait_tx))
         })
     }
 
     /// Build the App around whatever transport `make` returns. The in-process
     /// transports (`ThreadTransport`, test `LocalTransport`) build a `Supervisor`
-    /// from `(pane_rows, cols, invocation_dir)`; `SocketTransport` ignores those
-    /// and talks to the daemon's supervisor instead. Either way the client then
-    /// declares its content size up front. Essential for the daemon, which
-    /// otherwise sizes PTYs at its 24x80 default; a harmless no-op in-process.
+    /// from `(pane_rows, cols)`; `SocketTransport` ignores those and talks to
+    /// the daemon's supervisor instead. Either way the client then declares its
+    /// content size up front. Essential for the daemon, which otherwise sizes
+    /// PTYs at its 24x80 default; a harmless no-op in-process.
     fn assemble(
         rows: u16,
         cols: u16,
-        make: impl FnOnce(u16, u16, &Path, Sender<()>) -> Box<dyn Transport>,
+        make: impl FnOnce(u16, u16, Sender<()>) -> Box<dyn Transport>,
     ) -> App {
         let invocation_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         let invocation_label = path::abbreviate(&invocation_dir);
@@ -246,7 +244,7 @@ impl App {
         // reader alike; one input channel from the stdin thread.
         let (wait_tx, wait_rx) = channel::<()>();
         let (input_tx, input_rx) = channel::<CtEvent>();
-        let mut transport = make(pane_rows, cols, &invocation_dir, wait_tx.clone());
+        let mut transport = make(pane_rows, cols, wait_tx.clone());
         transport.send(Command::Resize {
             rows: pane_rows,
             cols,
@@ -459,6 +457,10 @@ impl App {
     fn sync(&mut self) {
         for ev in self.transport.poll() {
             match ev {
+                // The handshake consumed the ack before the transport existed;
+                // one arriving here (an in-process core echoing nothing today)
+                // carries no state to fold.
+                Event::HelloOk { .. } => {}
                 Event::Tasks(v) => self.views = v,
                 Event::Screen(s) => self.focused_screen = Some(s),
                 Event::Status(s) => self.status = Some(s),
@@ -1056,12 +1058,8 @@ mod tests {
         /// A synchronous App: the supervisor ticks inline on `poll`, so `send`
         /// then `pump` is deterministic with no core-thread timing to race.
         fn new_local(rows: u16, cols: u16) -> App {
-            App::assemble(rows, cols, |pr, c, dir, _wait_tx| {
-                Box::new(LocalTransport::new(Supervisor::new(
-                    pr,
-                    c,
-                    dir.to_path_buf(),
-                )))
+            App::assemble(rows, cols, |pr, c, _wait_tx| {
+                Box::new(LocalTransport::new(Supervisor::new(pr, c)))
             })
         }
 

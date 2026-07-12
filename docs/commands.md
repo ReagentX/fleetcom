@@ -55,11 +55,11 @@ While attached, `Ctrl-\` returns to the dashboard. Every other key, including `C
 
 #### Destroy is Shift-gated
 
-`X` (capital) kills the selected task if it's running, or removes it from the list if it's finished. Lowercase `x` is a deliberate no-op: the same guard as `Q` vs. `q`. It is *not* `Ctrl-X`: the terminal sends byte `0x18` for both `Ctrl+x` and `Ctrl+Shift+X`, with no shift bit, so a Ctrl chord can't carry the distinction. Only an unmodified capital reliably means "yes, destroy this."
+`X` (capital) kills the selected task if it's running, or removes it from the list if it's finished. Removal also sweeps anything the job left in its process group (a `cmd &` child, for instance): `TERM` at removal, `KILL` after the 2 s grace, behind the already-gone row. Lowercase `x` is a deliberate no-op: the same guard as `Q` vs. `q`. It is *not* `Ctrl-X`: the terminal sends byte `0x18` for both `Ctrl+x` and `Ctrl+Shift+X`, with no shift bit, so a Ctrl chord can't carry the distinction. Only an unmodified capital reliably means "yes, destroy this."
 
 #### Rerun
 
-`r` re-executes a *finished* task's command using the same command string, directory, and daemon-captured environment. The task retains its ID, `◆` tag, and list position; its clock and screen reset. On a running task, `r` is a no-op because rerunning would first require a destructive kill. Rerun also works inside peek, which keeps the result visible while starting the next run.
+`r` re-executes a *finished* task's command using the same command string and directory, under the environment of the client requesting the rerun (launch context always belongs to whoever asks for the launch). The task retains its ID, `◆` tag, and list position; its clock and screen reset. On a running task, `r` is a no-op because rerunning would first require a destructive kill. Rerun also works inside peek, which keeps the result visible while starting the next run.
 
 #### Detach vs. quit
 

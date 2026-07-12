@@ -4,6 +4,7 @@
 //! sizes, and "backgrounding" an attached task is a pure focus change. The
 //! child never learns it lost the foreground.
 
+use std::ffi::OsString;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -13,6 +14,7 @@ use std::time::{Duration, Instant};
 use nix::sys::signal::{Signal, killpg};
 use nix::unistd::Pid;
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
+use rustix::process::{WaitId, WaitIdOptions, waitid};
 
 use crate::core::{Wake, Waker};
 
@@ -44,6 +46,10 @@ pub struct Task {
     master: Box<dyn MasterPty + Send>,
     writer: Box<dyn Write + Send>,
     child: Box<dyn Child + Send + Sync>,
+    /// The leader's pid, cached at spawn. portable-pty `setsid`s the child, so
+    /// this is also the job's pgid: the target for group signals and the
+    /// `WNOWAIT` status latch.
+    pid: Option<u32>,
     /// Shared with the reader thread: it writes (process bytes), the UI reads
     /// (render/preview). Contention is trivial: writes are per output chunk.
     parser: Arc<Mutex<vt100::Parser>>,
@@ -56,6 +62,19 @@ pub struct Task {
     /// When SIGTERM was sent (`terminate`): the start of the grace window the
     /// supervisor measures before escalating to SIGKILL.
     term_sent: Option<Instant>,
+    /// SIGKILL already sent to the group: the escalate-once latch `overdue`
+    /// checks. A latch rather than a group-liveness probe because there is no
+    /// portable probe: `killpg(pgid, 0)` on a zombie-only group succeeds on
+    /// Linux and fails `EPERM` on macOS.
+    kill_sent: bool,
+    /// The leader's zombie has been collected (a real, reaping wait). Until
+    /// then the exited leader stays a zombie on purpose: an unreaped pid cannot
+    /// be recycled, and a pgid can only come into existence equal to the pid of
+    /// a live process calling `setsid`/`setpgid`, so holding the zombie
+    /// reserves the pgid and makes `killpg` safe at any time — even if the
+    /// leader had moved itself to another group before exiting. After this
+    /// flips, the pid/pgid may belong to anyone: never signal again.
+    reaped: bool,
 }
 
 /// Wake the core loop that this task's screen advanced. Best-effort: the slot is
@@ -71,15 +90,18 @@ fn signal(waker: &Waker) {
 }
 
 impl Task {
-    /// Spawn `command` under `$SHELL -c` in `cwd`, in a fresh PTY sized `rows`×`cols`.
-    /// `waker` lets the reader thread nudge the core loop when the PTY produces
-    /// output, so an attached screen refreshes without a polling delay.
+    /// Spawn `command` under `$SHELL -c` in `cwd`, in a fresh PTY sized `rows`×`cols`,
+    /// with exactly `env` as the environment (the launching client's; the caller
+    /// owns any fallback policy). `waker` lets the reader thread nudge the core
+    /// loop when the PTY produces output, so an attached screen refreshes
+    /// without a polling delay.
     pub fn spawn(
         id: u64,
         command: &str,
         cwd: &Path,
         rows: u16,
         cols: u16,
+        env: &[(OsString, OsString)],
         waker: Waker,
     ) -> io::Result<Task> {
         let pair = native_pty_system()
@@ -91,18 +113,28 @@ impl Task {
             })
             .map_err(io_err)?;
 
-        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
+        // The launch context's shell, not the daemon's: a zsh client attached
+        // to a bash-started daemon still gets zsh word-splitting.
+        let shell = env
+            .iter()
+            .find(|(k, _)| k == "SHELL")
+            .map(|(_, v)| v.clone())
+            .or_else(|| std::env::var_os("SHELL"))
+            .unwrap_or_else(|| "/bin/sh".into());
         let mut cmd = CommandBuilder::new(shell);
         // Use a non-interactive shell. Interactive startup files, aliases, and
         // shell functions are not loaded.
         cmd.arg("-c");
         cmd.arg(command);
-        // Inherit the parent environment explicitly (PATH/HOME/…) and force a
-        // TERM the emulator understands, so color/interactivity are on.
-        // `vars_os` preserves non-UTF-8 environment keys and values.
-        for (k, v) in std::env::vars_os() {
+        // The job runs under the *client's* environment, verbatim: clear the
+        // builder's captured base (the daemon's own env — whatever the client
+        // that first autostarted it happened to have) so nothing leaks through
+        // where the client's env lacks a key.
+        cmd.env_clear();
+        for (k, v) in env {
             cmd.env(k, v);
         }
+        // Force a TERM the emulator understands, so color/interactivity are on.
         cmd.env("TERM", "xterm-256color");
         // Override the inherited (stale) PWD so the shell's logical cwd matches
         // where we actually put it. Otherwise prompts and `pwd` lie.
@@ -150,6 +182,7 @@ impl Task {
             })
         };
 
+        let pid = child.process_id();
         Ok(Task {
             id,
             command: command.to_string(),
@@ -157,6 +190,7 @@ impl Task {
             master: pair.master,
             writer,
             child,
+            pid,
             parser,
             last_activity,
             handle: Some(handle),
@@ -165,18 +199,70 @@ impl Task {
             started: Instant::now(),
             finished: None,
             term_sent: None,
+            kill_sent: false,
+            reaped: false,
         })
     }
 
-    /// Reap the child if it has exited; latch the exit code and finish time.
+    /// Latch the exit code and finish time if the leader has exited — without
+    /// reaping it. `WNOWAIT` leaves the zombie in place, which is what keeps
+    /// the pid (and therefore the pgid) reserved so the group stays signalable
+    /// for the task's whole life; see the `reaped` field. The zombie is
+    /// collected exactly once, at teardown (`collect`).
     pub fn poll_exit(&mut self) -> io::Result<()> {
-        if self.finished.is_none()
-            && let Some(status) = self.child.try_wait()?
-        {
-            self.exit_code = Some(status.exit_code() as i32);
+        if self.finished.is_some() || self.reaped {
+            return Ok(());
+        }
+        let Some(pid) = self
+            .pid
+            .and_then(|p| rustix::process::Pid::from_raw(p as i32))
+        else {
+            return Ok(());
+        };
+        let flags = WaitIdOptions::EXITED | WaitIdOptions::NOWAIT | WaitIdOptions::NOHANG;
+        if let Some(status) = waitid(WaitId::Pid(pid), flags)? {
+            // 128+signal mirrors the shell convention, so a KILLed job reads as
+            // 137 in the dashboard rather than masquerading as a clean exit.
+            let code = status
+                .exit_status()
+                .or_else(|| status.terminating_signal().map(|s| 128 + s))
+                .unwrap_or(1);
+            self.exit_code = Some(code);
             self.finished = Some(Instant::now());
         }
         Ok(())
+    }
+
+    /// Collect the leader's zombie: the one real, reaping wait. After this the
+    /// OS may recycle the pid/pgid, so it runs only where no further signal can
+    /// follow — `Drop`, and the graveyard sweep via `try_collect`. Non-blocking
+    /// (`try_wait` is `WNOHANG`): a leader still dying from its KILL just isn't
+    /// collected this pass and reparents to init at daemon exit in the worst
+    /// case. `finished`/`exit_code` are normally latched already; the KILL path
+    /// can get here first, so latch them from the collected status too.
+    fn collect(&mut self) {
+        if self.reaped {
+            return;
+        }
+        if let Ok(Some(status)) = self.child.try_wait() {
+            self.reaped = true;
+            if self.finished.is_none() {
+                self.exit_code = Some(status.exit_code() as i32);
+                self.finished = Some(Instant::now());
+            }
+        }
+    }
+
+    /// Graveyard step: once the KILL has gone out, try to collect the leader's
+    /// zombie. Returns true when collected — nothing left to signal, so the
+    /// caller can drop this task silently. Never blocks: a leader wedged in
+    /// uninterruptible sleep (dead NFS/FUSE) stays uncollected and the caller
+    /// retries next reap pass instead of hanging the daemon.
+    pub fn try_collect(&mut self) -> bool {
+        if self.kill_sent {
+            self.collect();
+        }
+        self.reaped
     }
 
     pub fn lifecycle(&self, now: Instant, idle_after: Duration) -> Lifecycle {
@@ -254,31 +340,35 @@ impl Task {
     }
 
     /// Ask the whole job to exit: SIGTERM to the process *group*, not just the
-    /// direct child, so a shell's foreground children get it too. TERM, not
-    /// KILL: the job gets a chance to flush and clean up. The supervisor owns
-    /// the escalation: `overdue` turns true once the grace elapses without an
-    /// exit, and `force_kill` finishes it.
+    /// direct child, so every group member gets it — including background
+    /// children a `cmd &` left behind (a non-interactive shell's `&` creates no
+    /// new group, so they never leave this one). TERM, not KILL: the job gets a
+    /// chance to flush and clean up. The supervisor owns the escalation:
+    /// `overdue` turns true once the grace elapses, and `force_kill` finishes it.
     ///
-    /// Gated on `finished.is_none()`: once we've reaped the child, its pid can
-    /// be recycled, and signalling a recycled pgid could hit an unrelated group.
-    /// The cost is that a process explicitly backgrounded past its parent's exit
-    /// (`cmd &`) may survive: an acceptable, arguably-intended outcome.
+    /// Safe even after the leader exits: the unreaped zombie reserves the pgid
+    /// (see `reaped`), and a TERM into a group with no live members is a no-op.
     /// Idempotent: the first TERM starts the grace clock; repeats don't reset it.
     pub fn terminate(&mut self) {
-        if self.finished.is_none() && self.term_sent.is_none() {
-            if let Some(pid) = self.child.process_id() {
-                // portable-pty `setsid`s the child, so its pid == its pgid.
+        if !self.reaped && self.term_sent.is_none() {
+            if let Some(pid) = self.pid {
                 let _ = killpg(Pid::from_raw(pid as i32), Signal::SIGTERM);
             }
             self.term_sent = Some(Instant::now());
         }
     }
 
-    /// Whether the TERM grace has run out: terminated, still not exited, and
-    /// `grace` past the TERM. The supervisor checks this each reap and answers
-    /// with `force_kill`.
+    /// Whether the TERM grace has run out without the KILL having gone out yet.
+    /// The supervisor checks this each reap and answers with `force_kill`.
+    ///
+    /// An escalate-once latch, deliberately not conditioned on `finished` or on
+    /// group liveness: the leader exiting promptly says nothing about TERM-
+    /// ignoring stragglers still in the group, and there is no portable probe
+    /// for "live members remain" (see `kill_sent`). So every `terminate` is
+    /// followed by exactly one group KILL at grace end — a no-op against a
+    /// group that already died, a sweep for one that didn't.
     pub fn overdue(&self, now: Instant, grace: Duration) -> bool {
-        self.finished.is_none()
+        !self.kill_sent
             && self
                 .term_sent
                 .is_some_and(|t| now.duration_since(t) >= grace)
@@ -287,18 +377,23 @@ impl Task {
     /// Kill the whole job for real: SIGKILL to the group. The PTY slave closes
     /// with it; that EOF is what lets the reader thread end.
     ///
-    /// Non-blocking on purpose: we never `join` the reader. A grandchild that
-    /// escaped the group (its own `setsid`) and kept the PTY open would make the
-    /// read and block shutdown indefinitely. The detached thread ends on EOF;
-    /// process exit reaps it.
-    /// Same pid-recycle gate as `terminate`.
+    /// Non-blocking on purpose, twice over: we never `join` the reader (a
+    /// grandchild that escaped the group via its own `setsid` and kept the PTY
+    /// open would wedge the join), and we never block waiting for the corpses —
+    /// `killpg` returns when the signals are *queued*, not when the targets are
+    /// dead, and SIGKILL itself cannot kill a process stuck in uninterruptible
+    /// sleep. Collection happens later and non-blockingly (`collect`).
+    /// `killpg` only, never `child.kill()`: the leader is in the group by
+    /// definition, and portable-pty's `ChildKiller::kill` is a trap here — it
+    /// SIGHUPs, then loops `try_wait` for up to 250 ms: a *blocking reap* that
+    /// would collect the zombie mid-flight and destroy the pgid reservation.
     pub fn force_kill(&mut self) {
-        if self.finished.is_none() {
-            if let Some(pid) = self.child.process_id() {
-                let _ = killpg(Pid::from_raw(pid as i32), Signal::SIGKILL);
-            }
-            let _ = self.child.kill();
+        if !self.reaped
+            && let Some(pid) = self.pid
+        {
+            let _ = killpg(Pid::from_raw(pid as i32), Signal::SIGKILL);
         }
+        self.kill_sent = true;
         self.handle.take(); // drop the JoinHandle -> detach, never block
     }
 }
@@ -307,8 +402,11 @@ impl Drop for Task {
     fn drop(&mut self) {
         // The last-resort backstop, not the policy point: guarantees no
         // orphaned job tree regardless of how a Task leaves scope. Graceful
-        // TERM-first teardown happens above this, in the supervisor.
+        // TERM-first teardown happens above this, in the supervisor. The
+        // collect is best-effort: an already-exited leader reaps instantly; one
+        // still dying from the KILL reparents to init, which collects it.
         self.force_kill();
+        self.collect();
     }
 }
 
@@ -320,17 +418,49 @@ mod tests {
         std::env::current_dir().unwrap()
     }
 
+    /// Tests launch under this process's own env, the same fallback the
+    /// supervisor uses when no client context has arrived.
+    fn env_here() -> Vec<(OsString, OsString)> {
+        std::env::vars_os().collect()
+    }
+
+    /// `env_here` with `SHELL` pinned to `/bin/sh`. The straggler tests assert
+    /// POSIX process-group mechanics, and zsh (a developer's likely `$SHELL`)
+    /// adds its own policy on top: it kills a `-c` shell's background jobs on
+    /// exit even under `trap '' HUP`, so the straggler would be dead before
+    /// the code under test ever ran.
+    fn sh_env() -> Vec<(OsString, OsString)> {
+        let mut env = env_here();
+        env.retain(|(k, _)| k != "SHELL");
+        env.push(("SHELL".into(), "/bin/sh".into()));
+        env
+    }
+
     /// Tests drive the reader directly, so there is no core loop to wake.
     fn no_waker() -> Waker {
         Arc::new(Mutex::new(None))
     }
 
+    fn spawn(id: u64, command: &str) -> Task {
+        Task::spawn(id, command, &here(), 24, 80, &env_here(), no_waker()).unwrap()
+    }
+
+    fn wait_finished(t: &mut Task) {
+        for _ in 0..100 {
+            t.poll_exit().unwrap();
+            if t.finished.is_some() {
+                return;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        panic!("task never finished");
+    }
+
     /// End-to-end plumbing: spawn under a PTY, the reader thread feeds vt100,
-    /// the screen reflects the output, and the exit code is reaped.
+    /// the screen reflects the output, and the exit code is latched.
     #[test]
     fn spawn_reads_output_and_exits_zero() {
-        let mut t =
-            Task::spawn(1, "printf 'alpha\\nomega\\n'", &here(), 24, 80, no_waker()).unwrap();
+        let mut t = spawn(1, "printf 'alpha\\nomega\\n'");
         let mut preview = String::new();
         for _ in 0..100 {
             t.poll_exit().unwrap();
@@ -347,14 +477,8 @@ mod tests {
 
     #[test]
     fn nonzero_exit_is_recorded() {
-        let mut t = Task::spawn(2, "exit 3", &here(), 24, 80, no_waker()).unwrap();
-        for _ in 0..100 {
-            t.poll_exit().unwrap();
-            if t.finished.is_some() {
-                break;
-            }
-            thread::sleep(Duration::from_millis(20));
-        }
+        let mut t = spawn(2, "exit 3");
+        wait_finished(&mut t);
         assert_eq!(t.exit_code, Some(3));
         assert_eq!(
             t.lifecycle(Instant::now(), Duration::from_millis(600)),
@@ -365,9 +489,78 @@ mod tests {
 
     #[test]
     fn resize_is_reflected_in_the_grid() {
-        let mut t = Task::spawn(3, "sleep 5", &here(), 24, 80, no_waker()).unwrap();
+        let mut t = Task::spawn(3, "sleep 5", &here(), 24, 80, &env_here(), no_waker()).unwrap();
         t.resize(30, 100).unwrap();
         assert_eq!(t.parser.lock().unwrap().screen().size(), (30, 100));
         t.terminate();
+    }
+
+    /// The exit latch must not reap: after `finished` latches, the leader is
+    /// still a zombie (pid reserved, so the pgid stays valid for group
+    /// signals); `Drop` collects it and only then does the pid free up.
+    #[test]
+    fn exited_leader_stays_a_zombie_until_drop() {
+        use nix::sys::signal::kill;
+        let mut t = spawn(4, "exit 7");
+        wait_finished(&mut t);
+        assert_eq!(t.exit_code, Some(7));
+        let pid = Pid::from_raw(t.pid.expect("spawn always yields a pid") as i32);
+        // Signal 0 = existence check; a zombie still exists.
+        assert!(
+            kill(pid, None).is_ok(),
+            "leader was reaped by the latch; the pgid reservation is gone"
+        );
+        drop(t);
+        // The zombie was already collectible, so Drop's collect is synchronous
+        // here: the pid is free immediately (barring an improbable instant
+        // recycle, which would fail this assertion spuriously, not silently).
+        assert!(kill(pid, None).is_err(), "Drop did not collect the zombie");
+    }
+
+    /// `terminate` after the leader has exited must still reach live group
+    /// members: the straggler case the old `finished.is_none()` gate leaked.
+    #[test]
+    fn terminate_reaches_stragglers_after_leader_exit() {
+        use nix::sys::signal::kill;
+        let dir =
+            std::env::temp_dir().join(format!("fleetcom_task_straggler_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let spid = dir.join("spid");
+        // `trap '' HUP` first: the ignore is inherited by the `&` child, which
+        // must survive its session leader's exit (leader death HUPs the
+        // foreground group) to *be* a straggler.
+        let mut t = Task::spawn(
+            5,
+            &format!("trap '' HUP; sleep 300 & echo $! > {}", spid.display()),
+            &here(),
+            24,
+            80,
+            &sh_env(),
+            no_waker(),
+        )
+        .unwrap();
+        wait_finished(&mut t); // leader exits as soon as the background job is up
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut straggler = None;
+        while straggler.is_none() && Instant::now() < deadline {
+            straggler = std::fs::read_to_string(&spid)
+                .ok()
+                .and_then(|s| s.trim().parse::<i32>().ok());
+            thread::sleep(Duration::from_millis(10));
+        }
+        let straggler = Pid::from_raw(straggler.expect("straggler pid never written"));
+        assert!(kill(straggler, None).is_ok(), "straggler should be alive");
+
+        t.terminate(); // leader already finished: the group signal must still fire
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while kill(straggler, None).is_ok() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            kill(straggler, None).is_err(),
+            "TERM after leader exit never reached the straggler"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

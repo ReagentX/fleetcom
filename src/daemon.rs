@@ -1,23 +1,31 @@
 //! The daemon: `fleetcom --daemon`. Owns the one `Supervisor`, listens on a
-//! per-user Unix socket, and serves a client at a time: reading framed
-//! `Command`s, applying them, writing framed `Event`s back. It runs the shared
-//! event-driven `core::run_loop`. The supervisor **outlives each client
-//! connection**: `q` disconnects, the jobs keep running, and the next `fleetcom`
-//! reattaches.
+//! per-user Unix socket, and serves a client at a time: a hello handshake
+//! (protocol version + the client's launch context), then framed `Command`s in,
+//! framed `Event`s back. It runs the shared event-driven `core::run_loop`. The
+//! supervisor **outlives each client connection**: `q` disconnects, the jobs
+//! keep running, and the next `fleetcom` reattaches.
 //!
 //! Autostart lives here too: a plain `fleetcom` connects to a running daemon, or
 //! spawns one (detached, its own process group) and polls the socket until it's
 //! up.
 //!
-//! SIGTERM/SIGINT/SIGHUP mean "shut down cleanly": group-kill every job, remove
-//! the socket, and exit. Jobs run in separate process groups so shutdown can
-//! terminate each complete job tree.
+//! The fleet's lifetime is bounded by the daemon's. The daemon holds every
+//! task's PTY master, so daemon death of any kind closes them, and the kernel
+//! hangs up each task's controlling terminal: SIGHUP to its foreground process
+//! group, which (job control being off under `$SHELL -c`) is the whole job.
+//! Process-group isolation does not change this — it guards against signals
+//! aimed at the daemon's *group*, not against the tty hangup. What "shut down
+//! cleanly" (SIGTERM/SIGINT/SIGHUP) buys is the *manner* of death: TERM to each
+//! job's group with a KILL after the grace, plus socket/lock cleanup. A crash
+//! or SIGKILL skips that and the jobs get the bare HUP; only HUP-immune jobs
+//! (`nohup`, `trap '' HUP`) survive it — unowned, invisible to the next daemon.
 
 use std::fs;
 use std::io::{self, ErrorKind, Read, Write};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::os::unix::process::CommandExt;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
@@ -32,8 +40,17 @@ use nix::unistd::Pid;
 
 use crate::core::{LoopExit, Wake, run_loop};
 use crate::frame::{read_frame, write_frame};
-use crate::protocol::{Command, decode_command, encode_command, encode_event};
+use crate::protocol::{
+    Command, Event, PROTOCOL_VERSION, decode_command, decode_event, encode_command, encode_event,
+    hello_here,
+};
 use crate::supervisor::Supervisor;
+
+/// How long each side waits on the other during the hello exchange. Generous:
+/// a healthy daemon acks in microseconds; this only bounds a hung or
+/// pre-handshake peer so neither side wedges (the daemon's accept/reap loop
+/// waits behind its read).
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Per-user directory holding the socket. `FLEETCOM_RUNTIME_DIR` overrides it
 /// (tests point it at an isolated temp dir); else `$XDG_RUNTIME_DIR/fleetcom`
@@ -41,16 +58,33 @@ use crate::supervisor::Supervisor;
 /// `$TMPDIR` is already per-user and the uid suffix covers a shared `/tmp` on an
 /// XDG-less Linux.
 fn runtime_dir() -> PathBuf {
-    if let Ok(d) = std::env::var("FLEETCOM_RUNTIME_DIR") {
+    resolve_runtime_dir(
+        std::env::var("FLEETCOM_RUNTIME_DIR").ok(),
+        std::env::var("XDG_RUNTIME_DIR").ok(),
+        std::env::temp_dir(),
+        nix::unistd::getuid().as_raw(),
+    )
+}
+
+/// The pure resolver behind [`runtime_dir`], with every input a parameter so
+/// tests can drive all three branches directly: env mutation is process-global
+/// and races parallel tests, and CI runners set `XDG_RUNTIME_DIR` on neither
+/// OS, so the lower branches would otherwise never execute anywhere.
+fn resolve_runtime_dir(
+    override_dir: Option<String>,
+    xdg: Option<String>,
+    tmp: PathBuf,
+    uid: u32,
+) -> PathBuf {
+    if let Some(d) = override_dir {
         return PathBuf::from(d);
     }
-    if let Ok(d) = std::env::var("XDG_RUNTIME_DIR")
+    if let Some(d) = xdg
         && !d.is_empty()
     {
         return PathBuf::from(d).join("fleetcom");
     }
-    let uid = nix::unistd::getuid().as_raw();
-    std::env::temp_dir().join(format!("fleetcom-{uid}"))
+    tmp.join(format!("fleetcom-{uid}"))
 }
 
 fn socket_path() -> PathBuf {
@@ -88,6 +122,38 @@ fn ensure_runtime_dir(dir: &Path) -> io::Result<()> {
             .mode(0o700)
             .create(dir),
         Err(e) => Err(e),
+    }
+}
+
+/// Connect (autostarting if needed) and complete the hello handshake: send
+/// this process's protocol version and launch context, require the daemon's
+/// ack. Every launch this connection makes then runs under *this* client's
+/// env, and a version mismatch surfaces as one actionable error here instead
+/// of a silently wrong environment later.
+pub fn connect_ready() -> io::Result<UnixStream> {
+    let mut stream = connect_or_autostart()?;
+    let (kind, payload) = encode_command(&hello_here());
+    write_frame(&mut stream, kind, &payload)?;
+
+    stream.set_read_timeout(Some(HANDSHAKE_TIMEOUT))?;
+    let reply = read_frame(&mut stream);
+    stream.set_read_timeout(None)?;
+    let (kind, payload) = reply.map_err(|_| {
+        io::Error::new(
+            ErrorKind::TimedOut,
+            "daemon did not answer the hello; run 'fleetcom --kill' and retry",
+        )
+    })?;
+    match decode_event(kind, &payload) {
+        Some(Event::HelloOk { .. }) => Ok(stream),
+        // The daemon's refusal names both versions; pass it through verbatim.
+        Some(Event::Status(msg)) => Err(io::Error::other(msg)),
+        // Anything else is a pre-handshake daemon: it ignored the hello it
+        // couldn't decode and opened with its first `Tasks` tick.
+        _ => Err(io::Error::other(
+            "daemon predates the protocol handshake (stale daemon from an older \
+             fleetcom); run 'fleetcom --kill' and retry",
+        )),
     }
 }
 
@@ -196,11 +262,15 @@ pub fn run_kill() -> io::Result<()> {
 }
 
 /// Send a `Shutdown` frame when the lock file contains no usable pid, blocking
-/// until the daemon closes the socket after stopping its jobs.
+/// until the daemon closes the socket after stopping its jobs. Hellos first:
+/// the daemon refuses pre-handshake commands, and this path is same-binary so
+/// the versions always match.
 fn kill_via_socket() -> io::Result<()> {
     let path = socket_path();
     match UnixStream::connect(&path) {
         Ok(mut s) => {
+            let (kind, payload) = encode_command(&hello_here());
+            write_frame(&mut s, kind, &payload)?;
             let (kind, payload) = encode_command(&Command::Shutdown);
             write_frame(&mut s, kind, &payload)?;
             let mut buf = [0u8; 256];
@@ -250,14 +320,15 @@ pub fn run_daemon() -> io::Result<()> {
     let listener = UnixListener::bind(&path)?;
     fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
 
-    let base_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     // 24x80 until the first client's Resize, which arrives before any Spawn.
-    let mut sup = Supervisor::new(24, 80, base_dir);
+    // Launch context (env, session base dir) arrives per-connection via Hello.
+    let mut sup = Supervisor::new(24, 80);
 
-    // A signalled daemon must shut down cleanly (group-kill its jobs, remove the
-    // socket) rather than die and orphan them: the tasks live in their own
-    // process groups, so daemon death alone leaves them running, unowned and
-    // invisible to the next (empty) daemon. The flag is checked in the idle
+    // A signalled daemon shuts down *cleanly*: TERM each job's group with a
+    // KILL after the grace, remove the socket. Dying without that cleanup
+    // would still kill the fleet — closing the PTY masters hangs up every
+    // job's terminal (see the module docs) — but rudely: no TERM, no grace,
+    // and HUP-immune jobs would leak unowned. The flag is checked in the idle
     // branch below and inside `run_loop` while a client is being served; both
     // observe it within ~200 ms.
     let term = Arc::new(AtomicBool::new(false));
@@ -336,13 +407,79 @@ enum ServeOutcome {
     Shutdown,
 }
 
-/// Serve one client to completion. A reader thread turns inbound frames into
+/// Read and validate the connection-opening `Hello`. `Ok` carries the decoded
+/// command for `apply` (it sets the client's launch context); `Err` carries the
+/// refusal text for the client's status line. Bounded read: a peer that
+/// connects and sends nothing must not wedge the daemon — accept, reap, and
+/// `--kill` all wait behind this.
+fn handshake(stream: &mut UnixStream) -> Result<Command, String> {
+    let _ = stream.set_read_timeout(Some(HANDSHAKE_TIMEOUT));
+    let frame = read_frame(stream);
+    let _ = stream.set_read_timeout(None);
+    let Ok((kind, payload)) = frame else {
+        return Err("no hello received".to_string());
+    };
+    match decode_command(kind, &payload) {
+        Some(
+            hello @ Command::Hello {
+                version: PROTOCOL_VERSION,
+                ..
+            },
+        ) => Ok(hello),
+        Some(Command::Hello { version, .. }) => Err(format!(
+            "protocol mismatch: daemon {} speaks v{PROTOCOL_VERSION}, client speaks \
+             v{version}; run 'fleetcom --kill' and retry",
+            env!("CARGO_PKG_VERSION"),
+        )),
+        // A recognizable command that isn't a Hello is a pre-handshake client.
+        // Refusing (not serving) is deliberate: an old daemon silently strips
+        // fields it doesn't know from a new client's commands, and the same
+        // degradation must not be tolerated in the other direction.
+        _ => Err(format!(
+            "daemon {} requires a hello handshake (older client?); upgrade the \
+             client or run 'fleetcom --kill' and retry",
+            env!("CARGO_PKG_VERSION"),
+        )),
+    }
+}
+
+/// Serve one client to completion. The hello handshake runs first (version
+/// check, launch context); then a reader thread turns inbound frames into
 /// `Wake::Cmd`s on the channel the core loop waits on; task output arrives on the
 /// same channel as `Wake::Output` (via the supervisor's waker), so `run_loop`
 /// reacts to a keystroke's echo the instant the child emits it. `stop` is the
 /// daemon's signal flag: raised, it ends the loop as a `Shutdown` even while a
 /// client is attached.
+///
+/// The serve loop runs under `catch_unwind`: a panic while serving (protocol,
+/// vt100, UI-facing encoding) must cost one connection, not the fleet — daemon
+/// death would close every PTY master and HUP every job (see the module docs).
+/// The guarantee is exactly that and no more: `apply` is not transactional, so
+/// after a panic the supervisor's *state* is best-effort while every `Task`
+/// (and the accept loop) stays intact. Re-exec-style recovery that would also
+/// preserve state was considered and deferred: `catch_unwind` removes the
+/// dominant crash source at a fraction of the complexity, and the residual
+/// (a panic outside the serve path) is small.
 fn serve_client(sup: &mut Supervisor, stream: UnixStream, stop: &AtomicBool) -> ServeOutcome {
+    let mut stream = stream;
+    match handshake(&mut stream) {
+        Ok(hello) => {
+            sup.apply(hello);
+            let (kind, payload) = encode_event(&Event::HelloOk {
+                version: PROTOCOL_VERSION,
+            });
+            if write_frame(&mut stream, kind, &payload).is_err() {
+                return ServeOutcome::Disconnected;
+            }
+        }
+        Err(reason) => {
+            eprintln!("fleetcom: refusing client: {reason}");
+            let (kind, payload) = encode_event(&Event::Status(reason));
+            let _ = write_frame(&mut stream, kind, &payload);
+            return ServeOutcome::Disconnected;
+        }
+    }
+
     let Ok(read) = stream.try_clone() else {
         return ServeOutcome::Disconnected;
     };
@@ -373,17 +510,27 @@ fn serve_client(sup: &mut Supervisor, stream: UnixStream, stop: &AtomicBool) -> 
     // and `accept`, and `--kill` could never get in. Cap how long one event
     // write may block; a timeout surfaces as an error below and drops the client.
     let _ = write.set_write_timeout(Some(Duration::from_secs(5)));
-    let outcome = run_loop(sup, &wake_rx, stop, |ev| {
-        let (kind, payload) = encode_event(ev);
-        write_frame(&mut write, kind, &payload).is_ok()
-    });
+    let outcome = catch_unwind(AssertUnwindSafe(|| {
+        run_loop(sup, &wake_rx, stop, |ev| {
+            let (kind, payload) = encode_event(ev);
+            write_frame(&mut write, kind, &payload).is_ok()
+        })
+    }));
+    // Cleanup sits *after* the catch so every exit — return or panic — passes
+    // through it: a stale waker points task reader threads at a dead channel,
+    // and a stale watch would stream the next client Screen frames it never
+    // asked for.
     sup.clear_waker();
-    // The watch dies with the connection: the next client must not inherit a
-    // Screen stream it never asked for.
     sup.clear_watch();
     match outcome {
-        LoopExit::Shutdown => ServeOutcome::Shutdown,
-        LoopExit::ClientGone => ServeOutcome::Disconnected,
+        Ok(LoopExit::Shutdown) => ServeOutcome::Shutdown,
+        Ok(LoopExit::ClientGone) => ServeOutcome::Disconnected,
+        Err(_) => {
+            // The default panic hook already wrote the message and backtrace to
+            // stderr (daemon.log); this line ties it to the consequence.
+            eprintln!("fleetcom: serve loop panicked; client dropped, fleet kept");
+            ServeOutcome::Disconnected
+        }
     }
 }
 
@@ -442,6 +589,40 @@ mod tests {
             Errno::EBADF as i32
         )));
         assert!(!transient_accept_error(&io::Error::other("no raw errno")));
+    }
+
+    /// All three resolver branches, driven directly: CI sets neither
+    /// `FLEETCOM_RUNTIME_DIR` (outside tests) nor `XDG_RUNTIME_DIR`, so going
+    /// through the env-reading wrapper would leave the lower branches
+    /// permanently unexecuted on both platforms.
+    #[test]
+    fn runtime_dir_resolution_order() {
+        let tmp = PathBuf::from("/tmpdir");
+        // Explicit override wins over everything.
+        assert_eq!(
+            resolve_runtime_dir(
+                Some("/override".into()),
+                Some("/xdg".into()),
+                tmp.clone(),
+                501
+            ),
+            PathBuf::from("/override")
+        );
+        // XDG next, namespaced.
+        assert_eq!(
+            resolve_runtime_dir(None, Some("/run/user/501".into()), tmp.clone(), 501),
+            PathBuf::from("/run/user/501/fleetcom")
+        );
+        // An *empty* XDG value is unset in spirit: fall through.
+        assert_eq!(
+            resolve_runtime_dir(None, Some(String::new()), tmp.clone(), 501),
+            PathBuf::from("/tmpdir/fleetcom-501")
+        );
+        // The uid-suffixed tmp fallback (the macOS steady state).
+        assert_eq!(
+            resolve_runtime_dir(None, None, tmp, 42),
+            PathBuf::from("/tmpdir/fleetcom-42")
+        );
     }
 
     /// A fresh dir is created private, and revalidating it succeeds (the
