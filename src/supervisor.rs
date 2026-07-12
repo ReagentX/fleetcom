@@ -227,10 +227,18 @@ impl Supervisor {
     }
 
     /// Kill every task for the quit path: TERM all groups at once, wait out one
-    /// shared grace (early exit as soon as every leader has exited), SIGKILL
-    /// the stragglers via `Task::drop`. Blocking here is fine (the core is
-    /// exiting), and the wait is bounded by the grace, paid only by jobs that
-    /// ignore their TERM. Anything the final KILLs don't collect (a leader in
+    /// shared grace (early exit as soon as every leader has exited *and* the
+    /// graveyard has drained), SIGKILL the stragglers via `Task::drop`. The
+    /// graveyard is part of the predicate because its entries hold live TERM
+    /// grace windows: dropping them here would straight-SIGKILL stragglers of a
+    /// just-removed task — the exact failure the graveyard exists to prevent.
+    /// The shared deadline still bounds them: an entry's `term_sent` predates
+    /// this call, so its escalation fires no later than `deadline`. The cost is
+    /// that quit-after-remove can block for the entry's *remaining* grace even
+    /// when its group is already empty — emptiness is undetectable (see the
+    /// graveyard docs), so the wait is the price of the grace being real.
+    /// Blocking here is fine (the core is exiting), and the wait is bounded by
+    /// the grace. Anything the final KILLs don't collect (a leader in
     /// uninterruptible sleep) reparents to init when the daemon exits moments
     /// later; blocking on it here could wedge shutdown forever.
     fn shutdown_all(&mut self) {
@@ -238,7 +246,9 @@ impl Supervisor {
             t.terminate();
         }
         let deadline = Instant::now() + self.kill_grace;
-        while self.tasks.iter().any(|t| t.finished.is_none()) && Instant::now() < deadline {
+        while (self.tasks.iter().any(|t| t.finished.is_none()) || !self.graveyard.is_empty())
+            && Instant::now() < deadline
+        {
             std::thread::sleep(Duration::from_millis(25));
             self.reap();
         }
@@ -1056,6 +1066,57 @@ mod tests {
             reap_until(&mut s, Duration::from_secs(5), |_| kill(straggler, None)
                 .is_err()),
             "reap-driven escalation never KILLed the straggler"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `Shutdown` right after `Remove` must wait out the graveyard entry's
+    /// TERM grace instead of dropping it into an instant SIGKILL (the
+    /// remove-then-quit path): the TERM-ignoring straggler is still alive at
+    /// mid-grace while `shutdown_all` blocks, and dead once it returns.
+    #[test]
+    fn shutdown_waits_for_graveyard_grace() {
+        use nix::sys::signal::kill;
+        let dir = scratch("shutdown_graveyard");
+        let (spid, ready) = (dir.join("spid"), dir.join("ready"));
+        let mut s = Supervisor::new(24, 80);
+        s.set_kill_grace(Duration::from_millis(400));
+        hello_with_sh(&mut s, dir.clone());
+        // Same straggler recipe as the kill-escalation test: HUP-immune so it
+        // survives the leader, TERM-immune so only the end-of-grace KILL can
+        // end it.
+        let id = spawn_ready(
+            &mut s,
+            format!(
+                "trap '' HUP; (trap '' TERM; exec sleep 300) & echo $! > {sp}; echo r > {r}",
+                sp = spid.display(),
+                r = ready.display()
+            ),
+            dir.clone(),
+            &ready,
+        );
+        let straggler = read_pid(&spid);
+        assert!(reap_until(&mut s, Duration::from_secs(5), |s| {
+            s.tasks.iter().all(|t| t.id != id || t.finished.is_some())
+        }));
+
+        s.apply(Command::Remove { id }); // graveyard: TERM sent, grace running
+        // Sample mid-grace from a watcher thread while `apply` below blocks in
+        // `shutdown_all`. The pre-fix code SIGKILLed the straggler at t≈0 by
+        // dropping the graveyard, so aliveness here is the whole assertion.
+        let alive_mid_grace = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(200));
+            kill(straggler, None).is_ok()
+        });
+        s.apply(Command::Shutdown);
+        assert!(
+            alive_mid_grace.join().unwrap(),
+            "straggler was KILLed before its grace elapsed"
+        );
+        assert!(
+            reap_until(&mut s, Duration::from_secs(5), |_| kill(straggler, None)
+                .is_err()),
+            "straggler survived shutdown"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
