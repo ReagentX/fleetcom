@@ -202,28 +202,41 @@ pub fn connect_ready() -> io::Result<UnixStream> {
     Ok(stream)
 }
 
+/// Map a handshake deadline to its actual meaning: the daemon serves one
+/// client at a time, so a timeout is "busy", not "broken". Both bounded
+/// branches route through here — the read (a fitting hello sent, no ack
+/// while another client is served) *and* the write (a hello too big for the
+/// unaccepted connection's socket buffer, which on macOS is 8 KB; the write
+/// is where an oversized handshake actually stalls). Non-timeout errors pass
+/// through unchanged.
+fn busy_daemon_error(e: io::Error) -> io::Error {
+    if is_timeout(&e) {
+        io::Error::new(
+            ErrorKind::TimedOut,
+            "the daemon is serving another client; retry after it detaches",
+        )
+    } else {
+        e
+    }
+}
+
 /// The handshake for `reconnect`: called from inside the live UI (raw mode,
 /// alternate screen), where an unbounded wait would freeze the client and a
 /// printed notice would land on the alternate screen. A busy daemon surfaces
 /// as a status-line error instead; the user retries once the other client
 /// detaches. Write is bounded too: a full send buffer (large env, unaccepted
-/// connection) must not wedge the UI either.
+/// connection) must not wedge the UI either. A timed-out write can leave a
+/// partial frame, but never a corrupt stream: the connection is dropped with
+/// the error, so nothing reads past it.
 pub fn connect_ready_bounded() -> io::Result<UnixStream> {
     let mut stream = connect_or_autostart()?;
     stream.set_write_timeout(Some(HANDSHAKE_TIMEOUT))?;
     let (kind, payload) = encode_command(&hello_here());
-    write_frame(&mut stream, kind, &payload)?;
+    write_frame(&mut stream, kind, &payload).map_err(busy_daemon_error)?;
     stream.set_write_timeout(None)?;
 
-    let (kind, payload) = match read_frame_bounded(&mut stream, HANDSHAKE_TIMEOUT) {
-        Err(e) if is_timeout(&e) => {
-            return Err(io::Error::new(
-                ErrorKind::TimedOut,
-                "the daemon is serving another client; retry after it detaches",
-            ));
-        }
-        other => other.map_err(hello_read_error)?,
-    };
+    let (kind, payload) = read_frame_bounded(&mut stream, HANDSHAKE_TIMEOUT)
+        .map_err(|e| hello_read_error(busy_daemon_error(e)))?;
     check_hello_ack(kind, &payload)?;
     Ok(stream)
 }
