@@ -60,7 +60,9 @@ fn from_json(text: &str) -> io::Result<SessionConfig> {
     Ok(cfg)
 }
 
-// --- fs surface, taking an explicit dir so tests avoid the real config path --
+// --- fs surface: callers supply the root. The supervisor resolves it from the
+// connection's launch context; `sessions_dir` above is only its process-env
+// fallback. Tests point it at scratch dirs the same way. -----------------------
 
 pub fn save_in(dir: &Path, name: &str, cfg: &SessionConfig) -> io::Result<PathBuf> {
     fs::create_dir_all(dir)?;
@@ -88,24 +90,6 @@ pub fn list_in(dir: &Path) -> Vec<String> {
     }
     names.sort();
     names
-}
-
-// --- convenience wrappers over the real config dir ---------------------------
-
-fn no_dir() -> io::Error {
-    io::Error::other("no config directory available")
-}
-
-pub fn save(name: &str, cfg: &SessionConfig) -> io::Result<PathBuf> {
-    save_in(&sessions_dir().ok_or_else(no_dir)?, name, cfg)
-}
-
-pub fn load(name: &str) -> io::Result<SessionConfig> {
-    load_in(&sessions_dir().ok_or_else(no_dir)?, name)
-}
-
-pub fn list() -> Vec<String> {
-    sessions_dir().map(|d| list_in(&d)).unwrap_or_default()
 }
 
 #[cfg(test)]

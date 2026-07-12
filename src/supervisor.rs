@@ -206,6 +206,7 @@ impl Supervisor {
             }
             Command::SaveSession { name } => self.save_session(&name),
             Command::LoadSession { name } => self.load_session(&name),
+            Command::ListSessions => self.list_sessions(),
             Command::Shutdown => self.shutdown_all(),
         }
     }
@@ -421,23 +422,57 @@ impl Supervisor {
         cfg
     }
 
+    /// Session-recipe root for this connection: `FLEETCOM_CONFIG_DIR` from the
+    /// installed launch context's env, else this process's
+    /// [`session::sessions_dir`]. The launch context wins because the daemon's
+    /// own env is frozen from whichever client first autostarted it, so save,
+    /// load, and list must all read the *connecting* client's override. A
+    /// client whose `HOME` alone differs still falls to the daemon's
+    /// `dirs::config_dir()`: resolving `dirs` against a foreign env would mean
+    /// reimplementing it, and `FLEETCOM_CONFIG_DIR` is the supported override.
+    fn sessions_root(&self) -> Option<PathBuf> {
+        if let Some(ctx) = &self.launch
+            && let Some((_, dir)) = ctx.env.iter().find(|(k, _)| k == "FLEETCOM_CONFIG_DIR")
+        {
+            return Some(PathBuf::from(dir).join("sessions"));
+        }
+        session::sessions_dir()
+    }
+
     fn save_session(&mut self, name: &str) {
         let cfg = self.session_config();
         let count: usize = cfg.values().map(Vec::len).sum();
-        let status = match session::save(name, &cfg) {
-            Ok(_) => format!("saved '{name}': {count} command(s)"),
-            Err(e) => format!("save failed: {e}"),
+        let status = match self
+            .sessions_root()
+            .map(|root| session::save_in(&root, name, &cfg))
+        {
+            Some(Ok(_)) => format!("saved '{name}': {count} command(s)"),
+            Some(Err(e)) => format!("save failed: {e}"),
+            None => "save failed: no config directory available".to_string(),
         };
         self.events.push(Event::Status(status));
+    }
+
+    /// Answer `ListSessions` with the recipe names under this connection's
+    /// session root (sorted by `list_in`); no root reads as no sessions.
+    fn list_sessions(&mut self) {
+        let names = self
+            .sessions_root()
+            .map(|root| session::list_in(&root))
+            .unwrap_or_default();
+        self.events.push(Event::Sessions(names));
     }
 
     /// Spawn every command in the named session, each in its (existing) dir.
     /// Missing dirs are skipped rather than spawning tasks doomed to fail on
     /// chdir.
     fn load_session(&mut self, name: &str) {
-        let cfg = match session::load(name) {
-            Ok(c) => c,
-            Err(_) => {
+        let cfg = match self
+            .sessions_root()
+            .map(|root| session::load_in(&root, name))
+        {
+            Some(Ok(c)) => c,
+            _ => {
                 self.events
                     .push(Event::Status(format!("session '{name}' not found")));
                 return;
@@ -1204,6 +1239,52 @@ mod tests {
             reap_until(&mut s, Duration::from_secs(5), |_| kill(straggler, None)
                 .is_err()),
             "straggler survived shutdown"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Session paths follow the connection's launch context: a hello env
+    /// carrying `FLEETCOM_CONFIG_DIR` decides where save, list, and load look.
+    /// The context env holds *only* the override, so anything this process's
+    /// env says about config locations is provably ignored.
+    #[test]
+    fn session_commands_use_the_launch_context_config_dir() {
+        let dir = scratch("sess_root");
+        let config = dir.join("config");
+        let mut s = Supervisor::new(24, 80);
+        s.set_launch_context(LaunchContext {
+            env: vec![(
+                "FLEETCOM_CONFIG_DIR".into(),
+                config.clone().into_os_string(),
+            )],
+            cwd: dir.clone(),
+        });
+
+        s.apply(Command::SaveSession { name: "ctx".into() });
+        assert!(
+            config.join("sessions").join("ctx.json").is_file(),
+            "save must land under the launch context's config dir"
+        );
+        assert!(
+            s.drain()
+                .iter()
+                .any(|e| matches!(e, Event::Status(m) if m.starts_with("saved 'ctx'"))),
+        );
+
+        s.apply(Command::ListSessions);
+        let evs = s.drain();
+        assert!(
+            evs.iter()
+                .any(|e| matches!(e, Event::Sessions(n) if n == &["ctx".to_string()])),
+            "list must see the recipe save just wrote; got {evs:?}"
+        );
+
+        s.apply(Command::LoadSession { name: "ctx".into() });
+        let evs = s.drain();
+        assert!(
+            evs.iter()
+                .any(|e| matches!(e, Event::Status(m) if m.starts_with("loaded 'ctx'"))),
+            "load must find the recipe under the same root; got {evs:?}"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

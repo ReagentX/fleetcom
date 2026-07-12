@@ -19,7 +19,6 @@ use crate::path;
 use crate::protocol::{
     Command, Event, Lifecycle, MouseBtn, MouseKind, ScreenView, ScrollAction, TaskView,
 };
-use crate::session;
 use crate::supervisor::Supervisor;
 use crate::transport::{ExitIntent, SocketTransport, ThreadTransport, Transport};
 use crate::ui;
@@ -484,6 +483,12 @@ impl App {
                     self.focused_screen = Some(s);
                 }
                 Event::Status(s) => self.status = Some(s),
+                Event::Sessions(names) => {
+                    // A shorter list can land while the picker is open; clamp
+                    // the selection before it can index past the end.
+                    self.session_sel = self.session_sel.min(names.len().saturating_sub(1));
+                    self.session_names = names;
+                }
             }
         }
     }
@@ -744,7 +749,12 @@ impl App {
                 self.mode = Mode::SaveSession;
             }
             KeyCode::Char('o') => {
-                self.session_names = session::list();
+                // The core owns the session dir (it resolves against the
+                // connection's launch context, not this process's env), so the
+                // names round-trip through it. The picker opens immediately and
+                // shows "(no saved sessions)" until the reply lands next sync.
+                self.transport.send(Command::ListSessions);
+                self.session_names.clear();
                 self.session_sel = 0;
                 self.mode = Mode::LoadSession;
             }
@@ -1237,6 +1247,16 @@ mod tests {
             })
         }
 
+        /// `new_local` with an explicit launch context, for tests that must pin
+        /// the core's session root instead of inheriting this process's env.
+        fn new_local_with_ctx(rows: u16, cols: u16, ctx: crate::protocol::LaunchContext) -> App {
+            App::assemble(rows, cols, move |pr, c, _wait_tx| {
+                let mut sup = Supervisor::new(pr, c);
+                sup.set_launch_context(ctx);
+                Box::new(LocalTransport::new(sup))
+            })
+        }
+
         /// Drive one core sync so `views` reflects the latest spawns and reaps:
         /// the test-side equivalent of one run-loop tick.
         fn pump(&mut self) {
@@ -1388,6 +1408,86 @@ mod tests {
             app.views.iter().any(|v| v.id == 2),
             "rerun must keep the id"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Scratch config dir with the given pre-written (empty) session recipes.
+    fn session_scratch(tag: &str, names: &[&str]) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("fleetcom_app_{tag}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("sessions")).unwrap();
+        for n in names {
+            std::fs::write(dir.join("sessions").join(format!("{n}.json")), "{}").unwrap();
+        }
+        dir
+    }
+
+    /// An App whose core's session root is pinned to `dir` via the launch
+    /// context, so these tests never read this process's real config dir.
+    fn app_with_config_dir(dir: &Path) -> App {
+        App::new_local_with_ctx(
+            30,
+            100,
+            crate::protocol::LaunchContext {
+                env: vec![(
+                    "FLEETCOM_CONFIG_DIR".into(),
+                    dir.to_path_buf().into_os_string(),
+                )],
+                cwd: dir.to_path_buf(),
+            },
+        )
+    }
+
+    /// `o` never touches the local filesystem: it sends `ListSessions`, opens
+    /// the picker empty, and the core's `Sessions` reply fills it.
+    #[test]
+    fn o_key_round_trips_the_session_list_through_the_core() {
+        let dir = session_scratch("sess_list", &["b", "a"]);
+        let mut app = app_with_config_dir(&dir);
+        app.session_sel = 3; // stale from a previous picker visit
+
+        app.on_key_dashboard(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::NONE));
+        assert!(matches!(app.mode, Mode::LoadSession));
+        assert!(
+            app.session_names.is_empty(),
+            "the picker opens empty until the reply lands"
+        );
+        assert_eq!(app.session_sel, 0, "opening the picker resets the selection");
+
+        app.pump();
+        assert_eq!(
+            app.session_names,
+            vec!["a".to_string(), "b".to_string()],
+            "the Sessions reply populates the picker, sorted"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A shorter list arriving while the picker is open clamps the selection so
+    /// Enter cannot index past the new end.
+    #[test]
+    fn session_selection_clamps_when_a_shorter_list_arrives() {
+        let dir = session_scratch("sess_clamp", &["a", "b", "c"]);
+        let mut app = app_with_config_dir(&dir);
+        app.on_key_dashboard(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::NONE));
+        app.pump();
+        assert_eq!(app.session_names.len(), 3);
+        app.session_sel = 2;
+
+        // Two recipes vanish; a refresh lands while the picker is still open.
+        std::fs::remove_file(dir.join("sessions").join("b.json")).unwrap();
+        std::fs::remove_file(dir.join("sessions").join("c.json")).unwrap();
+        app.transport.send(Command::ListSessions);
+        app.pump();
+        assert_eq!(app.session_names, vec!["a".to_string()]);
+        assert_eq!(app.session_sel, 0, "selection must clamp to the new length");
+
+        // The empty list parks the selection at 0 too.
+        std::fs::remove_file(dir.join("sessions").join("a.json")).unwrap();
+        app.transport.send(Command::ListSessions);
+        app.pump();
+        assert!(app.session_names.is_empty());
+        assert_eq!(app.session_sel, 0);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 
 /// The protocol version this test suite speaks; must track
 /// `protocol::PROTOCOL_VERSION` (drift fails the handshake, loudly).
-pub const PROTOCOL_VERSION: u32 = 4;
+pub const PROTOCOL_VERSION: u32 = 5;
 
 /// One frame of the given kind: `[u32 len][kind][payload]`.
 pub fn frame(kind: u8, payload: &[u8]) -> Vec<u8> {
