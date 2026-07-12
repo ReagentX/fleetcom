@@ -11,7 +11,7 @@ use base64::engine::general_purpose::STANDARD as B64;
 use crate::frame::{KIND_CONTROL, KIND_HELLO, KIND_SCREEN};
 
 /// Wire-protocol version; the handshake rejects mismatched peers.
-pub const PROTOCOL_VERSION: u32 = 4;
+pub const PROTOCOL_VERSION: u32 = 5;
 
 /// Environment and working directory supplied by the launching client.
 #[derive(Debug, Clone, PartialEq)]
@@ -78,6 +78,9 @@ pub enum Command {
     SaveSession { name: String },
     /// Spawn every command in a named recipe, each in its (existing) dir.
     LoadSession { name: String },
+    /// Ask for the saved recipe names; answered with `Event::Sessions`. Listing
+    /// is core-side like save/load, so the picker shows the same dir they use.
+    ListSessions,
     /// Kill every task (the quit path).
     Shutdown,
 }
@@ -122,6 +125,8 @@ pub enum Event {
     Screen(ScreenView),
     /// A one-line notice for the status line (save/load result, spawn error).
     Status(String),
+    /// Saved session-recipe names, sorted: the reply to `ListSessions`.
+    Sessions(Vec<String>),
 }
 
 /// Process-derived lifecycle state, independent of the user's `tagged` intent.
@@ -351,6 +356,9 @@ pub fn encode_command(cmd: &Command) -> (u8, Vec<u8>) {
             let _ = o.insert("t", "load");
             let _ = o.insert("name", name.as_str());
         }
+        Command::ListSessions => {
+            let _ = o.insert("t", "list");
+        }
         Command::Shutdown => {
             let _ = o.insert("t", "shutdown");
         }
@@ -359,7 +367,7 @@ pub fn encode_command(cmd: &Command) -> (u8, Vec<u8>) {
 }
 
 /// Parse a command from a received frame. `None` on a wrong kind, non-UTF-8/
-/// non-JSON payload, unknown discriminant, or a missing/mistyped field —
+/// non-JSON payload, unknown discriminant, or a missing/mistyped field,
 /// including out-of-range numerics and invalid base64. The daemon drops a
 /// malformed command rather than trusting it.
 pub fn decode_command(kind: u8, payload: &[u8]) -> Option<Command> {
@@ -443,6 +451,7 @@ pub fn decode_command(kind: u8, payload: &[u8]) -> Option<Command> {
         "load" => Command::LoadSession {
             name: v["name"].as_str()?.to_string(),
         },
+        "list" => Command::ListSessions,
         "shutdown" => Command::Shutdown,
         _ => return None,
     };
@@ -481,6 +490,16 @@ pub fn encode_event(ev: &Event) -> (u8, Vec<u8>) {
             let mut o = jzon::JsonValue::new_object();
             let _ = o.insert("t", "status");
             let _ = o.insert("msg", msg.as_str());
+            (KIND_CONTROL, o.dump().into_bytes())
+        }
+        Event::Sessions(names) => {
+            let mut arr = jzon::JsonValue::new_array();
+            for n in names {
+                let _ = arr.push(n.as_str());
+            }
+            let mut o = jzon::JsonValue::new_object();
+            let _ = o.insert("t", "sessions");
+            let _ = o.insert("names", arr);
             (KIND_CONTROL, o.dump().into_bytes())
         }
         Event::Screen(sv) => {
@@ -534,6 +553,15 @@ pub fn decode_event(kind: u8, payload: &[u8]) -> Option<Event> {
                     Some(Event::Tasks(views))
                 }
                 "status" => Some(Event::Status(v["msg"].as_str()?.to_string())),
+                "sessions" => {
+                    // Preserve the one-to-one mapping between encoded and
+                    // decoded names. A non-string member invalidates the event.
+                    let mut names = Vec::with_capacity(v["names"].len());
+                    for n in v["names"].members() {
+                        names.push(n.as_str()?.to_string());
+                    }
+                    Some(Event::Sessions(names))
+                }
                 _ => None,
             }
         }
@@ -649,6 +677,7 @@ mod tests {
             Command::LoadSession {
                 name: "home".into(),
             },
+            Command::ListSessions,
             Command::Shutdown,
         ];
         for c in cases {
@@ -774,8 +803,8 @@ mod tests {
         p
     }
 
-    /// A mistyped member in `lines` or `tasks` rejects the whole event, keeping
-    /// decoded rows aligned with their encoded positions.
+    /// A mistyped member in `lines`, `tasks`, or `names` rejects the whole
+    /// event, keeping decoded rows aligned with their encoded positions.
     #[test]
     fn mistyped_event_members_are_rejected() {
         for header in [
@@ -795,6 +824,8 @@ mod tests {
             // The cwd must be a base64 string.
             r#"{"t":"tasks","tasks":[{"id":1,"command":"x","cwd":"/x","tagged":true,"life":"ok","preview":"","started_ms":0}]}"#,
             r#"{"t":"tasks","tasks":["flat"]}"#,
+            // Numeric member in `names`.
+            r#"{"t":"sessions","names":["ok",5]}"#,
         ] {
             assert_eq!(
                 decode_event(KIND_CONTROL, json.as_bytes()),
@@ -834,6 +865,22 @@ mod tests {
         let status = Event::Status("saved 'x'".into());
         let (k, p) = encode_event(&status);
         assert_eq!(decode_event(k, &p), Some(status));
+    }
+
+    /// `Sessions` carries the picker's names verbatim: several names, an empty
+    /// list, and names with spaces and non-ASCII all round-trip.
+    #[test]
+    fn sessions_event_round_trips() {
+        for names in [
+            vec!["alpha".to_string(), "beta".to_string(), "gamma".to_string()],
+            Vec::new(),
+            vec!["my session".to_string(), "café ☕".to_string()],
+        ] {
+            let ev = Event::Sessions(names);
+            let (k, p) = encode_event(&ev);
+            assert_eq!(k, KIND_CONTROL);
+            assert_eq!(decode_event(k, &p).as_ref(), Some(&ev), "round-trip {ev:?}");
+        }
     }
 
     /// The `Screen` event keeps its formatted bytes intact through the raw tail,

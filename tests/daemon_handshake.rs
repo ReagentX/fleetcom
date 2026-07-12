@@ -104,7 +104,7 @@ fn silent_client_cannot_wedge_the_daemon() {
 }
 
 /// The documented single-client semantics: a second client's hello gets no
-/// reply while the first is attached (it queues — the client side waits, it
+/// reply while the first is attached (it queues; the client side waits and
 /// must never be told to `--kill` a healthy daemon), and is served the moment
 /// the first detaches.
 #[test]
