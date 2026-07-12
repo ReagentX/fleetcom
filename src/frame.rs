@@ -17,16 +17,24 @@ pub const KIND_HELLO: u8 = 3;
 
 /// Reject an absurd length prefix (corrupt or hostile peer) before allocating.
 /// 64 MiB is far above any real frame. A full 8K screen's formatted bytes are
-/// a few hundred KiB at most.
-const MAX_FRAME: u32 = 64 * 1024 * 1024;
+/// a few hundred KiB at most. Both directions enforce it — `write_frame`
+/// refuses to emit what `read_frame` would refuse to accept — and it is public
+/// so upstream size limits (`app::MAX_PASTE`) can compile-check that their
+/// worst-case encoding fits.
+pub const MAX_FRAME: u32 = 64 * 1024 * 1024;
 
 /// Write one frame and flush. Flushing per frame keeps latency low: the peer sees
 /// each command/event immediately. A firehose can't drown the socket because the
 /// core loop already coalesces screen emission to one frame per `FRAME_MIN` (see
 /// `core::run_loop`). The flush here is per *emitted* frame, not per output byte.
 pub fn write_frame(w: &mut impl Write, kind: u8, payload: &[u8]) -> io::Result<()> {
+    // Mirror `read_frame`'s limit: an oversized frame written here would fail
+    // at the *peer* as `InvalidData` and a dead connection. Failing before any
+    // byte hits the stream keeps the error local to the source.
     let len = u32::try_from(payload.len())
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "frame too large"))?;
+        .ok()
+        .filter(|len| *len <= MAX_FRAME)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "frame too large"))?;
     w.write_all(&len.to_be_bytes())?;
     w.write_all(&[kind])?;
     w.write_all(payload)?;
@@ -104,5 +112,16 @@ mod tests {
             read_frame(&mut t).unwrap(),
             (KIND_CONTROL, b"split me".to_vec())
         );
+    }
+
+    /// An oversized payload fails at the writer, before any byte hits the
+    /// stream — not at the peer as `InvalidData` and a dead connection.
+    #[test]
+    fn oversized_write_fails_locally() {
+        let payload = vec![0u8; MAX_FRAME as usize + 1];
+        let mut buf: Vec<u8> = Vec::new();
+        let err = write_frame(&mut buf, KIND_CONTROL, &payload).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert!(buf.is_empty(), "no bytes may reach the stream");
     }
 }

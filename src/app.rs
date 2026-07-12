@@ -27,6 +27,15 @@ use crate::ui;
 /// Maximum attached paste size, leaving headroom below the frame limit.
 const MAX_PASTE: usize = 8 * 1024 * 1024;
 
+// The paste-size chain, compile-checked: a max-size paste base64-expands by
+// 4/3 in `protocol::encode_command`, and the whole encoded command must fit
+// one frame (`write_frame` now refuses anything larger). 64 KiB of headroom
+// covers the jzon envelope many times over.
+const _: () = assert!(
+    MAX_PASTE.div_ceil(3) * 4 + 64 * 1024 <= crate::frame::MAX_FRAME as usize,
+    "MAX_PASTE must base64-encode to under frame::MAX_FRAME"
+);
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
     Dashboard,
