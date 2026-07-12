@@ -11,6 +11,7 @@ repository = "https://github.com/ReagentX/fleetcom"
 version = "0.0.0"
 
 [dependencies]
+base64 = "=0.22.1"
 crossterm = "=0.29.0"
 dirs = "=6.0.0"
 jzon = "=0.12.5"

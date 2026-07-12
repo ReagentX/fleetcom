@@ -199,6 +199,7 @@ mod tests {
 
         let cwd = std::env::current_dir().unwrap();
         let mut sup = Supervisor::new(24, 80);
+        sup.set_launch_context(crate::protocol::LaunchContext::here());
         let (wake_tx, wake_rx) = channel::<Wake>();
         let (evt_tx, evt_rx) = channel::<Event>();
         sup.set_waker(wake_tx.clone());
@@ -259,6 +260,7 @@ mod tests {
     fn stop_flag_ends_loop_with_shutdown() {
         let cwd = std::env::current_dir().unwrap();
         let mut sup = Supervisor::new(24, 80);
+        sup.set_launch_context(crate::protocol::LaunchContext::here());
         let (wake_tx, wake_rx) = std::sync::mpsc::channel::<Wake>();
         sup.set_waker(wake_tx);
         // Spawn synchronously so a live task exists *before* the loop runs: the

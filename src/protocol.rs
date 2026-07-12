@@ -5,25 +5,48 @@ use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use crate::frame::{KIND_CONTROL, KIND_SCREEN};
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as B64;
+
+use crate::frame::{KIND_CONTROL, KIND_HELLO, KIND_SCREEN};
 use crate::task::Lifecycle;
 
 /// Wire-protocol version; the handshake rejects mismatched peers.
-pub const PROTOCOL_VERSION: u32 = 2;
+/// v3: the hello moved from a `Command` to its own `KIND_HELLO` frame, and env
+/// bytes moved from JSON number arrays to base64.
+pub const PROTOCOL_VERSION: u32 = 3;
+
+/// The environment a spawn runs under and the directory session recipes
+/// resolve against: the *launching client's*, captured in the process that
+/// asked for the launch. Carried by the handshake (socket) or constructed
+/// in-process (`--foreground`) — never defaulted from the daemon's own env,
+/// which is whatever the first autostarting client happened to have.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LaunchContext {
+    pub env: Vec<(OsString, OsString)>,
+    /// Base for resolving a session recipe's relative dirs: the client's
+    /// invocation dir, not the daemon's (frozen, first-client) cwd.
+    pub cwd: PathBuf,
+}
+
+impl LaunchContext {
+    /// This process's own env and cwd — the real launch context exactly when
+    /// this process is the one the user launched from.
+    pub fn here() -> LaunchContext {
+        LaunchContext {
+            env: std::env::vars_os().collect(),
+            cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+        }
+    }
+}
 
 /// A client→core request. Every mutation of the task set is one of these; the
 /// client never touches a `Task` directly. Fire-and-forget: results come back
-/// as `Event`s, never as return values.
+/// as `Event`s, never as return values. The handshake is deliberately *not*
+/// here: a hello rides its own frame kind (`encode_hello`/`decode_hello`), so
+/// re-setting the launch context mid-stream has no representation.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Command {
-    /// The client's protocol version, environment, and working directory.
-    Hello {
-        version: u32,
-        env: Vec<(OsString, OsString)>,
-        /// Base for resolving a session recipe's relative dirs: the client's
-        /// invocation dir, not the daemon's (frozen, first-client) cwd.
-        cwd: PathBuf,
-    },
     /// Run `command` under `$SHELL -c` in `cwd`.
     Spawn { command: String, cwd: PathBuf },
     /// Signal-kill a live task's process group; it reaps into Completed.
@@ -159,39 +182,22 @@ fn ps(p: &Path) -> String {
     p.to_string_lossy().into_owned()
 }
 
-/// The `Hello` for this process: its own env and cwd at `PROTOCOL_VERSION`.
-/// The socket client sends it as the handshake; the in-process transport
-/// applies it directly — either way a launch context always comes from the
-/// process that asked for the launch.
-pub fn hello_here() -> Command {
-    Command::Hello {
-        version: PROTOCOL_VERSION,
-        env: std::env::vars_os().collect(),
-        cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
-    }
+/// An `OsStr` as base64. JSON strings are UTF-8, so non-UTF-8 env bytes can't
+/// ride verbatim; base64 is lossless at ≈1.35× where a number array is ≈4× —
+/// which matters because the hello is written to a connection the daemon may
+/// not have accepted yet, whose buffer is 8 KB on macOS
+/// (`net.local.stream.recvspace`). A typical env encodes to 5–6 KB and never
+/// touches that limit; number arrays put the same env at 14–16 KB, over it.
+fn os_b64(s: &OsStr) -> String {
+    B64.encode(s.as_bytes())
 }
 
-/// An `OsStr` as a jzon byte array. JSON strings are UTF-8, so non-UTF-8 env
-/// bytes can't ride as a string; a number array is lossless and paid once per
-/// connection (the `Hello`), never per spawn.
-fn os_arr(s: &OsStr) -> jzon::JsonValue {
-    let mut a = jzon::JsonValue::new_array();
-    for b in s.as_bytes() {
-        let _ = a.push(*b as u64);
-    }
-    a
-}
-
-/// Decode a JSON byte array as an `OsString`.
-fn os_from(v: &jzon::JsonValue) -> Option<OsString> {
-    if !v.is_array() {
-        return None;
-    }
-    let mut bytes = Vec::with_capacity(v.len());
-    for m in v.members() {
-        bytes.push(u8::try_from(m.as_u64()?).ok()?);
-    }
-    Some(OsString::from_vec(bytes))
+/// Decode a base64 JSON string as an `OsString`. `None` on a non-string or on
+/// anything the strict decoder rejects (bad characters, bad length, bad
+/// padding), which rejects the whole hello: the daemon must never launch jobs
+/// under a guessed environment.
+fn os_from_b64(v: &jzon::JsonValue) -> Option<OsString> {
+    Some(OsString::from_vec(B64.decode(v.as_str()?).ok()?))
 }
 
 fn lifecycle_str(l: Lifecycle) -> &'static str {
@@ -213,24 +219,53 @@ fn lifecycle_from(s: &str) -> Option<Lifecycle> {
     }
 }
 
+/// Serialize the handshake to `(kind, payload)`: a `KIND_HELLO` frame carrying
+/// this side's protocol version and launch context. Its own frame kind (not a
+/// `"t"`-tagged command) so the handshake exists only where the connection
+/// opens; see [`crate::frame::KIND_HELLO`].
+pub fn encode_hello(ctx: &LaunchContext) -> (u8, Vec<u8>) {
+    let mut o = jzon::JsonValue::new_object();
+    let _ = o.insert("v", PROTOCOL_VERSION);
+    let _ = o.insert("cwd", ps(&ctx.cwd));
+    let mut pairs = jzon::JsonValue::new_array();
+    for (k, v) in &ctx.env {
+        let mut pair = jzon::JsonValue::new_array();
+        let _ = pair.push(os_b64(k));
+        let _ = pair.push(os_b64(v));
+        let _ = pairs.push(pair);
+    }
+    let _ = o.insert("env", pairs);
+    (KIND_HELLO, o.dump().into_bytes())
+}
+
+/// Parse a handshake frame into `(version, context)`. `None` on a wrong kind
+/// or any malformed field — including a single env pair the strict base64
+/// decode rejects — mirroring [`decode_command`]'s all-or-nothing stance.
+/// The version is returned even when it won't match: the caller's refusal
+/// names both sides.
+pub fn decode_hello(kind: u8, payload: &[u8]) -> Option<(u32, LaunchContext)> {
+    if kind != KIND_HELLO {
+        return None;
+    }
+    let v = jzon::parse(std::str::from_utf8(payload).ok()?).ok()?;
+    let mut env = Vec::new();
+    for pair in v["env"].members() {
+        env.push((os_from_b64(&pair[0])?, os_from_b64(&pair[1])?));
+    }
+    Some((
+        v["v"].as_u32()?,
+        LaunchContext {
+            env,
+            cwd: PathBuf::from(v["cwd"].as_str()?),
+        },
+    ))
+}
+
 /// Serialize a command to `(kind, payload)` for [`crate::frame::write_frame`].
 /// Every command is a jzon control frame tagged by a `"t"` discriminant.
 pub fn encode_command(cmd: &Command) -> (u8, Vec<u8>) {
     let mut o = jzon::JsonValue::new_object();
     match cmd {
-        Command::Hello { version, env, cwd } => {
-            let _ = o.insert("t", "hello");
-            let _ = o.insert("v", *version);
-            let _ = o.insert("cwd", ps(cwd));
-            let mut pairs = jzon::JsonValue::new_array();
-            for (k, v) in env {
-                let mut pair = jzon::JsonValue::new_array();
-                let _ = pair.push(os_arr(k));
-                let _ = pair.push(os_arr(v));
-                let _ = pairs.push(pair);
-            }
-            let _ = o.insert("env", pairs);
-        }
         Command::Spawn { command, cwd } => {
             let _ = o.insert("t", "spawn");
             let _ = o.insert("command", command.as_str());
@@ -342,17 +377,6 @@ pub fn decode_command(kind: u8, payload: &[u8]) -> Option<Command> {
     }
     let v = jzon::parse(std::str::from_utf8(payload).ok()?).ok()?;
     let cmd = match v["t"].as_str()? {
-        "hello" => {
-            let mut env = Vec::new();
-            for pair in v["env"].members() {
-                env.push((os_from(&pair[0])?, os_from(&pair[1])?));
-            }
-            Command::Hello {
-                version: v["v"].as_u32()?,
-                env,
-                cwd: PathBuf::from(v["cwd"].as_str()?),
-            }
-        }
         "spawn" => Command::Spawn {
             command: v["command"].as_str()?.to_string(),
             cwd: PathBuf::from(v["cwd"].as_str()?),
@@ -566,24 +590,6 @@ mod tests {
     #[test]
     fn command_round_trips() {
         let cases = [
-            Command::Hello {
-                version: PROTOCOL_VERSION,
-                // 0xFF/0xFE are invalid UTF-8 anywhere in a sequence: the env
-                // encoding must be byte-exact, not string-shaped.
-                env: vec![
-                    ("PATH".into(), "/usr/bin:/bin".into()),
-                    (
-                        OsString::from_vec(b"BAD\xff\xfe".to_vec()),
-                        OsString::from_vec(b"v\xff".to_vec()),
-                    ),
-                ],
-                cwd: PathBuf::from("/home/x"),
-            },
-            Command::Hello {
-                version: 0,
-                env: Vec::new(),
-                cwd: PathBuf::from("/"),
-            },
             Command::Spawn {
                 command: "echo hi".into(),
                 cwd: PathBuf::from("/tmp"),
@@ -670,26 +676,66 @@ mod tests {
         assert_eq!(decode_event(k, &p), Some(ack));
     }
 
-    /// A malformed env pair (a non-byte element) rejects the whole `Hello`:
-    /// the daemon must never launch jobs under a guessed environment.
+    /// The handshake survives encode→decode byte-exact, including env entries
+    /// that are invalid UTF-8 anywhere in a sequence (0xFF/0xFE): base64 must
+    /// be a transparent byte channel, not string-shaped.
     #[test]
-    fn hello_with_malformed_env_is_rejected() {
-        let json = r#"{"t":"hello","v":1,"cwd":"/","env":[[[300],[65]]]}"#;
-        assert_eq!(decode_command(KIND_CONTROL, json.as_bytes()), None);
+    fn hello_round_trips() {
+        let ctx = LaunchContext {
+            env: vec![
+                ("PATH".into(), "/usr/bin:/bin".into()),
+                (
+                    OsString::from_vec(b"BAD\xff\xfe".to_vec()),
+                    OsString::from_vec(b"v\xff".to_vec()),
+                ),
+            ],
+            cwd: PathBuf::from("/home/x"),
+        };
+        let (k, p) = encode_hello(&ctx);
+        assert_eq!(k, KIND_HELLO);
+        assert_eq!(decode_hello(k, &p), Some((PROTOCOL_VERSION, ctx)));
+
+        let empty = LaunchContext {
+            env: Vec::new(),
+            cwd: PathBuf::from("/"),
+        };
+        let (k, p) = encode_hello(&empty);
+        assert_eq!(decode_hello(k, &p), Some((PROTOCOL_VERSION, empty)));
     }
 
-    /// Wrong-*shape* pairs must reject too, not decode as empty strings: a
-    /// client that encodes env entries as JSON strings would otherwise pass
-    /// the handshake and spawn PATH-less jobs with nothing pointing back at
-    /// the malformed hello.
+    /// A hello is only a hello on its own frame kind: the identical payload on
+    /// a control frame is not a handshake (and `decode_command` won't read it
+    /// as a command either — the post-handshake hello has no representation).
     #[test]
-    fn hello_with_string_env_pairs_is_rejected() {
-        // Pair elements as strings instead of byte arrays.
-        let strings = r#"{"t":"hello","v":1,"cwd":"/","env":[["PATH","/bin"]]}"#;
-        assert_eq!(decode_command(KIND_CONTROL, strings.as_bytes()), None);
-        // Pair itself as a string: indexing it yields Null for both elements.
-        let flat = r#"{"t":"hello","v":1,"cwd":"/","env":["PATH=/bin"]}"#;
-        assert_eq!(decode_command(KIND_CONTROL, flat.as_bytes()), None);
+    fn hello_requires_its_own_frame_kind() {
+        let (_, p) = encode_hello(&LaunchContext {
+            env: Vec::new(),
+            cwd: PathBuf::from("/"),
+        });
+        assert_eq!(decode_hello(KIND_CONTROL, &p), None);
+        assert_eq!(decode_command(KIND_CONTROL, &p), None);
+    }
+
+    /// A malformed env pair rejects the whole hello: the daemon must never
+    /// launch jobs under a guessed environment. Strict base64 is the gate —
+    /// bad characters, bad length, bad padding all reject — and wrong-shape
+    /// pairs (numbers, a flat string) fail the string check first.
+    #[test]
+    fn hello_with_malformed_env_is_rejected() {
+        for env in [
+            r#"[["P@TH","L2Jpbg=="]]"#,    // invalid base64 character
+            r#"[["QUFBQUE","L2Jpbg=="]]"#, // truncated: missing padding
+            r#"[["UEFUSA==","AAAA="]]"#,   // bad padding length
+            r#"[[[80],[65]]]"#,            // v2 number arrays are not v3
+            r#"["PATH=/bin"]"#,            // flat string pair
+        ] {
+            let json = format!(r#"{{"v":3,"cwd":"/","env":{env}}}"#);
+            assert_eq!(
+                decode_hello(KIND_HELLO, json.as_bytes()),
+                None,
+                "should reject env {env}"
+            );
+        }
     }
 
     #[test]

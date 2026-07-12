@@ -11,6 +11,12 @@ pub const KIND_CONTROL: u8 = 1;
 /// A `Screen` event: a jzon header (id, cursor, lines) followed by the raw
 /// `contents_formatted` bytes, spliced by [`crate::protocol`].
 pub const KIND_SCREEN: u8 = 2;
+/// The connection-opening handshake: protocol version plus the client's launch
+/// context. Its own kind — not a `Command` — so a post-handshake hello is
+/// unrepresentable in the command stream: the serving loop decodes only
+/// `KIND_CONTROL` frames, and the launch context can change exactly where the
+/// version gate sits.
+pub const KIND_HELLO: u8 = 3;
 
 /// Reject an absurd length prefix (corrupt or hostile peer) before allocating.
 /// 64 MiB is far above any real frame. A full 8K screen's formatted bytes are
