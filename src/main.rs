@@ -10,6 +10,9 @@ mod daemon;
 mod emulator;
 mod format;
 mod frame;
+// Differential golden suites over the PTY corpus (migration step 3).
+#[cfg(test)]
+mod golden;
 mod path;
 mod protocol;
 // Unreferenced until migration step 4 wires it into the Emulator seam.
