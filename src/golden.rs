@@ -1,21 +1,14 @@
-//! Differential tests for the production and vt100 terminal emulators. Both
-//! backends parse the recorded PTY corpus, and each difference is either an
-//! encoding equivalence, an explicitly asserted semantic difference, or a
-//! test failure. Serialized output is compared by displayed state rather than
-//! byte equality.
+//! Terminal parser changes can preserve plain text while shifting cursor state,
+//! styling, or scrollback. These golden tests replay the recorded PTY corpus
+//! (`tests/corpus`) and report the exact row, cell, or count on a mismatch.
 //!
-//! **Compatibility suite.** Primary comparison is reconstructed screen state:
-//! each backend's screen-as-ANSI (`vt100::Screen::contents_formatted` vs
-//! [`serialize::formatted`]) is replayed into a fresh alacritty reference
-//! terminal and the two reference grids are compared cell-by-cell. The replay
-//! step is what absorbs encoding equivalences. The backends legitimately
-//! choose different SGR parameters and addressing, but a client terminal must
-//! display the same thing. Plain text and cursor position are compared across
-//! backends directly as a secondary check.
+//! **Displayed state.** Each fixture pins every final plain-text row via
+//! [`serialize::contents`], cursor position and visibility via
+//! [`serialize::formatted`], and selected styled cells for the fixture's
+//! purpose (see `tests/corpus/README.md`).
 //!
-//! **Semantic suite.** Fixtures with parser-level differences assert exact
-//! values for top-anchored-region scrollback retention, bold-plus-dim
-//! intensity stacking, DEC charset translation, and VS16 width.
+//! **Parser semantics.** Targeted fixtures pin exact scrollback retention,
+//! bold-plus-dim intensity stacking, DEC charset translation, and VS16 width.
 
 use alacritty_terminal::{
     Term,
@@ -23,7 +16,7 @@ use alacritty_terminal::{
     grid::Dimensions,
     index::{Column, Line, Point},
     term::{Config, TermMode, cell::Flags, test::TermSize},
-    vte::ansi::{Color, Processor},
+    vte::ansi::{Color, NamedColor, Processor, Rgb},
 };
 
 use crate::serialize;
@@ -32,15 +25,6 @@ use crate::serialize;
 const LINES: usize = 40;
 const COLS: usize = 120;
 
-/// Scrollback depth used by production tasks and the vt100 test backend.
-const SCROLLBACK: usize = 2000;
-
-/// Wrap bookkeeping is invisible on screen and diverges by construction:
-/// vt100's serialization recreates soft wraps by writing through the right
-/// edge, while [`serialize::formatted`] is CUP-per-row and never wraps.
-/// These flags are masked in the reference-grid comparison.
-const WRAP_ARTIFACTS: Flags = Flags::WRAPLINE.union(Flags::LEADING_WIDE_CHAR_SPACER);
-
 fn alacritty(bytes: &[u8]) -> Term<VoidListener> {
     let mut term = Term::new(Config::default(), &TermSize::new(COLS, LINES), VoidListener);
     let mut parser: Processor = Processor::new();
@@ -48,322 +32,536 @@ fn alacritty(bytes: &[u8]) -> Term<VoidListener> {
     term
 }
 
-fn vt100(bytes: &[u8]) -> vt100::Parser {
-    let mut parser = vt100::Parser::new(LINES as u16, COLS as u16, SCROLLBACK);
-    parser.process(bytes);
-    parser
-}
-
-/// Rows vt100 retained in scrollback. vt100 exposes no direct count; the
-/// viewport offset clamps to stored history, so requesting `usize::MAX` and
-/// reading the offset back measures it. Restores the live view.
-fn vt100_retained(parser: &mut vt100::Parser) -> usize {
-    parser.screen_mut().set_scrollback(usize::MAX);
-    let rows = parser.screen().scrollback();
-    parser.screen_mut().set_scrollback(0);
-    rows
-}
-
-/// Two spellings of one palette slot: `CSI 3x m` parses to a named color,
-/// `CSI 38;5;x m` to an indexed one, and both address palette entry `x`: a
-/// client displays them identically. vt100 stores every color as an index and
-/// re-emits 0-15 in the short form; the alacritty serializer preserves the
-/// child's spelling. Comparisons canonicalize both to the indexed form.
-fn canon(color: Color) -> Color {
-    match color {
-        Color::Named(named) if (named as usize) < 16 => Color::Indexed(named as u8),
-        other => other,
-    }
-}
-
-/// Cell-by-cell comparison of two reference terminals that replayed each
-/// backend's serialized screen: character, zero-width extras, colors, style
-/// flags, underline color. Exactly two documented equivalences are absorbed:
-/// the `WRAP_ARTIFACTS` mask and [`canon`]'s palette-spelling collapse.
-///
-/// `allow_bold_dim` admits one parser-level difference: after SGR 1 followed
-/// by SGR 2 without SGR 22, alacritty stores both flags while vt100 stores
-/// only the later intensity. The return value counts affected cells so the
-/// semantic test can assert the exact footprint; compatibility fixtures pass
-/// `false` and reject the difference.
-fn assert_reference_grids_match(
-    vt_ref: &Term<VoidListener>,
-    al_ref: &Term<VoidListener>,
+/// Pin every visible text row, cursor position and visibility, and the active
+/// primary screen. Any row omitted from `rows` must be blank.
+fn assert_screen(
     fixture: &str,
-    allow_bold_dim: bool,
-) -> usize {
-    let vgrid = vt_ref.grid();
-    let agrid = al_ref.grid();
-    let mut bold_dim_cells = 0;
+    al: &Term<VoidListener>,
+    rows: &[(usize, &str)],
+    cursor: (u16, u16),
+) {
+    assert!(
+        !al.mode().contains(TermMode::ALT_SCREEN),
+        "{fixture}: primary screen active"
+    );
+    let text = serialize::contents(al);
+    let got: Vec<&str> = text.split('\n').collect();
+    assert_eq!(got.len(), LINES, "{fixture}: plain-text row count");
+    for (row, line) in got.iter().enumerate() {
+        let expected = rows
+            .iter()
+            .find_map(|&(r, t)| (r == row).then_some(t))
+            .unwrap_or("");
+        assert_eq!(*line, expected, "{fixture}: plain text at row {row}");
+    }
+    let (_, pos, hidden) = serialize::formatted(al);
+    assert_eq!(pos, cursor, "{fixture}: cursor position");
+    assert!(!hidden, "{fixture}: cursor visibility");
+}
+
+/// Pin one load-bearing styled cell: character, colors, exact flag set.
+fn assert_cell(
+    fixture: &str,
+    al: &Term<VoidListener>,
+    (row, col): (usize, usize),
+    c: char,
+    fg: Color,
+    bg: Color,
+    flags: Flags,
+) {
+    let cell = &al.grid()[Line(row as i32)][Column(col)];
+    assert_eq!(cell.c, c, "{fixture}: char at ({row},{col})");
+    assert_eq!(cell.fg, fg, "{fixture}: fg at ({row},{col})");
+    assert_eq!(cell.bg, bg, "{fixture}: bg at ({row},{col})");
+    assert_eq!(cell.flags, flags, "{fixture}: flags at ({row},{col})");
+}
+
+/// Pin default characters, colors, and flags across the primary grid after an
+/// alternate-screen fixture exits. This catches styling on blank cells, which
+/// the plain-text assertion cannot observe.
+fn assert_grid_unstyled(fixture: &str, al: &Term<VoidListener>) {
     for row in 0..LINES {
-        let vline = &vgrid[Line(row as i32)];
-        let aline = &agrid[Line(row as i32)];
         for col in 0..COLS {
-            let v = &vline[Column(col)];
-            let a = &aline[Column(col)];
-            assert_eq!(v.c, a.c, "{fixture}: char at ({row},{col})");
-            assert_eq!(canon(v.fg), canon(a.fg), "{fixture}: fg at ({row},{col})");
-            assert_eq!(canon(v.bg), canon(a.bg), "{fixture}: bg at ({row},{col})");
-            let vflags = v.flags.difference(WRAP_ARTIFACTS);
-            let aflags = a.flags.difference(WRAP_ARTIFACTS);
-            // The bold+dim shape: alacritty holds both intensity flags,
-            // vt100 exactly one of them, all other bits equal.
-            let intensity = Flags::BOLD.union(Flags::DIM);
-            let one_of = vflags.intersection(intensity);
-            if allow_bold_dim
-                && (one_of == Flags::BOLD || one_of == Flags::DIM)
-                && aflags == vflags.union(intensity)
-            {
-                bold_dim_cells += 1;
-            } else {
-                assert_eq!(vflags, aflags, "{fixture}: flags at ({row},{col})");
-            }
+            let cell = &al.grid()[Line(row as i32)][Column(col)];
+            assert_eq!(cell.c, ' ', "{fixture}: char at ({row},{col})");
             assert_eq!(
-                v.zerowidth().unwrap_or(&[]),
-                a.zerowidth().unwrap_or(&[]),
-                "{fixture}: zerowidth at ({row},{col})"
+                cell.fg,
+                Color::Named(NamedColor::Foreground),
+                "{fixture}: fg at ({row},{col})"
             );
             assert_eq!(
-                v.underline_color(),
-                a.underline_color(),
-                "{fixture}: underline color at ({row},{col})"
+                cell.bg,
+                Color::Named(NamedColor::Background),
+                "{fixture}: bg at ({row},{col})"
             );
+            assert!(cell.flags.is_empty(), "{fixture}: flags at ({row},{col})");
         }
     }
-    bold_dim_cells
 }
 
-/// The compatibility comparison: both backends parse `bytes`, then
-///
-/// 1. each backend's screen-as-ANSI replays into a fresh reference terminal
-///    and the reference grids, cursors, and cursor-visibility modes must
-///    match: what a client terminal would display;
-/// 2. cursor position, visibility, and per-row plain text are compared across
-///    backends directly.
-///
-/// Returns both parsers so semantic goldens can assert their approved deltas
-/// on top of a proven-equivalent visible screen, plus the count of cells the
-/// bold+dim delta absorbed when `allow_bold_dim` admits it (see
-/// [`assert_reference_grids_match`]).
-fn compare_backends(
-    fixture: &str,
-    bytes: &[u8],
-    allow_bold_dim: bool,
-) -> (vt100::Parser, Term<VoidListener>, usize) {
-    let vt = vt100(bytes);
-    let al = alacritty(bytes);
-
-    let vt_ref = alacritty(&vt.screen().contents_formatted());
-    let (al_bytes, al_pos, al_hidden) = serialize::formatted(&al);
-    let al_ref = alacritty(&al_bytes);
-    let bold_dim_cells = assert_reference_grids_match(&vt_ref, &al_ref, fixture, allow_bold_dim);
-    assert_eq!(
-        vt_ref.grid().cursor.point,
-        al_ref.grid().cursor.point,
-        "{fixture}: reference cursor position"
+/// tmux detach leaves its message on the primary screen with the cursor on
+/// the following row. The first cell pins the message's default styling.
+#[test]
+fn compat_tmux_split() {
+    let al = alacritty(include_bytes!("../tests/corpus/tmux_split.bin"));
+    assert_screen(
+        "tmux_split.bin",
+        &al,
+        &[(0, "[detached (from session 0)]")],
+        (1, 0),
     );
-    assert_eq!(
-        vt_ref.mode().contains(TermMode::SHOW_CURSOR),
-        al_ref.mode().contains(TermMode::SHOW_CURSOR),
-        "{fixture}: reference cursor visibility"
+    assert_cell(
+        "tmux_split.bin",
+        &al,
+        (0, 0),
+        '[',
+        Color::Named(NamedColor::Foreground),
+        Color::Named(NamedColor::Background),
+        Flags::empty(),
     );
-
-    assert_eq!(
-        vt.screen().cursor_position(),
-        al_pos,
-        "{fixture}: cursor position across backends"
-    );
-    assert_eq!(
-        vt.screen().hide_cursor(),
-        al_hidden,
-        "{fixture}: cursor visibility across backends"
-    );
-
-    // Per-row text, not `vt100::Screen::contents()`: that joins soft-wrapped
-    // rows without a newline, which is a representation choice, not a screen
-    // difference. Both sides trim trailing blanks per row.
-    let al_text = serialize::contents(&al);
-    let al_rows: Vec<&str> = al_text.split('\n').collect();
-    assert_eq!(al_rows.len(), LINES, "{fixture}: plain-text row count");
-    for (row, vt_row) in vt.screen().rows(0, COLS as u16).enumerate() {
-        assert_eq!(
-            vt_row, al_rows[row],
-            "{fixture}: plain text at row {row} (vt100 left, alacritty right)"
-        );
-    }
-
-    (vt, al, bold_dim_cells)
 }
 
-/// Compatibility entry point: no parser-level deltas admitted.
-fn assert_visible_equivalent(fixture: &str, bytes: &[u8]) -> (vt100::Parser, Term<VoidListener>) {
-    let (vt, al, _) = compare_backends(fixture, bytes, false);
-    (vt, al)
+/// `vim` runs entirely on the alternate screen; `:q!` restores a blank primary
+/// grid with default colors and flags and the cursor at the origin.
+#[test]
+fn compat_vim_session() {
+    let al = alacritty(include_bytes!("../tests/corpus/vim_session.bin"));
+    assert_screen("vim_session.bin", &al, &[], (0, 0));
+    assert_grid_unstyled("vim_session.bin", &al);
 }
 
-macro_rules! compat {
-    ($name:ident, $file:literal) => {
-        #[test]
-        fn $name() {
-            assert_visible_equivalent($file, include_bytes!(concat!("../tests/corpus/", $file)));
-        }
-    };
+/// `less` pages on the alternate screen; `q` restores a blank primary grid
+/// with default colors and flags and the cursor at the origin.
+#[test]
+fn compat_less_altscreen() {
+    let al = alacritty(include_bytes!("../tests/corpus/less_altscreen.bin"));
+    assert_screen("less_altscreen.bin", &al, &[], (0, 0));
+    assert_grid_unstyled("less_altscreen.bin", &al);
 }
 
-compat!(compat_tmux_split, "tmux_split.bin");
-compat!(compat_vim_session, "vim_session.bin");
-compat!(compat_less_altscreen, "less_altscreen.bin");
-compat!(compat_top_live, "top_live.bin");
-compat!(compat_shell_colors, "shell_colors.bin");
-compat!(compat_build_log, "build_log.bin");
+/// `top` redraws the alternate screen rapidly; `q` restores a blank primary
+/// grid with default colors and flags.
+#[test]
+fn compat_top_live() {
+    let al = alacritty(include_bytes!("../tests/corpus/top_live.bin"));
+    assert_screen("top_live.bin", &al, &[], (0, 0));
+    assert_grid_unstyled("top_live.bin", &al);
+}
 
-// Semantic tests assert cross-backend differences as concrete values.
+/// Pin SGR output from `ls --color`, `git log --color`, and scripted 16-color,
+/// 256-color, and truecolor sequences. Selected cells cover each color depth,
+/// bold, underline, reverse, and a background color.
+#[test]
+fn compat_shell_colors() {
+    const F: &str = "shell_colors.bin";
+    let al = alacritty(include_bytes!("../tests/corpus/shell_colors.bin"));
+    assert_screen(
+        F,
+        &al,
+        &[
+            (0, "-rwxr-xr-x   78 root   wheel    118928 May 21 01:57 as"),
+            (1, "-rwxr-xr-x   78 root   wheel    118928 May 21 01:57 asa"),
+            (
+                2,
+                "-rwxr-xr-x    1 root   wheel    171888 May 21 01:57 AssetCacheLocatorUtil",
+            ),
+            (
+                3,
+                "-rwxr-xr-x    1 root   wheel    227664 May 21 01:57 AssetCacheManagerUtil",
+            ),
+            (
+                4,
+                "-rwxr-xr-x    1 root   wheel    172976 May 21 01:57 AssetCacheTetheratorUtil",
+            ),
+            (
+                5,
+                "-rwxr-xr-x    1 root   wheel   4034112 May 21 01:57 assetutil",
+            ),
+            (6, "-r-sr-xr-x    3 root   wheel    170832 May 21 01:57 at"),
+            (
+                7,
+                "-rwxr-xr-x    1 root   wheel    211936 May 21 01:57 atos",
+            ),
+            (8, "-r-sr-xr-x    3 root   wheel    170832 May 21 01:57 atq"),
+            (
+                9,
+                "-r-sr-xr-x    3 root   wheel    170832 May 21 01:57 atrm",
+            ),
+            (
+                10,
+                "-rwxr-xr-x    1 root   wheel    138096 May 21 01:57 atsutil",
+            ),
+            (
+                11,
+                "-rwxr-xr-x    1 root   wheel    136416 May 21 01:57 automationmodetool",
+            ),
+            (
+                12,
+                "-rwxr-xr-x    1 root   wheel    171440 May 21 01:57 automator",
+            ),
+            (
+                13,
+                "lrwxr-xr-x    1 root   wheel        18 May 21 01:57 auval -> /usr/bin/auvaltool",
+            ),
+            (
+                14,
+                "-rwxr-xr-x    1 root   wheel    400544 May 21 01:57 auvaltool",
+            ),
+            (
+                15,
+                "-rwxr-xr-x    1 root   wheel    567072 May 21 01:57 avbanalyse",
+            ),
+            (16, "ls: stdout: Undefined error: 0"),
+            (
+                17,
+                "f00e685 docs: add emulator migration plan (vt100 → alacritty_terminal)",
+            ),
+            (
+                18,
+                "3e00d45 Merge pull request #15 from ReagentX/feat/cs/cleanup-imports",
+            ),
+            (
+                19,
+                "600908f refactor: clean up import statements across multiple files for improved readability",
+            ),
+            (
+                20,
+                "b7800d5 Merge pull request #14 from ReagentX/fix/cs/terminal-restore-guard",
+            ),
+            (
+                21,
+                "f21ea98 fix: improve code formatting and comments for clarity in terminal restoration",
+            ),
+            (
+                22,
+                "8cc6623 fix: restore the terminal on every exit path after raw mode is enabled",
+            ),
+            (
+                23,
+                "a84a60c Merge pull request #13 from ReagentX/feat/cs/session-ownership",
+            ),
+            (
+                24,
+                "1e52bae fix: improve code comments and formatting for clarity",
+            ),
+            (
+                25,
+                "78f9ddc feat: protocol v5 — session listing and paths follow the connection's launch context",
+            ),
+            (
+                26,
+                "411545a Merge pull request #12 from ReagentX/fix/cs/blocking-write-wedge",
+            ),
+            (
+                27,
+                "865249d fix: improve documentation for writer queue and message handling",
+            ),
+            (
+                28,
+                "ba2d23a fix: bound client socket writes and declare a failed transport dead",
+            ),
+            (
+                29,
+                "4496980 fix: move PTY writes to a per-task writer worker so a stalled child cannot wedge the core",
+            ),
+            (
+                30,
+                "74e6520 Merge pull request #11 from ReagentX/feat/cs/protocol-v4-hardening",
+            ),
+            (
+                31,
+                "47efd3a feat: enhance protocol v4 handling with strict decoding and base64 encoding for paths",
+            ),
+            (
+                32,
+                "36d7cc9 feat: enforce MAX_FRAME on write; compile-check the paste-size chain",
+            ),
+            (
+                33,
+                "b65f9b4 feat: protocol v4 — strict decode, base64 input/paste bytes, lossless paths",
+            ),
+            (
+                34,
+                "efd09da Merge pull request #10 from ReagentX/refactor/cs/mechanical-cleanups",
+            ),
+            (
+                35,
+                "e74973e refactor: improve documentation for clarity and conciseness",
+            ),
+            (
+                36,
+                "4db69a3 fix: require the hello ack in --kill's socket path; single connect-error report",
+            ),
+            (37, "bold red underline green reverse"),
+            (38, "256color truecolor"),
+        ],
+        (39, 0),
+    );
 
-/// The Codex fixture pushes chat history into scrollback through a top-anchored
-/// DECSTBM region (`CSI 1;N r` plus `\r\n` at the bottom). vt100 retains no
-/// rows from those scrolls, while alacritty retains 85.
+    let fg = Color::Named(NamedColor::Foreground);
+    let bg = Color::Named(NamedColor::Background);
+    // ls colors: executable, setuid (fg plus bg), symlink.
+    assert_cell(
+        F,
+        &al,
+        (0, 52),
+        'a',
+        Color::Named(NamedColor::Red),
+        bg,
+        Flags::empty(),
+    );
+    assert_cell(
+        F,
+        &al,
+        (6, 52),
+        'a',
+        Color::Named(NamedColor::Black),
+        Color::Named(NamedColor::Red),
+        Flags::empty(),
+    );
+    assert_cell(
+        F,
+        &al,
+        (13, 52),
+        'a',
+        Color::Named(NamedColor::Magenta),
+        bg,
+        Flags::empty(),
+    );
+    // git log hash.
+    assert_cell(
+        F,
+        &al,
+        (17, 0),
+        'f',
+        Color::Named(NamedColor::Yellow),
+        bg,
+        Flags::empty(),
+    );
+    // Scripted attribute row: bold, underline, reverse.
+    assert_cell(
+        F,
+        &al,
+        (37, 0),
+        'b',
+        Color::Named(NamedColor::Red),
+        bg,
+        Flags::BOLD,
+    );
+    assert_cell(
+        F,
+        &al,
+        (37, 9),
+        'u',
+        Color::Named(NamedColor::Green),
+        bg,
+        Flags::UNDERLINE,
+    );
+    assert_cell(F, &al, (37, 25), 'r', fg, bg, Flags::INVERSE);
+    // Color depth: 256-color index and truecolor RGB.
+    assert_cell(
+        F,
+        &al,
+        (38, 0),
+        '2',
+        Color::Indexed(208),
+        bg,
+        Flags::empty(),
+    );
+    assert_cell(
+        F,
+        &al,
+        (38, 9),
+        't',
+        Color::Spec(Rgb {
+            r: 100,
+            g: 200,
+            b: 50,
+        }),
+        bg,
+        Flags::empty(),
+    );
+}
+
+/// Bulk scrolling `cargo check`/`cargo clippy` output. The bold bright-green
+/// "Compiling" and "Finished" cells pin Cargo's status styling.
+#[test]
+fn compat_build_log() {
+    const F: &str = "build_log.bin";
+    let al = alacritty(include_bytes!("../tests/corpus/build_log.bin"));
+    assert_screen(
+        F,
+        &al,
+        &[
+            (0, "   Compiling libc v0.2.186"),
+            (1, "   Compiling serde_core v1.0.228"),
+            (2, "   Compiling proc-macro2 v1.0.106"),
+            (3, "   Compiling unicode-ident v1.0.24"),
+            (4, "   Compiling quote v1.0.46"),
+            (5, "   Compiling rustix v1.1.4"),
+            (6, "   Compiling serde v1.0.228"),
+            (7, "    Checking memchr v2.8.3"),
+            (8, "    Checking cfg-if v1.0.4"),
+            (9, "   Compiling parking_lot_core v0.9.12"),
+            (10, "    Checking scopeguard v1.2.0"),
+            (11, "    Checking smallvec v1.15.2"),
+            (12, "   Compiling signal-hook v0.4.4"),
+            (13, "    Checking lock_api v0.4.14"),
+            (14, "    Checking log v0.4.33"),
+            (15, "    Checking regex-syntax v0.8.11"),
+            (16, "    Checking cursor-icon v1.2.0"),
+            (17, "    Checking arrayvec v0.7.8"),
+            (18, "    Checking base64 v0.22.1"),
+            (19, "    Checking unicode-width v0.2.2"),
+            (20, "    Checking home v0.5.12"),
+            (21, "    Checking aho-corasick v1.1.4"),
+            (22, "    Checking errno v0.3.14"),
+            (23, "    Checking signal-hook-registry v1.4.8"),
+            (24, "    Checking parking_lot v0.12.5"),
+            (25, "   Compiling syn v2.0.118"),
+            (26, "    Checking regex-automata v0.4.15"),
+            (27, "    Checking bitflags v2.13.0"),
+            (28, "   Compiling serde_derive v1.0.228"),
+            (29, "    Checking polling v3.11.0"),
+            (30, "    Checking rustix-openpty v0.2.0"),
+            (31, "    Checking vte v0.15.0"),
+            (32, "    Checking alacritty_terminal v0.26.0"),
+            (
+                33,
+                "    Checking depcheck v0.0.0 (/Users/chris/.claude/jobs/6638be1a/tmp/depcheck)",
+            ),
+            (
+                34,
+                "    Finished `dev` profile [unoptimized + debuginfo] target(s) in 3.63s",
+            ),
+            (
+                35,
+                "    Checking depcheck v0.0.0 (/Users/chris/.claude/jobs/6638be1a/tmp/depcheck)",
+            ),
+            (
+                36,
+                "    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.11s",
+            ),
+        ],
+        (37, 0),
+    );
+
+    let bg = Color::Named(NamedColor::Background);
+    assert_cell(
+        F,
+        &al,
+        (0, 3),
+        'C',
+        Color::Named(NamedColor::BrightGreen),
+        bg,
+        Flags::BOLD,
+    );
+    assert_cell(
+        F,
+        &al,
+        (34, 4),
+        'F',
+        Color::Named(NamedColor::BrightGreen),
+        bg,
+        Flags::BOLD,
+    );
+}
+
+// These fixtures isolate parser behavior that visible-screen checks miss.
+
+/// The Codex fixture pushes chat history through a top-anchored DECSTBM region
+/// (`CSI 1;N r` plus `\r\n` at the bottom). The resulting scrollback contains
+/// exactly 85 rows.
 ///
 /// The fixture styles its two-cell "› " prompt marker with bold followed by
-/// dim. alacritty stores both flags, while vt100 stores only dim. Apart from
-/// these asserted differences, the visible screen, cursor, and plain text are
-/// equivalent.
+/// dim and no intervening SGR 22: both intensity flags stack on the cells.
 #[test]
 fn semantic_codex_resume_scrollback_retention() {
-    let (mut vt, al, bold_dim_cells) = compare_backends(
-        "codex_resume.bin",
-        include_bytes!("../tests/corpus/codex_resume.bin"),
-        true,
-    );
-    assert_eq!(
-        vt100_retained(&mut vt),
-        0,
-        "vt100 drops all region-scrolled history"
-    );
-    assert_eq!(
-        al.grid().history_size(),
-        85,
-        "alacritty retains the codex chat history"
-    );
+    let al = alacritty(include_bytes!("../tests/corpus/codex_resume.bin"));
+    assert_eq!(al.grid().history_size(), 85, "codex chat history retention");
 
-    // The bold+dim delta's exact footprint: the "› " prompt marker, row 7.
-    assert_eq!(bold_dim_cells, 2, "cells the intensity delta touches");
     let marker = &al.grid()[Line(7)][Column(0)];
     assert_eq!(marker.c, '\u{203a}');
     assert!(
         marker.flags.contains(Flags::BOLD.union(Flags::DIM)),
-        "alacritty stacks bold and dim"
+        "bold and dim stack on the prompt marker"
     );
-    let vt_marker = vt.screen().cell(7, 0).unwrap();
+    let pad = &al.grid()[Line(7)][Column(1)];
     assert!(
-        !vt_marker.bold() && vt_marker.dim(),
-        "vt100 keeps only the later SGR (dim)"
+        pad.flags.contains(Flags::BOLD.union(Flags::DIM)),
+        "the marker's padding cell carries both flags too"
     );
 }
 
-/// Golden: the retention delta in its minimal synthetic form. A top-anchored
-/// `CSI 1;20 r` region with 34 newlines scrolled through its bottom margin.
-/// vt100 retains none of the scrolled-off rows, while alacritty retains all
-/// 34. The visible screens stay equivalent; only history differs.
+/// Isolate top-anchored-region retention with a `CSI 1;20 r` region and 34
+/// newlines through its bottom margin. The parser retains 35 rows: 34 region
+/// scrolls plus the initial row that `ESC[2J` moves into history.
 #[test]
 fn semantic_topregion_scroll_retention() {
-    let (mut vt, al, _) = compare_backends(
-        "topregion_scroll.bin",
-        include_bytes!("../tests/corpus/topregion_scroll.bin"),
-        false,
-    );
-    assert_eq!(
-        vt100_retained(&mut vt),
-        0,
-        "vt100 drops all region-scrolled history"
-    );
-    // alacritty retains 34 region scrolls plus the initial row preserved by
-    // `ESC[2J`; vt100 erases the initial row in place.
+    let al = alacritty(include_bytes!("../tests/corpus/topregion_scroll.bin"));
     assert_eq!(
         al.grid().history_size(),
         35,
-        "alacritty retains one row per bottom-margin newline, plus ED 2's"
+        "one row per bottom-margin newline, plus ED 2's"
     );
 }
 
-/// VS16 emoji-presentation width is equal in both configured backends.
-/// U+26A0+VS16 occupies one cell, with VS16 stored as a zero-width attachment,
-/// so the fixture has identical emoji column alignment.
+/// Pin VS16 emoji-presentation width. U+26A0+VS16 occupies one cell because
+/// VS16 remains a zero-width attachment; default-emoji codepoints remain wide.
 #[test]
-fn semantic_wide_emoji_vs16_width_parity() {
-    let (vt, al) = assert_visible_equivalent(
-        "wide_emoji.bin",
-        include_bytes!("../tests/corpus/wide_emoji.bin"),
-    );
+fn semantic_wide_emoji_vs16_width() {
+    let al = alacritty(include_bytes!("../tests/corpus/wide_emoji.bin"));
     let grid = al.grid();
 
-    // U+2705 has emoji presentation by default: two cells in both backends.
+    // U+2705 has emoji presentation by default: two cells.
     let check = &grid[Line(0)][Column(8)];
     assert_eq!(check.c, '\u{2705}');
     assert!(check.flags.contains(Flags::WIDE_CHAR));
-    assert!(vt.screen().cell(0, 8).unwrap().is_wide());
 
     // U+26A0 is width 1; VS16 attaches as a zero-width extra and does not
-    // widen the cell, in either backend.
+    // widen the cell.
     let warn = &grid[Line(0)][Column(16)];
     assert_eq!(warn.c, '\u{26a0}');
     assert!(!warn.flags.contains(Flags::WIDE_CHAR));
     assert_eq!(warn.zerowidth(), Some(&['\u{fe0f}'][..]));
-    let vt_warn = vt.screen().cell(0, 16).unwrap();
-    assert_eq!(vt_warn.contents(), "\u{26a0}\u{fe0f}");
-    assert!(!vt_warn.is_wide());
 
     // The alignment consequence: the following text starts one cell after
-    // the narrow emoji in both backends, and the next default-wide emoji
-    // lands on the same column.
+    // the narrow emoji, and the next default-wide emoji lands on column 23.
     assert_eq!(grid[Line(0)][Column(18)].c, 'w');
-    assert_eq!(vt.screen().cell(0, 18).unwrap().contents(), "w");
     let fire = &grid[Line(0)][Column(23)];
     assert_eq!(fire.c, '\u{1f525}');
     assert!(fire.flags.contains(Flags::WIDE_CHAR));
-    assert!(vt.screen().cell(0, 23).unwrap().is_wide());
 }
 
-/// Golden: DEC line-drawing charset (SCS). vt100 leaves special-graphics bytes
-/// as ASCII, while alacritty translates them to box-drawing glyphs.
+/// Pin the DEC line-drawing charset (SCS). Special-graphics bytes translate to
+/// box-drawing glyphs in retained history and on the visible screen; ASCII
+/// resumes after `ESC ( B`.
 ///
-/// The fixture's region starts at row 5 and does not scroll. Its only scroll
-/// is a full-screen `\r\n` after the region resets, and both backends retain
-/// that row.
+/// The fixture's region starts at row 5 and does not scroll; its only scroll
+/// is a full-screen `\r\n` after the region resets, retained as one row.
 #[test]
 fn semantic_dec_scrollregion_charset_translation() {
-    let bytes = include_bytes!("../tests/corpus/dec_scrollregion.bin");
-    let mut vt = vt100(bytes);
-    let al = alacritty(bytes);
+    let al = alacritty(include_bytes!("../tests/corpus/dec_scrollregion.bin"));
 
-    // Identical retention: one full-screen scroll, both backends keep it.
-    assert_eq!(vt100_retained(&mut vt), 1, "vt100 retains the one scroll");
     assert_eq!(
         al.grid().history_size(),
         1,
-        "alacritty retains the same one scroll"
+        "the one full-screen scroll is retained"
     );
 
-    // The box's top edge is the scrolled-off row: translated in alacritty's
-    // history, untranslated in vt100's.
+    // The box's top edge is the scrolled-off row: translated in history.
     let top = al.grid()[Line(-1)]
         .into_iter()
         .map(|cell| cell.c)
         .collect::<String>();
     assert_eq!(top.trim_end(), "┌─────┐");
-    vt.screen_mut().set_scrollback(1);
-    let vt_top = vt.screen().rows(0, COLS as u16).next().unwrap();
-    vt.screen_mut().set_scrollback(0);
-    assert_eq!(vt_top, "lqqqqqk");
 
-    // Visible screen: the box body diverges per charset, everything after
-    // `ESC ( B` (and everything the region touched) is identical.
+    // Visible screen: box body translated, ASCII rows verbatim, the rest
+    // blank.
     let al_text = serialize::contents(&al);
     let al_rows: Vec<&str> = al_text.split('\n').collect();
-    let vt_rows: Vec<String> = vt.screen().rows(0, COLS as u16).collect();
     assert_eq!(al_rows[0], "│     │");
-    assert_eq!(vt_rows[0], "x     x");
     assert_eq!(al_rows[1], "└─────┘");
-    assert_eq!(vt_rows[1], "mqqqqqj");
     let shared = [
         (2, "ascii after charset"),
         (3, "inside region 1"),
@@ -372,13 +570,10 @@ fn semantic_dec_scrollregion_charset_translation() {
         (38, "bottom line after region reset"),
     ];
     for (row, text) in shared {
-        assert_eq!(al_rows[row], text, "alacritty row {row}");
-        assert_eq!(vt_rows[row], text, "vt100 row {row}");
+        assert_eq!(al_rows[row], text, "row {row}");
     }
     for row in (6..38).chain([39]) {
-        assert_eq!(al_rows[row], "", "alacritty row {row} blank");
-        assert_eq!(vt_rows[row], "", "vt100 row {row} blank");
+        assert_eq!(al_rows[row], "", "row {row} blank");
     }
-    assert_eq!(vt.screen().cursor_position(), (39, 0));
     assert_eq!(al.grid().cursor.point, Point::new(Line(39), Column(0)));
 }

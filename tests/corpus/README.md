@@ -1,15 +1,16 @@
 # PTY capture corpus
 
-Terminal emulators are difficult to test with synthetic escape sequences
-alone. This corpus preserves the raw output of real terminal programs so the
-emulator tests can replay the same byte stream into each backend.
+Synthetic escape sequences isolate parser rules, but they do not reproduce the
+state transitions emitted by real terminal programs. This corpus keeps their
+raw PTY output so the emulator tests can replay those transitions byte for
+byte.
 
 ## Capture method
 
-Each fixture was recorded under a 40×120 PTY with
-`TERM=xterm-256color`, using a scripted `pty.fork` driver. Tests feed these
-bytes to the parsers verbatim. If a fixture needs to change, record a new
-session; do not patch the captured bytes.
+Each fixture comes from a scripted `pty.fork` session under a 40×120 PTY with
+`TERM=xterm-256color`. Tests feed the captured bytes to the emulator verbatim.
+If a fixture needs to change, record a new session rather than patching the
+binary capture.
 
 ## Fixtures
 
@@ -22,14 +23,21 @@ session; do not patch the captured bytes.
 | `top_live.bin` | live `top` session for approximately four seconds, then `q` | rapid full-screen redraws, HPA/VPA addressing |
 | `shell_colors.bin` | `ls --color`, `git log --color`, and 16-color, 256-color, and truecolor SGR | SGR runs, color-depth coverage |
 | `build_log.bin` | `cargo check` and `cargo clippy` with `CARGO_TERM_COLOR=always` | bulk scrolling output, styled diagnostics |
-| `wide_emoji.bin` | `printf` output containing VS16 emoji, CJK, and combining marks | wide and zero-width character semantics; both configured backends treat VS16 as zero-width |
-| `dec_scrollregion.bin` | `printf` output with DEC line drawing (`ESC ( 0`) and `CSI 5;20r` | DEC charset translation; the region does not scroll because it is not top-anchored, and both backends retain the later full-screen scroll |
-| `topregion_scroll.bin` | `printf` output with `CSI 1;20r`, 34 newlines through the bottom margin, and an isolation line below the region | top-anchored-region retention: vt100 retains no rows, while alacritty retains 35, including the row preserved by `ESC[2J` |
+| `wide_emoji.bin` | `printf` output containing VS16 emoji, CJK, and combining marks | wide and zero-width characters; VS16 remains a zero-width attachment on a single-cell base |
+| `dec_scrollregion.bin` | `printf` output with DEC line drawing (`ESC ( 0`) and `CSI 5;20r` | DEC charset translation; the non-top-anchored region does not scroll, and the later full-screen scroll retains one row |
+| `topregion_scroll.bin` | `printf` output with `CSI 1;20r`, 34 newlines through the bottom margin, and an isolation line below the region | top-anchored-region retention pinned at 35: 34 region scrolls plus the row preserved by `ESC[2J` |
 
 ## Test classification
 
-The differential suite uses `tmux_split`, `vim_session`, `less_altscreen`,
-`top_live`, `shell_colors`, and `build_log` to verify compatible displayed
-state. It uses `codex_resume`, `wide_emoji`, `dec_scrollregion`, and
-`topregion_scroll` to assert exact semantic behavior where the backends differ
-or where parity is significant.
+The fixtures cover two classes of behavior:
+
+- `tmux_split`, `vim_session`, `less_altscreen`, `top_live`, `shell_colors`,
+  and `build_log` pin displayed state: every plain-text row, the cursor, and
+  selected styled cells.
+- `codex_resume`, `wide_emoji`, `dec_scrollregion`, and `topregion_scroll` pin
+  parser semantics: scrollback retention, intensity stacking, charset
+  translation, and VS16 width.
+
+These are absolute values in `src/golden.rs`. If an `alacritty_terminal` update
+changes one, the failing row, cell, or count identifies the behavior that needs
+review.

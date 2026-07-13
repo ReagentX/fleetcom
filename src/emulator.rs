@@ -1,6 +1,5 @@
-//! Terminal emulation for task output and screen-state queries. Production
-//! tasks use `alacritty_terminal`; tests can also construct a vt100-backed
-//! emulator for differential comparisons.
+//! Fleetcom reconstructs each task's terminal state from raw PTY output.
+//! `alacritty_terminal` provides the parser, visible grid, and scrollback.
 
 use std::{
     sync::{Arc, Mutex},
@@ -16,12 +15,10 @@ use alacritty_terminal::{
     vte::ansi::Processor,
 };
 
-/// Mouse event classes the child requested (DECSET 9/1000/1002/1003).
-/// Backend-neutral so callers route input without naming a backend type.
+/// Mouse event classes requested by the child through DECSET 1000/1002/1003.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MouseProtocolMode {
     None,
-    Press,
     PressRelease,
     ButtonMotion,
     AnyMotion,
@@ -114,9 +111,9 @@ const MAX_ZEROWIDTH: usize = 16;
 /// Counting bytes lets repeated marks trigger a scan without a separate timer.
 const SWEEP_INTERVAL_BYTES: usize = 256 * 1024;
 
-/// The alacritty backend: grid plus parser, advanced together so one lock
-/// covers both, plus the probe-response buffer shared with `term`'s listener.
-pub struct AlacrittyBackend {
+/// One task's parser, terminal grid, and buffered probe responses. The parser
+/// and grid advance together under the same caller-held lock.
+pub struct Emulator {
     term: Term<ProbeSink>,
     parser: Processor,
     responses: Arc<Mutex<Vec<String>>>,
@@ -124,7 +121,7 @@ pub struct AlacrittyBackend {
     bytes_since_sweep: usize,
 }
 
-impl AlacrittyBackend {
+impl Emulator {
     /// Drain buffered `PtyWrite` responses through the allowlist, preserving
     /// generation order. Runs after `advance`/`stop_sync` returns, outside
     /// the listener callback.
@@ -175,18 +172,7 @@ impl AlacrittyBackend {
             }
         }
     }
-}
 
-/// One task's terminal parser and grid.
-pub enum Emulator {
-    /// Test-only reference backend used by differential and mouse tests.
-    /// Both variants are boxed to keep the enum small.
-    #[cfg(test)]
-    Vt100(Box<vt100::Parser>),
-    Alacritty(Box<AlacrittyBackend>),
-}
-
-impl Emulator {
     /// A fresh `rows`×`cols` grid retaining `scrollback` rows of history.
     pub fn new(rows: u16, cols: u16, scrollback: usize) -> Self {
         let responses = Arc::new(Mutex::new(Vec::new()));
@@ -204,41 +190,25 @@ impl Emulator {
             },
             ProbeSink(Arc::clone(&responses)),
         );
-        Self::Alacritty(Box::new(AlacrittyBackend {
+        Self {
             term,
             parser: Processor::new(),
             responses,
             bytes_since_sweep: 0,
-        }))
-    }
-
-    /// A fresh vt100-backed emulator for cross-backend tests.
-    #[cfg(test)]
-    pub fn new_vt100(rows: u16, cols: u16, scrollback: usize) -> Self {
-        Self::Vt100(Box::new(vt100::Parser::new(rows, cols, scrollback)))
+        }
     }
 
     /// Parse raw child output into the grid. Returns the probe replies the
     /// backend generated that pass the allowlist, in generation order; the
     /// caller owns delivering them to the child.
     pub fn process(&mut self, bytes: &[u8]) -> Vec<String> {
-        match self {
-            #[cfg(test)]
-            Self::Vt100(p) => {
-                p.process(bytes);
-                // vt100 has no response machinery at all.
-                Vec::new()
-            }
-            Self::Alacritty(b) => {
-                b.parser.advance(&mut b.term, bytes);
-                b.bytes_since_sweep = b.bytes_since_sweep.saturating_add(bytes.len());
-                if b.bytes_since_sweep >= SWEEP_INTERVAL_BYTES {
-                    b.bytes_since_sweep = 0;
-                    b.sweep_zerowidth();
-                }
-                b.drain_allowed()
-            }
+        self.parser.advance(&mut self.term, bytes);
+        self.bytes_since_sweep = self.bytes_since_sweep.saturating_add(bytes.len());
+        if self.bytes_since_sweep >= SWEEP_INTERVAL_BYTES {
+            self.bytes_since_sweep = 0;
+            self.sweep_zerowidth();
         }
+        self.drain_allowed()
     }
 
     /// Terminate a `?2026` synchronized update whose timeout has expired,
@@ -249,192 +219,113 @@ impl Emulator {
     /// to bound the stall. No-op while the timeout is still pending (an
     /// in-flight frame is not torn) and when no sync is open.
     pub fn flush_expired_sync(&mut self) -> Vec<String> {
-        match self {
-            // vt100 never buffers: there is nothing to flush.
-            #[cfg(test)]
-            Self::Vt100(_) => Vec::new(),
-            Self::Alacritty(b) => {
-                let expired = b
-                    .parser
-                    .sync_timeout()
-                    .sync_timeout()
-                    .is_some_and(|deadline| deadline <= Instant::now());
-                if !expired {
-                    return Vec::new();
-                }
-                b.parser.stop_sync(&mut b.term);
-                b.drain_allowed()
-            }
+        let expired = self
+            .parser
+            .sync_timeout()
+            .sync_timeout()
+            .is_some_and(|deadline| deadline <= Instant::now());
+        if !expired {
+            return Vec::new();
         }
+        self.parser.stop_sync(&mut self.term);
+        self.drain_allowed()
     }
 
     /// The visible screen as ANSI bytes, plus cursor position and whether the
     /// child hid the cursor.
     pub fn formatted(&self) -> (Vec<u8>, (u16, u16), bool) {
-        match self {
-            #[cfg(test)]
-            Self::Vt100(p) => {
-                let s = p.screen();
-                (s.contents_formatted(), s.cursor_position(), s.hide_cursor())
-            }
-            Self::Alacritty(b) => crate::serialize::formatted(&b.term),
-        }
+        crate::serialize::formatted(&self.term)
     }
 
     /// Plain-text contents of the visible screen, one line per row.
     pub fn contents(&self) -> String {
-        match self {
-            #[cfg(test)]
-            Self::Vt100(p) => p.screen().contents(),
-            Self::Alacritty(b) => crate::serialize::contents(&b.term),
-        }
+        crate::serialize::contents(&self.term)
     }
 
     /// Which mouse events the child asked for; the most recent DECSET wins
-    /// (both backends keep the modes mutually exclusive). The alacritty
-    /// backend does not model DECSET 9 (vte's `NamedPrivateMode` has no
-    /// mode 9), so it never reports `Press`: an X10-only child gets no mouse
-    /// reports at all, matching alacritty the terminal.
+    /// (the backend keeps the modes mutually exclusive). DECSET 9 (X10) is
+    /// not modeled, so an X10-only child gets no mouse reports.
     pub fn mouse_protocol_mode(&self) -> MouseProtocolMode {
-        match self {
-            #[cfg(test)]
-            Self::Vt100(p) => match p.screen().mouse_protocol_mode() {
-                vt100::MouseProtocolMode::None => MouseProtocolMode::None,
-                vt100::MouseProtocolMode::Press => MouseProtocolMode::Press,
-                vt100::MouseProtocolMode::PressRelease => MouseProtocolMode::PressRelease,
-                vt100::MouseProtocolMode::ButtonMotion => MouseProtocolMode::ButtonMotion,
-                vt100::MouseProtocolMode::AnyMotion => MouseProtocolMode::AnyMotion,
-            },
-            Self::Alacritty(b) => {
-                let mode = b.term.mode();
-                if mode.contains(TermMode::MOUSE_MOTION) {
-                    MouseProtocolMode::AnyMotion
-                } else if mode.contains(TermMode::MOUSE_DRAG) {
-                    MouseProtocolMode::ButtonMotion
-                } else if mode.contains(TermMode::MOUSE_REPORT_CLICK) {
-                    MouseProtocolMode::PressRelease
-                } else {
-                    MouseProtocolMode::None
-                }
-            }
+        let mode = self.term.mode();
+        if mode.contains(TermMode::MOUSE_MOTION) {
+            MouseProtocolMode::AnyMotion
+        } else if mode.contains(TermMode::MOUSE_DRAG) {
+            MouseProtocolMode::ButtonMotion
+        } else if mode.contains(TermMode::MOUSE_REPORT_CLICK) {
+            MouseProtocolMode::PressRelease
+        } else {
+            MouseProtocolMode::None
         }
     }
 
     /// How mouse coordinates are encoded on the wire. SGR wins over UTF-8
-    /// when both bits are somehow set; the backend keeps them exclusive
-    /// (each DECSET clears the other), so the order is belt-and-braces.
+    /// if both bits are set. Each DECSET normally clears the other bit.
     pub fn mouse_protocol_encoding(&self) -> MouseProtocolEncoding {
-        match self {
-            #[cfg(test)]
-            Self::Vt100(p) => match p.screen().mouse_protocol_encoding() {
-                vt100::MouseProtocolEncoding::Default => MouseProtocolEncoding::Default,
-                vt100::MouseProtocolEncoding::Utf8 => MouseProtocolEncoding::Utf8,
-                vt100::MouseProtocolEncoding::Sgr => MouseProtocolEncoding::Sgr,
-            },
-            Self::Alacritty(b) => {
-                let mode = b.term.mode();
-                if mode.contains(TermMode::SGR_MOUSE) {
-                    MouseProtocolEncoding::Sgr
-                } else if mode.contains(TermMode::UTF8_MOUSE) {
-                    MouseProtocolEncoding::Utf8
-                } else {
-                    MouseProtocolEncoding::Default
-                }
-            }
+        let mode = self.term.mode();
+        if mode.contains(TermMode::SGR_MOUSE) {
+            MouseProtocolEncoding::Sgr
+        } else if mode.contains(TermMode::UTF8_MOUSE) {
+            MouseProtocolEncoding::Utf8
+        } else {
+            MouseProtocolEncoding::Default
         }
     }
 
     /// Whether the child is on the alternate screen (DECSET 1049).
     pub fn alternate_screen(&self) -> bool {
-        match self {
-            #[cfg(test)]
-            Self::Vt100(p) => p.screen().alternate_screen(),
-            Self::Alacritty(b) => b.term.mode().contains(TermMode::ALT_SCREEN),
-        }
+        self.term.mode().contains(TermMode::ALT_SCREEN)
     }
 
-    /// Whether wheel events should reach the child as arrow keys. Production
-    /// requires the alternate screen and DECSET 1007, which defaults enabled.
-    /// The vt100 test backend cannot model DECSET 1007 and therefore checks
-    /// only the alternate screen.
+    /// Whether wheel events should reach the child as arrow keys: requires
+    /// the alternate screen and DECSET 1007, which defaults enabled.
     pub fn alternate_scroll(&self) -> bool {
-        match self {
-            #[cfg(test)]
-            Self::Vt100(p) => p.screen().alternate_screen(),
-            Self::Alacritty(b) => b
-                .term
-                .mode()
-                .contains(TermMode::ALT_SCREEN | TermMode::ALTERNATE_SCROLL),
-        }
+        self.term
+            .mode()
+            .contains(TermMode::ALT_SCREEN | TermMode::ALTERNATE_SCROLL)
     }
 
     /// Whether application cursor keys are on (DECSET 1).
     pub fn application_cursor(&self) -> bool {
-        match self {
-            #[cfg(test)]
-            Self::Vt100(p) => p.screen().application_cursor(),
-            Self::Alacritty(b) => b.term.mode().contains(TermMode::APP_CURSOR),
-        }
+        self.term.mode().contains(TermMode::APP_CURSOR)
     }
 
     /// Whether the child opted into bracketed paste (DECSET 2004).
     pub fn bracketed_paste(&self) -> bool {
-        match self {
-            #[cfg(test)]
-            Self::Vt100(p) => p.screen().bracketed_paste(),
-            Self::Alacritty(b) => b.term.mode().contains(TermMode::BRACKETED_PASTE),
-        }
+        self.term.mode().contains(TermMode::BRACKETED_PASTE)
     }
 
     /// Rows the viewport is scrolled back from live output.
     pub fn scrollback(&self) -> usize {
-        match self {
-            #[cfg(test)]
-            Self::Vt100(p) => p.screen().scrollback(),
-            Self::Alacritty(b) => b.term.grid().display_offset(),
-        }
+        self.term.grid().display_offset()
     }
 
     /// Move the viewport `rows` back from live output; the backend clamps to
     /// retained history, so `usize::MAX` means the oldest stored row.
     pub fn set_scrollback(&mut self, rows: usize) {
-        match self {
-            #[cfg(test)]
-            Self::Vt100(p) => p.screen_mut().set_scrollback(rows),
-            Self::Alacritty(b) => {
-                // Same clamp contract as vt100: absolute target, capped at
-                // retained history. The grid API is relative; both offsets
-                // are bounded by the history cap, so the delta fits i32.
-                let grid = b.term.grid();
-                let target = rows.min(grid.history_size());
-                let delta = target as i32 - grid.display_offset() as i32;
-                b.term.scroll_display(Scroll::Delta(delta));
-            }
-        }
+        // Clamp contract: absolute target, capped at retained history. The
+        // grid API is relative; both offsets are bounded by the history cap,
+        // so the delta fits i32.
+        let grid = self.term.grid();
+        let target = rows.min(grid.history_size());
+        let delta = target as i32 - grid.display_offset() as i32;
+        self.term.scroll_display(Scroll::Delta(delta));
     }
 
     /// Resize the grid to `rows`×`cols`.
     pub fn resize(&mut self, rows: u16, cols: u16) {
-        match self {
-            #[cfg(test)]
-            Self::Vt100(p) => p.screen_mut().set_size(rows, cols),
-            Self::Alacritty(b) => b.term.resize(GridSize {
-                lines: rows as usize,
-                columns: cols as usize,
-            }),
-        }
+        self.term.resize(GridSize {
+            lines: rows as usize,
+            columns: cols as usize,
+        });
     }
 
     /// Grid size as `(rows, cols)`.
     #[cfg(test)]
     pub fn size(&self) -> (u16, u16) {
-        match self {
-            Self::Vt100(p) => p.screen().size(),
-            Self::Alacritty(b) => (
-                b.term.grid().screen_lines() as u16,
-                b.term.grid().columns() as u16,
-            ),
-        }
+        (
+            self.term.grid().screen_lines() as u16,
+            self.term.grid().columns() as u16,
+        )
     }
 }
 
@@ -518,13 +409,6 @@ mod tests {
         assert!(emu.process(b"\x1b[?u").is_empty());
     }
 
-    /// The vt100 backend answers nothing: it has no response machinery.
-    #[test]
-    fn vt100_backend_answers_no_probes() {
-        let mut emu = Emulator::new_vt100(24, 80, 0);
-        assert!(emu.process(b"\x1b[6n\x1b[5n\x1b[c").is_empty());
-    }
-
     /// The stall the flush hook exists for: BSU plus a partial frame, then
     /// silence. The buffered frame must stay invisible while the timeout is
     /// pending (the hook must not tear an in-flight frame) and flush once the
@@ -556,7 +440,7 @@ mod tests {
         assert!(emu.contents().contains("and on"));
     }
 
-    /// Production mouse modes follow the most recent DECSET, return to none
+    /// Mouse modes follow the most recent DECSET, return to none
     /// when unset, and keep 1005 and 1006 mutually exclusive.
     #[test]
     fn mouse_modes_map_to_termmode_bits() {
@@ -586,22 +470,17 @@ mod tests {
         );
     }
 
-    /// DECSET 9 (X10 press-only) is ignored by the production backend, while
-    /// the vt100 test backend reports `Press`.
+    /// DECSET 9 (X10 press-only) is not modeled, so an X10-only child gets no
+    /// mouse reports.
     #[test]
-    fn x10_decset9_unmodeled_by_alacritty() {
+    fn x10_decset9_is_not_modeled() {
         let mut emu = Emulator::new(24, 80, 0);
         emu.process(b"\x1b[?9h");
         assert_eq!(emu.mouse_protocol_mode(), MouseProtocolMode::None);
-
-        let mut vt = Emulator::new_vt100(24, 80, 0);
-        vt.process(b"\x1b[?9h");
-        assert_eq!(vt.mouse_protocol_mode(), MouseProtocolMode::Press);
     }
 
-    /// The production wheel-as-arrows gate requires the alternate screen and
-    /// DECSET 1007, which defaults on. The vt100 test backend has no DECSET
-    /// 1007 state and gates only on the alternate screen.
+    /// The wheel-as-arrows gate requires the alternate screen and DECSET
+    /// 1007, which defaults on.
     #[test]
     fn alternate_scroll_requires_alt_screen_and_1007() {
         let mut emu = Emulator::new(24, 80, 0);
@@ -614,10 +493,6 @@ mod tests {
         assert!(emu.alternate_scroll());
         emu.process(b"\x1b[?1049l");
         assert!(!emu.alternate_scroll(), "leaving the alt screen closes it");
-
-        let mut vt = Emulator::new_vt100(24, 80, 0);
-        vt.process(b"\x1b[?1049h\x1b[?1007l");
-        assert!(vt.alternate_scroll(), "vt100 has no 1007 state; heuristic");
     }
 
     /// The clamp contract `scroll_view` relies on: absolute target capped at
@@ -704,17 +579,9 @@ mod tests {
         );
     }
 
-    /// Return the Alacritty terminal for direct grid assertions.
-    fn term_of(emu: &Emulator) -> &Term<ProbeSink> {
-        match emu {
-            Emulator::Vt100(_) => panic!("alacritty backend required"),
-            Emulator::Alacritty(b) => &b.term,
-        }
-    }
-
     /// Total zero-width characters retained across the viewport and history.
     fn total_zerowidth(emu: &Emulator) -> usize {
-        let grid = term_of(emu).grid();
+        let grid = emu.term.grid();
         let top = -(grid.history_size() as i32);
         let bottom = grid.screen_lines() as i32 - 1;
         (top..=bottom)
@@ -733,7 +600,7 @@ mod tests {
         let chunk = "\u{0301}".repeat(SWEEP_INTERVAL_BYTES / 2);
 
         emu.process(chunk.as_bytes());
-        let len = term_of(&emu).grid()[Line(0)][Column(0)]
+        let len = emu.term.grid()[Line(0)][Column(0)]
             .zerowidth()
             .map_or(0, <[char]>::len);
         assert!(
@@ -765,7 +632,7 @@ mod tests {
         );
         emu.process(payload.as_bytes());
 
-        let grid = term_of(&emu).grid();
+        let grid = emu.term.grid();
         for col in 0..80 {
             let z = grid[Line(1)][Column(col)]
                 .zerowidth()
@@ -797,7 +664,7 @@ mod tests {
             fed += filler.len();
         }
 
-        let cell = &term_of(&emu).grid()[Line(0)][Column(0)];
+        let cell = &emu.term.grid()[Line(0)][Column(0)];
         assert_eq!(cell.c, 'e');
         assert_eq!(
             cell.zerowidth(),
@@ -824,7 +691,7 @@ mod tests {
 
         // Confirm that the oversized cell reached history before the scan.
         let find_h = |emu: &Emulator| -> (i32, usize) {
-            let grid = term_of(emu).grid();
+            let grid = emu.term.grid();
             let top = -(grid.history_size() as i32);
             (top..0)
                 .find_map(|line| {

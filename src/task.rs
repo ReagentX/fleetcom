@@ -89,25 +89,23 @@ pub fn paste_bytes(bracketed: bool, content: &[u8]) -> Vec<u8> {
     }
 }
 
-/// Encode a mouse action using the child's current terminal mode. Mouse
-/// protocols determine supported actions and encoding. Without one, wheel
-/// actions become alternate-scroll arrows when the child's gate is open
-/// (alt screen with DECSET 1007, which defaults on; see
-/// [`Emulator::alternate_scroll`]); unsupported actions return `None`.
+/// Encode a mouse action under the child's current terminal mode. The selected
+/// protocol determines which actions are valid and how they are encoded. With
+/// no mouse protocol, wheel actions become alternate-scroll arrows when the
+/// alternate screen and DECSET 1007 are both active. DECSET 1007 defaults on;
+/// see [`Emulator::alternate_scroll`]. Unsupported actions return `None`.
 pub fn mouse_bytes(emu: &Emulator, kind: MouseKind, col: u16, row: u16) -> Option<Vec<u8>> {
     use crate::emulator::{MouseProtocolEncoding, MouseProtocolMode};
     let mode = emu.mouse_protocol_mode();
     if mode != MouseProtocolMode::None {
-        // The mode determines supported event classes.
-        let wanted = match kind {
-            MouseKind::WheelUp | MouseKind::WheelDown | MouseKind::Press(_) => true,
-            MouseKind::Release(_) => mode != MouseProtocolMode::Press,
-            MouseKind::Drag(_) => matches!(
+        // Every supported mode reports presses, releases, and wheel events;
+        // only motion modes 1002 and 1003 report drags.
+        if matches!(kind, MouseKind::Drag(_))
+            && !matches!(
                 mode,
                 MouseProtocolMode::ButtonMotion | MouseProtocolMode::AnyMotion
-            ),
-        };
-        if !wanted {
+            )
+        {
             return None;
         }
         // xterm button codes: wheel 64/65; drag adds 32.
@@ -950,43 +948,89 @@ mod tests {
         assert_eq!(mouse_bytes(&p, up, 0, 0), Some(b"\x1b[<64;1;1M".to_vec()));
     }
 
-    /// Verify mode-specific button delivery and encoding.
+    /// DECSET 1000/1002/1003 all report presses, releases, and wheel events;
+    /// only motion modes 1002 and 1003 report drags. SGR marks releases with
+    /// the `m` suffix and preserves the button code; the default and UTF-8
+    /// encodings use code 3 for every release.
     #[test]
     fn buttons_respect_mode_granularity_and_encoding() {
         let press = MouseKind::Press(MouseBtn::Left);
         let drag = MouseKind::Drag(MouseBtn::Left);
         let release = MouseKind::Release(MouseBtn::Left);
+        let wheel = MouseKind::WheelUp;
 
-        // The vt100 test backend models X10 mode, which accepts presses only.
-        let mut p = Emulator::new_vt100(24, 80, 0);
-        p.process(b"\x1b[?9h");
-        assert_eq!(
-            mouse_bytes(&p, press, 4, 2),
-            Some(vec![0x1b, b'[', b'M', 32, 33 + 4, 33 + 2])
-        );
-        assert_eq!(mouse_bytes(&p, release, 4, 2), None);
-        assert_eq!(mouse_bytes(&p, drag, 4, 2), None);
+        for (mode, drags) in [(1000, false), (1002, true), (1003, true)] {
+            let mut p = Emulator::new(24, 80, 0);
+            p.process(format!("\x1b[?{mode}h").as_bytes());
 
-        // The remaining modes use the production backend. In mode 1000 with
-        // SGR encoding, releases use `m` and drags remain disabled.
-        let mut p = Emulator::new(24, 80, 0);
-        p.process(b"\x1b[?1000h\x1b[?1006h");
-        assert_eq!(mouse_bytes(&p, press, 4, 2), Some(b"\x1b[<0;5;3M".to_vec()));
-        assert_eq!(
-            mouse_bytes(&p, release, 4, 2),
-            Some(b"\x1b[<0;5;3m".to_vec())
-        );
-        assert_eq!(mouse_bytes(&p, drag, 4, 2), None);
+            // Default encoding: single-byte fields.
+            assert_eq!(
+                mouse_bytes(&p, press, 4, 2),
+                Some(vec![0x1b, b'[', b'M', 32, 33 + 4, 33 + 2]),
+                "mode {mode}: default press"
+            );
+            assert_eq!(
+                mouse_bytes(&p, release, 4, 2),
+                Some(vec![0x1b, b'[', b'M', 32 + 3, 33 + 4, 33 + 2]),
+                "mode {mode}: default release"
+            );
+            assert_eq!(
+                mouse_bytes(&p, wheel, 4, 2),
+                Some(vec![0x1b, b'[', b'M', 32 + 64, 33 + 4, 33 + 2]),
+                "mode {mode}: default wheel"
+            );
+            assert_eq!(
+                mouse_bytes(&p, drag, 4, 2),
+                drags.then(|| vec![0x1b, b'[', b'M', 32 + 32, 33 + 4, 33 + 2]),
+                "mode {mode}: default drag"
+            );
 
-        // 1002 enables drag events.
-        p.process(b"\x1b[?1002h");
-        assert_eq!(mouse_bytes(&p, drag, 4, 2), Some(b"\x1b[<32;5;3M".to_vec()));
-        // Non-SGR releases use code 3.
-        p.process(b"\x1b[?1006l");
-        assert_eq!(
-            mouse_bytes(&p, release, 4, 2),
-            Some(vec![0x1b, b'[', b'M', 32 + 3, 33 + 4, 33 + 2])
-        );
+            // UTF-8 encoding: same codes, multi-byte coordinates.
+            p.process(b"\x1b[?1005h");
+            assert_eq!(
+                mouse_bytes(&p, press, 200, 2),
+                Some(vec![0x1b, b'[', b'M', 32, 0xc3, 0xa9, 33 + 2]),
+                "mode {mode}: utf8 press"
+            );
+            assert_eq!(
+                mouse_bytes(&p, release, 200, 2),
+                Some(vec![0x1b, b'[', b'M', 32 + 3, 0xc3, 0xa9, 33 + 2]),
+                "mode {mode}: utf8 release"
+            );
+            assert_eq!(
+                mouse_bytes(&p, wheel, 200, 2),
+                Some(vec![0x1b, b'[', b'M', 32 + 64, 0xc3, 0xa9, 33 + 2]),
+                "mode {mode}: utf8 wheel"
+            );
+            assert_eq!(
+                mouse_bytes(&p, drag, 200, 2),
+                drags.then(|| vec![0x1b, b'[', b'M', 32 + 32, 0xc3, 0xa9, 33 + 2]),
+                "mode {mode}: utf8 drag"
+            );
+
+            // SGR encoding: parameterized fields, release keeps its code.
+            p.process(b"\x1b[?1006h");
+            assert_eq!(
+                mouse_bytes(&p, press, 4, 2),
+                Some(b"\x1b[<0;5;3M".to_vec()),
+                "mode {mode}: sgr press"
+            );
+            assert_eq!(
+                mouse_bytes(&p, release, 4, 2),
+                Some(b"\x1b[<0;5;3m".to_vec()),
+                "mode {mode}: sgr release"
+            );
+            assert_eq!(
+                mouse_bytes(&p, wheel, 4, 2),
+                Some(b"\x1b[<64;5;3M".to_vec()),
+                "mode {mode}: sgr wheel"
+            );
+            assert_eq!(
+                mouse_bytes(&p, drag, 4, 2),
+                drags.then(|| b"\x1b[<32;5;3M".to_vec()),
+                "mode {mode}: sgr drag"
+            );
+        }
     }
 
     /// Scrollback clamps at both ends and input returns to live output.
