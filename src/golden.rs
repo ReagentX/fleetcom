@@ -292,6 +292,39 @@ fn semantic_codex_resume_scrollback_retention() {
     );
 }
 
+/// Golden: the retention delta in its minimal synthetic form — a top-anchored
+/// `CSI 1;20 r` region with 34 newlines scrolled through its bottom margin.
+/// vt100 drops every scrolled-off row (`grid.rs:566` requires a full-screen
+/// region); alacritty retains all 34 (`region.start == 0` suffices). The
+/// visible screens stay equivalent — only history differs — which is exactly
+/// the user-facing shape of the codex defect without codex's styling noise.
+///
+/// Certifies: scrollback exists after the swap for inline-TUI children that
+/// push history through top-anchored regions.
+#[test]
+fn semantic_topregion_scroll_retention() {
+    let (mut vt, al, _) = compare_backends(
+        "topregion_scroll.bin",
+        include_bytes!("../tests/corpus/topregion_scroll.bin"),
+        false,
+    );
+    assert_eq!(
+        vt100_retained(&mut vt),
+        0,
+        "vt100 drops all region-scrolled history"
+    );
+    // 34 region scrolls plus 1 from the opening `ESC[2J`: alacritty's ED 2
+    // clears the primary screen by scrolling the viewport into history
+    // (`clear_viewport`), here the single cursor row of the then-empty
+    // screen; vt100's ED 2 erases in place. Both deltas are whitelisted
+    // parser-level behavior (EMULATOR_MIGRATION.md, Testing).
+    assert_eq!(
+        al.grid().history_size(),
+        35,
+        "alacritty retains one row per bottom-margin newline, plus ED 2's"
+    );
+}
+
 /// Golden: VS16 emoji-presentation width — the expected delta is *absent* at
 /// these pins. The migration doc whitelists VS16 width as a parser-level
 /// delta, but alacritty_terminal 0.26.0 sizes cells with plain

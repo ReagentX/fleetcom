@@ -15,7 +15,8 @@ edited. Regenerating a fixture means re-recording, not patching bytes.
 | `shell_colors.bin` | ls --color, git log --color, 16/256/truecolor SGR | SGR runs, color depth coverage |
 | `build_log.bin` | cargo check + clippy, CARGO_TERM_COLOR=always | bulk scrolling output, styled diagnostics |
 | `wide_emoji.bin` | printf: VS16 emoji, CJK, combining marks | width semantics — vt100 and alacritty *disagree* here (VS16); semantic-suite candidate |
-| `dec_scrollregion.bin` | printf: DEC line drawing (ESC ( 0), explicit top-anchored scroll region | charset shifts; scrollback-retention delta between backends; semantic-suite candidate |
+| `dec_scrollregion.bin` | printf: DEC line drawing (ESC ( 0), scroll region `CSI 5;20r` | DEC charset translation delta — vt100 has no SCS machinery, glyphs stay ASCII. Its region is *not* top-anchored and nothing scrolls inside it, so it exercises no retention delta (suite finding; an earlier revision of this row claimed otherwise). Semantic-suite candidate |
+| `topregion_scroll.bin` | printf: `CSI 1;20r`, 34 newlines through the bottom margin, isolation line below the region | the retention delta in minimal synthetic form: vt100 drops all 34 scrolled rows, alacritty retains 35 (34 + `ESC[2J` viewport preservation). Semantic-suite candidate |
 
 Captures marked semantic-suite candidates exercise known parser-level deltas
 (see the migration plan's classifier whitelist); the rest are
