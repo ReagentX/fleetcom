@@ -13,6 +13,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use alacritty_terminal::sync::FairMutex;
 use nix::{
     sys::signal::{Signal, killpg},
     unistd::Pid,
@@ -177,15 +178,20 @@ pub struct Task {
     /// Sender for the detached PTY writer worker. `None` after `force_kill`.
     /// Queuing keeps a blocked PTY write off the core thread.
     input_tx: Option<Sender<Vec<u8>>>,
-    /// Bytes admitted to the writer queue but not yet fully written. Only the
-    /// core thread admits (single producer), so `queue_write`'s check-then-add
-    /// cannot over-admit; the worker subtracts after each completed write.
+    /// Bytes admitted to the writer queue but not yet fully written. Two
+    /// admitters: the core thread (`queue_write`, client input) and the reader
+    /// thread (`forward_probe_replies`, probe replies of a few bytes each).
+    /// Each check-then-add can over-admit by at most the other's in-flight
+    /// reply — noise against the 16 MiB cap; the worker subtracts after each
+    /// completed write.
     pending_write: Arc<AtomicUsize>,
     /// Session-leader PID, also used as the process-group ID.
     pid: Option<u32>,
     /// Shared with the reader thread: it writes (process bytes), the UI reads
-    /// (render/preview). Contention is trivial: writes are per output chunk.
-    parser: Arc<Mutex<Emulator>>,
+    /// (render/preview). Fair, not std: under a firehose the reader's long
+    /// `process` calls re-acquire back-to-back, and a std mutex would let it
+    /// starve the supervisor's snapshot locks indefinitely.
+    parser: Arc<FairMutex<Emulator>>,
     last_activity: Arc<Mutex<Instant>>,
     handle: Option<JoinHandle<()>>,
     pub tagged: bool,
@@ -214,11 +220,29 @@ fn signal(waker: &Waker) {
     }
 }
 
-/// Lock the shared emulator grid, recovering from a poisoned mutex.
-fn grid(parser: &Mutex<Emulator>) -> std::sync::MutexGuard<'_, Emulator> {
-    parser
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
+/// Lock the shared emulator grid. `FairMutex` is parking_lot underneath, so
+/// there is no poison state to recover from: a panic while parsing releases
+/// the lock and the next render proceeds on whatever state the grid holds.
+fn grid(parser: &FairMutex<Emulator>) -> impl std::ops::DerefMut<Target = Emulator> + '_ {
+    parser.lock()
+}
+
+/// Queue allowlisted probe replies for the child on the writer worker, using
+/// the same pending-byte accounting as `queue_write` but dropping instead of
+/// reporting when the queue is full: a child that stopped reading input is
+/// not waiting on a reply, and replies are a few bytes each.
+fn forward_probe_replies(tx: &Sender<Vec<u8>>, pending: &AtomicUsize, replies: Vec<String>) {
+    for reply in replies {
+        let len = reply.len();
+        if pending.load(Ordering::Acquire) + len > MAX_PENDING_WRITE {
+            continue;
+        }
+        pending.fetch_add(len, Ordering::Release);
+        if tx.send(reply.into_bytes()).is_err() {
+            // The worker has exited; remove the failed admission.
+            pending.fetch_sub(len, Ordering::Release);
+        }
+    }
 }
 
 /// Convert a wait status to a shell-style exit code.
@@ -292,13 +316,20 @@ impl Task {
         let mut reader = pair.master.try_clone_reader().map_err(io_err)?;
         let writer = pair.master.take_writer().map_err(io_err)?;
 
-        let parser = Arc::new(Mutex::new(Emulator::new(rows, cols, SCROLLBACK)));
+        let parser = Arc::new(FairMutex::new(Emulator::new(rows, cols, SCROLLBACK)));
         let last_activity = Arc::new(Mutex::new(Instant::now()));
+
+        // The writer channel exists before the reader thread because the
+        // reader forwards probe replies (CPR and friends) through it.
+        let (input_tx, input_rx) = channel::<Vec<u8>>();
+        let pending_write = Arc::new(AtomicUsize::new(0));
 
         let handle = {
             let parser = Arc::clone(&parser);
             let last_activity = Arc::clone(&last_activity);
             let waker = Arc::clone(&waker);
+            let input_tx = input_tx.clone();
+            let pending = Arc::clone(&pending_write);
             thread::spawn(move || {
                 let mut buf = [0u8; 8192];
                 loop {
@@ -311,7 +342,13 @@ impl Task {
                             break;
                         }
                         Ok(n) => {
-                            grid(&parser).process(&buf[..n]);
+                            let replies = grid(&parser).process(&buf[..n]);
+                            if !replies.is_empty() {
+                                // Probe replies answer the child through the
+                                // same writer worker as client input, keeping
+                                // PTY writes off this thread.
+                                forward_probe_replies(&input_tx, &pending, replies);
+                            }
                             if let Ok(mut t) = last_activity.lock() {
                                 *t = Instant::now();
                             }
@@ -325,8 +362,6 @@ impl Task {
 
         // Drain whole queued messages on a detached worker. The worker is not
         // joined because a PTY write can block until the slave side closes.
-        let (input_tx, input_rx) = channel::<Vec<u8>>();
-        let pending_write = Arc::new(AtomicUsize::new(0));
         {
             let pending = Arc::clone(&pending_write);
             let mut writer = writer;
@@ -446,6 +481,20 @@ impl Task {
             Lifecycle::Idle
         } else {
             Lifecycle::Active
+        }
+    }
+
+    /// Flush an expired `?2026` synchronized update so a stalled child's
+    /// buffered frame becomes visible (see [`Emulator::flush_expired_sync`]);
+    /// probe replies the flushed bytes generated are forwarded like live
+    /// ones. Called from the supervisor's tick — the loop's only periodic
+    /// path — because vte re-checks its sync timeout only when bytes arrive.
+    pub fn flush_expired_sync(&self) {
+        let replies = grid(&self.parser).flush_expired_sync();
+        if !replies.is_empty()
+            && let Some(tx) = &self.input_tx
+        {
+            forward_probe_replies(tx, &self.pending_write, replies);
         }
     }
 
@@ -609,8 +658,10 @@ impl Task {
         }
         self.kill_sent = true;
         self.handle.take(); // drop the JoinHandle -> detach, never block
-        // Close the queue without joining a worker that may still be in a PTY
-        // write. Killing the process group closes the slave side and unblocks it.
+        // Stop admitting input without joining a worker that may still be in
+        // a PTY write. Killing the process group closes the slave side, which
+        // unblocks the worker and EOFs the reader; the reader's own sender
+        // clone drops when it exits, closing the queue.
         self.input_tx.take();
     }
 }
@@ -706,7 +757,7 @@ mod tests {
     fn resize_is_reflected_in_the_grid() {
         let mut t = Task::spawn(3, "sleep 5", &here(), 24, 80, &env_here(), no_waker()).unwrap();
         t.resize(30, 100).unwrap();
-        assert_eq!(t.parser.lock().unwrap().size(), (30, 100));
+        assert_eq!(t.parser.lock().size(), (30, 100));
         t.terminate();
     }
 
@@ -890,8 +941,11 @@ mod tests {
         let drag = MouseKind::Drag(MouseBtn::Left);
         let release = MouseKind::Release(MouseBtn::Left);
 
-        // X10 mode: presses only.
-        let mut p = Emulator::new(24, 80, 0);
+        // X10 mode: presses only. Pinned through the vt100 backend, the only
+        // one that models DECSET 9 — alacritty ignores it entirely (see
+        // `emulator::tests::x10_decset9_unmodeled_by_alacritty`) — so this
+        // keeps `mouse_bytes`'s Press-mode gating under test.
+        let mut p = Emulator::new_vt100(24, 80, 0);
         p.process(b"\x1b[?9h");
         assert_eq!(
             mouse_bytes(&p, press, 4, 2),
@@ -900,8 +954,10 @@ mod tests {
         assert_eq!(mouse_bytes(&p, release, 4, 2), None);
         assert_eq!(mouse_bytes(&p, drag, 4, 2), None);
 
-        // 1000 with SGR: releases use `m`; drags remain disabled.
-        p.process(b"\x1b[?9l\x1b[?1000h\x1b[?1006h");
+        // 1000 with SGR: releases use `m`; drags remain disabled. From here
+        // on, the production backend.
+        let mut p = Emulator::new(24, 80, 0);
+        p.process(b"\x1b[?1000h\x1b[?1006h");
         assert_eq!(mouse_bytes(&p, press, 4, 2), Some(b"\x1b[<0;5;3M".to_vec()));
         assert_eq!(
             mouse_bytes(&p, release, 4, 2),
@@ -988,37 +1044,45 @@ mod tests {
         t.terminate();
     }
 
-    /// A poisoned grid mutex (a vt100 panic inside the guard) must degrade to
-    /// a recovered lock, not a permanently blank task: renders keep working
-    /// and the reader thread keeps feeding new output through the poison.
+    /// A child's cursor-position probe is answered on the wire: the reply
+    /// crosses the reader thread → allowlist → writer worker → PTY, and only
+    /// the advertised shape arrives. The child first sends secondary DA (a
+    /// denied probe), then primary DA and DSR 6; it reads 11 bytes — exactly
+    /// primary DA (5) plus CPR (6). If the secondary-DA reply leaked, those
+    /// bytes would arrive first and the assertion would see `ESC[>…`.
     #[test]
-    fn poisoned_grid_recovers_instead_of_blanking() {
-        let mut t = spawn(7, "sleep 1; printf 'aftermath\\n'");
-        // Poison the mutex the way a mid-render panic would.
-        let parser = Arc::clone(&t.parser);
-        let _ = thread::spawn(move || {
-            let _guard = parser.lock().unwrap();
-            panic!("simulated vt100 panic");
-        })
-        .join();
-        assert!(t.parser.is_poisoned());
-
-        let _ = t.preview(); // render side must not panic or wedge
-        // Output produced *after* the poison must still reach the screen.
+    fn probe_replies_reach_the_child_through_the_allowlist() {
+        let dir = std::env::temp_dir().join(format!("fleetcom_task_probe_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let out = dir.join("out");
+        // Raw-ish input: the CPR reply has no newline, so canonical mode
+        // would never hand it to the child.
+        let cmd = format!(
+            "stty -icanon -echo min 1 time 0; printf '\\033[>c\\033[c\\033[6n'; \
+             head -c 11 > {}",
+            out.display()
+        );
+        let mut t = Task::spawn(11, &cmd, &here(), 24, 80, &sh_env(), no_waker()).unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
-        let mut preview = String::new();
+        let mut got = Vec::new();
         while Instant::now() < deadline {
-            t.poll_exit().unwrap();
-            preview = t.preview();
-            if preview.contains("aftermath") {
+            got = std::fs::read(&out).unwrap_or_default();
+            if got.len() >= 11 {
                 break;
             }
             thread::sleep(Duration::from_millis(20));
         }
         assert!(
-            preview.contains("aftermath"),
-            "reader thread stopped feeding the grid after poison; preview: {preview:?}"
+            got.starts_with(b"\x1b[?6c\x1b["),
+            "child must read the primary DA reply first (no secondary-DA \
+             leak); got {got:?}"
+        );
+        assert!(
+            got.ends_with(b"R"),
+            "CPR reply must follow the DA reply; got {got:?}"
         );
         t.terminate();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

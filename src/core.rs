@@ -37,8 +37,8 @@ use crate::{
 pub enum Wake {
     /// A client request to apply.
     Cmd(Command),
-    /// A task wrote output; its `vt100` screen advanced (the reader thread has
-    /// already fed the parser), so the loop should tick to ship it.
+    /// A task wrote output; its emulator screen advanced (the reader thread
+    /// has already fed the parser), so the loop should tick to ship it.
     Output,
     /// The command source ended: the client's socket hit EOF. Distinct from a
     /// `Shutdown` command: the jobs keep running, only this connection is done.

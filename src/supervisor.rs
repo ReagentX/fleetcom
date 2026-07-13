@@ -257,6 +257,14 @@ impl Supervisor {
     /// `drain`ed events, never a `Task`.
     pub fn tick(&mut self) {
         self.reap();
+        // vte re-checks its ?2026 sync timeout only when bytes arrive, so a
+        // child that opens BSU and stalls would freeze its view. This tick is
+        // the loop's only periodic path (the idle backstop guarantees one at
+        // least every 200 ms), so an expired sync flushes here — before the
+        // snapshot below reads the grids, letting the same tick ship it.
+        for t in &self.tasks {
+            t.flush_expired_sync();
+        }
         let now = Instant::now();
 
         let views = self
@@ -634,6 +642,43 @@ mod tests {
         assert!(
             !s.drain().iter().any(|e| matches!(e, Event::Screen(_))),
             "unchanged screen must not be resent"
+        );
+    }
+
+    /// The tick path terminates an expired `?2026` synchronized update: a
+    /// child that opens BSU and stalls gets its buffered frame flushed by the
+    /// periodic tick instead of frozen until more bytes arrive. If the tick
+    /// hook were missing, the child's silence would keep the frame invisible
+    /// forever and this test would time out. Staleness *before* expiry is
+    /// pinned deterministically at the emulator level
+    /// (`emulator::tests::stalled_sync_update_flushes_after_timeout`); this
+    /// proves the supervisor wiring.
+    #[test]
+    fn tick_flushes_a_stalled_sync_update() {
+        let mut s = sup(24, 80);
+        s.apply(Command::Spawn {
+            command: "printf 'begin\\033[?2026hstalled'; sleep 30".into(),
+            cwd: here(),
+        });
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut preview = String::new();
+        while Instant::now() < deadline {
+            s.tick();
+            for e in s.drain() {
+                if let Event::Tasks(v) = e
+                    && let Some(t) = v.first()
+                {
+                    preview = t.preview.clone();
+                }
+            }
+            if preview.contains("stalled") {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        assert!(
+            preview.contains("stalled"),
+            "the stalled sync frame never flushed; preview: {preview:?}"
         );
     }
 
