@@ -12,6 +12,9 @@ mod format;
 mod frame;
 mod path;
 mod protocol;
+// Unreferenced until migration step 4 wires it into the Emulator seam.
+#[allow(dead_code)]
+mod serialize;
 mod session;
 mod supervisor;
 mod task;

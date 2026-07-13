@@ -11,6 +11,10 @@ repository = "https://github.com/ReagentX/fleetcom"
 version = "0.0.0"
 
 [dependencies]
+# `default-features = false` drops serde. Its unconditional tty module pulls
+# `signal-hook` 0.4 alongside crossterm's 0.3; the duplication is transitive
+# and unavoidable until crossterm bumps.
+alacritty_terminal = { version = "=0.26.0", default-features = false }
 base64 = "=0.22.1"
 crossterm = "=0.29.0"
 dirs = "=6.0.0"
