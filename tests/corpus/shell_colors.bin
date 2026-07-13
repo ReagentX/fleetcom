@@ -1,0 +1,63 @@
+total 172688
+drwxr-xr-x  926 root   wheel     29632 May 21 01:57 [1m[36m.[39;49m[0m
+drwxr-xr-x@  11 root   wheel       352 May 21 01:57 [1m[36m..[39;49m[0m
+-rwxr-xr-x    1 root   wheel    347840 May 21 01:57 [31maa[39;49m[0m
+-rwxr-xr-x   16 root   wheel    135488 May 21 01:57 [31mactool[39;49m[0m
+-rwxr-xr-x    1 root   wheel    222816 May 21 01:57 [31maea[39;49m[0m
+-rwxr-xr-x    1 root   wheel    171280 May 21 01:57 [31mafclip[39;49m[0m
+-rwxr-xr-x    1 root   wheel    361824 May 21 01:57 [31mafconvert[39;49m[0m
+-rwxr-xr-x    1 root   wheel    136000 May 21 01:57 [31mafhash[39;49m[0m
+-rwxr-xr-x    1 root   wheel    220128 May 21 01:57 [31mafida[39;49m[0m
+-rwxr-xr-x    1 root   wheel    226208 May 21 01:57 [31mafinfo[39;49m[0m
+-rwxr-xr-x    1 root   wheel    227872 May 21 01:57 [31mafktool[39;49m[0m
+-rwxr-xr-x    1 root   wheel    173728 May 21 01:57 [31mafplay[39;49m[0m
+-rwxr-xr-x    1 root   wheel    597680 May 21 01:57 [31mafscexpand[39;49m[0m
+-rwxr-xr-x    1 root   wheel    120928 May 21 01:57 [31magentxtrap[39;49m[0m
+-rwxr-xr-x   16 root   wheel    135488 May 21 01:57 [31magvtool[39;49m[0m
+-rwxr-xr-x   15 root   wheel       120 May 21 01:57 [31malias[39;49m[0m
+-rwxr-xr-x    1 root   wheel    173488 May 21 01:57 [31mapp-sso[39;49m[0m
+-rwxr-xr-x    1 root   wheel    169232 May 21 01:57 [31mapplesingle[39;49m[0m
+-rwxr-xr-x    1 root   wheel    102400 May 21 01:57 [31mapply[39;49m[0m
+-r-xr-xr-x    4 root   wheel     32136 May 21 01:57 [31mapropos[39;49m[0m
+-rwxr-xr-x   78 root   wheel    118928 May 21 01:57 [31mar[39;49m[0m
+-rwxr-xr-x    1 root   wheel    121216 May 21 01:57 [31march[39;49m[0m
+-rwxr-xr-x    1 root   wheel    205616 May 21 01:57 [31marchiveutil[39;49m[0m
+-rwxr-xr-x   78 root   wheel    118928 May 21 01:57 [31mas[39;49m[0m
+-rwxr-xr-x   78 root   wheel    118928 May 21 01:57 [31masa[39;49m[0m
+-rwxr-xr-x    1 root   wheel    171888 May 21 01:57 [31mAssetCacheLocatorUtil[39;49m[0m
+-rwxr-xr-x    1 root   wheel    227664 May 21 01:57 [31mAssetCacheManagerUtil[39;49m[0m
+-rwxr-xr-x    1 root   wheel    172976 May 21 01:57 [31mAssetCacheTetheratorUtil[39;49m[0m
+-rwxr-xr-x    1 root   wheel   4034112 May 21 01:57 [31massetutil[39;49m[0m
+-r-sr-xr-x    3 root   wheel    170832 May 21 01:57 [30m[41mat[39;49m[0m
+-rwxr-xr-x    1 root   wheel    211936 May 21 01:57 [31matos[39;49m[0m
+-r-sr-xr-x    3 root   wheel    170832 May 21 01:57 [30m[41matq[39;49m[0m
+-r-sr-xr-x    3 root   wheel    170832 May 21 01:57 [30m[41matrm[39;49m[0m
+-rwxr-xr-x    1 root   wheel    138096 May 21 01:57 [31matsutil[39;49m[0m
+-rwxr-xr-x    1 root   wheel    136416 May 21 01:57 [31mautomationmodetool[39;49m[0m
+-rwxr-xr-x    1 root   wheel    171440 May 21 01:57 [31mautomator[39;49m[0m
+lrwxr-xr-x    1 root   wheel        18 May 21 01:57 [35mauval[39;49m[0m -> /usr/bin/auvaltool
+-rwxr-xr-x    1 root   wheel    400544 May 21 01:57 [31mauvaltool[39;49m[0m
+-rwxr-xr-x    1 root   wheel    567072 May 21 01:57 [31mavbanalyse[39;49m[0m
+ls: stdout: Undefined error: 0
+[33mf00e685[m docs: add emulator migration plan (vt100 → alacritty_terminal)
+[33m3e00d45[m Merge pull request #15 from ReagentX/feat/cs/cleanup-imports
+[33m600908f[m refactor: clean up import statements across multiple files for improved readability
+[33mb7800d5[m Merge pull request #14 from ReagentX/fix/cs/terminal-restore-guard
+[33mf21ea98[m fix: improve code formatting and comments for clarity in terminal restoration
+[33m8cc6623[m fix: restore the terminal on every exit path after raw mode is enabled
+[33ma84a60c[m Merge pull request #13 from ReagentX/feat/cs/session-ownership
+[33m1e52bae[m fix: improve code comments and formatting for clarity
+[33m78f9ddc[m feat: protocol v5 — session listing and paths follow the connection's launch context
+[33m411545a[m Merge pull request #12 from ReagentX/fix/cs/blocking-write-wedge
+[33m865249d[m fix: improve documentation for writer queue and message handling
+[33mba2d23a[m fix: bound client socket writes and declare a failed transport dead
+[33m4496980[m fix: move PTY writes to a per-task writer worker so a stalled child cannot wedge the core
+[33m74e6520[m Merge pull request #11 from ReagentX/feat/cs/protocol-v4-hardening
+[33m47efd3a[m feat: enhance protocol v4 handling with strict decoding and base64 encoding for paths
+[33m36d7cc9[m feat: enforce MAX_FRAME on write; compile-check the paste-size chain
+[33mb65f9b4[m feat: protocol v4 — strict decode, base64 input/paste bytes, lossless paths
+[33mefd09da[m Merge pull request #10 from ReagentX/refactor/cs/mechanical-cleanups
+[33me74973e[m refactor: improve documentation for clarity and conciseness
+[33m4db69a3[m fix: require the hello ack in --kill's socket path; single connect-error report
+[1;31mbold red[0m [4;32munderline green[0m [7mreverse[0m
+[38;5;208m256color[0m [38;2;100;200;50mtruecolor[0m
