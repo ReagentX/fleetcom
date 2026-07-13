@@ -554,4 +554,68 @@ mod tests {
         emu.set_scrollback(0);
         assert_eq!(emu.scrollback(), 0);
     }
+
+    /// History gathered through a top-anchored scroll region must survive
+    /// resize, and insertion at the new geometry must keep accumulating.
+    /// Multiplexers with homegrown grids historically lose exactly this
+    /// (zellij drops region-scrolled history after a pane resize until the
+    /// original size returns); alacritty reflows history through resize in
+    /// both directions, and this pins that our seam preserves that.
+    #[test]
+    fn region_scrolled_history_survives_resize() {
+        let mut emu = Emulator::new(40, 120, 2000);
+        for i in 1..=20 {
+            emu.process(format!("\x1b[{i};1Hseed {i:02}").as_bytes());
+        }
+        // Codex-style insertion: top-anchored region, newlines at its bottom.
+        emu.process(b"\x1b[1;20r\x1b[20;1H");
+        for i in 1..=30 {
+            emu.process(format!("\r\nhist {i:02}").as_bytes());
+        }
+        emu.process(b"\x1b[r");
+        emu.set_scrollback(usize::MAX);
+        assert_eq!(emu.scrollback(), 30);
+        assert!(
+            emu.contents().starts_with("seed 01"),
+            "oldest region-scrolled row heads the history"
+        );
+        emu.set_scrollback(0);
+
+        // Shrink, then keep inserting at the new geometry. Row counts shift
+        // with reflow (shrinking parks the excess viewport rows in history),
+        // so assert reachability and monotonic growth, not exact totals.
+        emu.resize(30, 100);
+        emu.process(b"\x1b[1;15r\x1b[15;1H");
+        for i in 1..=20 {
+            emu.process(format!("\r\nmore {i:02}").as_bytes());
+        }
+        emu.process(b"\x1b[r");
+        emu.set_scrollback(usize::MAX);
+        let after_shrink = emu.scrollback();
+        assert!(
+            after_shrink >= 50,
+            "history keeps accumulating at the new size: {after_shrink}"
+        );
+        assert!(
+            emu.contents().starts_with("seed 01"),
+            "pre-resize history remains reachable"
+        );
+
+        // Growing back must not orphan anything either.
+        emu.set_scrollback(0);
+        emu.resize(40, 120);
+        emu.set_scrollback(usize::MAX);
+        assert!(
+            emu.contents().contains("seed 01"),
+            "history survives the round trip"
+        );
+        let live = {
+            emu.set_scrollback(0);
+            emu.contents()
+        };
+        assert!(
+            live.contains("more 20"),
+            "the newest insertion is on the live screen"
+        );
+    }
 }
