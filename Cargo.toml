@@ -11,6 +11,8 @@ repository = "https://github.com/ReagentX/fleetcom"
 version = "0.0.0"
 
 [dependencies]
+# Disable the unused serde integration.
+alacritty_terminal = { version = "=0.26.0", default-features = false }
 base64 = "=0.22.1"
 crossterm = "=0.29.0"
 dirs = "=6.0.0"
@@ -21,7 +23,6 @@ portable-pty = "=0.9.0"
 rustix = { version = "=1.1.4", features = ["process"] }
 # Match crossterm's `signal-hook` requirement to avoid duplicate versions.
 signal-hook = { version = "0.3", default-features = false }
-vt100 = "=0.16.2"
 
 [profile.release]
 # Enable link-time optimization.

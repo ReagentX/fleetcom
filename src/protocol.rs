@@ -12,7 +12,7 @@ use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
 use crate::frame::{KIND_CONTROL, KIND_HELLO, KIND_SCREEN};
 
 /// Wire-protocol version; the handshake rejects mismatched peers.
-pub const PROTOCOL_VERSION: u32 = 5;
+pub const PROTOCOL_VERSION: u32 = 6;
 
 /// Environment and working directory supplied by the launching client.
 #[derive(Debug, Clone, PartialEq)]
@@ -58,15 +58,15 @@ pub enum Command {
     /// Forward raw keystroke bytes to a task's PTY.
     Input { id: u64, bytes: Vec<u8> },
     /// Clipboard paste for a task. Kept distinct from `Input` because the
-    /// encoding depends on state only the core can see: the task's vt100 screen
+    /// encoding depends on state only the core can see: the task's emulator
     /// knows whether the child enabled bracketed paste (DECSET 2004), which
     /// decides between wrapping in paste markers and newline conversion.
     Paste { id: u64, bytes: Vec<u8> },
     /// One mouse action over an attached task. `col`/`row` are 0-based pane
     /// cells. Routing is core-side for the same reason as `Paste`: the child's
-    /// mouse-protocol mode, encoding, and alt-screen state live in its vt100
-    /// screen, and they decide both whether the child hears about the action
-    /// at all and in which byte encoding.
+    /// mouse-protocol mode, encoding, and alternate-scroll state live in its
+    /// emulator, and they decide both whether the child hears about the
+    /// action at all and in which byte encoding.
     Mouse {
         id: u64,
         kind: MouseKind,
@@ -168,9 +168,10 @@ pub struct ScreenView {
     pub hide_cursor: bool,
     /// Whether the child requested a mouse protocol.
     pub wants_mouse: bool,
-    /// Whether the child is on the alternate screen. Without mouse capture,
-    /// this determines whether alternate scroll is enabled.
+    /// Whether the child is on the alternate screen.
     pub alt_screen: bool,
+    /// Whether alternate-screen wheel events may become arrow keys.
+    pub alt_scroll: bool,
     /// Rows the viewport is scrolled back from live output.
     pub scrollback: usize,
 }
@@ -513,6 +514,7 @@ pub fn encode_event(ev: &Event) -> (u8, Vec<u8>) {
             let _ = header.insert("hide", sv.hide_cursor);
             let _ = header.insert("mouse", sv.wants_mouse);
             let _ = header.insert("alt", sv.alt_screen);
+            let _ = header.insert("ascr", sv.alt_scroll);
             let _ = header.insert("sb", sv.scrollback as u64);
             let mut lines = jzon::JsonValue::new_array();
             for l in &sv.lines {
@@ -586,6 +588,7 @@ pub fn decode_event(kind: u8, payload: &[u8]) -> Option<Event> {
                 hide_cursor: h["hide"].as_bool()?,
                 wants_mouse: h["mouse"].as_bool()?,
                 alt_screen: h["alt"].as_bool()?,
+                alt_scroll: h["ascr"].as_bool()?,
                 scrollback: usize::try_from(h["sb"].as_u64()?).ok()?,
             }))
         }
@@ -810,9 +813,9 @@ mod tests {
     fn mistyped_event_members_are_rejected() {
         for header in [
             // Numeric member in `lines`.
-            r#"{"id":1,"cursor":[0,0],"hide":false,"mouse":false,"alt":false,"sb":0,"lines":["ok",5]}"#,
+            r#"{"id":1,"cursor":[0,0],"hide":false,"mouse":false,"alt":false,"ascr":false,"sb":0,"lines":["ok",5]}"#,
             // Out-of-range cursor cell.
-            r#"{"id":1,"cursor":[65536,0],"hide":false,"mouse":false,"alt":false,"sb":0,"lines":[]}"#,
+            r#"{"id":1,"cursor":[65536,0],"hide":false,"mouse":false,"alt":false,"ascr":false,"sb":0,"lines":[]}"#,
         ] {
             assert_eq!(
                 decode_event(KIND_SCREEN, &screen_payload(header)),
@@ -834,6 +837,14 @@ mod tests {
                 "should reject {json}"
             );
         }
+    }
+
+    /// Screen events without the required alternate-scroll field are rejected.
+    #[test]
+    fn screen_header_without_alt_scroll_is_rejected() {
+        let header =
+            r#"{"id":1,"cursor":[0,0],"hide":false,"mouse":false,"alt":true,"sb":0,"lines":[]}"#;
+        assert_eq!(decode_event(KIND_SCREEN, &screen_payload(header)), None);
     }
 
     #[test]
@@ -896,6 +907,8 @@ mod tests {
             hide_cursor: false,
             wants_mouse: true,
             alt_screen: false,
+            // The wire encodes this field independently of `alt_screen`.
+            alt_scroll: true,
             scrollback: 42,
         });
         let (k, p) = encode_event(&screen);

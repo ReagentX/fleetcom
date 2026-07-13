@@ -1,0 +1,37 @@
+[1m[92m   Compiling[0m libc v0.2.186
+[1m[92m   Compiling[0m serde_core v1.0.228
+[1m[92m   Compiling[0m proc-macro2 v1.0.106
+[1m[92m   Compiling[0m unicode-ident v1.0.24
+[1m[92m   Compiling[0m quote v1.0.46
+[1m[92m   Compiling[0m rustix v1.1.4
+[1m[92m   Compiling[0m serde v1.0.228
+[1m[92m    Checking[0m memchr v2.8.3
+[1m[92m    Checking[0m cfg-if v1.0.4
+[1m[92m   Compiling[0m parking_lot_core v0.9.12
+[1m[92m    Checking[0m scopeguard v1.2.0
+[1m[92m    Checking[0m smallvec v1.15.2
+[1m[92m   Compiling[0m signal-hook v0.4.4
+[1m[92m    Checking[0m lock_api v0.4.14
+[1m[92m    Checking[0m log v0.4.33
+[1m[92m    Checking[0m regex-syntax v0.8.11
+[1m[92m    Checking[0m cursor-icon v1.2.0
+[1m[92m    Checking[0m arrayvec v0.7.8
+[1m[92m    Checking[0m base64 v0.22.1
+[1m[92m    Checking[0m unicode-width v0.2.2
+[1m[92m    Checking[0m home v0.5.12
+[1m[92m    Checking[0m aho-corasick v1.1.4
+[1m[92m    Checking[0m errno v0.3.14
+[1m[92m    Checking[0m signal-hook-registry v1.4.8
+[1m[92m    Checking[0m parking_lot v0.12.5
+[1m[92m   Compiling[0m syn v2.0.118
+[1m[92m    Checking[0m regex-automata v0.4.15
+[1m[92m    Checking[0m bitflags v2.13.0
+[1m[92m   Compiling[0m serde_derive v1.0.228
+[1m[92m    Checking[0m polling v3.11.0
+[1m[92m    Checking[0m rustix-openpty v0.2.0
+[1m[92m    Checking[0m vte v0.15.0
+[1m[92m    Checking[0m alacritty_terminal v0.26.0
+[1m[92m    Checking[0m depcheck v0.0.0 (/Users/chris/.claude/jobs/6638be1a/tmp/depcheck)
+[1m[92m    Finished[0m `dev` profile [unoptimized + debuginfo] target(s) in 3.63s
+[1m[92m    Checking[0m depcheck v0.0.0 (/Users/chris/.claude/jobs/6638be1a/tmp/depcheck)
+[1m[92m    Finished[0m `dev` profile [unoptimized + debuginfo] target(s) in 0.11s

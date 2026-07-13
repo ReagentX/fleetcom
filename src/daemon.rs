@@ -43,7 +43,7 @@ use nix::{
 
 use crate::{
     core::{LoopExit, Wake, run_loop},
-    frame::{read_frame, write_frame},
+    frame::{MAX_FRAME, read_frame, write_frame},
     protocol::{
         Command, Event, LaunchContext, PROTOCOL_VERSION, decode_command, decode_event,
         decode_hello, encode_command, encode_event, encode_hello,
@@ -531,6 +531,16 @@ fn handshake(stream: &mut UnixStream) -> Result<LaunchContext, String> {
     }
 }
 
+/// Encode and write one event frame. Oversized payloads are skipped without
+/// disconnecting the client; other write failures return `false`.
+fn send_event(write: &mut impl Write, ev: &Event) -> bool {
+    let (kind, payload) = encode_event(ev);
+    if payload.len() > MAX_FRAME as usize {
+        return true;
+    }
+    write_frame(write, kind, &payload).is_ok()
+}
+
 /// Serve one client to completion. The hello handshake runs first (version
 /// check, launch context); then a reader thread turns inbound frames into
 /// `Wake::Cmd`s on the channel the core loop waits on; task output arrives on the
@@ -540,9 +550,8 @@ fn handshake(stream: &mut UnixStream) -> Result<LaunchContext, String> {
 /// client is attached.
 ///
 /// Panics while serving end the connection without terminating the daemon.
-/// Supervisor state is best-effort afterwards (`apply` is not transactional);
-/// a panic mid-render at worst garbles one task's grid until its next repaint
-/// (`task::grid` recovers the poisoned lock rather than blanking the screen).
+/// Supervisor updates are not transactional, and grid locks remain usable
+/// after a panic, so subsequent work may observe partial updates.
 fn serve_client(sup: &mut Supervisor, stream: UnixStream, stop: &AtomicBool) -> ServeOutcome {
     let mut stream = stream;
     match handshake(&mut stream) {
@@ -592,10 +601,7 @@ fn serve_client(sup: &mut Supervisor, stream: UnixStream, stop: &AtomicBool) -> 
     // write may block; a timeout surfaces as an error below and drops the client.
     let _ = write.set_write_timeout(Some(Duration::from_secs(5)));
     let outcome = catch_unwind(AssertUnwindSafe(|| {
-        run_loop(sup, &wake_rx, stop, |ev| {
-            let (kind, payload) = encode_event(ev);
-            write_frame(&mut write, kind, &payload).is_ok()
-        })
+        run_loop(sup, &wake_rx, stop, |ev| send_event(&mut write, ev))
     }));
     // Cleanup sits *after* the catch so every exit (return or panic) passes
     // through it: a stale waker points task reader threads at a dead channel,
@@ -648,6 +654,37 @@ mod tests {
         fs::write(&path, b"x").unwrap();
         assert!(ensure_runtime_dir(&path).is_err());
         let _ = fs::remove_dir_all(&base);
+    }
+
+    /// Oversized events are skipped without preventing subsequent writes.
+    #[test]
+    fn oversized_event_is_skipped_not_fatal() {
+        use crate::protocol::ScreenView;
+        let oversized = Event::Screen(ScreenView {
+            id: 1,
+            lines: Vec::new(),
+            formatted: vec![b'x'; MAX_FRAME as usize + 1],
+            cursor: (0, 0),
+            hide_cursor: false,
+            wants_mouse: false,
+            alt_screen: false,
+            alt_scroll: false,
+            scrollback: 0,
+        });
+        let mut buf: Vec<u8> = Vec::new();
+        assert!(
+            send_event(&mut buf, &oversized),
+            "an oversized event must not read as a dead client"
+        );
+        assert!(buf.is_empty(), "no partial frame may reach the stream");
+
+        assert!(send_event(&mut buf, &Event::Status("ok".into())));
+        let (kind, payload) = read_frame(&mut io::Cursor::new(&buf)).unwrap();
+        assert_eq!(
+            decode_event(kind, &payload),
+            Some(Event::Status("ok".into())),
+            "ordinary events still flow after a skip"
+        );
     }
 
     /// The retry whitelist: fd exhaustion, interruption, and an aborted peer

@@ -23,20 +23,23 @@ use crate::{
 const IDLE_AFTER: Duration = Duration::from_millis(600);
 
 /// Send-on-change fingerprint for the watched screen and scrollback offset.
-type LastScreen = (u64, Vec<u8>, (u16, u16), bool, (bool, bool), usize);
+type LastScreen = (u64, Vec<u8>, (u16, u16), bool, (bool, bool, bool), usize);
 
-/// Ceiling for PTY dimensions accepted from a (possibly crafted) `Resize`. A 0
-/// dimension underflows vt100 (`grid.rs` does `size.rows - 1`): panic in debug,
-/// out-of-bounds in release. An unbounded one (up to `u16::MAX`) would
-/// allocate a multi-billion-cell grid and OOM. Real terminals never approach
-/// this, so clamping to `[1, MAX_DIM]` is invisible in normal use and a hard
-/// stop against a malicious peer.
+/// Per-dimension PTY size limit. Resizes are clamped to `[1, MAX_DIM]` to keep
+/// grid dimensions valid and memory bounded.
 const MAX_DIM: u16 = 1000;
 
-/// Ceiling on live tasks. Each is a PTY (fds) + child + reader thread + a vt100
-/// grid, so an unbounded `Spawn` loop or a huge session recipe could exhaust
-/// file descriptors and memory. Far above any real fleet: a guardrail, not a
-/// working limit.
+/// PTY grid-area limit. Geometry-bounded `Screen` payloads fit `MAX_FRAME`
+/// with a 25% reserve at this size.
+const MAX_CELLS: u32 = 500_000;
+
+// Keep `MAX_CELLS / rows` nonzero for every clamped row count.
+const _: () = assert!(MAX_CELLS >= MAX_DIM as u32);
+
+/// Ceiling on live tasks. Each is a PTY (fds) + child + reader thread + a
+/// terminal grid, so an unbounded `Spawn` loop or a huge session recipe could
+/// exhaust file descriptors and memory. Far above any real fleet: a
+/// guardrail, not a working limit.
 const MAX_TASKS: usize = 256;
 
 /// How long a SIGTERMed job gets to exit before SIGKILL. TERM-respecting
@@ -160,9 +163,15 @@ impl Supervisor {
                 }
             }
             Command::Resize { rows, cols } => {
-                // Keep untrusted dimensions nonzero and within `MAX_DIM`.
+                // Clamp each dimension first, then preserve rows and reduce
+                // columns when the grid exceeds `MAX_CELLS`. The constant
+                // assertion keeps the quotient nonzero; this branch also
+                // guarantees the quotient is below `cols` and fits `u16`.
                 self.rows = rows.clamp(1, MAX_DIM);
                 self.cols = cols.clamp(1, MAX_DIM);
+                if u32::from(self.rows) * u32::from(self.cols) > MAX_CELLS {
+                    self.cols = (MAX_CELLS / u32::from(self.rows)) as u16;
+                }
                 for t in &mut self.tasks {
                     let _ = t.resize(self.rows, self.cols);
                 }
@@ -186,8 +195,8 @@ impl Supervisor {
                 }
             }
             // Paste and scroll land here (not as pre-encoded `Input`) because
-            // their encoding depends on the child's vt100 state, which only
-            // this side of the socket can see.
+            // their encoding depends on the child's terminal state, which
+            // only this side of the socket can see.
             Command::Paste { id, bytes } => {
                 let refused = self.by_id_mut(id).and_then(|t| t.send_paste(&bytes).err());
                 if let Some(r) = refused {
@@ -257,6 +266,14 @@ impl Supervisor {
     /// `drain`ed events, never a `Task`.
     pub fn tick(&mut self) {
         self.reap();
+        // vte re-checks its ?2026 sync timeout only when bytes arrive, so a
+        // child that opens BSU and stalls would freeze its view. This tick is
+        // the loop's only periodic path (the idle backstop guarantees one at
+        // least every 200 ms), so an expired sync flushes here, before the
+        // snapshot below reads the grids, letting the same tick ship it.
+        for t in &self.tasks {
+            t.flush_expired_sync();
+        }
         let now = Instant::now();
 
         let views = self
@@ -298,6 +315,7 @@ impl Supervisor {
                     hide_cursor: hide_cursor || sb > 0,
                     wants_mouse: hints.0,
                     alt_screen: hints.1,
+                    alt_scroll: hints.2,
                     scrollback: sb,
                 }));
             }
@@ -634,6 +652,83 @@ mod tests {
         assert!(
             !s.drain().iter().any(|e| matches!(e, Event::Screen(_))),
             "unchanged screen must not be resent"
+        );
+    }
+
+    /// A DECSET 1007 change emits a new `Screen` event even when the rendered
+    /// contents are unchanged.
+    #[test]
+    fn decset_1007_flip_resends_watched_screen() {
+        let dir = scratch("flip_1007");
+        let ready = dir.join("ready");
+        let flag = dir.join("flag");
+        let mut s = sup(24, 80);
+        // Enter the alternate screen, then disable DECSET 1007 when signaled.
+        let cmd = format!(
+            "printf '\\033[?1049h'; touch {r}; until [ -e {f} ]; do sleep 0.05; done; \
+             printf '\\033[?1007l'; sleep 30",
+            r = ready.display(),
+            f = flag.display()
+        );
+        let id = spawn_ready(&mut s, cmd, here(), &ready);
+        s.apply(Command::Watch { id: Some(id) });
+
+        // Wait for the initial alternate-scroll state.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut open = false;
+        while Instant::now() < deadline && !open {
+            s.tick();
+            open = s
+                .drain()
+                .iter()
+                .any(|e| matches!(e, Event::Screen(sv) if sv.alt_screen && sv.alt_scroll));
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(open, "the gate-open screen never arrived");
+
+        std::fs::write(&flag, b"").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut closed = false;
+        while Instant::now() < deadline && !closed {
+            s.tick();
+            closed = s
+                .drain()
+                .iter()
+                .any(|e| matches!(e, Event::Screen(sv) if sv.alt_screen && !sv.alt_scroll));
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(closed, "the ?1007l flip never re-sent the screen");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A periodic tick flushes an expired synchronized update from a child
+    /// that stops producing output.
+    #[test]
+    fn tick_flushes_a_stalled_sync_update() {
+        let mut s = sup(24, 80);
+        s.apply(Command::Spawn {
+            command: "printf 'begin\\033[?2026hstalled'; sleep 30".into(),
+            cwd: here(),
+        });
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut preview = String::new();
+        while Instant::now() < deadline {
+            s.tick();
+            for e in s.drain() {
+                if let Event::Tasks(v) = e
+                    && let Some(t) = v.first()
+                {
+                    preview = t.preview.clone();
+                }
+            }
+            if preview.contains("stalled") {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        assert!(
+            preview.contains("stalled"),
+            "the stalled sync frame never flushed; preview: {preview:?}"
         );
     }
 
@@ -1016,10 +1111,7 @@ mod tests {
         );
     }
 
-    /// A crafted `Resize` with zero or enormous dimensions must be clamped, not
-    /// forwarded to vt100. 0 underflows its `size.rows - 1` (panics in debug),
-    /// and `u16::MAX` would allocate a multi-billion-cell grid. Reaching the end
-    /// without a panic/OOM is the assertion.
+    /// Resize clamps each dimension and the total grid area.
     #[test]
     fn resize_clamps_hostile_dimensions() {
         let mut s = sup(24, 80);
@@ -1030,12 +1122,135 @@ mod tests {
         s.apply(Command::Resize { rows: 0, cols: 0 });
         s.tick(); // exercises the resized grid (snapshot + screen): no panic
         let _ = s.drain();
+        assert_eq!((s.rows, s.cols), (1, 1), "zero dims clamp to the floor");
+
         s.apply(Command::Resize {
             rows: u16::MAX,
             cols: u16::MAX,
         });
-        s.tick(); // clamped to MAX_DIM² cells, not u16::MAX²: no OOM
+        s.tick(); // clamped to the area bound, not u16::MAX² cells: no OOM
         let _ = s.drain();
+        assert!(s.rows >= 1 && s.rows <= MAX_DIM);
+        assert!(s.cols >= 1 && s.cols <= MAX_DIM);
+        assert!(
+            u32::from(s.rows) * u32::from(s.cols) <= MAX_CELLS,
+            "accepted geometry {}x{} exceeds MAX_CELLS ({MAX_CELLS}): its \
+             worst-case Screen frame would not fit MAX_FRAME",
+            s.rows,
+            s.cols,
+        );
+
+        // An over-area resize preserves rows and reduces columns.
+        s.apply(Command::Resize {
+            rows: MAX_DIM,
+            cols: MAX_DIM,
+        });
+        assert_eq!(u32::from(s.rows), u32::from(MAX_DIM));
+        assert_eq!(u32::from(s.cols), MAX_CELLS / u32::from(MAX_DIM));
+
+        // In-range geometry remains unchanged.
+        s.apply(Command::Resize {
+            rows: 67,
+            cols: 302,
+        });
+        assert_eq!((s.rows, s.cols), (67, 302));
+    }
+
+    /// The densest geometry-bounded `Screen` payload fits `MAX_FRAME` with a
+    /// 25% reserve. Each cell uses tab emission and alternating full SGR state
+    /// across `MAX_CELLS` cells and `MAX_DIM` rows. Per-cell zero-width extras
+    /// are unbounded by geometry and handled by the oversized-event check.
+    #[test]
+    fn worst_case_screen_frame_fits_max_frame() {
+        use std::fmt::Write as _;
+
+        use alacritty_terminal::{
+            event::VoidListener,
+            index::{Column, Line},
+            term::{Config, test::TermSize},
+            vte::ansi::Processor,
+        };
+
+        use crate::{
+            frame::{KIND_SCREEN, MAX_FRAME},
+            protocol::{ScreenView, encode_event},
+            serialize,
+        };
+
+        // Alternate complete SGR states so every cell emits all style and
+        // color fields; `4:5` is the longest underline parameter.
+        const SGR_A: &str =
+            "\x1b[0;1;2;3;4:5;7;8;9;38;2;255;254;253;48;2;252;251;250;58;2;249;248;247m";
+        const SGR_B: &str =
+            "\x1b[0;1;2;3;4:5;7;8;9;38;2;155;154;153;48;2;152;151;150;58;2;149;148;147m";
+
+        let rows = usize::from(MAX_DIM);
+        let cols = (MAX_CELLS / u32::from(MAX_DIM)) as usize;
+        assert_eq!(rows * cols, MAX_CELLS as usize, "geometry covers the bound");
+
+        // Write a styled space, then replace its character with a tab while
+        // preserving its attributes.
+        let mut input = String::with_capacity(rows * cols * 100);
+        for row in 1..=rows {
+            for col in 1..=cols {
+                let sgr = if (row * cols + col).is_multiple_of(2) {
+                    SGR_A
+                } else {
+                    SGR_B
+                };
+                let _ = write!(input, "\x1b[{row};{col}H{sgr} \x1b[{row};{col}H\t");
+            }
+        }
+
+        let mut term = alacritty_terminal::Term::new(
+            Config::default(),
+            &TermSize::new(cols, rows),
+            VoidListener,
+        );
+        let mut parser: Processor = Processor::new();
+        parser.advance(&mut term, input.as_bytes());
+
+        // Confirm the grid contains the features used by the density bound.
+        let probe = &term.grid()[Line(0)][Column(0)];
+        assert_eq!(probe.c, '\t', "cells must take the expensive tab path");
+        assert!(
+            probe.underline_color().is_some(),
+            "cells must carry an underline color"
+        );
+
+        let (formatted, cursor, hide) = serialize::formatted(&term);
+        let lines: Vec<String> = serialize::contents(&term)
+            .lines()
+            .map(str::to_string)
+            .collect();
+        let (kind, payload) = encode_event(&Event::Screen(ScreenView {
+            id: 1,
+            lines,
+            formatted,
+            cursor,
+            hide_cursor: hide,
+            wants_mouse: false,
+            alt_screen: false,
+            alt_scroll: false,
+            scrollback: 0,
+        }));
+        assert_eq!(kind, KIND_SCREEN);
+
+        let per_cell = payload.len() as f64 / MAX_CELLS as f64;
+        // Keep the constructed density above 85 bytes per cell.
+        assert!(
+            per_cell >= 85.0,
+            "worst-case construction degenerated: {per_cell:.1} bytes/cell"
+        );
+        // `Screen` payload bytes are written directly to the frame. Include a
+        // 25% reserve in the size check.
+        assert!(
+            payload.len() + payload.len() / 4 <= MAX_FRAME as usize,
+            "worst-case Screen frame no longer fits MAX_FRAME with 25 % \
+             headroom: serialize::formatted emits {per_cell:.1} bytes/cell, \
+             MAX_CELLS is {MAX_CELLS}, MAX_FRAME is {MAX_FRAME}; shrink \
+             MAX_CELLS, cheapen the serializer, or raise MAX_FRAME",
+        );
     }
 
     /// Poll `reap` until `pred` holds or the deadline passes. The sweep paths

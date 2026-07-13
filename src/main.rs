@@ -7,10 +7,15 @@
 mod app;
 mod core;
 mod daemon;
+mod emulator;
 mod format;
 mod frame;
+// Differential emulator tests over recorded PTY output.
+#[cfg(test)]
+mod golden;
 mod path;
 mod protocol;
+mod serialize;
 mod session;
 mod supervisor;
 mod task;

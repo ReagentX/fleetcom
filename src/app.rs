@@ -174,9 +174,8 @@ pub struct App {
     view_scroll: bool,
 }
 
-/// Return `(mouse_capture, alt_scroll)` for the attached child's screen.
-/// Scrollback and inline children capture the mouse; mouse-aware children
-/// receive events, while full-screen children use alternate scroll.
+/// Return `(mouse_capture, alt_scroll)` for the attached view. Scrollback,
+/// inline views, and children that disable alternate scroll capture the mouse.
 fn desired_input_modes(attached: Option<&ScreenView>, view_scroll: bool) -> (bool, bool) {
     if view_scroll {
         return (true, true);
@@ -184,8 +183,10 @@ fn desired_input_modes(attached: Option<&ScreenView>, view_scroll: bool) -> (boo
     match attached {
         // Capture and forward mouse events requested by the child.
         Some(s) if s.wants_mouse => (true, true),
-        // Scroll full-screen children through alternate-scroll arrows.
-        Some(s) if s.alt_screen => (false, true),
+        // Let the terminal convert wheel events to arrow keys.
+        Some(s) if s.alt_screen && s.alt_scroll => (false, true),
+        // Capture wheel events when the child disables alternate scroll.
+        Some(s) if s.alt_screen => (true, true),
         // Capture wheel-up to enter scrollback for inline children.
         Some(_) => (true, true),
         None => (false, true),
@@ -1701,7 +1702,7 @@ mod tests {
     /// Select capture and alternate-scroll modes by screen type.
     #[test]
     fn input_modes_match_screen_type() {
-        let screen = |wants_mouse, alt_screen| ScreenView {
+        let screen = |wants_mouse, alt_screen, alt_scroll| ScreenView {
             id: 1,
             lines: Vec::new(),
             formatted: Vec::new(),
@@ -1709,32 +1710,38 @@ mod tests {
             hide_cursor: false,
             wants_mouse,
             alt_screen,
+            alt_scroll,
             scrollback: 0,
         };
         // No attached screen: keep native selection available.
         assert_eq!(desired_input_modes(None, false), (false, true));
         // Mouse-aware child: capture.
         assert_eq!(
-            desired_input_modes(Some(&screen(true, true)), false),
+            desired_input_modes(Some(&screen(true, true, true)), false),
             (true, true)
         );
         assert_eq!(
-            desired_input_modes(Some(&screen(true, false)), false),
+            desired_input_modes(Some(&screen(true, false, false)), false),
             (true, true)
         );
-        // Full-screen child without mouse mode: alternate scroll.
+        // Full-screen child with alternate scroll enabled.
         assert_eq!(
-            desired_input_modes(Some(&screen(false, true)), false),
+            desired_input_modes(Some(&screen(false, true, true)), false),
             (false, true)
+        );
+        // Full-screen child with alternate scroll disabled.
+        assert_eq!(
+            desired_input_modes(Some(&screen(false, true, false)), false),
+            (true, true)
         );
         // Inline child: capture wheel-up to enter scrollback.
         assert_eq!(
-            desired_input_modes(Some(&screen(false, false)), false),
+            desired_input_modes(Some(&screen(false, false, false)), false),
             (true, true)
         );
         // The scroll view overrides everything: the wheel must scroll it.
         assert_eq!(
-            desired_input_modes(Some(&screen(false, false)), true),
+            desired_input_modes(Some(&screen(false, false, false)), true),
             (true, true)
         );
         assert_eq!(desired_input_modes(None, true), (true, true));
@@ -1759,6 +1766,7 @@ mod tests {
             hide_cursor: false,
             wants_mouse,
             alt_screen: false,
+            alt_scroll: false,
             scrollback: 0,
         };
         let wheel_up = MouseEvent {
@@ -1778,6 +1786,88 @@ mod tests {
         app.focused_screen = Some(screen(true));
         app.on_mouse(wheel_up);
         assert!(!app.view_scroll, "mouse-aware children keep their wheel");
+    }
+
+    /// Attached wheel input follows the child's DECSET 1007 state.
+    #[test]
+    fn attached_wheel_honors_the_childs_1007_veto() {
+        use std::time::Instant;
+        let dir = std::env::temp_dir().join(format!("fleetcom_app_1007_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let wheel_up = MouseEvent {
+            kind: MouseEventKind::ScrollUp,
+            column: 0,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        };
+        // Send one wheel notch and return the first `take` bytes read by the child.
+        let run = |veto: bool, take: usize, out: PathBuf| -> Vec<u8> {
+            let mut app = App::new_local(30, 100);
+            let cwd = app.invocation_dir.clone();
+            let modes = if veto {
+                "\\033[?1049h\\033[?1007l"
+            } else {
+                "\\033[?1049h"
+            };
+            // Noncanonical input lets `head` read arrow sequences without a newline.
+            let cmd = format!(
+                "stty -icanon -echo min 1 time 0; printf '{modes}'; head -c {take} > {}",
+                out.display()
+            );
+            app.spawn_in(&cmd, cwd);
+            app.pump();
+            app.resolve_selection();
+            app.attach();
+            let id = app.focused_id.expect("attached");
+            app.set_watch(Some(id));
+            // Wait for the child's terminal modes to reach the client.
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                app.pump();
+                if matches!(
+                    app.screen_for(id),
+                    Some(s) if s.alt_screen && s.alt_scroll != veto
+                ) {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "gate state (veto: {veto}) never reached the client"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            // Disabled alternate scroll captures the wheel; enabled does not.
+            assert_eq!(desired_input_modes(app.screen_for(id), false), (veto, true));
+            app.on_mouse(wheel_up);
+            if veto {
+                // The sentinel follows the wheel on the writer queue.
+                app.transport.send(Command::Input {
+                    id,
+                    bytes: b"zzz".to_vec(),
+                });
+            }
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let mut got = Vec::new();
+            while Instant::now() < deadline {
+                got = std::fs::read(&out).unwrap_or_default();
+                if got.len() >= take {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            got
+        };
+
+        // Disabled alternate scroll suppresses the wheel bytes.
+        assert_eq!(run(true, 3, dir.join("veto")), b"zzz".to_vec());
+        // Enabled alternate scroll emits three arrows per notch.
+        assert_eq!(
+            run(false, 9, dir.join("dflt")),
+            b"\x1b[A\x1b[A\x1b[A".to_vec()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Scrollback opens with modified PageUp and closes on Esc or typing.

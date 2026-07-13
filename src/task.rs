@@ -13,6 +13,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use alacritty_terminal::sync::FairMutex;
 use nix::{
     sys::signal::{Signal, killpg},
     unistd::Pid,
@@ -22,6 +23,7 @@ use rustix::process::{WaitId, WaitIdOptions, waitid};
 
 use crate::{
     core::{Wake, Waker},
+    emulator::Emulator,
     protocol::{Lifecycle, MouseKind, ScrollAction},
 };
 
@@ -87,24 +89,23 @@ pub fn paste_bytes(bracketed: bool, content: &[u8]) -> Vec<u8> {
     }
 }
 
-/// Encode a mouse action using the child's current terminal mode. Mouse
-/// protocols determine supported actions and encoding. Without one,
-/// full-screen children receive wheel actions as alternate-scroll arrows;
-/// unsupported actions return `None`.
-pub fn mouse_bytes(screen: &vt100::Screen, kind: MouseKind, col: u16, row: u16) -> Option<Vec<u8>> {
-    use vt100::{MouseProtocolEncoding, MouseProtocolMode};
-    let mode = screen.mouse_protocol_mode();
+/// Encode a mouse action under the child's current terminal mode. The selected
+/// protocol determines which actions are valid and how they are encoded. With
+/// no mouse protocol, wheel actions become alternate-scroll arrows when the
+/// alternate screen and DECSET 1007 are both active. DECSET 1007 defaults on;
+/// see [`Emulator::alternate_scroll`]. Unsupported actions return `None`.
+pub fn mouse_bytes(emu: &Emulator, kind: MouseKind, col: u16, row: u16) -> Option<Vec<u8>> {
+    use crate::emulator::{MouseProtocolEncoding, MouseProtocolMode};
+    let mode = emu.mouse_protocol_mode();
     if mode != MouseProtocolMode::None {
-        // The mode determines supported event classes.
-        let wanted = match kind {
-            MouseKind::WheelUp | MouseKind::WheelDown | MouseKind::Press(_) => true,
-            MouseKind::Release(_) => mode != MouseProtocolMode::Press,
-            MouseKind::Drag(_) => matches!(
+        // Every supported mode reports presses, releases, and wheel events;
+        // only motion modes 1002 and 1003 report drags.
+        if matches!(kind, MouseKind::Drag(_))
+            && !matches!(
                 mode,
                 MouseProtocolMode::ButtonMotion | MouseProtocolMode::AnyMotion
-            ),
-        };
-        if !wanted {
+            )
+        {
             return None;
         }
         // xterm button codes: wheel 64/65; drag adds 32.
@@ -115,7 +116,7 @@ pub fn mouse_bytes(screen: &vt100::Screen, kind: MouseKind, col: u16, row: u16) 
             MouseKind::Drag(b) => 32 + b as u16,
         };
         let release = matches!(kind, MouseKind::Release(_));
-        return Some(match screen.mouse_protocol_encoding() {
+        return Some(match emu.mouse_protocol_encoding() {
             // SGR releases use the `m` suffix.
             MouseProtocolEncoding::Sgr => {
                 let suffix = if release { 'm' } else { 'M' };
@@ -147,14 +148,14 @@ pub fn mouse_bytes(screen: &vt100::Screen, kind: MouseKind, col: u16, row: u16) 
             }
         });
     }
-    if screen.alternate_screen() {
+    if emu.alternate_scroll() {
         let up = match kind {
             MouseKind::WheelUp => true,
             MouseKind::WheelDown => false,
             // Only wheel actions map to alternate-scroll arrows.
             _ => return None,
         };
-        let arrow: &[u8] = match (screen.application_cursor(), up) {
+        let arrow: &[u8] = match (emu.application_cursor(), up) {
             (true, true) => b"\x1bOA",
             (true, false) => b"\x1bOB",
             (false, true) => b"\x1b[A",
@@ -176,15 +177,18 @@ pub struct Task {
     /// Sender for the detached PTY writer worker. `None` after `force_kill`.
     /// Queuing keeps a blocked PTY write off the core thread.
     input_tx: Option<Sender<Vec<u8>>>,
-    /// Bytes admitted to the writer queue but not yet fully written. Only the
-    /// core thread admits (single producer), so `queue_write`'s check-then-add
-    /// cannot over-admit; the worker subtracts after each completed write.
+    /// Bytes admitted to the writer queue but not yet fully written. Two
+    /// admitters: the core thread (`queue_write`, client input) and the reader
+    /// thread (`forward_probe_replies`, probe replies of a few bytes each).
+    /// A race can exceed the 16 MiB cap by at most one small probe reply. The
+    /// worker subtracts after each completed write.
     pending_write: Arc<AtomicUsize>,
     /// Session-leader PID, also used as the process-group ID.
     pid: Option<u32>,
     /// Shared with the reader thread: it writes (process bytes), the UI reads
-    /// (render/preview). Contention is trivial: writes are per output chunk.
-    parser: Arc<Mutex<vt100::Parser>>,
+    /// (render/preview). Fair locking prevents repeated parser writes from
+    /// starving the supervisor's snapshot reads.
+    parser: Arc<FairMutex<Emulator>>,
     last_activity: Arc<Mutex<Instant>>,
     handle: Option<JoinHandle<()>>,
     pub tagged: bool,
@@ -213,11 +217,26 @@ fn signal(waker: &Waker) {
     }
 }
 
-/// Lock the shared vt100 grid, recovering from a poisoned mutex.
-fn grid(parser: &Mutex<vt100::Parser>) -> std::sync::MutexGuard<'_, vt100::Parser> {
-    parser
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
+/// Lock the shared emulator grid. `FairMutex` does not poison, so a later
+/// access can read the state left by a panicking operation.
+fn grid(parser: &FairMutex<Emulator>) -> impl std::ops::DerefMut<Target = Emulator> + '_ {
+    parser.lock()
+}
+
+/// Queue allowlisted probe replies on the PTY writer worker. Replies use the
+/// normal pending-byte accounting and are dropped when the queue is full.
+fn forward_probe_replies(tx: &Sender<Vec<u8>>, pending: &AtomicUsize, replies: Vec<String>) {
+    for reply in replies {
+        let len = reply.len();
+        if pending.load(Ordering::Acquire) + len > MAX_PENDING_WRITE {
+            continue;
+        }
+        pending.fetch_add(len, Ordering::Release);
+        if tx.send(reply.into_bytes()).is_err() {
+            // The worker has exited; remove the failed admission.
+            pending.fetch_sub(len, Ordering::Release);
+        }
+    }
 }
 
 /// Convert a wait status to a shell-style exit code.
@@ -291,13 +310,20 @@ impl Task {
         let mut reader = pair.master.try_clone_reader().map_err(io_err)?;
         let writer = pair.master.take_writer().map_err(io_err)?;
 
-        let parser = Arc::new(Mutex::new(vt100::Parser::new(rows, cols, SCROLLBACK)));
+        let parser = Arc::new(FairMutex::new(Emulator::new(rows, cols, SCROLLBACK)));
         let last_activity = Arc::new(Mutex::new(Instant::now()));
+
+        // The writer channel exists before the reader thread because the
+        // reader forwards probe replies (CPR and friends) through it.
+        let (input_tx, input_rx) = channel::<Vec<u8>>();
+        let pending_write = Arc::new(AtomicUsize::new(0));
 
         let handle = {
             let parser = Arc::clone(&parser);
             let last_activity = Arc::clone(&last_activity);
             let waker = Arc::clone(&waker);
+            let input_tx = input_tx.clone();
+            let pending = Arc::clone(&pending_write);
             thread::spawn(move || {
                 let mut buf = [0u8; 8192];
                 loop {
@@ -310,7 +336,13 @@ impl Task {
                             break;
                         }
                         Ok(n) => {
-                            grid(&parser).process(&buf[..n]);
+                            let replies = grid(&parser).process(&buf[..n]);
+                            if !replies.is_empty() {
+                                // Probe replies answer the child through the
+                                // same writer worker as client input, keeping
+                                // PTY writes off this thread.
+                                forward_probe_replies(&input_tx, &pending, replies);
+                            }
                             if let Ok(mut t) = last_activity.lock() {
                                 *t = Instant::now();
                             }
@@ -324,8 +356,6 @@ impl Task {
 
         // Drain whole queued messages on a detached worker. The worker is not
         // joined because a PTY write can block until the slave side closes.
-        let (input_tx, input_rx) = channel::<Vec<u8>>();
-        let pending_write = Arc::new(AtomicUsize::new(0));
         {
             let pending = Arc::clone(&pending_write);
             let mut writer = writer;
@@ -448,10 +478,23 @@ impl Task {
         }
     }
 
+    /// Flush an expired `?2026` synchronized update so a stalled child's
+    /// buffered frame becomes visible (see [`Emulator::flush_expired_sync`]);
+    /// probe replies the flushed bytes generated are forwarded like live
+    /// ones. Called from the supervisor's tick (the loop's only periodic
+    /// path) because vte re-checks its sync timeout only when bytes arrive.
+    pub fn flush_expired_sync(&self) {
+        let replies = grid(&self.parser).flush_expired_sync();
+        if !replies.is_empty()
+            && let Some(tx) = &self.input_tx
+        {
+            forward_probe_replies(tx, &self.pending_write, replies);
+        }
+    }
+
     /// The dashboard preview line: the last non-blank row of the live screen.
     pub fn preview(&self) -> String {
         grid(&self.parser)
-            .screen()
             .contents()
             .lines()
             .rev()
@@ -463,15 +506,12 @@ impl Task {
     /// Full screen as ANSI bytes for attached mode, plus cursor state so we can
     /// place the real cursor where the child put it.
     pub fn formatted(&self) -> (Vec<u8>, (u16, u16), bool) {
-        let p = grid(&self.parser);
-        let s = p.screen();
-        (s.contents_formatted(), s.cursor_position(), s.hide_cursor())
+        grid(&self.parser).formatted()
     }
 
     /// Snapshot of visible rows for the peek overlay.
     pub fn screen_lines(&self) -> Vec<String> {
         grid(&self.parser)
-            .screen()
             .contents()
             .lines()
             .map(str::to_string)
@@ -487,7 +527,7 @@ impl Task {
                 pixel_height: 0,
             })
             .map_err(io_err)?;
-        grid(&self.parser).screen_mut().set_size(rows, cols);
+        grid(&self.parser).resize(rows, cols);
         Ok(())
     }
 
@@ -501,8 +541,8 @@ impl Task {
     /// Input returns the viewport to live before the bytes are queued.
     fn snap_live(&mut self) {
         let mut p = grid(&self.parser);
-        if p.screen().scrollback() > 0 {
-            p.screen_mut().set_scrollback(0);
+        if p.scrollback() > 0 {
+            p.set_scrollback(0);
         }
     }
 
@@ -527,19 +567,19 @@ impl Task {
     /// Move the scrollback viewport, clamped to retained history.
     pub fn scroll_view(&mut self, action: ScrollAction) {
         let mut p = grid(&self.parser);
-        let cur = p.screen().scrollback();
+        let cur = p.scrollback();
         let target = match action {
             ScrollAction::Up(n) => cur.saturating_add(n as usize),
             ScrollAction::Down(n) => cur.saturating_sub(n as usize),
             ScrollAction::Top => usize::MAX,
             ScrollAction::Live => 0,
         };
-        p.screen_mut().set_scrollback(target);
+        p.set_scrollback(target);
     }
 
     /// Rows the viewport is scrolled back from live output.
     pub fn scroll_offset(&self) -> usize {
-        grid(&self.parser).screen().scrollback()
+        grid(&self.parser).scrollback()
     }
 
     /// Forward a clipboard paste in whichever shape the child negotiated; see
@@ -547,7 +587,7 @@ impl Task {
     /// on this thread), then queued whole: the PTY write itself happens on the
     /// writer worker.
     pub fn send_paste(&mut self, content: &[u8]) -> Result<(), WriteRefused> {
-        let bracketed = grid(&self.parser).screen().bracketed_paste();
+        let bracketed = grid(&self.parser).bracketed_paste();
         let msg = paste_bytes(bracketed, content);
         self.snap_live();
         self.queue_write(msg)
@@ -558,7 +598,7 @@ impl Task {
     pub fn send_mouse(&mut self, kind: MouseKind, col: u16, row: u16) -> Result<(), WriteRefused> {
         let bytes = {
             let p = grid(&self.parser);
-            mouse_bytes(p.screen(), kind, col, row)
+            mouse_bytes(&p, kind, col, row)
         };
         match bytes {
             Some(b) => self.send_input(&b),
@@ -566,14 +606,14 @@ impl Task {
         }
     }
 
-    /// Return whether the child requests mouse input and uses the alternate
-    /// screen. The client receives these values in each `ScreenView`.
-    pub fn input_hints(&self) -> (bool, bool) {
+    /// Return the child's mouse, alternate-screen, and alternate-scroll modes
+    /// for `ScreenView`.
+    pub fn input_hints(&self) -> (bool, bool, bool) {
         let p = grid(&self.parser);
-        let s = p.screen();
         (
-            s.mouse_protocol_mode() != vt100::MouseProtocolMode::None,
-            s.alternate_screen(),
+            p.mouse_protocol_mode() != crate::emulator::MouseProtocolMode::None,
+            p.alternate_screen(),
+            p.alternate_scroll(),
         )
     }
 
@@ -613,8 +653,10 @@ impl Task {
         }
         self.kill_sent = true;
         self.handle.take(); // drop the JoinHandle -> detach, never block
-        // Close the queue without joining a worker that may still be in a PTY
-        // write. Killing the process group closes the slave side and unblocks it.
+        // Stop admitting input without joining a worker that may still be in
+        // a PTY write. Killing the process group closes the slave side, which
+        // unblocks the worker and EOFs the reader; the reader's own sender
+        // clone drops when it exits, closing the queue.
         self.input_tx.take();
     }
 }
@@ -675,8 +717,8 @@ mod tests {
         panic!("task never finished");
     }
 
-    /// End-to-end plumbing: spawn under a PTY, the reader thread feeds vt100,
-    /// the screen reflects the output, and the exit code is latched.
+    /// End-to-end plumbing: spawn under a PTY, the reader thread feeds the
+    /// emulator, the screen reflects the output, and the exit code is latched.
     #[test]
     fn spawn_reads_output_and_exits_zero() {
         let mut t = spawn(1, "printf 'alpha\\nomega\\n'");
@@ -710,7 +752,7 @@ mod tests {
     fn resize_is_reflected_in_the_grid() {
         let mut t = Task::spawn(3, "sleep 5", &here(), 24, 80, &env_here(), no_waker()).unwrap();
         t.resize(30, 100).unwrap();
-        assert_eq!(t.parser.lock().unwrap().screen().size(), (30, 100));
+        assert_eq!(t.parser.lock().size(), (30, 100));
         t.terminate();
     }
 
@@ -841,96 +883,154 @@ mod tests {
     fn wheel_routes_by_child_state() {
         let up = MouseKind::WheelUp;
         let down = MouseKind::WheelDown;
-        let mut p = vt100::Parser::new(24, 80, 0);
+        let mut p = Emulator::new(24, 80, 0);
         // Inline child, no mouse: dropped, not translated into arrow spam.
-        assert_eq!(mouse_bytes(p.screen(), up, 0, 0), None);
+        assert_eq!(mouse_bytes(&p, up, 0, 0), None);
         // Full-screen child: three arrows per notch, normal cursor keys.
         p.process(b"\x1b[?1049h");
         assert_eq!(
-            mouse_bytes(p.screen(), up, 0, 0),
+            mouse_bytes(&p, up, 0, 0),
             Some(b"\x1b[A\x1b[A\x1b[A".to_vec())
         );
         // Clicks mean nothing to a full-screen child without a mouse mode.
         assert_eq!(
-            mouse_bytes(p.screen(), MouseKind::Press(MouseBtn::Left), 0, 0),
+            mouse_bytes(&p, MouseKind::Press(MouseBtn::Left), 0, 0),
             None
         );
         // Application cursor keys switch the arrows to SS3 form.
         p.process(b"\x1b[?1h");
         assert_eq!(
-            mouse_bytes(p.screen(), down, 0, 0),
+            mouse_bytes(&p, down, 0, 0),
             Some(b"\x1bOB\x1bOB\x1bOB".to_vec())
         );
         // SGR mouse protocol: a real wheel event, 1-based coordinates.
         p.process(b"\x1b[?1000h\x1b[?1006h");
-        assert_eq!(
-            mouse_bytes(p.screen(), up, 4, 2),
-            Some(b"\x1b[<64;5;3M".to_vec())
-        );
+        assert_eq!(mouse_bytes(&p, up, 4, 2), Some(b"\x1b[<64;5;3M".to_vec()));
         // Default encoding: single-byte cells, clamped to fit.
         p.process(b"\x1b[?1006l");
         assert_eq!(
-            mouse_bytes(p.screen(), down, 0, 0),
+            mouse_bytes(&p, down, 0, 0),
             Some(vec![0x1b, b'[', b'M', 32 + 65, 33, 33])
         );
         assert_eq!(
-            mouse_bytes(p.screen(), down, 500, 500),
+            mouse_bytes(&p, down, 500, 500),
             Some(vec![0x1b, b'[', b'M', 32 + 65, 255, 255])
         );
         // UTF-8 mouse coordinates can use multiple bytes.
         p.process(b"\x1b[?1005h");
         assert_eq!(
-            mouse_bytes(p.screen(), up, 200, 2),
+            mouse_bytes(&p, up, 200, 2),
             Some(vec![0x1b, b'[', b'M', 32 + 64, 0xc3, 0xa9, 33 + 2])
         );
         // UTF-8 mouse coordinates cap at the protocol limit.
         assert_eq!(
-            mouse_bytes(p.screen(), up, 5000, 5000),
+            mouse_bytes(&p, up, 5000, 5000),
             Some(vec![0x1b, b'[', b'M', 32 + 64, 0xdf, 0xbf, 0xdf, 0xbf])
         );
     }
 
-    /// Verify mode-specific button delivery and encoding.
+    /// A full-screen child receives wheel arrows only while DECSET 1007 is
+    /// enabled; the mode defaults on.
+    #[test]
+    fn wheel_arrows_honor_decset_1007() {
+        let up = MouseKind::WheelUp;
+        let mut p = Emulator::new(24, 80, 0);
+        p.process(b"\x1b[?1049h\x1b[?1007l");
+        assert_eq!(mouse_bytes(&p, up, 0, 0), None, "1007 off: no arrows");
+        p.process(b"\x1b[?1007h");
+        assert_eq!(
+            mouse_bytes(&p, up, 0, 0),
+            Some(b"\x1b[A\x1b[A\x1b[A".to_vec()),
+            "1007 back on: arrows resume"
+        );
+        // A mouse protocol still outranks the gate: real wheel events.
+        p.process(b"\x1b[?1000h\x1b[?1006h");
+        assert_eq!(mouse_bytes(&p, up, 0, 0), Some(b"\x1b[<64;1;1M".to_vec()));
+    }
+
+    /// DECSET 1000/1002/1003 all report presses, releases, and wheel events;
+    /// only motion modes 1002 and 1003 report drags. SGR marks releases with
+    /// the `m` suffix and preserves the button code; the default and UTF-8
+    /// encodings use code 3 for every release.
     #[test]
     fn buttons_respect_mode_granularity_and_encoding() {
         let press = MouseKind::Press(MouseBtn::Left);
         let drag = MouseKind::Drag(MouseBtn::Left);
         let release = MouseKind::Release(MouseBtn::Left);
+        let wheel = MouseKind::WheelUp;
 
-        // X10 mode: presses only.
-        let mut p = vt100::Parser::new(24, 80, 0);
-        p.process(b"\x1b[?9h");
-        assert_eq!(
-            mouse_bytes(p.screen(), press, 4, 2),
-            Some(vec![0x1b, b'[', b'M', 32, 33 + 4, 33 + 2])
-        );
-        assert_eq!(mouse_bytes(p.screen(), release, 4, 2), None);
-        assert_eq!(mouse_bytes(p.screen(), drag, 4, 2), None);
+        for (mode, drags) in [(1000, false), (1002, true), (1003, true)] {
+            let mut p = Emulator::new(24, 80, 0);
+            p.process(format!("\x1b[?{mode}h").as_bytes());
 
-        // 1000 with SGR: releases use `m`; drags remain disabled.
-        p.process(b"\x1b[?9l\x1b[?1000h\x1b[?1006h");
-        assert_eq!(
-            mouse_bytes(p.screen(), press, 4, 2),
-            Some(b"\x1b[<0;5;3M".to_vec())
-        );
-        assert_eq!(
-            mouse_bytes(p.screen(), release, 4, 2),
-            Some(b"\x1b[<0;5;3m".to_vec())
-        );
-        assert_eq!(mouse_bytes(p.screen(), drag, 4, 2), None);
+            // Default encoding: single-byte fields.
+            assert_eq!(
+                mouse_bytes(&p, press, 4, 2),
+                Some(vec![0x1b, b'[', b'M', 32, 33 + 4, 33 + 2]),
+                "mode {mode}: default press"
+            );
+            assert_eq!(
+                mouse_bytes(&p, release, 4, 2),
+                Some(vec![0x1b, b'[', b'M', 32 + 3, 33 + 4, 33 + 2]),
+                "mode {mode}: default release"
+            );
+            assert_eq!(
+                mouse_bytes(&p, wheel, 4, 2),
+                Some(vec![0x1b, b'[', b'M', 32 + 64, 33 + 4, 33 + 2]),
+                "mode {mode}: default wheel"
+            );
+            assert_eq!(
+                mouse_bytes(&p, drag, 4, 2),
+                drags.then(|| vec![0x1b, b'[', b'M', 32 + 32, 33 + 4, 33 + 2]),
+                "mode {mode}: default drag"
+            );
 
-        // 1002 enables drag events.
-        p.process(b"\x1b[?1002h");
-        assert_eq!(
-            mouse_bytes(p.screen(), drag, 4, 2),
-            Some(b"\x1b[<32;5;3M".to_vec())
-        );
-        // Non-SGR releases use code 3.
-        p.process(b"\x1b[?1006l");
-        assert_eq!(
-            mouse_bytes(p.screen(), release, 4, 2),
-            Some(vec![0x1b, b'[', b'M', 32 + 3, 33 + 4, 33 + 2])
-        );
+            // UTF-8 encoding: same codes, multi-byte coordinates.
+            p.process(b"\x1b[?1005h");
+            assert_eq!(
+                mouse_bytes(&p, press, 200, 2),
+                Some(vec![0x1b, b'[', b'M', 32, 0xc3, 0xa9, 33 + 2]),
+                "mode {mode}: utf8 press"
+            );
+            assert_eq!(
+                mouse_bytes(&p, release, 200, 2),
+                Some(vec![0x1b, b'[', b'M', 32 + 3, 0xc3, 0xa9, 33 + 2]),
+                "mode {mode}: utf8 release"
+            );
+            assert_eq!(
+                mouse_bytes(&p, wheel, 200, 2),
+                Some(vec![0x1b, b'[', b'M', 32 + 64, 0xc3, 0xa9, 33 + 2]),
+                "mode {mode}: utf8 wheel"
+            );
+            assert_eq!(
+                mouse_bytes(&p, drag, 200, 2),
+                drags.then(|| vec![0x1b, b'[', b'M', 32 + 32, 0xc3, 0xa9, 33 + 2]),
+                "mode {mode}: utf8 drag"
+            );
+
+            // SGR encoding: parameterized fields, release keeps its code.
+            p.process(b"\x1b[?1006h");
+            assert_eq!(
+                mouse_bytes(&p, press, 4, 2),
+                Some(b"\x1b[<0;5;3M".to_vec()),
+                "mode {mode}: sgr press"
+            );
+            assert_eq!(
+                mouse_bytes(&p, release, 4, 2),
+                Some(b"\x1b[<0;5;3m".to_vec()),
+                "mode {mode}: sgr release"
+            );
+            assert_eq!(
+                mouse_bytes(&p, wheel, 4, 2),
+                Some(b"\x1b[<64;5;3M".to_vec()),
+                "mode {mode}: sgr wheel"
+            );
+            assert_eq!(
+                mouse_bytes(&p, drag, 4, 2),
+                drags.then(|| b"\x1b[<32;5;3M".to_vec()),
+                "mode {mode}: sgr drag"
+            );
+        }
     }
 
     /// Scrollback clamps at both ends and input returns to live output.
@@ -973,7 +1073,7 @@ mod tests {
         let deadline = Instant::now() + Duration::from_secs(5);
         let mut contents = String::new();
         while Instant::now() < deadline {
-            contents = grid(&t.parser).screen().contents();
+            contents = grid(&t.parser).contents();
             if contents.contains("zqsecondqz") {
                 break;
             }
@@ -989,49 +1089,59 @@ mod tests {
         t.terminate();
     }
 
-    /// Input hints track child terminal-mode changes.
+    /// Input hints track mouse, alternate-screen, and DECSET 1007 modes.
     #[test]
     fn input_hints_track_child_modes() {
         let mut t = spawn(8, "sleep 5");
-        assert_eq!(t.input_hints(), (false, false));
+        assert_eq!(t.input_hints(), (false, false, false));
         grid(&t.parser).process(b"\x1b[?1000h");
-        assert_eq!(t.input_hints(), (true, false));
+        assert_eq!(t.input_hints(), (true, false, false));
         grid(&t.parser).process(b"\x1b[?1000l\x1b[?1049h");
-        assert_eq!(t.input_hints(), (false, true));
+        assert_eq!(t.input_hints(), (false, true, true));
+        grid(&t.parser).process(b"\x1b[?1007l");
+        assert_eq!(t.input_hints(), (false, true, false));
         t.terminate();
     }
 
-    /// A poisoned grid mutex (a vt100 panic inside the guard) must degrade to
-    /// a recovered lock, not a permanently blank task: renders keep working
-    /// and the reader thread keeps feeding new output through the poison.
+    /// A child's cursor-position probe is answered on the wire: the reply
+    /// crosses the reader thread → allowlist → writer worker → PTY, and only
+    /// the advertised shape arrives. The child first sends secondary DA (a
+    /// denied probe), then primary DA and DSR 6; it reads 11 bytes: exactly
+    /// primary DA (5) plus CPR (6). If the secondary-DA reply leaked, those
+    /// bytes would arrive first and the assertion would see `ESC[>...`.
     #[test]
-    fn poisoned_grid_recovers_instead_of_blanking() {
-        let mut t = spawn(7, "sleep 1; printf 'aftermath\\n'");
-        // Poison the mutex the way a mid-render panic would.
-        let parser = Arc::clone(&t.parser);
-        let _ = thread::spawn(move || {
-            let _guard = parser.lock().unwrap();
-            panic!("simulated vt100 panic");
-        })
-        .join();
-        assert!(t.parser.is_poisoned());
-
-        let _ = t.preview(); // render side must not panic or wedge
-        // Output produced *after* the poison must still reach the screen.
+    fn probe_replies_reach_the_child_through_the_allowlist() {
+        let dir = std::env::temp_dir().join(format!("fleetcom_task_probe_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let out = dir.join("out");
+        // Raw-ish input: the CPR reply has no newline, so canonical mode
+        // would never hand it to the child.
+        let cmd = format!(
+            "stty -icanon -echo min 1 time 0; printf '\\033[>c\\033[c\\033[6n'; \
+             head -c 11 > {}",
+            out.display()
+        );
+        let mut t = Task::spawn(11, &cmd, &here(), 24, 80, &sh_env(), no_waker()).unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
-        let mut preview = String::new();
+        let mut got = Vec::new();
         while Instant::now() < deadline {
-            t.poll_exit().unwrap();
-            preview = t.preview();
-            if preview.contains("aftermath") {
+            got = std::fs::read(&out).unwrap_or_default();
+            if got.len() >= 11 {
                 break;
             }
             thread::sleep(Duration::from_millis(20));
         }
         assert!(
-            preview.contains("aftermath"),
-            "reader thread stopped feeding the grid after poison; preview: {preview:?}"
+            got.starts_with(b"\x1b[?6c\x1b["),
+            "child must read the primary DA reply first (no secondary-DA \
+             leak); got {got:?}"
+        );
+        assert!(
+            got.ends_with(b"R"),
+            "CPR reply must follow the DA reply; got {got:?}"
         );
         t.terminate();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
