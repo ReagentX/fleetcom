@@ -23,7 +23,7 @@ use crate::{
 const IDLE_AFTER: Duration = Duration::from_millis(600);
 
 /// Send-on-change fingerprint for the watched screen and scrollback offset.
-type LastScreen = (u64, Vec<u8>, (u16, u16), bool, (bool, bool), usize);
+type LastScreen = (u64, Vec<u8>, (u16, u16), bool, (bool, bool, bool), usize);
 
 /// Ceiling for PTY dimensions accepted from a `Resize`. Zero is invalid for
 /// the terminal grid, while values up to `u16::MAX` could exhaust memory.
@@ -303,6 +303,7 @@ impl Supervisor {
                     hide_cursor: hide_cursor || sb > 0,
                     wants_mouse: hints.0,
                     alt_screen: hints.1,
+                    alt_scroll: hints.2,
                     scrollback: sb,
                 }));
             }
@@ -640,6 +641,56 @@ mod tests {
             !s.drain().iter().any(|e| matches!(e, Event::Screen(_))),
             "unchanged screen must not be resent"
         );
+    }
+
+    /// A DECSET 1007 flip changes no formatted bytes, only the input hints,
+    /// so the send-on-change fingerprint must count it as a change: the
+    /// client applies its capture/alternate-scroll decision from the last
+    /// `ScreenView`, and a stale one leaves the real terminal converting
+    /// wheel to arrows against the child's veto.
+    #[test]
+    fn decset_1007_flip_resends_watched_screen() {
+        let dir = scratch("flip_1007");
+        let ready = dir.join("ready");
+        let flag = dir.join("flag");
+        let mut s = sup(24, 80);
+        // Enter the alt screen (1007 gate open by default), then veto 1007 on
+        // cue — after the watched screen has settled.
+        let cmd = format!(
+            "printf '\\033[?1049h'; touch {r}; until [ -e {f} ]; do sleep 0.05; done; \
+             printf '\\033[?1007l'; sleep 30",
+            r = ready.display(),
+            f = flag.display()
+        );
+        let id = spawn_ready(&mut s, cmd, here(), &ready);
+        s.apply(Command::Watch { id: Some(id) });
+
+        // Settle until the gate-open screen arrives and stops re-sending.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut open = false;
+        while Instant::now() < deadline && !open {
+            s.tick();
+            open = s
+                .drain()
+                .iter()
+                .any(|e| matches!(e, Event::Screen(sv) if sv.alt_screen && sv.alt_scroll));
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(open, "the gate-open screen never arrived");
+
+        std::fs::write(&flag, b"").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut closed = false;
+        while Instant::now() < deadline && !closed {
+            s.tick();
+            closed = s
+                .drain()
+                .iter()
+                .any(|e| matches!(e, Event::Screen(sv) if sv.alt_screen && !sv.alt_scroll));
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(closed, "the ?1007l flip never re-sent the screen");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A periodic tick flushes an expired synchronized update from a child

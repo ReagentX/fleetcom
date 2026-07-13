@@ -12,7 +12,7 @@ use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
 use crate::frame::{KIND_CONTROL, KIND_HELLO, KIND_SCREEN};
 
 /// Wire-protocol version; the handshake rejects mismatched peers.
-pub const PROTOCOL_VERSION: u32 = 5;
+pub const PROTOCOL_VERSION: u32 = 6;
 
 /// Environment and working directory supplied by the launching client.
 #[derive(Debug, Clone, PartialEq)]
@@ -168,9 +168,14 @@ pub struct ScreenView {
     pub hide_cursor: bool,
     /// Whether the child requested a mouse protocol.
     pub wants_mouse: bool,
-    /// Whether the child is on the alternate screen. Without mouse capture,
-    /// this determines whether alternate scroll is enabled.
+    /// Whether the child is on the alternate screen.
     pub alt_screen: bool,
+    /// Whether the child's wheel-to-arrows gate is open: alt screen with
+    /// DECSET 1007 in effect. Carried separately from `alt_screen` because a
+    /// `?1007l` veto must reach the client — left uncaptured with alternate
+    /// scroll on, the user's real terminal converts wheel to arrows itself,
+    /// past any core-side gate.
+    pub alt_scroll: bool,
     /// Rows the viewport is scrolled back from live output.
     pub scrollback: usize,
 }
@@ -513,6 +518,7 @@ pub fn encode_event(ev: &Event) -> (u8, Vec<u8>) {
             let _ = header.insert("hide", sv.hide_cursor);
             let _ = header.insert("mouse", sv.wants_mouse);
             let _ = header.insert("alt", sv.alt_screen);
+            let _ = header.insert("ascr", sv.alt_scroll);
             let _ = header.insert("sb", sv.scrollback as u64);
             let mut lines = jzon::JsonValue::new_array();
             for l in &sv.lines {
@@ -586,6 +592,7 @@ pub fn decode_event(kind: u8, payload: &[u8]) -> Option<Event> {
                 hide_cursor: h["hide"].as_bool()?,
                 wants_mouse: h["mouse"].as_bool()?,
                 alt_screen: h["alt"].as_bool()?,
+                alt_scroll: h["ascr"].as_bool()?,
                 scrollback: usize::try_from(h["sb"].as_u64()?).ok()?,
             }))
         }
@@ -810,9 +817,9 @@ mod tests {
     fn mistyped_event_members_are_rejected() {
         for header in [
             // Numeric member in `lines`.
-            r#"{"id":1,"cursor":[0,0],"hide":false,"mouse":false,"alt":false,"sb":0,"lines":["ok",5]}"#,
+            r#"{"id":1,"cursor":[0,0],"hide":false,"mouse":false,"alt":false,"ascr":false,"sb":0,"lines":["ok",5]}"#,
             // Out-of-range cursor cell.
-            r#"{"id":1,"cursor":[65536,0],"hide":false,"mouse":false,"alt":false,"sb":0,"lines":[]}"#,
+            r#"{"id":1,"cursor":[65536,0],"hide":false,"mouse":false,"alt":false,"ascr":false,"sb":0,"lines":[]}"#,
         ] {
             assert_eq!(
                 decode_event(KIND_SCREEN, &screen_payload(header)),
@@ -834,6 +841,17 @@ mod tests {
                 "should reject {json}"
             );
         }
+    }
+
+    /// A v5-shaped screen header (no `ascr`) is rejected whole: strict decode
+    /// treats a missing field like a mistyped one. Version-skewed peers never
+    /// get this far — the hello gate refuses them first — so this pins the
+    /// fallback, not the primary defense.
+    #[test]
+    fn screen_header_without_alt_scroll_is_rejected() {
+        let header =
+            r#"{"id":1,"cursor":[0,0],"hide":false,"mouse":false,"alt":true,"sb":0,"lines":[]}"#;
+        assert_eq!(decode_event(KIND_SCREEN, &screen_payload(header)), None);
     }
 
     #[test]
@@ -896,6 +914,9 @@ mod tests {
             hide_cursor: false,
             wants_mouse: true,
             alt_screen: false,
+            // Deliberately decoupled from `alt_screen`: the wire carries the
+            // bit verbatim, it never re-derives it.
+            alt_scroll: true,
             scrollback: 42,
         });
         let (k, p) = encode_event(&screen);

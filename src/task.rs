@@ -608,13 +608,16 @@ impl Task {
         }
     }
 
-    /// Return whether the child requests mouse input and uses the alternate
-    /// screen. The client receives these values in each `ScreenView`.
-    pub fn input_hints(&self) -> (bool, bool) {
+    /// Return whether the child requests mouse input, uses the alternate
+    /// screen, and holds its wheel-to-arrows gate open (alt screen with
+    /// DECSET 1007 in effect — [`Emulator::alternate_scroll`]). The client
+    /// receives these values in each `ScreenView`.
+    pub fn input_hints(&self) -> (bool, bool, bool) {
         let p = grid(&self.parser);
         (
             p.mouse_protocol_mode() != crate::emulator::MouseProtocolMode::None,
             p.alternate_screen(),
+            p.alternate_scroll(),
         )
     }
 
@@ -1044,15 +1047,18 @@ mod tests {
         t.terminate();
     }
 
-    /// Input hints track child terminal-mode changes.
+    /// Input hints track child terminal-mode changes, including the 1007
+    /// wheel gate: default-on with the alt screen, closed by the child's veto.
     #[test]
     fn input_hints_track_child_modes() {
         let mut t = spawn(8, "sleep 5");
-        assert_eq!(t.input_hints(), (false, false));
+        assert_eq!(t.input_hints(), (false, false, false));
         grid(&t.parser).process(b"\x1b[?1000h");
-        assert_eq!(t.input_hints(), (true, false));
+        assert_eq!(t.input_hints(), (true, false, false));
         grid(&t.parser).process(b"\x1b[?1000l\x1b[?1049h");
-        assert_eq!(t.input_hints(), (false, true));
+        assert_eq!(t.input_hints(), (false, true, true));
+        grid(&t.parser).process(b"\x1b[?1007l");
+        assert_eq!(t.input_hints(), (false, true, false));
         t.terminate();
     }
 
