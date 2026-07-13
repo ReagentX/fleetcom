@@ -561,8 +561,9 @@ fn send_event(write: &mut impl Write, ev: &Event) -> bool {
 ///
 /// Panics while serving end the connection without terminating the daemon.
 /// Supervisor state is best-effort afterwards (`apply` is not transactional);
-/// a panic mid-render at worst garbles one task's grid until its next repaint
-/// (`task::grid` recovers the poisoned lock rather than blanking the screen).
+/// a panic mid-render at worst garbles one task's grid until its next repaint.
+/// The grid lock is a `FairMutex` (parking_lot), which does not poison: the
+/// next lock proceeds over whatever state the panic left behind.
 fn serve_client(sup: &mut Supervisor, stream: UnixStream, stop: &AtomicBool) -> ServeOutcome {
     let mut stream = stream;
     match handshake(&mut stream) {
