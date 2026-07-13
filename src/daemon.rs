@@ -531,18 +531,8 @@ fn handshake(stream: &mut UnixStream) -> Result<LaunchContext, String> {
     }
 }
 
-/// Encode and write one event frame; `false` means "drop the client". An
-/// event whose payload exceeds `MAX_FRAME` is skipped instead (`true`,
-/// nothing written): the supervisor's geometry clamp bounds per-cell SGR
-/// emission, but per-cell zero-width extras are unbounded (alacritty stacks
-/// combining marks without limit), so a pathological child can still push a
-/// `Screen` (or its scrollback line into a `Tasks` preview) past the frame
-/// cap. `write_frame` would refuse such a payload before emitting a byte;
-/// treating that as a disconnect strands the client in a reconnect loop that
-/// re-requests the same frame. Skipping degrades one repaint: `Tasks` is
-/// rebuilt every tick, and a skipped `Screen` leaves the pane stale until the
-/// child's next write (the supervisor's send-on-change fingerprint was
-/// already updated), which only a hostile child can trigger.
+/// Encode and write one event frame. Oversized payloads are skipped without
+/// disconnecting the client; other write failures return `false`.
 fn send_event(write: &mut impl Write, ev: &Event) -> bool {
     let (kind, payload) = encode_event(ev);
     if payload.len() > MAX_FRAME as usize {
@@ -560,10 +550,8 @@ fn send_event(write: &mut impl Write, ev: &Event) -> bool {
 /// client is attached.
 ///
 /// Panics while serving end the connection without terminating the daemon.
-/// Supervisor state is best-effort afterwards (`apply` is not transactional);
-/// a panic mid-render at worst garbles one task's grid until its next repaint.
-/// The grid lock is a `FairMutex` (parking_lot), which does not poison: the
-/// next lock proceeds over whatever state the panic left behind.
+/// Supervisor updates are not transactional, and grid locks remain usable
+/// after a panic, so subsequent work may observe partial updates.
 fn serve_client(sup: &mut Supervisor, stream: UnixStream, stop: &AtomicBool) -> ServeOutcome {
     let mut stream = stream;
     match handshake(&mut stream) {
@@ -668,11 +656,7 @@ mod tests {
         let _ = fs::remove_dir_all(&base);
     }
 
-    /// An event too large for one frame is skipped (nothing written, client
-    /// kept) while ordinary events still go out. The backstop behind the
-    /// supervisor's geometry clamp: unbounded per-cell zero-width extras (or
-    /// a serializer density regression the frame-fit test would have caught)
-    /// must cost one repaint, not the connection.
+    /// Oversized events are skipped without preventing subsequent writes.
     #[test]
     fn oversized_event_is_skipped_not_fatal() {
         use crate::protocol::ScreenView;

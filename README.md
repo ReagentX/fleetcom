@@ -80,17 +80,11 @@ The first ordinary invocation starts the daemon when necessary. `--daemon` is an
 
 ### One PTY per command
 
-Every task runs in its own pseudo-terminal, emulated with `alacritty_terminal`
-(the same core Alacritty uses). Capability probes (cursor position, device
-attributes) are answered, `?2026` synchronized updates render as whole frames,
-and history reflows on resize. The same screen grid powers the dashboard
-preview, the peek overlay, and full attached rendering. A mid-run `vim` or
-`htop` therefore renders from the same terminal state as any other task.
-Backgrounding changes client focus; it does not notify the child.
+Every task runs in its own pseudo-terminal, emulated with `alacritty_terminal`. Cursor-position and device-attribute queries are answered, `?2026` synchronized updates render as whole frames, and history reflows on resize. The same screen grid powers the dashboard preview, the peek overlay, and full attached rendering. A mid-run `vim` or `htop` therefore renders from the same terminal state as any other task. Backgrounding changes client focus; it does not notify the child.
 
 ### Input fidelity
 
-Attached input follows the child's terminal state. Modified Enter is sent as `ESC CR` when reported, and paste uses bracketed-paste markers only when enabled by the child. Mouse-protocol children receive mouse events, and full-screen children use alternate scroll. Tasks retain 2,000 lines of scrollback: for inline children, wheel-up over output enters scrollback; `Shift+PageUp` also enters it, paging keys navigate, and `Esc` or typing returns to live output. Details are in [`docs/commands.md`](docs/commands.md).
+Attached input follows the child's terminal state. Modified Enter is sent as `ESC CR` when reported, and paste uses bracketed-paste markers only when enabled by the child. Mouse-protocol children receive mouse events. Full-screen children use alternate scroll only while DECSET 1007 is enabled; otherwise wheel events are suppressed. Tasks retain 2,000 lines of scrollback: for inline children, wheel-up over output enters scrollback; `Shift+PageUp` also enters it, paging keys navigate, and `Esc` or typing returns to live output. Details are in [`docs/commands.md`](docs/commands.md).
 
 ### Jobs outlive the UI
 

@@ -25,31 +25,15 @@ const IDLE_AFTER: Duration = Duration::from_millis(600);
 /// Send-on-change fingerprint for the watched screen and scrollback offset.
 type LastScreen = (u64, Vec<u8>, (u16, u16), bool, (bool, bool, bool), usize);
 
-/// Per-dimension ceiling for PTY dimensions accepted from a (possibly
-/// crafted) `Resize`. A 0 dimension is outside alacritty's grid domain: a
-/// zero-column resize underflows `columns - 1` in its shrink path and a
-/// zero-row grid is indexed out of bounds by the first cell write: a panic
-/// in both build profiles. An unbounded one (up to `u16::MAX`) would allocate
-/// a multi-billion-cell grid and OOM. Real terminals never approach this, so
-/// clamping to `[1, MAX_DIM]` is invisible in normal use and a hard stop
-/// against a malicious peer.
+/// Per-dimension PTY size limit. Resizes are clamped to `[1, MAX_DIM]` to keep
+/// grid dimensions valid and memory bounded.
 const MAX_DIM: u16 = 1000;
 
-/// Area ceiling (`rows × cols`) for the same untrusted `Resize`. `MAX_DIM`
-/// alone still admits a 1,000,000-cell grid, and `serialize::formatted`'s
-/// worst case (adjacent cells alternating maximal SGR state) measures at
-/// ≈93 bytes per cell (`worst_case_screen_frame_fits_max_frame`), so a
-/// full-`MAX_DIM²` screen would encode past `frame::MAX_FRAME`, fail
-/// `write_frame`, and drop the client on a frame it would re-request on every
-/// reconnect. 500,000 cells keeps the measured worst-case `Screen` payload
-/// under ≈70 % of `MAX_FRAME`; the same test enforces that headroom against
-/// serializer, bound, or frame-cap drift. Like `MAX_DIM`, the bound is
-/// invisible to real displays: an 8K portrait monitor (4320×7680 px) at a
-/// compact 8×16 px cell is 540×480 ≈ 260k cells, about half of it.
+/// PTY grid-area limit. Geometry-bounded `Screen` payloads fit `MAX_FRAME`
+/// with a 25% reserve at this size.
 const MAX_CELLS: u32 = 500_000;
 
-// The area clamp divides `MAX_CELLS / rows` with `rows ≤ MAX_DIM`; this is
-// what keeps that quotient (the clamped column count) nonzero.
+// Keep `MAX_CELLS / rows` nonzero for every clamped row count.
 const _: () = assert!(MAX_CELLS >= MAX_DIM as u32);
 
 /// Ceiling on live tasks. Each is a PTY (fds) + child + reader thread + a
@@ -179,15 +163,10 @@ impl Supervisor {
                 }
             }
             Command::Resize { rows, cols } => {
-                // Keep untrusted dimensions nonzero, within `MAX_DIM`, and
-                // under the `MAX_CELLS` area bound. Over-area geometry shrinks
-                // columns while keeping rows: the area clamp only engages when
-                // both dimensions are already in the many-hundreds (no real
-                // terminal), so the choice is arbitrary but must be
-                // deterministic. The quotient is safe on both sides: it is
-                // `≥ MAX_CELLS / MAX_DIM ≥ 1` (nonzero columns), and under the
-                // branch condition it is `< cols ≤ MAX_DIM` (the `u16` cast
-                // cannot truncate).
+                // Clamp each dimension first, then preserve rows and reduce
+                // columns when the grid exceeds `MAX_CELLS`. The constant
+                // assertion keeps the quotient nonzero; this branch also
+                // guarantees the quotient is below `cols` and fits `u16`.
                 self.rows = rows.clamp(1, MAX_DIM);
                 self.cols = cols.clamp(1, MAX_DIM);
                 if u32::from(self.rows) * u32::from(self.cols) > MAX_CELLS {
@@ -676,19 +655,15 @@ mod tests {
         );
     }
 
-    /// A DECSET 1007 flip changes no formatted bytes, only the input hints,
-    /// so the send-on-change fingerprint must count it as a change: the
-    /// client applies its capture/alternate-scroll decision from the last
-    /// `ScreenView`, and a stale one leaves the real terminal converting
-    /// wheel to arrows against the child's veto.
+    /// A DECSET 1007 change emits a new `Screen` event even when the rendered
+    /// contents are unchanged.
     #[test]
     fn decset_1007_flip_resends_watched_screen() {
         let dir = scratch("flip_1007");
         let ready = dir.join("ready");
         let flag = dir.join("flag");
         let mut s = sup(24, 80);
-        // Enter the alt screen (1007 gate open by default), then veto 1007 on
-        // cue, after the watched screen has settled.
+        // Enter the alternate screen, then disable DECSET 1007 when signaled.
         let cmd = format!(
             "printf '\\033[?1049h'; touch {r}; until [ -e {f} ]; do sleep 0.05; done; \
              printf '\\033[?1007l'; sleep 30",
@@ -698,7 +673,7 @@ mod tests {
         let id = spawn_ready(&mut s, cmd, here(), &ready);
         s.apply(Command::Watch { id: Some(id) });
 
-        // Settle until the gate-open screen arrives and stops re-sending.
+        // Wait for the initial alternate-scroll state.
         let deadline = Instant::now() + Duration::from_secs(5);
         let mut open = false;
         while Instant::now() < deadline && !open {
@@ -1136,12 +1111,7 @@ mod tests {
         );
     }
 
-    /// A crafted `Resize` with zero or enormous dimensions must be clamped,
-    /// not forwarded to the grid. 0 panics inside alacritty (column-shrink
-    /// underflow, out-of-bounds cell writes), and `u16::MAX` would allocate a
-    /// multi-billion-cell grid. The accepted geometry must satisfy both
-    /// bounds: each dimension in `[1, MAX_DIM]` and the area within
-    /// `MAX_CELLS` (the frame-fit guarantee).
+    /// Resize clamps each dimension and the total grid area.
     #[test]
     fn resize_clamps_hostile_dimensions() {
         let mut s = sup(24, 80);
@@ -1170,8 +1140,7 @@ mod tests {
             s.cols,
         );
 
-        // A per-dimension-legal but over-area resize engages the area clamp:
-        // rows survive, columns shrink to fit.
+        // An over-area resize preserves rows and reduces columns.
         s.apply(Command::Resize {
             rows: MAX_DIM,
             cols: MAX_DIM,
@@ -1179,7 +1148,7 @@ mod tests {
         assert_eq!(u32::from(s.rows), u32::from(MAX_DIM));
         assert_eq!(u32::from(s.cols), MAX_CELLS / u32::from(MAX_DIM));
 
-        // A real-terminal resize is untouched by either bound.
+        // In-range geometry remains unchanged.
         s.apply(Command::Resize {
             rows: 67,
             cols: 302,
@@ -1187,23 +1156,10 @@ mod tests {
         assert_eq!((s.rows, s.cols), (67, 302));
     }
 
-    /// The frame-fit guarantee, pinned by measurement: the worst `Screen`
-    /// payload any clamp-accepted geometry can produce must fit
-    /// `frame::MAX_FRAME` with headroom. Couples `serialize::formatted`'s
-    /// emission density to `MAX_CELLS` and `MAX_FRAME`: a change to any of
-    /// the three that breaks the invariant fails this test instead of as a
-    /// production disconnect loop.
-    ///
-    /// The construction maximizes bytes per cell against the real serializer:
-    /// every cell is a `'\t'` (whose emission path adds two per-cell CUPs on
-    /// top of the glyph) styled with the maximal SGR: every style flag plus
-    /// three-digit truecolor fg, bg, and underline color, alternating
-    /// between two color sets so `sync_sgr` re-specifies in full at every
-    /// cell. Geometry is the worst the clamp admits: `MAX_DIM` rows (largest
-    /// CUP row digits, most per-row CUPs) at exactly `MAX_CELLS` total.
-    /// Per-cell zero-width extras are deliberately absent: alacritty stores
-    /// unboundedly many per cell, so no geometry bound can cover them. That
-    /// tail is what the daemon's oversized-frame skip is for.
+    /// The densest geometry-bounded `Screen` payload fits `MAX_FRAME` with a
+    /// 25% reserve. Each cell uses tab emission and alternating full SGR state
+    /// across `MAX_CELLS` cells and `MAX_DIM` rows. Per-cell zero-width extras
+    /// are unbounded by geometry and handled by the oversized-event check.
     #[test]
     fn worst_case_screen_frame_fits_max_frame() {
         use std::fmt::Write as _;
@@ -1221,9 +1177,8 @@ mod tests {
             serialize,
         };
 
-        // Every style flag the serializer emits, with the widest underline
-        // param (`4:5`); colors differ between the sets in all three slots so
-        // adjacency always forces a full respec.
+        // Alternate complete SGR states so every cell emits all style and
+        // color fields; `4:5` is the longest underline parameter.
         const SGR_A: &str =
             "\x1b[0;1;2;3;4:5;7;8;9;38;2;255;254;253;48;2;252;251;250;58;2;249;248;247m";
         const SGR_B: &str =
@@ -1233,9 +1188,8 @@ mod tests {
         let cols = (MAX_CELLS / u32::from(MAX_DIM)) as usize;
         assert_eq!(rows * cols, MAX_CELLS as usize, "geometry covers the bound");
 
-        // Per cell: address it, set the alternating SGR, plant a styled
-        // space, re-address, and overtype with '\t' (put_tab flips `c` on a
-        // space without touching its attributes).
+        // Write a styled space, then replace its character with a tab while
+        // preserving its attributes.
         let mut input = String::with_capacity(rows * cols * 100);
         for row in 1..=rows {
             for col in 1..=cols {
@@ -1256,9 +1210,7 @@ mod tests {
         let mut parser: Processor = Processor::new();
         parser.advance(&mut term, input.as_bytes());
 
-        // Premises: the construction really produced maximal-SGR tab cells;
-        // a put_tab or parser change that degrades it would otherwise leave
-        // this test green while measuring the wrong worst case.
+        // Confirm the grid contains the features used by the density bound.
         let probe = &term.grid()[Line(0)][Column(0)];
         assert_eq!(probe.c, '\t', "cells must take the expensive tab path");
         assert!(
@@ -1285,17 +1237,13 @@ mod tests {
         assert_eq!(kind, KIND_SCREEN);
 
         let per_cell = payload.len() as f64 / MAX_CELLS as f64;
-        // Density floor: the analytic worst case is ≈92 bytes/cell, so a
-        // measurement far below it means the construction degenerated, not
-        // that the serializer got cheap.
+        // Keep the constructed density above 85 bytes per cell.
         assert!(
             per_cell >= 85.0,
             "worst-case construction degenerated: {per_cell:.1} bytes/cell"
         );
-        // The invariant, with enforced headroom: the measured worst case plus
-        // a 25 % reserve must fit. `Screen` payloads ride the frame raw (no
-        // base64 expansion; see protocol.rs), so the payload length is the
-        // wire length.
+        // `Screen` payload bytes are written directly to the frame. Include a
+        // 25% reserve in the size check.
         assert!(
             payload.len() + payload.len() / 4 <= MAX_FRAME as usize,
             "worst-case Screen frame no longer fits MAX_FRAME with 25 % \

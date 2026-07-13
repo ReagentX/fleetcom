@@ -174,9 +174,8 @@ pub struct App {
     view_scroll: bool,
 }
 
-/// Return `(mouse_capture, alt_scroll)` for the attached child's screen.
-/// Scrollback and inline children capture the mouse; mouse-aware children
-/// receive events, while full-screen children use alternate scroll.
+/// Return `(mouse_capture, alt_scroll)` for the attached view. Scrollback,
+/// inline views, and children that disable alternate scroll capture the mouse.
 fn desired_input_modes(attached: Option<&ScreenView>, view_scroll: bool) -> (bool, bool) {
     if view_scroll {
         return (true, true);
@@ -184,15 +183,9 @@ fn desired_input_modes(attached: Option<&ScreenView>, view_scroll: bool) -> (boo
     match attached {
         // Capture and forward mouse events requested by the child.
         Some(s) if s.wants_mouse => (true, true),
-        // Scroll full-screen children through alternate-scroll arrows. The
-        // real terminal converts wheel to arrows only while the child's 1007
-        // gate is open.
+        // Let the terminal convert wheel events to arrow keys.
         Some(s) if s.alt_screen && s.alt_scroll => (false, true),
-        // A full-screen child that vetoed 1007 (`?1007l`) gets capture
-        // instead: the wheel routes through `mouse_bytes`, which honors the
-        // veto by delivering nothing. Uncaptured, the real terminal would
-        // synthesize the arrows itself and they'd bypass the veto as
-        // ordinary input bytes.
+        // Capture wheel events when the child disables alternate scroll.
         Some(s) if s.alt_screen => (true, true),
         // Capture wheel-up to enter scrollback for inline children.
         Some(_) => (true, true),
@@ -1731,14 +1724,12 @@ mod tests {
             desired_input_modes(Some(&screen(true, false, false)), false),
             (true, true)
         );
-        // Full-screen child without mouse mode: alternate scroll while its
-        // 1007 gate is open.
+        // Full-screen child with alternate scroll enabled.
         assert_eq!(
             desired_input_modes(Some(&screen(false, true, true)), false),
             (false, true)
         );
-        // Full-screen child that vetoed 1007: capture, so the wheel routes
-        // through `mouse_bytes` and delivers nothing instead of arrows.
+        // Full-screen child with alternate scroll disabled.
         assert_eq!(
             desired_input_modes(Some(&screen(false, true, false)), false),
             (true, true)
@@ -1797,14 +1788,7 @@ mod tests {
         assert!(!app.view_scroll, "mouse-aware children keep their wheel");
     }
 
-    /// A full-screen child's `?1007l` veto holds across the whole attached
-    /// path: emulator hint → `ScreenView` over the transport → the capture
-    /// decision → `Command::Mouse` → `mouse_bytes` → PTY. With the veto the
-    /// wheel delivers nothing. A sentinel written after it proves the child
-    /// was reading, so absence is the veto, not a stall. With 1007 at its
-    /// default the same wheel delivers three arrows. The uncaptured half is
-    /// out of process: the user's real terminal converting wheel to arrows
-    /// while the gate is open (`(false, true)` here).
+    /// Attached wheel input follows the child's DECSET 1007 state.
     #[test]
     fn attached_wheel_honors_the_childs_1007_veto() {
         use std::time::Instant;
@@ -1818,8 +1802,7 @@ mod tests {
             row: 0,
             modifiers: KeyModifiers::NONE,
         };
-        // Run one attached wheel notch against a child holding the gate in
-        // `veto` state; return the first `take` bytes the child read.
+        // Send one wheel notch and return the first `take` bytes read by the child.
         let run = |veto: bool, take: usize, out: PathBuf| -> Vec<u8> {
             let mut app = App::new_local(30, 100);
             let cwd = app.invocation_dir.clone();
@@ -1828,8 +1811,7 @@ mod tests {
             } else {
                 "\\033[?1049h"
             };
-            // Raw-ish input, like the task-level probe test: arrows have no
-            // newline, so canonical mode would never hand them to `head`.
+            // Noncanonical input lets `head` read arrow sequences without a newline.
             let cmd = format!(
                 "stty -icanon -echo min 1 time 0; printf '{modes}'; head -c {take} > {}",
                 out.display()
@@ -1840,8 +1822,7 @@ mod tests {
             app.attach();
             let id = app.focused_id.expect("attached");
             app.set_watch(Some(id));
-            // Wait for the child's gate state to round-trip to the client;
-            // wheel first, or it would race the mode prints.
+            // Wait for the child's terminal modes to reach the client.
             let deadline = Instant::now() + Duration::from_secs(5);
             loop {
                 app.pump();
@@ -1857,14 +1838,11 @@ mod tests {
                 );
                 std::thread::sleep(Duration::from_millis(10));
             }
-            // The client-side decision under test: a veto means capture (the
-            // wheel routes through `mouse_bytes`), the default leaves the
-            // wheel to the real terminal's alternate scroll.
+            // Disabled alternate scroll captures the wheel; enabled does not.
             assert_eq!(desired_input_modes(app.screen_for(id), false), (veto, true));
             app.on_mouse(wheel_up);
             if veto {
-                // Ordered behind the wheel on the writer queue: if the veto
-                // leaked arrows, they'd reach the child before the sentinel.
+                // The sentinel follows the wheel on the writer queue.
                 app.transport.send(Command::Input {
                     id,
                     bytes: b"zzz".to_vec(),
@@ -1882,9 +1860,9 @@ mod tests {
             got
         };
 
-        // ?1007l: the wheel delivers nothing; only the sentinel arrives.
+        // Disabled alternate scroll suppresses the wheel bytes.
         assert_eq!(run(true, 3, dir.join("veto")), b"zzz".to_vec());
-        // Default 1007: three arrows per notch.
+        // Enabled alternate scroll emits three arrows per notch.
         assert_eq!(
             run(false, 9, dir.join("dflt")),
             b"\x1b[A\x1b[A\x1b[A".to_vec()

@@ -170,11 +170,7 @@ pub struct ScreenView {
     pub wants_mouse: bool,
     /// Whether the child is on the alternate screen.
     pub alt_screen: bool,
-    /// Whether the child's wheel-to-arrows gate is open: alt screen with
-    /// DECSET 1007 in effect. Carried separately from `alt_screen` because a
-    /// `?1007l` veto must reach the client. Left uncaptured with alternate
-    /// scroll on, the user's real terminal converts wheel to arrows itself,
-    /// past any core-side gate.
+    /// Whether alternate-screen wheel events may become arrow keys.
     pub alt_scroll: bool,
     /// Rows the viewport is scrolled back from live output.
     pub scrollback: usize,
@@ -843,10 +839,7 @@ mod tests {
         }
     }
 
-    /// A v5-shaped screen header (no `ascr`) is rejected whole: strict decode
-    /// treats a missing field like a mistyped one. Version-skewed peers never
-    /// get this far (the hello gate refuses them first), so this pins the
-    /// fallback, not the primary defense.
+    /// Screen events without the required alternate-scroll field are rejected.
     #[test]
     fn screen_header_without_alt_scroll_is_rejected() {
         let header =
@@ -914,8 +907,7 @@ mod tests {
             hide_cursor: false,
             wants_mouse: true,
             alt_screen: false,
-            // Deliberately decoupled from `alt_screen`: the wire carries the
-            // bit verbatim, it never re-derives it.
+            // The wire encodes this field independently of `alt_screen`.
             alt_scroll: true,
             scrollback: 42,
         });

@@ -608,10 +608,8 @@ impl Task {
         }
     }
 
-    /// Return whether the child requests mouse input, uses the alternate
-    /// screen, and holds its wheel-to-arrows gate open (alt screen with
-    /// DECSET 1007 in effect; see [`Emulator::alternate_scroll`]). The client
-    /// receives these values in each `ScreenView`.
+    /// Return the child's mouse, alternate-screen, and alternate-scroll modes
+    /// for `ScreenView`.
     pub fn input_hints(&self) -> (bool, bool, bool) {
         let p = grid(&self.parser);
         (
@@ -1047,8 +1045,7 @@ mod tests {
         t.terminate();
     }
 
-    /// Input hints track child terminal-mode changes, including the 1007
-    /// wheel gate: default-on with the alt screen, closed by the child's veto.
+    /// Input hints track mouse, alternate-screen, and DECSET 1007 modes.
     #[test]
     fn input_hints_track_child_modes() {
         let mut t = spawn(8, "sleep 5");
