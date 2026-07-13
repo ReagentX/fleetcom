@@ -1,8 +1,9 @@
 //! The terminal-emulation seam: every read of a task's screen state and every
 //! byte parsed into it goes through [`Emulator`], so the backend can change
-//! without touching call-sites. As of migration step 4 the production backend
-//! is `alacritty_terminal`; the vt100 variant survives only for the
-//! differential tests until step 6 retires it.
+//! without touching call-sites. The production backend is
+//! `alacritty_terminal`; a `#[cfg(test)]` vt100 variant survives as the
+//! reference side of the differential golden suites (a dev-dependency —
+//! release builds compile it out entirely).
 
 use std::{
     sync::{Arc, Mutex},
@@ -141,12 +142,13 @@ impl AlacrittyBackend {
 /// object, because the variant set is closed — two backends during a
 /// migration, one at ship. Promote to a trait only if a third materializes.
 pub enum Emulator {
-    /// The retiring backend. Production never constructs it; the golden and
-    /// mouse-contract tests do, until step 6 deletes it.
+    /// The differential-harness reference backend: the golden and
+    /// mouse-contract tests construct it, production cannot — vt100 is a
+    /// dev-dependency, so the variant only compiles under `cfg(test)`.
     /// Both variants are boxed: each backend's inline state runs to
     /// kilobytes, and every task holds exactly one emulator behind an `Arc`,
     /// so the indirection costs nothing that matters.
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     Vt100(Box<vt100::Parser>),
     Alacritty(Box<AlacrittyBackend>),
 }
@@ -178,7 +180,7 @@ impl Emulator {
     }
 
     /// A fresh vt100-backed emulator, for tests pinning cross-backend
-    /// behavior until step 6 retires the variant.
+    /// behavior against the differential reference.
     #[cfg(test)]
     pub fn new_vt100(rows: u16, cols: u16, scrollback: usize) -> Self {
         Self::Vt100(Box::new(vt100::Parser::new(rows, cols, scrollback)))
@@ -189,6 +191,7 @@ impl Emulator {
     /// caller owns delivering them to the child.
     pub fn process(&mut self, bytes: &[u8]) -> Vec<String> {
         match self {
+            #[cfg(test)]
             Self::Vt100(p) => {
                 p.process(bytes);
                 // vt100 has no response machinery at all.
@@ -207,10 +210,11 @@ impl Emulator {
     /// only when more bytes arrive, so a child that opens BSU and stalls
     /// would freeze its view until then — the core's periodic tick calls this
     /// to bound the stall. No-op while the timeout is still pending (an
-    /// in-flight frame is not torn), when no sync is open, and for the vt100
-    /// backend (which never buffers).
+    /// in-flight frame is not torn) and when no sync is open.
     pub fn flush_expired_sync(&mut self) -> Vec<String> {
         match self {
+            // vt100 never buffers: there is nothing to flush.
+            #[cfg(test)]
             Self::Vt100(_) => Vec::new(),
             Self::Alacritty(b) => {
                 let expired = b
@@ -231,6 +235,7 @@ impl Emulator {
     /// child hid the cursor.
     pub fn formatted(&self) -> (Vec<u8>, (u16, u16), bool) {
         match self {
+            #[cfg(test)]
             Self::Vt100(p) => {
                 let s = p.screen();
                 (s.contents_formatted(), s.cursor_position(), s.hide_cursor())
@@ -242,6 +247,7 @@ impl Emulator {
     /// Plain-text contents of the visible screen, one line per row.
     pub fn contents(&self) -> String {
         match self {
+            #[cfg(test)]
             Self::Vt100(p) => p.screen().contents(),
             Self::Alacritty(b) => crate::serialize::contents(&b.term),
         }
@@ -254,6 +260,7 @@ impl Emulator {
     /// reports at all, matching alacritty the terminal.
     pub fn mouse_protocol_mode(&self) -> MouseProtocolMode {
         match self {
+            #[cfg(test)]
             Self::Vt100(p) => match p.screen().mouse_protocol_mode() {
                 vt100::MouseProtocolMode::None => MouseProtocolMode::None,
                 vt100::MouseProtocolMode::Press => MouseProtocolMode::Press,
@@ -281,6 +288,7 @@ impl Emulator {
     /// (each DECSET clears the other), so the order is belt-and-braces.
     pub fn mouse_protocol_encoding(&self) -> MouseProtocolEncoding {
         match self {
+            #[cfg(test)]
             Self::Vt100(p) => match p.screen().mouse_protocol_encoding() {
                 vt100::MouseProtocolEncoding::Default => MouseProtocolEncoding::Default,
                 vt100::MouseProtocolEncoding::Utf8 => MouseProtocolEncoding::Utf8,
@@ -302,14 +310,35 @@ impl Emulator {
     /// Whether the child is on the alternate screen (DECSET 1049).
     pub fn alternate_screen(&self) -> bool {
         match self {
+            #[cfg(test)]
             Self::Vt100(p) => p.screen().alternate_screen(),
             Self::Alacritty(b) => b.term.mode().contains(TermMode::ALT_SCREEN),
+        }
+    }
+
+    /// Whether wheel events should reach the child as arrow keys: on the
+    /// alternate screen with DECSET 1007 in effect. The gate mirrors
+    /// alacritty the terminal's own arrow-emission check —
+    /// `mode().contains(ALT_SCREEN | ALTERNATE_SCROLL)` in its
+    /// `scroll_terminal` — and 1007 defaults *on* (xterm semantics), so a
+    /// full-screen child scrolls without opting in but keeps `?1007l` as its
+    /// veto. vt100 cannot model 1007; its arm keeps the pre-step-6 heuristic
+    /// (alt screen alone) so the cross-backend tests retain their meaning.
+    pub fn alternate_scroll(&self) -> bool {
+        match self {
+            #[cfg(test)]
+            Self::Vt100(p) => p.screen().alternate_screen(),
+            Self::Alacritty(b) => b
+                .term
+                .mode()
+                .contains(TermMode::ALT_SCREEN | TermMode::ALTERNATE_SCROLL),
         }
     }
 
     /// Whether application cursor keys are on (DECSET 1).
     pub fn application_cursor(&self) -> bool {
         match self {
+            #[cfg(test)]
             Self::Vt100(p) => p.screen().application_cursor(),
             Self::Alacritty(b) => b.term.mode().contains(TermMode::APP_CURSOR),
         }
@@ -318,6 +347,7 @@ impl Emulator {
     /// Whether the child opted into bracketed paste (DECSET 2004).
     pub fn bracketed_paste(&self) -> bool {
         match self {
+            #[cfg(test)]
             Self::Vt100(p) => p.screen().bracketed_paste(),
             Self::Alacritty(b) => b.term.mode().contains(TermMode::BRACKETED_PASTE),
         }
@@ -326,6 +356,7 @@ impl Emulator {
     /// Rows the viewport is scrolled back from live output.
     pub fn scrollback(&self) -> usize {
         match self {
+            #[cfg(test)]
             Self::Vt100(p) => p.screen().scrollback(),
             Self::Alacritty(b) => b.term.grid().display_offset(),
         }
@@ -335,6 +366,7 @@ impl Emulator {
     /// retained history, so `usize::MAX` means the oldest stored row.
     pub fn set_scrollback(&mut self, rows: usize) {
         match self {
+            #[cfg(test)]
             Self::Vt100(p) => p.screen_mut().set_scrollback(rows),
             Self::Alacritty(b) => {
                 // Same clamp contract as vt100: absolute target, capped at
@@ -351,6 +383,7 @@ impl Emulator {
     /// Resize the grid to `rows`×`cols`.
     pub fn resize(&mut self, rows: u16, cols: u16) {
         match self {
+            #[cfg(test)]
             Self::Vt100(p) => p.screen_mut().set_size(rows, cols),
             Self::Alacritty(b) => b.term.resize(GridSize {
                 lines: rows as usize,
@@ -529,6 +562,29 @@ mod tests {
         let mut vt = Emulator::new_vt100(24, 80, 0);
         vt.process(b"\x1b[?9h");
         assert_eq!(vt.mouse_protocol_mode(), MouseProtocolMode::Press);
+    }
+
+    /// The wheel-as-arrows gate is alt screen *and* DECSET 1007, with 1007
+    /// defaulting on — and the child's `?1007l` veto is honored, which the
+    /// old alt-screen heuristic could not do. The vt100 arm keeps that
+    /// heuristic (no 1007 state to read), pinned here so the divergence is
+    /// explicit rather than a silent cross-backend drift.
+    #[test]
+    fn alternate_scroll_requires_alt_screen_and_1007() {
+        let mut emu = Emulator::new(24, 80, 0);
+        assert!(!emu.alternate_scroll(), "primary screen never gates open");
+        emu.process(b"\x1b[?1049h");
+        assert!(emu.alternate_scroll(), "1007 defaults on");
+        emu.process(b"\x1b[?1007l");
+        assert!(!emu.alternate_scroll(), "the child's veto must stick");
+        emu.process(b"\x1b[?1007h");
+        assert!(emu.alternate_scroll());
+        emu.process(b"\x1b[?1049l");
+        assert!(!emu.alternate_scroll(), "leaving the alt screen closes it");
+
+        let mut vt = Emulator::new_vt100(24, 80, 0);
+        vt.process(b"\x1b[?1049h\x1b[?1007l");
+        assert!(vt.alternate_scroll(), "vt100 has no 1007 state; heuristic");
     }
 
     /// The clamp contract `scroll_view` relies on: absolute target capped at

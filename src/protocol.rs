@@ -58,15 +58,15 @@ pub enum Command {
     /// Forward raw keystroke bytes to a task's PTY.
     Input { id: u64, bytes: Vec<u8> },
     /// Clipboard paste for a task. Kept distinct from `Input` because the
-    /// encoding depends on state only the core can see: the task's vt100 screen
+    /// encoding depends on state only the core can see: the task's emulator
     /// knows whether the child enabled bracketed paste (DECSET 2004), which
     /// decides between wrapping in paste markers and newline conversion.
     Paste { id: u64, bytes: Vec<u8> },
     /// One mouse action over an attached task. `col`/`row` are 0-based pane
     /// cells. Routing is core-side for the same reason as `Paste`: the child's
-    /// mouse-protocol mode, encoding, and alt-screen state live in its vt100
-    /// screen, and they decide both whether the child hears about the action
-    /// at all and in which byte encoding.
+    /// mouse-protocol mode, encoding, and alternate-scroll state live in its
+    /// emulator, and they decide both whether the child hears about the
+    /// action at all and in which byte encoding.
     Mouse {
         id: u64,
         kind: MouseKind,

@@ -26,17 +26,18 @@ const IDLE_AFTER: Duration = Duration::from_millis(600);
 type LastScreen = (u64, Vec<u8>, (u16, u16), bool, (bool, bool), usize);
 
 /// Ceiling for PTY dimensions accepted from a (possibly crafted) `Resize`. A 0
-/// dimension underflows vt100 (`grid.rs` does `size.rows - 1`): panic in debug,
-/// out-of-bounds in release. An unbounded one (up to `u16::MAX`) would
-/// allocate a multi-billion-cell grid and OOM. Real terminals never approach
-/// this, so clamping to `[1, MAX_DIM]` is invisible in normal use and a hard
-/// stop against a malicious peer.
+/// dimension is outside alacritty's grid domain: a zero-column resize
+/// underflows `columns - 1` in its shrink path and a zero-row grid is indexed
+/// out of bounds by the first cell write — a panic in both build profiles. An
+/// unbounded one (up to `u16::MAX`) would allocate a multi-billion-cell grid
+/// and OOM. Real terminals never approach this, so clamping to `[1, MAX_DIM]`
+/// is invisible in normal use and a hard stop against a malicious peer.
 const MAX_DIM: u16 = 1000;
 
-/// Ceiling on live tasks. Each is a PTY (fds) + child + reader thread + a vt100
-/// grid, so an unbounded `Spawn` loop or a huge session recipe could exhaust
-/// file descriptors and memory. Far above any real fleet: a guardrail, not a
-/// working limit.
+/// Ceiling on live tasks. Each is a PTY (fds) + child + reader thread + a
+/// terminal grid, so an unbounded `Spawn` loop or a huge session recipe could
+/// exhaust file descriptors and memory. Far above any real fleet: a
+/// guardrail, not a working limit.
 const MAX_TASKS: usize = 256;
 
 /// How long a SIGTERMed job gets to exit before SIGKILL. TERM-respecting
@@ -186,8 +187,8 @@ impl Supervisor {
                 }
             }
             // Paste and scroll land here (not as pre-encoded `Input`) because
-            // their encoding depends on the child's vt100 state, which only
-            // this side of the socket can see.
+            // their encoding depends on the child's terminal state, which
+            // only this side of the socket can see.
             Command::Paste { id, bytes } => {
                 let refused = self.by_id_mut(id).and_then(|t| t.send_paste(&bytes).err());
                 if let Some(r) = refused {
@@ -1061,10 +1062,11 @@ mod tests {
         );
     }
 
-    /// A crafted `Resize` with zero or enormous dimensions must be clamped, not
-    /// forwarded to vt100. 0 underflows its `size.rows - 1` (panics in debug),
-    /// and `u16::MAX` would allocate a multi-billion-cell grid. Reaching the end
-    /// without a panic/OOM is the assertion.
+    /// A crafted `Resize` with zero or enormous dimensions must be clamped,
+    /// not forwarded to the grid. 0 panics inside alacritty (column-shrink
+    /// underflow, out-of-bounds cell writes), and `u16::MAX` would allocate a
+    /// multi-billion-cell grid. Reaching the end without a panic/OOM is the
+    /// assertion.
     #[test]
     fn resize_clamps_hostile_dimensions() {
         let mut s = sup(24, 80);

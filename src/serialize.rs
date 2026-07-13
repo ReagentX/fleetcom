@@ -1,7 +1,6 @@
 //! Serialize an `alacritty_terminal` grid back into ANSI bytes: the owned
 //! correctness surface of the emulator migration (EMULATOR_MIGRATION.md).
-//! Replaces `vt100::Screen::contents_formatted` when the backend swaps in
-//! migration step 4.
+//! Replaced `vt100::Screen::contents_formatted` at the step-4 backend swap.
 //!
 //! Contract: replaying [`formatted`]'s bytes into a fresh terminal of the same
 //! dimensions reproduces the source's *displayed* screen — every cell's

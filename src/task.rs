@@ -90,9 +90,10 @@ pub fn paste_bytes(bracketed: bool, content: &[u8]) -> Vec<u8> {
 }
 
 /// Encode a mouse action using the child's current terminal mode. Mouse
-/// protocols determine supported actions and encoding. Without one,
-/// full-screen children receive wheel actions as alternate-scroll arrows;
-/// unsupported actions return `None`.
+/// protocols determine supported actions and encoding. Without one, wheel
+/// actions become alternate-scroll arrows when the child's gate is open
+/// (alt screen with DECSET 1007, which defaults on — see
+/// [`Emulator::alternate_scroll`]); unsupported actions return `None`.
 pub fn mouse_bytes(emu: &Emulator, kind: MouseKind, col: u16, row: u16) -> Option<Vec<u8>> {
     use crate::emulator::{MouseProtocolEncoding, MouseProtocolMode};
     let mode = emu.mouse_protocol_mode();
@@ -149,7 +150,7 @@ pub fn mouse_bytes(emu: &Emulator, kind: MouseKind, col: u16, row: u16) -> Optio
             }
         });
     }
-    if emu.alternate_screen() {
+    if emu.alternate_scroll() {
         let up = match kind {
             MouseKind::WheelUp => true,
             MouseKind::WheelDown => false,
@@ -722,8 +723,8 @@ mod tests {
         panic!("task never finished");
     }
 
-    /// End-to-end plumbing: spawn under a PTY, the reader thread feeds vt100,
-    /// the screen reflects the output, and the exit code is latched.
+    /// End-to-end plumbing: spawn under a PTY, the reader thread feeds the
+    /// emulator, the screen reflects the output, and the exit code is latched.
     #[test]
     fn spawn_reads_output_and_exits_zero() {
         let mut t = spawn(1, "printf 'alpha\\nomega\\n'");
@@ -932,6 +933,27 @@ mod tests {
             mouse_bytes(&p, up, 5000, 5000),
             Some(vec![0x1b, b'[', b'M', 32 + 64, 0xdf, 0xbf, 0xdf, 0xbf])
         );
+    }
+
+    /// The wheel-as-arrows gate is real DECSET 1007 state, not the alt-screen
+    /// heuristic it replaced: a full-screen child that switches 1007 off gets
+    /// nothing from the wheel, and one that leaves it default-on (the
+    /// `wheel_routes_by_child_state` case) gets arrows.
+    #[test]
+    fn wheel_arrows_honor_decset_1007() {
+        let up = MouseKind::WheelUp;
+        let mut p = Emulator::new(24, 80, 0);
+        p.process(b"\x1b[?1049h\x1b[?1007l");
+        assert_eq!(mouse_bytes(&p, up, 0, 0), None, "1007 off: no arrows");
+        p.process(b"\x1b[?1007h");
+        assert_eq!(
+            mouse_bytes(&p, up, 0, 0),
+            Some(b"\x1b[A\x1b[A\x1b[A".to_vec()),
+            "1007 back on: arrows resume"
+        );
+        // A mouse protocol still outranks the gate: real wheel events.
+        p.process(b"\x1b[?1000h\x1b[?1006h");
+        assert_eq!(mouse_bytes(&p, up, 0, 0), Some(b"\x1b[<64;1;1M".to_vec()));
     }
 
     /// Verify mode-specific button delivery and encoding.

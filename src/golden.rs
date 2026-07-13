@@ -21,9 +21,9 @@
 //! at the backend swap (step 4): a measurement moving here means the
 //! user-visible contract moved, not that a tolerance needs widening.
 //!
-//! This module outlives the migration as the differential harness: vt100
-//! moves to `[dev-dependencies]` at ship and lives on only here, guarding
-//! alacritty pin-bumps.
+//! This module outlives the migration as the differential harness: vt100 is
+//! a `[dev-dependencies]` entry that lives on only here and in the seam's
+//! test-only variant, guarding alacritty pin-bumps.
 
 use alacritty_terminal::{
     Term,

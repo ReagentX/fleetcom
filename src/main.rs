@@ -15,8 +15,6 @@ mod frame;
 mod golden;
 mod path;
 mod protocol;
-// Unreferenced until migration step 4 wires it into the Emulator seam.
-#[allow(dead_code)]
 mod serialize;
 mod session;
 mod supervisor;
