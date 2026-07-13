@@ -1,6 +1,6 @@
 # Commands
 
-`fleetcom` has two control surfaces: launch arguments select the operating mode, while keys control the dashboard and its overlays.
+Fleetcom has two control surfaces. Launch arguments select the operating mode; keys control the dashboard and its overlays.
 
 ## Invocation
 
@@ -27,7 +27,7 @@
 | `s` | Cycle grouping: by state / by directory / by custom group |
 | `m` | Tag the selected task "in use" (toggles) |
 | `g` | Assign the selected task to a group (opens the group picker) |
-| `r` | Rerun a finished task: same command, same directory, same row |
+| `r` | Rerun a finished task with the same command, directory, tag, and group |
 | `X` | Kill a running task (`TERM`, then `KILL` after 2 s), or remove a finished one |
 | `w` | Save the current tasks as a session |
 | `o` | Load a saved session |
@@ -56,7 +56,7 @@ While attached, `Ctrl-\` returns to the dashboard. Every other key, including `C
 
 #### Shift+Enter, paste, and the wheel
 
-Three inputs are richer than a keypress, and each is routed by state rather than forwarded blind:
+Modified Enter, paste, and mouse input require state-dependent encoding:
 
 - Shift+Enter and Alt+Enter are sent as `ESC CR`, which is distinct from plain Enter. Shift requires a terminal that reports modified keys; terminals that do not report it send plain `CR`.
 - Paste travels as one message. Bracketed-paste-aware children receive paste markers with embedded terminators removed; other children receive line endings as `CR`. Fleetcom text fields strip control characters.
@@ -72,7 +72,7 @@ Tasks retain 2,000 lines of scrollback. While attached to an inline child, wheel
 
 #### Rerun
 
-`r` re-executes a *finished* task's command using the same command string and directory, under the environment of the client requesting the rerun (launch context always belongs to whoever asks for the launch). The task retains its ID, `◆` tag, group, and list position; its clock and screen reset. On a running task, `r` is a no-op because rerunning would first require a destructive kill. Rerun also works inside peek, which keeps the result visible while starting the next run.
+`r` re-executes a *finished* task with the same command and directory, using the environment of the client that requested the rerun. The task retains its ID, `◆` tag, group, and spawn order; its clock and screen reset. Because lifecycle participates in sorting, the task can move to another section when it starts running again. On a running task, `r` is a no-op because rerunning would require a destructive kill first. The same key works inside peek, keeping the task visible while the next run starts.
 
 #### Detach vs. quit
 
@@ -84,19 +84,19 @@ Tasks retain 2,000 lines of scrollback. While attached to an inline child, wheel
 
 - By state: In use / Running / Completed.
 - By dir: one section per working directory; the invocation directory first, the rest alphabetical.
-- By custom group: one section per group name, sorted by name, with Unassigned last. Unassigned is the triage inbox — fresh spawns land there unless they inherit a group (below) — and the section exists only while an ungrouped task does.
+- By custom group: one section per group name, sorted by name, with Unassigned last. Fresh spawns remain unassigned unless they inherit a group, and the Unassigned section exists only while it has a member.
 
-Groups are daemon state on the task itself: an assignment survives client detach and rerun (`r`), and switching grouping modes never touches it. `g` reassigns the selected task through the [group picker](#the-g-group-picker).
+Groups belong to task state: an assignment survives client detach and rerun (`r`), and switching grouping modes does not modify it. `g` reassigns the selected task through the [group picker](#the-g-group-picker).
 
-`m` toggles the "in use" tag on the selected task; tagged tasks are marked `◆`, so the handful you're actively steering stay reachable as the list grows. In state mode they form the In use section at the top. In custom mode a tag floats the task to the top of its group rather than ejecting it into a global section: within a group, tagged tasks sort first, then running, then completed, and within each of those, tasks cluster by directory, then spawn order.
+`m` toggles the "in use" tag and marks the task with `◆`. In state mode, tagged tasks form the In use section at the top. In custom mode, a tag moves the task to the top of its existing group rather than creating a global section. Within each group, the order is tagged, running, completed; each bucket then sorts by directory and spawn order.
 
-In custom mode — and only there — a new command inherits the selected task's group, through both `n` and the `@` picker. The spawn prompt shows the destination as `❯ dir ▸ group ▸ command`, each segment present only when it applies: the dir segment for a non-default directory, the group segment when a group will be inherited. State- and dir-mode spawns start unassigned.
+In custom mode only, a new command inherits the selected task's group, through both `n` and the `@` picker. The spawn prompt shows the destination as `❯ dir ▸ group ▸ command`, each segment present only when it applies: the dir segment for a non-default directory, the group segment when a group will be inherited. State- and dir-mode spawns start unassigned.
 
 ## The `@` directory picker
 
-`@` opens a bottom panel: a typed-path field, plus the directories that match it. There are three kinds of row, and `Enter` does the right thing for each:
+`@` opens a bottom panel containing a path field and its matching directories. `Enter` depends on the selected row type:
 
-- Current directory: run the command right here (`Enter`).
+- Current directory: run the command in that directory (`Enter`).
 - Recent directories: ones you've launched in before; `Enter` runs there, `Tab`/`→` browses into them.
 - Subdirectories of the current path: `Enter` or `Tab`/`→` descends into one.
 
@@ -114,7 +114,7 @@ Typing filters the rows; `Backspace` climbs the typed path; `↑`/`↓` move the
 
 `↑`/`↓` move the highlight; `Esc` cancels without changing anything.
 
-The daemon normalizes every group name it receives, whether from the picker or a [session](sessions.md) file: control characters are stripped, surrounding whitespace is trimmed, and the result is capped at 64 characters. A name that normalizes to nothing, or to the literal `Unassigned`, means "no group" — the reserved section name can never collide with a group of your own. Case is preserved and significant: `unassigned` is a legal group name.
+The daemon normalizes every group name received from the picker or a [session](sessions.md) file. It removes control characters, trims surrounding whitespace, and caps the result at 64 characters. An empty result or the exact name `Unassigned` means no group, preventing a user-defined name from colliding with the reserved section. Comparison remains case-sensitive, so `unassigned` is a valid group name.
 
 ## Peek
 
@@ -124,6 +124,6 @@ A centered box over the dashboard showing the selected task's live screen (the l
 
 The task owns the terminal, and its status bar reads `[attached] <command>    Ctrl-\ background`. `Ctrl-\` returns to the dashboard; every other key (control chords included) goes to the child.
 
-## When the daemon drops
+## Connection loss
 
-If the daemon connection is lost, the client clears the task list because it can no longer verify that state. `r` reconnects in daemon-backed mode; `q` quits. A `--foreground` core has no external process to reconnect to, so only quit is available.
+If the daemon connection closes, the client clears the task list because it can no longer verify the snapshot. In daemon-backed mode, `r` reconnects and `q` quits. A `--foreground` core has no external process to reconnect to, so only quit remains available.

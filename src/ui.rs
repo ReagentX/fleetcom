@@ -104,10 +104,7 @@ fn render_dashboard(out: &mut impl Write, app: &App) -> io::Result<()> {
         }
         _ => String::new(),
     };
-    // Header: bold counts, the grouping-mode strip (active mode bold, the
-    // rest dim), bold tags. `pad` on the joined plain text decides truncation
-    // and padding exactly as it did when the header was one string; the
-    // segment walk below only re-styles its output.
+    // Build and pad the complete header before styling each intensity run.
     let prefix = format!("  fleetcom   {running} running · {idle} idle · {done} done      by ");
     let suffix = format!("{mode_tag}{scroll_tag}");
     let segs = header_segments(&prefix, app.group_mode, &suffix);
@@ -124,9 +121,7 @@ fn render_dashboard(out: &mut impl Write, app: &App) -> io::Result<()> {
         if piece.is_empty() {
             break; // ran off the truncated end; attributes are already reset
         }
-        // One intensity per run, reset between runs: Bold and Dim are never
-        // stacked, because terminals disagree on which competing intensity
-        // attribute wins.
+        // Reset between runs so Bold and Dim are not stacked.
         let attr = match intensity {
             Intensity::Bold => Attribute::Bold,
             Intensity::Dim => Attribute::Dim,
@@ -226,17 +221,13 @@ fn cmdline(app: &App) -> Option<String> {
     }
 }
 
-/// The `❯` command line, prefixed with the spawn destination: the target dir
-/// when it isn't the default invocation dir (the `@` flow), then the group a
-/// Custom-mode spawn inherits.
+/// Render the `❯` command line with optional directory and group destinations.
 fn spawn_prompt(app: &App) -> String {
     let dir = (app.spawn_cwd != app.invocation_dir).then(|| app.dir_label(&app.spawn_cwd));
     prompt_line(dir.as_deref(), app.spawn_group.as_deref(), &app.input)
 }
 
 /// Assemble the spawn prompt from its optional `▸` destination segments.
-/// Absent segments vanish whole — separator included — so the no-group
-/// prompt stays char-identical to the pre-group one.
 fn prompt_line(dir: Option<&str>, group: Option<&str>, input: &str) -> String {
     let mut line = String::from("  ❯ ");
     for seg in [dir, group].into_iter().flatten() {
@@ -247,20 +238,17 @@ fn prompt_line(dir: Option<&str>, group: Option<&str>, input: &str) -> String {
     line
 }
 
-/// Per-run intensity for the header line. Bold and Dim are emitted as
-/// separate runs with a reset between them, never combined on one run.
+/// Header intensity for one output run. Each run emits Bold or Dim, followed
+/// by a reset, so the attributes never compete.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Intensity {
     Bold,
     Dim,
 }
 
-/// The header as (text, intensity) runs: bold prefix, the mode strip with
-/// only the active mode bold, bold suffix. Pure so the strip's assembly is
-/// testable without a terminal.
+/// Split the header into styled runs, emphasizing only the active mode.
 fn header_segments(prefix: &str, active: GroupMode, suffix: &str) -> Vec<(String, Intensity)> {
-    // The strip is `GroupMode::next()`'s cycle laid flat starting at State,
-    // so `s` walks it left to right and wraps.
+    // Keep the displayed order aligned with the grouping cycle.
     const STRIP: [GroupMode; 3] = [GroupMode::State, GroupMode::Dir, GroupMode::Custom];
     let mut segs = vec![(prefix.to_string(), Intensity::Bold)];
     for (i, m) in STRIP.iter().enumerate() {
@@ -439,10 +427,9 @@ fn render_pickdir(out: &mut impl Write, app: &App) -> io::Result<()> {
     Ok(())
 }
 
-/// The `g` picker: a bottom panel over the dashboard, structured like the
-/// `@` picker. A typed group-name input plus the matching fleet groups,
-/// `group_sel` highlighted; row 0 always offers Unassigned (clear), so the
-/// list is never empty.
+/// Render the `g` picker as a bottom panel over the dashboard. It contains the
+/// typed name and matching groups, with `group_sel` highlighted. Row 0 always
+/// provides Unassigned, so the list cannot be empty.
 fn render_pickgroup(out: &mut impl Write, app: &App) -> io::Result<()> {
     let cols = app.cols as usize;
     let rows = app.rows;
@@ -483,7 +470,7 @@ fn render_pickgroup(out: &mut impl Write, app: &App) -> io::Result<()> {
         }
     }
 
-    // Hint reflects what Enter does: create when the typed text stands alone
+    // Hint reflects what Enter does: create when the typed text matches nothing
     // (nothing matched), otherwise act on the highlighted row.
     let action = if !app.group_input.is_empty() && total < 2 {
         "enter create"
@@ -650,9 +637,7 @@ fn render_attached(out: &mut impl Write, app: &App) -> io::Result<()> {
 mod tests {
     use super::*;
 
-    /// The four prompt shapes. The two no-group forms are pinned to the exact
-    /// pre-group strings: with no group set the prompt must not have changed
-    /// by a single char.
+    /// Directory and group destinations appear only when present.
     #[test]
     fn spawn_prompt_decoration_shapes() {
         assert_eq!(prompt_line(None, None, "cargo test"), "  ❯ cargo test");

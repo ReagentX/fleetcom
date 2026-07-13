@@ -7,26 +7,15 @@ use std::{
     path::{Path, PathBuf},
 };
 
-/// One recipe member: a command plus its optional workstream group.
-///
-/// Two serialized forms: `group: None` writes the command as a plain JSON
-/// string — exactly the pre-group format — and `group: Some` writes
-/// `{"cmd": ..., "group": ...}`. The compat contract:
-///
-/// - old files (string members only) parse unchanged;
-/// - a config with no groups writes a file byte-identical to the pre-group
-///   format;
-/// - an *older* fleetcom reading a *new* grouped file silently drops the
-///   object-form members — its parser keeps only string members — so the
-///   downgrade loses those commands entirely, not merely their groups. That
-///   lossy path is accepted and documented here, not fixed.
+/// One recipe entry. Ungrouped commands serialize as strings; grouped commands
+/// serialize as `{"cmd", "group"}` objects.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionEntry {
     pub cmd: String,
     pub group: Option<String>,
 }
 
-/// Session recipe mapping directories to ordered commands.
+/// Session recipe mapping directories to ordered entries.
 pub type SessionConfig = BTreeMap<String, Vec<SessionEntry>>;
 
 /// Characters replaced with `_` in session filenames.
@@ -61,8 +50,7 @@ fn to_json(cfg: &SessionConfig) -> String {
         let mut arr = jzon::JsonValue::new_array();
         for e in entries {
             let member = match &e.group {
-                // A plain string, not `{"cmd": ...}`: this arm is what keeps
-                // group-free configs byte-identical to the pre-group format.
+                // Ungrouped entries use the compact string form.
                 None => jzon::JsonValue::from(e.cmd.as_str()),
                 Some(g) => {
                     let mut m = jzon::JsonValue::new_object();
@@ -82,9 +70,7 @@ fn from_json(text: &str) -> io::Result<SessionConfig> {
     let parsed = jzon::parse(text).map_err(|e| io::Error::other(e.to_string()))?;
     let mut cfg = SessionConfig::new();
     for (dir, val) in parsed.entries() {
-        // Same tolerance as the string-only parser this replaces: a member
-        // that fits neither form (non-string scalar, object without a string
-        // "cmd", non-string "group") is dropped, never an error.
+        // Ignore members that match neither supported entry form.
         let entries = val
             .members()
             .filter_map(|m| {
@@ -94,8 +80,7 @@ fn from_json(text: &str) -> io::Result<SessionConfig> {
                         group: None,
                     });
                 }
-                // Indexing a non-object yields Null, so `as_str()?` drops
-                // every malformed member through the same hole.
+                // Indexing a non-object yields Null, so malformed members drop here.
                 let cmd = m["cmd"].as_str()?.to_string();
                 let group = match &m["group"] {
                     g if g.is_null() => None,
@@ -180,7 +165,7 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
-    /// Both member forms coexist in one dir array and survive a round trip.
+    /// Mixed string and object entries survive one serialization round trip.
     #[test]
     fn round_trips_mixed_grouped_and_ungrouped_entries() {
         let dir = temp("mixed");
@@ -195,16 +180,14 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
-    /// A pre-group file (string members only) parses into all-`None` groups.
+    /// String members parse as ungrouped entries.
     #[test]
     fn parses_the_pre_group_string_only_format() {
         let cfg = from_json(r#"{"~/proj": ["cargo test", "vim"]}"#).unwrap();
         assert_eq!(cfg["~/proj"], vec![e("cargo test"), e("vim")]);
     }
 
-    /// The byte-identity half of the compat contract: a group-free config
-    /// must serialize with no object members, pinned to the exact `pretty(2)`
-    /// bytes the pre-group `to_json` produced.
+    /// A group-free config serializes using only string members.
     #[test]
     fn group_free_config_writes_the_pre_group_bytes() {
         let mut cfg = SessionConfig::new();
@@ -215,8 +198,7 @@ mod tests {
         assert_eq!(to_json(&cfg), expected);
     }
 
-    /// Malformed members drop through the same `filter_map` hole as the old
-    /// parser's non-string members: no error, no partial entry.
+    /// Malformed members are omitted rather than decoded into partial entries.
     #[test]
     fn malformed_object_members_drop_without_error() {
         let cfg = from_json(

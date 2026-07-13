@@ -80,10 +80,7 @@ impl GroupMode {
         }
     }
 
-    /// The next mode in the cycle: State → Dir → Custom → State. Single source
-    /// of truth for the order — the header's mode strip (rendered in a later
-    /// phase) and the `s` key handler both derive from it, so they can never
-    /// disagree.
+    /// Advance through State → Dir → Custom → State.
     pub fn next(self) -> GroupMode {
         match self {
             GroupMode::State => GroupMode::Dir,
@@ -111,10 +108,8 @@ pub struct DirCand {
     pub kind: DirKind,
 }
 
-/// A group offered in the `g` picker. `group` is what Enter sends: `None` on
-/// the fixed Unassigned row (row 0), the exact stored name otherwise. The
-/// label is display-only — it may carry the "(current)" marker — so it is
-/// never the wire value.
+/// One `g`-picker row. Enter sends `group`; `label` may contain display-only
+/// state such as "(current)".
 pub struct GroupCand {
     pub label: String,
     pub group: Option<String>,
@@ -150,10 +145,8 @@ pub struct App {
     /// Directory a spawned command runs in. Set to `invocation_dir` for the `n`
     /// flow, or to the picked directory for the `@` flow.
     pub spawn_cwd: PathBuf,
-    /// Group a spawned task lands in: the selected task's group, captured at
-    /// spawn-mode entry, but only when the dashboard is grouped by Custom —
-    /// inheritance follows the visible structure, so State/Dir spawns stay
-    /// unassigned (`None`).
+    /// Group assigned to the next spawn. Custom mode snapshots the selected
+    /// task's group; State and Dir modes leave the spawn unassigned.
     pub spawn_group: Option<String>,
     /// Id of the attached task, if any: by id (not index) so it survives the
     /// task list changing underneath it.
@@ -175,9 +168,7 @@ pub struct App {
     pub group_input: String,
     pub group_candidates: Vec<GroupCand>,
     pub group_sel: usize,
-    /// Task the open picker reassigns, pinned by id on entry: selection is
-    /// re-resolved every tick, so a task exiting mid-pick could otherwise
-    /// retarget the `SetGroup` at whatever the cursor fell back to.
+    /// Id of the task being reassigned by the open group picker.
     group_target: Option<u64>,
     // Load-session picker state.
     pub session_names: Vec<String>,
@@ -426,20 +417,12 @@ impl App {
                     }
                     GroupMode::Custom => match &v.group {
                         Some(g) => (0, g.clone()),
-                        // Unassigned sorts *last*, deliberately inverting Dir
-                        // mode's invocation-dir-first rule: Unassigned is the
-                        // triage inbox — every fresh spawn lands there, and
-                        // ranking it first would churn the curated top of the
-                        // list on every spawn.
+                        // Named groups sort before Unassigned.
                         None => (1, "Unassigned".to_string()),
                     },
                 };
-                // The dir label sits after `bucket` (running/completed stays
-                // the primary order within a section) and before `id`, so a
-                // section spanning subdirectories clusters by dir before
-                // falling back to spawn order. In Dir mode it is a no-op (the
-                // section label already pins the dir); in State mode it
-                // clusters same-dir tasks within each state bucket.
+                // Within each section, sort by tag/lifecycle bucket, directory,
+                // then task id.
                 (rank, label, bucket(v), self.dir_label(&v.cwd), v.id, i)
             })
             .collect();
@@ -739,11 +722,7 @@ impl App {
 
     // --- `g` group picker -------------------------------------------------------
 
-    /// The group a fresh spawn inherits: the selected task's, but only when
-    /// the dashboard is grouped by Custom — inheritance follows the visible
-    /// structure, so State/Dir spawns stay unassigned. Callers snapshot this
-    /// at spawn-mode entry (`n`, and the `@` picker's handoff), so a views
-    /// reorder mid-typing cannot retarget it.
+    /// Resolve spawn inheritance from the selected task in Custom mode.
     fn inherited_group(&self) -> Option<String> {
         if self.group_mode != GroupMode::Custom {
             return None;
@@ -762,13 +741,10 @@ impl App {
         }
     }
 
-    /// Recompute picker rows: the fixed Unassigned row first (row 0, "clear"),
-    /// then the fleet's distinct group names matching the typed fragment —
-    /// byte-sorted, the Custom section order. The target's current group is
-    /// labeled "(current)".
+    /// Rebuild the picker as Unassigned followed by distinct prefix matches in
+    /// byte order.
     fn refresh_group_candidates(&mut self) {
-        // Marking follows the picker's pinned target, not the live selection:
-        // the cursor can be re-resolved mid-pick, the target cannot.
+        // Mark the pinned target's group even if dashboard selection changes.
         let current = self
             .group_target
             .and_then(|id| self.views.iter().find(|v| v.id == id))
@@ -786,7 +762,7 @@ impl App {
             group: None,
         }];
 
-        // Same matching rule as the dir picker: case-insensitive prefix.
+        // Group names match by case-insensitive prefix.
         let needle = self.group_input.to_lowercase();
         let mut names: Vec<&String> = self
             .views
@@ -803,8 +779,7 @@ impl App {
             });
         }
 
-        // Nothing typed → keep the Unassigned row selected (row 0). Filtering
-        // → jump to the first match so Enter assigns it directly.
+        // Empty input selects Unassigned; matched input selects the first group.
         self.group_sel = if self.group_input.is_empty() || cands.len() < 2 {
             0
         } else {
@@ -813,7 +788,7 @@ impl App {
         self.group_candidates = cands;
     }
 
-    /// Drop picker state and return to the dashboard.
+    /// Clear the group-picker state and return to the dashboard.
     fn close_group_picker(&mut self) {
         self.group_input.clear();
         self.group_candidates.clear();
@@ -1016,11 +991,8 @@ impl App {
                 }
             }
             KeyCode::Enter => {
-                // The `@` picker's disambiguation rule: Enter acts on the
-                // highlighted row; the typed text stands alone only when
-                // nothing matched (just the Unassigned row is left), and then
-                // it names a new group. Sent exactly as typed — normalization
-                // has one owner, the daemon.
+                // Enter assigns the highlighted group, or creates the typed
+                // group when no existing name matches.
                 let group = if !self.group_input.is_empty() && self.group_candidates.len() < 2 {
                     Some(self.group_input.clone())
                 } else {
@@ -1477,8 +1449,7 @@ mod tests {
             });
         }
 
-        /// Section labels paired with member ids: what the grouping tests
-        /// assert against, since `sections()` hands back `views` indices.
+        /// Return section labels with task ids instead of `views` indices.
         fn section_ids(&self) -> Vec<(String, Vec<u64>)> {
             self.sections()
                 .into_iter()
@@ -1534,7 +1505,7 @@ mod tests {
         assert_eq!(s[1].0, "/tmp");
     }
 
-    /// `next()` owns the mode cycle; the `s` key just applies it.
+    /// `s` cycles through all grouping modes.
     #[test]
     fn group_mode_cycles_state_dir_custom() {
         assert_eq!(GroupMode::State.next(), GroupMode::Dir);
@@ -1549,11 +1520,9 @@ mod tests {
         }
     }
 
-    /// Custom mode: one section per group name, alphabetical, with the
-    /// Unassigned inbox last — after every named group, not first like Dir
-    /// mode's invocation dir.
+    /// Custom mode sorts named sections alphabetically and Unassigned last.
     #[test]
-    fn custom_mode_groups_by_workstream_with_unassigned_last() {
+    fn custom_mode_groups_by_name_with_unassigned_last() {
         let mut app = App::new_local(30, 100);
         let inv = app.invocation_dir.clone();
         app.spawn_grouped("sleep 5", inv.clone(), "beta"); // id 1
@@ -1572,9 +1541,7 @@ mod tests {
         );
     }
 
-    /// The Unassigned section exists only when an ungrouped task does: no
-    /// placeholder when the fleet is fully curated, and no phantom named
-    /// groups when nothing is.
+    /// Custom mode does not emit empty group sections.
     #[test]
     fn custom_mode_unassigned_tracks_membership() {
         let mut app = App::new_local(30, 100);
@@ -1592,9 +1559,7 @@ mod tests {
         assert_eq!(app.section_ids(), vec![("Unassigned".to_string(), vec![1])]);
     }
 
-    /// In Custom mode a tag reorders *within* the task's group (the bucket
-    /// component still sorts ahead of id): it must not eject the task into a
-    /// global "In use" section, which only State mode has.
+    /// In Custom mode, tagged tasks sort first within their existing group.
     #[test]
     fn custom_mode_tag_floats_within_group() {
         let mut app = App::new_local(30, 100);
@@ -1614,9 +1579,7 @@ mod tests {
         );
     }
 
-    /// Reassigning a task's group reorders the list; the id-bound selection
-    /// must ride along, exactly like the tag reorder in
-    /// `selection_follows_task_across_reorder`.
+    /// Group reassignment can reorder sections without changing the selected id.
     #[test]
     fn custom_mode_selection_survives_group_move() {
         let mut app = App::new_local(30, 100);
@@ -1628,7 +1591,7 @@ mod tests {
         app.resolve_selection();
         assert_eq!(app.selected_id, Some(1));
 
-        // Move id 1 from "alpha" (first section) to "zeta" (now last).
+        // Move id 1 from the first section to the last.
         app.transport.send(Command::SetGroup {
             id: 1,
             group: Some("zeta".to_string()),
@@ -1639,14 +1602,12 @@ mod tests {
             vec![("beta".to_string(), vec![2]), ("zeta".to_string(), vec![1]),]
         );
 
-        // Still on id 1, even though it is now the last row.
+        // Selection remains on id 1 in its new section.
         assert_eq!(app.selected_id, Some(1));
         assert_eq!(app.views[app.selected_task().unwrap()].id, 1);
     }
 
-    /// Within one group the dir component clusters tasks by cwd, and within
-    /// one dir the id component keeps spawn order — so a group spanning
-    /// subdirectories reads as dir-sized runs, not an id interleave.
+    /// Within a group, tasks cluster by directory and then by spawn order.
     #[test]
     fn custom_mode_clusters_by_dir_within_group() {
         let mut app = App::new_local(30, 100);
@@ -2295,9 +2256,8 @@ mod tests {
         assert_eq!(app.group_target, Some(1));
     }
 
-    /// Candidates are the fleet's distinct group names behind the fixed
-    /// Unassigned row: byte-sorted, deduped, and the target's current group
-    /// carries the "(current)" label.
+    /// Picker candidates are distinct byte-sorted groups after Unassigned, with
+    /// the target's assignment marked "(current)".
     #[test]
     fn group_candidates_are_distinct_sorted_and_marked() {
         let mut app = App::new_local(30, 100);
@@ -2331,8 +2291,8 @@ mod tests {
         assert_eq!(app.group_candidates[0].label, "Unassigned (current)");
     }
 
-    /// Typing filters with the dir picker's rule (case-insensitive prefix)
-    /// and jumps the selection to the first match; backspace widens again.
+    /// Typing applies a case-insensitive prefix filter and selects the first
+    /// match; Backspace expands the candidate set again.
     #[test]
     fn group_filter_narrows_and_preselects_the_first_match() {
         let mut app = App::new_local(30, 100);
@@ -2365,8 +2325,7 @@ mod tests {
         assert_eq!(app.group_candidates.len(), 2, "backspace re-widens");
     }
 
-    /// Enter on a highlighted candidate sends its stored name: the SetGroup
-    /// round-trips through the core into the next snapshot.
+    /// Enter assigns the highlighted candidate to the target task.
     #[test]
     fn group_enter_on_a_candidate_assigns_it() {
         let mut app = App::new_local(30, 100);
@@ -2385,8 +2344,7 @@ mod tests {
         assert_eq!(v.group.as_deref(), Some("alpha"));
     }
 
-    /// Enter when the typed text matches no candidate creates that group,
-    /// sent exactly as typed.
+    /// Enter creates the typed group when no candidate matches.
     #[test]
     fn group_enter_on_novel_text_creates_the_group() {
         let mut app = App::new_local(30, 100);
@@ -2405,8 +2363,7 @@ mod tests {
         assert_eq!(v.group.as_deref(), Some("gamma"));
     }
 
-    /// Enter on the empty input is the clear gesture: the Unassigned row is
-    /// highlighted and the task goes back to no group.
+    /// Empty input selects Unassigned, so Enter clears the target's group.
     #[test]
     fn group_enter_on_empty_input_clears_to_unassigned() {
         let mut app = App::new_local(30, 100);
@@ -2422,8 +2379,7 @@ mod tests {
         assert_eq!(v.group, None);
     }
 
-    /// Esc cancels without sending: the group survives, the picker state is
-    /// dropped.
+    /// Esc closes the picker without changing the target task.
     #[test]
     fn group_esc_cancels_without_sending() {
         let mut app = App::new_local(30, 100);
@@ -2446,8 +2402,7 @@ mod tests {
 
     // --- spawn group inheritance -------------------------------------------
 
-    /// In Custom mode `n` snapshots the selected task's group and the spawn
-    /// carries it.
+    /// In Custom mode, `n` assigns the selected task's group to the spawn.
     #[test]
     fn custom_mode_spawn_inherits_the_selected_group() {
         let mut app = App::new_local(30, 100);
@@ -2474,7 +2429,7 @@ mod tests {
         );
     }
 
-    /// The `@` flow inherits too, captured at the PickDir→Spawn handoff.
+    /// In Custom mode, the `@` flow snapshots the group after directory selection.
     #[test]
     fn dir_picker_handoff_inherits_the_selected_group_in_custom_mode() {
         let mut app = App::new_local(30, 100);
@@ -2492,8 +2447,7 @@ mod tests {
         assert_eq!(app.spawn_group.as_deref(), Some("alpha"));
     }
 
-    /// State and Dir modes never inherit: entering spawn mode there resets
-    /// any stale capture and the spawn goes out unassigned.
+    /// State and Dir mode spawns are unassigned.
     #[test]
     fn state_and_dir_mode_spawns_stay_unassigned() {
         let mut app = App::new_local(30, 100);

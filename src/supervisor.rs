@@ -48,22 +48,13 @@ const MAX_TASKS: usize = 256;
 /// wedged job from making `Q` feel broken.
 const KILL_GRACE: Duration = Duration::from_secs(2);
 
-/// Group-name length cap, in chars after the trim. Display sanity for a
-/// section header, not validation: over-long names truncate, never refuse.
+/// Maximum stored group-name length in Unicode scalar values after normalization.
 const MAX_GROUP_CHARS: usize = 64;
 
-/// Normalize an inbound group name at the command boundary (`SetGroup` and
-/// `Spawn`), so every stored group is already display-safe. Control
-/// characters are stripped first: group names render as dashboard section
-/// headers, so raw C0/C1 bytes are a terminal-escape injection surface. The
-/// result is then trimmed and capped at [`MAX_GROUP_CHARS`] chars (chars, not
-/// bytes: the cap never splits a character). Two results map to `None`: the
-/// empty string, and the exact string "Unassigned". Mapping beats refusing
-/// because "no group" is precisely what that name claims, and it keeps a
-/// user-created section from colliding with the real Unassigned bucket.
-/// Everything else is byte-preserved. No case folding: "unassigned" is a
-/// legal group name, and distinct names must never collapse into one section
-/// (the rule `path::abbreviate` applies to directory labels).
+/// Normalize a group assignment before storage. Remove control characters,
+/// trim surrounding whitespace, and cap the result at [`MAX_GROUP_CHARS`]
+/// characters. Empty names and the reserved `Unassigned` label map to `None`;
+/// comparison remains case-sensitive.
 fn normalize_group(name: Option<String>) -> Option<String> {
     let name = name?;
     let stripped: String = name.chars().filter(|c| !c.is_control()).collect();
@@ -192,8 +183,7 @@ impl Supervisor {
                     t.tagged = on;
                 }
             }
-            // Like `Tag`, an unknown id is a silent no-op: the task can exit
-            // between the client's keypress and this apply.
+            // Ignore assignments for tasks no longer present.
             Command::SetGroup { id, group } => {
                 if let Some(t) = self.by_id_mut(id) {
                     t.group = normalize_group(group);
@@ -468,9 +458,8 @@ impl Supervisor {
         }
     }
 
-    /// Snapshot the task set as a `{dir: [entries]}` recipe, in spawn (id)
-    /// order within each dir. Each entry carries the task's group so a
-    /// reloaded fleet keeps its sections.
+    /// Snapshot tasks as `{dir: [entries]}`. Entries preserve spawn order and
+    /// group assignments.
     fn session_config(&self) -> SessionConfig {
         let mut order: Vec<usize> = (0..self.tasks.len()).collect();
         order.sort_by_key(|&i| self.tasks[i].id);
@@ -567,9 +556,7 @@ impl Supervisor {
                     &launch.env,
                     Arc::clone(&self.waker),
                 ) {
-                    // Recipes are hand-editable on disk, so a loaded group
-                    // re-crosses the same boundary as `Spawn` instead of
-                    // trusting the file's bytes.
+                    // Normalize group names read from editable recipe files.
                     task.group = normalize_group(entry.group.clone());
                     self.next_id += 1;
                     self.tasks.push(task);
@@ -1116,38 +1103,33 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// The boundary table for `normalize_group`: controls stripped (section
-    /// headers are a terminal-escape surface), whitespace trimmed, the
-    /// 64-char cap counted after the trim and in chars, empty and the literal
-    /// "Unassigned" mapped to `None`, everything else byte-preserved.
+    /// Group normalization strips controls, trims whitespace, caps by character,
+    /// reserves `Unassigned`, and preserves case.
     #[test]
     fn group_names_normalize_at_the_boundary() {
         let n = |s: &str| normalize_group(Some(s.to_string()));
         assert_eq!(normalize_group(None), None);
-        // Controls vanish; the printable remainder survives.
+        // Controls are removed while printable text remains.
         assert_eq!(n("\x1b[31mapi\x07"), Some("[31mapi".into()));
         assert_eq!(n("  backend  "), Some("backend".into()));
-        // C0, DEL, and C1 with only whitespace between: nothing left.
+        // Control-only names become unassigned.
         assert_eq!(n(" \t \x1b \x7f \u{9b} "), None);
         assert_eq!(n(""), None);
         // The cap counts chars, not bytes: 80 two-byte chars keep exactly 64.
         assert_eq!(n(&"\u{e9}".repeat(80)), Some("\u{e9}".repeat(64)));
         // The cap applies after the trim, so padding spends none of it.
         assert_eq!(n(&format!("  {}  ", "x".repeat(64))), Some("x".repeat(64)));
-        // "Unassigned" *is* the unassigned state; a user section by that name
-        // would collide with the real bucket.
+        // The reserved section label maps to unassigned.
         assert_eq!(n("Unassigned"), None);
         assert_eq!(n("  Unassigned  "), None);
-        // Byte-exact match only: no case folding anywhere.
+        // Matching is case-sensitive.
         assert_eq!(n("unassigned"), Some("unassigned".into()));
         assert_eq!(n("UNASSIGNED"), Some("UNASSIGNED".into()));
         assert_eq!(n("Api"), Some("Api".into()));
     }
 
-    /// `SetGroup` round-trips through the snapshot: assignment shows the
-    /// normalized name, `None` clears it back to unassigned, and an unknown
-    /// id is the same silent no-op as `Tag` (the task can exit between the
-    /// client's keypress and this apply).
+    /// `SetGroup` normalizes assignments, clears with `None`, and ignores
+    /// unknown task ids.
     #[test]
     fn set_group_round_trips_and_clears() {
         let mut s = sup(24, 80);
@@ -1191,9 +1173,7 @@ mod tests {
         assert_eq!(group_of(&mut s), None);
     }
 
-    /// A spawn-time group passes the same normalization as `SetGroup` and is
-    /// present from the first snapshot: a task born into a workstream never
-    /// appears unassigned.
+    /// Spawned tasks expose their normalized initial group in the first snapshot.
     #[test]
     fn spawn_carries_a_normalized_group_from_birth() {
         let mut s = sup(24, 80);
@@ -1209,8 +1189,7 @@ mod tests {
         }
     }
 
-    /// Restart preserves `group` alongside the tag: the assignment belongs to
-    /// the task slot, not the process instance that happened to run in it.
+    /// Restart preserves the task's group and tag.
     #[test]
     fn restart_carries_the_group_over() {
         use crate::protocol::Lifecycle;
@@ -1709,8 +1688,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Groups survive the save/load cycle: reloading a curated fleet after a
-    /// daemon restart must not dump everything into Unassigned.
+    /// Saving and loading preserve group assignments.
     #[test]
     fn load_session_restores_saved_groups() {
         let dir = scratch("sess_groups");
@@ -1771,8 +1749,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A hand-edited recipe's group re-crosses the `Spawn` normalization
-    /// boundary on load: padding is trimmed rather than trusted from disk.
+    /// Loaded recipe groups are normalized before assignment.
     #[test]
     fn load_session_renormalizes_hand_edited_groups() {
         let dir = scratch("sess_norm");

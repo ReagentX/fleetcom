@@ -38,9 +38,8 @@ impl LaunchContext {
 /// command.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Command {
-    /// Run `command` under `$SHELL -c` in `cwd`. `group` is the spawn-time
-    /// workstream assignment: it carries the client's group inheritance now
-    /// and session-recipe groups later.
+    /// Run `command` under `$SHELL -c` in `cwd`; `group` is the initial
+    /// dashboard assignment.
     Spawn {
         command: String,
         cwd: PathBuf,
@@ -50,13 +49,12 @@ pub enum Command {
     Kill { id: u64 },
     /// Drop a task from the set entirely (used on already-finished tasks).
     Remove { id: u64 },
-    /// Re-run a *finished* task in place: a fresh spawn of the same command in
-    /// the same cwd, keeping the id (so selection, watch, tag, and list
-    /// position survive). Refused on a running task.
+    /// Re-run a finished task with the same id, command, cwd, tag, and group.
+    /// Running tasks reject this request.
     Restart { id: u64 },
     /// Set the manual "in use" tag.
     Tag { id: u64, on: bool },
-    /// Set a task's workstream group; `None` clears it back to unassigned.
+    /// Set a task's group; `None` clears it back to unassigned.
     SetGroup { id: u64, group: Option<String> },
     /// Client terminal resized: `rows`×`cols` is the PTY *content* size. The
     /// client has already subtracted the row it reserves for its status bar.
@@ -83,7 +81,7 @@ pub enum Command {
     },
     /// Move a task's scrollback viewport.
     Scrollback { id: u64, action: ScrollAction },
-    /// Write the current task set as a named `{dir: [cmds]}` recipe.
+    /// Write the current task set as a named session recipe.
     SaveSession { name: String },
     /// Spawn every command in a named recipe, each in its (existing) dir.
     LoadSession { name: String },
@@ -159,7 +157,7 @@ pub struct TaskView {
     pub command: String,
     pub cwd: PathBuf,
     pub tagged: bool,
-    /// Workstream group; `None` = unassigned.
+    /// Dashboard group; `None` means unassigned.
     pub group: Option<String>,
     pub lifecycle: Lifecycle,
     pub preview: String,
@@ -311,7 +309,7 @@ pub fn encode_command(cmd: &Command) -> (u8, Vec<u8>) {
         Command::SetGroup { id, group } => {
             let _ = o.insert("t", "group");
             let _ = o.insert("id", *id);
-            // Omitted when clearing: a missing and a null "g" decode identically.
+            // Absence of `g` encodes an unassigned task.
             if let Some(g) = group {
                 let _ = o.insert("g", g.as_str());
             }
@@ -406,8 +404,7 @@ pub fn decode_command(kind: u8, payload: &[u8]) -> Option<Command> {
         "spawn" => Command::Spawn {
             command: v["command"].as_str()?.to_string(),
             cwd: path_from_b64(&v["cwd"])?,
-            // Missing or null both mean unassigned: the encoder omits the key
-            // for `None`.
+            // Missing and null group fields both decode as unassigned.
             group: if v["group"].is_null() {
                 None
             } else {
@@ -518,8 +515,7 @@ pub fn encode_event(ev: &Event) -> (u8, Vec<u8>) {
                 let _ = o.insert("command", tv.command.as_str());
                 let _ = o.insert("cwd", path_b64(&tv.cwd));
                 let _ = o.insert("tagged", tv.tagged);
-                // Omitted when unassigned: an ungrouped task's frame stays
-                // byte-identical to the pre-group encoding.
+                // The group field is present only for assigned tasks.
                 if let Some(g) = &tv.group {
                     let _ = o.insert("group", g.as_str());
                 }
@@ -593,8 +589,7 @@ pub fn decode_event(kind: u8, payload: &[u8]) -> Option<Event> {
                             command: tv["command"].as_str()?.to_string(),
                             cwd: path_from_b64(&tv["cwd"])?,
                             tagged: tv["tagged"].as_bool()?,
-                            // Missing or null both mean unassigned: the
-                            // encoder omits the key for `None`.
+                            // Missing and null group fields both mean unassigned.
                             group: if tv["group"].is_null() {
                                 None
                             } else {
@@ -947,8 +942,8 @@ mod tests {
         assert_eq!(decode_event(k, &p), Some(status));
     }
 
-    /// `SetGroup` wire form: `"g"` is present exactly when a group is set; a
-    /// missing or explicit-null `"g"` decodes as a clear.
+    /// `SetGroup` emits `"g"` only for an assignment. A missing or null `"g"`
+    /// decodes as a clear.
     #[test]
     fn set_group_wire_form() {
         let (k, p) = encode_command(&Command::SetGroup {
@@ -974,19 +969,17 @@ mod tests {
         );
     }
 
-    /// A tasks frame carries `"group"` only for grouped tasks: an ungrouped
-    /// task's frame is byte-identical to the pre-group encoding, and a frame
-    /// without the key decodes to `None`.
+    /// Task frames omit `"group"` when unassigned; an absent key decodes as
+    /// `None`.
     #[test]
     fn tasks_frame_group_key_is_optional() {
-        // The pre-group frame shape, verbatim ("Lw==" is "/").
+        // "Lw==" is the base64 encoding of "/".
         let ungrouped = r#"{"t":"tasks","tasks":[{"id":1,"command":"x","cwd":"Lw==","tagged":false,"life":"ok","preview":"","started_ms":0}]}"#;
         match decode_event(KIND_CONTROL, ungrouped.as_bytes()) {
             Some(Event::Tasks(v)) => assert_eq!(v[0].group, None),
             other => panic!("expected tasks event, got {other:?}"),
         }
-        // Encoding the same task must reproduce that frame byte-for-byte: an
-        // ungrouped task never grows a "group" key.
+        // Encoding an unassigned task omits the group key.
         let (_, p) = encode_event(&Event::Tasks(vec![TaskView {
             id: 1,
             command: "x".into(),

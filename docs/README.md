@@ -1,14 +1,14 @@
 # fleetcom Documentation
 
-`fleetcom` splits durable session recipes from ephemeral daemon state. This document covers those paths, installation from source, and a complete first run.
+Fleetcom keeps durable session recipes separate from ephemeral daemon state. This guide documents both storage paths, the build workflow, and a complete first run.
 
 ## Index
 
-- [Commands](commands.md): every key and launch flag, with the mechanics behind them
-- [Sessions](sessions.md): the `{directory: [commands]}` recipe format and where it lives
+- [Commands](commands.md): every key and launch flag, including the routing mechanics
+- [Sessions](sessions.md): the task recipe format and where it lives
 - [Directory & Environment Configuration](#directory--environment-configuration): the socket, the lock, and the session paths
 - [Sample Usage Session](#sample-usage-session): a first run, start to finish
-- [Notes & Caveats](#notes--caveats): the sharp edges
+- [Notes & Caveats](#notes--caveats): process and protocol boundaries
 
 ## Installation from source
 
@@ -22,13 +22,11 @@ From a repository clone:
 
 ## Directory & Environment Configuration
 
-`fleetcom` writes two kinds of state in separate locations. Runtime state
-contains the ephemeral daemon socket and lock. Config state contains durable
-session recipes.
+Fleetcom separates runtime state from configuration. Runtime state contains the daemon socket and lock; configuration contains durable session recipes.
 
 ### Runtime directory (socket + lock)
 
-The runtime directory holds `default.sock`, the mode-`0600` client↔daemon socket, and `daemon.lock`, the single-instance `flock`. The daemon writes its PID into the lock file, which is how `--kill` finds it. The directory is created with mode `0700`; an existing path must be a real directory owned by the current user. Symlinks and directories owned by another user are rejected.
+The runtime directory holds `default.sock`, the mode-`0600` client↔daemon socket, and `daemon.lock`, the single-instance `flock`. The daemon records its PID in the lock file; `--kill` uses that PID rather than waiting for the socket. Fleetcom creates the directory with mode `0700`. An existing path must be a real directory owned by the current user, so symlinks and directories owned by another user are rejected.
 
 Resolved in this order:
 
@@ -54,9 +52,9 @@ The platform default is [`dirs::config_dir()`](https://docs.rs/dirs/latest/dirs/
 
 ## Sample Usage Session
 
-The following walkthrough moves from an empty dashboard to a saved fleet. The frames are layout sketches rather than terminal captures.
+The following walkthrough moves from an empty dashboard to a saved fleet. The frames show layout, not captured terminal output.
 
-Start it. The first `fleetcom` autostarts the daemon and opens an empty dashboard:
+Run `fleetcom`. The first invocation starts the daemon and opens an empty dashboard:
 
 ```text
   fleetcom   0 running · 0 idle · 0 done      by state · dir · custom
@@ -106,7 +104,7 @@ Each row is `glyph · tag · command · latest output · age`. `Space` peeks: a 
   ✻  npm run dev              VITE v5.0  ready in 312 ms        1m
 ```
 
-`s` cycles the grouping mode — state, dir, custom — with the active mode shown bold in the header strip. In custom mode, `g` assigns the selected task to a named group. Each group is a section, sorted by name, with Unassigned last: the inbox for anything not yet filed:
+`s` cycles through state, directory, and custom grouping. The header renders the active mode in bold. In custom mode, `g` assigns the selected task to a named group. Named sections sort alphabetically; Unassigned appears last when at least one task has no group:
 
 ```text
   fleetcom   2 running · 0 idle · 0 done      by state · dir · custom
@@ -118,17 +116,17 @@ Each row is `glyph · tag · command · latest output · age`. `Space` peeks: a 
   ✻  npm run dev              VITE v5.0  ready in 312 ms        2m
 ```
 
-A command spawned in custom mode inherits the selected task's group, and the spawn prompt names the destination (`❯ api ▸ cargo run`). Assignments live in the daemon, so they survive detach and rerun. Picker mechanics are in [commands](commands.md#the-g-group-picker).
+In custom mode, a new command inherits the selected task's group. The spawn prompt makes that destination explicit (`❯ api ▸ cargo run`). Group assignments belong to task state, so detach and rerun preserve them. The [command reference](commands.md#the-g-group-picker) documents the picker mechanics.
 
 `w`, a name, and `Enter` save the fleet as a [session](sessions.md). `q` then disconnects while the daemon and both jobs continue running. A subsequent `fleetcom` invocation reconstructs the dashboard from the daemon's current task state. `Q` or `fleetcom --kill` stops the jobs (`TERM`, then `KILL` after a two-second grace period) and exits the daemon.
 
 ## Notes & Caveats
 
-- The fleet dies with the daemon. The daemon holds every task's PTY master, so daemon death of any kind closes them and the kernel hangs up each task's controlling terminal: `SIGHUP` to its process group. A clean shutdown (below) is gentler, but a crash or `SIGKILL` delivers the bare HUP with no grace. Only HUP-immune jobs (`nohup`, `trap '' HUP`) survive that: unowned and invisible to the next daemon, which starts empty. A panic while *serving a client* is contained: the connection drops, the fleet keeps running.
+- The fleet dies with the daemon. Because the daemon holds each PTY master, daemon termination closes the terminals and the kernel sends `SIGHUP` to every task's process group. A clean shutdown sends `SIGTERM` before `SIGKILL`; a crash or direct `SIGKILL` provides no grace period. HUP-immune jobs (`nohup`, `trap '' HUP`) can survive, but the next daemon neither owns nor displays them. A panic while serving one client only drops that connection.
 - Commands run through the client's non-interactive shell (`$SHELL -c`, or `/bin/sh` when `SHELL` is unset), so functions and aliases from `~/.zshrc` are unavailable.
-- Each launch uses the launching client's environment and working directory, sent once per connection during the hello handshake. Connect from a venv terminal and your spawns, reruns, and session loads all see that venv, whichever client originally autostarted the daemon. Environment is never written to disk; session files store only directories and commands.
-- Client and daemon versions must match. The handshake carries a protocol version, and the daemon refuses a mismatched client with instructions (`fleetcom --kill`, retry) instead of serving it with silently wrong semantics. The common case is a `cargo install` while an old daemon is still running. Custom grouping bumped the protocol to v7, so the first client run after that upgrade hits exactly this: a still-running v6 daemon refuses it at the handshake. Recovery is `fleetcom --kill` and a fresh start — and `--kill` kills every running job, so finish or drain the fleet before upgrading.
+- Each launch uses the launching client's environment and working directory, sent once per connection during the hello handshake. Connect from a venv terminal and your spawns, reruns, and session loads all see that venv, whichever client originally autostarted the daemon. Environment is never written to disk; session files store only directories, commands, and group assignments.
+- Client and daemon protocol versions must match. The daemon rejects a mismatch during the handshake instead of accepting semantics it cannot interpret. Recovery requires `fleetcom --kill` followed by a new client invocation; note that `--kill` also terminates every running job.
 - The daemon serves one client at a time. A second `fleetcom` prints a waiting notice, then attaches when the active client disconnects (`q`). `Ctrl-C` while waiting aborts without touching the daemon.
-- Kills are graceful-first, and the group stays reachable. `X`, `Q`, `--kill`, and daemon signals all send `SIGTERM` to the job's *process group* and escalate to `SIGKILL` only after a 2-second grace, so a `TERM` handler gets its chance to flush and exit cleanly. The exited leader is deliberately held unreaped (a zombie) until the task is removed, which keeps the group id reserved: kills and removals reach background children the job left in its group (`cmd &` never leaves the group in a non-interactive shell). A job that `setsid`s or double-forks out of the group escapes the sweep; kill that one by hand.
+- Shutdown is graceful-first. `X`, `Q`, `--kill`, and daemon signals send `SIGTERM` to the job's *process group* and escalate to `SIGKILL` after two seconds. Fleetcom holds an exited leader unreaped until task removal, which reserves the process-group ID and keeps background children signalable. A child created by `cmd &` in a non-interactive shell remains in that group. A process that calls `setsid` or double-forks out of the group escapes this sweep and must be terminated separately.
 - `--foreground` is ephemeral. It runs the core in-process with no daemon, so the jobs die when you quit and there is nothing to reattach to.
 - Signalling the daemon is a clean shutdown. `SIGTERM`/`SIGINT`/`SIGHUP` to the daemon group-kill every job, remove the socket, and exit. This is the same teardown as `Q` or `fleetcom --kill`.
