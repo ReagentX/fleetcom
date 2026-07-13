@@ -92,7 +92,7 @@ pub fn paste_bytes(bracketed: bool, content: &[u8]) -> Vec<u8> {
 /// Encode a mouse action using the child's current terminal mode. Mouse
 /// protocols determine supported actions and encoding. Without one, wheel
 /// actions become alternate-scroll arrows when the child's gate is open
-/// (alt screen with DECSET 1007, which defaults on — see
+/// (alt screen with DECSET 1007, which defaults on; see
 /// [`Emulator::alternate_scroll`]); unsupported actions return `None`.
 pub fn mouse_bytes(emu: &Emulator, kind: MouseKind, col: u16, row: u16) -> Option<Vec<u8>> {
     use crate::emulator::{MouseProtocolEncoding, MouseProtocolMode};
@@ -183,7 +183,7 @@ pub struct Task {
     /// admitters: the core thread (`queue_write`, client input) and the reader
     /// thread (`forward_probe_replies`, probe replies of a few bytes each).
     /// Each check-then-add can over-admit by at most the other's in-flight
-    /// reply — noise against the 16 MiB cap; the worker subtracts after each
+    /// reply: noise against the 16 MiB cap. The worker subtracts after each
     /// completed write.
     pending_write: Arc<AtomicUsize>,
     /// Session-leader PID, also used as the process-group ID.
@@ -488,8 +488,8 @@ impl Task {
     /// Flush an expired `?2026` synchronized update so a stalled child's
     /// buffered frame becomes visible (see [`Emulator::flush_expired_sync`]);
     /// probe replies the flushed bytes generated are forwarded like live
-    /// ones. Called from the supervisor's tick — the loop's only periodic
-    /// path — because vte re-checks its sync timeout only when bytes arrive.
+    /// ones. Called from the supervisor's tick (the loop's only periodic
+    /// path) because vte re-checks its sync timeout only when bytes arrive.
     pub fn flush_expired_sync(&self) {
         let replies = grid(&self.parser).flush_expired_sync();
         if !replies.is_empty()
@@ -964,8 +964,8 @@ mod tests {
         let release = MouseKind::Release(MouseBtn::Left);
 
         // X10 mode: presses only. Pinned through the vt100 backend, the only
-        // one that models DECSET 9 — alacritty ignores it entirely (see
-        // `emulator::tests::x10_decset9_unmodeled_by_alacritty`) — so this
+        // one that models DECSET 9. alacritty ignores it entirely (see
+        // `emulator::tests::x10_decset9_unmodeled_by_alacritty`), so this
         // keeps `mouse_bytes`'s Press-mode gating under test.
         let mut p = Emulator::new_vt100(24, 80, 0);
         p.process(b"\x1b[?9h");
@@ -1069,9 +1069,9 @@ mod tests {
     /// A child's cursor-position probe is answered on the wire: the reply
     /// crosses the reader thread → allowlist → writer worker → PTY, and only
     /// the advertised shape arrives. The child first sends secondary DA (a
-    /// denied probe), then primary DA and DSR 6; it reads 11 bytes — exactly
+    /// denied probe), then primary DA and DSR 6; it reads 11 bytes: exactly
     /// primary DA (5) plus CPR (6). If the secondary-DA reply leaked, those
-    /// bytes would arrive first and the assertion would see `ESC[>…`.
+    /// bytes would arrive first and the assertion would see `ESC[>...`.
     #[test]
     fn probe_replies_reach_the_child_through_the_allowlist() {
         let dir = std::env::temp_dir().join(format!("fleetcom_task_probe_{}", std::process::id()));

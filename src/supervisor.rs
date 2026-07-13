@@ -28,7 +28,7 @@ type LastScreen = (u64, Vec<u8>, (u16, u16), bool, (bool, bool), usize);
 /// Ceiling for PTY dimensions accepted from a (possibly crafted) `Resize`. A 0
 /// dimension is outside alacritty's grid domain: a zero-column resize
 /// underflows `columns - 1` in its shrink path and a zero-row grid is indexed
-/// out of bounds by the first cell write — a panic in both build profiles. An
+/// out of bounds by the first cell write: a panic in both build profiles. An
 /// unbounded one (up to `u16::MAX`) would allocate a multi-billion-cell grid
 /// and OOM. Real terminals never approach this, so clamping to `[1, MAX_DIM]`
 /// is invisible in normal use and a hard stop against a malicious peer.
@@ -261,7 +261,7 @@ impl Supervisor {
         // vte re-checks its ?2026 sync timeout only when bytes arrive, so a
         // child that opens BSU and stalls would freeze its view. This tick is
         // the loop's only periodic path (the idle backstop guarantees one at
-        // least every 200 ms), so an expired sync flushes here — before the
+        // least every 200 ms), so an expired sync flushes here, before the
         // snapshot below reads the grids, letting the same tick ship it.
         for t in &self.tasks {
             t.flush_expired_sync();

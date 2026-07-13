@@ -3,8 +3,8 @@
 //! Replaced `vt100::Screen::contents_formatted` at the step-4 backend swap.
 //!
 //! Contract: replaying [`formatted`]'s bytes into a fresh terminal of the same
-//! dimensions reproduces the source's *displayed* screen — every cell's
-//! character, zero-width extras, colors, and style flags — plus the cursor's
+//! dimensions reproduces the source's *displayed* screen (every cell's
+//! character, zero-width extras, colors, and style flags) plus the cursor's
 //! position, visibility, and pending-wrap (phantom column) state. The
 //! round-trip oracle in this module's tests enforces exactly that over the
 //! recorded PTY corpus and targeted synthetic cases.
@@ -13,7 +13,7 @@
 //!
 //! Each viewport row is emitted under an absolute cursor address (CUP), never
 //! by letting output wrap at the right edge. Replay therefore cannot set
-//! `WRAPLINE` or `LEADING_WIDE_CHAR_SPACER` — wrap bookkeeping the grid keeps
+//! `WRAPLINE` or `LEADING_WIDE_CHAR_SPACER`: wrap bookkeeping the grid keeps
 //! for reflow and selection, invisible on screen. Consequence: a client
 //! copying a soft-wrapped logical line out of a replayed view gets hard
 //! newlines at row boundaries. Accepted for v1; wrap-aware emission can
@@ -27,9 +27,9 @@
 //! - Blink (SGR 5/6): alacritty stores no blink flag, so there is nothing to
 //!   serialize; both source and replay drop it identically.
 //! - Orphaned wide-char halves: ECH/DCH/ICH can strip a wide glyph's partner
-//!   cell without repairing it. No byte stream recreates a lone half — writing
+//!   cell without repairing it. No byte stream recreates a lone half: writing
 //!   the glyph would fabricate a spacer over the neighbor, or wrap at the last
-//!   column — so orphans are emitted as blanks carrying the cell's attributes.
+//!   column, so orphans are emitted as blanks carrying the cell's attributes.
 //! - A `'\t'` cell under a pending-wrap cursor: `put_tab` never sets pending
 //!   wrap, so the cursor state wins and the cell is rewritten as a styled
 //!   blank.
@@ -1117,7 +1117,7 @@ mod tests {
                     };
                 }
                 // Partial escapes: a bare ESC or an unterminated CSI swallows
-                // the following token as parameter bytes — realistic torn
+                // the following token as parameter bytes: realistic torn
                 // input, deterministic parse.
                 _ => {
                     if rng.below(2) == 0 {

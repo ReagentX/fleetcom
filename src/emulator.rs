@@ -2,7 +2,7 @@
 //! byte parsed into it goes through [`Emulator`], so the backend can change
 //! without touching call-sites. The production backend is
 //! `alacritty_terminal`; a `#[cfg(test)]` vt100 variant survives as the
-//! reference side of the differential golden suites (a dev-dependency —
+//! reference side of the differential golden suites (a dev-dependency:
 //! release builds compile it out entirely).
 
 use std::{
@@ -39,7 +39,7 @@ pub enum MouseProtocolEncoding {
 
 /// Routes the backend's `Event::PtyWrite` probe responses into a buffer. The
 /// listener fires inside `Processor::advance`, while the caller holds the
-/// emulator lock — so it only appends, never blocks; the caller drains and
+/// emulator lock, so it only appends, never blocks; the caller drains and
 /// filters after `advance` returns. Every other backend event (title,
 /// clipboard, color requests, bell) is discarded here: the default-deny probe
 /// policy starts with what never gets buffered.
@@ -83,8 +83,8 @@ impl Dimensions for GridSize {
 /// (EMULATOR_MIGRATION.md, probe policy). The advertised contract is exactly
 /// three shapes: CPR (`ESC[<row>;<col>R`), the DSR-5 ok reply (`ESC[0n`), and
 /// the primary DA response (`ESC[?<params>c`). Everything else the backend
-/// can emit — secondary DA `ESC[>…c`, kitty keyboard reports `ESC[?…u`,
-/// DECRPM `…$y`, window-size `ESC[8;…t`, and whatever a future pin adds — is
+/// can emit (secondary DA `ESC[>...c`, kitty keyboard reports `ESC[?...u`,
+/// DECRPM `...$y`, window-size `ESC[8;...t`, and whatever a future pin adds) is
 /// dropped, so a backend bump cannot silently widen what fleetcom advertises
 /// to children.
 fn allowed_probe_response(resp: &str) -> bool {
@@ -139,11 +139,11 @@ impl AlacrittyBackend {
 }
 
 /// One task's terminal emulator: parser plus grid. An enum, not a trait
-/// object, because the variant set is closed — two backends during a
+/// object, because the variant set is closed: two backends during a
 /// migration, one at ship. Promote to a trait only if a third materializes.
 pub enum Emulator {
     /// The differential-harness reference backend: the golden and
-    /// mouse-contract tests construct it, production cannot — vt100 is a
+    /// mouse-contract tests construct it; production cannot. vt100 is a
     /// dev-dependency, so the variant only compiles under `cfg(test)`.
     /// Both variants are boxed: each backend's inline state runs to
     /// kilobytes, and every task holds exactly one emulator behind an `Arc`,
@@ -208,7 +208,7 @@ impl Emulator {
     /// flushing the buffered frame into the grid; returns any allowlisted
     /// probe replies the flushed bytes generated. vte re-checks its timeout
     /// only when more bytes arrive, so a child that opens BSU and stalls
-    /// would freeze its view until then — the core's periodic tick calls this
+    /// would freeze its view until then. The core's periodic tick calls this
     /// to bound the stall. No-op while the timeout is still pending (an
     /// in-flight frame is not torn) and when no sync is open.
     pub fn flush_expired_sync(&mut self) -> Vec<String> {
@@ -318,9 +318,9 @@ impl Emulator {
 
     /// Whether wheel events should reach the child as arrow keys: on the
     /// alternate screen with DECSET 1007 in effect. The gate mirrors
-    /// alacritty the terminal's own arrow-emission check —
-    /// `mode().contains(ALT_SCREEN | ALTERNATE_SCROLL)` in its
-    /// `scroll_terminal` — and 1007 defaults *on* (xterm semantics), so a
+    /// alacritty the terminal's own arrow-emission check
+    /// (`mode().contains(ALT_SCREEN | ALTERNATE_SCROLL)` in its
+    /// `scroll_terminal`). 1007 defaults *on* (xterm semantics), so a
     /// full-screen child scrolls without opting in but keeps `?1007l` as its
     /// veto. vt100 cannot model 1007; its arm keeps the pre-step-6 heuristic
     /// (alt screen alone) so the cross-backend tests retain their meaning.
@@ -477,7 +477,7 @@ mod tests {
         // Window-size report dropped.
         assert!(emu.process(b"\x1b[18t").is_empty());
         // Kitty keyboard query: disabled in config, no reply generated; the
-        // allowlist would drop the `ESC[?…u` shape regardless.
+        // allowlist would drop the `ESC[?...u` shape regardless.
         assert!(emu.process(b"\x1b[?u").is_empty());
     }
 
@@ -550,7 +550,7 @@ mod tests {
     }
 
     /// The step-4 modeling gap, pinned: DECSET 9 (X10 press-only) is ignored
-    /// by alacritty/vte — no `NamedPrivateMode` for mode 9 — where vt100
+    /// by alacritty/vte (no `NamedPrivateMode` for mode 9) where vt100
     /// reported `Press`. An X10-only child gets no mouse reports after the
     /// swap, matching alacritty the terminal.
     #[test]
@@ -565,7 +565,7 @@ mod tests {
     }
 
     /// The wheel-as-arrows gate is alt screen *and* DECSET 1007, with 1007
-    /// defaulting on — and the child's `?1007l` veto is honored, which the
+    /// defaulting on, and the child's `?1007l` veto is honored, which the
     /// old alt-screen heuristic could not do. The vt100 arm keeps that
     /// heuristic (no 1007 state to read), pinned here so the divergence is
     /// explicit rather than a silent cross-backend drift.
