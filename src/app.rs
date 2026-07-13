@@ -1802,10 +1802,9 @@ mod tests {
     /// decision → `Command::Mouse` → `mouse_bytes` → PTY. With the veto the
     /// wheel delivers nothing. A sentinel written after it proves the child
     /// was reading, so absence is the veto, not a stall. With 1007 at its
-    /// default the same wheel delivers three arrows. What no in-process test
-    /// can cover is the uncaptured half: the user's real terminal converting
-    /// wheel to arrows while the gate is open (`(false, true)` here) happens
-    /// outside this process.
+    /// default the same wheel delivers three arrows. The uncaptured half is
+    /// out of process: the user's real terminal converting wheel to arrows
+    /// while the gate is open (`(false, true)` here).
     #[test]
     fn attached_wheel_honors_the_childs_1007_veto() {
         use std::time::Instant;

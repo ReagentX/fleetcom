@@ -1139,9 +1139,9 @@ mod tests {
     /// A crafted `Resize` with zero or enormous dimensions must be clamped,
     /// not forwarded to the grid. 0 panics inside alacritty (column-shrink
     /// underflow, out-of-bounds cell writes), and `u16::MAX` would allocate a
-    /// multi-billion-cell grid. Beyond not panicking, the accepted geometry
-    /// must satisfy both bounds: each dimension in `[1, MAX_DIM]` and the
-    /// area within `MAX_CELLS` (the frame-fit guarantee).
+    /// multi-billion-cell grid. The accepted geometry must satisfy both
+    /// bounds: each dimension in `[1, MAX_DIM]` and the area within
+    /// `MAX_CELLS` (the frame-fit guarantee).
     #[test]
     fn resize_clamps_hostile_dimensions() {
         let mut s = sup(24, 80);
@@ -1189,15 +1189,15 @@ mod tests {
 
     /// The frame-fit guarantee, pinned by measurement: the worst `Screen`
     /// payload any clamp-accepted geometry can produce must fit
-    /// `frame::MAX_FRAME` with headroom. Ties `serialize::formatted`'s
-    /// emission density, `MAX_CELLS`, and `MAX_FRAME` together, so a change
-    /// to any of the three that breaks (or erodes) the invariant fails here
-    /// by name instead of surfacing as a production disconnect loop.
+    /// `frame::MAX_FRAME` with headroom. Couples `serialize::formatted`'s
+    /// emission density to `MAX_CELLS` and `MAX_FRAME`: a change to any of
+    /// the three that breaks the invariant fails this test instead of as a
+    /// production disconnect loop.
     ///
     /// The construction maximizes bytes per cell against the real serializer:
     /// every cell is a `'\t'` (whose emission path adds two per-cell CUPs on
     /// top of the glyph) styled with the maximal SGR: every style flag plus
-    /// three-digit truecolor fg, bg, AND underline color, alternating
+    /// three-digit truecolor fg, bg, and underline color, alternating
     /// between two color sets so `sync_sgr` re-specifies in full at every
     /// cell. Geometry is the worst the clamp admits: `MAX_DIM` rows (largest
     /// CUP row digits, most per-row CUPs) at exactly `MAX_CELLS` total.
