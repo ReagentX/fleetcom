@@ -14,7 +14,7 @@ use crate::{
     core::{Wake, Waker},
     path,
     protocol::{Command, Event, LaunchContext, ScreenView, ScrollAction, TaskView},
-    session::{self, SessionConfig},
+    session::{self, SessionConfig, SessionEntry},
     task::Task,
 };
 
@@ -47,6 +47,23 @@ const MAX_TASKS: usize = 256;
 /// not the norm; 2 s is enough for any real flush handler while keeping a
 /// wedged job from making `Q` feel broken.
 const KILL_GRACE: Duration = Duration::from_secs(2);
+
+/// Maximum stored group-name length in Unicode scalar values after normalization.
+const MAX_GROUP_CHARS: usize = 64;
+
+/// Normalize a group assignment before storage. Remove control characters,
+/// trim surrounding whitespace, and cap the result at [`MAX_GROUP_CHARS`]
+/// characters. Empty names and the reserved `Unassigned` label map to `None`;
+/// comparison remains case-sensitive.
+fn normalize_group(name: Option<String>) -> Option<String> {
+    let name = name?;
+    let stripped: String = name.chars().filter(|c| !c.is_control()).collect();
+    let capped: String = stripped.trim().chars().take(MAX_GROUP_CHARS).collect();
+    if capped.is_empty() || capped == "Unassigned" {
+        return None;
+    }
+    Some(capped)
+}
 
 pub struct Supervisor {
     tasks: Vec<Task>,
@@ -142,7 +159,11 @@ impl Supervisor {
     /// notice, a spawn failure) is queued as `Event::Status`, never returned.
     pub fn apply(&mut self, cmd: Command) {
         match cmd {
-            Command::Spawn { command, cwd } => self.spawn(&command, cwd),
+            Command::Spawn {
+                command,
+                cwd,
+                group,
+            } => self.spawn(&command, cwd, normalize_group(group)),
             Command::Kill { id } => {
                 if let Some(t) = self.by_id_mut(id) {
                     t.terminate();
@@ -160,6 +181,12 @@ impl Supervisor {
             Command::Tag { id, on } => {
                 if let Some(t) = self.by_id_mut(id) {
                     t.tagged = on;
+                }
+            }
+            // Ignore assignments for tasks no longer present.
+            Command::SetGroup { id, group } => {
+                if let Some(t) = self.by_id_mut(id) {
+                    t.group = normalize_group(group);
                 }
             }
             Command::Resize { rows, cols } => {
@@ -284,6 +311,7 @@ impl Supervisor {
                 command: t.command.clone(),
                 cwd: t.cwd.clone(),
                 tagged: t.tagged,
+                group: t.group.clone(),
                 lifecycle: t.lifecycle(now, IDLE_AFTER),
                 preview: t.preview(),
                 started_ago: now.duration_since(t.started),
@@ -355,7 +383,7 @@ impl Supervisor {
         self.launch.clone()
     }
 
-    fn spawn(&mut self, command: &str, cwd: PathBuf) {
+    fn spawn(&mut self, command: &str, cwd: PathBuf, group: Option<String>) {
         if self.tasks.len() >= MAX_TASKS {
             self.events.push(Event::Status(format!(
                 "task limit reached ({MAX_TASKS}), not spawning"
@@ -374,7 +402,8 @@ impl Supervisor {
             &launch.env,
             Arc::clone(&self.waker),
         ) {
-            Ok(task) => {
+            Ok(mut task) => {
+                task.group = group;
                 self.next_id += 1;
                 self.tasks.push(task);
             }
@@ -384,7 +413,7 @@ impl Supervisor {
         }
     }
 
-    /// Re-run a finished task in place while preserving its ID and tag.
+    /// Re-run a finished task in place while preserving its ID, tag, and group.
     fn restart(&mut self, id: u64) {
         let Some(i) = self.index_of(id) else {
             self.events
@@ -411,6 +440,7 @@ impl Supervisor {
         ) {
             Ok(mut fresh) => {
                 fresh.tagged = self.tasks[i].tagged;
+                fresh.group = self.tasks[i].group.clone();
                 // The displaced job exits like a Remove: TERM now, the
                 // graveyard's grace-then-KILL behind it. Dropping it here
                 // would straight-SIGKILL stragglers of the old run.
@@ -428,8 +458,8 @@ impl Supervisor {
         }
     }
 
-    /// Snapshot the task set as a `{dir: [commands]}` recipe, in spawn (id) order
-    /// within each dir.
+    /// Snapshot tasks as `{dir: [entries]}`. Entries preserve spawn order and
+    /// group assignments.
     fn session_config(&self) -> SessionConfig {
         let mut order: Vec<usize> = (0..self.tasks.len()).collect();
         order.sort_by_key(|&i| self.tasks[i].id);
@@ -438,7 +468,10 @@ impl Supervisor {
             let t = &self.tasks[i];
             cfg.entry(path::abbreviate(&t.cwd))
                 .or_default()
-                .push(t.command.clone());
+                .push(SessionEntry {
+                    cmd: t.command.clone(),
+                    group: t.group.clone(),
+                });
         }
         cfg
     }
@@ -503,26 +536,28 @@ impl Supervisor {
             return;
         };
         let (mut spawned, mut skipped) = (0usize, 0usize);
-        for (dir, cmds) in &cfg {
+        for (dir, entries) in &cfg {
             let resolved = path::resolve(&launch.cwd, dir);
             if !resolved.is_dir() {
-                skipped += cmds.len();
+                skipped += entries.len();
                 continue;
             }
-            for cmd in cmds {
+            for entry in entries {
                 if self.tasks.len() >= MAX_TASKS {
                     skipped += 1;
                     continue;
                 }
-                if let Ok(task) = Task::spawn(
+                if let Ok(mut task) = Task::spawn(
                     self.next_id,
-                    cmd,
+                    &entry.cmd,
                     &resolved,
                     self.rows,
                     self.cols,
                     &launch.env,
                     Arc::clone(&self.waker),
                 ) {
+                    // Normalize group names read from editable recipe files.
+                    task.group = normalize_group(entry.group.clone());
                     self.next_id += 1;
                     self.tasks.push(task);
                     spawned += 1;
@@ -565,22 +600,40 @@ mod tests {
         s.apply(Command::Spawn {
             command: "a".into(),
             cwd: here(),
+            group: None,
         });
         s.apply(Command::Spawn {
             command: "b".into(),
             cwd: PathBuf::from("/tmp"),
+            group: None,
         });
         s.apply(Command::Spawn {
             command: "c".into(),
             cwd: here(),
+            group: None,
         });
 
         let cfg = s.session_config();
         assert_eq!(
             cfg[&path::abbreviate(&here())],
-            vec!["a".to_string(), "c".to_string()]
+            vec![
+                SessionEntry {
+                    cmd: "a".into(),
+                    group: None,
+                },
+                SessionEntry {
+                    cmd: "c".into(),
+                    group: None,
+                },
+            ]
         );
-        assert_eq!(cfg["/tmp"], vec!["b".to_string()]);
+        assert_eq!(
+            cfg["/tmp"],
+            vec![SessionEntry {
+                cmd: "b".into(),
+                group: None,
+            }]
+        );
     }
 
     /// `tick` emits exactly a `Tasks` snapshot while nothing is watched, and
@@ -592,6 +645,7 @@ mod tests {
         s.apply(Command::Spawn {
             command: "sleep 30".into(),
             cwd: here(),
+            group: None,
         });
 
         s.tick();
@@ -624,6 +678,7 @@ mod tests {
         s.apply(Command::Spawn {
             command: "sleep 30".into(),
             cwd: here(),
+            group: None,
         });
         // Settle: let the silent shell finish any startup writes so the screen
         // stabilizes before we assert nothing changes.
@@ -709,6 +764,7 @@ mod tests {
         s.apply(Command::Spawn {
             command: "printf 'begin\\033[?2026hstalled'; sleep 30".into(),
             cwd: here(),
+            group: None,
         });
         let deadline = Instant::now() + Duration::from_secs(5);
         let mut preview = String::new();
@@ -745,7 +801,11 @@ mod tests {
     /// keeps kill-path tests deterministic (no signalling a shell that hasn't
     /// installed its trap yet).
     fn spawn_ready(s: &mut Supervisor, command: String, cwd: PathBuf, ready: &Path) -> u64 {
-        s.apply(Command::Spawn { command, cwd });
+        s.apply(Command::Spawn {
+            command,
+            cwd,
+            group: None,
+        });
         for _ in 0..200 {
             if ready.exists() {
                 break;
@@ -837,6 +897,7 @@ mod tests {
         s.apply(Command::Spawn {
             command: "sleep 300".into(),
             cwd: here(),
+            group: None,
         });
         let t0 = Instant::now();
         s.apply(Command::Shutdown);
@@ -861,6 +922,7 @@ mod tests {
         s.apply(Command::Spawn {
             command: "sleep 300".into(),
             cwd: here(),
+            group: None,
         });
         s.tick();
         let id = match s.drain().first() {
@@ -896,6 +958,7 @@ mod tests {
         s.apply(Command::Spawn {
             command: "sleep 300".into(),
             cwd: here(),
+            group: None,
         });
         s.tick();
         let id = match s.drain().first() {
@@ -971,6 +1034,7 @@ mod tests {
         s.apply(Command::Spawn {
             command: "sleep 30".into(),
             cwd: here(),
+            group: None,
         });
         s.tick();
         let id = match s.drain().first() {
@@ -1015,6 +1079,7 @@ mod tests {
         s.apply(Command::Spawn {
             command: format!("echo run >> {}", marker.display()),
             cwd: dir.clone(),
+            group: None,
         });
         s.tick();
         let id = match s.drain().first() {
@@ -1038,6 +1103,119 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Group normalization strips controls, trims whitespace, caps by character,
+    /// reserves `Unassigned`, and preserves case.
+    #[test]
+    fn group_names_normalize_at_the_boundary() {
+        let n = |s: &str| normalize_group(Some(s.to_string()));
+        assert_eq!(normalize_group(None), None);
+        // Controls are removed while printable text remains.
+        assert_eq!(n("\x1b[31mapi\x07"), Some("[31mapi".into()));
+        assert_eq!(n("  backend  "), Some("backend".into()));
+        // Control-only names become unassigned.
+        assert_eq!(n(" \t \x1b \x7f \u{9b} "), None);
+        assert_eq!(n(""), None);
+        // The cap counts chars, not bytes: 80 two-byte chars keep exactly 64.
+        assert_eq!(n(&"\u{e9}".repeat(80)), Some("\u{e9}".repeat(64)));
+        // The cap applies after the trim, so padding spends none of it.
+        assert_eq!(n(&format!("  {}  ", "x".repeat(64))), Some("x".repeat(64)));
+        // The reserved section label maps to unassigned.
+        assert_eq!(n("Unassigned"), None);
+        assert_eq!(n("  Unassigned  "), None);
+        // Matching is case-sensitive.
+        assert_eq!(n("unassigned"), Some("unassigned".into()));
+        assert_eq!(n("UNASSIGNED"), Some("UNASSIGNED".into()));
+        assert_eq!(n("Api"), Some("Api".into()));
+    }
+
+    /// `SetGroup` normalizes assignments, clears with `None`, and ignores
+    /// unknown task ids.
+    #[test]
+    fn set_group_round_trips_and_clears() {
+        let mut s = sup(24, 80);
+        s.apply(Command::Spawn {
+            command: "sleep 30".into(),
+            cwd: here(),
+            group: None,
+        });
+        s.tick();
+        let id = match s.drain().first() {
+            Some(Event::Tasks(v)) => v[0].id,
+            _ => panic!("expected a Tasks snapshot"),
+        };
+        let group_of = |s: &mut Supervisor| -> Option<String> {
+            s.tick();
+            for e in s.drain() {
+                if let Event::Tasks(v) = e
+                    && let Some(t) = v.iter().find(|t| t.id == id)
+                {
+                    return t.group.clone();
+                }
+            }
+            panic!("task {id} missing from the snapshot");
+        };
+
+        s.apply(Command::SetGroup {
+            id,
+            group: Some("  api  ".into()),
+        });
+        assert_eq!(group_of(&mut s), Some("api".into()));
+
+        s.apply(Command::SetGroup { id, group: None });
+        assert_eq!(group_of(&mut s), None);
+
+        // Unknown id: no panic, no event, no state change.
+        s.apply(Command::SetGroup {
+            id: 999,
+            group: Some("ghost".into()),
+        });
+        assert!(s.drain().is_empty(), "unknown-id SetGroup must stay silent");
+        assert_eq!(group_of(&mut s), None);
+    }
+
+    /// Spawned tasks expose their normalized initial group in the first snapshot.
+    #[test]
+    fn spawn_carries_a_normalized_group_from_birth() {
+        let mut s = sup(24, 80);
+        s.apply(Command::Spawn {
+            command: "sleep 30".into(),
+            cwd: here(),
+            group: Some("  ui\x1b[2J  ".into()),
+        });
+        s.tick();
+        match s.drain().first() {
+            Some(Event::Tasks(v)) => assert_eq!(v[0].group.as_deref(), Some("ui[2J")),
+            _ => panic!("expected a Tasks snapshot"),
+        }
+    }
+
+    /// Restart preserves the task's group and tag.
+    #[test]
+    fn restart_carries_the_group_over() {
+        use crate::protocol::Lifecycle;
+        let mut s = sup(24, 80);
+        s.apply(Command::Spawn {
+            command: "true".into(),
+            cwd: here(),
+            group: Some("infra".into()),
+        });
+        s.tick();
+        let id = match s.drain().first() {
+            Some(Event::Tasks(v)) => v[0].id,
+            _ => panic!("expected a Tasks snapshot"),
+        };
+        wait_for_lifecycle(&mut s, id, |l| l == Lifecycle::Ok);
+
+        s.apply(Command::Restart { id });
+        wait_for_lifecycle(&mut s, id, |l| l == Lifecycle::Ok);
+        s.tick();
+        let carried = s.drain().iter().any(|e| {
+            matches!(e, Event::Tasks(v)
+                if v.iter().any(|t| t.id == id && t.group.as_deref() == Some("infra")))
+        });
+        assert!(carried, "restart must carry the group over");
+    }
+
     /// `Restart` never kills: a running task is refused with a status notice
     /// and keeps running. An unknown id gets a notice too, not a panic.
     #[test]
@@ -1047,6 +1225,7 @@ mod tests {
         s.apply(Command::Spawn {
             command: "sleep 30".into(),
             cwd: here(),
+            group: None,
         });
         s.tick();
         let id = match s.drain().first() {
@@ -1088,6 +1267,7 @@ mod tests {
         s.apply(Command::Spawn {
             command: "true".into(),
             cwd: here(),
+            group: None,
         });
         s.tick();
         let id = match s.drain().first() {
@@ -1118,6 +1298,7 @@ mod tests {
         s.apply(Command::Spawn {
             command: "sleep 30".into(),
             cwd: here(),
+            group: None,
         });
         s.apply(Command::Resize { rows: 0, cols: 0 });
         s.tick(); // exercises the resized grid (snapshot + screen): no panic
@@ -1507,6 +1688,102 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Saving and loading preserve group assignments.
+    #[test]
+    fn load_session_restores_saved_groups() {
+        let dir = scratch("sess_groups");
+        let config = dir.join("config");
+        let ctx = LaunchContext {
+            env: vec![(
+                "FLEETCOM_CONFIG_DIR".into(),
+                config.clone().into_os_string(),
+            )],
+            cwd: dir.clone(),
+        };
+        let mut s = Supervisor::new(24, 80);
+        s.set_launch_context(ctx.clone());
+        s.apply(Command::Spawn {
+            command: "sleep 30".into(),
+            cwd: dir.clone(),
+            group: Some("api".into()),
+        });
+        s.apply(Command::Spawn {
+            command: "sleep 31".into(),
+            cwd: dir.clone(),
+            group: None,
+        });
+        s.apply(Command::SaveSession {
+            name: "fleet".into(),
+        });
+        assert!(
+            s.drain().iter().any(
+                |e| matches!(e, Event::Status(m) if m.starts_with("saved 'fleet': 2 command(s)"))
+            ),
+            "save must still count commands"
+        );
+
+        let mut fresh = Supervisor::new(24, 80);
+        fresh.set_launch_context(ctx);
+        fresh.apply(Command::LoadSession {
+            name: "fleet".into(),
+        });
+        fresh.tick();
+        let evs = fresh.drain();
+        let tasks = evs
+            .iter()
+            .find_map(|e| match e {
+                Event::Tasks(v) => Some(v),
+                _ => None,
+            })
+            .expect("a Tasks snapshot after load");
+        let group_of = |cmd: &str| {
+            tasks
+                .iter()
+                .find(|t| t.command == cmd)
+                .unwrap_or_else(|| panic!("task '{cmd}' missing after load"))
+                .group
+                .clone()
+        };
+        assert_eq!(group_of("sleep 30"), Some("api".into()));
+        assert_eq!(group_of("sleep 31"), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Loaded recipe groups are normalized before assignment.
+    #[test]
+    fn load_session_renormalizes_hand_edited_groups() {
+        let dir = scratch("sess_norm");
+        let config = dir.join("config");
+        std::fs::create_dir_all(config.join("sessions")).unwrap();
+        std::fs::write(
+            config.join("sessions").join("edited.json"),
+            format!(
+                r#"{{"{}": [{{"cmd": "sleep 30", "group": "  x  "}}]}}"#,
+                dir.display()
+            ),
+        )
+        .unwrap();
+        let mut s = Supervisor::new(24, 80);
+        s.set_launch_context(LaunchContext {
+            env: vec![("FLEETCOM_CONFIG_DIR".into(), config.into_os_string())],
+            cwd: dir.clone(),
+        });
+        s.apply(Command::LoadSession {
+            name: "edited".into(),
+        });
+        s.tick();
+        let evs = s.drain();
+        let restored = evs.iter().any(|e| {
+            matches!(e, Event::Tasks(v)
+                if v.iter().any(|t| t.group.as_deref() == Some("x")))
+        });
+        assert!(
+            restored,
+            "loaded group must come back normalized; got {evs:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Spawns inherit only the installed launch-context environment.
     #[test]
     fn spawn_uses_the_launch_context_env_not_the_process_env() {
@@ -1527,6 +1804,7 @@ mod tests {
                 out.display()
             ),
             cwd: dir.clone(),
+            group: None,
         });
         let ok = reap_until(&mut s, Duration::from_secs(5), |_| {
             std::fs::read_to_string(&out).is_ok_and(|c| !c.is_empty())
@@ -1544,6 +1822,7 @@ mod tests {
         s.apply(Command::Spawn {
             command: "true".into(),
             cwd: here(),
+            group: None,
         });
         assert!(
             s.drain()

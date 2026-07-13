@@ -49,6 +49,8 @@ pub enum Mode {
     Spawn,
     /// Live directory picker (the `@` flow) that sets `spawn_cwd`.
     PickDir,
+    /// Live group picker (the `g` flow) that reassigns the selected task's group.
+    PickGroup,
     /// Typing a name to save the current tasks as a session.
     SaveSession,
     /// Picking a saved session to load.
@@ -62,10 +64,11 @@ pub enum Mode {
 }
 
 /// How the dashboard groups tasks into sections.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum GroupMode {
     State,
     Dir,
+    Custom,
 }
 
 impl GroupMode {
@@ -73,6 +76,16 @@ impl GroupMode {
         match self {
             GroupMode::State => "state",
             GroupMode::Dir => "dir",
+            GroupMode::Custom => "custom",
+        }
+    }
+
+    /// Advance through State → Dir → Custom → State.
+    pub fn next(self) -> GroupMode {
+        match self {
+            GroupMode::State => GroupMode::Dir,
+            GroupMode::Dir => GroupMode::Custom,
+            GroupMode::Custom => GroupMode::State,
         }
     }
 }
@@ -93,6 +106,13 @@ pub struct DirCand {
     pub label: String,
     pub path: PathBuf,
     pub kind: DirKind,
+}
+
+/// One `g`-picker row. Enter sends `group`; `label` may contain display-only
+/// state such as "(current)".
+pub struct GroupCand {
+    pub label: String,
+    pub group: Option<String>,
 }
 
 /// One dashboard list row: a section header, or the task at a `views` index.
@@ -125,6 +145,9 @@ pub struct App {
     /// Directory a spawned command runs in. Set to `invocation_dir` for the `n`
     /// flow, or to the picked directory for the `@` flow.
     pub spawn_cwd: PathBuf,
+    /// Group assigned to the next spawn. Custom mode snapshots the selected
+    /// task's group; State and Dir modes leave the spawn unassigned.
+    pub spawn_group: Option<String>,
     /// Id of the attached task, if any: by id (not index) so it survives the
     /// task list changing underneath it.
     pub focused_id: Option<u64>,
@@ -141,6 +164,12 @@ pub struct App {
     pub dir_input: String,
     pub dir_candidates: Vec<DirCand>,
     pub dir_sel: usize,
+    // `g` group-picker state (only meaningful in `Mode::PickGroup`).
+    pub group_input: String,
+    pub group_candidates: Vec<GroupCand>,
+    pub group_sel: usize,
+    /// Id of the task being reassigned by the open group picker.
+    group_target: Option<u64>,
     // Load-session picker state.
     pub session_names: Vec<String>,
     pub session_sel: usize,
@@ -287,6 +316,7 @@ impl App {
             group_mode: GroupMode::State,
             input: String::new(),
             spawn_cwd: invocation_dir.clone(),
+            spawn_group: None,
             focused_id: None,
             rows,
             cols,
@@ -296,6 +326,10 @@ impl App {
             dir_input: String::new(),
             dir_candidates: Vec::new(),
             dir_sel: 0,
+            group_input: String::new(),
+            group_candidates: Vec::new(),
+            group_sel: 0,
+            group_target: None,
             session_names: Vec::new(),
             session_sel: 0,
             status: None,
@@ -360,7 +394,7 @@ impl App {
 
     /// Task sections in render order. Navigation uses their flattened order.
     pub fn sections(&self) -> Vec<(String, Vec<usize>)> {
-        let mut labeled: Vec<(u8, String, u8, u64, usize)> = self
+        let mut labeled: Vec<(u8, String, u8, String, u64, usize)> = self
             .views
             .iter()
             .enumerate()
@@ -381,14 +415,21 @@ impl App {
                         let rank = if label == self.invocation_label { 0 } else { 1 };
                         (rank, label)
                     }
+                    GroupMode::Custom => match &v.group {
+                        Some(g) => (0, g.clone()),
+                        // Named groups sort before Unassigned.
+                        None => (1, "Unassigned".to_string()),
+                    },
                 };
-                (rank, label, bucket(v), v.id, i)
+                // Within each section, sort by tag/lifecycle bucket, directory,
+                // then task id.
+                (rank, label, bucket(v), self.dir_label(&v.cwd), v.id, i)
             })
             .collect();
         labeled.sort();
 
         let mut out: Vec<(String, Vec<usize>)> = Vec::new();
-        for (_, label, _, _, i) in labeled {
+        for (_, label, _, _, _, i) in labeled {
             match out.last_mut() {
                 Some(last) if last.0 == label => last.1.push(i),
                 _ => out.push((label, vec![i])),
@@ -594,6 +635,7 @@ impl App {
         self.transport.send(Command::Spawn {
             command: command.to_string(),
             cwd: self.spawn_cwd.clone(),
+            group: self.spawn_group.clone(),
         });
     }
 
@@ -659,6 +701,7 @@ impl App {
     /// Lock in `dir` as the spawn target and move to command entry.
     fn confirm_dir(&mut self, dir: PathBuf) {
         self.spawn_cwd = dir;
+        self.spawn_group = self.inherited_group();
         self.input.clear();
         self.dir_candidates.clear();
         self.mode = Mode::Spawn;
@@ -675,6 +718,82 @@ impl App {
     fn enter_dir(&mut self, dir: PathBuf) {
         self.dir_input = format!("{}/", path::abbreviate(&dir));
         self.refresh_dir_candidates();
+    }
+
+    // --- `g` group picker -------------------------------------------------------
+
+    /// Resolve spawn inheritance from the selected task in Custom mode.
+    fn inherited_group(&self) -> Option<String> {
+        if self.group_mode != GroupMode::Custom {
+            return None;
+        }
+        self.selected_task()
+            .and_then(|i| self.views[i].group.clone())
+    }
+
+    /// Open the `g` picker on the selected task; a no-op with no selection.
+    fn open_group_picker(&mut self) {
+        if let Some(i) = self.selected_task() {
+            self.group_target = Some(self.views[i].id);
+            self.group_input.clear();
+            self.refresh_group_candidates();
+            self.mode = Mode::PickGroup;
+        }
+    }
+
+    /// Rebuild the picker as Unassigned followed by distinct prefix matches in
+    /// byte order.
+    fn refresh_group_candidates(&mut self) {
+        // Mark the pinned target's group even if dashboard selection changes.
+        let current = self
+            .group_target
+            .and_then(|id| self.views.iter().find(|v| v.id == id))
+            .and_then(|v| v.group.clone());
+        let mark = |name: &str, is_current: bool| {
+            if is_current {
+                format!("{name} (current)")
+            } else {
+                name.to_string()
+            }
+        };
+
+        let mut cands = vec![GroupCand {
+            label: mark("Unassigned", current.is_none()),
+            group: None,
+        }];
+
+        // Group names match by case-insensitive prefix.
+        let needle = self.group_input.to_lowercase();
+        let mut names: Vec<&String> = self
+            .views
+            .iter()
+            .filter_map(|v| v.group.as_ref())
+            .filter(|g| g.to_lowercase().starts_with(&needle))
+            .collect();
+        names.sort();
+        names.dedup();
+        for name in names {
+            cands.push(GroupCand {
+                label: mark(name, current.as_deref() == Some(name.as_str())),
+                group: Some(name.clone()),
+            });
+        }
+
+        // Empty input selects Unassigned; matched input selects the first group.
+        self.group_sel = if self.group_input.is_empty() || cands.len() < 2 {
+            0
+        } else {
+            1
+        };
+        self.group_candidates = cands;
+    }
+
+    /// Clear the group-picker state and return to the dashboard.
+    fn close_group_picker(&mut self) {
+        self.group_input.clear();
+        self.group_candidates.clear();
+        self.group_target = None;
+        self.mode = Mode::Dashboard;
     }
 
     fn on_key(&mut self, out: &mut Stdout, k: KeyEvent) -> io::Result<()> {
@@ -694,6 +813,7 @@ impl App {
             Mode::Dashboard => self.on_key_dashboard(k),
             Mode::Spawn => self.on_key_spawn(k),
             Mode::PickDir => self.on_key_pickdir(k),
+            Mode::PickGroup => self.on_key_pickgroup(k),
             Mode::SaveSession => self.on_key_savesession(k),
             Mode::LoadSession => self.on_key_loadsession(k),
             Mode::Peek => self.on_key_peek(k),
@@ -738,9 +858,11 @@ impl App {
                     self.transport.send(Command::Tag { id, on: !tagged });
                 }
             }
+            KeyCode::Char('g') => self.open_group_picker(),
             KeyCode::Char('n') => {
                 self.input.clear();
                 self.spawn_cwd = self.invocation_dir.clone();
+                self.spawn_group = self.inherited_group();
                 self.mode = Mode::Spawn;
             }
             KeyCode::Char('@') => {
@@ -749,10 +871,7 @@ impl App {
                 self.mode = Mode::PickDir;
             }
             KeyCode::Char('s') => {
-                self.group_mode = match self.group_mode {
-                    GroupMode::State => GroupMode::Dir,
-                    GroupMode::Dir => GroupMode::State,
-                };
+                self.group_mode = self.group_mode.next();
             }
             KeyCode::Char('w') => {
                 self.input.clear();
@@ -857,6 +976,42 @@ impl App {
             KeyCode::Char(c) => {
                 self.dir_input.push(c);
                 self.refresh_dir_candidates();
+            }
+            _ => {}
+        }
+    }
+
+    fn on_key_pickgroup(&mut self, k: KeyEvent) {
+        match k.code {
+            KeyCode::Esc => self.close_group_picker(),
+            KeyCode::Up => self.group_sel = self.group_sel.saturating_sub(1),
+            KeyCode::Down => {
+                if !self.group_candidates.is_empty() {
+                    self.group_sel = (self.group_sel + 1).min(self.group_candidates.len() - 1);
+                }
+            }
+            KeyCode::Enter => {
+                // Enter assigns the highlighted group, or creates the typed
+                // group when no existing name matches.
+                let group = if !self.group_input.is_empty() && self.group_candidates.len() < 2 {
+                    Some(self.group_input.clone())
+                } else {
+                    self.group_candidates
+                        .get(self.group_sel)
+                        .and_then(|c| c.group.clone())
+                };
+                if let Some(id) = self.group_target {
+                    self.transport.send(Command::SetGroup { id, group });
+                }
+                self.close_group_picker();
+            }
+            KeyCode::Backspace => {
+                self.group_input.pop();
+                self.refresh_group_candidates();
+            }
+            KeyCode::Char(c) => {
+                self.group_input.push(c);
+                self.refresh_group_candidates();
             }
             _ => {}
         }
@@ -988,6 +1143,11 @@ impl App {
             Mode::PickDir => {
                 self.dir_input.extend(s.chars().filter(|c| !c.is_control()));
                 self.refresh_dir_candidates();
+            }
+            Mode::PickGroup => {
+                self.group_input
+                    .extend(s.chars().filter(|c| !c.is_control()));
+                self.refresh_group_candidates();
             }
             _ => {}
         }
@@ -1277,7 +1437,24 @@ mod tests {
             self.transport.send(Command::Spawn {
                 command: cmd.to_string(),
                 cwd,
+                group: None,
             });
+        }
+
+        fn spawn_grouped(&mut self, cmd: &str, cwd: PathBuf, group: &str) {
+            self.transport.send(Command::Spawn {
+                command: cmd.to_string(),
+                cwd,
+                group: Some(group.to_string()),
+            });
+        }
+
+        /// Return section labels with task ids instead of `views` indices.
+        fn section_ids(&self) -> Vec<(String, Vec<u64>)> {
+            self.sections()
+                .into_iter()
+                .map(|(l, idxs)| (l, idxs.into_iter().map(|i| self.views[i].id).collect()))
+                .collect()
         }
     }
 
@@ -1326,6 +1503,132 @@ mod tests {
         assert_eq!(s.len(), 2, "one section per distinct cwd");
         assert_eq!(s[0].0, app.invocation_label, "invocation dir sorts first");
         assert_eq!(s[1].0, "/tmp");
+    }
+
+    /// `s` cycles through all grouping modes.
+    #[test]
+    fn group_mode_cycles_state_dir_custom() {
+        assert_eq!(GroupMode::State.next(), GroupMode::Dir);
+        assert_eq!(GroupMode::Dir.next(), GroupMode::Custom);
+        assert_eq!(GroupMode::Custom.next(), GroupMode::State);
+
+        let mut app = App::new_local(30, 100);
+        assert_eq!(app.group_mode, GroupMode::State);
+        for expect in [GroupMode::Dir, GroupMode::Custom, GroupMode::State] {
+            app.on_key_dashboard(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE));
+            assert_eq!(app.group_mode, expect);
+        }
+    }
+
+    /// Custom mode sorts named sections alphabetically and Unassigned last.
+    #[test]
+    fn custom_mode_groups_by_name_with_unassigned_last() {
+        let mut app = App::new_local(30, 100);
+        let inv = app.invocation_dir.clone();
+        app.spawn_grouped("sleep 5", inv.clone(), "beta"); // id 1
+        app.spawn_grouped("sleep 5", inv.clone(), "alpha"); // id 2
+        app.spawn_in("sleep 5", inv); // id 3, no group
+        app.pump();
+
+        app.group_mode = GroupMode::Custom;
+        assert_eq!(
+            app.section_ids(),
+            vec![
+                ("alpha".to_string(), vec![2]),
+                ("beta".to_string(), vec![1]),
+                ("Unassigned".to_string(), vec![3]),
+            ]
+        );
+    }
+
+    /// Custom mode does not emit empty group sections.
+    #[test]
+    fn custom_mode_unassigned_tracks_membership() {
+        let mut app = App::new_local(30, 100);
+        let inv = app.invocation_dir.clone();
+        app.spawn_grouped("sleep 5", inv.clone(), "alpha"); // id 1
+        app.pump();
+        app.group_mode = GroupMode::Custom;
+        assert_eq!(app.section_ids(), vec![("alpha".to_string(), vec![1])]);
+
+        let mut app = App::new_local(30, 100);
+        let inv = app.invocation_dir.clone();
+        app.spawn_in("sleep 5", inv); // id 1, no group
+        app.pump();
+        app.group_mode = GroupMode::Custom;
+        assert_eq!(app.section_ids(), vec![("Unassigned".to_string(), vec![1])]);
+    }
+
+    /// In Custom mode, tagged tasks sort first within their existing group.
+    #[test]
+    fn custom_mode_tag_floats_within_group() {
+        let mut app = App::new_local(30, 100);
+        let inv = app.invocation_dir.clone();
+        app.spawn_grouped("sleep 5", inv.clone(), "alpha"); // id 1
+        app.spawn_grouped("sleep 5", inv, "alpha"); // id 2
+        app.pump();
+        app.group_mode = GroupMode::Custom;
+        assert_eq!(app.section_ids(), vec![("alpha".to_string(), vec![1, 2])]);
+
+        app.transport.send(Command::Tag { id: 2, on: true });
+        app.pump();
+        assert_eq!(
+            app.section_ids(),
+            vec![("alpha".to_string(), vec![2, 1])],
+            "tag floats id 2 to the top of alpha, not into an In use section"
+        );
+    }
+
+    /// Group reassignment can reorder sections without changing the selected id.
+    #[test]
+    fn custom_mode_selection_survives_group_move() {
+        let mut app = App::new_local(30, 100);
+        let inv = app.invocation_dir.clone();
+        app.spawn_grouped("sleep 5", inv.clone(), "alpha"); // id 1
+        app.spawn_grouped("sleep 5", inv, "beta"); // id 2
+        app.pump();
+        app.group_mode = GroupMode::Custom;
+        app.resolve_selection();
+        assert_eq!(app.selected_id, Some(1));
+
+        // Move id 1 from the first section to the last.
+        app.transport.send(Command::SetGroup {
+            id: 1,
+            group: Some("zeta".to_string()),
+        });
+        app.pump();
+        assert_eq!(
+            app.section_ids(),
+            vec![("beta".to_string(), vec![2]), ("zeta".to_string(), vec![1]),]
+        );
+
+        // Selection remains on id 1 in its new section.
+        assert_eq!(app.selected_id, Some(1));
+        assert_eq!(app.views[app.selected_task().unwrap()].id, 1);
+    }
+
+    /// Within a group, tasks cluster by directory and then by spawn order.
+    #[test]
+    fn custom_mode_clusters_by_dir_within_group() {
+        let mut app = App::new_local(30, 100);
+        let base = std::env::temp_dir().join(format!("fleetcom_app_cg_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let (dir_a, dir_b) = (base.join("a"), base.join("b"));
+        std::fs::create_dir_all(&dir_a).unwrap();
+        std::fs::create_dir_all(&dir_b).unwrap();
+
+        app.spawn_grouped("sleep 5", dir_b.clone(), "alpha"); // id 1, dir b
+        app.spawn_grouped("sleep 5", dir_a.clone(), "alpha"); // id 2, dir a
+        app.spawn_grouped("sleep 5", dir_a, "alpha"); // id 3, dir a
+        app.pump();
+
+        app.group_mode = GroupMode::Custom;
+        assert_eq!(
+            app.section_ids(),
+            vec![("alpha".to_string(), vec![2, 3, 1])],
+            "dir a's tasks cluster (in id order) ahead of dir b's"
+        );
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     /// A manual tag must pull a task out of Completed into In use, even after it
@@ -1928,5 +2231,246 @@ mod tests {
         assert_eq!(app.selected_id, Some(2));
         app.on_mouse(wheel(MouseEventKind::ScrollUp));
         assert_eq!(app.selected_id, Some(1));
+    }
+
+    // --- `g` group picker -------------------------------------------------
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    /// `g` opens the picker only when a task is selected, pinning the target
+    /// to that task's id.
+    #[test]
+    fn group_picker_opens_on_g_only_with_a_selection() {
+        let mut app = App::new_local(30, 100);
+        app.on_key_dashboard(key(KeyCode::Char('g')));
+        assert!(app.mode == Mode::Dashboard, "no selection: g must no-op");
+
+        let inv = app.invocation_dir.clone();
+        app.spawn_in("sleep 5", inv);
+        app.pump();
+        app.resolve_selection();
+        app.on_key_dashboard(key(KeyCode::Char('g')));
+        assert!(app.mode == Mode::PickGroup);
+        assert_eq!(app.group_target, Some(1));
+    }
+
+    /// Picker candidates are distinct byte-sorted groups after Unassigned, with
+    /// the target's assignment marked "(current)".
+    #[test]
+    fn group_candidates_are_distinct_sorted_and_marked() {
+        let mut app = App::new_local(30, 100);
+        let inv = app.invocation_dir.clone();
+        app.spawn_grouped("sleep 5", inv.clone(), "beta"); // id 1
+        app.spawn_grouped("sleep 5", inv.clone(), "alpha"); // id 2
+        app.spawn_grouped("sleep 5", inv.clone(), "alpha"); // id 3, dup group
+        app.spawn_in("sleep 5", inv); // id 4, no group
+        app.pump();
+
+        app.selected_id = Some(1); // group "beta"
+        app.on_key_dashboard(key(KeyCode::Char('g')));
+        let labels: Vec<&str> = app
+            .group_candidates
+            .iter()
+            .map(|c| c.label.as_str())
+            .collect();
+        assert_eq!(labels, vec!["Unassigned", "alpha", "beta (current)"]);
+        let groups: Vec<Option<&str>> = app
+            .group_candidates
+            .iter()
+            .map(|c| c.group.as_deref())
+            .collect();
+        assert_eq!(groups, vec![None, Some("alpha"), Some("beta")]);
+        assert_eq!(app.group_sel, 0, "nothing typed keeps the clear row");
+
+        // An ungrouped target marks the Unassigned row instead.
+        app.on_key_pickgroup(key(KeyCode::Esc));
+        app.selected_id = Some(4);
+        app.on_key_dashboard(key(KeyCode::Char('g')));
+        assert_eq!(app.group_candidates[0].label, "Unassigned (current)");
+    }
+
+    /// Typing applies a case-insensitive prefix filter and selects the first
+    /// match; Backspace expands the candidate set again.
+    #[test]
+    fn group_filter_narrows_and_preselects_the_first_match() {
+        let mut app = App::new_local(30, 100);
+        let inv = app.invocation_dir.clone();
+        app.spawn_grouped("sleep 5", inv.clone(), "alpha"); // id 1
+        app.spawn_grouped("sleep 5", inv, "beta"); // id 2
+        app.pump();
+        app.resolve_selection();
+        app.on_key_dashboard(key(KeyCode::Char('g')));
+        assert_eq!(app.group_candidates.len(), 3);
+
+        app.on_key_pickgroup(key(KeyCode::Char('B')));
+        let labels: Vec<&str> = app
+            .group_candidates
+            .iter()
+            .map(|c| c.label.as_str())
+            .collect();
+        assert_eq!(
+            labels,
+            vec!["Unassigned", "beta"],
+            "case-insensitive prefix"
+        );
+        assert_eq!(app.group_sel, 1, "filtering preselects the first match");
+
+        app.on_key_pickgroup(key(KeyCode::Char('z')));
+        assert_eq!(app.group_candidates.len(), 1, "\"Bz\" matches nothing");
+        assert_eq!(app.group_sel, 0);
+
+        app.on_key_pickgroup(key(KeyCode::Backspace));
+        assert_eq!(app.group_candidates.len(), 2, "backspace re-widens");
+    }
+
+    /// Enter assigns the highlighted candidate to the target task.
+    #[test]
+    fn group_enter_on_a_candidate_assigns_it() {
+        let mut app = App::new_local(30, 100);
+        let inv = app.invocation_dir.clone();
+        app.spawn_grouped("sleep 5", inv.clone(), "alpha"); // id 1
+        app.spawn_in("sleep 5", inv); // id 2, no group
+        app.pump();
+
+        app.selected_id = Some(2);
+        app.on_key_dashboard(key(KeyCode::Char('g')));
+        app.on_key_pickgroup(key(KeyCode::Char('a'))); // highlights "alpha"
+        app.on_key_pickgroup(key(KeyCode::Enter));
+        assert!(app.mode == Mode::Dashboard);
+        app.pump();
+        let v = app.views.iter().find(|v| v.id == 2).unwrap();
+        assert_eq!(v.group.as_deref(), Some("alpha"));
+    }
+
+    /// Enter creates the typed group when no candidate matches.
+    #[test]
+    fn group_enter_on_novel_text_creates_the_group() {
+        let mut app = App::new_local(30, 100);
+        let inv = app.invocation_dir.clone();
+        app.spawn_grouped("sleep 5", inv, "alpha"); // id 1
+        app.pump();
+        app.resolve_selection();
+        app.on_key_dashboard(key(KeyCode::Char('g')));
+        for c in "gamma".chars() {
+            app.on_key_pickgroup(key(KeyCode::Char(c)));
+        }
+        assert_eq!(app.group_candidates.len(), 1, "nothing matches");
+        app.on_key_pickgroup(key(KeyCode::Enter));
+        app.pump();
+        let v = app.views.iter().find(|v| v.id == 1).unwrap();
+        assert_eq!(v.group.as_deref(), Some("gamma"));
+    }
+
+    /// Empty input selects Unassigned, so Enter clears the target's group.
+    #[test]
+    fn group_enter_on_empty_input_clears_to_unassigned() {
+        let mut app = App::new_local(30, 100);
+        let inv = app.invocation_dir.clone();
+        app.spawn_grouped("sleep 5", inv, "alpha"); // id 1
+        app.pump();
+        app.resolve_selection();
+        app.on_key_dashboard(key(KeyCode::Char('g')));
+        assert_eq!(app.group_sel, 0, "empty input highlights the clear row");
+        app.on_key_pickgroup(key(KeyCode::Enter));
+        app.pump();
+        let v = app.views.iter().find(|v| v.id == 1).unwrap();
+        assert_eq!(v.group, None);
+    }
+
+    /// Esc closes the picker without changing the target task.
+    #[test]
+    fn group_esc_cancels_without_sending() {
+        let mut app = App::new_local(30, 100);
+        let inv = app.invocation_dir.clone();
+        app.spawn_grouped("sleep 5", inv, "alpha"); // id 1
+        app.pump();
+        app.resolve_selection();
+        app.on_key_dashboard(key(KeyCode::Char('g')));
+        for c in "gamma".chars() {
+            app.on_key_pickgroup(key(KeyCode::Char(c)));
+        }
+        app.on_key_pickgroup(key(KeyCode::Esc));
+        assert!(app.mode == Mode::Dashboard);
+        assert!(app.group_input.is_empty() && app.group_candidates.is_empty());
+        assert_eq!(app.group_target, None);
+        app.pump();
+        let v = app.views.iter().find(|v| v.id == 1).unwrap();
+        assert_eq!(v.group.as_deref(), Some("alpha"), "Esc must send nothing");
+    }
+
+    // --- spawn group inheritance -------------------------------------------
+
+    /// In Custom mode, `n` assigns the selected task's group to the spawn.
+    #[test]
+    fn custom_mode_spawn_inherits_the_selected_group() {
+        let mut app = App::new_local(30, 100);
+        let inv = app.invocation_dir.clone();
+        app.spawn_grouped("sleep 5", inv, "alpha"); // id 1
+        app.pump();
+        app.group_mode = GroupMode::Custom;
+        app.resolve_selection();
+
+        app.on_key_dashboard(key(KeyCode::Char('n')));
+        assert!(app.mode == Mode::Spawn);
+        assert_eq!(app.spawn_group.as_deref(), Some("alpha"));
+
+        for c in "sleep 5".chars() {
+            app.on_key_spawn(key(KeyCode::Char(c)));
+        }
+        app.on_key_spawn(key(KeyCode::Enter));
+        app.pump();
+        let v = app.views.iter().find(|v| v.id == 2).unwrap();
+        assert_eq!(
+            v.group.as_deref(),
+            Some("alpha"),
+            "the spawn must carry the inherited group"
+        );
+    }
+
+    /// In Custom mode, the `@` flow snapshots the group after directory selection.
+    #[test]
+    fn dir_picker_handoff_inherits_the_selected_group_in_custom_mode() {
+        let mut app = App::new_local(30, 100);
+        let inv = app.invocation_dir.clone();
+        app.spawn_grouped("sleep 5", inv, "alpha"); // id 1
+        app.pump();
+        app.group_mode = GroupMode::Custom;
+        app.resolve_selection();
+
+        app.on_key_dashboard(key(KeyCode::Char('@')));
+        assert!(app.mode == Mode::PickDir);
+        // Row 0 is the current dir (DirKind::Use): Enter hands off to Spawn.
+        app.on_key_pickdir(key(KeyCode::Enter));
+        assert!(app.mode == Mode::Spawn);
+        assert_eq!(app.spawn_group.as_deref(), Some("alpha"));
+    }
+
+    /// State and Dir mode spawns are unassigned.
+    #[test]
+    fn state_and_dir_mode_spawns_stay_unassigned() {
+        let mut app = App::new_local(30, 100);
+        let inv = app.invocation_dir.clone();
+        app.spawn_grouped("sleep 5", inv, "alpha"); // id 1
+        app.pump();
+        app.resolve_selection();
+
+        for mode in [GroupMode::State, GroupMode::Dir] {
+            app.group_mode = mode;
+            app.spawn_group = Some("stale".to_string());
+            app.on_key_dashboard(key(KeyCode::Char('n')));
+            assert_eq!(app.spawn_group, None, "{mode:?} must not inherit");
+            app.on_key_spawn(key(KeyCode::Esc));
+        }
+
+        app.on_key_dashboard(key(KeyCode::Char('n')));
+        for c in "sleep 5".chars() {
+            app.on_key_spawn(key(KeyCode::Char(c)));
+        }
+        app.on_key_spawn(key(KeyCode::Enter));
+        app.pump();
+        let v = app.views.iter().find(|v| v.id == 2).unwrap();
+        assert_eq!(v.group, None);
     }
 }

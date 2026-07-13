@@ -221,6 +221,7 @@ mod tests {
             .send(Wake::Cmd(Command::Spawn {
                 command: "cat".into(),
                 cwd,
+                group: None,
             }))
             .unwrap();
         wake_tx
@@ -274,6 +275,7 @@ mod tests {
         sup.apply(Command::Spawn {
             command: "sleep 30".into(),
             cwd,
+            group: None,
         });
 
         let stop = AtomicBool::new(true);

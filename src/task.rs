@@ -192,6 +192,8 @@ pub struct Task {
     last_activity: Arc<Mutex<Instant>>,
     handle: Option<JoinHandle<()>>,
     pub tagged: bool,
+    /// Dashboard group stored with the task; `None` means unassigned.
+    pub group: Option<String>,
     pub exit_code: Option<i32>,
     pub started: Instant,
     pub finished: Option<Instant>,
@@ -387,6 +389,7 @@ impl Task {
             last_activity,
             handle: Some(handle),
             tagged: false,
+            group: None,
             exit_code: None,
             started: Instant::now(),
             finished: None,
