@@ -62,10 +62,11 @@ pub enum Mode {
 }
 
 /// How the dashboard groups tasks into sections.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum GroupMode {
     State,
     Dir,
+    Custom,
 }
 
 impl GroupMode {
@@ -73,6 +74,19 @@ impl GroupMode {
         match self {
             GroupMode::State => "state",
             GroupMode::Dir => "dir",
+            GroupMode::Custom => "custom",
+        }
+    }
+
+    /// The next mode in the cycle: State → Dir → Custom → State. Single source
+    /// of truth for the order — the header's mode strip (rendered in a later
+    /// phase) and the `s` key handler both derive from it, so they can never
+    /// disagree.
+    pub fn next(self) -> GroupMode {
+        match self {
+            GroupMode::State => GroupMode::Dir,
+            GroupMode::Dir => GroupMode::Custom,
+            GroupMode::Custom => GroupMode::State,
         }
     }
 }
@@ -360,7 +374,7 @@ impl App {
 
     /// Task sections in render order. Navigation uses their flattened order.
     pub fn sections(&self) -> Vec<(String, Vec<usize>)> {
-        let mut labeled: Vec<(u8, String, u8, u64, usize)> = self
+        let mut labeled: Vec<(u8, String, u8, String, u64, usize)> = self
             .views
             .iter()
             .enumerate()
@@ -381,14 +395,29 @@ impl App {
                         let rank = if label == self.invocation_label { 0 } else { 1 };
                         (rank, label)
                     }
+                    GroupMode::Custom => match &v.group {
+                        Some(g) => (0, g.clone()),
+                        // Unassigned sorts *last*, deliberately inverting Dir
+                        // mode's invocation-dir-first rule: Unassigned is the
+                        // triage inbox — every fresh spawn lands there, and
+                        // ranking it first would churn the curated top of the
+                        // list on every spawn.
+                        None => (1, "Unassigned".to_string()),
+                    },
                 };
-                (rank, label, bucket(v), v.id, i)
+                // The dir label sits after `bucket` (running/completed stays
+                // the primary order within a section) and before `id`, so a
+                // section spanning subdirectories clusters by dir before
+                // falling back to spawn order. In Dir mode it is a no-op (the
+                // section label already pins the dir); in State mode it
+                // clusters same-dir tasks within each state bucket.
+                (rank, label, bucket(v), self.dir_label(&v.cwd), v.id, i)
             })
             .collect();
         labeled.sort();
 
         let mut out: Vec<(String, Vec<usize>)> = Vec::new();
-        for (_, label, _, _, i) in labeled {
+        for (_, label, _, _, _, i) in labeled {
             match out.last_mut() {
                 Some(last) if last.0 == label => last.1.push(i),
                 _ => out.push((label, vec![i])),
@@ -750,10 +779,7 @@ impl App {
                 self.mode = Mode::PickDir;
             }
             KeyCode::Char('s') => {
-                self.group_mode = match self.group_mode {
-                    GroupMode::State => GroupMode::Dir,
-                    GroupMode::Dir => GroupMode::State,
-                };
+                self.group_mode = self.group_mode.next();
             }
             KeyCode::Char('w') => {
                 self.input.clear();
@@ -1281,6 +1307,23 @@ mod tests {
                 group: None,
             });
         }
+
+        fn spawn_grouped(&mut self, cmd: &str, cwd: PathBuf, group: &str) {
+            self.transport.send(Command::Spawn {
+                command: cmd.to_string(),
+                cwd,
+                group: Some(group.to_string()),
+            });
+        }
+
+        /// Section labels paired with member ids: what the grouping tests
+        /// assert against, since `sections()` hands back `views` indices.
+        fn section_ids(&self) -> Vec<(String, Vec<u64>)> {
+            self.sections()
+                .into_iter()
+                .map(|(l, idxs)| (l, idxs.into_iter().map(|i| self.views[i].id).collect()))
+                .collect()
+        }
     }
 
     /// Selection is bound to a task id, so a reorder (here: tagging a task into
@@ -1328,6 +1371,142 @@ mod tests {
         assert_eq!(s.len(), 2, "one section per distinct cwd");
         assert_eq!(s[0].0, app.invocation_label, "invocation dir sorts first");
         assert_eq!(s[1].0, "/tmp");
+    }
+
+    /// `next()` owns the mode cycle; the `s` key just applies it.
+    #[test]
+    fn group_mode_cycles_state_dir_custom() {
+        assert_eq!(GroupMode::State.next(), GroupMode::Dir);
+        assert_eq!(GroupMode::Dir.next(), GroupMode::Custom);
+        assert_eq!(GroupMode::Custom.next(), GroupMode::State);
+
+        let mut app = App::new_local(30, 100);
+        assert_eq!(app.group_mode, GroupMode::State);
+        for expect in [GroupMode::Dir, GroupMode::Custom, GroupMode::State] {
+            app.on_key_dashboard(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE));
+            assert_eq!(app.group_mode, expect);
+        }
+    }
+
+    /// Custom mode: one section per group name, alphabetical, with the
+    /// Unassigned inbox last — after every named group, not first like Dir
+    /// mode's invocation dir.
+    #[test]
+    fn custom_mode_groups_by_workstream_with_unassigned_last() {
+        let mut app = App::new_local(30, 100);
+        let inv = app.invocation_dir.clone();
+        app.spawn_grouped("sleep 5", inv.clone(), "beta"); // id 1
+        app.spawn_grouped("sleep 5", inv.clone(), "alpha"); // id 2
+        app.spawn_in("sleep 5", inv); // id 3, no group
+        app.pump();
+
+        app.group_mode = GroupMode::Custom;
+        assert_eq!(
+            app.section_ids(),
+            vec![
+                ("alpha".to_string(), vec![2]),
+                ("beta".to_string(), vec![1]),
+                ("Unassigned".to_string(), vec![3]),
+            ]
+        );
+    }
+
+    /// The Unassigned section exists only when an ungrouped task does: no
+    /// placeholder when the fleet is fully curated, and no phantom named
+    /// groups when nothing is.
+    #[test]
+    fn custom_mode_unassigned_tracks_membership() {
+        let mut app = App::new_local(30, 100);
+        let inv = app.invocation_dir.clone();
+        app.spawn_grouped("sleep 5", inv.clone(), "alpha"); // id 1
+        app.pump();
+        app.group_mode = GroupMode::Custom;
+        assert_eq!(app.section_ids(), vec![("alpha".to_string(), vec![1])]);
+
+        let mut app = App::new_local(30, 100);
+        let inv = app.invocation_dir.clone();
+        app.spawn_in("sleep 5", inv); // id 1, no group
+        app.pump();
+        app.group_mode = GroupMode::Custom;
+        assert_eq!(app.section_ids(), vec![("Unassigned".to_string(), vec![1])]);
+    }
+
+    /// In Custom mode a tag reorders *within* the task's group (the bucket
+    /// component still sorts ahead of id): it must not eject the task into a
+    /// global "In use" section, which only State mode has.
+    #[test]
+    fn custom_mode_tag_floats_within_group() {
+        let mut app = App::new_local(30, 100);
+        let inv = app.invocation_dir.clone();
+        app.spawn_grouped("sleep 5", inv.clone(), "alpha"); // id 1
+        app.spawn_grouped("sleep 5", inv, "alpha"); // id 2
+        app.pump();
+        app.group_mode = GroupMode::Custom;
+        assert_eq!(app.section_ids(), vec![("alpha".to_string(), vec![1, 2])]);
+
+        app.transport.send(Command::Tag { id: 2, on: true });
+        app.pump();
+        assert_eq!(
+            app.section_ids(),
+            vec![("alpha".to_string(), vec![2, 1])],
+            "tag floats id 2 to the top of alpha, not into an In use section"
+        );
+    }
+
+    /// Reassigning a task's group reorders the list; the id-bound selection
+    /// must ride along, exactly like the tag reorder in
+    /// `selection_follows_task_across_reorder`.
+    #[test]
+    fn custom_mode_selection_survives_group_move() {
+        let mut app = App::new_local(30, 100);
+        let inv = app.invocation_dir.clone();
+        app.spawn_grouped("sleep 5", inv.clone(), "alpha"); // id 1
+        app.spawn_grouped("sleep 5", inv, "beta"); // id 2
+        app.pump();
+        app.group_mode = GroupMode::Custom;
+        app.resolve_selection();
+        assert_eq!(app.selected_id, Some(1));
+
+        // Move id 1 from "alpha" (first section) to "zeta" (now last).
+        app.transport.send(Command::SetGroup {
+            id: 1,
+            group: Some("zeta".to_string()),
+        });
+        app.pump();
+        assert_eq!(
+            app.section_ids(),
+            vec![("beta".to_string(), vec![2]), ("zeta".to_string(), vec![1]),]
+        );
+
+        // Still on id 1, even though it is now the last row.
+        assert_eq!(app.selected_id, Some(1));
+        assert_eq!(app.views[app.selected_task().unwrap()].id, 1);
+    }
+
+    /// Within one group the dir component clusters tasks by cwd, and within
+    /// one dir the id component keeps spawn order — so a group spanning
+    /// subdirectories reads as dir-sized runs, not an id interleave.
+    #[test]
+    fn custom_mode_clusters_by_dir_within_group() {
+        let mut app = App::new_local(30, 100);
+        let base = std::env::temp_dir().join(format!("fleetcom_app_cg_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let (dir_a, dir_b) = (base.join("a"), base.join("b"));
+        std::fs::create_dir_all(&dir_a).unwrap();
+        std::fs::create_dir_all(&dir_b).unwrap();
+
+        app.spawn_grouped("sleep 5", dir_b.clone(), "alpha"); // id 1, dir b
+        app.spawn_grouped("sleep 5", dir_a.clone(), "alpha"); // id 2, dir a
+        app.spawn_grouped("sleep 5", dir_a, "alpha"); // id 3, dir a
+        app.pump();
+
+        app.group_mode = GroupMode::Custom;
+        assert_eq!(
+            app.section_ids(),
+            vec![("alpha".to_string(), vec![2, 3, 1])],
+            "dir a's tasks cluster (in id order) ahead of dir b's"
+        );
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     /// A manual tag must pull a task out of Completed into In use, even after it
