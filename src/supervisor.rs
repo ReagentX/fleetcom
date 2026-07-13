@@ -14,7 +14,7 @@ use crate::{
     core::{Wake, Waker},
     path,
     protocol::{Command, Event, LaunchContext, ScreenView, ScrollAction, TaskView},
-    session::{self, SessionConfig},
+    session::{self, SessionConfig, SessionEntry},
     task::Task,
 };
 
@@ -468,8 +468,9 @@ impl Supervisor {
         }
     }
 
-    /// Snapshot the task set as a `{dir: [commands]}` recipe, in spawn (id) order
-    /// within each dir.
+    /// Snapshot the task set as a `{dir: [entries]}` recipe, in spawn (id)
+    /// order within each dir. Each entry carries the task's group so a
+    /// reloaded fleet keeps its sections.
     fn session_config(&self) -> SessionConfig {
         let mut order: Vec<usize> = (0..self.tasks.len()).collect();
         order.sort_by_key(|&i| self.tasks[i].id);
@@ -478,7 +479,10 @@ impl Supervisor {
             let t = &self.tasks[i];
             cfg.entry(path::abbreviate(&t.cwd))
                 .or_default()
-                .push(t.command.clone());
+                .push(SessionEntry {
+                    cmd: t.command.clone(),
+                    group: t.group.clone(),
+                });
         }
         cfg
     }
@@ -543,26 +547,30 @@ impl Supervisor {
             return;
         };
         let (mut spawned, mut skipped) = (0usize, 0usize);
-        for (dir, cmds) in &cfg {
+        for (dir, entries) in &cfg {
             let resolved = path::resolve(&launch.cwd, dir);
             if !resolved.is_dir() {
-                skipped += cmds.len();
+                skipped += entries.len();
                 continue;
             }
-            for cmd in cmds {
+            for entry in entries {
                 if self.tasks.len() >= MAX_TASKS {
                     skipped += 1;
                     continue;
                 }
-                if let Ok(task) = Task::spawn(
+                if let Ok(mut task) = Task::spawn(
                     self.next_id,
-                    cmd,
+                    &entry.cmd,
                     &resolved,
                     self.rows,
                     self.cols,
                     &launch.env,
                     Arc::clone(&self.waker),
                 ) {
+                    // Recipes are hand-editable on disk, so a loaded group
+                    // re-crosses the same boundary as `Spawn` instead of
+                    // trusting the file's bytes.
+                    task.group = normalize_group(entry.group.clone());
                     self.next_id += 1;
                     self.tasks.push(task);
                     spawned += 1;
@@ -621,9 +629,24 @@ mod tests {
         let cfg = s.session_config();
         assert_eq!(
             cfg[&path::abbreviate(&here())],
-            vec!["a".to_string(), "c".to_string()]
+            vec![
+                SessionEntry {
+                    cmd: "a".into(),
+                    group: None,
+                },
+                SessionEntry {
+                    cmd: "c".into(),
+                    group: None,
+                },
+            ]
         );
-        assert_eq!(cfg["/tmp"], vec!["b".to_string()]);
+        assert_eq!(
+            cfg["/tmp"],
+            vec![SessionEntry {
+                cmd: "b".into(),
+                group: None,
+            }]
+        );
     }
 
     /// `tick` emits exactly a `Tasks` snapshot while nothing is watched, and
@@ -1682,6 +1705,104 @@ mod tests {
             evs.iter()
                 .any(|e| matches!(e, Event::Status(m) if m.starts_with("loaded 'ctx'"))),
             "load must find the recipe under the same root; got {evs:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Groups survive the save/load cycle: reloading a curated fleet after a
+    /// daemon restart must not dump everything into Unassigned.
+    #[test]
+    fn load_session_restores_saved_groups() {
+        let dir = scratch("sess_groups");
+        let config = dir.join("config");
+        let ctx = LaunchContext {
+            env: vec![(
+                "FLEETCOM_CONFIG_DIR".into(),
+                config.clone().into_os_string(),
+            )],
+            cwd: dir.clone(),
+        };
+        let mut s = Supervisor::new(24, 80);
+        s.set_launch_context(ctx.clone());
+        s.apply(Command::Spawn {
+            command: "sleep 30".into(),
+            cwd: dir.clone(),
+            group: Some("api".into()),
+        });
+        s.apply(Command::Spawn {
+            command: "sleep 31".into(),
+            cwd: dir.clone(),
+            group: None,
+        });
+        s.apply(Command::SaveSession {
+            name: "fleet".into(),
+        });
+        assert!(
+            s.drain().iter().any(
+                |e| matches!(e, Event::Status(m) if m.starts_with("saved 'fleet': 2 command(s)"))
+            ),
+            "save must still count commands"
+        );
+
+        let mut fresh = Supervisor::new(24, 80);
+        fresh.set_launch_context(ctx);
+        fresh.apply(Command::LoadSession {
+            name: "fleet".into(),
+        });
+        fresh.tick();
+        let evs = fresh.drain();
+        let tasks = evs
+            .iter()
+            .find_map(|e| match e {
+                Event::Tasks(v) => Some(v),
+                _ => None,
+            })
+            .expect("a Tasks snapshot after load");
+        let group_of = |cmd: &str| {
+            tasks
+                .iter()
+                .find(|t| t.command == cmd)
+                .unwrap_or_else(|| panic!("task '{cmd}' missing after load"))
+                .group
+                .clone()
+        };
+        assert_eq!(group_of("sleep 30"), Some("api".into()));
+        assert_eq!(group_of("sleep 31"), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A hand-edited recipe's group re-crosses the `Spawn` normalization
+    /// boundary on load: padding is trimmed rather than trusted from disk.
+    #[test]
+    fn load_session_renormalizes_hand_edited_groups() {
+        let dir = scratch("sess_norm");
+        let config = dir.join("config");
+        std::fs::create_dir_all(config.join("sessions")).unwrap();
+        std::fs::write(
+            config.join("sessions").join("edited.json"),
+            format!(
+                r#"{{"{}": [{{"cmd": "sleep 30", "group": "  x  "}}]}}"#,
+                dir.display()
+            ),
+        )
+        .unwrap();
+        let mut s = Supervisor::new(24, 80);
+        s.set_launch_context(LaunchContext {
+            env: vec![("FLEETCOM_CONFIG_DIR".into(), config.into_os_string())],
+            cwd: dir.clone(),
+        });
+        s.apply(Command::LoadSession {
+            name: "edited".into(),
+        });
+        s.tick();
+        let evs = s.drain();
+        let restored = evs.iter().any(|e| {
+            matches!(e, Event::Tasks(v)
+                if v.iter().any(|t| t.group.as_deref() == Some("x")))
+        });
+        assert!(
+            restored,
+            "loaded group must come back normalized; got {evs:?}"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

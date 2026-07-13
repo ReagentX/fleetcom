@@ -7,8 +7,27 @@ use std::{
     path::{Path, PathBuf},
 };
 
+/// One recipe member: a command plus its optional workstream group.
+///
+/// Two serialized forms: `group: None` writes the command as a plain JSON
+/// string — exactly the pre-group format — and `group: Some` writes
+/// `{"cmd": ..., "group": ...}`. The compat contract:
+///
+/// - old files (string members only) parse unchanged;
+/// - a config with no groups writes a file byte-identical to the pre-group
+///   format;
+/// - an *older* fleetcom reading a *new* grouped file silently drops the
+///   object-form members — its parser keeps only string members — so the
+///   downgrade loses those commands entirely, not merely their groups. That
+///   lossy path is accepted and documented here, not fixed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionEntry {
+    pub cmd: String,
+    pub group: Option<String>,
+}
+
 /// Session recipe mapping directories to ordered commands.
-pub type SessionConfig = BTreeMap<String, Vec<String>>;
+pub type SessionConfig = BTreeMap<String, Vec<SessionEntry>>;
 
 /// Characters replaced with `_` in session filenames.
 const DISALLOWED: &[char] = &['*', '"', '/', '\\', '<', '>', ':', '|', '?', '.'];
@@ -38,10 +57,21 @@ pub fn sessions_dir() -> Option<PathBuf> {
 
 fn to_json(cfg: &SessionConfig) -> String {
     let mut obj = jzon::JsonValue::new_object();
-    for (dir, cmds) in cfg {
+    for (dir, entries) in cfg {
         let mut arr = jzon::JsonValue::new_array();
-        for c in cmds {
-            let _ = arr.push(c.as_str());
+        for e in entries {
+            let member = match &e.group {
+                // A plain string, not `{"cmd": ...}`: this arm is what keeps
+                // group-free configs byte-identical to the pre-group format.
+                None => jzon::JsonValue::from(e.cmd.as_str()),
+                Some(g) => {
+                    let mut m = jzon::JsonValue::new_object();
+                    let _ = m.insert("cmd", e.cmd.as_str());
+                    let _ = m.insert("group", g.as_str());
+                    m
+                }
+            };
+            let _ = arr.push(member);
         }
         let _ = obj.insert(dir, arr);
     }
@@ -52,11 +82,29 @@ fn from_json(text: &str) -> io::Result<SessionConfig> {
     let parsed = jzon::parse(text).map_err(|e| io::Error::other(e.to_string()))?;
     let mut cfg = SessionConfig::new();
     for (dir, val) in parsed.entries() {
-        let cmds = val
+        // Same tolerance as the string-only parser this replaces: a member
+        // that fits neither form (non-string scalar, object without a string
+        // "cmd", non-string "group") is dropped, never an error.
+        let entries = val
             .members()
-            .filter_map(|m| m.as_str().map(str::to_string))
+            .filter_map(|m| {
+                if let Some(cmd) = m.as_str() {
+                    return Some(SessionEntry {
+                        cmd: cmd.to_string(),
+                        group: None,
+                    });
+                }
+                // Indexing a non-object yields Null, so `as_str()?` drops
+                // every malformed member through the same hole.
+                let cmd = m["cmd"].as_str()?.to_string();
+                let group = match &m["group"] {
+                    g if g.is_null() => None,
+                    g => Some(g.as_str()?.to_string()),
+                };
+                Some(SessionEntry { cmd, group })
+            })
             .collect();
-        cfg.insert(dir.to_string(), cmds);
+        cfg.insert(dir.to_string(), entries);
     }
     Ok(cfg)
 }
@@ -103,17 +151,91 @@ mod tests {
         d
     }
 
+    /// Ungrouped entry: the plain-string member form.
+    fn e(cmd: &str) -> SessionEntry {
+        SessionEntry {
+            cmd: cmd.into(),
+            group: None,
+        }
+    }
+
+    /// Grouped entry: the `{"cmd", "group"}` member form.
+    fn ge(cmd: &str, group: &str) -> SessionEntry {
+        SessionEntry {
+            cmd: cmd.into(),
+            group: Some(group.into()),
+        }
+    }
+
     #[test]
     fn round_trips_dirs_and_commands() {
         let dir = temp("roundtrip");
         let mut cfg = SessionConfig::new();
-        cfg.insert("~/proj".into(), vec!["cargo test".into(), "vim".into()]);
-        cfg.insert("/tmp".into(), vec!["top".into()]);
+        cfg.insert("~/proj".into(), vec![e("cargo test"), e("vim")]);
+        cfg.insert("/tmp".into(), vec![e("top")]);
 
         save_in(&dir, "work", &cfg).unwrap();
         assert_eq!(load_in(&dir, "work").unwrap(), cfg);
         assert_eq!(list_in(&dir), vec!["work".to_string()]);
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Both member forms coexist in one dir array and survive a round trip.
+    #[test]
+    fn round_trips_mixed_grouped_and_ungrouped_entries() {
+        let dir = temp("mixed");
+        let mut cfg = SessionConfig::new();
+        cfg.insert(
+            "~/proj".into(),
+            vec![ge("cargo test", "ci"), e("vim"), ge("top", "ops")],
+        );
+
+        save_in(&dir, "mixed", &cfg).unwrap();
+        assert_eq!(load_in(&dir, "mixed").unwrap(), cfg);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A pre-group file (string members only) parses into all-`None` groups.
+    #[test]
+    fn parses_the_pre_group_string_only_format() {
+        let cfg = from_json(r#"{"~/proj": ["cargo test", "vim"]}"#).unwrap();
+        assert_eq!(cfg["~/proj"], vec![e("cargo test"), e("vim")]);
+    }
+
+    /// The byte-identity half of the compat contract: a group-free config
+    /// must serialize with no object members, pinned to the exact `pretty(2)`
+    /// bytes the pre-group `to_json` produced.
+    #[test]
+    fn group_free_config_writes_the_pre_group_bytes() {
+        let mut cfg = SessionConfig::new();
+        cfg.insert("~/proj".into(), vec![e("cargo test"), e("vim")]);
+        cfg.insert("/tmp".into(), vec![e("top")]);
+
+        let expected = "{\n  \"/tmp\": [\n    \"top\"\n  ],\n  \"~/proj\": [\n    \"cargo test\",\n    \"vim\"\n  ]\n}";
+        assert_eq!(to_json(&cfg), expected);
+    }
+
+    /// Malformed members drop through the same `filter_map` hole as the old
+    /// parser's non-string members: no error, no partial entry.
+    #[test]
+    fn malformed_object_members_drop_without_error() {
+        let cfg = from_json(
+            r#"{"d": [
+                {"group": "g"},
+                {"cmd": 3},
+                {"cmd": "x", "group": 5},
+                42,
+                {"cmd": "bare"},
+                {"cmd": "n", "group": null},
+                {"cmd": "ok", "group": "api"},
+                "plain"
+            ]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            cfg["d"],
+            vec![e("bare"), e("n"), ge("ok", "api"), e("plain")]
+        );
     }
 
     #[test]
