@@ -7,6 +7,7 @@
 mod app;
 mod core;
 mod daemon;
+mod emulator;
 mod format;
 mod frame;
 mod path;

@@ -22,6 +22,7 @@ use rustix::process::{WaitId, WaitIdOptions, waitid};
 
 use crate::{
     core::{Wake, Waker},
+    emulator::Emulator,
     protocol::{Lifecycle, MouseKind, ScrollAction},
 };
 
@@ -91,9 +92,9 @@ pub fn paste_bytes(bracketed: bool, content: &[u8]) -> Vec<u8> {
 /// protocols determine supported actions and encoding. Without one,
 /// full-screen children receive wheel actions as alternate-scroll arrows;
 /// unsupported actions return `None`.
-pub fn mouse_bytes(screen: &vt100::Screen, kind: MouseKind, col: u16, row: u16) -> Option<Vec<u8>> {
-    use vt100::{MouseProtocolEncoding, MouseProtocolMode};
-    let mode = screen.mouse_protocol_mode();
+pub fn mouse_bytes(emu: &Emulator, kind: MouseKind, col: u16, row: u16) -> Option<Vec<u8>> {
+    use crate::emulator::{MouseProtocolEncoding, MouseProtocolMode};
+    let mode = emu.mouse_protocol_mode();
     if mode != MouseProtocolMode::None {
         // The mode determines supported event classes.
         let wanted = match kind {
@@ -115,7 +116,7 @@ pub fn mouse_bytes(screen: &vt100::Screen, kind: MouseKind, col: u16, row: u16) 
             MouseKind::Drag(b) => 32 + b as u16,
         };
         let release = matches!(kind, MouseKind::Release(_));
-        return Some(match screen.mouse_protocol_encoding() {
+        return Some(match emu.mouse_protocol_encoding() {
             // SGR releases use the `m` suffix.
             MouseProtocolEncoding::Sgr => {
                 let suffix = if release { 'm' } else { 'M' };
@@ -147,14 +148,14 @@ pub fn mouse_bytes(screen: &vt100::Screen, kind: MouseKind, col: u16, row: u16) 
             }
         });
     }
-    if screen.alternate_screen() {
+    if emu.alternate_screen() {
         let up = match kind {
             MouseKind::WheelUp => true,
             MouseKind::WheelDown => false,
             // Only wheel actions map to alternate-scroll arrows.
             _ => return None,
         };
-        let arrow: &[u8] = match (screen.application_cursor(), up) {
+        let arrow: &[u8] = match (emu.application_cursor(), up) {
             (true, true) => b"\x1bOA",
             (true, false) => b"\x1bOB",
             (false, true) => b"\x1b[A",
@@ -184,7 +185,7 @@ pub struct Task {
     pid: Option<u32>,
     /// Shared with the reader thread: it writes (process bytes), the UI reads
     /// (render/preview). Contention is trivial: writes are per output chunk.
-    parser: Arc<Mutex<vt100::Parser>>,
+    parser: Arc<Mutex<Emulator>>,
     last_activity: Arc<Mutex<Instant>>,
     handle: Option<JoinHandle<()>>,
     pub tagged: bool,
@@ -213,8 +214,8 @@ fn signal(waker: &Waker) {
     }
 }
 
-/// Lock the shared vt100 grid, recovering from a poisoned mutex.
-fn grid(parser: &Mutex<vt100::Parser>) -> std::sync::MutexGuard<'_, vt100::Parser> {
+/// Lock the shared emulator grid, recovering from a poisoned mutex.
+fn grid(parser: &Mutex<Emulator>) -> std::sync::MutexGuard<'_, Emulator> {
     parser
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -291,7 +292,7 @@ impl Task {
         let mut reader = pair.master.try_clone_reader().map_err(io_err)?;
         let writer = pair.master.take_writer().map_err(io_err)?;
 
-        let parser = Arc::new(Mutex::new(vt100::Parser::new(rows, cols, SCROLLBACK)));
+        let parser = Arc::new(Mutex::new(Emulator::new(rows, cols, SCROLLBACK)));
         let last_activity = Arc::new(Mutex::new(Instant::now()));
 
         let handle = {
@@ -451,7 +452,6 @@ impl Task {
     /// The dashboard preview line: the last non-blank row of the live screen.
     pub fn preview(&self) -> String {
         grid(&self.parser)
-            .screen()
             .contents()
             .lines()
             .rev()
@@ -463,15 +463,12 @@ impl Task {
     /// Full screen as ANSI bytes for attached mode, plus cursor state so we can
     /// place the real cursor where the child put it.
     pub fn formatted(&self) -> (Vec<u8>, (u16, u16), bool) {
-        let p = grid(&self.parser);
-        let s = p.screen();
-        (s.contents_formatted(), s.cursor_position(), s.hide_cursor())
+        grid(&self.parser).formatted()
     }
 
     /// Snapshot of visible rows for the peek overlay.
     pub fn screen_lines(&self) -> Vec<String> {
         grid(&self.parser)
-            .screen()
             .contents()
             .lines()
             .map(str::to_string)
@@ -487,7 +484,7 @@ impl Task {
                 pixel_height: 0,
             })
             .map_err(io_err)?;
-        grid(&self.parser).screen_mut().set_size(rows, cols);
+        grid(&self.parser).resize(rows, cols);
         Ok(())
     }
 
@@ -501,8 +498,8 @@ impl Task {
     /// Input returns the viewport to live before the bytes are queued.
     fn snap_live(&mut self) {
         let mut p = grid(&self.parser);
-        if p.screen().scrollback() > 0 {
-            p.screen_mut().set_scrollback(0);
+        if p.scrollback() > 0 {
+            p.set_scrollback(0);
         }
     }
 
@@ -527,19 +524,19 @@ impl Task {
     /// Move the scrollback viewport, clamped to retained history.
     pub fn scroll_view(&mut self, action: ScrollAction) {
         let mut p = grid(&self.parser);
-        let cur = p.screen().scrollback();
+        let cur = p.scrollback();
         let target = match action {
             ScrollAction::Up(n) => cur.saturating_add(n as usize),
             ScrollAction::Down(n) => cur.saturating_sub(n as usize),
             ScrollAction::Top => usize::MAX,
             ScrollAction::Live => 0,
         };
-        p.screen_mut().set_scrollback(target);
+        p.set_scrollback(target);
     }
 
     /// Rows the viewport is scrolled back from live output.
     pub fn scroll_offset(&self) -> usize {
-        grid(&self.parser).screen().scrollback()
+        grid(&self.parser).scrollback()
     }
 
     /// Forward a clipboard paste in whichever shape the child negotiated; see
@@ -547,7 +544,7 @@ impl Task {
     /// on this thread), then queued whole: the PTY write itself happens on the
     /// writer worker.
     pub fn send_paste(&mut self, content: &[u8]) -> Result<(), WriteRefused> {
-        let bracketed = grid(&self.parser).screen().bracketed_paste();
+        let bracketed = grid(&self.parser).bracketed_paste();
         let msg = paste_bytes(bracketed, content);
         self.snap_live();
         self.queue_write(msg)
@@ -558,7 +555,7 @@ impl Task {
     pub fn send_mouse(&mut self, kind: MouseKind, col: u16, row: u16) -> Result<(), WriteRefused> {
         let bytes = {
             let p = grid(&self.parser);
-            mouse_bytes(p.screen(), kind, col, row)
+            mouse_bytes(&p, kind, col, row)
         };
         match bytes {
             Some(b) => self.send_input(&b),
@@ -570,10 +567,9 @@ impl Task {
     /// screen. The client receives these values in each `ScreenView`.
     pub fn input_hints(&self) -> (bool, bool) {
         let p = grid(&self.parser);
-        let s = p.screen();
         (
-            s.mouse_protocol_mode() != vt100::MouseProtocolMode::None,
-            s.alternate_screen(),
+            p.mouse_protocol_mode() != crate::emulator::MouseProtocolMode::None,
+            p.alternate_screen(),
         )
     }
 
@@ -710,7 +706,7 @@ mod tests {
     fn resize_is_reflected_in_the_grid() {
         let mut t = Task::spawn(3, "sleep 5", &here(), 24, 80, &env_here(), no_waker()).unwrap();
         t.resize(30, 100).unwrap();
-        assert_eq!(t.parser.lock().unwrap().screen().size(), (30, 100));
+        assert_eq!(t.parser.lock().unwrap().size(), (30, 100));
         t.terminate();
     }
 
@@ -841,51 +837,48 @@ mod tests {
     fn wheel_routes_by_child_state() {
         let up = MouseKind::WheelUp;
         let down = MouseKind::WheelDown;
-        let mut p = vt100::Parser::new(24, 80, 0);
+        let mut p = Emulator::new(24, 80, 0);
         // Inline child, no mouse: dropped, not translated into arrow spam.
-        assert_eq!(mouse_bytes(p.screen(), up, 0, 0), None);
+        assert_eq!(mouse_bytes(&p, up, 0, 0), None);
         // Full-screen child: three arrows per notch, normal cursor keys.
         p.process(b"\x1b[?1049h");
         assert_eq!(
-            mouse_bytes(p.screen(), up, 0, 0),
+            mouse_bytes(&p, up, 0, 0),
             Some(b"\x1b[A\x1b[A\x1b[A".to_vec())
         );
         // Clicks mean nothing to a full-screen child without a mouse mode.
         assert_eq!(
-            mouse_bytes(p.screen(), MouseKind::Press(MouseBtn::Left), 0, 0),
+            mouse_bytes(&p, MouseKind::Press(MouseBtn::Left), 0, 0),
             None
         );
         // Application cursor keys switch the arrows to SS3 form.
         p.process(b"\x1b[?1h");
         assert_eq!(
-            mouse_bytes(p.screen(), down, 0, 0),
+            mouse_bytes(&p, down, 0, 0),
             Some(b"\x1bOB\x1bOB\x1bOB".to_vec())
         );
         // SGR mouse protocol: a real wheel event, 1-based coordinates.
         p.process(b"\x1b[?1000h\x1b[?1006h");
-        assert_eq!(
-            mouse_bytes(p.screen(), up, 4, 2),
-            Some(b"\x1b[<64;5;3M".to_vec())
-        );
+        assert_eq!(mouse_bytes(&p, up, 4, 2), Some(b"\x1b[<64;5;3M".to_vec()));
         // Default encoding: single-byte cells, clamped to fit.
         p.process(b"\x1b[?1006l");
         assert_eq!(
-            mouse_bytes(p.screen(), down, 0, 0),
+            mouse_bytes(&p, down, 0, 0),
             Some(vec![0x1b, b'[', b'M', 32 + 65, 33, 33])
         );
         assert_eq!(
-            mouse_bytes(p.screen(), down, 500, 500),
+            mouse_bytes(&p, down, 500, 500),
             Some(vec![0x1b, b'[', b'M', 32 + 65, 255, 255])
         );
         // UTF-8 mouse coordinates can use multiple bytes.
         p.process(b"\x1b[?1005h");
         assert_eq!(
-            mouse_bytes(p.screen(), up, 200, 2),
+            mouse_bytes(&p, up, 200, 2),
             Some(vec![0x1b, b'[', b'M', 32 + 64, 0xc3, 0xa9, 33 + 2])
         );
         // UTF-8 mouse coordinates cap at the protocol limit.
         assert_eq!(
-            mouse_bytes(p.screen(), up, 5000, 5000),
+            mouse_bytes(&p, up, 5000, 5000),
             Some(vec![0x1b, b'[', b'M', 32 + 64, 0xdf, 0xbf, 0xdf, 0xbf])
         );
     }
@@ -898,37 +891,31 @@ mod tests {
         let release = MouseKind::Release(MouseBtn::Left);
 
         // X10 mode: presses only.
-        let mut p = vt100::Parser::new(24, 80, 0);
+        let mut p = Emulator::new(24, 80, 0);
         p.process(b"\x1b[?9h");
         assert_eq!(
-            mouse_bytes(p.screen(), press, 4, 2),
+            mouse_bytes(&p, press, 4, 2),
             Some(vec![0x1b, b'[', b'M', 32, 33 + 4, 33 + 2])
         );
-        assert_eq!(mouse_bytes(p.screen(), release, 4, 2), None);
-        assert_eq!(mouse_bytes(p.screen(), drag, 4, 2), None);
+        assert_eq!(mouse_bytes(&p, release, 4, 2), None);
+        assert_eq!(mouse_bytes(&p, drag, 4, 2), None);
 
         // 1000 with SGR: releases use `m`; drags remain disabled.
         p.process(b"\x1b[?9l\x1b[?1000h\x1b[?1006h");
+        assert_eq!(mouse_bytes(&p, press, 4, 2), Some(b"\x1b[<0;5;3M".to_vec()));
         assert_eq!(
-            mouse_bytes(p.screen(), press, 4, 2),
-            Some(b"\x1b[<0;5;3M".to_vec())
-        );
-        assert_eq!(
-            mouse_bytes(p.screen(), release, 4, 2),
+            mouse_bytes(&p, release, 4, 2),
             Some(b"\x1b[<0;5;3m".to_vec())
         );
-        assert_eq!(mouse_bytes(p.screen(), drag, 4, 2), None);
+        assert_eq!(mouse_bytes(&p, drag, 4, 2), None);
 
         // 1002 enables drag events.
         p.process(b"\x1b[?1002h");
-        assert_eq!(
-            mouse_bytes(p.screen(), drag, 4, 2),
-            Some(b"\x1b[<32;5;3M".to_vec())
-        );
+        assert_eq!(mouse_bytes(&p, drag, 4, 2), Some(b"\x1b[<32;5;3M".to_vec()));
         // Non-SGR releases use code 3.
         p.process(b"\x1b[?1006l");
         assert_eq!(
-            mouse_bytes(p.screen(), release, 4, 2),
+            mouse_bytes(&p, release, 4, 2),
             Some(vec![0x1b, b'[', b'M', 32 + 3, 33 + 4, 33 + 2])
         );
     }
@@ -973,7 +960,7 @@ mod tests {
         let deadline = Instant::now() + Duration::from_secs(5);
         let mut contents = String::new();
         while Instant::now() < deadline {
-            contents = grid(&t.parser).screen().contents();
+            contents = grid(&t.parser).contents();
             if contents.contains("zqsecondqz") {
                 break;
             }
