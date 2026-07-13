@@ -594,6 +594,7 @@ impl App {
         self.transport.send(Command::Spawn {
             command: command.to_string(),
             cwd: self.spawn_cwd.clone(),
+            group: None,
         });
     }
 
@@ -1277,6 +1278,7 @@ mod tests {
             self.transport.send(Command::Spawn {
                 command: cmd.to_string(),
                 cwd,
+                group: None,
             });
         }
     }

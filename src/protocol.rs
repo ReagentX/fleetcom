@@ -12,7 +12,7 @@ use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
 use crate::frame::{KIND_CONTROL, KIND_HELLO, KIND_SCREEN};
 
 /// Wire-protocol version; the handshake rejects mismatched peers.
-pub const PROTOCOL_VERSION: u32 = 6;
+pub const PROTOCOL_VERSION: u32 = 7;
 
 /// Environment and working directory supplied by the launching client.
 #[derive(Debug, Clone, PartialEq)]
@@ -38,8 +38,14 @@ impl LaunchContext {
 /// command.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Command {
-    /// Run `command` under `$SHELL -c` in `cwd`.
-    Spawn { command: String, cwd: PathBuf },
+    /// Run `command` under `$SHELL -c` in `cwd`. `group` is the spawn-time
+    /// workstream assignment: it carries the client's group inheritance now
+    /// and session-recipe groups later.
+    Spawn {
+        command: String,
+        cwd: PathBuf,
+        group: Option<String>,
+    },
     /// Signal-kill a live task's process group; it reaps into Completed.
     Kill { id: u64 },
     /// Drop a task from the set entirely (used on already-finished tasks).
@@ -50,6 +56,8 @@ pub enum Command {
     Restart { id: u64 },
     /// Set the manual "in use" tag.
     Tag { id: u64, on: bool },
+    /// Set a task's workstream group; `None` clears it back to unassigned.
+    SetGroup { id: u64, group: Option<String> },
     /// Client terminal resized: `rows`×`cols` is the PTY *content* size. The
     /// client has already subtracted the row it reserves for its status bar.
     Resize { rows: u16, cols: u16 },
@@ -151,6 +159,8 @@ pub struct TaskView {
     pub command: String,
     pub cwd: PathBuf,
     pub tagged: bool,
+    /// Workstream group; `None` = unassigned.
+    pub group: Option<String>,
     pub lifecycle: Lifecycle,
     pub preview: String,
     pub started_ago: Duration,
@@ -269,10 +279,17 @@ pub fn decode_hello(kind: u8, payload: &[u8]) -> Option<(u32, LaunchContext)> {
 pub fn encode_command(cmd: &Command) -> (u8, Vec<u8>) {
     let mut o = jzon::JsonValue::new_object();
     match cmd {
-        Command::Spawn { command, cwd } => {
+        Command::Spawn {
+            command,
+            cwd,
+            group,
+        } => {
             let _ = o.insert("t", "spawn");
             let _ = o.insert("command", command.as_str());
             let _ = o.insert("cwd", path_b64(cwd));
+            if let Some(g) = group {
+                let _ = o.insert("group", g.as_str());
+            }
         }
         Command::Kill { id } => {
             let _ = o.insert("t", "kill");
@@ -290,6 +307,14 @@ pub fn encode_command(cmd: &Command) -> (u8, Vec<u8>) {
             let _ = o.insert("t", "tag");
             let _ = o.insert("id", *id);
             let _ = o.insert("on", *on);
+        }
+        Command::SetGroup { id, group } => {
+            let _ = o.insert("t", "group");
+            let _ = o.insert("id", *id);
+            // Omitted when clearing: a missing and a null "g" decode identically.
+            if let Some(g) = group {
+                let _ = o.insert("g", g.as_str());
+            }
         }
         Command::Resize { rows, cols } => {
             let _ = o.insert("t", "resize");
@@ -381,6 +406,13 @@ pub fn decode_command(kind: u8, payload: &[u8]) -> Option<Command> {
         "spawn" => Command::Spawn {
             command: v["command"].as_str()?.to_string(),
             cwd: path_from_b64(&v["cwd"])?,
+            // Missing or null both mean unassigned: the encoder omits the key
+            // for `None`.
+            group: if v["group"].is_null() {
+                None
+            } else {
+                Some(v["group"].as_str()?.to_string())
+            },
         },
         "kill" => Command::Kill {
             id: v["id"].as_u64()?,
@@ -394,6 +426,14 @@ pub fn decode_command(kind: u8, payload: &[u8]) -> Option<Command> {
         "tag" => Command::Tag {
             id: v["id"].as_u64()?,
             on: v["on"].as_bool()?,
+        },
+        "group" => Command::SetGroup {
+            id: v["id"].as_u64()?,
+            group: if v["g"].is_null() {
+                None
+            } else {
+                Some(v["g"].as_str()?.to_string())
+            },
         },
         "resize" => Command::Resize {
             rows: u16_from(&v["rows"])?,
@@ -478,6 +518,11 @@ pub fn encode_event(ev: &Event) -> (u8, Vec<u8>) {
                 let _ = o.insert("command", tv.command.as_str());
                 let _ = o.insert("cwd", path_b64(&tv.cwd));
                 let _ = o.insert("tagged", tv.tagged);
+                // Omitted when unassigned: an ungrouped task's frame stays
+                // byte-identical to the pre-group encoding.
+                if let Some(g) = &tv.group {
+                    let _ = o.insert("group", g.as_str());
+                }
                 let _ = o.insert("life", lifecycle_str(tv.lifecycle));
                 let _ = o.insert("preview", tv.preview.as_str());
                 let _ = o.insert("started_ms", tv.started_ago.as_millis() as u64);
@@ -548,6 +593,13 @@ pub fn decode_event(kind: u8, payload: &[u8]) -> Option<Event> {
                             command: tv["command"].as_str()?.to_string(),
                             cwd: path_from_b64(&tv["cwd"])?,
                             tagged: tv["tagged"].as_bool()?,
+                            // Missing or null both mean unassigned: the
+                            // encoder omits the key for `None`.
+                            group: if tv["group"].is_null() {
+                                None
+                            } else {
+                                Some(tv["group"].as_str()?.to_string())
+                            },
                             lifecycle: lifecycle_from(tv["life"].as_str()?)?,
                             preview: tv["preview"].as_str()?.to_string(),
                             started_ago: Duration::from_millis(tv["started_ms"].as_u64()?),
@@ -609,16 +661,28 @@ mod tests {
             Command::Spawn {
                 command: "echo hi".into(),
                 cwd: PathBuf::from("/tmp"),
+                group: None,
             },
             Command::Spawn {
                 // Exercise byte-preserving serialization of a non-UTF-8 path.
                 command: "ls".into(),
                 cwd: PathBuf::from(OsString::from_vec(b"/tmp/\xff\xfe dir".to_vec())),
+                group: None,
+            },
+            Command::Spawn {
+                command: "make".into(),
+                cwd: PathBuf::from("/tmp"),
+                group: Some("build".into()),
             },
             Command::Kill { id: 7 },
             Command::Remove { id: 3 },
             Command::Restart { id: 4 },
             Command::Tag { id: 2, on: true },
+            Command::SetGroup {
+                id: 2,
+                group: Some("infra".into()),
+            },
+            Command::SetGroup { id: 2, group: None },
             Command::Resize {
                 rows: 30,
                 cols: 100,
@@ -827,6 +891,8 @@ mod tests {
             r#"{"t":"tasks","tasks":[{"id":"nope"}]}"#,
             // The cwd must be a base64 string.
             r#"{"t":"tasks","tasks":[{"id":1,"command":"x","cwd":"/x","tagged":true,"life":"ok","preview":"","started_ms":0}]}"#,
+            // A present group must be a string; only missing/null means unassigned.
+            r#"{"t":"tasks","tasks":[{"id":1,"command":"x","cwd":"Lw==","tagged":true,"life":"ok","preview":"","started_ms":0,"group":5}]}"#,
             r#"{"t":"tasks","tasks":["flat"]}"#,
             // Numeric member in `names`.
             r#"{"t":"sessions","names":["ok",5]}"#,
@@ -855,6 +921,7 @@ mod tests {
                 command: "vim".into(),
                 cwd: PathBuf::from("/home/x"),
                 tagged: true,
+                group: Some("x".into()),
                 lifecycle: Lifecycle::Idle,
                 preview: "~ line".into(),
                 started_ago: Duration::from_millis(4200),
@@ -865,6 +932,7 @@ mod tests {
                 // Exercise byte-preserving task-path serialization.
                 cwd: PathBuf::from(OsString::from_vec(b"/srv/\xff\xfe".to_vec())),
                 tagged: false,
+                group: None,
                 lifecycle: Lifecycle::Active,
                 preview: String::new(),
                 started_ago: Duration::from_millis(10),
@@ -877,6 +945,65 @@ mod tests {
         let status = Event::Status("saved 'x'".into());
         let (k, p) = encode_event(&status);
         assert_eq!(decode_event(k, &p), Some(status));
+    }
+
+    /// `SetGroup` wire form: `"g"` is present exactly when a group is set; a
+    /// missing or explicit-null `"g"` decodes as a clear.
+    #[test]
+    fn set_group_wire_form() {
+        let (k, p) = encode_command(&Command::SetGroup {
+            id: 3,
+            group: Some("infra".into()),
+        });
+        assert_eq!(k, KIND_CONTROL);
+        assert_eq!(
+            std::str::from_utf8(&p).unwrap(),
+            r#"{"t":"group","id":3,"g":"infra"}"#
+        );
+        let (_, p) = encode_command(&Command::SetGroup { id: 3, group: None });
+        assert!(!String::from_utf8(p).unwrap().contains("\"g\""));
+        // An explicit null clears, same as an omitted key.
+        assert_eq!(
+            decode_command(KIND_CONTROL, br#"{"t":"group","id":3,"g":null}"#),
+            Some(Command::SetGroup { id: 3, group: None })
+        );
+        // A present group must be a string.
+        assert_eq!(
+            decode_command(KIND_CONTROL, br#"{"t":"group","id":3,"g":5}"#),
+            None
+        );
+    }
+
+    /// A tasks frame carries `"group"` only for grouped tasks: an ungrouped
+    /// task's frame is byte-identical to the pre-group encoding, and a frame
+    /// without the key decodes to `None`.
+    #[test]
+    fn tasks_frame_group_key_is_optional() {
+        // The pre-group frame shape, verbatim ("Lw==" is "/").
+        let ungrouped = r#"{"t":"tasks","tasks":[{"id":1,"command":"x","cwd":"Lw==","tagged":false,"life":"ok","preview":"","started_ms":0}]}"#;
+        match decode_event(KIND_CONTROL, ungrouped.as_bytes()) {
+            Some(Event::Tasks(v)) => assert_eq!(v[0].group, None),
+            other => panic!("expected tasks event, got {other:?}"),
+        }
+        // Encoding the same task must reproduce that frame byte-for-byte: an
+        // ungrouped task never grows a "group" key.
+        let (_, p) = encode_event(&Event::Tasks(vec![TaskView {
+            id: 1,
+            command: "x".into(),
+            cwd: PathBuf::from("/"),
+            tagged: false,
+            group: None,
+            lifecycle: Lifecycle::Ok,
+            preview: String::new(),
+            started_ago: Duration::from_millis(0),
+        }]));
+        assert_eq!(std::str::from_utf8(&p).unwrap(), ungrouped);
+
+        let grouped = r#"{"t":"tasks","tasks":[{"id":1,"command":"x","cwd":"Lw==","tagged":false,"group":"infra","life":"ok","preview":"","started_ms":0}]}"#;
+        match decode_event(KIND_CONTROL, grouped.as_bytes()) {
+            Some(Event::Tasks(v)) => assert_eq!(v[0].group.as_deref(), Some("infra")),
+            other => panic!("expected tasks event, got {other:?}"),
+        }
     }
 
     /// `Sessions` carries the picker's names verbatim: several names, an empty

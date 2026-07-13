@@ -142,7 +142,12 @@ impl Supervisor {
     /// notice, a spawn failure) is queued as `Event::Status`, never returned.
     pub fn apply(&mut self, cmd: Command) {
         match cmd {
-            Command::Spawn { command, cwd } => self.spawn(&command, cwd),
+            // `group` is wire-only until the supervisor phase lands.
+            Command::Spawn {
+                command,
+                cwd,
+                group: _,
+            } => self.spawn(&command, cwd),
             Command::Kill { id } => {
                 if let Some(t) = self.by_id_mut(id) {
                     t.terminate();
@@ -162,6 +167,8 @@ impl Supervisor {
                     t.tagged = on;
                 }
             }
+            // Accepted and dropped: group state lands with the supervisor phase.
+            Command::SetGroup { .. } => {}
             Command::Resize { rows, cols } => {
                 // Clamp each dimension first, then preserve rows and reduce
                 // columns when the grid exceeds `MAX_CELLS`. The constant
@@ -284,6 +291,7 @@ impl Supervisor {
                 command: t.command.clone(),
                 cwd: t.cwd.clone(),
                 tagged: t.tagged,
+                group: None,
                 lifecycle: t.lifecycle(now, IDLE_AFTER),
                 preview: t.preview(),
                 started_ago: now.duration_since(t.started),
@@ -565,14 +573,17 @@ mod tests {
         s.apply(Command::Spawn {
             command: "a".into(),
             cwd: here(),
+            group: None,
         });
         s.apply(Command::Spawn {
             command: "b".into(),
             cwd: PathBuf::from("/tmp"),
+            group: None,
         });
         s.apply(Command::Spawn {
             command: "c".into(),
             cwd: here(),
+            group: None,
         });
 
         let cfg = s.session_config();
@@ -592,6 +603,7 @@ mod tests {
         s.apply(Command::Spawn {
             command: "sleep 30".into(),
             cwd: here(),
+            group: None,
         });
 
         s.tick();
@@ -624,6 +636,7 @@ mod tests {
         s.apply(Command::Spawn {
             command: "sleep 30".into(),
             cwd: here(),
+            group: None,
         });
         // Settle: let the silent shell finish any startup writes so the screen
         // stabilizes before we assert nothing changes.
@@ -709,6 +722,7 @@ mod tests {
         s.apply(Command::Spawn {
             command: "printf 'begin\\033[?2026hstalled'; sleep 30".into(),
             cwd: here(),
+            group: None,
         });
         let deadline = Instant::now() + Duration::from_secs(5);
         let mut preview = String::new();
@@ -745,7 +759,11 @@ mod tests {
     /// keeps kill-path tests deterministic (no signalling a shell that hasn't
     /// installed its trap yet).
     fn spawn_ready(s: &mut Supervisor, command: String, cwd: PathBuf, ready: &Path) -> u64 {
-        s.apply(Command::Spawn { command, cwd });
+        s.apply(Command::Spawn {
+            command,
+            cwd,
+            group: None,
+        });
         for _ in 0..200 {
             if ready.exists() {
                 break;
@@ -837,6 +855,7 @@ mod tests {
         s.apply(Command::Spawn {
             command: "sleep 300".into(),
             cwd: here(),
+            group: None,
         });
         let t0 = Instant::now();
         s.apply(Command::Shutdown);
@@ -861,6 +880,7 @@ mod tests {
         s.apply(Command::Spawn {
             command: "sleep 300".into(),
             cwd: here(),
+            group: None,
         });
         s.tick();
         let id = match s.drain().first() {
@@ -896,6 +916,7 @@ mod tests {
         s.apply(Command::Spawn {
             command: "sleep 300".into(),
             cwd: here(),
+            group: None,
         });
         s.tick();
         let id = match s.drain().first() {
@@ -971,6 +992,7 @@ mod tests {
         s.apply(Command::Spawn {
             command: "sleep 30".into(),
             cwd: here(),
+            group: None,
         });
         s.tick();
         let id = match s.drain().first() {
@@ -1015,6 +1037,7 @@ mod tests {
         s.apply(Command::Spawn {
             command: format!("echo run >> {}", marker.display()),
             cwd: dir.clone(),
+            group: None,
         });
         s.tick();
         let id = match s.drain().first() {
@@ -1047,6 +1070,7 @@ mod tests {
         s.apply(Command::Spawn {
             command: "sleep 30".into(),
             cwd: here(),
+            group: None,
         });
         s.tick();
         let id = match s.drain().first() {
@@ -1088,6 +1112,7 @@ mod tests {
         s.apply(Command::Spawn {
             command: "true".into(),
             cwd: here(),
+            group: None,
         });
         s.tick();
         let id = match s.drain().first() {
@@ -1118,6 +1143,7 @@ mod tests {
         s.apply(Command::Spawn {
             command: "sleep 30".into(),
             cwd: here(),
+            group: None,
         });
         s.apply(Command::Resize { rows: 0, cols: 0 });
         s.tick(); // exercises the resized grid (snapshot + screen): no panic
@@ -1527,6 +1553,7 @@ mod tests {
                 out.display()
             ),
             cwd: dir.clone(),
+            group: None,
         });
         let ok = reap_until(&mut s, Duration::from_secs(5), |_| {
             std::fs::read_to_string(&out).is_ok_and(|c| !c.is_empty())
@@ -1544,6 +1571,7 @@ mod tests {
         s.apply(Command::Spawn {
             command: "true".into(),
             cwd: here(),
+            group: None,
         });
         assert!(
             s.drain()
