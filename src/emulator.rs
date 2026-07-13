@@ -11,7 +11,8 @@ use alacritty_terminal::{
     Term,
     event::{Event, EventListener},
     grid::{Dimensions, Scroll},
-    term::{Config, TermMode},
+    index::Line,
+    term::{Config, TermMode, cell::Cell},
     vte::ansi::Processor,
 };
 
@@ -105,12 +106,22 @@ fn is_digits(s: &str) -> bool {
     !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit())
 }
 
+/// Maximum number of zero-width characters retained per cell. This bounds
+/// the otherwise unbounded vector created by repeated zero-width input.
+const MAX_ZEROWIDTH: usize = 16;
+
+/// Child-output byte threshold for scanning oversized zero-width vectors.
+/// Counting bytes lets repeated marks trigger a scan without a separate timer.
+const SWEEP_INTERVAL_BYTES: usize = 256 * 1024;
+
 /// The alacritty backend: grid plus parser, advanced together so one lock
 /// covers both, plus the probe-response buffer shared with `term`'s listener.
 pub struct AlacrittyBackend {
     term: Term<ProbeSink>,
     parser: Processor,
     responses: Arc<Mutex<Vec<String>>>,
+    /// Bytes ingested since the last zero-width scan.
+    bytes_since_sweep: usize,
 }
 
 impl AlacrittyBackend {
@@ -125,6 +136,44 @@ impl AlacrittyBackend {
         buf.drain(..)
             .filter(|r| allowed_probe_response(r))
             .collect()
+    }
+
+    /// Truncate zero-width characters in each active-grid cell to
+    /// `MAX_ZEROWIDTH`. The scan covers the viewport and all scrollback rows.
+    ///
+    /// The inactive screen does not receive parsed output and is scanned only
+    /// after it becomes active. Synchronized-update bytes are counted before
+    /// they reach the grid, so cells applied after an early scan remain until
+    /// a later scan.
+    fn sweep_zerowidth(&mut self) {
+        let grid = self.term.grid_mut();
+        // History rows are negative Line indices, oldest first.
+        let top = -(grid.history_size() as i32);
+        let bottom = grid.screen_lines() as i32 - 1;
+        for line in top..=bottom {
+            for cell in &mut grid[Line(line)][..] {
+                if !cell.zerowidth().is_some_and(|z| z.len() > MAX_ZEROWIDTH) {
+                    continue;
+                }
+                // Rebuild the cell because `Cell` has no setter for
+                // truncating its zero-width vector.
+                let mut rebuilt = Cell {
+                    c: cell.c,
+                    fg: cell.fg,
+                    bg: cell.bg,
+                    flags: cell.flags,
+                    extra: None,
+                };
+                if let Some(z) = cell.zerowidth() {
+                    for &mark in &z[..MAX_ZEROWIDTH] {
+                        rebuilt.push_zerowidth(mark);
+                    }
+                }
+                rebuilt.set_underline_color(cell.underline_color());
+                rebuilt.set_hyperlink(cell.hyperlink());
+                *cell = rebuilt;
+            }
+        }
     }
 }
 
@@ -159,6 +208,7 @@ impl Emulator {
             term,
             parser: Processor::new(),
             responses,
+            bytes_since_sweep: 0,
         }))
     }
 
@@ -181,6 +231,11 @@ impl Emulator {
             }
             Self::Alacritty(b) => {
                 b.parser.advance(&mut b.term, bytes);
+                b.bytes_since_sweep = b.bytes_since_sweep.saturating_add(bytes.len());
+                if b.bytes_since_sweep >= SWEEP_INTERVAL_BYTES {
+                    b.bytes_since_sweep = 0;
+                    b.sweep_zerowidth();
+                }
                 b.drain_allowed()
             }
         }
@@ -386,6 +441,12 @@ impl Emulator {
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
+
+    use alacritty_terminal::{
+        index::Column,
+        term::cell::Flags,
+        vte::ansi::{Color, NamedColor},
+    };
 
     use super::*;
 
@@ -641,5 +702,151 @@ mod tests {
             live.contains("more 20"),
             "the newest insertion is on the live screen"
         );
+    }
+
+    /// Return the Alacritty terminal for direct grid assertions.
+    fn term_of(emu: &Emulator) -> &Term<ProbeSink> {
+        match emu {
+            Emulator::Vt100(_) => panic!("alacritty backend required"),
+            Emulator::Alacritty(b) => &b.term,
+        }
+    }
+
+    /// Total zero-width characters retained across the viewport and history.
+    fn total_zerowidth(emu: &Emulator) -> usize {
+        let grid = term_of(emu).grid();
+        let top = -(grid.history_size() as i32);
+        let bottom = grid.screen_lines() as i32 - 1;
+        (top..=bottom)
+            .flat_map(|line| grid[Line(line)][..].iter())
+            .map(|cell| cell.zerowidth().map_or(0, <[char]>::len))
+            .sum()
+    }
+
+    /// A full interval of combining marks on one cell is capped before
+    /// `process` returns.
+    #[test]
+    fn zerowidth_spam_on_one_cell_is_capped() {
+        let mut emu = Emulator::new(4, 10, 0);
+        emu.process(b"a");
+        // U+0301 is two UTF-8 bytes, making this chunk one full interval.
+        let chunk = "\u{0301}".repeat(SWEEP_INTERVAL_BYTES / 2);
+
+        emu.process(chunk.as_bytes());
+        let len = term_of(&emu).grid()[Line(0)][Column(0)]
+            .zerowidth()
+            .map_or(0, <[char]>::len);
+        assert!(
+            len <= MAX_ZEROWIDTH,
+            "hot cell retains {len} marks after process returned"
+        );
+
+        // A second interval on the same cell is capped independently.
+        emu.process(chunk.as_bytes());
+        assert!(
+            total_zerowidth(&emu) <= MAX_ZEROWIDTH,
+            "marks retained beyond the single spammed cell"
+        );
+    }
+
+    /// A scan caps combining marks in every cell across a populated row.
+    #[test]
+    fn zerowidth_spray_across_cells_is_capped() {
+        let mut emu = Emulator::new(4, 80, 0);
+        let marks = "\u{0301}".repeat(2048);
+        let mut payload = String::new();
+        for col in 1..=80 {
+            payload.push_str(&format!("\x1b[2;{col}Hx"));
+            payload.push_str(&marks);
+        }
+        assert!(
+            payload.len() >= SWEEP_INTERVAL_BYTES,
+            "payload must cross the sweep interval in one call"
+        );
+        emu.process(payload.as_bytes());
+
+        let grid = term_of(&emu).grid();
+        for col in 0..80 {
+            let z = grid[Line(1)][Column(col)]
+                .zerowidth()
+                .expect("sprayed cell lost its marks entirely");
+            // Exactly the cap: truncation keeps the first marks, it does not
+            // clear the cell.
+            assert_eq!(z.len(), MAX_ZEROWIDTH, "column {col}");
+            assert!(z.iter().all(|&m| m == '\u{0301}'));
+        }
+        assert!(total_zerowidth(&emu) <= 80 * MAX_ZEROWIDTH);
+    }
+
+    /// A scan triggered by unrelated output preserves an under-limit styled
+    /// cluster and all of its cell attributes.
+    #[test]
+    fn legitimate_cluster_survives_sweep_untouched() {
+        let mut emu = Emulator::new(4, 80, 0);
+        let cluster = "\x1b]8;;https://example.com\x1b\\\
+                       \x1b[1;4;31;44m\x1b[58;5;42m\
+                       e\u{0301}\u{0302}\u{0304}\
+                       \x1b[0m\x1b]8;;\x1b\\";
+        emu.process(cluster.as_bytes());
+
+        // CUP keeps the filler on row 2 while enough bytes trigger a scan.
+        let filler = format!("\x1b[2;1H{}", "x".repeat(64)).repeat(1024);
+        let mut fed = cluster.len();
+        while fed < SWEEP_INTERVAL_BYTES {
+            emu.process(filler.as_bytes());
+            fed += filler.len();
+        }
+
+        let cell = &term_of(&emu).grid()[Line(0)][Column(0)];
+        assert_eq!(cell.c, 'e');
+        assert_eq!(
+            cell.zerowidth(),
+            Some(&['\u{0301}', '\u{0302}', '\u{0304}'][..])
+        );
+        assert_eq!(cell.fg, Color::Named(NamedColor::Red));
+        assert_eq!(cell.bg, Color::Named(NamedColor::Blue));
+        assert!(cell.flags.contains(Flags::BOLD | Flags::UNDERLINE));
+        assert_eq!(cell.underline_color(), Some(Color::Indexed(42)));
+        assert_eq!(
+            cell.hyperlink().map(|h| h.uri().to_owned()),
+            Some("https://example.com".to_owned())
+        );
+    }
+
+    /// A scan also caps a cell that entered scrollback before the threshold.
+    #[test]
+    fn history_cells_are_swept() {
+        let mut emu = Emulator::new(4, 10, 100);
+        // This oversized cluster remains below the scan threshold.
+        let spam = format!("h{}", "\u{0301}".repeat(4096));
+        emu.process(spam.as_bytes());
+        emu.process(b"\r\n\r\n\r\n\r\n\r\n\r\n");
+
+        // Confirm that the oversized cell reached history before the scan.
+        let find_h = |emu: &Emulator| -> (i32, usize) {
+            let grid = term_of(emu).grid();
+            let top = -(grid.history_size() as i32);
+            (top..0)
+                .find_map(|line| {
+                    let cell = &grid[Line(line)][Column(0)];
+                    (cell.c == 'h').then(|| (line, cell.zerowidth().map_or(0, <[char]>::len)))
+                })
+                .expect("spammed row must be in history")
+        };
+        let (line, len) = find_h(&emu);
+        assert!(line < 0);
+        assert_eq!(len, 4096, "excess must predate the sweep");
+
+        // CUP keeps filler on the last row so the history position is stable.
+        let filler = "\x1b[4;1Hxxxxxxxx".repeat(1024);
+        let mut fed = spam.len() + 12;
+        while fed < SWEEP_INTERVAL_BYTES {
+            emu.process(filler.as_bytes());
+            fed += filler.len();
+        }
+
+        let (line_after, len_after) = find_h(&emu);
+        assert_eq!(line_after, line, "row must not have moved");
+        assert_eq!(len_after, MAX_ZEROWIDTH);
     }
 }
