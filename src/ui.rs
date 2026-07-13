@@ -10,7 +10,7 @@ use crossterm::{
 };
 
 use crate::{
-    app::{App, DirKind, Mode, Row, scroll_window},
+    app::{App, DirKind, GroupMode, Mode, Row, scroll_window},
     format::{pad, rel_time, truncate},
     protocol::{Lifecycle, TaskView},
 };
@@ -26,6 +26,10 @@ pub fn render(out: &mut Stdout, app: &mut App) -> io::Result<()> {
         Mode::PickDir => {
             render_dashboard(&mut buf, app)?;
             render_pickdir(&mut buf, app)?;
+        }
+        Mode::PickGroup => {
+            render_dashboard(&mut buf, app)?;
+            render_pickgroup(&mut buf, app)?;
         }
         Mode::LoadSession => {
             render_dashboard(&mut buf, app)?;
@@ -100,19 +104,45 @@ fn render_dashboard(out: &mut impl Write, app: &App) -> io::Result<()> {
         }
         _ => String::new(),
     };
-    queue!(
-        out,
-        MoveTo(0, 0),
-        SetAttribute(Attribute::Bold),
-        Print(pad(
-            &format!(
-                "  fleetcom   {running} running · {idle} idle · {done} done      by {}{mode_tag}{scroll_tag}",
-                app.group_mode.label()
-            ),
-            cols
-        )),
-        SetAttribute(Attribute::Reset)
-    )?;
+    // Header: bold counts, the grouping-mode strip (active mode bold, the
+    // rest dim), bold tags. `pad` on the joined plain text decides truncation
+    // and padding exactly as it did when the header was one string; the
+    // segment walk below only re-styles its output.
+    let prefix = format!("  fleetcom   {running} running · {idle} idle · {done} done      by ");
+    let suffix = format!("{mode_tag}{scroll_tag}");
+    let segs = header_segments(&prefix, app.group_mode, &suffix);
+    let plain: String = segs.iter().map(|(t, _)| t.as_str()).collect();
+    let display = pad(&plain, cols);
+    let mut chars = display.chars();
+    queue!(out, MoveTo(0, 0))?;
+    for (text, intensity) in &segs {
+        let n = text.chars().count();
+        if n == 0 {
+            continue;
+        }
+        let piece: String = chars.by_ref().take(n).collect();
+        if piece.is_empty() {
+            break; // ran off the truncated end; attributes are already reset
+        }
+        // One intensity per run, reset between runs: Bold and Dim are never
+        // stacked, because terminals disagree on which competing intensity
+        // attribute wins.
+        let attr = match intensity {
+            Intensity::Bold => Attribute::Bold,
+            Intensity::Dim => Attribute::Dim,
+        };
+        queue!(
+            out,
+            SetAttribute(attr),
+            Print(piece),
+            SetAttribute(Attribute::Reset)
+        )?;
+    }
+    // Whatever `pad` appended past the segments is blank padding: unstyled.
+    let rest: String = chars.collect();
+    if !rest.is_empty() {
+        queue!(out, Print(rest))?;
+    }
     put(out, 1, "", cols)?;
 
     let mut y = list_top;
@@ -171,7 +201,7 @@ fn render_dashboard(out: &mut impl Write, app: &App) -> io::Result<()> {
         out,
         rows.saturating_sub(1),
         &format!(
-            "  ↑↓ select · enter attach · space peek · n/@ new · s sort · m tag · r rerun · X kill · {exit_hint}"
+            "  ↑↓ select · enter attach · space peek · n/@ new · s sort · m tag · g group · r rerun · X kill · {exit_hint}"
         ),
         cols,
     )?;
@@ -196,14 +226,56 @@ fn cmdline(app: &App) -> Option<String> {
     }
 }
 
-/// The `❯` command line, prefixed with the target directory when it isn't the
-/// default invocation dir (the `@` flow).
+/// The `❯` command line, prefixed with the spawn destination: the target dir
+/// when it isn't the default invocation dir (the `@` flow), then the group a
+/// Custom-mode spawn inherits.
 fn spawn_prompt(app: &App) -> String {
-    if app.spawn_cwd == app.invocation_dir {
-        format!("  ❯ {}", app.input)
-    } else {
-        format!("  ❯ {} ▸ {}", app.dir_label(&app.spawn_cwd), app.input)
+    let dir = (app.spawn_cwd != app.invocation_dir).then(|| app.dir_label(&app.spawn_cwd));
+    prompt_line(dir.as_deref(), app.spawn_group.as_deref(), &app.input)
+}
+
+/// Assemble the spawn prompt from its optional `▸` destination segments.
+/// Absent segments vanish whole — separator included — so the no-group
+/// prompt stays char-identical to the pre-group one.
+fn prompt_line(dir: Option<&str>, group: Option<&str>, input: &str) -> String {
+    let mut line = String::from("  ❯ ");
+    for seg in [dir, group].into_iter().flatten() {
+        line.push_str(seg);
+        line.push_str(" ▸ ");
     }
+    line.push_str(input);
+    line
+}
+
+/// Per-run intensity for the header line. Bold and Dim are emitted as
+/// separate runs with a reset between them, never combined on one run.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Intensity {
+    Bold,
+    Dim,
+}
+
+/// The header as (text, intensity) runs: bold prefix, the mode strip with
+/// only the active mode bold, bold suffix. Pure so the strip's assembly is
+/// testable without a terminal.
+fn header_segments(prefix: &str, active: GroupMode, suffix: &str) -> Vec<(String, Intensity)> {
+    // The strip is `GroupMode::next()`'s cycle laid flat starting at State,
+    // so `s` walks it left to right and wraps.
+    const STRIP: [GroupMode; 3] = [GroupMode::State, GroupMode::Dir, GroupMode::Custom];
+    let mut segs = vec![(prefix.to_string(), Intensity::Bold)];
+    for (i, m) in STRIP.iter().enumerate() {
+        if i > 0 {
+            segs.push((" · ".to_string(), Intensity::Dim));
+        }
+        let intensity = if *m == active {
+            Intensity::Bold
+        } else {
+            Intensity::Dim
+        };
+        segs.push((m.label().to_string(), intensity));
+    }
+    segs.push((suffix.to_string(), Intensity::Bold));
+    segs
 }
 
 fn task_row(v: &TaskView, cols: usize) -> String {
@@ -367,6 +439,80 @@ fn render_pickdir(out: &mut impl Write, app: &App) -> io::Result<()> {
     Ok(())
 }
 
+/// The `g` picker: a bottom panel over the dashboard, structured like the
+/// `@` picker. A typed group-name input plus the matching fleet groups,
+/// `group_sel` highlighted; row 0 always offers Unassigned (clear), so the
+/// list is never empty.
+fn render_pickgroup(out: &mut impl Write, app: &App) -> io::Result<()> {
+    let cols = app.cols as usize;
+    let rows = app.rows;
+    let total = app.group_candidates.len();
+
+    let max_list = 8usize.min((rows as usize).saturating_sub(4)).max(1);
+    // Keep the selected group visible.
+    let (start, visible) = scroll_window(app.group_sel, total, max_list);
+    let body = visible.max(1);
+    let panel_h = (body + 2) as u16;
+    let top = rows.saturating_sub(panel_h).max(2);
+
+    // Input line as a focused field.
+    queue!(
+        out,
+        MoveTo(0, top),
+        SetAttribute(Attribute::Reverse),
+        Print(pad(&format!("  g {}   ", app.group_input), cols)),
+        SetAttribute(Attribute::Reset)
+    )?;
+
+    for row in 0..visible {
+        let idx = start + row;
+        let y = top + 1 + row as u16;
+        let c = &app.group_candidates[idx];
+        let marker = if idx == app.group_sel { "▸ " } else { "  " };
+        let line = format!("    {marker}{}", c.label);
+        if idx == app.group_sel {
+            queue!(
+                out,
+                MoveTo(0, y),
+                SetAttribute(Attribute::Reverse),
+                Print(pad(&line, cols)),
+                SetAttribute(Attribute::Reset)
+            )?;
+        } else {
+            put(out, y, &line, cols)?;
+        }
+    }
+
+    // Hint reflects what Enter does: create when the typed text stands alone
+    // (nothing matched), otherwise act on the highlighted row.
+    let action = if !app.group_input.is_empty() && total < 2 {
+        "enter create"
+    } else {
+        match app.group_candidates.get(app.group_sel) {
+            Some(c) if c.group.is_some() => "enter assign",
+            Some(_) => "enter clear",
+            None => "",
+        }
+    };
+    let pos = if total > visible {
+        format!(" · {}/{}", app.group_sel + 1, total)
+    } else {
+        String::new()
+    };
+    dim(
+        out,
+        top + 1 + body as u16,
+        &format!("  {action} · ↑↓ pick · esc{pos}"),
+        cols,
+    )?;
+
+    let cx = truncate(&format!("  g {}", app.group_input), cols)
+        .chars()
+        .count() as u16;
+    queue!(out, MoveTo(cx, top), Show)?;
+    Ok(())
+}
+
 /// The `o` load-session picker: a bottom panel listing saved session names.
 fn render_session_picker(out: &mut impl Write, app: &App) -> io::Result<()> {
     let cols = app.cols as usize;
@@ -498,4 +644,55 @@ fn render_attached(out: &mut impl Write, app: &App) -> io::Result<()> {
         _ => queue!(out, Hide)?,
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The four prompt shapes. The two no-group forms are pinned to the exact
+    /// pre-group strings: with no group set the prompt must not have changed
+    /// by a single char.
+    #[test]
+    fn spawn_prompt_decoration_shapes() {
+        assert_eq!(prompt_line(None, None, "cargo test"), "  ❯ cargo test");
+        assert_eq!(
+            prompt_line(Some("~/x"), None, "cargo test"),
+            "  ❯ ~/x ▸ cargo test"
+        );
+        assert_eq!(
+            prompt_line(None, Some("alpha"), "cargo test"),
+            "  ❯ alpha ▸ cargo test"
+        );
+        assert_eq!(
+            prompt_line(Some("~/x"), Some("alpha"), "cargo test"),
+            "  ❯ ~/x ▸ alpha ▸ cargo test"
+        );
+    }
+
+    /// The strip's plain text is fixed; exactly the active mode's label is
+    /// bold, every other strip run (labels and separators) is dim, and the
+    /// prefix/suffix keep the header's bold.
+    #[test]
+    fn header_strip_bolds_only_the_active_mode() {
+        for active in [GroupMode::State, GroupMode::Dir, GroupMode::Custom] {
+            let segs = header_segments("by ", active, " · tail");
+            let plain: String = segs.iter().map(|(t, _)| t.as_str()).collect();
+            assert_eq!(plain, "by state · dir · custom · tail");
+
+            assert_eq!(segs.first().unwrap(), &("by ".to_string(), Intensity::Bold));
+            assert_eq!(
+                segs.last().unwrap(),
+                &(" · tail".to_string(), Intensity::Bold)
+            );
+            for (text, intensity) in &segs[1..segs.len() - 1] {
+                let expect = if text == active.label() {
+                    Intensity::Bold
+                } else {
+                    Intensity::Dim
+                };
+                assert_eq!(*intensity, expect, "run {text:?} with active {active:?}");
+            }
+        }
+    }
 }
