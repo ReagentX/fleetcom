@@ -6,7 +6,7 @@ Supervising several long-running commands usually means juggling terminal panes 
 
 ## What it does
 
-- Runs each command in its own PTY and groups tasks by state or working directory.
+- Runs each command in its own PTY and groups tasks by state, by working directory, or by custom named groups.
 - Provides read-only previews and full interactive attachment.
 - Keeps jobs running after the client disconnects.
 - Saves and reloads `{directory: [commands]}` recipes.
@@ -61,8 +61,9 @@ The first ordinary invocation starts the daemon when necessary. `--daemon` is an
 | `Space` | peek at the selected task |
 | `n` | new command in the current directory |
 | `@` | new command in a directory you pick (with completion) |
-| `s` | toggle grouping: by state / by directory |
+| `s` | cycle grouping: by state / by directory / by custom group |
 | `m` | tag the task "in use" (pins it to the top) |
+| `g` | assign the selected task to a named group (picker: pick, create, or clear) |
 | `X` | kill a running task (`TERM`, then `KILL` after 2 s), or remove a finished one (Shift-gated); removal sweeps any background processes the job left in its group, with the same `TERM`-then-`KILL` grace |
 | `w` | save the current tasks as a session |
 | `o` | load a saved session |
@@ -94,7 +95,7 @@ Signals target each task's process group. The exited leader remains unreaped unt
 
 ### Grouping and the `@` picker
 
-Group the fleet by state (In use / Running / Completed) or by working directory. `@` opens a live directory picker: the current dir first, recently used dirs next, matching subdirectories below. Launch a command anywhere without leaving the dashboard.
+Group the fleet by state (In use / Running / Completed), by working directory, or by named groups you assign with `g` (one section per group, Unassigned last). `@` opens a live directory picker: the current dir first, recently used dirs next, matching subdirectories below. Launch a command anywhere without leaving the dashboard.
 
 ### Sessions
 

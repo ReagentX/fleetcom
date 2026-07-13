@@ -24,8 +24,9 @@
 | `Space` | Peek at the selected task |
 | `n` | New command in the invocation directory |
 | `@` | New command in a directory you pick |
-| `s` | Toggle grouping: by state / by directory |
+| `s` | Cycle grouping: by state / by directory / by custom group |
 | `m` | Tag the selected task "in use" (toggles) |
+| `g` | Assign the selected task to a group (opens the group picker) |
 | `r` | Rerun a finished task: same command, same directory, same row |
 | `X` | Kill a running task (`TERM`, then `KILL` after 2 s), or remove a finished one |
 | `w` | Save the current tasks as a session |
@@ -71,7 +72,7 @@ Tasks retain 2,000 lines of scrollback. While attached to an inline child, wheel
 
 #### Rerun
 
-`r` re-executes a *finished* task's command using the same command string and directory, under the environment of the client requesting the rerun (launch context always belongs to whoever asks for the launch). The task retains its ID, `◆` tag, and list position; its clock and screen reset. On a running task, `r` is a no-op because rerunning would first require a destructive kill. Rerun also works inside peek, which keeps the result visible while starting the next run.
+`r` re-executes a *finished* task's command using the same command string and directory, under the environment of the client requesting the rerun (launch context always belongs to whoever asks for the launch). The task retains its ID, `◆` tag, group, and list position; its clock and screen reset. On a running task, `r` is a no-op because rerunning would first require a destructive kill. Rerun also works inside peek, which keeps the result visible while starting the next run.
 
 #### Detach vs. quit
 
@@ -79,7 +80,17 @@ Tasks retain 2,000 lines of scrollback. While attached to an inline child, wheel
 
 #### Grouping and tagging
 
-`s` toggles between grouping by state (In use / Running / Completed) and by working directory. `m` toggles the "in use" tag on the selected task; tagged tasks are marked `◆` and pinned to the top, so the handful you're actively steering stay reachable as the list grows.
+`s` cycles three grouping modes: state, dir, custom. The header shows the strip `by state · dir · custom` with the active mode bold and the rest dim.
+
+- By state: In use / Running / Completed.
+- By dir: one section per working directory; the invocation directory first, the rest alphabetical.
+- By custom group: one section per group name, sorted by name, with Unassigned last. Unassigned is the triage inbox — fresh spawns land there unless they inherit a group (below) — and the section exists only while an ungrouped task does.
+
+Groups are daemon state on the task itself: an assignment survives client detach and rerun (`r`), and switching grouping modes never touches it. `g` reassigns the selected task through the [group picker](#the-g-group-picker).
+
+`m` toggles the "in use" tag on the selected task; tagged tasks are marked `◆`, so the handful you're actively steering stay reachable as the list grows. In state mode they form the In use section at the top. In custom mode a tag floats the task to the top of its group rather than ejecting it into a global section: within a group, tagged tasks sort first, then running, then completed, and within each of those, tasks cluster by directory, then spawn order.
+
+In custom mode — and only there — a new command inherits the selected task's group, through both `n` and the `@` picker. The spawn prompt shows the destination as `❯ dir ▸ group ▸ command`, each segment present only when it applies: the dir segment for a non-default directory, the group segment when a group will be inherited. State- and dir-mode spawns start unassigned.
 
 ## The `@` directory picker
 
@@ -90,6 +101,20 @@ Tasks retain 2,000 lines of scrollback. While attached to an inline child, wheel
 - Subdirectories of the current path: `Enter` or `Tab`/`→` descends into one.
 
 Typing filters the rows; `Backspace` climbs the typed path; `↑`/`↓` move the highlight; `Esc` cancels. Completion updates on each input, permitting navigation and launch without leaving the dashboard.
+
+## The `g` group picker
+
+`g` on a selected task opens a bottom panel with the same structure as the `@` picker: a typed-name field plus the matching rows. Row 0 is always Unassigned, so the list is never empty; the fleet's existing group names follow, sorted, filtered by case-insensitive prefix as you type. The task's current group is marked `(current)`.
+
+`Enter` acts on the highlighted row, and the hint line names the action:
+
+- The Unassigned row: clear the task back to unassigned (`enter clear`).
+- An existing group: assign it (`enter assign`).
+- Typed text matching no existing group: create that group and assign it (`enter create`).
+
+`↑`/`↓` move the highlight; `Esc` cancels without changing anything.
+
+The daemon normalizes every group name it receives, whether from the picker or a [session](sessions.md) file: control characters are stripped, surrounding whitespace is trimmed, and the result is capped at 64 characters. A name that normalizes to nothing, or to the literal `Unassigned`, means "no group" — the reserved section name can never collide with a group of your own. Case is preserved and significant: `unassigned` is a legal group name.
 
 ## Peek
 

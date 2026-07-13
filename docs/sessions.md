@@ -16,13 +16,13 @@ The filename derives from the session name. Leading and trailing whitespace is r
 
 ## Format
 
-A session is a JSON object mapping a working directory to the commands to run there:
+A session is a JSON object mapping a working directory to the commands to run there. A member takes one of two forms: a plain command string, or — when the task carried a group at save time — an object naming both:
 
 ```json
 {
   "/home/you/work/api": [
     "cargo watch -x test",
-    "cargo run"
+    { "cmd": "cargo run", "group": "api" }
   ],
   "/tmp": [
     "top"
@@ -31,10 +31,18 @@ A session is a JSON object mapping a working directory to the commands to run th
 ```
 
 - Keys are directory paths: each task's working directory.
-- Values are ordered lists of shell command strings. Order is preserved, and each command runs in its own PTY under that directory.
+- Values are ordered lists. A string member is an ungrouped shell command; `{"cmd": ..., "group": ...}` is a command plus the group its task is assigned on load. Order is preserved, and each command runs in its own PTY under that directory.
 - Directories serialize alphabetically. Command order remains stable within each directory.
 
-The schema is a flat map with no version field or metadata, so files can be edited directly. Invalid JSON fails the load. Within valid JSON, entries that do not produce string command values are omitted.
+The schema is a flat map with no version field or metadata, so files can be edited directly. Loaded group names pass through the daemon's normalization (control characters stripped, whitespace trimmed, capped at 64 characters; `Unassigned` means no group). Invalid JSON fails the load. Within valid JSON, a member that fits neither form — a non-string scalar, an object without a string `cmd`, a non-string `group` — is dropped, never an error.
+
+### Compatibility
+
+The two member forms carry a three-part contract:
+
+- Old files (string members only) load unchanged, with every command ungrouped.
+- A save with no groups anywhere writes only string members: byte-identical to the pre-group format.
+- An *older* fleetcom loading a *new* grouped file silently drops the object-form members. Its parser keeps only string members, so the downgrade loses those commands entirely, not merely their groups.
 
 ## Saving and loading
 

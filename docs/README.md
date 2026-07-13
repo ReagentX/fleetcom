@@ -59,23 +59,23 @@ The following walkthrough moves from an empty dashboard to a saved fleet. The fr
 Start it. The first `fleetcom` autostarts the daemon and opens an empty dashboard:
 
 ```text
-  fleetcom   0 running · 0 idle · 0 done      by state
+  fleetcom   0 running · 0 idle · 0 done      by state · dir · custom
 
   ❯ n run · @ dir · s sort · w save · o load
-  ↑↓ select · enter attach · space peek · n/@ new · s sort · m tag · r rerun · X kill · q detach · Q quit
+  ↑↓ select · enter attach · space peek · n/@ new · s sort · m tag · g group · r rerun · X kill · q detach · Q quit
 ```
 
 Press `n`, enter a command, and press `Enter`. The command runs in its own PTY and appears under Running. Repeat the process for a second command:
 
 ```text
-  fleetcom   2 running · 0 idle · 0 done      by state
+  fleetcom   2 running · 0 idle · 0 done      by state · dir · custom
 
   Running
   ✻  cargo watch -x test      test result: ok. 42 passed         9s
   ✻  npm run dev              VITE v5.0  ready in 312 ms         4s
 
   ❯ n run · @ dir · s sort · w save · o load
-  ↑↓ select · enter attach · space peek · n/@ new · s sort · m tag · r rerun · X kill · q detach · Q quit
+  ↑↓ select · enter attach · space peek · n/@ new · s sort · m tag · g group · r rerun · X kill · q detach · Q quit
 ```
 
 Each row is `glyph · tag · command · latest output · age`. `Space` peeks: a read-only box of the selected task's live screen, without leaving the dashboard:
@@ -97,7 +97,7 @@ Each row is `glyph · tag · command · latest output · age`. `Space` peeks: a 
 `Ctrl-\` returns to the dashboard. `m` tags the selected task "in use," adding `◆` and moving it to the first section:
 
 ```text
-  fleetcom   2 running · 0 idle · 0 done      by state
+  fleetcom   2 running · 0 idle · 0 done      by state · dir · custom
 
   In use
   ✻ ◆cargo watch -x test      test result: ok. 42 passed        1m
@@ -106,6 +106,20 @@ Each row is `glyph · tag · command · latest output · age`. `Space` peeks: a 
   ✻  npm run dev              VITE v5.0  ready in 312 ms        1m
 ```
 
+`s` cycles the grouping mode — state, dir, custom — with the active mode shown bold in the header strip. In custom mode, `g` assigns the selected task to a named group. Each group is a section, sorted by name, with Unassigned last: the inbox for anything not yet filed:
+
+```text
+  fleetcom   2 running · 0 idle · 0 done      by state · dir · custom
+
+  api
+  ✻ ◆cargo watch -x test      test result: ok. 42 passed        2m
+
+  Unassigned
+  ✻  npm run dev              VITE v5.0  ready in 312 ms        2m
+```
+
+A command spawned in custom mode inherits the selected task's group, and the spawn prompt names the destination (`❯ api ▸ cargo run`). Assignments live in the daemon, so they survive detach and rerun. Picker mechanics are in [commands](commands.md#the-g-group-picker).
+
 `w`, a name, and `Enter` save the fleet as a [session](sessions.md). `q` then disconnects while the daemon and both jobs continue running. A subsequent `fleetcom` invocation reconstructs the dashboard from the daemon's current task state. `Q` or `fleetcom --kill` stops the jobs (`TERM`, then `KILL` after a two-second grace period) and exits the daemon.
 
 ## Notes & Caveats
@@ -113,7 +127,7 @@ Each row is `glyph · tag · command · latest output · age`. `Space` peeks: a 
 - The fleet dies with the daemon. The daemon holds every task's PTY master, so daemon death of any kind closes them and the kernel hangs up each task's controlling terminal: `SIGHUP` to its process group. A clean shutdown (below) is gentler, but a crash or `SIGKILL` delivers the bare HUP with no grace. Only HUP-immune jobs (`nohup`, `trap '' HUP`) survive that: unowned and invisible to the next daemon, which starts empty. A panic while *serving a client* is contained: the connection drops, the fleet keeps running.
 - Commands run through the client's non-interactive shell (`$SHELL -c`, or `/bin/sh` when `SHELL` is unset), so functions and aliases from `~/.zshrc` are unavailable.
 - Each launch uses the launching client's environment and working directory, sent once per connection during the hello handshake. Connect from a venv terminal and your spawns, reruns, and session loads all see that venv, whichever client originally autostarted the daemon. Environment is never written to disk; session files store only directories and commands.
-- Client and daemon versions must match. The handshake carries a protocol version, and the daemon refuses a mismatched client with instructions (`fleetcom --kill`, retry) instead of serving it with silently wrong semantics. The common case is a `cargo install` while an old daemon is still running.
+- Client and daemon versions must match. The handshake carries a protocol version, and the daemon refuses a mismatched client with instructions (`fleetcom --kill`, retry) instead of serving it with silently wrong semantics. The common case is a `cargo install` while an old daemon is still running. Custom grouping bumped the protocol to v7, so the first client run after that upgrade hits exactly this: a still-running v6 daemon refuses it at the handshake. Recovery is `fleetcom --kill` and a fresh start — and `--kill` kills every running job, so finish or drain the fleet before upgrading.
 - The daemon serves one client at a time. A second `fleetcom` prints a waiting notice, then attaches when the active client disconnects (`q`). `Ctrl-C` while waiting aborts without touching the daemon.
 - Kills are graceful-first, and the group stays reachable. `X`, `Q`, `--kill`, and daemon signals all send `SIGTERM` to the job's *process group* and escalate to `SIGKILL` only after a 2-second grace, so a `TERM` handler gets its chance to flush and exit cleanly. The exited leader is deliberately held unreaped (a zombie) until the task is removed, which keeps the group id reserved: kills and removals reach background children the job left in its group (`cmd &` never leaves the group in a non-interactive shell). A job that `setsid`s or double-forks out of the group escapes the sweep; kill that one by hand.
 - `--foreground` is ephemeral. It runs the core in-process with no daemon, so the jobs die when you quit and there is nothing to reattach to.
