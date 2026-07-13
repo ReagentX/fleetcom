@@ -536,7 +536,7 @@ fn handshake(stream: &mut UnixStream) -> Result<LaunchContext, String> {
 /// nothing written): the supervisor's geometry clamp bounds per-cell SGR
 /// emission, but per-cell zero-width extras are unbounded (alacritty stacks
 /// combining marks without limit), so a pathological child can still push a
-/// `Screen` — or its scrollback line into a `Tasks` preview — past the frame
+/// `Screen` (or its scrollback line into a `Tasks` preview) past the frame
 /// cap. `write_frame` would refuse such a payload before emitting a byte;
 /// treating that as a disconnect strands the client in a reconnect loop that
 /// re-requests the same frame. Skipping degrades one repaint: `Tasks` is
@@ -668,8 +668,8 @@ mod tests {
         let _ = fs::remove_dir_all(&base);
     }
 
-    /// An event too large for one frame is skipped — nothing written, client
-    /// kept — while ordinary events still go out. The backstop behind the
+    /// An event too large for one frame is skipped (nothing written, client
+    /// kept) while ordinary events still go out. The backstop behind the
     /// supervisor's geometry clamp: unbounded per-cell zero-width extras (or
     /// a serializer density regression the frame-fit test would have caught)
     /// must cost one repaint, not the connection.

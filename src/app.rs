@@ -184,7 +184,7 @@ fn desired_input_modes(attached: Option<&ScreenView>, view_scroll: bool) -> (boo
     match attached {
         // Capture and forward mouse events requested by the child.
         Some(s) if s.wants_mouse => (true, true),
-        // Scroll full-screen children through alternate-scroll arrows — the
+        // Scroll full-screen children through alternate-scroll arrows. The
         // real terminal converts wheel to arrows only while the child's 1007
         // gate is open.
         Some(s) if s.alt_screen && s.alt_scroll => (false, true),
@@ -1800,7 +1800,7 @@ mod tests {
     /// A full-screen child's `?1007l` veto holds across the whole attached
     /// path: emulator hint → `ScreenView` over the transport → the capture
     /// decision → `Command::Mouse` → `mouse_bytes` → PTY. With the veto the
-    /// wheel delivers nothing — a sentinel written after it proves the child
+    /// wheel delivers nothing. A sentinel written after it proves the child
     /// was reading, so absence is the veto, not a stall. With 1007 at its
     /// default the same wheel delivers three arrows. What no in-process test
     /// can cover is the uncaptured half: the user's real terminal converting

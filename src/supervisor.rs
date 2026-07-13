@@ -28,7 +28,7 @@ type LastScreen = (u64, Vec<u8>, (u16, u16), bool, (bool, bool, bool), usize);
 /// Per-dimension ceiling for PTY dimensions accepted from a (possibly
 /// crafted) `Resize`. A 0 dimension is outside alacritty's grid domain: a
 /// zero-column resize underflows `columns - 1` in its shrink path and a
-/// zero-row grid is indexed out of bounds by the first cell write — a panic
+/// zero-row grid is indexed out of bounds by the first cell write: a panic
 /// in both build profiles. An unbounded one (up to `u16::MAX`) would allocate
 /// a multi-billion-cell grid and OOM. Real terminals never approach this, so
 /// clamping to `[1, MAX_DIM]` is invisible in normal use and a hard stop
@@ -37,7 +37,7 @@ const MAX_DIM: u16 = 1000;
 
 /// Area ceiling (`rows × cols`) for the same untrusted `Resize`. `MAX_DIM`
 /// alone still admits a 1,000,000-cell grid, and `serialize::formatted`'s
-/// worst case — adjacent cells alternating maximal SGR state — measures at
+/// worst case (adjacent cells alternating maximal SGR state) measures at
 /// ≈93 bytes per cell (`worst_case_screen_frame_fits_max_frame`), so a
 /// full-`MAX_DIM²` screen would encode past `frame::MAX_FRAME`, fail
 /// `write_frame`, and drop the client on a frame it would re-request on every
@@ -688,7 +688,7 @@ mod tests {
         let flag = dir.join("flag");
         let mut s = sup(24, 80);
         // Enter the alt screen (1007 gate open by default), then veto 1007 on
-        // cue — after the watched screen has settled.
+        // cue, after the watched screen has settled.
         let cmd = format!(
             "printf '\\033[?1049h'; touch {r}; until [ -e {f} ]; do sleep 0.05; done; \
              printf '\\033[?1007l'; sleep 30",
@@ -1196,13 +1196,13 @@ mod tests {
     ///
     /// The construction maximizes bytes per cell against the real serializer:
     /// every cell is a `'\t'` (whose emission path adds two per-cell CUPs on
-    /// top of the glyph) styled with the maximal SGR — every style flag plus
-    /// three-digit truecolor fg, bg, AND underline color — alternating
+    /// top of the glyph) styled with the maximal SGR: every style flag plus
+    /// three-digit truecolor fg, bg, AND underline color, alternating
     /// between two color sets so `sync_sgr` re-specifies in full at every
     /// cell. Geometry is the worst the clamp admits: `MAX_DIM` rows (largest
     /// CUP row digits, most per-row CUPs) at exactly `MAX_CELLS` total.
     /// Per-cell zero-width extras are deliberately absent: alacritty stores
-    /// unboundedly many per cell, so no geometry bound can cover them — that
+    /// unboundedly many per cell, so no geometry bound can cover them. That
     /// tail is what the daemon's oversized-frame skip is for.
     #[test]
     fn worst_case_screen_frame_fits_max_frame() {

@@ -610,7 +610,7 @@ impl Task {
 
     /// Return whether the child requests mouse input, uses the alternate
     /// screen, and holds its wheel-to-arrows gate open (alt screen with
-    /// DECSET 1007 in effect — [`Emulator::alternate_scroll`]). The client
+    /// DECSET 1007 in effect; see [`Emulator::alternate_scroll`]). The client
     /// receives these values in each `ScreenView`.
     pub fn input_hints(&self) -> (bool, bool, bool) {
         let p = grid(&self.parser);

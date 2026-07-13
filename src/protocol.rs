@@ -172,7 +172,7 @@ pub struct ScreenView {
     pub alt_screen: bool,
     /// Whether the child's wheel-to-arrows gate is open: alt screen with
     /// DECSET 1007 in effect. Carried separately from `alt_screen` because a
-    /// `?1007l` veto must reach the client — left uncaptured with alternate
+    /// `?1007l` veto must reach the client. Left uncaptured with alternate
     /// scroll on, the user's real terminal converts wheel to arrows itself,
     /// past any core-side gate.
     pub alt_scroll: bool,
@@ -845,7 +845,7 @@ mod tests {
 
     /// A v5-shaped screen header (no `ascr`) is rejected whole: strict decode
     /// treats a missing field like a mistyped one. Version-skewed peers never
-    /// get this far — the hello gate refuses them first — so this pins the
+    /// get this far (the hello gate refuses them first), so this pins the
     /// fallback, not the primary defense.
     #[test]
     fn screen_header_without_alt_scroll_is_rejected() {
