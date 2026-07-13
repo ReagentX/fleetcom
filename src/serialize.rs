@@ -1,6 +1,4 @@
-//! Serialize an `alacritty_terminal` grid back into ANSI bytes: the owned
-//! correctness surface of the emulator migration (EMULATOR_MIGRATION.md).
-//! Replaced `vt100::Screen::contents_formatted` at the step-4 backend swap.
+//! Serialize an `alacritty_terminal` grid into ANSI bytes for attached clients.
 //!
 //! Contract: replaying [`formatted`]'s bytes into a fresh terminal of the same
 //! dimensions reproduces the source's *displayed* screen (every cell's
@@ -16,14 +14,12 @@
 //! `WRAPLINE` or `LEADING_WIDE_CHAR_SPACER`: wrap bookkeeping the grid keeps
 //! for reflow and selection, invisible on screen. Consequence: a client
 //! copying a soft-wrapped logical line out of a replayed view gets hard
-//! newlines at row boundaries. Accepted for v1; wrap-aware emission can
-//! replace this later under the same oracle, which excludes exactly those two
-//! flags from comparison.
+//! newlines at row boundaries. The round-trip comparison excludes exactly
+//! those two flags.
 //!
-//! # Known drops and normalizations (v1)
+//! # Serialization limits and normalizations
 //!
-//! - Hyperlinks (OSC 8): modeled by the backend, not re-emitted (post-ship
-//!   tier in the migration plan). On the known-drop ledger.
+//! - Hyperlinks (OSC 8): modeled by the backend but not re-emitted or compared.
 //! - Blink (SGR 5/6): alacritty stores no blink flag, so there is nothing to
 //!   serialize; both source and replay drop it identically.
 //! - Orphaned wide-char halves: ECH/DCH/ICH can strip a wide glyph's partner
@@ -418,11 +414,9 @@ fn push_underline_color(buf: &mut String, color: Color) {
     }
 }
 
-/// The round-trip oracle (migration step 2's gate): parse bytes into a term,
-/// serialize, replay into a fresh term, compare every displayed cell and the
-/// cursor. Comparison exclusions mirror the module-level normalizations and
-/// are documented at [`tests::assert_same_screen`], where the comparison is
-/// defined.
+/// Round-trip tests parse bytes, serialize the resulting grid, replay the
+/// serialization, and compare every displayed cell and the cursor. Comparison
+/// exclusions are documented by [`tests::assert_same_screen`].
 #[cfg(test)]
 mod tests {
     use alacritty_terminal::{
@@ -468,7 +462,7 @@ mod tests {
     ///   stream recreates a lone half.
     /// - A `'\t'` cell under a pending-wrap cursor is expected as a blank:
     ///   `put_tab` cannot set pending wrap, and cursor state wins.
-    /// - Hyperlink extras are not compared (v1 known drop, post-ship tier).
+    /// - Hyperlink extras are not compared because they are not serialized.
     fn assert_same_screen(source: &Term<VoidListener>, replay: &Term<VoidListener>, case: &str) {
         let sgrid = source.grid();
         let rgrid = replay.grid();
@@ -638,8 +632,7 @@ mod tests {
         round_trip(&source, "codex_resume.bin scrolled to top");
     }
 
-    // Targeted synthetic cases: one per hard case from the migration doc's
-    // serializer section, so an oracle failure names its cause.
+    // Targeted synthetic cases cover each serialization edge case separately.
 
     #[test]
     fn sgr_reset_boundaries() {
@@ -986,7 +979,7 @@ mod tests {
     // wall-clock-dependent sequences), covering interleavings the targeted
     // cases cannot enumerate.
 
-    /// xorshift64 (Marsaglia): tiny, deterministic, no dependency.
+    /// Small deterministic PRNG with no additional dependency.
     struct XorShift64(u64);
 
     impl XorShift64 {

@@ -1,7 +1,8 @@
-//! Golden suites for the emulator migration (EMULATOR_MIGRATION.md, "Testing",
-//! step 3): both backends parse the recorded PTY corpus (tests/corpus), and
-//! every difference is classified: encoding equivalence, whitelisted
-//! parser-level delta, or failure. Nothing is held to byte equality.
+//! Differential tests for the production and vt100 terminal emulators. Both
+//! backends parse the recorded PTY corpus, and each difference is either an
+//! encoding equivalence, an explicitly asserted semantic difference, or a
+//! test failure. Serialized output is compared by displayed state rather than
+//! byte equality.
 //!
 //! **Compatibility suite.** Primary comparison is reconstructed screen state:
 //! each backend's screen-as-ANSI (`vt100::Screen::contents_formatted` vs
@@ -12,18 +13,9 @@
 //! display the same thing. Plain text and cursor position are compared across
 //! backends directly as a secondary check.
 //!
-//! **Semantic suite.** The fixtures that exercise parser-level deltas get
-//! goldens asserting each difference as concrete values: top-anchored-region
-//! scrollback retention plus bold+dim intensity stacking (codex_resume), DEC
-//! charset translation (dec_scrollregion), and VS16 width, which measurement
-//! shows is *absent* at these pins, so its golden pins the parity
-//! (wide_emoji). These goldens are the record of intentional behavior change
-//! at the backend swap (step 4): a measurement moving here means the
-//! user-visible contract moved, not that a tolerance needs widening.
-//!
-//! This module outlives the migration as the differential harness: vt100 is
-//! a `[dev-dependencies]` entry that lives on only here and in the seam's
-//! test-only variant, guarding alacritty pin-bumps.
+//! **Semantic suite.** Fixtures with parser-level differences assert exact
+//! values for top-anchored-region scrollback retention, bold-plus-dim
+//! intensity stacking, DEC charset translation, and VS16 width.
 
 use alacritty_terminal::{
     Term,
@@ -36,21 +28,17 @@ use alacritty_terminal::{
 
 use crate::serialize;
 
-/// Corpus fixtures were captured under a 40-row, 120-column PTY
-/// (tests/corpus/README.md).
+/// Corpus dimensions: 40 rows by 120 columns.
 const LINES: usize = 40;
 const COLS: usize = 120;
 
-/// vt100 fixes its scrollback cap at construction; matches the production
-/// depth (`task.rs`). Every retention golden measures far below it, so the
-/// cap never clips a measurement.
+/// Scrollback depth used by production tasks and the vt100 test backend.
 const SCROLLBACK: usize = 2000;
 
 /// Wrap bookkeeping is invisible on screen and diverges by construction:
 /// vt100's serialization recreates soft wraps by writing through the right
 /// edge, while [`serialize::formatted`] is CUP-per-row and never wraps.
-/// Encoding equivalence (classifier class "same displayed result"), masked in
-/// the reference-grid comparison.
+/// These flags are masked in the reference-grid comparison.
 const WRAP_ARTIFACTS: Flags = Flags::WRAPLINE.union(Flags::LEADING_WIDE_CHAR_SPACER);
 
 fn alacritty(bytes: &[u8]) -> Term<VoidListener> {
@@ -80,8 +68,7 @@ fn vt100_retained(parser: &mut vt100::Parser) -> usize {
 /// `CSI 38;5;x m` to an indexed one, and both address palette entry `x`: a
 /// client displays them identically. vt100 stores every color as an index and
 /// re-emits 0-15 in the short form; the alacritty serializer preserves the
-/// child's spelling. SGR encoding equivalence (classifier class "same
-/// displayed result"), canonicalized to the indexed form for comparison.
+/// child's spelling. Comparisons canonicalize both to the indexed form.
 fn canon(color: Color) -> Color {
     match color {
         Color::Named(named) if (named as usize) < 16 => Color::Indexed(named as u8),
@@ -94,16 +81,11 @@ fn canon(color: Color) -> Color {
 /// flags, underline color. Exactly two documented equivalences are absorbed:
 /// the `WRAP_ARTIFACTS` mask and [`canon`]'s palette-spelling collapse.
 ///
-/// `allow_bold_dim` admits one approved *parser-level* delta, discovered by
-/// this suite and absent from the migration doc's whitelist: SGR 1 followed
-/// by SGR 2 without an intervening 22. alacritty models bold and dim as
-/// independent attributes (xterm semantics; both flags set), while vt100's
-/// intensity is a two-state exclusive field (`attrs.rs`
-/// `TEXT_MODE_INTENSITY`: `set_bold`/`set_dim` clear each other), keeping
-/// only the later SGR. Returns the number of cells absorbed so the approving
-/// golden pins the delta's exact footprint; compat fixtures pass `false` and
-/// fail on it. Everything else that differs is a real display difference and
-/// fails.
+/// `allow_bold_dim` admits one parser-level difference: after SGR 1 followed
+/// by SGR 2 without SGR 22, alacritty stores both flags while vt100 stores
+/// only the later intensity. The return value counts affected cells so the
+/// semantic test can assert the exact footprint; compatibility fixtures pass
+/// `false` and reject the difference.
 fn assert_reference_grids_match(
     vt_ref: &Term<VoidListener>,
     al_ref: &Term<VoidListener>,
@@ -235,30 +217,16 @@ compat!(compat_top_live, "top_live.bin");
 compat!(compat_shell_colors, "shell_colors.bin");
 compat!(compat_build_log, "build_log.bin");
 
-// Semantic suite: each golden asserts an approved cross-backend difference
-// (or a verified absence of an expected one) as concrete values, and states
-// the user-visible behavior it certifies. A golden moving means the contract
-// moved: re-approve explicitly, never widen a tolerance.
+// Semantic tests assert cross-backend differences as concrete values.
 
-/// Golden: the defect that motivated the migration. Codex's inline TUI pushes
-/// chat history into scrollback through a top-anchored DECSTBM region
-/// (`CSI 1;N r` + `\r\n` at the region bottom); vt100 gates the scrollback
-/// push on the region being the *full* screen (`grid.rs:566`) and drops every
-/// one of those rows, alacritty retains rows whenever the region's top margin
-/// is row 0, matching xterm.js, kitty, wezterm.
+/// The Codex fixture pushes chat history into scrollback through a top-anchored
+/// DECSTBM region (`CSI 1;N r` plus `\r\n` at the bottom). vt100 retains no
+/// rows from those scrolls, while alacritty retains 85.
 ///
-/// The fixture also exercises a second, *discovered* parser-level delta the
-/// migration doc's whitelist does not carry: codex styles its "› " prompt
-/// marker with `ESC[1m ESC[2m` (bold, then dim, no intervening 22). alacritty
-/// keeps both intensity flags, vt100's exclusive intensity field keeps only
-/// dim, so the marker renders bold+dim after the swap, dim-only before. Two
-/// cells on the visible screen, pinned below.
-///
-/// Certifies: after the swap, a user attaching to this codex session can
-/// scroll back through 85 rows of chat history where today there are none,
-/// and the prompt marker gains bold on top of dim. Beyond those two deltas
-/// the visible screen, cursor, and plain text are equivalent. Nothing else
-/// changes for the user.
+/// The fixture styles its two-cell "› " prompt marker with bold followed by
+/// dim. alacritty stores both flags, while vt100 stores only dim. Apart from
+/// these asserted differences, the visible screen, cursor, and plain text are
+/// equivalent.
 #[test]
 fn semantic_codex_resume_scrollback_retention() {
     let (mut vt, al, bold_dim_cells) = compare_backends(
@@ -294,13 +262,8 @@ fn semantic_codex_resume_scrollback_retention() {
 
 /// Golden: the retention delta in its minimal synthetic form. A top-anchored
 /// `CSI 1;20 r` region with 34 newlines scrolled through its bottom margin.
-/// vt100 drops every scrolled-off row (`grid.rs:566` requires a full-screen
-/// region); alacritty retains all 34 (`region.start == 0` suffices). The
-/// visible screens stay equivalent; only history differs. That is exactly
-/// the user-facing shape of the codex defect without codex's styling noise.
-///
-/// Certifies: scrollback exists after the swap for inline-TUI children that
-/// push history through top-anchored regions.
+/// vt100 retains none of the scrolled-off rows, while alacritty retains all
+/// 34. The visible screens stay equivalent; only history differs.
 #[test]
 fn semantic_topregion_scroll_retention() {
     let (mut vt, al, _) = compare_backends(
@@ -313,11 +276,8 @@ fn semantic_topregion_scroll_retention() {
         0,
         "vt100 drops all region-scrolled history"
     );
-    // 34 region scrolls plus 1 from the opening `ESC[2J`: alacritty's ED 2
-    // clears the primary screen by scrolling the viewport into history
-    // (`clear_viewport`), here the single cursor row of the then-empty
-    // screen; vt100's ED 2 erases in place. Both deltas are whitelisted
-    // parser-level behavior (EMULATOR_MIGRATION.md, Testing).
+    // alacritty retains 34 region scrolls plus the initial row preserved by
+    // `ESC[2J`; vt100 erases the initial row in place.
     assert_eq!(
         al.grid().history_size(),
         35,
@@ -325,18 +285,9 @@ fn semantic_topregion_scroll_retention() {
     );
 }
 
-/// Golden: VS16 emoji-presentation width. The expected delta is *absent* at
-/// these pins. The migration doc whitelists VS16 width as a parser-level
-/// delta, but alacritty_terminal 0.26.0 sizes cells with plain
-/// `unicode_width` (`term/mod.rs` `input`) and files U+FE0F as a zero-width
-/// attach, exactly like vt100: U+26A0+VS16 occupies one cell in both, and the
-/// whole fixture is visible-screen equivalent (the widening lives in the
-/// alacritty *renderer*, not the grid this crate consumes).
-///
-/// Certifies: the backend swap does not move emoji column alignment. The
-/// concrete cell pins exist so a pin-bump that adds grid-level VS16 widening
-/// trips here and gets re-approved as an intentional, user-visible width
-/// change instead of slipping through.
+/// VS16 emoji-presentation width is equal in both configured backends.
+/// U+26A0+VS16 occupies one cell, with VS16 stored as a zero-width attachment,
+/// so the fixture has identical emoji column alignment.
 #[test]
 fn semantic_wide_emoji_vs16_width_parity() {
     let (vt, al) = assert_visible_equivalent(
@@ -372,22 +323,12 @@ fn semantic_wide_emoji_vs16_width_parity() {
     assert!(vt.screen().cell(0, 23).unwrap().is_wide());
 }
 
-/// Golden: DEC line-drawing charset (SCS). vt100 has no charset machinery at
-/// all (`esc_dispatch` routes `ESC ( 0` to `unhandled_escape`), so DEC
-/// special-graphics bytes keep their ASCII identities; alacritty translates
-/// them to box-drawing glyphs at write time.
+/// Golden: DEC line-drawing charset (SCS). vt100 leaves special-graphics bytes
+/// as ASCII, while alacritty translates them to box-drawing glyphs.
 ///
-/// The fixture's scroll region is a deliberate contrast to codex_resume: its
-/// top margin is row 5 (`CSI 5;20r`), not row 0, and nothing scrolls inside
-/// it. The only scroll is a full-screen `\r\n` on the bottom line after the
-/// region resets, which *both* backends push to scrollback. The corpus README
-/// hints at a retention delta here; measurement says otherwise, so the pinned
-/// value is equality. The retention delta is exclusively codex_resume's
-/// top-anchored golden.
-///
-/// Certifies: after the swap, vim/tmux-style borders drawn via `ESC ( 0`
-/// render as lines instead of `lqqk`/`x`/`mqqj` letter soup, and non-top-
-/// anchored regions keep their scrollback behavior bit-for-bit.
+/// The fixture's region starts at row 5 and does not scroll. Its only scroll
+/// is a full-screen `\r\n` after the region resets, and both backends retain
+/// that row.
 #[test]
 fn semantic_dec_scrollregion_charset_translation() {
     let bytes = include_bytes!("../tests/corpus/dec_scrollregion.bin");

@@ -25,13 +25,9 @@ const IDLE_AFTER: Duration = Duration::from_millis(600);
 /// Send-on-change fingerprint for the watched screen and scrollback offset.
 type LastScreen = (u64, Vec<u8>, (u16, u16), bool, (bool, bool), usize);
 
-/// Ceiling for PTY dimensions accepted from a (possibly crafted) `Resize`. A 0
-/// dimension is outside alacritty's grid domain: a zero-column resize
-/// underflows `columns - 1` in its shrink path and a zero-row grid is indexed
-/// out of bounds by the first cell write: a panic in both build profiles. An
-/// unbounded one (up to `u16::MAX`) would allocate a multi-billion-cell grid
-/// and OOM. Real terminals never approach this, so clamping to `[1, MAX_DIM]`
-/// is invisible in normal use and a hard stop against a malicious peer.
+/// Ceiling for PTY dimensions accepted from a `Resize`. Zero is invalid for
+/// the terminal grid, while values up to `u16::MAX` could exhaust memory.
+/// Clamping to `[1, MAX_DIM]` bounds allocations from untrusted requests.
 const MAX_DIM: u16 = 1000;
 
 /// Ceiling on live tasks. Each is a PTY (fds) + child + reader thread + a
@@ -646,14 +642,8 @@ mod tests {
         );
     }
 
-    /// The tick path terminates an expired `?2026` synchronized update: a
-    /// child that opens BSU and stalls gets its buffered frame flushed by the
-    /// periodic tick instead of frozen until more bytes arrive. If the tick
-    /// hook were missing, the child's silence would keep the frame invisible
-    /// forever and this test would time out. Staleness *before* expiry is
-    /// pinned deterministically at the emulator level
-    /// (`emulator::tests::stalled_sync_update_flushes_after_timeout`); this
-    /// proves the supervisor wiring.
+    /// A periodic tick flushes an expired synchronized update from a child
+    /// that stops producing output.
     #[test]
     fn tick_flushes_a_stalled_sync_update() {
         let mut s = sup(24, 80);
@@ -1062,11 +1052,8 @@ mod tests {
         );
     }
 
-    /// A crafted `Resize` with zero or enormous dimensions must be clamped,
-    /// not forwarded to the grid. 0 panics inside alacritty (column-shrink
-    /// underflow, out-of-bounds cell writes), and `u16::MAX` would allocate a
-    /// multi-billion-cell grid. Reaching the end without a panic/OOM is the
-    /// assertion.
+    /// Hostile resize dimensions are clamped to the grid's valid, bounded
+    /// range.
     #[test]
     fn resize_clamps_hostile_dimensions() {
         let mut s = sup(24, 80);

@@ -11,9 +11,7 @@ repository = "https://github.com/ReagentX/fleetcom"
 version = "0.0.0"
 
 [dependencies]
-# `default-features = false` drops serde. Its unconditional tty module pulls
-# `signal-hook` 0.4 alongside crossterm's 0.3; the duplication is transitive
-# and unavoidable until crossterm bumps.
+# Disable the unused serde integration.
 alacritty_terminal = { version = "=0.26.0", default-features = false }
 base64 = "=0.22.1"
 crossterm = "=0.29.0"
@@ -27,9 +25,7 @@ rustix = { version = "=1.1.4", features = ["process"] }
 signal-hook = { version = "0.3", default-features = false }
 
 [dev-dependencies]
-# The differential-harness reference backend (EMULATOR_MIGRATION.md,
-# "Testing"): the golden suites parse the corpus through both emulators.
-# Never ships; the production `Emulator::Vt100` variant is `#[cfg(test)]`.
+# Test-only reference backend for differential emulator comparisons.
 vt100 = "=0.16.2"
 
 [profile.release]

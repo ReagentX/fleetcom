@@ -182,16 +182,14 @@ pub struct Task {
     /// Bytes admitted to the writer queue but not yet fully written. Two
     /// admitters: the core thread (`queue_write`, client input) and the reader
     /// thread (`forward_probe_replies`, probe replies of a few bytes each).
-    /// Each check-then-add can over-admit by at most the other's in-flight
-    /// reply: noise against the 16 MiB cap. The worker subtracts after each
-    /// completed write.
+    /// A race can exceed the 16 MiB cap by at most one small probe reply. The
+    /// worker subtracts after each completed write.
     pending_write: Arc<AtomicUsize>,
     /// Session-leader PID, also used as the process-group ID.
     pid: Option<u32>,
     /// Shared with the reader thread: it writes (process bytes), the UI reads
-    /// (render/preview). Fair, not std: under a firehose the reader's long
-    /// `process` calls re-acquire back-to-back, and a std mutex would let it
-    /// starve the supervisor's snapshot locks indefinitely.
+    /// (render/preview). Fair locking prevents repeated parser writes from
+    /// starving the supervisor's snapshot reads.
     parser: Arc<FairMutex<Emulator>>,
     last_activity: Arc<Mutex<Instant>>,
     handle: Option<JoinHandle<()>>,
@@ -221,17 +219,14 @@ fn signal(waker: &Waker) {
     }
 }
 
-/// Lock the shared emulator grid. `FairMutex` is parking_lot underneath, so
-/// there is no poison state to recover from: a panic while parsing releases
-/// the lock and the next render proceeds on whatever state the grid holds.
+/// Lock the shared emulator grid. `FairMutex` does not poison, so a later
+/// access can read the state left by a panicking operation.
 fn grid(parser: &FairMutex<Emulator>) -> impl std::ops::DerefMut<Target = Emulator> + '_ {
     parser.lock()
 }
 
-/// Queue allowlisted probe replies for the child on the writer worker, using
-/// the same pending-byte accounting as `queue_write` but dropping instead of
-/// reporting when the queue is full: a child that stopped reading input is
-/// not waiting on a reply, and replies are a few bytes each.
+/// Queue allowlisted probe replies on the PTY writer worker. Replies use the
+/// normal pending-byte accounting and are dropped when the queue is full.
 fn forward_probe_replies(tx: &Sender<Vec<u8>>, pending: &AtomicUsize, replies: Vec<String>) {
     for reply in replies {
         let len = reply.len();
@@ -935,10 +930,8 @@ mod tests {
         );
     }
 
-    /// The wheel-as-arrows gate is real DECSET 1007 state, not the alt-screen
-    /// heuristic it replaced: a full-screen child that switches 1007 off gets
-    /// nothing from the wheel, and one that leaves it default-on (the
-    /// `wheel_routes_by_child_state` case) gets arrows.
+    /// A full-screen child receives wheel arrows only while DECSET 1007 is
+    /// enabled; the mode defaults on.
     #[test]
     fn wheel_arrows_honor_decset_1007() {
         let up = MouseKind::WheelUp;
@@ -963,10 +956,7 @@ mod tests {
         let drag = MouseKind::Drag(MouseBtn::Left);
         let release = MouseKind::Release(MouseBtn::Left);
 
-        // X10 mode: presses only. Pinned through the vt100 backend, the only
-        // one that models DECSET 9. alacritty ignores it entirely (see
-        // `emulator::tests::x10_decset9_unmodeled_by_alacritty`), so this
-        // keeps `mouse_bytes`'s Press-mode gating under test.
+        // The vt100 test backend models X10 mode, which accepts presses only.
         let mut p = Emulator::new_vt100(24, 80, 0);
         p.process(b"\x1b[?9h");
         assert_eq!(
@@ -976,8 +966,8 @@ mod tests {
         assert_eq!(mouse_bytes(&p, release, 4, 2), None);
         assert_eq!(mouse_bytes(&p, drag, 4, 2), None);
 
-        // 1000 with SGR: releases use `m`; drags remain disabled. From here
-        // on, the production backend.
+        // The remaining modes use the production backend. In mode 1000 with
+        // SGR encoding, releases use `m` and drags remain disabled.
         let mut p = Emulator::new(24, 80, 0);
         p.process(b"\x1b[?1000h\x1b[?1006h");
         assert_eq!(mouse_bytes(&p, press, 4, 2), Some(b"\x1b[<0;5;3M".to_vec()));

@@ -1,9 +1,6 @@
-//! The terminal-emulation seam: every read of a task's screen state and every
-//! byte parsed into it goes through [`Emulator`], so the backend can change
-//! without touching call-sites. The production backend is
-//! `alacritty_terminal`; a `#[cfg(test)]` vt100 variant survives as the
-//! reference side of the differential golden suites (a dev-dependency:
-//! release builds compile it out entirely).
+//! Terminal emulation for task output and screen-state queries. Production
+//! tasks use `alacritty_terminal`; tests can also construct a vt100-backed
+//! emulator for differential comparisons.
 
 use std::{
     sync::{Arc, Mutex},
@@ -57,9 +54,7 @@ impl EventListener for ProbeSink {
     }
 }
 
-/// `Dimensions` carrier for `Term::new`/`Term::resize`. alacritty's own
-/// concrete impl (`term::test::TermSize`) lives in its test module, which
-/// production code shouldn't reach into.
+/// Terminal dimensions supplied to `Term::new` and `Term::resize`.
 struct GridSize {
     lines: usize,
     columns: usize,
@@ -79,14 +74,9 @@ impl Dimensions for GridSize {
     }
 }
 
-/// Default-deny allowlist over backend-generated probe responses
-/// (EMULATOR_MIGRATION.md, probe policy). The advertised contract is exactly
-/// three shapes: CPR (`ESC[<row>;<col>R`), the DSR-5 ok reply (`ESC[0n`), and
-/// the primary DA response (`ESC[?<params>c`). Everything else the backend
-/// can emit (secondary DA `ESC[>...c`, kitty keyboard reports `ESC[?...u`,
-/// DECRPM `...$y`, window-size `ESC[8;...t`, and whatever a future pin adds) is
-/// dropped, so a backend bump cannot silently widen what fleetcom advertises
-/// to children.
+/// Default-deny allowlist for backend-generated probe responses. Fleetcom
+/// forwards only CPR (`ESC[<row>;<col>R`), DSR-5 (`ESC[0n`), and primary DA
+/// (`ESC[?<params>c`) responses.
 fn allowed_probe_response(resp: &str) -> bool {
     let Some(body) = resp.strip_prefix("\x1b[") else {
         return false;
@@ -138,16 +128,10 @@ impl AlacrittyBackend {
     }
 }
 
-/// One task's terminal emulator: parser plus grid. An enum, not a trait
-/// object, because the variant set is closed: two backends during a
-/// migration, one at ship. Promote to a trait only if a third materializes.
+/// One task's terminal parser and grid.
 pub enum Emulator {
-    /// The differential-harness reference backend: the golden and
-    /// mouse-contract tests construct it; production cannot. vt100 is a
-    /// dev-dependency, so the variant only compiles under `cfg(test)`.
-    /// Both variants are boxed: each backend's inline state runs to
-    /// kilobytes, and every task holds exactly one emulator behind an `Arc`,
-    /// so the indirection costs nothing that matters.
+    /// Test-only reference backend used by differential and mouse tests.
+    /// Both variants are boxed to keep the enum small.
     #[cfg(test)]
     Vt100(Box<vt100::Parser>),
     Alacritty(Box<AlacrittyBackend>),
@@ -158,9 +142,8 @@ impl Emulator {
     pub fn new(rows: u16, cols: u16, scrollback: usize) -> Self {
         let responses = Arc::new(Mutex::new(Vec::new()));
         let config = Config {
-            // The plan's fixed history depth, not alacritty's 10k default:
-            // per-task memory stays bounded at the depth the golden retention
-            // measurements assume.
+            // Use fleetcom's per-task history limit instead of the backend
+            // default.
             scrolling_history: scrollback,
             ..Config::default()
         };
@@ -179,8 +162,7 @@ impl Emulator {
         }))
     }
 
-    /// A fresh vt100-backed emulator, for tests pinning cross-backend
-    /// behavior against the differential reference.
+    /// A fresh vt100-backed emulator for cross-backend tests.
     #[cfg(test)]
     pub fn new_vt100(rows: u16, cols: u16, scrollback: usize) -> Self {
         Self::Vt100(Box::new(vt100::Parser::new(rows, cols, scrollback)))
@@ -316,14 +298,10 @@ impl Emulator {
         }
     }
 
-    /// Whether wheel events should reach the child as arrow keys: on the
-    /// alternate screen with DECSET 1007 in effect. The gate mirrors
-    /// alacritty the terminal's own arrow-emission check
-    /// (`mode().contains(ALT_SCREEN | ALTERNATE_SCROLL)` in its
-    /// `scroll_terminal`). 1007 defaults *on* (xterm semantics), so a
-    /// full-screen child scrolls without opting in but keeps `?1007l` as its
-    /// veto. vt100 cannot model 1007; its arm keeps the pre-step-6 heuristic
-    /// (alt screen alone) so the cross-backend tests retain their meaning.
+    /// Whether wheel events should reach the child as arrow keys. Production
+    /// requires the alternate screen and DECSET 1007, which defaults enabled.
+    /// The vt100 test backend cannot model DECSET 1007 and therefore checks
+    /// only the alternate screen.
     pub fn alternate_scroll(&self) -> bool {
         match self {
             #[cfg(test)]
@@ -411,10 +389,8 @@ mod tests {
 
     use super::*;
 
-    /// The filter's exact contract, shape by shape. The denied cases name
-    /// every response class the backend can emit at this pin plus arbitrary
-    /// unknown strings, so a pin-bump that grows the response surface cannot
-    /// silently widen the advertised contract.
+    /// The allowlist accepts only the advertised response shapes and rejects
+    /// other backend responses, malformed variants, and unknown strings.
     #[test]
     fn probe_allowlist_forwards_only_the_advertised_shapes() {
         // Allowed: CPR, DSR-5 ok, primary DA.
@@ -424,7 +400,7 @@ mod tests {
         assert!(allowed_probe_response("\x1b[?6c"));
         assert!(allowed_probe_response("\x1b[?62;22c"));
 
-        // Denied: named response classes alacritty emits today.
+        // Denied: other backend response classes.
         assert!(!allowed_probe_response("\x1b[>0;2606;1c")); // secondary DA
         assert!(!allowed_probe_response("\x1b[?1u")); // kitty keyboard report
         assert!(!allowed_probe_response("\x1b[?2026;2$y")); // DECRPM, private
@@ -443,7 +419,7 @@ mod tests {
         assert!(!allowed_probe_response("\x1b[?c")); // DA needs params
         assert!(!allowed_probe_response("\x1b[?6xc"));
 
-        // Denied: arbitrary unknown responses (the pin-bump guard).
+        // Denied: arbitrary unknown responses.
         assert!(!allowed_probe_response("\x1b[?9999;42z"));
         assert!(!allowed_probe_response("unrecognized"));
         assert!(!allowed_probe_response(""));
@@ -519,8 +495,8 @@ mod tests {
         assert!(emu.contents().contains("and on"));
     }
 
-    /// vt100→TermMode mouse-mode mapping: most recent DECSET wins, unset
-    /// returns to none, and 1005/1006 stay mutually exclusive.
+    /// Production mouse modes follow the most recent DECSET, return to none
+    /// when unset, and keep 1005 and 1006 mutually exclusive.
     #[test]
     fn mouse_modes_map_to_termmode_bits() {
         let mut emu = Emulator::new(24, 80, 0);
@@ -549,10 +525,8 @@ mod tests {
         );
     }
 
-    /// The step-4 modeling gap, pinned: DECSET 9 (X10 press-only) is ignored
-    /// by alacritty/vte (no `NamedPrivateMode` for mode 9) where vt100
-    /// reported `Press`. An X10-only child gets no mouse reports after the
-    /// swap, matching alacritty the terminal.
+    /// DECSET 9 (X10 press-only) is ignored by the production backend, while
+    /// the vt100 test backend reports `Press`.
     #[test]
     fn x10_decset9_unmodeled_by_alacritty() {
         let mut emu = Emulator::new(24, 80, 0);
@@ -564,11 +538,9 @@ mod tests {
         assert_eq!(vt.mouse_protocol_mode(), MouseProtocolMode::Press);
     }
 
-    /// The wheel-as-arrows gate is alt screen *and* DECSET 1007, with 1007
-    /// defaulting on, and the child's `?1007l` veto is honored, which the
-    /// old alt-screen heuristic could not do. The vt100 arm keeps that
-    /// heuristic (no 1007 state to read), pinned here so the divergence is
-    /// explicit rather than a silent cross-backend drift.
+    /// The production wheel-as-arrows gate requires the alternate screen and
+    /// DECSET 1007, which defaults on. The vt100 test backend has no DECSET
+    /// 1007 state and gates only on the alternate screen.
     #[test]
     fn alternate_scroll_requires_alt_screen_and_1007() {
         let mut emu = Emulator::new(24, 80, 0);
@@ -611,19 +583,15 @@ mod tests {
         assert_eq!(emu.scrollback(), 0);
     }
 
-    /// History gathered through a top-anchored scroll region must survive
-    /// resize, and insertion at the new geometry must keep accumulating.
-    /// Multiplexers with homegrown grids historically lose exactly this
-    /// (zellij drops region-scrolled history after a pane resize until the
-    /// original size returns); alacritty reflows history through resize in
-    /// both directions, and this pins that our seam preserves that.
+    /// Top-anchored region scrollback remains reachable after shrinking and
+    /// regrowing the grid, while new output continues to accumulate.
     #[test]
     fn region_scrolled_history_survives_resize() {
         let mut emu = Emulator::new(40, 120, 2000);
         for i in 1..=20 {
             emu.process(format!("\x1b[{i};1Hseed {i:02}").as_bytes());
         }
-        // Codex-style insertion: top-anchored region, newlines at its bottom.
+        // Insert history through newlines at a top-anchored region's bottom.
         emu.process(b"\x1b[1;20r\x1b[20;1H");
         for i in 1..=30 {
             emu.process(format!("\r\nhist {i:02}").as_bytes());
