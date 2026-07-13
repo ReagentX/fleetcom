@@ -43,7 +43,7 @@ use nix::{
 
 use crate::{
     core::{LoopExit, Wake, run_loop},
-    frame::{read_frame, write_frame},
+    frame::{MAX_FRAME, read_frame, write_frame},
     protocol::{
         Command, Event, LaunchContext, PROTOCOL_VERSION, decode_command, decode_event,
         decode_hello, encode_command, encode_event, encode_hello,
@@ -531,6 +531,26 @@ fn handshake(stream: &mut UnixStream) -> Result<LaunchContext, String> {
     }
 }
 
+/// Encode and write one event frame; `false` means "drop the client". An
+/// event whose payload exceeds `MAX_FRAME` is skipped instead (`true`,
+/// nothing written): the supervisor's geometry clamp bounds per-cell SGR
+/// emission, but per-cell zero-width extras are unbounded (alacritty stacks
+/// combining marks without limit), so a pathological child can still push a
+/// `Screen` — or its scrollback line into a `Tasks` preview — past the frame
+/// cap. `write_frame` would refuse such a payload before emitting a byte;
+/// treating that as a disconnect strands the client in a reconnect loop that
+/// re-requests the same frame. Skipping degrades one repaint: `Tasks` is
+/// rebuilt every tick, and a skipped `Screen` leaves the pane stale until the
+/// child's next write (the supervisor's send-on-change fingerprint was
+/// already updated), which only a hostile child can trigger.
+fn send_event(write: &mut impl Write, ev: &Event) -> bool {
+    let (kind, payload) = encode_event(ev);
+    if payload.len() > MAX_FRAME as usize {
+        return true;
+    }
+    write_frame(write, kind, &payload).is_ok()
+}
+
 /// Serve one client to completion. The hello handshake runs first (version
 /// check, launch context); then a reader thread turns inbound frames into
 /// `Wake::Cmd`s on the channel the core loop waits on; task output arrives on the
@@ -592,10 +612,7 @@ fn serve_client(sup: &mut Supervisor, stream: UnixStream, stop: &AtomicBool) -> 
     // write may block; a timeout surfaces as an error below and drops the client.
     let _ = write.set_write_timeout(Some(Duration::from_secs(5)));
     let outcome = catch_unwind(AssertUnwindSafe(|| {
-        run_loop(sup, &wake_rx, stop, |ev| {
-            let (kind, payload) = encode_event(ev);
-            write_frame(&mut write, kind, &payload).is_ok()
-        })
+        run_loop(sup, &wake_rx, stop, |ev| send_event(&mut write, ev))
     }));
     // Cleanup sits *after* the catch so every exit (return or panic) passes
     // through it: a stale waker points task reader threads at a dead channel,
@@ -648,6 +665,41 @@ mod tests {
         fs::write(&path, b"x").unwrap();
         assert!(ensure_runtime_dir(&path).is_err());
         let _ = fs::remove_dir_all(&base);
+    }
+
+    /// An event too large for one frame is skipped — nothing written, client
+    /// kept — while ordinary events still go out. The backstop behind the
+    /// supervisor's geometry clamp: unbounded per-cell zero-width extras (or
+    /// a serializer density regression the frame-fit test would have caught)
+    /// must cost one repaint, not the connection.
+    #[test]
+    fn oversized_event_is_skipped_not_fatal() {
+        use crate::protocol::ScreenView;
+        let oversized = Event::Screen(ScreenView {
+            id: 1,
+            lines: Vec::new(),
+            formatted: vec![b'x'; MAX_FRAME as usize + 1],
+            cursor: (0, 0),
+            hide_cursor: false,
+            wants_mouse: false,
+            alt_screen: false,
+            alt_scroll: false,
+            scrollback: 0,
+        });
+        let mut buf: Vec<u8> = Vec::new();
+        assert!(
+            send_event(&mut buf, &oversized),
+            "an oversized event must not read as a dead client"
+        );
+        assert!(buf.is_empty(), "no partial frame may reach the stream");
+
+        assert!(send_event(&mut buf, &Event::Status("ok".into())));
+        let (kind, payload) = read_frame(&mut io::Cursor::new(&buf)).unwrap();
+        assert_eq!(
+            decode_event(kind, &payload),
+            Some(Event::Status("ok".into())),
+            "ordinary events still flow after a skip"
+        );
     }
 
     /// The retry whitelist: fd exhaustion, interruption, and an aborted peer
