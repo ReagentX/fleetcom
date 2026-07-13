@@ -48,6 +48,32 @@ const MAX_TASKS: usize = 256;
 /// wedged job from making `Q` feel broken.
 const KILL_GRACE: Duration = Duration::from_secs(2);
 
+/// Group-name length cap, in chars after the trim. Display sanity for a
+/// section header, not validation: over-long names truncate, never refuse.
+const MAX_GROUP_CHARS: usize = 64;
+
+/// Normalize an inbound group name at the command boundary (`SetGroup` and
+/// `Spawn`), so every stored group is already display-safe. Control
+/// characters are stripped first: group names render as dashboard section
+/// headers, so raw C0/C1 bytes are a terminal-escape injection surface. The
+/// result is then trimmed and capped at [`MAX_GROUP_CHARS`] chars (chars, not
+/// bytes: the cap never splits a character). Two results map to `None`: the
+/// empty string, and the exact string "Unassigned". Mapping beats refusing
+/// because "no group" is precisely what that name claims, and it keeps a
+/// user-created section from colliding with the real Unassigned bucket.
+/// Everything else is byte-preserved. No case folding: "unassigned" is a
+/// legal group name, and distinct names must never collapse into one section
+/// (the rule `path::abbreviate` applies to directory labels).
+fn normalize_group(name: Option<String>) -> Option<String> {
+    let name = name?;
+    let stripped: String = name.chars().filter(|c| !c.is_control()).collect();
+    let capped: String = stripped.trim().chars().take(MAX_GROUP_CHARS).collect();
+    if capped.is_empty() || capped == "Unassigned" {
+        return None;
+    }
+    Some(capped)
+}
+
 pub struct Supervisor {
     tasks: Vec<Task>,
     /// Removed tasks whose process groups may still be winding down: TERMed at
@@ -142,12 +168,11 @@ impl Supervisor {
     /// notice, a spawn failure) is queued as `Event::Status`, never returned.
     pub fn apply(&mut self, cmd: Command) {
         match cmd {
-            // `group` is wire-only until the supervisor phase lands.
             Command::Spawn {
                 command,
                 cwd,
-                group: _,
-            } => self.spawn(&command, cwd),
+                group,
+            } => self.spawn(&command, cwd, normalize_group(group)),
             Command::Kill { id } => {
                 if let Some(t) = self.by_id_mut(id) {
                     t.terminate();
@@ -167,8 +192,13 @@ impl Supervisor {
                     t.tagged = on;
                 }
             }
-            // Accepted and dropped: group state lands with the supervisor phase.
-            Command::SetGroup { .. } => {}
+            // Like `Tag`, an unknown id is a silent no-op: the task can exit
+            // between the client's keypress and this apply.
+            Command::SetGroup { id, group } => {
+                if let Some(t) = self.by_id_mut(id) {
+                    t.group = normalize_group(group);
+                }
+            }
             Command::Resize { rows, cols } => {
                 // Clamp each dimension first, then preserve rows and reduce
                 // columns when the grid exceeds `MAX_CELLS`. The constant
@@ -291,7 +321,7 @@ impl Supervisor {
                 command: t.command.clone(),
                 cwd: t.cwd.clone(),
                 tagged: t.tagged,
-                group: None,
+                group: t.group.clone(),
                 lifecycle: t.lifecycle(now, IDLE_AFTER),
                 preview: t.preview(),
                 started_ago: now.duration_since(t.started),
@@ -363,7 +393,7 @@ impl Supervisor {
         self.launch.clone()
     }
 
-    fn spawn(&mut self, command: &str, cwd: PathBuf) {
+    fn spawn(&mut self, command: &str, cwd: PathBuf, group: Option<String>) {
         if self.tasks.len() >= MAX_TASKS {
             self.events.push(Event::Status(format!(
                 "task limit reached ({MAX_TASKS}), not spawning"
@@ -382,7 +412,8 @@ impl Supervisor {
             &launch.env,
             Arc::clone(&self.waker),
         ) {
-            Ok(task) => {
+            Ok(mut task) => {
+                task.group = group;
                 self.next_id += 1;
                 self.tasks.push(task);
             }
@@ -392,7 +423,7 @@ impl Supervisor {
         }
     }
 
-    /// Re-run a finished task in place while preserving its ID and tag.
+    /// Re-run a finished task in place while preserving its ID, tag, and group.
     fn restart(&mut self, id: u64) {
         let Some(i) = self.index_of(id) else {
             self.events
@@ -419,6 +450,7 @@ impl Supervisor {
         ) {
             Ok(mut fresh) => {
                 fresh.tagged = self.tasks[i].tagged;
+                fresh.group = self.tasks[i].group.clone();
                 // The displaced job exits like a Remove: TERM now, the
                 // graveyard's grace-then-KILL behind it. Dropping it here
                 // would straight-SIGKILL stragglers of the old run.
@@ -1059,6 +1091,127 @@ mod tests {
             .any(|e| matches!(e, Event::Tasks(v) if v.iter().any(|t| t.id == id && t.tagged)));
         assert!(tagged, "restart must carry the tag over");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The boundary table for `normalize_group`: controls stripped (section
+    /// headers are a terminal-escape surface), whitespace trimmed, the
+    /// 64-char cap counted after the trim and in chars, empty and the literal
+    /// "Unassigned" mapped to `None`, everything else byte-preserved.
+    #[test]
+    fn group_names_normalize_at_the_boundary() {
+        let n = |s: &str| normalize_group(Some(s.to_string()));
+        assert_eq!(normalize_group(None), None);
+        // Controls vanish; the printable remainder survives.
+        assert_eq!(n("\x1b[31mapi\x07"), Some("[31mapi".into()));
+        assert_eq!(n("  backend  "), Some("backend".into()));
+        // C0, DEL, and C1 with only whitespace between: nothing left.
+        assert_eq!(n(" \t \x1b \x7f \u{9b} "), None);
+        assert_eq!(n(""), None);
+        // The cap counts chars, not bytes: 80 two-byte chars keep exactly 64.
+        assert_eq!(n(&"\u{e9}".repeat(80)), Some("\u{e9}".repeat(64)));
+        // The cap applies after the trim, so padding spends none of it.
+        assert_eq!(n(&format!("  {}  ", "x".repeat(64))), Some("x".repeat(64)));
+        // "Unassigned" *is* the unassigned state; a user section by that name
+        // would collide with the real bucket.
+        assert_eq!(n("Unassigned"), None);
+        assert_eq!(n("  Unassigned  "), None);
+        // Byte-exact match only: no case folding anywhere.
+        assert_eq!(n("unassigned"), Some("unassigned".into()));
+        assert_eq!(n("UNASSIGNED"), Some("UNASSIGNED".into()));
+        assert_eq!(n("Api"), Some("Api".into()));
+    }
+
+    /// `SetGroup` round-trips through the snapshot: assignment shows the
+    /// normalized name, `None` clears it back to unassigned, and an unknown
+    /// id is the same silent no-op as `Tag` (the task can exit between the
+    /// client's keypress and this apply).
+    #[test]
+    fn set_group_round_trips_and_clears() {
+        let mut s = sup(24, 80);
+        s.apply(Command::Spawn {
+            command: "sleep 30".into(),
+            cwd: here(),
+            group: None,
+        });
+        s.tick();
+        let id = match s.drain().first() {
+            Some(Event::Tasks(v)) => v[0].id,
+            _ => panic!("expected a Tasks snapshot"),
+        };
+        let group_of = |s: &mut Supervisor| -> Option<String> {
+            s.tick();
+            for e in s.drain() {
+                if let Event::Tasks(v) = e
+                    && let Some(t) = v.iter().find(|t| t.id == id)
+                {
+                    return t.group.clone();
+                }
+            }
+            panic!("task {id} missing from the snapshot");
+        };
+
+        s.apply(Command::SetGroup {
+            id,
+            group: Some("  api  ".into()),
+        });
+        assert_eq!(group_of(&mut s), Some("api".into()));
+
+        s.apply(Command::SetGroup { id, group: None });
+        assert_eq!(group_of(&mut s), None);
+
+        // Unknown id: no panic, no event, no state change.
+        s.apply(Command::SetGroup {
+            id: 999,
+            group: Some("ghost".into()),
+        });
+        assert!(s.drain().is_empty(), "unknown-id SetGroup must stay silent");
+        assert_eq!(group_of(&mut s), None);
+    }
+
+    /// A spawn-time group passes the same normalization as `SetGroup` and is
+    /// present from the first snapshot: a task born into a workstream never
+    /// appears unassigned.
+    #[test]
+    fn spawn_carries_a_normalized_group_from_birth() {
+        let mut s = sup(24, 80);
+        s.apply(Command::Spawn {
+            command: "sleep 30".into(),
+            cwd: here(),
+            group: Some("  ui\x1b[2J  ".into()),
+        });
+        s.tick();
+        match s.drain().first() {
+            Some(Event::Tasks(v)) => assert_eq!(v[0].group.as_deref(), Some("ui[2J")),
+            _ => panic!("expected a Tasks snapshot"),
+        }
+    }
+
+    /// Restart preserves `group` alongside the tag: the assignment belongs to
+    /// the task slot, not the process instance that happened to run in it.
+    #[test]
+    fn restart_carries_the_group_over() {
+        use crate::protocol::Lifecycle;
+        let mut s = sup(24, 80);
+        s.apply(Command::Spawn {
+            command: "true".into(),
+            cwd: here(),
+            group: Some("infra".into()),
+        });
+        s.tick();
+        let id = match s.drain().first() {
+            Some(Event::Tasks(v)) => v[0].id,
+            _ => panic!("expected a Tasks snapshot"),
+        };
+        wait_for_lifecycle(&mut s, id, |l| l == Lifecycle::Ok);
+
+        s.apply(Command::Restart { id });
+        wait_for_lifecycle(&mut s, id, |l| l == Lifecycle::Ok);
+        s.tick();
+        let carried = s.drain().iter().any(|e| {
+            matches!(e, Event::Tasks(v)
+                if v.iter().any(|t| t.id == id && t.group.as_deref() == Some("infra")))
+        });
+        assert!(carried, "restart must carry the group over");
     }
 
     /// `Restart` never kills: a running task is refused with a status notice

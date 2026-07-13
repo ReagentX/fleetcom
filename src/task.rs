@@ -192,6 +192,10 @@ pub struct Task {
     last_activity: Arc<Mutex<Instant>>,
     handle: Option<JoinHandle<()>>,
     pub tagged: bool,
+    /// Workstream label the dashboard groups under; `None` = unassigned.
+    /// Lives on the task, not the client, so an assignment survives detach
+    /// exactly like `tagged`.
+    pub group: Option<String>,
     pub exit_code: Option<i32>,
     pub started: Instant,
     pub finished: Option<Instant>,
@@ -387,6 +391,7 @@ impl Task {
             last_activity,
             handle: Some(handle),
             tagged: false,
+            group: None,
             exit_code: None,
             started: Instant::now(),
             finished: None,
