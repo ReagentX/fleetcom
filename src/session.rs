@@ -7,9 +7,8 @@ use std::{
     path::{Path, PathBuf},
 };
 
-/// One recipe entry. Commands with neither group nor name serialize as
-/// strings; the rest serialize as `{"cmd", "group", "name"}` objects with the
-/// optional fields written only when set.
+/// One recipe entry. Entries without a group or name serialize as strings;
+/// other entries use objects whose optional fields are written only when set.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionEntry {
     pub cmd: String,
@@ -52,7 +51,7 @@ fn to_json(cfg: &SessionConfig) -> String {
         let mut arr = jzon::JsonValue::new_array();
         for e in entries {
             let member = if e.group.is_none() && e.name.is_none() {
-                // Unadorned entries use the compact string form.
+                // Entries without optional labels use the string form.
                 jzon::JsonValue::from(e.cmd.as_str())
             } else {
                 let mut m = jzon::JsonValue::new_object();
@@ -211,7 +210,7 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
-    /// Every group/name combination survives one serialization round trip.
+    /// Every group/name combination survives serialization.
     #[test]
     fn round_trips_named_entries() {
         let dir = temp("named");
@@ -238,14 +237,14 @@ mod tests {
         assert_eq!(cfg["~/proj"], vec![e("cargo test"), e("vim")]);
     }
 
-    /// Object members without a `name` key parse exactly as before names existed.
+    /// Object members may omit the optional `name` field.
     #[test]
     fn parses_the_pre_name_object_format() {
         let cfg = from_json(r#"{"~/proj": [{"cmd": "cargo test", "group": "ci"}]}"#).unwrap();
         assert_eq!(cfg["~/proj"], vec![ge("cargo test", "ci")]);
     }
 
-    /// A group-free config serializes using only string members.
+    /// Entries without a group or name serialize as strings.
     #[test]
     fn group_free_config_writes_the_pre_group_bytes() {
         let mut cfg = SessionConfig::new();

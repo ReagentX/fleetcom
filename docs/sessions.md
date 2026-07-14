@@ -33,12 +33,12 @@ A session is a JSON object that maps each working directory to an ordered list o
 ```
 
 - Keys are directory paths: each task's working directory.
-- Values are ordered lists. A string member is a bare shell command; the object form adds the group and display name its task receives on load, each written only when set. Order is preserved, and each command runs in its own PTY under that directory.
+- Values are ordered lists. A string member is a bare shell command; the object form adds the optional group and display name assigned on load. Order is preserved, and each command runs in its own PTY under that directory.
 - Directories serialize alphabetically. Command order remains stable within each directory.
 
-The schema is a flat map with no version field or metadata, so it remains practical to edit by hand. On load, the daemon normalizes group and display names alike: control characters removed, whitespace trimmed, a 64-character cap. `Unassigned` maps to no group but remains a legal display name. Invalid JSON fails the entire load. Within valid JSON, Fleetcom drops any member that matches neither entry form, including a non-string scalar, an object without a string `cmd`, or an object with a non-string `group` or `name`.
+The schema is a flat map with no version field or metadata, so it remains practical to edit by hand. On load, the daemon removes control characters, trims surrounding whitespace, and limits group and display names to 64 characters. `Unassigned` maps to no group but remains a legal display name. Invalid JSON fails the entire load. Within valid JSON, Fleetcom drops any member that matches neither entry form, including a non-string scalar, an object without a string `cmd`, or an object with a non-string `group` or `name`.
 
-Commands with neither a group nor a name are written as strings, so a fleet without either produces a file identical to the pre-group format. Both forms can appear in the same directory array, and files that predate groups and names load unchanged.
+Commands with neither a group nor a name use the string form. String and object entries can appear in the same directory array.
 
 ## Saving and loading
 

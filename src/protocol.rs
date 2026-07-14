@@ -56,7 +56,7 @@ pub enum Command {
     Tag { id: u64, on: bool },
     /// Set a task's group; `None` clears it back to unassigned.
     SetGroup { id: u64, group: Option<String> },
-    /// Set a task's display name; `None` clears it back to the command.
+    /// Set a task's display name; `None` clears it.
     SetName { id: u64, name: Option<String> },
     /// Client terminal resized: `rows`×`cols` is the PTY *content* size. The
     /// client has already subtracted the row it reserves for its status bar.
@@ -161,7 +161,7 @@ pub struct TaskView {
     pub tagged: bool,
     /// Dashboard group; `None` means unassigned.
     pub group: Option<String>,
-    /// Custom display name; `None` means the row shows the command.
+    /// Custom display name; `None` means unnamed.
     pub name: Option<String>,
     pub lifecycle: Lifecycle,
     pub preview: String,
@@ -539,7 +539,7 @@ pub fn encode_event(ev: &Event) -> (u8, Vec<u8>) {
                 if let Some(g) = &tv.group {
                     let _ = o.insert("group", g.as_str());
                 }
-                // Likewise, the name field is present only for named tasks.
+                // The name field is present only for named tasks.
                 if let Some(n) = &tv.name {
                     let _ = o.insert("name", n.as_str());
                 }
@@ -923,7 +923,7 @@ mod tests {
             r#"{"t":"tasks","tasks":[{"id":1,"command":"x","cwd":"/x","tagged":true,"life":"ok","preview":"","started_ms":0}]}"#,
             // A present group must be a string; only missing/null means unassigned.
             r#"{"t":"tasks","tasks":[{"id":1,"command":"x","cwd":"Lw==","tagged":true,"life":"ok","preview":"","started_ms":0,"group":5}]}"#,
-            // Same for a present name.
+            // A present name must be a string.
             r#"{"t":"tasks","tasks":[{"id":1,"command":"x","cwd":"Lw==","tagged":true,"life":"ok","preview":"","started_ms":0,"name":5}]}"#,
             r#"{"t":"tasks","tasks":["flat"]}"#,
             // Numeric member in `names`.
@@ -1008,8 +1008,8 @@ mod tests {
         );
     }
 
-    /// `SetName` emits `"n"` only for an assignment. A missing or null `"n"`
-    /// decodes as a clear.
+    /// `SetName` omits `"n"` when clearing; a missing or null `"n"` decodes as
+    /// a clear.
     #[test]
     fn set_name_wire_form() {
         let (k, p) = encode_command(&Command::SetName {

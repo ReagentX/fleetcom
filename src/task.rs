@@ -194,8 +194,7 @@ pub struct Task {
     pub tagged: bool,
     /// Dashboard group stored with the task; `None` means unassigned.
     pub group: Option<String>,
-    /// Custom display name stored with the task; `None` means the UI shows
-    /// the command.
+    /// Custom display name; `None` means unnamed.
     pub name: Option<String>,
     pub exit_code: Option<i32>,
     pub started: Instant,

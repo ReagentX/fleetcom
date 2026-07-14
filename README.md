@@ -66,7 +66,7 @@ The first ordinary invocation starts the daemon when necessary. `--daemon` is an
 | `s` | cycle grouping: by state / by directory / by custom group |
 | `m` | tag the task "in use" (prioritizes it within the active grouping) |
 | `g` | assign the selected task to a named group (picker: pick, create, or clear) |
-| `R` | rename the selected task: a display name shown in place of the command (an emptied prompt clears it) |
+| `R` | rename the selected task: a display name shown in place of the command (an empty prompt clears it) |
 | `X` | kill a running task (`TERM`, then `KILL` after 2 s), or remove a finished one (Shift-gated); removal sweeps any background processes the job left in its group, with the same `TERM`-then-`KILL` grace |
 | `w` | save the current tasks as a session |
 | `o` | load a saved session |
@@ -104,7 +104,7 @@ The dashboard groups tasks by state (In use / Running / Completed), working dire
 
 ### Task names
 
-`R` gives the selected task a display name. The dashboard row and the peek title show the name in place of the command; the attached status bar shows `name — command`, so the underlying command stays visible. An emptied prompt clears the name, and rerun preserves it. Names pass through the same normalization as group labels: control characters stripped, whitespace trimmed, 64 characters at most.
+`R` gives the selected task a display name. The dashboard row and peek title show the name in place of the command; the attached status bar shows `name · command`. An empty prompt clears the name, and rerun preserves it. Fleetcom removes control characters, trims surrounding whitespace, and limits names to 64 characters.
 
 ### Sessions
 

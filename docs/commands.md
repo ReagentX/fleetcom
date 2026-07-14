@@ -95,11 +95,11 @@ In custom mode only, a new command inherits the selected task's group, through b
 
 #### Renaming
 
-`R` opens a rename prompt prefilled with the selected task's current name, so editing never means retyping. `Enter` saves; an emptied field clears the name, reverting the label to the command; `Esc` cancels. Plain `r` remains rerun.
+`R` opens a rename prompt containing the selected task's current name. `Enter` saves; an empty field clears the name and restores the command as the display label; `Esc` cancels. Plain `r` remains rerun.
 
-A named task shows its name in place of the command in the dashboard row and the peek title. The attached status bar shows `name — command`, so the underlying command stays visible.
+A named task shows its name in place of the command in the dashboard row and the peek title. The attached status bar shows `name · command`.
 
-The daemon normalizes display names exactly like group names: control characters removed, whitespace trimmed, a 64-character cap, and an empty result clears the name. One difference: `Unassigned` is a legal display name — that reservation belongs to the [group picker](#the-g-group-picker).
+The daemon removes control characters, trims surrounding whitespace, and limits display names to 64 characters. An empty result clears the name. Unlike groups, `Unassigned` is a legal display name; only the [group picker](#the-g-group-picker) reserves that label.
 
 ## The `@` directory picker
 
@@ -131,7 +131,7 @@ A centered box over the dashboard showing the selected task's live screen (the l
 
 ## Attached
 
-The task owns the terminal, and its status bar reads `[attached] <command>    Ctrl-\ background`, or `[attached] <name> — <command>` for a named task. `Ctrl-\` returns to the dashboard; every other key (control chords included) goes to the child.
+The task owns the terminal, and its status bar reads `[attached] <command>    Ctrl-\ background`, or `[attached] <name> · <command>` for a named task. `Ctrl-\` returns to the dashboard; every other key (control chords included) goes to the child.
 
 ## Connection loss
 

@@ -274,12 +274,10 @@ fn display_label(v: &TaskView) -> &str {
     v.name.as_deref().unwrap_or(&v.command)
 }
 
-/// Attached-bar title. The full row is available here, so a named task shows
-/// both the name and the command it stands in for; an unnamed one just the
-/// command.
+/// Attached-bar title: name and command when named, otherwise the command alone.
 fn attached_title(v: &TaskView) -> String {
     match &v.name {
-        Some(n) => format!("{n} — {}", v.command),
+        Some(n) => format!("{n} · {}", v.command),
         None => v.command.clone(),
     }
 }
@@ -334,7 +332,7 @@ fn render_peek(out: &mut impl Write, app: &App) -> io::Result<()> {
     let start = lines.len().saturating_sub(inner_h);
     let tail = &lines[start..];
 
-    // Top border with the command title inlined.
+    // Top border with the task's display label inlined.
     let mut top_mid = format!(
         "─ {} ",
         truncate(display_label(v), inner_w.saturating_sub(4))
@@ -676,7 +674,7 @@ mod tests {
         );
     }
 
-    /// A minimal snapshot for label tests; `name` is the field under test.
+    /// Minimal task snapshot for display-label tests.
     fn view(name: Option<&str>) -> TaskView {
         TaskView {
             id: 1,
@@ -711,7 +709,7 @@ mod tests {
         assert_eq!(attached_title(&view(None)), "cargo test");
         assert_eq!(
             attached_title(&view(Some("api server"))),
-            "api server — cargo test"
+            "api server · cargo test"
         );
     }
 

@@ -65,10 +65,8 @@ fn normalize_label(label: Option<String>) -> Option<String> {
     Some(capped)
 }
 
-/// Normalize a group assignment: [`normalize_label`], plus the reserved
-/// `Unassigned` section label maps to `None`; comparison remains
-/// case-sensitive. The reservation is the group picker's, so display names
-/// keep the literal `Unassigned`.
+/// Normalize a group assignment and map the case-sensitive reserved label
+/// `Unassigned` to `None`. Display names do not reserve this label.
 fn normalize_group(name: Option<String>) -> Option<String> {
     normalize_label(name).filter(|g| g != "Unassigned")
 }
@@ -573,7 +571,7 @@ impl Supervisor {
                     &launch.env,
                     Arc::clone(&self.waker),
                 ) {
-                    // Normalize labels read from editable recipe files.
+                    // Normalize persisted labels before assigning them.
                     task.group = normalize_group(entry.group.clone());
                     task.name = normalize_label(entry.name.clone());
                     self.next_id += 1;
@@ -1136,7 +1134,7 @@ mod tests {
         // Control-only names become unassigned.
         assert_eq!(n(" \t \x1b \x7f \u{9b} "), None);
         assert_eq!(n(""), None);
-        // The cap counts chars, not bytes: 80 two-byte chars keep exactly 64.
+        // The cap counts Unicode scalar values, not UTF-8 bytes.
         assert_eq!(n(&"\u{e9}".repeat(80)), Some("\u{e9}".repeat(64)));
         // The cap applies after the trim, so padding spends none of it.
         assert_eq!(n(&format!("  {}  ", "x".repeat(64))), Some("x".repeat(64)));
@@ -1149,9 +1147,8 @@ mod tests {
         assert_eq!(n("Api"), Some("Api".into()));
     }
 
-    /// Display names share the label rules — controls stripped, whitespace
-    /// trimmed, capped by character, empty cleared — but keep the literal
-    /// `Unassigned`: that reservation belongs to the group picker.
+    /// Display names remove controls, trim whitespace, and retain at most 64
+    /// Unicode scalar values. Empty names clear; `Unassigned` remains valid.
     #[test]
     fn display_names_normalize_at_the_boundary() {
         let n = |s: &str| normalize_label(Some(s.to_string()));
@@ -1310,7 +1307,7 @@ mod tests {
         assert!(carried, "restart must carry the group over");
     }
 
-    /// Restart preserves the task's name, exactly as it preserves its group.
+    /// Restart preserves the task's name.
     #[test]
     fn restart_carries_the_name_over() {
         use crate::protocol::Lifecycle;
