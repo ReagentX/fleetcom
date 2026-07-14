@@ -53,6 +53,8 @@ pub enum Mode {
     PickGroup,
     /// Typing a name to save the current tasks as a session.
     SaveSession,
+    /// Typing a display name for the pinned task (the `R` flow).
+    Rename,
     /// Picking a saved session to load.
     LoadSession,
     /// Overlay preview of the selected task.
@@ -170,6 +172,8 @@ pub struct App {
     pub group_sel: usize,
     /// Id of the task being reassigned by the open group picker.
     group_target: Option<u64>,
+    /// Id of the task being renamed by the open `R` prompt.
+    rename_target: Option<u64>,
     // Load-session picker state.
     pub session_names: Vec<String>,
     pub session_sel: usize,
@@ -330,6 +334,7 @@ impl App {
             group_candidates: Vec::new(),
             group_sel: 0,
             group_target: None,
+            rename_target: None,
             session_names: Vec::new(),
             session_sel: 0,
             status: None,
@@ -796,6 +801,25 @@ impl App {
         self.mode = Mode::Dashboard;
     }
 
+    // --- `R` rename prompt ------------------------------------------------------
+
+    /// Open the rename prompt on the selected task; a no-op with no selection.
+    /// The input starts as the current name, so editing never means retyping.
+    fn open_rename_prompt(&mut self) {
+        if let Some(i) = self.selected_task() {
+            self.rename_target = Some(self.views[i].id);
+            self.input = self.views[i].name.clone().unwrap_or_default();
+            self.mode = Mode::Rename;
+        }
+    }
+
+    /// Clear the rename state and return to the dashboard.
+    fn close_rename_prompt(&mut self) {
+        self.input.clear();
+        self.rename_target = None;
+        self.mode = Mode::Dashboard;
+    }
+
     fn on_key(&mut self, out: &mut Stdout, k: KeyEvent) -> io::Result<()> {
         // Any key dismisses a lingering save/load notice.
         self.status = None;
@@ -815,6 +839,7 @@ impl App {
             Mode::PickDir => self.on_key_pickdir(k),
             Mode::PickGroup => self.on_key_pickgroup(k),
             Mode::SaveSession => self.on_key_savesession(k),
+            Mode::Rename => self.on_key_rename(k),
             Mode::LoadSession => self.on_key_loadsession(k),
             Mode::Peek => self.on_key_peek(k),
             Mode::Attached => self.on_key_attached(out, k)?,
@@ -859,6 +884,8 @@ impl App {
                 }
             }
             KeyCode::Char('g') => self.open_group_picker(),
+            // Shift-R renames the selected task; plain `r` below restarts it.
+            KeyCode::Char('R') => self.open_rename_prompt(),
             KeyCode::Char('n') => {
                 self.input.clear();
                 self.spawn_cwd = self.invocation_dir.clone();
@@ -909,6 +936,26 @@ impl App {
                 self.input.clear();
                 self.mode = Mode::Dashboard;
             }
+            KeyCode::Backspace => {
+                self.input.pop();
+            }
+            KeyCode::Char(c) => self.input.push(c),
+            _ => {}
+        }
+    }
+
+    fn on_key_rename(&mut self, k: KeyEvent) {
+        match k.code {
+            KeyCode::Enter => {
+                // An emptied input clears the name: the row reverts to the
+                // command. The core normalizes further (controls, length cap).
+                let name = Some(self.input.trim().to_string()).filter(|s| !s.is_empty());
+                if let Some(id) = self.rename_target {
+                    self.transport.send(Command::SetName { id, name });
+                }
+                self.close_rename_prompt();
+            }
+            KeyCode::Esc => self.close_rename_prompt(),
             KeyCode::Backspace => {
                 self.input.pop();
             }
@@ -1137,7 +1184,7 @@ impl App {
                     });
                 }
             }
-            Mode::Spawn | Mode::SaveSession => {
+            Mode::Spawn | Mode::SaveSession | Mode::Rename => {
                 self.input.extend(s.chars().filter(|c| !c.is_control()));
             }
             Mode::PickDir => {
@@ -2398,6 +2445,106 @@ mod tests {
         app.pump();
         let v = app.views.iter().find(|v| v.id == 1).unwrap();
         assert_eq!(v.group.as_deref(), Some("alpha"), "Esc must send nothing");
+    }
+
+    // --- `R` rename prompt --------------------------------------------------
+
+    /// `R` opens the prompt only when a task is selected, pinning the target to
+    /// that task's id and prefilling the input with its current name.
+    #[test]
+    fn rename_prompt_opens_on_shift_r_only_with_a_selection() {
+        let mut app = App::new_local(30, 100);
+        app.on_key_dashboard(key(KeyCode::Char('R')));
+        assert!(app.mode == Mode::Dashboard, "no selection: R must no-op");
+        assert_eq!(app.rename_target, None);
+
+        let inv = app.invocation_dir.clone();
+        app.spawn_in("sleep 5", inv);
+        app.pump();
+        app.resolve_selection();
+        app.on_key_dashboard(key(KeyCode::Char('R')));
+        assert!(app.mode == Mode::Rename);
+        assert_eq!(app.rename_target, Some(1));
+        assert_eq!(app.input, "", "an unnamed task prefills empty");
+
+        // A named task prefills its name, so editing starts from it.
+        app.on_key_rename(key(KeyCode::Esc));
+        app.transport.send(Command::SetName {
+            id: 1,
+            name: Some("api".to_string()),
+        });
+        app.pump();
+        app.on_key_dashboard(key(KeyCode::Char('R')));
+        assert_eq!(app.input, "api");
+    }
+
+    /// Enter sends `SetName` with the typed name and returns to the dashboard.
+    #[test]
+    fn rename_enter_sends_the_typed_name() {
+        let mut app = App::new_local(30, 100);
+        let inv = app.invocation_dir.clone();
+        app.spawn_in("sleep 5", inv);
+        app.pump();
+        app.resolve_selection();
+        app.on_key_dashboard(key(KeyCode::Char('R')));
+        for c in "api server".chars() {
+            app.on_key_rename(key(KeyCode::Char(c)));
+        }
+        app.on_key_rename(key(KeyCode::Enter));
+        assert!(app.mode == Mode::Dashboard);
+        assert!(app.input.is_empty() && app.rename_target.is_none());
+        app.pump();
+        let v = app.views.iter().find(|v| v.id == 1).unwrap();
+        assert_eq!(v.name.as_deref(), Some("api server"));
+    }
+
+    /// Enter on an emptied input sends `SetName { name: None }`: the row
+    /// reverts to the command.
+    #[test]
+    fn rename_enter_on_empty_input_clears_the_name() {
+        let mut app = App::new_local(30, 100);
+        let inv = app.invocation_dir.clone();
+        app.spawn_in("sleep 5", inv);
+        app.transport.send(Command::SetName {
+            id: 1,
+            name: Some("api".to_string()),
+        });
+        app.pump();
+        app.resolve_selection();
+        app.on_key_dashboard(key(KeyCode::Char('R')));
+        assert_eq!(app.input, "api");
+        for _ in 0.."api".len() {
+            app.on_key_rename(key(KeyCode::Backspace));
+        }
+        app.on_key_rename(key(KeyCode::Enter));
+        app.pump();
+        let v = app.views.iter().find(|v| v.id == 1).unwrap();
+        assert_eq!(v.name, None);
+    }
+
+    /// Esc closes the prompt without changing the target task.
+    #[test]
+    fn rename_esc_cancels_without_sending() {
+        let mut app = App::new_local(30, 100);
+        let inv = app.invocation_dir.clone();
+        app.spawn_in("sleep 5", inv);
+        app.transport.send(Command::SetName {
+            id: 1,
+            name: Some("api".to_string()),
+        });
+        app.pump();
+        app.resolve_selection();
+        app.on_key_dashboard(key(KeyCode::Char('R')));
+        for c in "junk".chars() {
+            app.on_key_rename(key(KeyCode::Char(c)));
+        }
+        app.on_key_rename(key(KeyCode::Esc));
+        assert!(app.mode == Mode::Dashboard);
+        assert!(app.input.is_empty());
+        assert_eq!(app.rename_target, None);
+        app.pump();
+        let v = app.views.iter().find(|v| v.id == 1).unwrap();
+        assert_eq!(v.name.as_deref(), Some("api"), "Esc must send nothing");
     }
 
     // --- spawn group inheritance -------------------------------------------
