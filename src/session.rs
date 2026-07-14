@@ -7,12 +7,13 @@ use std::{
     path::{Path, PathBuf},
 };
 
-/// One recipe entry. Ungrouped commands serialize as strings; grouped commands
-/// serialize as `{"cmd", "group"}` objects.
+/// One recipe entry. Entries without a group or name serialize as strings;
+/// other entries use objects whose optional fields are written only when set.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionEntry {
     pub cmd: String,
     pub group: Option<String>,
+    pub name: Option<String>,
 }
 
 /// Session recipe mapping directories to ordered entries.
@@ -49,15 +50,19 @@ fn to_json(cfg: &SessionConfig) -> String {
     for (dir, entries) in cfg {
         let mut arr = jzon::JsonValue::new_array();
         for e in entries {
-            let member = match &e.group {
-                // Ungrouped entries use the compact string form.
-                None => jzon::JsonValue::from(e.cmd.as_str()),
-                Some(g) => {
-                    let mut m = jzon::JsonValue::new_object();
-                    let _ = m.insert("cmd", e.cmd.as_str());
+            let member = if e.group.is_none() && e.name.is_none() {
+                // Entries without optional labels use the string form.
+                jzon::JsonValue::from(e.cmd.as_str())
+            } else {
+                let mut m = jzon::JsonValue::new_object();
+                let _ = m.insert("cmd", e.cmd.as_str());
+                if let Some(g) = &e.group {
                     let _ = m.insert("group", g.as_str());
-                    m
                 }
+                if let Some(n) = &e.name {
+                    let _ = m.insert("name", n.as_str());
+                }
+                m
             };
             let _ = arr.push(member);
         }
@@ -78,6 +83,7 @@ fn from_json(text: &str) -> io::Result<SessionConfig> {
                     return Some(SessionEntry {
                         cmd: cmd.to_string(),
                         group: None,
+                        name: None,
                     });
                 }
                 // Indexing a non-object yields Null, so malformed members drop here.
@@ -86,7 +92,11 @@ fn from_json(text: &str) -> io::Result<SessionConfig> {
                     g if g.is_null() => None,
                     g => Some(g.as_str()?.to_string()),
                 };
-                Some(SessionEntry { cmd, group })
+                let name = match &m["name"] {
+                    n if n.is_null() => None,
+                    n => Some(n.as_str()?.to_string()),
+                };
+                Some(SessionEntry { cmd, group, name })
             })
             .collect();
         cfg.insert(dir.to_string(), entries);
@@ -136,11 +146,12 @@ mod tests {
         d
     }
 
-    /// Ungrouped entry: the plain-string member form.
+    /// Unadorned entry: the plain-string member form.
     fn e(cmd: &str) -> SessionEntry {
         SessionEntry {
             cmd: cmd.into(),
             group: None,
+            name: None,
         }
     }
 
@@ -149,6 +160,25 @@ mod tests {
         SessionEntry {
             cmd: cmd.into(),
             group: Some(group.into()),
+            name: None,
+        }
+    }
+
+    /// Named entry: the `{"cmd", "name"}` member form.
+    fn ne(cmd: &str, name: &str) -> SessionEntry {
+        SessionEntry {
+            cmd: cmd.into(),
+            group: None,
+            name: Some(name.into()),
+        }
+    }
+
+    /// Grouped and named entry: the full `{"cmd", "group", "name"}` form.
+    fn gne(cmd: &str, group: &str, name: &str) -> SessionEntry {
+        SessionEntry {
+            cmd: cmd.into(),
+            group: Some(group.into()),
+            name: Some(name.into()),
         }
     }
 
@@ -180,14 +210,41 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
-    /// String members parse as ungrouped entries.
+    /// Every group/name combination survives serialization.
+    #[test]
+    fn round_trips_named_entries() {
+        let dir = temp("named");
+        let mut cfg = SessionConfig::new();
+        cfg.insert(
+            "~/proj".into(),
+            vec![
+                gne("cargo test", "ci", "unit tests"),
+                ne("vim", "editor"),
+                ge("top", "ops"),
+                e("plain"),
+            ],
+        );
+
+        save_in(&dir, "named", &cfg).unwrap();
+        assert_eq!(load_in(&dir, "named").unwrap(), cfg);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// String members parse as unadorned entries.
     #[test]
     fn parses_the_pre_group_string_only_format() {
         let cfg = from_json(r#"{"~/proj": ["cargo test", "vim"]}"#).unwrap();
         assert_eq!(cfg["~/proj"], vec![e("cargo test"), e("vim")]);
     }
 
-    /// A group-free config serializes using only string members.
+    /// Object members may omit the optional `name` field.
+    #[test]
+    fn parses_the_pre_name_object_format() {
+        let cfg = from_json(r#"{"~/proj": [{"cmd": "cargo test", "group": "ci"}]}"#).unwrap();
+        assert_eq!(cfg["~/proj"], vec![ge("cargo test", "ci")]);
+    }
+
+    /// Entries without a group or name serialize as strings.
     #[test]
     fn group_free_config_writes_the_pre_group_bytes() {
         let mut cfg = SessionConfig::new();
@@ -206,17 +263,27 @@ mod tests {
                 {"group": "g"},
                 {"cmd": 3},
                 {"cmd": "x", "group": 5},
+                {"cmd": "y", "name": 5},
                 42,
                 {"cmd": "bare"},
                 {"cmd": "n", "group": null},
+                {"cmd": "m", "name": null},
                 {"cmd": "ok", "group": "api"},
+                {"cmd": "named", "name": "web"},
                 "plain"
             ]}"#,
         )
         .unwrap();
         assert_eq!(
             cfg["d"],
-            vec![e("bare"), e("n"), ge("ok", "api"), e("plain")]
+            vec![
+                e("bare"),
+                e("n"),
+                e("m"),
+                ge("ok", "api"),
+                ne("named", "web"),
+                e("plain")
+            ]
         );
     }
 

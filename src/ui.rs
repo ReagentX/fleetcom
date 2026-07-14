@@ -36,7 +36,9 @@ pub fn render(out: &mut Stdout, app: &mut App) -> io::Result<()> {
             render_session_picker(&mut buf, app)?;
         }
         Mode::Disconnected => render_disconnected(&mut buf, app)?,
-        Mode::Dashboard | Mode::Spawn | Mode::SaveSession => render_dashboard(&mut buf, app)?,
+        Mode::Dashboard | Mode::Spawn | Mode::SaveSession | Mode::Rename => {
+            render_dashboard(&mut buf, app)?
+        }
     }
     // Repaint only on change: a stable frame (idle tasks, no input) is a no-op,
     // so there is nothing to flicker and nothing to burn CPU on.
@@ -196,7 +198,7 @@ fn render_dashboard(out: &mut impl Write, app: &App) -> io::Result<()> {
         out,
         rows.saturating_sub(1),
         &format!(
-            "  ↑↓ select · enter attach · space peek · n/@ new · s sort · m tag · g group · r rerun · X kill · {exit_hint}"
+            "  ↑↓ select · enter attach · space peek · n/@ new · s sort · m tag · g group · R rename · r rerun · X kill · {exit_hint}"
         ),
         cols,
     )?;
@@ -217,6 +219,7 @@ fn cmdline(app: &App) -> Option<String> {
     match app.mode {
         Mode::Spawn => Some(spawn_prompt(app)),
         Mode::SaveSession => Some(format!("  save session as: {}", app.input)),
+        Mode::Rename => Some(format!("  rename task: {}", app.input)),
         _ => None,
     }
 }
@@ -266,6 +269,19 @@ fn header_segments(prefix: &str, active: GroupMode, suffix: &str) -> Vec<(String
     segs
 }
 
+/// A task's display label: its custom name when set, else the literal command.
+fn display_label(v: &TaskView) -> &str {
+    v.name.as_deref().unwrap_or(&v.command)
+}
+
+/// Attached-bar title: name and command when named, otherwise the command alone.
+fn attached_title(v: &TaskView) -> String {
+    match &v.name {
+        Some(n) => format!("{n} · {}", v.command),
+        None => v.command.clone(),
+    }
+}
+
 fn task_row(v: &TaskView, cols: usize) -> String {
     let glyph = match v.lifecycle {
         Lifecycle::Active => "✻",
@@ -276,7 +292,7 @@ fn task_row(v: &TaskView, cols: usize) -> String {
     let tag = if v.tagged { "◆" } else { " " };
     let time = rel_time(v.started_ago);
     let title_w = 26.min(cols / 3);
-    let title = truncate(&v.command, title_w);
+    let title = truncate(display_label(v), title_w);
 
     // prefix(2) glyph+sp(2) tag+sp(2) title(title_w) sp(1) preview(prev_w) sp(1) time
     let used = 2 + 2 + 2 + title_w + 1 + 1 + time.chars().count();
@@ -316,8 +332,11 @@ fn render_peek(out: &mut impl Write, app: &App) -> io::Result<()> {
     let start = lines.len().saturating_sub(inner_h);
     let tail = &lines[start..];
 
-    // Top border with the command title inlined.
-    let mut top_mid = format!("─ {} ", truncate(&v.command, inner_w.saturating_sub(4)));
+    // Top border with the task's display label inlined.
+    let mut top_mid = format!(
+        "─ {} ",
+        truncate(display_label(v), inner_w.saturating_sub(4))
+    );
     let tl = top_mid.chars().count();
     if tl < inner_w {
         top_mid.extend(std::iter::repeat_n('─', inner_w - tl));
@@ -610,12 +629,12 @@ fn render_attached(out: &mut impl Write, app: &App) -> io::Result<()> {
 
     let cols = app.cols as usize;
     // Display the scrollback offset when viewing history.
+    let title = attached_title(v);
     let bar = match screen.map_or(0, |s| s.scrollback) {
-        0 => format!("  [attached] {}    Ctrl-\\ background", v.command),
-        n => format!(
-            "  [scroll ↑{n}] {}    Esc live · PgUp/PgDn move · Ctrl-\\ background",
-            v.command
-        ),
+        0 => format!("  [attached] {title}    Ctrl-\\ background"),
+        n => {
+            format!("  [scroll ↑{n}] {title}    Esc live · PgUp/PgDn move · Ctrl-\\ background")
+        }
     };
     queue!(
         out,
@@ -652,6 +671,45 @@ mod tests {
         assert_eq!(
             prompt_line(Some("~/x"), Some("alpha"), "cargo test"),
             "  ❯ ~/x ▸ alpha ▸ cargo test"
+        );
+    }
+
+    /// Minimal task snapshot for display-label tests.
+    fn view(name: Option<&str>) -> TaskView {
+        TaskView {
+            id: 1,
+            command: "cargo test".into(),
+            cwd: std::path::PathBuf::from("/tmp"),
+            tagged: false,
+            group: None,
+            name: name.map(str::to_string),
+            lifecycle: Lifecycle::Active,
+            preview: String::new(),
+            started_ago: std::time::Duration::from_secs(5),
+        }
+    }
+
+    /// The dashboard row titles a task by its custom name when one is set.
+    #[test]
+    fn task_row_prefers_the_custom_name() {
+        let row = task_row(&view(None), 80);
+        assert!(row.contains("cargo test"), "row was {row:?}");
+
+        let row = task_row(&view(Some("api server")), 80);
+        assert!(row.contains("api server"), "row was {row:?}");
+        assert!(
+            !row.contains("cargo test"),
+            "the name replaces the command: {row:?}"
+        );
+    }
+
+    /// The attached bar shows both the name and the command for a named task.
+    #[test]
+    fn attached_title_shows_name_and_command() {
+        assert_eq!(attached_title(&view(None)), "cargo test");
+        assert_eq!(
+            attached_title(&view(Some("api server"))),
+            "api server · cargo test"
         );
     }
 

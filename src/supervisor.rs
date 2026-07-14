@@ -48,21 +48,27 @@ const MAX_TASKS: usize = 256;
 /// wedged job from making `Q` feel broken.
 const KILL_GRACE: Duration = Duration::from_secs(2);
 
-/// Maximum stored group-name length in Unicode scalar values after normalization.
-const MAX_GROUP_CHARS: usize = 64;
+/// Maximum stored label length in Unicode scalar values after normalization,
+/// shared by group and display-name assignments.
+const MAX_LABEL_CHARS: usize = 64;
 
-/// Normalize a group assignment before storage. Remove control characters,
-/// trim surrounding whitespace, and cap the result at [`MAX_GROUP_CHARS`]
-/// characters. Empty names and the reserved `Unassigned` label map to `None`;
-/// comparison remains case-sensitive.
-fn normalize_group(name: Option<String>) -> Option<String> {
-    let name = name?;
-    let stripped: String = name.chars().filter(|c| !c.is_control()).collect();
-    let capped: String = stripped.trim().chars().take(MAX_GROUP_CHARS).collect();
-    if capped.is_empty() || capped == "Unassigned" {
+/// Normalize a user-supplied label (a group or a display name) before storage.
+/// Remove control characters, trim surrounding whitespace, and cap the result
+/// at [`MAX_LABEL_CHARS`] characters. Empty labels map to `None`.
+fn normalize_label(label: Option<String>) -> Option<String> {
+    let label = label?;
+    let stripped: String = label.chars().filter(|c| !c.is_control()).collect();
+    let capped: String = stripped.trim().chars().take(MAX_LABEL_CHARS).collect();
+    if capped.is_empty() {
         return None;
     }
     Some(capped)
+}
+
+/// Normalize a group assignment and map the case-sensitive reserved label
+/// `Unassigned` to `None`. Display names do not reserve this label.
+fn normalize_group(name: Option<String>) -> Option<String> {
+    normalize_label(name).filter(|g| g != "Unassigned")
 }
 
 pub struct Supervisor {
@@ -189,6 +195,11 @@ impl Supervisor {
                     t.group = normalize_group(group);
                 }
             }
+            Command::SetName { id, name } => {
+                if let Some(t) = self.by_id_mut(id) {
+                    t.name = normalize_label(name);
+                }
+            }
             Command::Resize { rows, cols } => {
                 // Clamp each dimension first, then preserve rows and reduce
                 // columns when the grid exceeds `MAX_CELLS`. The constant
@@ -312,6 +323,7 @@ impl Supervisor {
                 cwd: t.cwd.clone(),
                 tagged: t.tagged,
                 group: t.group.clone(),
+                name: t.name.clone(),
                 lifecycle: t.lifecycle(now, IDLE_AFTER),
                 preview: t.preview(),
                 started_ago: now.duration_since(t.started),
@@ -413,7 +425,8 @@ impl Supervisor {
         }
     }
 
-    /// Re-run a finished task in place while preserving its ID, tag, and group.
+    /// Re-run a finished task in place while preserving its ID, tag, group,
+    /// and name.
     fn restart(&mut self, id: u64) {
         let Some(i) = self.index_of(id) else {
             self.events
@@ -441,6 +454,7 @@ impl Supervisor {
             Ok(mut fresh) => {
                 fresh.tagged = self.tasks[i].tagged;
                 fresh.group = self.tasks[i].group.clone();
+                fresh.name = self.tasks[i].name.clone();
                 // The displaced job exits like a Remove: TERM now, the
                 // graveyard's grace-then-KILL behind it. Dropping it here
                 // would straight-SIGKILL stragglers of the old run.
@@ -458,8 +472,8 @@ impl Supervisor {
         }
     }
 
-    /// Snapshot tasks as `{dir: [entries]}`. Entries preserve spawn order and
-    /// group assignments.
+    /// Snapshot tasks as `{dir: [entries]}`. Entries preserve spawn order,
+    /// group assignments, and display names.
     fn session_config(&self) -> SessionConfig {
         let mut order: Vec<usize> = (0..self.tasks.len()).collect();
         order.sort_by_key(|&i| self.tasks[i].id);
@@ -471,6 +485,7 @@ impl Supervisor {
                 .push(SessionEntry {
                     cmd: t.command.clone(),
                     group: t.group.clone(),
+                    name: t.name.clone(),
                 });
         }
         cfg
@@ -556,8 +571,9 @@ impl Supervisor {
                     &launch.env,
                     Arc::clone(&self.waker),
                 ) {
-                    // Normalize group names read from editable recipe files.
+                    // Normalize persisted labels before assigning them.
                     task.group = normalize_group(entry.group.clone());
+                    task.name = normalize_label(entry.name.clone());
                     self.next_id += 1;
                     self.tasks.push(task);
                     spawned += 1;
@@ -620,10 +636,12 @@ mod tests {
                 SessionEntry {
                     cmd: "a".into(),
                     group: None,
+                    name: None,
                 },
                 SessionEntry {
                     cmd: "c".into(),
                     group: None,
+                    name: None,
                 },
             ]
         );
@@ -632,6 +650,7 @@ mod tests {
             vec![SessionEntry {
                 cmd: "b".into(),
                 group: None,
+                name: None,
             }]
         );
     }
@@ -1115,7 +1134,7 @@ mod tests {
         // Control-only names become unassigned.
         assert_eq!(n(" \t \x1b \x7f \u{9b} "), None);
         assert_eq!(n(""), None);
-        // The cap counts chars, not bytes: 80 two-byte chars keep exactly 64.
+        // The cap counts Unicode scalar values, not UTF-8 bytes.
         assert_eq!(n(&"\u{e9}".repeat(80)), Some("\u{e9}".repeat(64)));
         // The cap applies after the trim, so padding spends none of it.
         assert_eq!(n(&format!("  {}  ", "x".repeat(64))), Some("x".repeat(64)));
@@ -1126,6 +1145,26 @@ mod tests {
         assert_eq!(n("unassigned"), Some("unassigned".into()));
         assert_eq!(n("UNASSIGNED"), Some("UNASSIGNED".into()));
         assert_eq!(n("Api"), Some("Api".into()));
+    }
+
+    /// Display names remove controls, trim whitespace, and retain at most 64
+    /// Unicode scalar values. Empty names clear; `Unassigned` remains valid.
+    #[test]
+    fn display_names_normalize_at_the_boundary() {
+        let n = |s: &str| normalize_label(Some(s.to_string()));
+        assert_eq!(normalize_label(None), None);
+        // Controls are removed while printable text remains.
+        assert_eq!(n("\x1b[31mapi\x07"), Some("[31mapi".into()));
+        assert_eq!(n("  backend  "), Some("backend".into()));
+        // Control-only names become unnamed.
+        assert_eq!(n(" \t \x1b \x7f \u{9b} "), None);
+        assert_eq!(n(""), None);
+        // The cap counts chars, not bytes: 80 two-byte chars keep exactly 64.
+        assert_eq!(n(&"\u{e9}".repeat(80)), Some("\u{e9}".repeat(64)));
+        // The cap applies after the trim, so padding spends none of it.
+        assert_eq!(n(&format!("  {}  ", "x".repeat(64))), Some("x".repeat(64)));
+        // The group picker's reserved label is a legal display name.
+        assert_eq!(n("Unassigned"), Some("Unassigned".into()));
     }
 
     /// `SetGroup` normalizes assignments, clears with `None`, and ignores
@@ -1173,6 +1212,58 @@ mod tests {
         assert_eq!(group_of(&mut s), None);
     }
 
+    /// `SetName` normalizes assignments, keeps the literal `Unassigned`
+    /// (unlike groups), clears with `None`, and ignores unknown task ids.
+    #[test]
+    fn set_name_round_trips_and_clears() {
+        let mut s = sup(24, 80);
+        s.apply(Command::Spawn {
+            command: "sleep 30".into(),
+            cwd: here(),
+            group: None,
+        });
+        s.tick();
+        let id = match s.drain().first() {
+            Some(Event::Tasks(v)) => v[0].id,
+            _ => panic!("expected a Tasks snapshot"),
+        };
+        let name_of = |s: &mut Supervisor| -> Option<String> {
+            s.tick();
+            for e in s.drain() {
+                if let Event::Tasks(v) = e
+                    && let Some(t) = v.iter().find(|t| t.id == id)
+                {
+                    return t.name.clone();
+                }
+            }
+            panic!("task {id} missing from the snapshot");
+        };
+
+        s.apply(Command::SetName {
+            id,
+            name: Some("  api \x1b[2J ".into()),
+        });
+        assert_eq!(name_of(&mut s), Some("api [2J".into()));
+
+        // The group picker's reserved label has no meaning for names.
+        s.apply(Command::SetName {
+            id,
+            name: Some("Unassigned".into()),
+        });
+        assert_eq!(name_of(&mut s), Some("Unassigned".into()));
+
+        s.apply(Command::SetName { id, name: None });
+        assert_eq!(name_of(&mut s), None);
+
+        // Unknown id: no panic, no event, no state change.
+        s.apply(Command::SetName {
+            id: 999,
+            name: Some("ghost".into()),
+        });
+        assert!(s.drain().is_empty(), "unknown-id SetName must stay silent");
+        assert_eq!(name_of(&mut s), None);
+    }
+
     /// Spawned tasks expose their normalized initial group in the first snapshot.
     #[test]
     fn spawn_carries_a_normalized_group_from_birth() {
@@ -1214,6 +1305,37 @@ mod tests {
                 if v.iter().any(|t| t.id == id && t.group.as_deref() == Some("infra")))
         });
         assert!(carried, "restart must carry the group over");
+    }
+
+    /// Restart preserves the task's name.
+    #[test]
+    fn restart_carries_the_name_over() {
+        use crate::protocol::Lifecycle;
+        let mut s = sup(24, 80);
+        s.apply(Command::Spawn {
+            command: "true".into(),
+            cwd: here(),
+            group: None,
+        });
+        s.tick();
+        let id = match s.drain().first() {
+            Some(Event::Tasks(v)) => v[0].id,
+            _ => panic!("expected a Tasks snapshot"),
+        };
+        s.apply(Command::SetName {
+            id,
+            name: Some("smoke".into()),
+        });
+        wait_for_lifecycle(&mut s, id, |l| l == Lifecycle::Ok);
+
+        s.apply(Command::Restart { id });
+        wait_for_lifecycle(&mut s, id, |l| l == Lifecycle::Ok);
+        s.tick();
+        let carried = s.drain().iter().any(|e| {
+            matches!(e, Event::Tasks(v)
+                if v.iter().any(|t| t.id == id && t.name.as_deref() == Some("smoke")))
+        });
+        assert!(carried, "restart must carry the name over");
     }
 
     /// `Restart` never kills: a running task is refused with a status notice
@@ -1749,7 +1871,71 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Loaded recipe groups are normalized before assignment.
+    /// Saving and loading preserve display names.
+    #[test]
+    fn load_session_restores_saved_names() {
+        let dir = scratch("sess_names");
+        let config = dir.join("config");
+        let ctx = LaunchContext {
+            env: vec![(
+                "FLEETCOM_CONFIG_DIR".into(),
+                config.clone().into_os_string(),
+            )],
+            cwd: dir.clone(),
+        };
+        let mut s = Supervisor::new(24, 80);
+        s.set_launch_context(ctx.clone());
+        s.apply(Command::Spawn {
+            command: "sleep 30".into(),
+            cwd: dir.clone(),
+            group: None,
+        });
+        s.apply(Command::Spawn {
+            command: "sleep 31".into(),
+            cwd: dir.clone(),
+            group: None,
+        });
+        s.tick();
+        let id = match s.drain().first() {
+            Some(Event::Tasks(v)) => v.iter().find(|t| t.command == "sleep 30").unwrap().id,
+            _ => panic!("expected a Tasks snapshot"),
+        };
+        s.apply(Command::SetName {
+            id,
+            name: Some("api server".into()),
+        });
+        s.apply(Command::SaveSession {
+            name: "fleet".into(),
+        });
+
+        let mut fresh = Supervisor::new(24, 80);
+        fresh.set_launch_context(ctx);
+        fresh.apply(Command::LoadSession {
+            name: "fleet".into(),
+        });
+        fresh.tick();
+        let evs = fresh.drain();
+        let tasks = evs
+            .iter()
+            .find_map(|e| match e {
+                Event::Tasks(v) => Some(v),
+                _ => None,
+            })
+            .expect("a Tasks snapshot after load");
+        let name_of = |cmd: &str| {
+            tasks
+                .iter()
+                .find(|t| t.command == cmd)
+                .unwrap_or_else(|| panic!("task '{cmd}' missing after load"))
+                .name
+                .clone()
+        };
+        assert_eq!(name_of("sleep 30"), Some("api server".into()));
+        assert_eq!(name_of("sleep 31"), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Loaded recipe groups and names are normalized before assignment.
     #[test]
     fn load_session_renormalizes_hand_edited_groups() {
         let dir = scratch("sess_norm");
@@ -1758,7 +1944,7 @@ mod tests {
         std::fs::write(
             config.join("sessions").join("edited.json"),
             format!(
-                r#"{{"{}": [{{"cmd": "sleep 30", "group": "  x  "}}]}}"#,
+                r#"{{"{}": [{{"cmd": "sleep 30", "group": "  x  ", "name": "  y  "}}]}}"#,
                 dir.display()
             ),
         )
@@ -1775,11 +1961,12 @@ mod tests {
         let evs = s.drain();
         let restored = evs.iter().any(|e| {
             matches!(e, Event::Tasks(v)
-                if v.iter().any(|t| t.group.as_deref() == Some("x")))
+                if v.iter().any(|t| t.group.as_deref() == Some("x")
+                    && t.name.as_deref() == Some("y")))
         });
         assert!(
             restored,
-            "loaded group must come back normalized; got {evs:?}"
+            "loaded group and name must come back normalized; got {evs:?}"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
