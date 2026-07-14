@@ -196,13 +196,13 @@ pub struct Task {
     pub group: Option<String>,
     /// Custom display name; `None` means unnamed.
     pub name: Option<String>,
-    /// Harness assigned by the supervisor; `None` for uninstrumented tasks.
+    /// Harness selected by the supervisor; `None` means no instrumentation.
     pub harness: Option<&'static dyn crate::harness::Harness>,
     /// Session ID injected or recognized at spawn. Capture files and exit
     /// scrapes can supersede it.
     pub resume_id: Option<String>,
-    /// Capture path allocated for this task; it may remain unwritten when no
-    /// live capture channel is injected.
+    /// Capture path allocated for this task. It remains unwritten when no live
+    /// capture channel is injected.
     pub capture_file: Option<PathBuf>,
     /// Session ID scraped once from final terminal text after exit and reader
     /// EOF.
@@ -271,7 +271,7 @@ impl Task {
     /// The task stores `command` for the UI and recipes, while only
     /// `exec_command` carries instrumentation. The child receives exactly
     /// `env`, and `waker` notifies the core when terminal output arrives.
-    #[allow(clippy::too_many_arguments)] // one call shape, three call sites
+    #[allow(clippy::too_many_arguments)] // All arguments define task launch state.
     pub fn spawn(
         id: u64,
         command: &str,
@@ -447,9 +447,9 @@ impl Task {
         Ok(())
     }
 
-    /// Scrape an exit hint once after the process exit is latched and the PTY
-    /// reader reaches EOF. A detached reader handle counts as complete. The
-    /// `scraped` latch limits full-history rendering to one pass per task.
+    /// Scrape one exit hint after process exit and reader completion. A missing
+    /// reader handle also satisfies the completion gate. The `scraped` latch
+    /// limits full-history rendering to one pass per task.
     pub(crate) fn scrape_exit_hint(&mut self) {
         let Some(h) = self.harness else { return };
         if self.scraped

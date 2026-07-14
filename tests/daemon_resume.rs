@@ -1,6 +1,6 @@
-//! These tests exercise agent-session resume through the daemon protocol.
-//! Stub `claude` and `codex` executables expose the executed argv, while an
-//! explicit handshake environment confines every store to scratch space.
+//! Agent resume crosses the daemon protocol, so supervisor unit tests are not
+//! sufficient. These tests use stub `claude` and `codex` executables to expose
+//! argv while an explicit handshake confines every store to scratch space.
 
 mod common;
 
@@ -18,7 +18,7 @@ use common::{
 /// Delimiter separating argv records in a stub's append-only output.
 const RUN_MARKER: &str = "-- run --";
 
-/// Fixed v7-shaped thread ID reported by the codex stub.
+/// Fixed v7-shaped thread ID reported by the `codex` stub.
 const CODEX_ID: &str = "019f5453-de22-7240-b2e5-0d32692aa6d9";
 
 /// Scratch tree containing the stub bin, runtime root, config, tool homes,
@@ -125,7 +125,7 @@ fn install_stub(s: &Scratch, name: &str, body: &str) {
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
 }
 
-/// Claude stub that records argv, writes a SessionStart payload to the
+/// `claude` stub that records argv, writes a `SessionStart` payload to the
 /// capture file, and prints a resumable exit hint.
 fn install_claude_stub(s: &Scratch) {
     let body = format!(
@@ -146,7 +146,7 @@ printf 'Resume this session with:\nclaude --resume %s\n' "$id""#,
     install_stub(s, "claude", &body);
 }
 
-/// Codex stub that records argv and reports `CODEX_ID` only through the
+/// `codex` stub that records argv and reports `CODEX_ID` only through the
 /// notify capture file.
 fn install_codex_stub(s: &Scratch) {
     let body = format!(
@@ -254,7 +254,7 @@ fn stop_daemon(daemon: &mut KillOnDrop) {
     assert!(exited, "daemon did not exit on SIGTERM");
 }
 
-/// Claude instrumentation captures an ID, persists a clean resume command,
+/// `claude` instrumentation captures an ID, persists a clean resume command,
 /// and loads the same conversation.
 #[test]
 fn claude_spawn_save_load_resumes_the_conversation() {
@@ -311,7 +311,7 @@ fn claude_spawn_save_load_resumes_the_conversation() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Codex notification capture persists a resume command and re-instruments
+/// `codex` notification capture persists a resume command and re-instruments
 /// the loaded task.
 #[test]
 fn codex_capture_file_drives_save_and_load_resumes() {

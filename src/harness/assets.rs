@@ -1,20 +1,18 @@
-//! Session capture needs executable/configuration assets outside the child
-//! process. This module installs those shared assets and allocates per-task
-//! capture paths. The supervisor installs each root at most once per daemon
-//! lifetime and reuses the assets afterwards.
+//! Hooks and notifiers need files outside the child process. This module
+//! installs those shared assets and allocates one capture path per task. The
+//! supervisor installs each root once per daemon lifetime and reuses it.
 //!
 //! Asset contracts:
-//! - claude: `--settings <claude-settings.json>` layers a SessionStart hook
-//!   (`cat > "$FLEETCOM_CAPTURE_FILE"`) over the user's own settings. claude
-//!   pipes the hook a JSON payload on stdin and runs it with the task's env,
+//! - `claude`: `--settings <claude-settings.json>` layers a `SessionStart` hook
+//!   (`cat > "$FLEETCOM_CAPTURE_FILE"`) over the user's settings. `claude`
+//!   sends the hook a JSON payload on stdin and runs it with the task's env,
 //!   where Fleetcom sets [`CAPTURE_ENV`](super::CAPTURE_ENV). The hook fires
 //!   on startup, resume, clear, and compact, each time overwriting the
-//!   capture file with the current session-id payload.
-//! - codex: `-c notify=["<codex-notify.sh>"]` names an executable that codex
-//!   invokes with the notification JSON as its final argument. The script
-//!   writes the argument verbatim (no trailing newline) over
-//!   `$FLEETCOM_CAPTURE_FILE`, and exits 0 without writing when the variable
-//!   is unset or empty (a run outside fleetcom).
+//!   capture file with the current session payload.
+//! - `codex`: `-c notify=["<codex-notify.sh>"]` names an executable that
+//!   `codex` invokes with notification JSON. The script writes its first
+//!   argument verbatim (no trailing newline) over `$FLEETCOM_CAPTURE_FILE`
+//!   and exits 0 without writing when the variable is unset or empty.
 
 use std::{
     fs, io,
@@ -24,16 +22,15 @@ use std::{
 
 use super::CapturePaths;
 
-/// Notify program injected into codex. Without a capture path it exits and
-/// writes nothing.
+/// Notify program injected into `codex`. Without a capture path it writes
+/// nothing.
 const CODEX_NOTIFY_SCRIPT: &str = r#"#!/bin/sh
-# Installed by fleetcom. Codex passes notification JSON as the final argument;
-# write it without a trailing newline to the capture path in the environment.
+# Write the notification JSON without a trailing newline.
 [ -n "$FLEETCOM_CAPTURE_FILE" ] || exit 0
 printf '%s' "$1" > "$FLEETCOM_CAPTURE_FILE"
 "#;
 
-/// Build the claude settings overlay containing the SessionStart hook.
+/// Build the `claude` settings overlay containing the `SessionStart` hook.
 fn claude_settings_json() -> String {
     let mut hook = jzon::JsonValue::new_object();
     let _ = hook.insert("type", "command");
@@ -72,17 +69,17 @@ pub struct CaptureAssets {
 }
 
 impl CaptureAssets {
-    /// Create `root` with mode 0o700, write both shared assets, and remove
+    /// Create `root` with mode `0700`, write both shared assets, and remove
     /// existing `task-*.json` capture files.
     ///
     /// Shared assets are overwritten with the current contents. The settings
-    /// file uses mode 0o600; the directly executed notify script uses 0o700.
+    /// file uses mode `0600`; the directly executed notify script uses `0700`.
     ///
     /// The supervisor calls this at most once per root per daemon lifetime,
     /// before allocating capture paths for it. Removing existing capture
-    /// files prevents reused task ids from reading payloads left by another
-    /// daemon process — sound only on that first install, when every capture
-    /// file present is an orphan of a dead daemon.
+    /// files prevents reused task IDs from reading payloads left by another
+    /// daemon process. The cleanup is valid only on the first install, when
+    /// existing capture files belong to a stopped daemon.
     pub fn install(root: &Path) -> io::Result<CaptureAssets> {
         fs::DirBuilder::new()
             .recursive(true)
@@ -210,8 +207,9 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
-    /// The notify script writes its final argument byte-for-byte, overwrites
-    /// earlier payloads, supports direct execution, and ignores missing paths.
+    /// The notify script writes its first argument byte-for-byte, overwrites
+    /// earlier payloads, supports direct execution, and does nothing without
+    /// a configured capture path.
     #[test]
     fn notify_script_writes_the_argument_verbatim() {
         let root = temp("notify");

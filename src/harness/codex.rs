@@ -1,6 +1,6 @@
-//! Codex does not expose launch-time ID pinning. Fleetcom instead injects a
-//! `notify` override, scans final terminal text for both resume-hint forms,
-//! and correlates rollout files under
+//! `codex` does not expose launch-time ID pinning. This harness therefore
+//! injects a `notify` override, scans both final resume-hint forms, and
+//! correlates rollout files under
 //! `<codex-home>/sessions/YYYY/MM/DD/rollout-<local-ts>-<uuid>.jsonl`.
 
 use std::{
@@ -44,9 +44,9 @@ const BLOCKLIST: &[&str] = &[
     "help",
 ];
 
-/// Codex top-level flags that take a separate value. `first_positional`
-/// skips the flag and its value while locating the subcommand or prompt;
-/// each also accepts the `--flag=value` spelling, handled inline.
+/// Top-level `codex` flags that consume a separate value. `first_positional`
+/// skips both tokens while locating the subcommand or prompt. Attached values
+/// such as `--flag=value` are handled inline.
 const VALUE_FLAGS: &[&str] = &[
     "-c",
     "--config",
@@ -70,7 +70,7 @@ const VALUE_FLAGS: &[&str] = &[
     "--remote-auth-token-env",
 ];
 
-/// Codex top-level flags that take no value.
+/// Top-level `codex` flags that consume no value.
 const BOOL_FLAGS: &[&str] = &[
     "--oss",
     "--search",
@@ -87,13 +87,9 @@ const BOOL_FLAGS: &[&str] = &[
     "--version",
 ];
 
-/// Whether `flag` (a `-`-prefixed token, `--flag=value` already split to its
-/// name) is a known codex top-level flag. A flag in neither table makes the
-/// command opaque: `detect` returns `None`, so it spawns and saves plain.
-/// This is deliberate. An unknown value-taking flag would desynchronize the
-/// positional walk — misreading its value as the subcommand or prompt — and
-/// corrupt the rewrite. The tradeoff: a codex flag added upstream after this
-/// list costs capture until the list learns it, never a corrupted recipe.
+/// Whether `flag` is a known `codex` top-level flag. A flag in neither table
+/// makes the command opaque because its value could be mistaken for a
+/// subcommand or prompt.
 fn is_known_flag(flag: &str) -> bool {
     VALUE_FLAGS.contains(&flag) || BOOL_FLAGS.contains(&flag)
 }
@@ -405,14 +401,10 @@ fn has_notify_override(tokens: &[String]) -> bool {
     })
 }
 
-/// Whether the user already routes `notify` through `config.toml` or the
-/// effective profile's config file. Codex layers `<home>/<profile>.config.toml`
-/// over `config.toml`, and the profile can be named on the command line
-/// (`-p`/`--profile`) or by a top-level `profile = "name"` in `config.toml`,
-/// with the command line winning. A `notify` in either file counts, so the
-/// CLI override never clobbers a profile-scoped route. The line-based checks
-/// are conservative: they also match a `notify`/`profile` key inside a TOML
-/// table, which only errs toward not injecting.
+/// Whether `config.toml` or the selected profile config contains a `notify`
+/// assignment. The last command-line profile wins; otherwise the first
+/// line-based `profile` assignment in `config.toml` is used. Line-based checks
+/// also match assignments inside TOML tables.
 fn config_has_notify(home: Option<&Path>, tokens: &[String]) -> bool {
     let root = match home {
         Some(p) => p.to_path_buf(),
@@ -436,8 +428,7 @@ fn config_has_notify(home: Option<&Path>, tokens: &[String]) -> bool {
 }
 
 /// Effective profile named on the command line, or `None`. Accepts `-p x`,
-/// `--profile x`, `--profile=x`, `-px`, and `-p=x`; the last occurrence wins,
-/// matching clap's override semantics.
+/// `--profile x`, `--profile=x`, `-px`, and `-p=x`; the last occurrence wins.
 fn cli_profile(tokens: &[String]) -> Option<String> {
     let mut profile = None;
     let mut i = 1;
@@ -460,9 +451,8 @@ fn cli_profile(tokens: &[String]) -> Option<String> {
     profile.filter(|p| !p.is_empty())
 }
 
-/// Top-level `profile = "name"` assignment in `config.toml` text, unquoted.
-/// Bare (`profile = name`) and quoted forms are both accepted; a trailing
-/// comment is dropped.
+/// First line-based `profile = name` assignment in `config.toml`. Bare and
+/// quoted values are accepted, and trailing comments are ignored.
 fn config_profile(text: &str) -> Option<String> {
     for line in text.lines() {
         let Some(rest) = line.trim_start().strip_prefix("profile") else {
@@ -479,8 +469,7 @@ fn config_profile(text: &str) -> Option<String> {
     None
 }
 
-/// Unquote a TOML scalar: a `"…"` or `'…'` string yields its contents; a bare
-/// value yields its first whitespace/`#`-delimited token.
+/// Extract a quoted value or the first whitespace/`#`-delimited bare token.
 fn unquote_toml(s: &str) -> String {
     for q in ['"', '\''] {
         if let Some(rest) = s.strip_prefix(q)
@@ -516,7 +505,7 @@ fn toml_escape(s: &str) -> String {
     out
 }
 
-/// Millisecond instant embedded in a v7 UUID's first 48 bits. Non-v7 IDs
+/// Return the millisecond instant in a validated v7 UUID. Other UUID versions
 /// return `None`.
 fn v7_millis(id: &str) -> Option<u64> {
     if id.as_bytes()[14] != b'7' {
@@ -525,8 +514,8 @@ fn v7_millis(id: &str) -> Option<u64> {
     u64::from_str_radix(&format!("{}{}", &id[..8], &id[9..13]), 16).ok()
 }
 
-/// Whether the rollout's first `session_meta` record names `cwd`. The read is
-/// capped at 64 KiB because later rollout content is irrelevant.
+/// Whether the rollout's first record names `cwd`. The read is capped at
+/// 64 KiB because later content is ignored.
 fn line1_cwd_matches(path: &Path, cwd: &Path) -> bool {
     let Ok(file) = fs::File::open(path) else {
         return false;
@@ -861,15 +850,13 @@ mod tests {
         // A multibyte char after the dash must classify (as Unknown), not
         // panic on a byte-boundary slice.
         assert!(Codex.detect("codex -\u{e9}x").is_none());
-        // A value-taking flag with a separate value no longer desyncs the
-        // walk: the subcommand after its value is read correctly.
+        // A separate flag value is skipped before locating the subcommand.
         let inv = Codex
             .detect(&format!("codex --sandbox workspace-write resume {ID}"))
             .unwrap();
         assert_eq!(inv.known_id.as_deref(), Some(ID));
 
-        // Corruption case (a): `exec` is correctly the subcommand, not the
-        // value, and stays blocklisted.
+        // `exec` remains the blocklisted subcommand after a value flag.
         assert!(
             Codex
                 .detect("codex --sandbox workspace-write exec 'do x'")
@@ -895,15 +882,13 @@ mod tests {
 
     #[test]
     fn resume_command_never_corrupts_after_a_value_flag() {
-        // Corruption case (a): the value flag's argument is not misread as a
-        // subcommand, so no stray `resume` precedes the blocklisted one.
+        // The value flag's argument is not treated as the subcommand.
         assert_eq!(
             Codex.resume_command("codex --sandbox workspace-write exec 'x'", ID),
             "codex --sandbox workspace-write exec 'x'"
         );
 
-        // Corruption case (b): the existing uuid target is replaced in place,
-        // never doubled with a second `resume`.
+        // The existing UUID target is replaced in place.
         let cmd = format!("codex --sandbox workspace-write resume {OTHER}");
         let out = Codex.resume_command(&cmd, ID);
         assert_eq!(out, format!("codex --sandbox workspace-write resume {ID}"));

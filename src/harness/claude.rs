@@ -1,12 +1,10 @@
-//! Claude exposes several session-ID channels. Fleetcom pins a v4 UUID with
-//! `--session-id`, adds a `SessionStart` hook through an additive `--settings`
-//! overlay, scans final terminal text for `claude --resume <uuid>`, and
-//! correlates transcripts under
-//! `<claude-home>/projects/<cwd-slug>/<uuid>.jsonl`.
+//! No single `claude` channel guarantees the current conversation ID. This
+//! harness pins a v4 UUID with `--session-id`, adds a `SessionStart` hook,
+//! scans final terminal text for `claude --resume <uuid>`, and correlates
+//! transcripts under `<claude-home>/projects/<cwd-slug>/<uuid>.jsonl`.
 //!
-//! `claude` rejects `--session-id` with `--resume` or `--continue` unless
-//! `--fork-session` is present. Fleetcom therefore pins only launches that
-//! contain none of these session-selection flags.
+//! Fleetcom does not pin launches that contain `--resume`, `--continue`,
+//! `--fork-session`, or `--session-id`.
 
 use std::{fs, path::Path, time::SystemTime};
 
@@ -54,17 +52,9 @@ impl Harness for Claude {
         let mut i = 1;
         while i < words.len() {
             let t = words[i].text.as_str();
-            // Values of the id/settings flags are consumed so they are never
-            // misread as the subcommand positional. Other flags' values are
-            // not modeled; a value that collides with a blocklist word makes
-            // the command opaque, which errs toward no-op.
-            //
-            // Claude tolerates unmodeled flags where codex cannot: its rewrite
-            // appends `--resume '<id>'` at the end, and claude's flags are
-            // order-insensitive, so a mis-skipped value cannot displace a
-            // positional or splice a duplicate subcommand. Codex instead
-            // inserts a positional `resume` whose placement depends on reading
-            // the value flags exactly, so it refuses on any unknown flag.
+            // Consume values for flags this parser interprets so they cannot
+            // be mistaken for a subcommand. Values of other flags are not
+            // modeled; a blocklisted value makes the command opaque.
             if t == "--resume" || t == "-r" {
                 can_inject_id = false;
                 if let Some(next) = words.get(i + 1).map(|w| w.text.as_str())
@@ -246,8 +236,7 @@ impl Harness for Claude {
                     replaced = true;
                 }
             } else if t == "--session-id" {
-                // claude rejects --session-id alongside --resume: drop the
-                // flag and its value.
+                // A resume command cannot retain a pinned session ID.
                 let start = words[i].start;
                 let end = match words.get(i + 1) {
                     Some(next) if !next.text.starts_with('-') => {
@@ -290,8 +279,7 @@ fn slug(cwd: &Path) -> Option<String> {
     )
 }
 
-/// Include whitespace before a removed token so the remaining command keeps
-/// a single separator.
+/// Include preceding whitespace when removing a token.
 fn erase_start(cmd: &str, mut start: usize) -> usize {
     let b = cmd.as_bytes();
     while start > 0 && matches!(b[start - 1], b' ' | b'\t') {
@@ -367,8 +355,7 @@ mod tests {
             assert!(!inv.can_inject_id, "{cmd}");
         }
 
-        // Continue/fork and non-uuid resume targets: detected, no known id,
-        // and no launch-time pinning (claude would reject it).
+        // Continue, fork, and non-UUID resume targets disable launch pinning.
         for cmd in [
             "claude --continue",
             "claude -c",
@@ -477,7 +464,7 @@ mod tests {
             Claude.resume_command("claude 'fix the bug' --model opus", ID),
             format!("claude 'fix the bug' --model opus --resume '{ID}'")
         );
-        // Both resume spellings are rewritten in place.
+        // UUIDs passed through either resume flag are replaced in place.
         assert_eq!(
             Claude.resume_command(&format!("claude --resume {OTHER} -v"), ID),
             format!("claude --resume {ID} -v")
@@ -500,7 +487,7 @@ mod tests {
             Claude.resume_command("claude | tee log", ID),
             "claude | tee log"
         );
-        // Gate re-check: a non-strict id is never spliced.
+        // Invalid IDs leave the command unchanged.
         assert_eq!(Claude.resume_command("claude", "evil'"), "claude");
     }
 

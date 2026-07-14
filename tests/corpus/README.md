@@ -30,7 +30,7 @@ binary capture.
 
 ## Test classification
 
-The fixtures cover two classes of behavior:
+The fixtures cover three classes of behavior:
 
 - `tmux_split`, `vim_session`, `less_altscreen`, `top_live`, `shell_colors`,
   and `build_log` pin displayed state: every plain-text row, the cursor, and
@@ -38,7 +38,8 @@ The fixtures cover two classes of behavior:
 - `codex_resume`, `wide_emoji`, `dec_scrollregion`, and `topregion_scroll` pin
   parser semantics: scrollback retention, intensity stacking, charset
   translation, and VS16 width.
+- `claude_resume` verifies that retained terminal text preserves the exit hint
+  consumed by the Claude harness.
 
-These are absolute values in `src/golden.rs`. If an `alacritty_terminal` update
-changes one, the failing row, cell, or count identifies the behavior that needs
-review.
+`src/golden.rs` contains the absolute display and parser expectations.
+`src/harness/claude.rs` contains the Claude scrape expectation.

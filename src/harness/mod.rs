@@ -1,15 +1,15 @@
-//! Saved commands can relaunch an agent CLI without resuming its conversation.
-//! A harness closes that gap: it classifies supported commands, instruments
-//! execution to capture a conversation ID, and emits a resuming command.
+//! Saving an agent command is insufficient because relaunching it can start
+//! another conversation. A harness detects supported commands, instruments
+//! execution to capture an ID, and emits a command that resumes that ID.
 //!
 //! Commands the tokenizer cannot fully account for remain uninstrumented.
 //!
 //! # Security invariant
 //!
-//! Every ID returned by `parse_capture`, `scrape_exit`,
-//! or `correlate_fs` is spliced into a shell command when a recipe loads.
-//! Only strings accepted by [`is_uuid`] may ever be returned: free-text
-//! session names, paths, and anything else must yield `None`.
+//! Every ID returned by `parse_capture`, `scrape_exit`, or `correlate_fs`
+//! eventually enters a shell command. These methods may therefore return only
+//! strings accepted by [`is_uuid`]. Free-text names, paths, and malformed IDs
+//! must yield `None`.
 
 pub mod assets;
 mod claude;
@@ -32,15 +32,13 @@ pub const CAPTURE_ENV: &str = "FLEETCOM_CAPTURE_FILE";
 /// Maximum difference between a task spawn and a correlated session timestamp.
 const CORRELATE_WINDOW: Duration = Duration::from_secs(30);
 
-/// Capture and resume behavior for one supported agent CLI.
+/// Detection, capture, correlation, and resume behavior for one agent CLI.
 pub trait Harness: Sync {
     #[allow(dead_code)] // test-only: registry routing assertions
     fn name(&self) -> &'static str;
 
-    /// Environment variable overriding the tool's home root (config plus
-    /// session store). The supervisor resolves it from the task's launch
-    /// env so `instrument` and `correlate_fs` inspect the store the child
-    /// actually uses, not the daemon's own.
+    /// Environment variable overriding the tool's home root. The supervisor
+    /// resolves it from the launch context used for instrumentation or save.
     fn home_env_var(&self) -> &'static str;
 
     /// Classify a command. Return `None` for another tool, an excluded
@@ -49,7 +47,7 @@ pub trait Harness: Sync {
 
     /// Build spawn-time command and environment additions.
     /// `home_override` is the launch env's [`Harness::home_env_var`] value;
-    /// codex reads the user's config through it before injecting notify.
+    /// `codex` reads the user's config through it before injecting `notify`.
     fn instrument(
         &self,
         inv: &Invocation,
@@ -63,7 +61,7 @@ pub trait Harness: Sync {
     /// Extract a session ID from final terminal text, including scrollback.
     fn scrape_exit(&self, text: &str) -> Option<String>;
 
-    /// Find a session ID in the tool's on-disk store. Ambiguous
+    /// Find one session ID in the tool's on-disk store. Missing or ambiguous
     /// matches return `None`.
     fn correlate_fs(
         &self,
@@ -96,7 +94,7 @@ pub struct Invocation {
     /// command does not contain a recognized UUID target.
     pub known_id: Option<String>,
     /// Whether `instrument` may pin a fresh session ID at launch. This is
-    /// false for codex and for claude commands carrying `--resume`,
+    /// false for `codex` and for `claude` commands carrying `--resume`,
     /// `--continue`, `--fork-session`, or `--session-id`.
     pub can_inject_id: bool,
 }
@@ -108,7 +106,7 @@ pub struct CapturePaths {
     pub capture_file: PathBuf,
     /// Additive settings file passed to `claude --settings`.
     pub claude_settings: PathBuf,
-    /// Program installed through codex's `notify` config override.
+    /// Program installed through `codex`'s `notify` config override.
     pub codex_notify: PathBuf,
 }
 
@@ -124,7 +122,7 @@ pub struct SpawnPlan {
     pub injected_id: Option<String>,
 }
 
-/// Validate the session-ID boundary: exactly `8-4-4-4-12` lowercase hex.
+/// Validate the shell-insertion boundary: exactly `8-4-4-4-12` lowercase hex.
 pub fn is_uuid(s: &str) -> bool {
     let b = s.as_bytes();
     b.len() == 36
@@ -189,8 +187,8 @@ pub(crate) struct Word {
     pub(crate) end: usize,
 }
 
-/// Split `cmd` into shell words: unquoted whitespace separates, single- and
-/// double-quoted spans are literal (no expansion). Refuses (`None`) any
+/// Split `cmd` into shell words: unquoted whitespace separates, and quoted
+/// spans are decoded without expansion by this tokenizer. Refuses (`None`) any
 /// command containing, outside quotes, a construct whose meaning this module
 /// cannot account for: `| ; & < > $ #` backtick `( ) \`, a newline or
 /// carriage return, an unterminated quote, or an `=` in the first word
@@ -381,7 +379,7 @@ mod tests {
         ] {
             assert_eq!(tokenize(cmd), None, "{cmd:?} must be refused");
         }
-        // Inside quotes both are prompt text, not shell or clap syntax.
+        // Inside larger quoted words, both remain prompt text.
         let words = tokenize("claude 'fix bug #3'").unwrap();
         assert_eq!(words[1].text, "fix bug #3");
         let words = tokenize("codex 'run -- now'").unwrap();

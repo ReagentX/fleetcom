@@ -40,7 +40,7 @@ The schema is a flat map with no version field or metadata, so it remains practi
 
 Commands with neither a group nor a name use the string form. String and object entries can appear in the same directory array.
 
-Commands that launch a supported agent CLI (`claude`, `codex`) are saved in their resuming form when Fleetcom can identify the conversation. The entry remains an ordinary command string that can run directly in a shell:
+A bare agent command does not identify its conversation. When Fleetcom captures an ID for `claude` or `codex`, it saves the resuming form instead. The result remains an ordinary command string that can run directly in a shell:
 
 ```json
 {
@@ -57,4 +57,4 @@ Commands that launch a supported agent CLI (`claude`, `codex`) are saved in thei
 - Load in-app: `o`, pick from the list, `Enter`.
 - Load at launch: `fleetcom <name>`.
 
-Loading always spawns new processes from the stored commands. Existing jobs remain daemon state and never become part of the session file. For supported agent commands, [Agent session resume](agent-resume.md) documents the capture and rewrite mechanics.
+Loading always spawns new processes from the stored commands. Existing jobs remain daemon state and never enter the session file. [Agent session resume](agent-resume.md) documents how supported agent commands preserve their conversations across that relaunch.

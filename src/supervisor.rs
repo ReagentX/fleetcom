@@ -86,10 +86,10 @@ fn fnv1a_hex(bytes: &[u8]) -> String {
     format!("{h:016x}")
 }
 
-/// Return the task's best-known session ID in this order: exit scrape,
-/// capture file, spawn-time ID. The scrape runs only after exit and reader
-/// EOF. Capture files can change during resume, clear, or compact events, so
-/// they take precedence over the ID known at spawn.
+/// Return the best session ID available for a task: exit scrape, capture file,
+/// then spawn-time ID. Exit scraping waits for process exit and reader EOF.
+/// Capture files outrank the spawn-time ID because resume, clear, and compact
+/// events can replace their contents.
 pub(crate) fn current_resume_id(task: &Task) -> Option<String> {
     if let Some(id) = &task.scraped_id {
         return Some(id.clone());
@@ -103,8 +103,7 @@ pub(crate) fn current_resume_id(task: &Task) -> Option<String> {
     task.resume_id.clone()
 }
 
-/// Resolve the harness home (`CLAUDE_CONFIG_DIR` or `CODEX_HOME`) from the
-/// child's launch environment.
+/// Resolve the harness home from the provided launch environment.
 fn home_override(env: &[(OsString, OsString)], h: &dyn harness::Harness) -> Option<PathBuf> {
     env.iter()
         .find(|(k, _)| k == h.home_env_var())
@@ -145,12 +144,8 @@ pub struct Supervisor {
     /// TERM→KILL escalation window. `KILL_GRACE` in production; a field so tests
     /// shrink it instead of sleeping through real seconds.
     kill_grace: Duration,
-    /// Installed capture assets, keyed by canonicalized root. Each root
-    /// installs — and therefore runs `install`'s `task-*.json` sweep — at
-    /// most once per daemon lifetime, so clients alternating runtime roots
-    /// never re-sweep a root that still holds live tasks' capture files.
-    /// Growth is bounded by the number of distinct roots clients present
-    /// (in practice one), so there is no eviction.
+    /// Capture assets keyed by canonicalized root. Each root is installed and
+    /// swept once per daemon lifetime.
     capture: BTreeMap<PathBuf, assets::CaptureAssets>,
 }
 
@@ -228,13 +223,8 @@ impl Supervisor {
                 if let Some(i) = self.index_of(id) {
                     let mut t = self.tasks.remove(i);
                     t.terminate();
-                    // The conversation ends with the task; its capture file
-                    // is dead state (and task ids restart per daemon, so a
-                    // leftover would be misread as a future task's capture).
-                    // The task's own recorded path is authoritative — the
-                    // root it spawned under may not be the one the current
-                    // client presents. Restart never comes through here: it
-                    // keeps the id and the file.
+                    // Remove the task's own capture file; the current client
+                    // may use a different capture root.
                     if let Some(cap) = &t.capture_file {
                         let _ = std::fs::remove_file(cap);
                     }
@@ -467,25 +457,11 @@ impl Supervisor {
         self.launch.clone()
     }
 
-    /// Resolve this connection's capture root, install its assets on first
-    /// use, and return them. `FLEETCOM_RUNTIME_DIR` from the launch context
-    /// is used verbatim; otherwise the platform root gains a discriminator
-    /// derived from the session root.
-    ///
-    /// Installation — and its `task-*.json` sweep — runs at most once per
-    /// root per daemon lifetime. The sweep's premise (every capture file
-    /// present is an orphan of a dead daemon) holds only on a root's first
-    /// install: a revisited root may hold live tasks' capture files, so it
-    /// is reused without touching disk.
-    ///
-    /// The map key is the canonicalized root: symlinked spellings of one
-    /// directory (macOS `/var` vs `/private/var`) share an entry instead of
-    /// sweeping each other. Canonicalization requires the directory to
-    /// exist, so a root's first visit misses the lookup, installs (creating
-    /// the directory), and canonicalizes afterwards.
-    ///
-    /// If installation fails, the spawn proceeds without instrumentation;
-    /// assets installed for other roots are unaffected.
+    /// Resolve and install this connection's capture assets. An explicit
+    /// `FLEETCOM_RUNTIME_DIR` is used verbatim; the fallback root includes a
+    /// session-root discriminator. Canonical roots are installed and swept
+    /// once per daemon lifetime, preserving live capture files on reuse.
+    /// Installation failure disables instrumentation for the spawn.
     fn ensure_capture_assets(&mut self) -> Option<&assets::CaptureAssets> {
         let root = if let Some(ctx) = &self.launch
             && let Some((_, dir)) = ctx.env.iter().find(|(k, _)| k == "FLEETCOM_RUNTIME_DIR")
@@ -511,9 +487,9 @@ impl Supervisor {
         Some(self.capture.entry(key).or_insert(installed))
     }
 
-    /// Spawn one command for direct launches, reruns, and session loads.
-    /// Recognized agent commands receive capture instrumentation only in the
-    /// executed string; the task retains the caller's command verbatim.
+    /// Spawn a direct command, rerun, or session entry. Agent instrumentation
+    /// modifies only the executed string; the task retains the caller's
+    /// command verbatim.
     fn spawn_task(
         &mut self,
         id: u64,
@@ -580,8 +556,7 @@ impl Supervisor {
     }
 
     /// Rerun a finished task in place, preserving its ID, tag, group, and
-    /// name. Captured agent tasks use the best-known session ID and retain
-    /// their capture file. Starting a fresh conversation requires a new task.
+    /// name. Captured agent tasks use the best-known session ID.
     fn restart(&mut self, id: u64) {
         let Some(i) = self.index_of(id) else {
             self.events
@@ -628,8 +603,8 @@ impl Supervisor {
         }
     }
 
-    /// Build `{dir: [entries]}` in spawn order, preserving groups and names.
-    /// Agent entries use the command returned by `recipe_command`.
+    /// Build `{dir: [entries]}` in spawn order. Groups and names remain intact;
+    /// agent entries use the command returned by `recipe_command`.
     fn session_config(&self) -> SessionConfig {
         let mut order: Vec<usize> = (0..self.tasks.len()).collect();
         order.sort_by_key(|&i| self.tasks[i].id);
@@ -2287,8 +2262,7 @@ mod tests {
         std::fs::read_to_string(config.join("sessions").join(format!("{name}.json"))).unwrap()
     }
 
-    /// Helpers for constructing rollout fixtures accepted by codex
-    /// filesystem correlation.
+    /// Construct a v7 rollout ID for filesystem-correlation fixtures.
     fn v7_at(ms: u64, tail: u32) -> String {
         format!(
             "{:08x}-{:04x}-7000-8000-0000000{:05x}",
@@ -2320,7 +2294,7 @@ mod tests {
         assert_ne!(fnv1a_hex(b"/cfg/one"), fnv1a_hex(b"/cfg/two"));
     }
 
-    /// A claude spawn receives a pinned ID, settings overlay, and capture
+    /// A `claude` spawn receives a pinned ID, settings overlay, and capture
     /// environment without changing the stored command.
     #[test]
     fn spawn_claude_pins_an_id_and_layers_settings() {
@@ -2403,7 +2377,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A resuming claude launch retains its target ID and adds only the
+    /// A resuming `claude` launch retains its target ID and adds only the
     /// capture overlay.
     #[test]
     fn spawn_resuming_claude_injects_only_the_capture_channel() {
@@ -2638,7 +2612,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A codex spawn receives a `notify=[...]` override naming an executable
+    /// A `codex` spawn receives a `notify=[...]` override naming an executable
     /// capture script.
     #[test]
     fn spawn_codex_installs_the_notify_override() {
@@ -2681,7 +2655,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A claude exit hint becomes the session ID used by the saved recipe.
+    /// A `claude` exit hint becomes the session ID used by the saved recipe.
     #[test]
     fn exit_hint_is_scraped_and_saved_as_a_resume() {
         let dir = scratch("scrape_exit");
@@ -2786,7 +2760,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A silent codex task can use a unique rollout under `CODEX_HOME` when
+    /// A silent `codex` task can use a unique rollout under `CODEX_HOME` when
     /// live capture channels produce no ID.
     #[test]
     fn save_falls_back_to_fs_correlation_for_a_silent_codex() {

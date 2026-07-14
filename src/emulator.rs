@@ -245,15 +245,9 @@ impl Emulator {
         crate::serialize::contents(&self.term)
     }
 
-    /// Return every retained row as plain text, from the oldest scrollback
-    /// row through the viewport, one line per logical line: a row whose last
-    /// cell carries `WRAPLINE` soft-wrapped mid-line, so its continuation
-    /// row joins it with no separator and a hint printed past the grid
-    /// width scrapes back as the one line the child wrote. Trailing blanks
-    /// are trimmed from unwrapped rows only — a wrapped row is full to the
-    /// last column by construction, so its trailing cells are content.
-    /// Absolute row addressing makes the result independent of the
-    /// viewport's current scroll offset.
+    /// Return retained plain text from the oldest scrollback row through the
+    /// viewport. Soft-wrapped rows join without a separator; trailing padding
+    /// is trimmed from other rows. The current scroll offset has no effect.
     pub fn text_with_history(&self) -> String {
         let grid = self.term.grid();
         let top = -(grid.history_size() as i32);
@@ -265,10 +259,8 @@ impl Emulator {
             let line = &grid[Line(row)];
             for col in 0..grid.columns() {
                 let cell = &line[Column(col)];
-                // Wide-char spacers duplicate their neighbor; the leading
-                // variant is the blank left in the last column when a wide
-                // glyph wrapped instead of splitting. Tabs render as the
-                // spaces they displayed as.
+                // Skip wide-character spacers and preserve displayed tabs as
+                // spaces.
                 if cell
                     .flags
                     .intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER)
@@ -280,9 +272,7 @@ impl Emulator {
                     out.extend(zerowidth.iter());
                 }
             }
-            // A soft-wrapped row continues into the next: no newline, and no
-            // trim, since a space in its last column is content the child
-            // wrote, not padding.
+            // A soft-wrapped row continues without trimming or a newline.
             if line[Column(last_col)].flags.contains(Flags::WRAPLINE) {
                 continue;
             }
@@ -595,8 +585,8 @@ mod tests {
 
     /// The exit-hint scrape depends on this: a line the child printed past
     /// the grid width soft-wraps, and the wrapped rows must join back into
-    /// the one line the child wrote — no synthetic newline through the
-    /// UUID — while explicit newlines still separate logical lines.
+    /// the one line the child wrote (no synthetic newline through the UUID),
+    /// while explicit newlines still separate logical lines.
     #[test]
     fn text_with_history_joins_soft_wrapped_rows() {
         let mut emu = Emulator::new(6, 20, 100);
@@ -611,8 +601,7 @@ mod tests {
         assert!(full.contains(&format!("before\n{hint}\nafter")));
     }
 
-    /// The codex named-thread hint wraps at ordinary 80-column widths; the
-    /// full sentence with `(<uuid>)` must survive as one line.
+    /// A wrapped codex named-thread hint remains one logical line.
     #[test]
     fn text_with_history_joins_codex_hint_across_rows() {
         let mut emu = Emulator::new(8, 40, 100);

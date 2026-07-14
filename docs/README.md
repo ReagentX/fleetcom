@@ -6,7 +6,7 @@ Fleetcom keeps durable session recipes separate from ephemeral daemon state. Thi
 
 - [Commands](commands.md): every key and launch flag, including the routing mechanics
 - [Sessions](sessions.md): the task recipe format and where it lives
-- [Agent session resume](agent-resume.md): how `claude` and `codex` tasks are captured and saved as resuming commands
+- [Agent session resume](agent-resume.md): how Fleetcom captures `claude` and `codex` conversation IDs and rewrites saved commands
 - [Directory & Environment Configuration](#directory--environment-configuration): the socket, the lock, and the session paths
 - [Sample Usage Session](#sample-usage-session): a first run, start to finish
 - [Notes & Caveats](#notes--caveats): process and protocol boundaries
