@@ -10,7 +10,7 @@ use std::{
         mpsc::{Sender, channel},
     },
     thread::{self, JoinHandle},
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime},
 };
 
 use alacritty_terminal::sync::FairMutex;
@@ -196,6 +196,20 @@ pub struct Task {
     pub group: Option<String>,
     /// Custom display name; `None` means unnamed.
     pub name: Option<String>,
+    /// The harness that claimed `command` at spawn; `None` for non-agent
+    /// commands and for degraded spawns whose capture assets never
+    /// installed. The supervisor sets it after construction.
+    pub harness: Option<&'static dyn crate::harness::Harness>,
+    /// Best-known session id at spawn: the injected or user-typed one. A
+    /// written capture file outranks it — see the supervisor's
+    /// `current_resume_id`.
+    pub resume_id: Option<String>,
+    /// Where this task's instrumented hook/notify writes its payload.
+    pub capture_file: Option<PathBuf>,
+    /// Wallclock twin of `started`: `Harness::correlate_fs` pairs it with
+    /// on-disk session timestamps, which `Instant` cannot reach.
+    #[allow(dead_code)] // consumed by the exit-scrape/correlation phase
+    pub spawned_at: SystemTime,
     pub exit_code: Option<i32>,
     pub started: Instant,
     pub finished: Option<Instant>,
@@ -252,14 +266,20 @@ fn wait_code(status: &rustix::process::WaitIdStatus) -> i32 {
 }
 
 impl Task {
-    /// Spawn `command` under `$SHELL -c` in `cwd`, in a fresh PTY sized `rows`×`cols`,
-    /// with exactly `env` as the environment (the launching client's; the caller
-    /// owns any fallback policy). `waker` lets the reader thread nudge the core
-    /// loop when the PTY produces output, so an attached screen refreshes
-    /// without a polling delay.
+    /// Spawn `exec_command` under `$SHELL -c` in `cwd`, in a fresh PTY sized
+    /// `rows`×`cols`, with exactly `env` as the environment (the launching
+    /// client's; the caller owns any fallback policy). Two command strings
+    /// because instrumentation must never leak into `command`, the string
+    /// recipes save and the UI shows: it is stored verbatim, while
+    /// `exec_command` — possibly carrying a capture suffix — is what actually
+    /// runs. Uninstrumented callers pass the same string twice. `waker` lets
+    /// the reader thread nudge the core loop when the PTY produces output, so
+    /// an attached screen refreshes without a polling delay.
+    #[allow(clippy::too_many_arguments)] // one call shape, three call sites
     pub fn spawn(
         id: u64,
         command: &str,
+        exec_command: &str,
         cwd: &Path,
         rows: u16,
         cols: u16,
@@ -290,7 +310,7 @@ impl Task {
         // Use a non-interactive shell. Interactive startup files, aliases, and
         // shell functions are not loaded.
         cmd.arg("-c");
-        cmd.arg(command);
+        cmd.arg(exec_command);
         // The job runs under the *client's* environment, verbatim: clear the
         // builder's captured base (the daemon's own env, whatever the client
         // that first autostarted it happened to have) so nothing leaks through
@@ -393,6 +413,10 @@ impl Task {
             tagged: false,
             group: None,
             name: None,
+            harness: None,
+            resume_id: None,
+            capture_file: None,
+            spawned_at: SystemTime::now(),
             exit_code: None,
             started: Instant::now(),
             finished: None,
@@ -709,7 +733,17 @@ mod tests {
     }
 
     fn spawn(id: u64, command: &str) -> Task {
-        Task::spawn(id, command, &here(), 24, 80, &env_here(), no_waker()).unwrap()
+        Task::spawn(
+            id,
+            command,
+            command,
+            &here(),
+            24,
+            80,
+            &env_here(),
+            no_waker(),
+        )
+        .unwrap()
     }
 
     fn wait_finished(t: &mut Task) {
@@ -756,7 +790,17 @@ mod tests {
 
     #[test]
     fn resize_is_reflected_in_the_grid() {
-        let mut t = Task::spawn(3, "sleep 5", &here(), 24, 80, &env_here(), no_waker()).unwrap();
+        let mut t = Task::spawn(
+            3,
+            "sleep 5",
+            "sleep 5",
+            &here(),
+            24,
+            80,
+            &env_here(),
+            no_waker(),
+        )
+        .unwrap();
         t.resize(30, 100).unwrap();
         assert_eq!(t.parser.lock().size(), (30, 100));
         t.terminate();
@@ -796,16 +840,8 @@ mod tests {
         // `trap '' HUP` first: the ignore is inherited by the `&` child, which
         // must survive its session leader's exit (leader death HUPs the
         // foreground group) to *be* a straggler.
-        let mut t = Task::spawn(
-            5,
-            &format!("trap '' HUP; sleep 300 & echo $! > {}", spid.display()),
-            &here(),
-            24,
-            80,
-            &sh_env(),
-            no_waker(),
-        )
-        .unwrap();
+        let cmd = format!("trap '' HUP; sleep 300 & echo $! > {}", spid.display());
+        let mut t = Task::spawn(5, &cmd, &cmd, &here(), 24, 80, &sh_env(), no_waker()).unwrap();
         wait_finished(&mut t); // leader exits as soon as the background job is up
         let deadline = Instant::now() + Duration::from_secs(5);
         let mut straggler = None;
@@ -1128,7 +1164,7 @@ mod tests {
              head -c 11 > {}",
             out.display()
         );
-        let mut t = Task::spawn(11, &cmd, &here(), 24, 80, &sh_env(), no_waker()).unwrap();
+        let mut t = Task::spawn(11, &cmd, &cmd, &here(), 24, 80, &sh_env(), no_waker()).unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
         let mut got = Vec::new();
         while Instant::now() < deadline {

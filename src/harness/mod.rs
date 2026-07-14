@@ -37,6 +37,7 @@ const CORRELATE_WINDOW: Duration = Duration::from_secs(30);
 
 /// One agent CLI fleetcom knows how to capture and resume.
 pub trait Harness: Sync {
+    #[allow(dead_code)] // consumed by the exit-scrape/correlation phase
     fn name(&self) -> &'static str;
 
     /// Classify a recipe command string. `None` = not this tool / excluded
@@ -51,10 +52,12 @@ pub trait Harness: Sync {
     fn parse_capture(&self, payload: &str) -> Option<String>;
 
     /// Session id from a task's final terminal text (viewport + scrollback).
+    #[allow(dead_code)] // consumed by the exit-scrape/correlation phase
     fn scrape_exit(&self, text: &str) -> Option<String>;
 
     /// Best-effort id from the tool's on-disk session store. Ambiguity is
     /// `None` by design: resuming the wrong conversation is worse than none.
+    #[allow(dead_code)] // consumed by the exit-scrape/correlation phase
     fn correlate_fs(
         &self,
         cwd: &Path,

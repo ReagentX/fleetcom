@@ -5,13 +5,16 @@
 //! `Event`s).
 
 use std::{
-    path::PathBuf,
+    ffi::OsString,
+    io,
+    path::{Path, PathBuf},
     sync::{Arc, Mutex, mpsc::Sender},
     time::{Duration, Instant},
 };
 
 use crate::{
     core::{Wake, Waker},
+    harness::{self, assets},
     path,
     protocol::{Command, Event, LaunchContext, ScreenView, ScrollAction, TaskView},
     session::{self, SessionConfig, SessionEntry},
@@ -71,6 +74,34 @@ fn normalize_group(name: Option<String>) -> Option<String> {
     normalize_label(name).filter(|g| g != "Unassigned")
 }
 
+/// Short hex FNV-1a (64-bit) of `bytes`: the per-daemon capture-root
+/// discriminator. Hashing rather than reusing the path keeps the directory
+/// name flat and free of the separator/quoting hazards a path-derived name
+/// would carry.
+fn fnv1a_hex(bytes: &[u8]) -> String {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for &b in bytes {
+        h ^= u64::from(b);
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("{h:016x}")
+}
+
+/// The task's best-known session id, capture file first: the injected hook
+/// rewrites the file on every session change (resume, clear, compact), so
+/// its payload outranks the id fixed at spawn. Falls back to the spawn-time
+/// `resume_id`. `pub(crate)` because the recipe-save path needs the same
+/// precedence.
+pub(crate) fn current_resume_id(task: &Task) -> Option<String> {
+    if let (Some(h), Some(path)) = (task.harness, &task.capture_file)
+        && let Ok(payload) = std::fs::read_to_string(path)
+        && let Some(id) = h.parse_capture(&payload)
+    {
+        return Some(id);
+    }
+    task.resume_id.clone()
+}
+
 pub struct Supervisor {
     tasks: Vec<Task>,
     /// Removed tasks whose process groups may still be winding down: TERMed at
@@ -105,6 +136,11 @@ pub struct Supervisor {
     /// TERM→KILL escalation window. `KILL_GRACE` in production; a field so tests
     /// shrink it instead of sleeping through real seconds.
     kill_grace: Duration,
+    /// Installed capture assets plus the root they live under. `None` until
+    /// an agent-CLI spawn first needs them. The root is remembered because
+    /// `install` sweeps `task-*.json`: reinstalling on an unchanged root (a
+    /// reconnect) would destroy live tasks' capture files.
+    capture: Option<(PathBuf, assets::CaptureAssets)>,
 }
 
 impl Supervisor {
@@ -121,6 +157,7 @@ impl Supervisor {
             events: Vec::new(),
             waker: Arc::new(Mutex::new(None)),
             kill_grace: KILL_GRACE,
+            capture: None,
         }
     }
 
@@ -180,6 +217,16 @@ impl Supervisor {
                 if let Some(i) = self.index_of(id) {
                     let mut t = self.tasks.remove(i);
                     t.terminate();
+                    // The conversation ends with the task; its capture file
+                    // is dead state (and task ids restart per daemon, so a
+                    // leftover would be misread as a future task's capture).
+                    // Restart never comes through here: it keeps the id and
+                    // the file.
+                    if t.capture_file.is_some()
+                        && let Some((_, installed)) = &self.capture
+                    {
+                        installed.remove(t.id);
+                    }
                     self.graveyard.push(t);
                 }
             }
@@ -395,6 +442,92 @@ impl Supervisor {
         self.launch.clone()
     }
 
+    /// Resolve this connection's capture root and install the assets under
+    /// it, once per root. `FLEETCOM_RUNTIME_DIR` from the launch context wins
+    /// verbatim — the `sessions_root` pattern: the daemon's own env is frozen
+    /// from whichever client first autostarted it. Otherwise the platform
+    /// runtime root gains a per-daemon discriminator directory hashed from
+    /// the sessions root (the value that distinguishes daemon instances,
+    /// which are keyed by config dir): two daemons must not share a capture
+    /// root, because `install`'s sweep would delete each other's live capture
+    /// files and task ids collide across daemons.
+    ///
+    /// An unchanged root never reinstalls: `install` sweeps `task-*.json`,
+    /// so a reconnect would destroy live tasks' captures. A failed install
+    /// leaves any previous root's assets in place (their tasks' capture
+    /// files stay removable) and the new root simply spawns uninstrumented.
+    fn ensure_capture_assets(&mut self) {
+        let root = if let Some(ctx) = &self.launch
+            && let Some((_, dir)) = ctx.env.iter().find(|(k, _)| k == "FLEETCOM_RUNTIME_DIR")
+        {
+            Some(PathBuf::from(dir))
+        } else {
+            assets::runtime_root(None).map(|base| {
+                let key = self
+                    .sessions_root()
+                    .map(PathBuf::into_os_string)
+                    .unwrap_or_default();
+                base.join(fnv1a_hex(key.as_encoded_bytes()))
+            })
+        };
+        let Some(root) = root else { return };
+        if self.capture.as_ref().is_some_and(|(r, _)| *r == root) {
+            return;
+        }
+        if let Ok(installed) = assets::CaptureAssets::install(&root) {
+            self.capture = Some((root, installed));
+        }
+    }
+
+    /// The one spawn path (spawn, rerun, session load): classify `command`,
+    /// instrument an agent-CLI launch for session capture, and stamp the
+    /// capture fields on the task. `command` lands on the task verbatim; only
+    /// the exec string carries the instrumentation suffix. A command no
+    /// harness claims — or a claimed one whose assets cannot install —
+    /// spawns untouched.
+    fn spawn_task(
+        &mut self,
+        id: u64,
+        command: &str,
+        cwd: &Path,
+        env: &[(OsString, OsString)],
+    ) -> io::Result<Task> {
+        if let Some((h, inv)) = harness::detect(command) {
+            self.ensure_capture_assets();
+            if let Some((_, installed)) = &self.capture {
+                let paths = installed.paths_for(id);
+                let plan = h.instrument(&inv, &paths);
+                let exec = format!("{command}{}", plan.args_suffix);
+                let mut env = env.to_vec();
+                env.extend(plan.env);
+                let mut task = Task::spawn(
+                    id,
+                    command,
+                    &exec,
+                    cwd,
+                    self.rows,
+                    self.cols,
+                    &env,
+                    Arc::clone(&self.waker),
+                )?;
+                task.harness = Some(h);
+                task.capture_file = Some(paths.capture_file);
+                task.resume_id = plan.injected_id.or(inv.known_id);
+                return Ok(task);
+            }
+        }
+        Task::spawn(
+            id,
+            command,
+            command,
+            cwd,
+            self.rows,
+            self.cols,
+            env,
+            Arc::clone(&self.waker),
+        )
+    }
+
     fn spawn(&mut self, command: &str, cwd: PathBuf, group: Option<String>) {
         if self.tasks.len() >= MAX_TASKS {
             self.events.push(Event::Status(format!(
@@ -405,15 +538,7 @@ impl Supervisor {
         let Some(launch) = self.launch_or_refuse() else {
             return;
         };
-        match Task::spawn(
-            self.next_id,
-            command,
-            &cwd,
-            self.rows,
-            self.cols,
-            &launch.env,
-            Arc::clone(&self.waker),
-        ) {
+        match self.spawn_task(self.next_id, command, &cwd, &launch.env) {
             Ok(mut task) => {
                 task.group = group;
                 self.next_id += 1;
@@ -426,7 +551,11 @@ impl Supervisor {
     }
 
     /// Re-run a finished task in place while preserving its ID, tag, group,
-    /// and name.
+    /// and name. A captured agent-CLI task re-enters its conversation: the
+    /// stored command is rewritten to resume the best-known session id, so
+    /// rerun continues where the task left off — a fresh conversation is a
+    /// new task instead. The capture file survives (same id, conversation
+    /// continues); only Remove deletes it.
     fn restart(&mut self, id: u64) {
         let Some(i) = self.index_of(id) else {
             self.events
@@ -441,16 +570,19 @@ impl Supervisor {
         let Some(launch) = self.launch_or_refuse() else {
             return;
         };
+        // The resuming command becomes the STORED command too: re-detection
+        // classifies it as resuming, so instrumentation injects only the
+        // capture channel, never a second id.
+        let (command, cwd) = {
+            let old = &self.tasks[i];
+            let command = match (old.harness, current_resume_id(old)) {
+                (Some(h), Some(rid)) => h.resume_command(&old.command, &rid),
+                _ => old.command.clone(),
+            };
+            (command, old.cwd.clone())
+        };
         // Preserve the finished task if its replacement cannot start.
-        match Task::spawn(
-            id,
-            &self.tasks[i].command,
-            &self.tasks[i].cwd,
-            self.rows,
-            self.cols,
-            &launch.env,
-            Arc::clone(&self.waker),
-        ) {
+        match self.spawn_task(id, &command, &cwd, &launch.env) {
             Ok(mut fresh) => {
                 fresh.tagged = self.tasks[i].tagged;
                 fresh.group = self.tasks[i].group.clone();
@@ -562,15 +694,9 @@ impl Supervisor {
                     skipped += 1;
                     continue;
                 }
-                if let Ok(mut task) = Task::spawn(
-                    self.next_id,
-                    &entry.cmd,
-                    &resolved,
-                    self.rows,
-                    self.cols,
-                    &launch.env,
-                    Arc::clone(&self.waker),
-                ) {
+                if let Ok(mut task) =
+                    self.spawn_task(self.next_id, &entry.cmd, &resolved, &launch.env)
+                {
                     // Normalize persisted labels before assigning them.
                     task.group = normalize_group(entry.group.clone());
                     task.name = normalize_label(entry.name.clone());
@@ -2032,5 +2158,351 @@ mod tests {
                 if m.contains("no launch context") || m.contains("not found"))),
             "context-less load must not spawn; got {evs:?}"
         );
+    }
+
+    // --- session-capture wiring -------------------------------------------
+
+    const CAP_ID: &str = "c8c4a5cc-0b32-4ba0-a6b4-6ed08c218e0d";
+    const CAP_OTHER: &str = "11111111-2222-4333-8444-555555555555";
+
+    /// Install an executable stub named `name` under `bin` that records
+    /// `FLEETCOM_CAPTURE_FILE` and its argv (one token per line) under `out`,
+    /// then exits. Capture tests never invoke a real agent CLI.
+    fn install_stub(bin: &Path, name: &str, out: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::create_dir_all(bin).unwrap();
+        let script = format!(
+            "#!/bin/sh\nprintf '%s' \"$FLEETCOM_CAPTURE_FILE\" > '{out}/capenv'\n\
+             printf '%s\\n' \"$@\" > '{out}/argv'\n",
+            out = out.display()
+        );
+        let path = bin.join(name);
+        std::fs::write(&path, script).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    /// Launch context for stub tests: the stub dir first in `PATH`, a
+    /// portable shell, and a per-test capture root. The env holds nothing
+    /// else, so this process's own environment provably never reaches the
+    /// child or the root resolution.
+    fn agent_ctx(bin: &Path, runtime: &Path, cwd: PathBuf) -> LaunchContext {
+        LaunchContext {
+            env: vec![
+                (
+                    "PATH".into(),
+                    format!("{}:/usr/bin:/bin", bin.display()).into(),
+                ),
+                ("SHELL".into(), "/bin/sh".into()),
+                (
+                    "FLEETCOM_RUNTIME_DIR".into(),
+                    runtime.as_os_str().to_os_string(),
+                ),
+            ],
+            cwd,
+        }
+    }
+
+    /// Poll until the stub has written its argv record, then return its
+    /// lines. Waiting on content, not existence: the shell creates the file
+    /// before printf fills it.
+    fn wait_argv(s: &mut Supervisor, path: &Path) -> Vec<String> {
+        assert!(
+            reap_until(s, Duration::from_secs(5), |_| std::fs::read_to_string(path)
+                .is_ok_and(|c| !c.is_empty())),
+            "the stub never recorded its argv"
+        );
+        std::fs::read_to_string(path)
+            .unwrap()
+            .lines()
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// The FNV-1a discriminator is deterministic (a daemon finds its own
+    /// capture root again) and separates config dirs (two daemons never
+    /// share one; install's sweep would eat each other's capture files).
+    #[test]
+    fn fnv_discriminator_is_stable_and_distinguishes_roots() {
+        // Published FNV-1a 64 test vectors: the offset basis and "a".
+        assert_eq!(fnv1a_hex(b""), "cbf29ce484222325");
+        assert_eq!(fnv1a_hex(b"a"), "af63dc4c8601ec8c");
+        assert_eq!(fnv1a_hex(b"/cfg/one"), fnv1a_hex(b"/cfg/one"));
+        assert_ne!(fnv1a_hex(b"/cfg/one"), fnv1a_hex(b"/cfg/two"));
+    }
+
+    /// Spawning `claude` instruments the launch end to end: the stub
+    /// receives a pinned `--session-id` and the shared `--settings` overlay,
+    /// the capture file is named through the env, the settings overlay
+    /// carries the hook, and none of it leaks into the stored command.
+    #[test]
+    fn spawn_claude_pins_an_id_and_layers_settings() {
+        let dir = scratch("cap_claude");
+        let (bin, runtime) = (dir.join("bin"), dir.join("run"));
+        install_stub(&bin, "claude", &dir);
+        let mut s = Supervisor::new(24, 80);
+        s.set_launch_context(agent_ctx(&bin, &runtime, dir.clone()));
+        s.apply(Command::Spawn {
+            command: "claude".into(),
+            cwd: dir.clone(),
+            group: None,
+        });
+
+        let argv = wait_argv(&mut s, &dir.join("argv"));
+        let si = argv
+            .iter()
+            .position(|a| a == "--session-id")
+            .expect("the stub must receive --session-id");
+        let id = argv[si + 1].clone();
+        assert!(
+            crate::harness::is_uuid(&id),
+            "the pinned id must be a strict uuid: {id:?}"
+        );
+        let fi = argv
+            .iter()
+            .position(|a| a == "--settings")
+            .expect("the stub must receive --settings");
+        let settings = PathBuf::from(&argv[fi + 1]);
+        assert!(settings.is_file(), "the settings overlay must exist");
+        let parsed = jzon::parse(&std::fs::read_to_string(&settings).unwrap())
+            .expect("the settings overlay must be valid JSON");
+        let hook = parsed["hooks"]["SessionStart"][0]["hooks"][0]["command"]
+            .as_str()
+            .expect("the overlay must carry the hook command");
+        assert!(
+            hook.contains("FLEETCOM_CAPTURE_FILE"),
+            "the hook must write to the capture env: {hook:?}"
+        );
+
+        let t = &s.tasks[0];
+        let cap = runtime.join(format!("task-{}.json", t.id));
+        // FLEETCOM_RUNTIME_DIR is used verbatim: no discriminator directory.
+        assert_eq!(
+            std::fs::read_to_string(dir.join("capenv")).unwrap(),
+            cap.display().to_string(),
+            "the capture env must name task-<id>.json under the override root"
+        );
+        assert_eq!(
+            t.command, "claude",
+            "instrumentation must never leak into the stored command"
+        );
+        assert_eq!(t.resume_id.as_deref(), Some(id.as_str()));
+        assert_eq!(t.capture_file.as_deref(), Some(cap.as_path()));
+        assert!(t.harness.is_some());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A command no harness claims spawns untouched: no harness, no capture
+    /// channel, and no assets ever installed for it.
+    #[test]
+    fn spawn_non_agent_command_is_not_instrumented() {
+        let dir = scratch("cap_plain");
+        let runtime = dir.join("run");
+        let mut s = Supervisor::new(24, 80);
+        s.set_launch_context(agent_ctx(&dir.join("bin"), &runtime, dir.clone()));
+        s.apply(Command::Spawn {
+            command: "printf ok".into(),
+            cwd: dir.clone(),
+            group: None,
+        });
+        let t = &s.tasks[0];
+        assert!(t.harness.is_none());
+        assert!(t.capture_file.is_none());
+        assert!(t.resume_id.is_none());
+        assert!(
+            s.capture.is_none(),
+            "a non-agent spawn must not install capture assets"
+        );
+        assert!(!runtime.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A resuming launch never gets a second id — claude would reject it —
+    /// but the capture overlay still rides along, and the typed id seeds
+    /// `resume_id`.
+    #[test]
+    fn spawn_resuming_claude_injects_only_the_capture_channel() {
+        let dir = scratch("cap_resume");
+        let (bin, runtime) = (dir.join("bin"), dir.join("run"));
+        install_stub(&bin, "claude", &dir);
+        let mut s = Supervisor::new(24, 80);
+        s.set_launch_context(agent_ctx(&bin, &runtime, dir.clone()));
+        s.apply(Command::Spawn {
+            command: format!("claude --resume {CAP_ID}"),
+            cwd: dir.clone(),
+            group: None,
+        });
+
+        let argv = wait_argv(&mut s, &dir.join("argv"));
+        assert!(
+            !argv.iter().any(|a| a == "--session-id"),
+            "a resuming launch must never pin a second id; argv: {argv:?}"
+        );
+        assert!(
+            argv.iter().any(|a| a == "--settings"),
+            "the settings overlay must still ride along; argv: {argv:?}"
+        );
+        let t = &s.tasks[0];
+        assert_eq!(t.command, format!("claude --resume {CAP_ID}"));
+        assert_eq!(t.resume_id.as_deref(), Some(CAP_ID));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Rerun re-enters the conversation: the capture file's id (the hook
+    /// moved the session after launch) outranks the spawn-time id, the
+    /// stored command becomes the resuming one, and the live capture file
+    /// survives the displaced run's trip through the graveyard.
+    #[test]
+    fn restart_resumes_the_captured_conversation() {
+        use crate::protocol::Lifecycle;
+        let dir = scratch("cap_restart");
+        let (bin, runtime) = (dir.join("bin"), dir.join("run"));
+        install_stub(&bin, "claude", &dir);
+        let mut s = Supervisor::new(24, 80);
+        s.set_launch_context(agent_ctx(&bin, &runtime, dir.clone()));
+        s.apply(Command::Spawn {
+            command: "claude".into(),
+            cwd: dir.clone(),
+            group: None,
+        });
+        let _ = wait_argv(&mut s, &dir.join("argv"));
+        let id = s.tasks[0].id;
+        wait_for_lifecycle(&mut s, id, |l| l == Lifecycle::Ok);
+
+        // The hook's payload names a different session than the pinned one:
+        // the conversation moved (clear/compact) while the task ran.
+        let cap = s.tasks[0].capture_file.clone().expect("capture file set");
+        std::fs::write(
+            &cap,
+            format!(
+                r#"{{"session_id":"{CAP_OTHER}","hook_event_name":"SessionStart","source":"clear"}}"#
+            ),
+        )
+        .unwrap();
+        std::fs::remove_file(dir.join("argv")).unwrap();
+
+        s.apply(Command::Restart { id });
+        let argv = wait_argv(&mut s, &dir.join("argv"));
+        assert_eq!(
+            s.tasks[0].command,
+            format!("claude --resume '{CAP_OTHER}'"),
+            "the stored command must become the resuming one"
+        );
+        let ri = argv
+            .iter()
+            .position(|a| a == "--resume")
+            .expect("the respawn must resume");
+        assert_eq!(argv[ri + 1], CAP_OTHER);
+        assert!(
+            !argv.iter().any(|a| a == "--session-id"),
+            "re-detection classifies the respawn as resuming: no second id"
+        );
+        // Same task id, same conversation: the capture file must survive the
+        // old run's graveyard passage — only Remove deletes it.
+        assert!(
+            reap_until(&mut s, Duration::from_secs(5), |s| s.graveyard.is_empty()),
+            "the displaced run was never collected"
+        );
+        assert!(
+            cap.exists(),
+            "restart must not delete the live capture file"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Removing a task deletes its capture file: the conversation ends with
+    /// the task, and task ids restart per daemon, so a leftover would be
+    /// misread as a future task's capture.
+    #[test]
+    fn remove_deletes_the_capture_file() {
+        use crate::protocol::Lifecycle;
+        let dir = scratch("cap_remove");
+        let (bin, runtime) = (dir.join("bin"), dir.join("run"));
+        install_stub(&bin, "claude", &dir);
+        let mut s = Supervisor::new(24, 80);
+        s.set_launch_context(agent_ctx(&bin, &runtime, dir.clone()));
+        s.apply(Command::Spawn {
+            command: "claude".into(),
+            cwd: dir.clone(),
+            group: None,
+        });
+        let _ = wait_argv(&mut s, &dir.join("argv"));
+        let id = s.tasks[0].id;
+        wait_for_lifecycle(&mut s, id, |l| l == Lifecycle::Ok);
+        let cap = s.tasks[0].capture_file.clone().unwrap();
+        std::fs::write(&cap, "{}").unwrap();
+
+        s.apply(Command::Remove { id });
+        assert!(!cap.exists(), "Remove must delete the task's capture file");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Reconnect safety: a second hello with the same env resolves the same
+    /// capture root, which must never reinstall — install's sweep would
+    /// destroy live tasks' capture files.
+    #[test]
+    fn reconnect_with_unchanged_root_preserves_capture_files() {
+        let dir = scratch("cap_reconnect");
+        let (bin, runtime) = (dir.join("bin"), dir.join("run"));
+        install_stub(&bin, "claude", &dir);
+        let mut s = Supervisor::new(24, 80);
+        s.set_launch_context(agent_ctx(&bin, &runtime, dir.clone()));
+        s.apply(Command::Spawn {
+            command: "claude".into(),
+            cwd: dir.clone(),
+            group: None,
+        });
+        let cap = s.tasks[0].capture_file.clone().expect("capture file set");
+        std::fs::write(&cap, "{}").unwrap();
+
+        // The client reconnects with an identical env and spawns again.
+        s.set_launch_context(agent_ctx(&bin, &runtime, dir.clone()));
+        s.apply(Command::Spawn {
+            command: "claude".into(),
+            cwd: dir.clone(),
+            group: None,
+        });
+        assert_eq!(s.tasks.len(), 2);
+        assert!(
+            cap.exists(),
+            "an unchanged root must not re-sweep live capture files"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Spawning `codex` routes capture through the notify override: `-c`
+    /// plus a `notify=[...]` TOML naming an installed, executable script.
+    #[test]
+    fn spawn_codex_installs_the_notify_override() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = scratch("cap_codex");
+        let (bin, runtime) = (dir.join("bin"), dir.join("run"));
+        install_stub(&bin, "codex", &dir);
+        let mut s = Supervisor::new(24, 80);
+        s.set_launch_context(agent_ctx(&bin, &runtime, dir.clone()));
+        s.apply(Command::Spawn {
+            command: "codex".into(),
+            cwd: dir.clone(),
+            group: None,
+        });
+
+        let argv = wait_argv(&mut s, &dir.join("argv"));
+        let ci = argv
+            .iter()
+            .position(|a| a == "-c")
+            .expect("the stub must receive -c");
+        let script = argv[ci + 1]
+            .strip_prefix("notify=[\"")
+            .and_then(|t| t.strip_suffix("\"]"))
+            .unwrap_or_else(|| panic!("malformed notify override: {:?}", argv[ci + 1]));
+        let meta = std::fs::metadata(script).expect("the notify program must exist");
+        assert!(
+            meta.permissions().mode() & 0o111 != 0,
+            "codex execs the notify program directly; it must be executable"
+        );
+        let t = &s.tasks[0];
+        assert_eq!(t.command, "codex");
+        assert!(t.resume_id.is_none(), "codex cannot pin an id at launch");
+        assert!(t.capture_file.is_some());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
