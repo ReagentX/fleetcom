@@ -1,6 +1,7 @@
 //! Session capture needs executable/configuration assets outside the child
 //! process. This module installs those shared assets and allocates per-task
-//! capture paths. The supervisor reuses them while a capture root is active.
+//! capture paths. The supervisor installs each root at most once per daemon
+//! lifetime and reuses the assets afterwards.
 //!
 //! Asset contracts:
 //! - claude: `--settings <claude-settings.json>` layers a SessionStart hook
@@ -77,9 +78,11 @@ impl CaptureAssets {
     /// Shared assets are overwritten with the current contents. The settings
     /// file uses mode 0o600; the directly executed notify script uses 0o700.
     ///
-    /// The supervisor calls this before allocating capture paths for an active
-    /// root. Removing existing capture files prevents reused task ids from
-    /// reading payloads left by another daemon process.
+    /// The supervisor calls this at most once per root per daemon lifetime,
+    /// before allocating capture paths for it. Removing existing capture
+    /// files prevents reused task ids from reading payloads left by another
+    /// daemon process — sound only on that first install, when every capture
+    /// file present is an orphan of a dead daemon.
     pub fn install(root: &Path) -> io::Result<CaptureAssets> {
         fs::DirBuilder::new()
             .recursive(true)
@@ -119,11 +122,6 @@ impl CaptureAssets {
             claude_settings: self.claude_settings.clone(),
             codex_notify: self.codex_notify.clone(),
         }
-    }
-
-    /// Delete a task's capture file, ignoring missing files and I/O errors.
-    pub fn remove(&self, task_id: u64) {
-        let _ = fs::remove_file(self.root.join(format!("task-{task_id}.json")));
     }
 }
 
@@ -293,20 +291,13 @@ mod tests {
     }
 
     #[test]
-    fn paths_for_and_remove_round_trip() {
+    fn paths_for_names_the_task_file_under_the_root() {
         let root = temp("paths");
         let assets = CaptureAssets::install(&root).unwrap();
         let paths = assets.paths_for(7);
         assert_eq!(paths.capture_file, root.join("task-7.json"));
         assert_eq!(paths.claude_settings, assets.claude_settings);
         assert_eq!(paths.codex_notify, assets.codex_notify);
-
-        fs::write(&paths.capture_file, "{}").unwrap();
-        assets.remove(7);
-        assert!(!paths.capture_file.exists());
-        // Removing an absent file (a task whose hook never fired) is silent.
-        assets.remove(7);
-        assets.remove(8);
         let _ = fs::remove_dir_all(&root);
     }
 }

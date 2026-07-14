@@ -5,6 +5,7 @@
 //! `Event`s).
 
 use std::{
+    collections::BTreeMap,
     ffi::OsString,
     io,
     path::{Path, PathBuf},
@@ -144,10 +145,13 @@ pub struct Supervisor {
     /// TERM→KILL escalation window. `KILL_GRACE` in production; a field so tests
     /// shrink it instead of sleeping through real seconds.
     kill_grace: Duration,
-    /// Installed capture assets and their root. `None` until a supported
-    /// agent spawn needs them. Reusing the active root avoids sweeping live
-    /// task capture files during reconnects.
-    capture: Option<(PathBuf, assets::CaptureAssets)>,
+    /// Installed capture assets, keyed by canonicalized root. Each root
+    /// installs — and therefore runs `install`'s `task-*.json` sweep — at
+    /// most once per daemon lifetime, so clients alternating runtime roots
+    /// never re-sweep a root that still holds live tasks' capture files.
+    /// Growth is bounded by the number of distinct roots clients present
+    /// (in practice one), so there is no eviction.
+    capture: BTreeMap<PathBuf, assets::CaptureAssets>,
 }
 
 impl Supervisor {
@@ -164,7 +168,7 @@ impl Supervisor {
             events: Vec::new(),
             waker: Arc::new(Mutex::new(None)),
             kill_grace: KILL_GRACE,
-            capture: None,
+            capture: BTreeMap::new(),
         }
     }
 
@@ -227,12 +231,12 @@ impl Supervisor {
                     // The conversation ends with the task; its capture file
                     // is dead state (and task ids restart per daemon, so a
                     // leftover would be misread as a future task's capture).
-                    // Restart never comes through here: it keeps the id and
-                    // the file.
-                    if t.capture_file.is_some()
-                        && let Some((_, installed)) = &self.capture
-                    {
-                        installed.remove(t.id);
+                    // The task's own recorded path is authoritative — the
+                    // root it spawned under may not be the one the current
+                    // client presents. Restart never comes through here: it
+                    // keeps the id and the file.
+                    if let Some(cap) = &t.capture_file {
+                        let _ = std::fs::remove_file(cap);
                     }
                     self.graveyard.push(t);
                 }
@@ -463,14 +467,26 @@ impl Supervisor {
         self.launch.clone()
     }
 
-    /// Resolve this connection's capture root and install its assets.
-    /// `FLEETCOM_RUNTIME_DIR` from the launch context is used verbatim;
-    /// otherwise the platform root gains a discriminator derived from the
-    /// session root. The active root is reused without reinstalling it.
+    /// Resolve this connection's capture root, install its assets on first
+    /// use, and return them. `FLEETCOM_RUNTIME_DIR` from the launch context
+    /// is used verbatim; otherwise the platform root gains a discriminator
+    /// derived from the session root.
     ///
-    /// If installation fails, an existing asset set remains active; with no
-    /// existing set, the spawn proceeds without instrumentation.
-    fn ensure_capture_assets(&mut self) {
+    /// Installation — and its `task-*.json` sweep — runs at most once per
+    /// root per daemon lifetime. The sweep's premise (every capture file
+    /// present is an orphan of a dead daemon) holds only on a root's first
+    /// install: a revisited root may hold live tasks' capture files, so it
+    /// is reused without touching disk.
+    ///
+    /// The map key is the canonicalized root: symlinked spellings of one
+    /// directory (macOS `/var` vs `/private/var`) share an entry instead of
+    /// sweeping each other. Canonicalization requires the directory to
+    /// exist, so a root's first visit misses the lookup, installs (creating
+    /// the directory), and canonicalizes afterwards.
+    ///
+    /// If installation fails, the spawn proceeds without instrumentation;
+    /// assets installed for other roots are unaffected.
+    fn ensure_capture_assets(&mut self) -> Option<&assets::CaptureAssets> {
         let root = if let Some(ctx) = &self.launch
             && let Some((_, dir)) = ctx.env.iter().find(|(k, _)| k == "FLEETCOM_RUNTIME_DIR")
         {
@@ -484,13 +500,15 @@ impl Supervisor {
                 base.join(fnv1a_hex(key.as_encoded_bytes()))
             })
         };
-        let Some(root) = root else { return };
-        if self.capture.as_ref().is_some_and(|(r, _)| *r == root) {
-            return;
+        let root = root?;
+        if let Ok(key) = std::fs::canonicalize(&root)
+            && self.capture.contains_key(&key)
+        {
+            return self.capture.get(&key);
         }
-        if let Ok(installed) = assets::CaptureAssets::install(&root) {
-            self.capture = Some((root, installed));
-        }
+        let installed = assets::CaptureAssets::install(&root).ok()?;
+        let key = std::fs::canonicalize(&root).unwrap_or(root);
+        Some(self.capture.entry(key).or_insert(installed))
     }
 
     /// Spawn one command for direct launches, reruns, and session loads.
@@ -504,9 +522,8 @@ impl Supervisor {
         env: &[(OsString, OsString)],
     ) -> io::Result<Task> {
         if let Some((h, inv)) = harness::detect(command) {
-            self.ensure_capture_assets();
-            if let Some((_, installed)) = &self.capture {
-                let paths = installed.paths_for(id);
+            let paths = self.ensure_capture_assets().map(|a| a.paths_for(id));
+            if let Some(paths) = paths {
                 let home = home_override(env, h);
                 let plan = h.instrument(&inv, &paths, home.as_deref());
                 let exec = format!("{command}{}", plan.args_suffix);
@@ -2379,7 +2396,7 @@ mod tests {
         assert!(t.capture_file.is_none());
         assert!(t.resume_id.is_none());
         assert!(
-            s.capture.is_none(),
+            s.capture.is_empty(),
             "a non-agent spawn must not install capture assets"
         );
         assert!(!runtime.exists());
@@ -2528,6 +2545,95 @@ mod tests {
         assert!(
             cap.exists(),
             "an unchanged root must not re-sweep live capture files"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Returning to a previously installed root reuses its assets: no
+    /// re-install, so no sweep of the capture files its live tasks wrote
+    /// during the root's first tenure.
+    #[test]
+    fn returning_to_a_prior_root_preserves_its_live_captures() {
+        let dir = scratch("cap_aba");
+        let (bin, root_a, root_b) = (dir.join("bin"), dir.join("run-a"), dir.join("run-b"));
+        install_stub(&bin, "claude", &dir);
+        let mut s = Supervisor::new(24, 80);
+        s.set_launch_context(agent_ctx(&bin, &root_a, dir.clone()));
+        s.apply(Command::Spawn {
+            command: "claude".into(),
+            cwd: dir.clone(),
+            group: None,
+        });
+        let cap_a = s.tasks[0].capture_file.clone().expect("capture file set");
+        std::fs::write(&cap_a, "{}").unwrap();
+
+        // The client reconnects under root B, spawns, then returns to A and
+        // spawns again.
+        s.set_launch_context(agent_ctx(&bin, &root_b, dir.clone()));
+        s.apply(Command::Spawn {
+            command: "claude".into(),
+            cwd: dir.clone(),
+            group: None,
+        });
+        s.set_launch_context(agent_ctx(&bin, &root_a, dir.clone()));
+        s.apply(Command::Spawn {
+            command: "claude".into(),
+            cwd: dir.clone(),
+            group: None,
+        });
+
+        assert_eq!(s.tasks.len(), 3);
+        assert!(
+            cap_a.exists(),
+            "returning to a known root must not re-sweep its live captures"
+        );
+        assert!(
+            root_b.join("claude-settings.json").is_file(),
+            "the interleaved root must keep its own assets"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Remove deletes the capture file under the root the task spawned in,
+    /// not under whichever root the current client presents.
+    #[test]
+    fn remove_deletes_the_capture_file_under_the_spawn_root() {
+        use crate::protocol::Lifecycle;
+        let dir = scratch("cap_remove_cross");
+        let (bin, root_a, root_b) = (dir.join("bin"), dir.join("run-a"), dir.join("run-b"));
+        install_stub(&bin, "claude", &dir);
+        let mut s = Supervisor::new(24, 80);
+        s.set_launch_context(agent_ctx(&bin, &root_a, dir.clone()));
+        s.apply(Command::Spawn {
+            command: "claude".into(),
+            cwd: dir.clone(),
+            group: None,
+        });
+        let _ = wait_argv(&mut s, &dir.join("argv"));
+        let id = s.tasks[0].id;
+        wait_for_lifecycle(&mut s, id, |l| l == Lifecycle::Ok);
+        let cap = s.tasks[0].capture_file.clone().unwrap();
+        std::fs::write(&cap, "{}").unwrap();
+
+        // Root B is installed by a newer spawn; a same-id file under it must
+        // survive the A task's removal.
+        s.set_launch_context(agent_ctx(&bin, &root_b, dir.clone()));
+        s.apply(Command::Spawn {
+            command: "claude".into(),
+            cwd: dir.clone(),
+            group: None,
+        });
+        let decoy = root_b.join(format!("task-{id}.json"));
+        std::fs::write(&decoy, "{}").unwrap();
+
+        s.apply(Command::Remove { id });
+        assert!(
+            !cap.exists(),
+            "Remove must delete the task's own capture file"
+        );
+        assert!(
+            decoy.exists(),
+            "Remove must not touch the same id under another root"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
