@@ -474,8 +474,8 @@ impl Supervisor {
         }
     }
 
-    /// Snapshot tasks as `{dir: [entries]}`. Entries preserve spawn order and
-    /// group assignments.
+    /// Snapshot tasks as `{dir: [entries]}`. Entries preserve spawn order,
+    /// group assignments, and display names.
     fn session_config(&self) -> SessionConfig {
         let mut order: Vec<usize> = (0..self.tasks.len()).collect();
         order.sort_by_key(|&i| self.tasks[i].id);
@@ -487,6 +487,7 @@ impl Supervisor {
                 .push(SessionEntry {
                     cmd: t.command.clone(),
                     group: t.group.clone(),
+                    name: t.name.clone(),
                 });
         }
         cfg
@@ -572,8 +573,9 @@ impl Supervisor {
                     &launch.env,
                     Arc::clone(&self.waker),
                 ) {
-                    // Normalize group names read from editable recipe files.
+                    // Normalize labels read from editable recipe files.
                     task.group = normalize_group(entry.group.clone());
+                    task.name = normalize_label(entry.name.clone());
                     self.next_id += 1;
                     self.tasks.push(task);
                     spawned += 1;
@@ -636,10 +638,12 @@ mod tests {
                 SessionEntry {
                     cmd: "a".into(),
                     group: None,
+                    name: None,
                 },
                 SessionEntry {
                     cmd: "c".into(),
                     group: None,
+                    name: None,
                 },
             ]
         );
@@ -648,6 +652,7 @@ mod tests {
             vec![SessionEntry {
                 cmd: "b".into(),
                 group: None,
+                name: None,
             }]
         );
     }
@@ -1869,7 +1874,71 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Loaded recipe groups are normalized before assignment.
+    /// Saving and loading preserve display names.
+    #[test]
+    fn load_session_restores_saved_names() {
+        let dir = scratch("sess_names");
+        let config = dir.join("config");
+        let ctx = LaunchContext {
+            env: vec![(
+                "FLEETCOM_CONFIG_DIR".into(),
+                config.clone().into_os_string(),
+            )],
+            cwd: dir.clone(),
+        };
+        let mut s = Supervisor::new(24, 80);
+        s.set_launch_context(ctx.clone());
+        s.apply(Command::Spawn {
+            command: "sleep 30".into(),
+            cwd: dir.clone(),
+            group: None,
+        });
+        s.apply(Command::Spawn {
+            command: "sleep 31".into(),
+            cwd: dir.clone(),
+            group: None,
+        });
+        s.tick();
+        let id = match s.drain().first() {
+            Some(Event::Tasks(v)) => v.iter().find(|t| t.command == "sleep 30").unwrap().id,
+            _ => panic!("expected a Tasks snapshot"),
+        };
+        s.apply(Command::SetName {
+            id,
+            name: Some("api server".into()),
+        });
+        s.apply(Command::SaveSession {
+            name: "fleet".into(),
+        });
+
+        let mut fresh = Supervisor::new(24, 80);
+        fresh.set_launch_context(ctx);
+        fresh.apply(Command::LoadSession {
+            name: "fleet".into(),
+        });
+        fresh.tick();
+        let evs = fresh.drain();
+        let tasks = evs
+            .iter()
+            .find_map(|e| match e {
+                Event::Tasks(v) => Some(v),
+                _ => None,
+            })
+            .expect("a Tasks snapshot after load");
+        let name_of = |cmd: &str| {
+            tasks
+                .iter()
+                .find(|t| t.command == cmd)
+                .unwrap_or_else(|| panic!("task '{cmd}' missing after load"))
+                .name
+                .clone()
+        };
+        assert_eq!(name_of("sleep 30"), Some("api server".into()));
+        assert_eq!(name_of("sleep 31"), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Loaded recipe groups and names are normalized before assignment.
     #[test]
     fn load_session_renormalizes_hand_edited_groups() {
         let dir = scratch("sess_norm");
@@ -1878,7 +1947,7 @@ mod tests {
         std::fs::write(
             config.join("sessions").join("edited.json"),
             format!(
-                r#"{{"{}": [{{"cmd": "sleep 30", "group": "  x  "}}]}}"#,
+                r#"{{"{}": [{{"cmd": "sleep 30", "group": "  x  ", "name": "  y  "}}]}}"#,
                 dir.display()
             ),
         )
@@ -1895,11 +1964,12 @@ mod tests {
         let evs = s.drain();
         let restored = evs.iter().any(|e| {
             matches!(e, Event::Tasks(v)
-                if v.iter().any(|t| t.group.as_deref() == Some("x")))
+                if v.iter().any(|t| t.group.as_deref() == Some("x")
+                    && t.name.as_deref() == Some("y")))
         });
         assert!(
             restored,
-            "loaded group must come back normalized; got {evs:?}"
+            "loaded group and name must come back normalized; got {evs:?}"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
