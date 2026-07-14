@@ -94,8 +94,15 @@ pub fn shake_hands(stream: &mut UnixStream, cwd: &str) {
         (b"PATH".as_slice(), path.as_bytes()),
         (b"SHELL".as_slice(), b"/bin/sh".as_slice()),
     ];
+    shake_hands_env(stream, cwd, &env);
+}
+
+/// [`shake_hands`] with a caller-supplied hello environment, for tests whose
+/// daemon-visible env must be fully explicit (stub PATH, scratch config and
+/// capture roots) rather than inherited from this process.
+pub fn shake_hands_env(stream: &mut UnixStream, cwd: &str, env: &[(&[u8], &[u8])]) {
     stream
-        .write_all(&hello_frame(PROTOCOL_VERSION, &env, cwd))
+        .write_all(&hello_frame(PROTOCOL_VERSION, env, cwd))
         .unwrap();
     let (kind, payload) = read_frame(stream).expect("no reply to hello");
     let text = String::from_utf8_lossy(&payload);
