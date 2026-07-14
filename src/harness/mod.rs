@@ -11,6 +11,7 @@
 //! Only strings accepted by [`is_uuid`] may ever be returned — free-text
 //! session names, paths, and anything else must yield `None`.
 
+pub mod assets;
 mod claude;
 mod codex;
 
@@ -26,8 +27,8 @@ pub use claude::Claude;
 pub use codex::Codex;
 
 /// Environment variable naming the capture file for the injected hook or
-/// notify program. Both harnesses set it; the scripts a later phase installs
-/// read it.
+/// notify program. Both harnesses set it; the assets installed by
+/// [`assets::CaptureAssets::install`] read it.
 pub const CAPTURE_ENV: &str = "FLEETCOM_CAPTURE_FILE";
 
 /// Both filesystem-correlation channels pair a timestamp with the task's
@@ -91,8 +92,9 @@ pub struct Invocation {
     pub can_inject_id: bool,
 }
 
-/// Filesystem paths a later phase allocates. This module treats them as
-/// opaque and only splices them — quoted — into command suffixes and env.
+/// Filesystem paths allocated by [`assets::CaptureAssets::paths_for`]. Harnesses
+/// treat them as opaque and only splice them — quoted — into command
+/// suffixes and env.
 #[derive(Debug, Clone)]
 pub struct CapturePaths {
     /// File the injected hook/notify program writes its payload to.
