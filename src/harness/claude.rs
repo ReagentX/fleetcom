@@ -1,14 +1,12 @@
-//! The `claude` CLI. Capture channels, strongest first: `--session-id`
-//! pins a v4 uuid at launch; a `--settings` overlay (additive — the user's
-//! own hooks still fire) delivers a SessionStart hook that writes the id to
-//! the capture file; the exit hint `Resume this session with:` /
-//! `claude --resume <uuid>` is scraped from final terminal text; transcripts
-//! land in `<claude-home>/projects/<cwd-slug>/<uuid>.jsonl` for filesystem
-//! correlation.
+//! Claude exposes several session-ID channels. Fleetcom pins a v4 UUID with
+//! `--session-id`, adds a `SessionStart` hook through an additive `--settings`
+//! overlay, scans final terminal text for `claude --resume <uuid>`, and
+//! correlates transcripts under
+//! `<claude-home>/projects/<cwd-slug>/<uuid>.jsonl`.
 //!
-//! `claude` rejects `--session-id` combined with `--resume`/`--continue`
-//! (absent `--fork-session`), so instrumentation only pins an id on a fresh
-//! launch that carries none of those flags.
+//! `claude` rejects `--session-id` with `--resume` or `--continue` unless
+//! `--fork-session` is present. Fleetcom therefore pins only launches that
+//! contain none of these session-selection flags.
 
 use std::{fs, path::Path, time::SystemTime};
 
@@ -17,8 +15,7 @@ use super::{
     tokenize, uuid_v4, within_window,
 };
 
-/// Subcommands that never start a conversation; detection refuses them so
-/// the feature no-ops.
+/// Subcommands excluded from session capture.
 const BLOCKLIST: &[&str] = &[
     "agents",
     "mcp",
@@ -137,8 +134,8 @@ impl Harness for Claude {
             suffix.push_str(&shell_quote(&id));
             injected_id = Some(id);
         }
-        // A second `--settings` would fight the user's own; their hooks are
-        // then the only capture channel and scrape/correlate the fallbacks.
+        // Preserve a user-supplied settings source. Launch-time ids, exit
+        // scraping, and filesystem correlation remain available.
         let has_settings = inv.tokens[1..]
             .iter()
             .any(|t| t == "--settings" || t.starts_with("--settings="));
@@ -163,8 +160,7 @@ impl Harness for Claude {
     }
 
     fn scrape_exit(&self, text: &str) -> Option<String> {
-        // The hint prints on every clean exit, so the LAST occurrence names
-        // the conversation the task actually ended on.
+        // The last valid hint names the conversation at exit.
         const HINT: &str = "claude --resume ";
         let mut last = None;
         for (i, _) in text.match_indices(HINT) {
@@ -192,8 +188,7 @@ impl Harness for Claude {
             if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
                 continue;
             }
-            // No creation time (some Linux filesystems): no window, no
-            // candidate.
+            // Entries without creation times cannot be correlated by window.
             let Ok(created) = entry.metadata().and_then(|m| m.created()) else {
                 continue;
             };
@@ -288,8 +283,8 @@ fn slug(cwd: &Path) -> Option<String> {
     )
 }
 
-/// Extend an erased span left over the whitespace that separated it from the
-/// previous token, so removals leave single spaces behind.
+/// Include whitespace before a removed token so the remaining command keeps
+/// a single separator.
 fn erase_start(cmd: &str, mut start: usize) -> usize {
     let b = cmd.as_bytes();
     while start > 0 && matches!(b[start - 1], b' ' | b'\t') {
@@ -470,7 +465,7 @@ mod tests {
             Claude.resume_command("claude", ID),
             format!("claude --resume '{ID}'")
         );
-        // Prompt bytes — including quotes — survive untouched.
+        // Prompt bytes, including quotes, survive untouched.
         assert_eq!(
             Claude.resume_command("claude 'fix the bug' --model opus", ID),
             format!("claude 'fix the bug' --model opus --resume '{ID}'")
@@ -498,7 +493,7 @@ mod tests {
             Claude.resume_command("claude | tee log", ID),
             "claude | tee log"
         );
-        // Defense in depth: a non-strict id is never spliced.
+        // Gate re-check: a non-strict id is never spliced.
         assert_eq!(Claude.resume_command("claude", "evil'"), "claude");
     }
 
@@ -545,8 +540,7 @@ mod tests {
         let _ = fs::remove_dir_all(&home);
     }
 
-    /// The recorded claude session ends with the real exit hint; the scrape
-    /// must recover its id from the emulator's full retained text.
+    /// The scraper recovers the exit-hint ID from a recorded terminal stream.
     #[test]
     fn corpus_scrape_recovers_the_exit_hint_id() {
         let mut emu = Emulator::new(40, 120, 2000);

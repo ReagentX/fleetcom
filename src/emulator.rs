@@ -245,11 +245,10 @@ impl Emulator {
         crate::serialize::contents(&self.term)
     }
 
-    /// Plain text of every retained row — oldest scrollback row first
-    /// through the last viewport row — one line per row, trailing blanks
-    /// trimmed. Rows are addressed absolutely (history rows are negative
-    /// line indices), so unlike [`Emulator::contents`] the result ignores
-    /// how far the user has scrolled the viewport.
+    /// Return every retained row as plain text, from the oldest scrollback
+    /// row through the viewport. Each grid row becomes one line with trailing
+    /// blanks removed. Absolute row addressing makes the result independent
+    /// of the viewport's current scroll offset.
     pub fn text_with_history(&self) -> String {
         let grid = self.term.grid();
         let top = -(grid.history_size() as i32);
@@ -557,8 +556,8 @@ mod tests {
         assert_eq!(emu.scrollback(), 0);
     }
 
-    /// Rows scrolled out of the viewport stay reachable through the full
-    /// retained text, oldest first, while the visible screen loses them.
+    /// Retained text includes scrollback in chronological order and does not
+    /// change when the viewport scroll offset changes.
     #[test]
     fn text_with_history_includes_scrolled_off_rows() {
         let mut emu = Emulator::new(4, 10, 100);

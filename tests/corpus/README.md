@@ -16,7 +16,7 @@ binary capture.
 
 | Fixture | Source | Coverage |
 | --- | --- | --- |
-| `claude_resume.bin` | real `claude --session-id` session: one prompt, reply, `/exit` | alternate-screen exit followed by the primary-screen resume hint (`claude --resume <uuid>`); the scrape target for harness exit capture |
+| `claude_resume.bin` | recorded `claude --session-id` session: one prompt, reply, `/exit` | alternate-screen exit followed by the primary-screen resume hint (`claude --resume <uuid>`); the scrape target for harness exit capture |
 | `codex_resume.bin` | real `codex resume` session replay | top-anchored DECSTBM scroll regions (`CSI 1;N r`), reverse index, inline-TUI history insertion |
 | `tmux_split.bin` | `tmux` session with two splits and one command per pane | scroll regions, pane borders, full redraws |
 | `vim_session.bin` | `vim -u NONE`: insert, navigate, `:set number`, `:q!` | alternate screen, cursor addressing, line editing |

@@ -1,14 +1,14 @@
-//! Agent-CLI session capture. A harness classifies recipe commands that
-//! launch an AI-agent CLI, instruments the spawn so the conversation's
-//! session id can be captured, and rewrites a saved command into one that
-//! resumes that conversation.
+//! Saved commands can relaunch an agent CLI without resuming its conversation.
+//! A harness closes that gap: it classifies supported commands, instruments
+//! execution to capture a conversation ID, and emits a resuming command.
 //!
-//! Everything here is conservative by construction: a command the tokenizer
-//! cannot fully account for is opaque to the feature, which then no-ops.
+//! Commands the tokenizer cannot fully account for remain uninstrumented.
 //!
-//! SECURITY INVARIANT: every id returned by `parse_capture`, `scrape_exit`,
+//! # Security invariant
+//!
+//! Every ID returned by `parse_capture`, `scrape_exit`,
 //! or `correlate_fs` is spliced into a shell command when a recipe loads.
-//! Only strings accepted by [`is_uuid`] may ever be returned — free-text
+//! Only strings accepted by [`is_uuid`] may ever be returned: free-text
 //! session names, paths, and anything else must yield `None`.
 
 pub mod assets;
@@ -26,16 +26,13 @@ use std::{
 pub use claude::Claude;
 pub use codex::Codex;
 
-/// Environment variable naming the capture file for the injected hook or
-/// notify program. Both harnesses set it; the assets installed by
-/// [`assets::CaptureAssets::install`] read it.
+/// Environment variable naming the capture file used by injected assets.
 pub const CAPTURE_ENV: &str = "FLEETCOM_CAPTURE_FILE";
 
-/// Both filesystem-correlation channels pair a timestamp with the task's
-/// spawn instant; this window bounds the pairing on each side.
+/// Maximum difference between a task spawn and a correlated session timestamp.
 const CORRELATE_WINDOW: Duration = Duration::from_secs(30);
 
-/// One agent CLI fleetcom knows how to capture and resume.
+/// Capture and resume behavior for one supported agent CLI.
 pub trait Harness: Sync {
     #[allow(dead_code)] // test-only: registry routing assertions
     fn name(&self) -> &'static str;
@@ -46,12 +43,11 @@ pub trait Harness: Sync {
     /// actually uses, not the daemon's own.
     fn home_env_var(&self) -> &'static str;
 
-    /// Classify a recipe command string. `None` = not this tool / excluded
-    /// subcommand / unparseable (feature no-ops).
+    /// Classify a command. Return `None` for another tool, an excluded
+    /// subcommand, or syntax this harness cannot parse safely.
     fn detect(&self, cmd: &str) -> Option<Invocation>;
 
-    /// Spawn-time additions: text appended to the shell command, env pairs,
-    /// and the session id if this harness can choose one at launch.
+    /// Build spawn-time command and environment additions.
     /// `home_override` is the launch env's [`Harness::home_env_var`] value;
     /// codex reads the user's config through it before injecting notify.
     fn instrument(
@@ -61,14 +57,14 @@ pub trait Harness: Sync {
         home_override: Option<&Path>,
     ) -> SpawnPlan;
 
-    /// Session id from a capture-file payload (hook/notify JSON).
+    /// Extract a session ID from hook or notify JSON.
     fn parse_capture(&self, payload: &str) -> Option<String>;
 
-    /// Session id from a task's final terminal text (viewport + scrollback).
+    /// Extract a session ID from final terminal text, including scrollback.
     fn scrape_exit(&self, text: &str) -> Option<String>;
 
-    /// Best-effort id from the tool's on-disk session store. Ambiguity is
-    /// `None` by design: resuming the wrong conversation is worse than none.
+    /// Find a session ID in the tool's on-disk store. Ambiguous
+    /// matches return `None`.
     fn correlate_fs(
         &self,
         cwd: &Path,
@@ -80,41 +76,37 @@ pub trait Harness: Sync {
     fn resume_command(&self, cmd: &str, id: &str) -> String;
 }
 
-/// Registry, in match order.
+/// Harness registry in detection order.
 pub static HARNESSES: &[&dyn Harness] = &[&Claude, &Codex];
 
-/// First registry match. `None`: no harness claims the command.
+/// Return the first harness that recognizes `cmd`.
 pub fn detect(cmd: &str) -> Option<(&'static dyn Harness, Invocation)> {
     HARNESSES
         .iter()
         .find_map(|h| h.detect(cmd).map(|inv| (*h, inv)))
 }
 
-/// A classified agent-CLI launch parsed from a recipe command string.
+/// Parsed state for a recognized agent-CLI command.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Invocation {
     /// Unquoted token texts, program first.
     pub tokens: Vec<String>,
-    /// Session id the user's own flags already target (`--resume <uuid>`,
-    /// `--session-id <uuid>`, `codex resume <uuid>`). `None` is a fresh
-    /// launch whose id must be captured after the fact.
+    /// Session ID explicitly targeted by the command (`--resume <uuid>`,
+    /// `--session-id <uuid>`, or `codex resume <uuid>`). `None` means the
+    /// command does not contain a recognized UUID target.
     pub known_id: Option<String>,
-    /// Whether `instrument` may pin a fresh session id at launch. Always
-    /// false for codex (no launch-time pinning exists) and for claude
-    /// commands carrying `--resume`/`--continue`/`--fork-session`/
-    /// `--session-id`, which either reject a second id or already fix one.
+    /// Whether `instrument` may pin a fresh session ID at launch. This is
+    /// false for codex and for claude commands carrying `--resume`,
+    /// `--continue`, `--fork-session`, or `--session-id`.
     pub can_inject_id: bool,
 }
 
-/// Filesystem paths allocated by [`assets::CaptureAssets::paths_for`]. Harnesses
-/// treat them as opaque and only splice them — quoted — into command
-/// suffixes and env.
+/// Capture paths allocated by [`assets::CaptureAssets::paths_for`].
 #[derive(Debug, Clone)]
 pub struct CapturePaths {
-    /// File the injected hook/notify program writes its payload to.
+    /// File written by the injected hook or notifier.
     pub capture_file: PathBuf,
-    /// Settings file passed to `claude --settings`; layers additively onto
-    /// the user's own settings.
+    /// Additive settings file passed to `claude --settings`.
     pub claude_settings: PathBuf,
     /// Program installed through codex's `notify` config override.
     pub codex_notify: PathBuf,
@@ -128,12 +120,11 @@ pub struct SpawnPlan {
     pub args_suffix: String,
     /// Environment pairs added to the child.
     pub env: Vec<(OsString, OsString)>,
-    /// The session id chosen at launch, when the harness can pin one.
+    /// The session ID chosen at launch, when the harness can pin one.
     pub injected_id: Option<String>,
 }
 
-/// Strict session-id shape: exactly `8-4-4-4-12` lowercase hex. This is the
-/// security boundary described in the module docs — see the invariant there.
+/// Validate the session-ID boundary: exactly `8-4-4-4-12` lowercase hex.
 pub fn is_uuid(s: &str) -> bool {
     let b = s.as_bytes();
     b.len() == 36
@@ -143,9 +134,9 @@ pub fn is_uuid(s: &str) -> bool {
         })
 }
 
-/// The strict uuid at the start of `s`. Requires a token boundary after it:
+/// Return the strict UUID at the start of `s`. A token boundary must follow:
 /// a trailing alphanumeric, `-`, or `_` means the token continues past 36
-/// bytes and is not an id.
+/// bytes and is not an ID.
 pub(crate) fn leading_uuid(s: &str) -> Option<&str> {
     let head = s.get(..36).filter(|h| is_uuid(h))?;
     match s.as_bytes().get(36) {
@@ -154,9 +145,8 @@ pub(crate) fn leading_uuid(s: &str) -> Option<&str> {
     }
 }
 
-/// Random v4 UUID: 16 bytes from `/dev/urandom` with the version and variant
-/// bits set. `None` when the device cannot be read; callers then fall back
-/// to capture-only operation instead of pinning an id.
+/// Generate a v4 UUID from `/dev/urandom`. Return `None` when the device
+/// cannot be read so callers can continue without launch-time pinning.
 pub(crate) fn uuid_v4() -> Option<String> {
     use std::fmt::Write;
     let mut bytes = [0u8; 16];
@@ -176,7 +166,7 @@ pub(crate) fn uuid_v4() -> Option<String> {
     Some(out)
 }
 
-/// `a` and `b` within [`CORRELATE_WINDOW`] of each other, either order.
+/// Whether `a` and `b` differ by at most [`CORRELATE_WINDOW`].
 pub(crate) fn within_window(a: SystemTime, b: SystemTime) -> bool {
     match a.duration_since(b) {
         Ok(d) => d <= CORRELATE_WINDOW,
@@ -184,13 +174,12 @@ pub(crate) fn within_window(a: SystemTime, b: SystemTime) -> bool {
     }
 }
 
-/// [`within_window`] in milliseconds, for timestamps that never become
-/// `SystemTime` (uuid-embedded instants).
+/// Millisecond form of [`within_window`] for UUID-embedded timestamps.
 pub(crate) fn within_window_ms(a: u128, b: u128) -> bool {
     a.abs_diff(b) <= CORRELATE_WINDOW.as_millis()
 }
 
-/// One shell word plus its byte span in the source, quotes included. Spans
+/// One shell word and its byte span in the source, including quotes. Spans
 /// let `resume_command` splice edits into the original string, preserving
 /// every untouched byte.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -201,7 +190,7 @@ pub(crate) struct Word {
 }
 
 /// Split `cmd` into shell words: unquoted whitespace separates, single- and
-/// double-quoted spans are literal (no expansion). Refuses — `None` — any
+/// double-quoted spans are literal (no expansion). Refuses (`None`) any
 /// command containing, outside quotes, a construct whose meaning this module
 /// cannot account for: `| ; & < > $` backtick `( ) \`, a newline or carriage
 /// return, an unterminated quote, or an `=` in the first word (env-prefix
@@ -260,14 +249,12 @@ pub(crate) fn tokenize(cmd: &str) -> Option<Vec<Word>> {
     Some(words)
 }
 
-/// Single-quote `s` for `$SHELL -c`: embedded `'` becomes `'\''`. Mandatory
-/// for every path spliced into an `args_suffix` — macOS runtime paths carry
-/// spaces ("Application Support").
+/// Single-quote `s` for `$SHELL -c`, encoding embedded `'` as `'\''`.
 pub(crate) fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
-/// `cmd` with `insertion` spliced in at byte `at`.
+/// Insert `insertion` into `cmd` at byte offset `at`.
 pub(crate) fn splice_insert(cmd: &str, at: usize, insertion: &str) -> String {
     let mut out = String::with_capacity(cmd.len() + insertion.len());
     out.push_str(&cmd[..at]);
@@ -368,9 +355,7 @@ mod tests {
         assert!(tokenize("claude --resume=abc").is_some());
     }
 
-    /// The mandated proof: a path with a space and a single-quote survives
-    /// quoting, verified against a real shell — the `'\''` escape is one of
-    /// the constructs the tokenizer itself deliberately refuses.
+    /// Shell quoting preserves spaces and embedded single quotes.
     #[test]
     fn shell_quote_survives_spaces_and_single_quotes() {
         let path = "/Users/x/Application Support/it's here/settings.json";

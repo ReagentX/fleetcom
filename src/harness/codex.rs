@@ -1,12 +1,7 @@
-//! The `codex` CLI. No launch-time id pinning exists, so capture leans on
-//! the `notify` config override (`-c notify=["<program>"]`), whose program
-//! receives an `agent-turn-complete` JSON payload as its final argv; the
-//! exit hints `codex resume <uuid>` / `codex resume, then select <name>
-//! (<uuid>)` scraped from final terminal text; and rollout files under
-//! `<codex-home>/sessions/YYYY/MM/DD/rollout-<local-ts>-<uuid>.jsonl` for
-//! filesystem correlation.
-//!
-//! Codex's own hooks are trust-gated; notify is the only injection channel.
+//! Codex does not expose launch-time ID pinning. Fleetcom instead injects a
+//! `notify` override, scans final terminal text for both resume-hint forms,
+//! and correlates rollout files under
+//! `<codex-home>/sessions/YYYY/MM/DD/rollout-<local-ts>-<uuid>.jsonl`.
 
 use std::{
     fmt::Write as _,
@@ -21,7 +16,7 @@ use super::{
     shell_quote, splice_insert, tokenize, within_window_ms,
 };
 
-/// Subcommands that never start a resumable interactive conversation.
+/// Subcommands excluded from session capture.
 const BLOCKLIST: &[&str] = &[
     "exec",
     "review",
@@ -49,10 +44,8 @@ const BLOCKLIST: &[&str] = &[
     "help",
 ];
 
-/// Flags whose value is a separate token, consumed while locating the
-/// subcommand so the value is never misread as a positional. Unlisted
-/// value-taking flags degrade to a misclassified positional, which at worst
-/// refuses the command — never rewrites it wrongly.
+/// Flags with separate values that detection skips while locating a
+/// subcommand or prompt.
 const VALUE_FLAGS: &[&str] = &["-c", "--config", "-m", "--model", "-p", "--profile"];
 
 pub struct Codex;
@@ -104,11 +97,8 @@ impl Harness for Codex {
         capture: &CapturePaths,
         home_override: Option<&Path>,
     ) -> SpawnPlan {
-        // A user-routed notify — on the command line or in config.toml —
-        // must not be clobbered: the `-c notify=` CLI override outranks the
-        // file, so injecting would silently disable the user's own notifier,
-        // and breaking configured notifications to gain capture is the wrong
-        // trade. Scrape and correlation remain as capture channels.
+        // Preserve an existing notify route. Exit scraping and filesystem
+        // correlation remain available without an injected notifier.
         if has_notify_override(&inv.tokens) || config_has_notify(home_override) {
             return SpawnPlan::default();
         }
@@ -145,7 +135,7 @@ impl Harness for Codex {
                 }
             }
             // Named-thread hint: `codex resume, then select <name> (<uuid>)`.
-            // Only the parenthesized id is trusted — never the name.
+            // Only the parenthesized id is trusted, never the name.
             if line.contains("codex resume") && line.contains("then select") {
                 for (i, _) in line.match_indices('(') {
                     let inner = &line[i + 1..];
@@ -204,11 +194,8 @@ impl Harness for Codex {
                 if !is_uuid(id) {
                     continue;
                 }
-                // The filename's own timestamp is local wall-clock time; the
-                // id's embedded v7 instant is UTC and marks the same moment
-                // (session start — rollouts are written lazily, so file
-                // creation time can lag by however long the first prompt
-                // took).
+                // Correlate with the v7 id's embedded UTC instant; the
+                // filename timestamp is local wall-clock time.
                 let Some(ms) = v7_millis(id) else { continue };
                 if !within_window_ms(u128::from(ms), spawn_ms) {
                     continue;
@@ -280,7 +267,7 @@ fn first_positional(words: &[Word], mut from: usize) -> Option<usize> {
     None
 }
 
-/// Whether the user already routes notify somewhere: `-c notify=…`,
+/// Whether the command already routes notifications through `-c notify=…`,
 /// `-cnotify=…`, `-c=notify=…`, `--config notify=…`, or `--config=notify=…`.
 fn has_notify_override(tokens: &[String]) -> bool {
     tokens.iter().enumerate().skip(1).any(|(i, t)| {
@@ -295,11 +282,9 @@ fn has_notify_override(tokens: &[String]) -> bool {
     })
 }
 
-/// Whether the user's `config.toml` (under `home`, else `~/.codex`) carries
-/// an active top-level `notify` assignment: a line whose first
-/// non-whitespace run — so before any `#` — is `notify`, then optional
-/// blanks, then `=`. Line-based on purpose: a `notify` key inside a TOML
-/// table matches too, which only errs toward not injecting.
+/// Whether `config.toml` under `home` (or `~/.codex`) contains an
+/// uncommented `notify` assignment. This conservative line-based check also
+/// matches `notify` keys inside TOML tables.
 fn config_has_notify(home: Option<&Path>) -> bool {
     let root = match home {
         Some(p) => p.to_path_buf(),
@@ -314,9 +299,7 @@ fn config_has_notify(home: Option<&Path>) -> bool {
     text.lines().any(is_notify_assignment)
 }
 
-/// Whether `line` is an uncommented `notify` assignment: leading blanks,
-/// the bare key `notify`, optional blanks, `=`. Anything else in between —
-/// a `#`, a longer key like `notify_extra` — is not one.
+/// Whether `line` begins with an uncommented bare `notify` assignment.
 fn is_notify_assignment(line: &str) -> bool {
     let Some(rest) = line.trim_start().strip_prefix("notify") else {
         return false;
@@ -324,8 +307,7 @@ fn is_notify_assignment(line: &str) -> bool {
     rest.trim_start_matches([' ', '\t']).starts_with('=')
 }
 
-/// Escape `s` for a TOML basic string. Backslash and double quote are the
-/// only path bytes TOML would misread; control characters get `\u` escapes.
+/// Escape a path for a TOML basic string.
 fn toml_escape(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
@@ -341,9 +323,8 @@ fn toml_escape(s: &str) -> String {
     out
 }
 
-/// Millisecond instant embedded in a v7 uuid's first 48 bits. Codex thread
-/// ids are `now_v7`, so this is the session's start. Non-v7 ids carry no
-/// instant.
+/// Millisecond instant embedded in a v7 UUID's first 48 bits. Non-v7 IDs
+/// return `None`.
 fn v7_millis(id: &str) -> Option<u64> {
     if id.as_bytes()[14] != b'7' {
         return None;
@@ -351,9 +332,8 @@ fn v7_millis(id: &str) -> Option<u64> {
     u64::from_str_radix(&format!("{}{}", &id[..8], &id[9..13]), 16).ok()
 }
 
-/// Whether the rollout's first line — its `session_meta` record — names
-/// `cwd` as the session's working directory. The read is capped: only the
-/// meta line is of interest, however large the rollout grew.
+/// Whether the rollout's first `session_meta` record names `cwd`. The read is
+/// capped at 64 KiB because later rollout content is irrelevant.
 fn line1_cwd_matches(path: &Path, cwd: &Path) -> bool {
     let Ok(file) = fs::File::open(path) else {
         return false;
@@ -373,8 +353,7 @@ fn line1_cwd_matches(path: &Path, cwd: &Path) -> bool {
         .is_some_and(|c| Path::new(c) == cwd)
 }
 
-/// Proleptic-Gregorian date for a count of days since 1970-01-01 (Howard
-/// Hinnant's `civil_from_days`).
+/// Proleptic Gregorian date for a count of days since 1970-01-01.
 fn civil_from_days(days: i64) -> (i64, u32, u32) {
     let z = days + 719_468;
     let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
@@ -411,7 +390,7 @@ mod tests {
         d
     }
 
-    /// A v7-shaped id whose embedded instant is `ms`, with a fixed tail.
+    /// A v7-shaped ID whose embedded instant is `ms`, with a fixed tail.
     fn v7_at(ms: u64, tail: u32) -> String {
         format!(
             "{:08x}-{:04x}-7000-8000-0000000{:05x}",
@@ -422,7 +401,7 @@ mod tests {
     }
 
     /// Write a rollout under the UTC day dir for `ms` with `cwd` in its
-    /// session_meta line; returns the id.
+    /// `session_meta` line; returns the ID.
     fn write_rollout(home: &Path, ms: u64, tail: u32, cwd: &str) -> String {
         let id = v7_at(ms, tail);
         let (y, m, d) = civil_from_days((ms / 86_400_000) as i64);
@@ -482,8 +461,7 @@ mod tests {
         assert_eq!(inv.known_id, None);
     }
 
-    /// A home path that provably has no `config.toml`, so instrument tests
-    /// never read this machine's real `~/.codex`.
+    /// Scratch home without a `config.toml`.
     fn no_config_home() -> PathBuf {
         temp("no_config_home")
     }
@@ -533,9 +511,8 @@ mod tests {
         );
     }
 
-    /// The config.toml guard: an active top-level `notify` assignment
-    /// suppresses injection entirely; commented lines, longer keys, and a
-    /// missing file do not.
+    /// An active `notify` assignment suppresses injection; comments, longer
+    /// keys, and missing files do not.
     #[test]
     fn instrument_defers_to_a_config_toml_notify() {
         let home = temp("cfg_notify");
@@ -593,8 +570,7 @@ mod tests {
             r#"/with space/and\"quote\\slash"#
         );
         assert_eq!(toml_escape("a\tb"), "a\\u0009b");
-        // End to end through a real shell: the suffix words reach codex as
-        // `-c` plus the exact TOML text, whatever the path contains.
+        // Execute the suffix through a shell and inspect the resulting words.
         let paths = CapturePaths {
             capture_file: PathBuf::from("/c"),
             claude_settings: PathBuf::from("/s"),
@@ -637,7 +613,7 @@ mod tests {
         let named = format!("To continue this session, run codex resume, then select docs ({ID})");
         assert_eq!(Codex.scrape_exit(&named).as_deref(), Some(ID));
 
-        // Named form without an id yields nothing — a name is not spliceable.
+        // Named form without an id yields nothing: a name is not spliceable.
         assert_eq!(
             Codex.scrape_exit("run codex resume, then select my-thread"),
             None
@@ -722,8 +698,7 @@ mod tests {
         let _ = fs::remove_dir_all(&home);
     }
 
-    /// A rollout filed under the previous day's directory (midnight or
-    /// timezone skew) is still found: the day probe spans ±2 UTC days.
+    /// The ±2-day probe includes a rollout in the adjacent day directory.
     #[test]
     fn correlate_fs_spans_adjacent_day_directories() {
         let home = temp("dayspan");
@@ -764,9 +739,8 @@ mod tests {
         assert_eq!(civil_from_days(-1), (1969, 12, 31));
     }
 
-    /// The recorded codex session ends with the real exit hint; the scrape
-    /// must recover its id from the emulator's full retained text. The hint
-    /// carries SGR mid-sentence, which the emulator strips.
+    /// The scraper recovers an SGR-split exit hint from a recorded terminal
+    /// stream after the emulator removes styling.
     #[test]
     fn corpus_scrape_recovers_the_exit_hint_id() {
         let mut emu = Emulator::new(40, 120, 2000);

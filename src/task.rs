@@ -196,26 +196,20 @@ pub struct Task {
     pub group: Option<String>,
     /// Custom display name; `None` means unnamed.
     pub name: Option<String>,
-    /// The harness that claimed `command` at spawn; `None` for non-agent
-    /// commands and for degraded spawns whose capture assets never
-    /// installed. The supervisor sets it after construction.
+    /// Harness assigned by the supervisor; `None` for uninstrumented tasks.
     pub harness: Option<&'static dyn crate::harness::Harness>,
-    /// Best-known session id at spawn: the injected or user-typed one. A
-    /// written capture file outranks it — see the supervisor's
-    /// `current_resume_id`.
+    /// Session ID injected or recognized at spawn. Capture files and exit
+    /// scrapes can supersede it.
     pub resume_id: Option<String>,
-    /// Where this task's instrumented hook/notify writes its payload.
+    /// Capture path allocated for this task; it may remain unwritten when no
+    /// live capture channel is injected.
     pub capture_file: Option<PathBuf>,
-    /// Session id scraped from the exit hint in final terminal text. Set at
-    /// most once, by `scrape_exit_hint`, after the exit latch and reader
-    /// EOF; existing only post-exit, it outranks every mid-run capture
-    /// channel (see the supervisor's `current_resume_id`).
+    /// Session ID scraped once from final terminal text after exit and reader
+    /// EOF.
     pub scraped_id: Option<String>,
-    /// Whether the one-shot exit scrape ran (hit or miss): the render walks
-    /// the full history, so it must not repeat on later reap passes.
+    /// Whether the one-shot full-history exit scrape has run.
     scraped: bool,
-    /// Wallclock twin of `started`: `Harness::correlate_fs` pairs it with
-    /// on-disk session timestamps, which `Instant` cannot reach.
+    /// Wall-clock spawn time used for filesystem correlation.
     pub spawned_at: SystemTime,
     pub exit_code: Option<i32>,
     pub started: Instant,
@@ -273,15 +267,10 @@ fn wait_code(status: &rustix::process::WaitIdStatus) -> i32 {
 }
 
 impl Task {
-    /// Spawn `exec_command` under `$SHELL -c` in `cwd`, in a fresh PTY sized
-    /// `rows`×`cols`, with exactly `env` as the environment (the launching
-    /// client's; the caller owns any fallback policy). Two command strings
-    /// because instrumentation must never leak into `command`, the string
-    /// recipes save and the UI shows: it is stored verbatim, while
-    /// `exec_command` — possibly carrying a capture suffix — is what actually
-    /// runs. Uninstrumented callers pass the same string twice. `waker` lets
-    /// the reader thread nudge the core loop when the PTY produces output, so
-    /// an attached screen refreshes without a polling delay.
+    /// Spawn `exec_command` under `$SHELL -c` in a fresh `rows`×`cols` PTY.
+    /// The task stores `command` for the UI and recipes, while only
+    /// `exec_command` carries instrumentation. The child receives exactly
+    /// `env`, and `waker` notifies the core when terminal output arrives.
     #[allow(clippy::too_many_arguments)] // one call shape, three call sites
     pub fn spawn(
         id: u64,
@@ -458,15 +447,9 @@ impl Task {
         Ok(())
     }
 
-    /// Scrape the harness's exit hint from this task's final terminal text,
-    /// once, and latch a hit in `scraped_id`. Gated on the exit latch AND
-    /// reader-thread EOF: `handle.is_finished()` flips only after the reader
-    /// hit EOF, i.e. after every byte the child ever wrote was parsed into
-    /// the grid — so the hint cannot still be in flight when the render
-    /// runs. A taken handle (`force_kill` detached it) counts as done:
-    /// scrape whatever text exists. The cost boundary: one full-history
-    /// text render (viewport + scrollback) under the grid lock; `scraped`
-    /// keeps it to at most one per task however often reap calls this.
+    /// Scrape an exit hint once after the process exit is latched and the PTY
+    /// reader reaches EOF. A detached reader handle counts as complete. The
+    /// `scraped` latch limits full-history rendering to one pass per task.
     pub(crate) fn scrape_exit_hint(&mut self) {
         let Some(h) = self.harness else { return };
         if self.scraped
@@ -1178,13 +1161,8 @@ mod tests {
         t.terminate();
     }
 
-    /// The exit scrape's reader-EOF gate, made deterministic: the test
-    /// holds the grid lock, so the reader thread cannot finish draining the
-    /// exit hint (and so cannot reach EOF), while `waitid` latches
-    /// `finished` regardless. The scrape must refuse to run in that state —
-    /// the hint is exactly "still in flight" — and must deliver it once the
-    /// reader is released and exits. A regression that drops the gate shows
-    /// up as a self-deadlock on the held FairMutex, not a silent pass.
+    /// Holding the grid lock keeps the reader from reaching EOF after process
+    /// exit; scraping waits until the lock is released and the reader exits.
     #[test]
     fn scrape_exit_hint_waits_for_reader_eof() {
         const ID: &str = "c8c4a5cc-0b32-4ba0-a6b4-6ed08c218e0d";
@@ -1200,8 +1178,8 @@ mod tests {
         let mut t = Task::spawn(20, &cmd, &cmd, &here(), 24, 80, &sh_env(), no_waker()).unwrap();
         t.harness = Some(&crate::harness::Claude);
 
-        // Park the reader before any output exists: it cannot process bytes
-        // — let alone observe EOF — while the test holds the grid lock.
+        // Park the reader before any output exists: it cannot process bytes,
+        // let alone observe EOF, while the test holds the grid lock.
         let parser = Arc::clone(&t.parser);
         let guard = parser.lock();
         std::fs::write(&flag, b"").unwrap();
@@ -1216,8 +1194,7 @@ mod tests {
         t.scrape_exit_hint();
         assert_eq!(t.scraped_id, None, "the scrape must wait for reader EOF");
 
-        // Release the reader: it drains the hint, hits EOF, and exits; the
-        // same call — reap's next pass — now delivers the id.
+        // Release the reader so it can parse the hint and reach EOF.
         drop(guard);
         let deadline = Instant::now() + Duration::from_secs(5);
         while t.scraped_id.is_none() && Instant::now() < deadline {

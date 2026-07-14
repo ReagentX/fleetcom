@@ -1,10 +1,6 @@
-//! Agent-session resume over the real wire: spawning `claude`/`codex`
-//! instruments only the exec string, save rewrites the recipe into the
-//! resuming command, and load re-enters the conversation — including across
-//! a full daemon restart. The agent CLIs are stub scripts heading the
-//! hello's PATH; the hello env is fully explicit, so every store the daemon
-//! resolves (config, capture root, CLAUDE_CONFIG_DIR, CODEX_HOME) points at
-//! scratch dirs and this machine's real ones are provably never touched.
+//! These tests exercise agent-session resume through the daemon protocol.
+//! Stub `claude` and `codex` executables expose the executed argv, while an
+//! explicit handshake environment confines every store to scratch space.
 
 mod common;
 
@@ -19,29 +15,22 @@ use common::{
     KillOnDrop, b64, control_frame, read_frame, shake_hands_env, start_daemon_raw, wait_until,
 };
 
-/// Line the stubs print before each argv record: one appended-to file holds
-/// the spawn run and the load respawn without either clobbering the other.
+/// Delimiter separating argv records in a stub's append-only output.
 const RUN_MARKER: &str = "-- run --";
 
-/// The v7-shaped thread id the codex stub reports. Fixed rather than minted:
-/// codex, not fleetcom, owns id creation, and the capture file is the only
-/// channel carrying it here.
+/// Fixed v7-shaped thread ID reported by the codex stub.
 const CODEX_ID: &str = "019f5453-de22-7240-b2e5-0d32692aa6d9";
 
-/// Scratch tree for one test: stub bin dir, capture runtime root, config
-/// root, per-tool home dirs, a working dir for spawns, and the stubs' argv
-/// records. Everything the hello env names lives under the one root; Drop
-/// removes it even when an assertion fails first.
+/// Scratch tree containing the stub bin, runtime root, config, tool homes,
+/// working directory, and argv records for one test.
 struct Scratch {
     root: PathBuf,
 }
 
 impl Scratch {
     fn new(tag: &str) -> Scratch {
-        // "scratch" keeps this root disjoint from start_daemon_raw's
-        // `fleetcom_it_<tag>_<pid>` dirs: a daemon tag starting with
-        // "resume_" would otherwise resolve to this exact path, and
-        // start_daemon_raw wipes its dir on startup — stubs included.
+        // Keep the scratch tree separate from start_daemon_raw's directory,
+        // which is cleared during daemon setup.
         let root = std::env::temp_dir().join(format!(
             "fleetcom_it_resume_scratch_{tag}_{}",
             std::process::id()
@@ -57,8 +46,7 @@ impl Scratch {
         self.root.join("bin")
     }
 
-    /// The hello's `FLEETCOM_RUNTIME_DIR`: the daemon roots the capture
-    /// assets here verbatim.
+    /// Runtime directory passed to the daemon handshake.
     fn runtime(&self) -> PathBuf {
         self.root.join("run")
     }
@@ -79,8 +67,7 @@ impl Scratch {
         self.root.join(format!("{tool}-argv"))
     }
 
-    /// The fully explicit hello env: the stub dir heads PATH, and every root
-    /// the daemon resolves from the hello points into this scratch tree.
+    /// Explicit handshake environment with every resolved path under `root`.
     fn hello_env(&self) -> Vec<(String, String)> {
         vec![
             (
@@ -114,7 +101,7 @@ impl Drop for Scratch {
     }
 }
 
-/// Handshake carrying the scratch tree's explicit env.
+/// Send a handshake scoped to the scratch tree.
 fn hello(stream: &mut UnixStream, s: &Scratch) {
     let owned = s.hello_env();
     let env: Vec<(&[u8], &[u8])> = owned
@@ -124,11 +111,8 @@ fn hello(stream: &mut UnixStream, s: &Scratch) {
     shake_hands_env(stream, &s.work().display().to_string(), &env);
 }
 
-/// Discard daemon→client traffic on a clone of the stream. The serve loop
-/// drops a client whose event writes block for 5s, and these tests poll
-/// files for whole seconds without reading; an undrained socket would back
-/// up with Tasks snapshots and cost the connection — and with it the hello
-/// context — mid-test. The thread ends when the daemon closes the socket.
+/// Drain daemon events so snapshot traffic cannot fill the socket while a
+/// test polls files. The thread exits when the daemon closes the connection.
 fn drain_events(stream: &UnixStream) {
     let mut rx = stream.try_clone().unwrap();
     std::thread::spawn(move || while read_frame(&mut rx).is_ok() {});
@@ -141,12 +125,8 @@ fn install_stub(s: &Scratch, name: &str, body: &str) {
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
 }
 
-/// The claude stub. Records argv (marker and args in one printf, so a
-/// visible run is a complete run), writes a SessionStart-shaped payload
-/// carrying the id it was launched with to `$FLEETCOM_CAPTURE_FILE` —
-/// simulating the injected hook, whose real contract is proven against the
-/// installed settings in `harness::assets` — and prints the exit hint real
-/// claude prints on a clean exit, feeding the scrape channel.
+/// Claude stub that records argv, writes a SessionStart payload to the
+/// capture file, and prints a resumable exit hint.
 fn install_claude_stub(s: &Scratch) {
     let body = format!(
         r#"id=''
@@ -166,9 +146,8 @@ printf 'Resume this session with:\nclaude --resume %s\n' "$id""#,
     install_stub(s, "claude", &body);
 }
 
-/// The codex stub. Records argv and reports the fixed v7 thread id through
-/// the notify channel, then exits silently — no exit hint, so the capture
-/// file is the only id channel this flow exercises.
+/// Codex stub that records argv and reports `CODEX_ID` only through the
+/// notify capture file.
 fn install_codex_stub(s: &Scratch) {
     let body = format!(
         r#"printf '%s\n' '{marker}' "$@" >> '{rec}'
@@ -198,8 +177,7 @@ fn argv_runs(rec: &Path) -> Vec<Vec<String>> {
     runs
 }
 
-/// Poll the stub's record until run `n` exists and satisfies `pred`, then
-/// return it.
+/// Return argv record `n` after it satisfies `pred`.
 fn wait_run(rec: &Path, n: usize, pred: impl Fn(&[String]) -> bool) -> Vec<String> {
     let ok = wait_until(Duration::from_secs(10), || {
         argv_runs(rec).get(n).is_some_and(|r| pred(r))
@@ -212,7 +190,7 @@ fn wait_run(rec: &Path, n: usize, pred: impl Fn(&[String]) -> bool) -> Vec<Strin
     argv_runs(rec).into_iter().nth(n).unwrap()
 }
 
-/// The token after `flag`, with the whole argv in the failure.
+/// Return the token after `flag`, including argv in assertion failures.
 fn value_after<'a>(argv: &'a [String], flag: &str) -> &'a str {
     let i = argv
         .iter()
@@ -222,7 +200,7 @@ fn value_after<'a>(argv: &'a [String], flag: &str) -> &'a str {
         .unwrap_or_else(|| panic!("{flag} carries no value: {argv:?}"))
 }
 
-/// A spawn control frame: the command string plus the base64 cwd bytes.
+/// Build a spawn control frame with a base64-encoded working directory.
 fn spawn_frame(command: &str, cwd: &Path) -> Vec<u8> {
     control_frame(&format!(
         r#"{{"t":"spawn","command":"{command}","cwd":"{}"}}"#,
@@ -230,12 +208,9 @@ fn spawn_frame(command: &str, cwd: &Path) -> Vec<u8> {
     ))
 }
 
-/// Send `save` and re-read the recipe until it contains `needle`, re-sending
-/// on a cadence, and return the matching JSON. Re-sent rather than sent
-/// once: an id can arrive through a channel that only opens after the
-/// daemon reaps the exited child (the exit-scrape gate closes on the exit
-/// latch plus reader EOF), so a single early save may legitimately still
-/// store the plain command.
+/// Repeat `save` until the persisted recipe contains `needle`. Exit scraping
+/// can produce an ID only after process exit and reader EOF, so an earlier
+/// save can legitimately retain the original command.
 fn save_until(stream: &mut UnixStream, recipe: &Path, name: &str, needle: &str) -> String {
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
@@ -266,7 +241,7 @@ fn save_until(stream: &mut UnixStream, recipe: &Path, name: &str, needle: &str) 
     }
 }
 
-/// SIGTERM the daemon and require a clean exit, mirroring the neighbors.
+/// Send SIGTERM and require the daemon to exit cleanly.
 fn stop_daemon(daemon: &mut KillOnDrop) {
     nix::sys::signal::kill(
         nix::unistd::Pid::from_raw(daemon.0.id() as i32),
@@ -279,11 +254,8 @@ fn stop_daemon(daemon: &mut KillOnDrop) {
     assert!(exited, "daemon did not exit on SIGTERM");
 }
 
-/// The claude user story end to end: spawn pins a session id and layers the
-/// settings overlay onto the exec string only, the hook payload lands in
-/// the capture file, save persists `claude --resume '<id>'` with no
-/// instrumentation leak, and loading that recipe relaunches the tool
-/// resuming the same conversation.
+/// Claude instrumentation captures an ID, persists a clean resume command,
+/// and loads the same conversation.
 #[test]
 fn claude_spawn_save_load_resumes_the_conversation() {
     let s = Scratch::new("claude");
@@ -339,10 +311,8 @@ fn claude_spawn_save_load_resumes_the_conversation() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// The codex user story: spawn carries the `-c notify=[...]` override, the
-/// notify payload's thread id reaches the recipe as `codex resume '<id>'`,
-/// and loading re-launches in the resume form, re-instrumented with the
-/// same notify override.
+/// Codex notification capture persists a resume command and re-instruments
+/// the loaded task.
 #[test]
 fn codex_capture_file_drives_save_and_load_resumes() {
     let s = Scratch::new("codex");
@@ -390,11 +360,7 @@ fn codex_capture_file_drives_save_and_load_resumes() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// The actual "quit fleetcom, come back tomorrow" story: save, SIGTERM the
-/// daemon, start a NEW daemon against the same scratch tree, load. The
-/// respawn resumes the saved uuid, which also proves the recipe file — not
-/// daemon memory — carries the id (the new daemon's asset install even
-/// sweeps the old capture files first).
+/// A recipe saved before a daemon restart resumes the same ID afterward.
 #[test]
 fn saved_recipe_resumes_across_a_daemon_restart() {
     let s = Scratch::new("restart");
@@ -419,7 +385,7 @@ fn saved_recipe_resumes_across_a_daemon_restart() {
     drop(stream_a);
     let _ = std::fs::remove_dir_all(&dir_a);
 
-    // Tomorrow: a fresh daemon, same config dir and hello env.
+    // Start another daemon with the same config and handshake environment.
     let (dir_b, mut daemon_b, mut stream_b) = start_daemon_raw("resume_restart_b", |_| {});
     hello(&mut stream_b, &s);
     drain_events(&stream_b);
@@ -430,7 +396,7 @@ fn saved_recipe_resumes_across_a_daemon_restart() {
     assert_eq!(
         value_after(&argv, "--resume"),
         id,
-        "the new daemon must resume the uuid saved by the old one: {argv:?}"
+        "the restarted daemon must resume the saved uuid: {argv:?}"
     );
     assert!(
         !argv.iter().any(|t| t == "--session-id"),

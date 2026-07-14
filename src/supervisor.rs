@@ -74,10 +74,8 @@ fn normalize_group(name: Option<String>) -> Option<String> {
     normalize_label(name).filter(|g| g != "Unassigned")
 }
 
-/// Short hex FNV-1a (64-bit) of `bytes`: the per-daemon capture-root
-/// discriminator. Hashing rather than reusing the path keeps the directory
-/// name flat and free of the separator/quoting hazards a path-derived name
-/// would carry.
+/// Return the 64-bit FNV-1a hash used to separate capture roots. A fixed-width
+/// hex component keeps the generated directory name flat and path-safe.
 fn fnv1a_hex(bytes: &[u8]) -> String {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
     for &b in bytes {
@@ -87,15 +85,10 @@ fn fnv1a_hex(bytes: &[u8]) -> String {
     format!("{h:016x}")
 }
 
-/// The task's best-known session id: scraped-at-exit > capture file >
-/// spawn-time id. The exit hint is authored by the tool as it exits, so it
-/// postdates every capture-file write — SessionStart hooks and per-turn
-/// notify all land mid-run. The capture file in turn outranks the id fixed
-/// at spawn because the hook rewrites it on every session change (resume,
-/// clear, compact). `scraped_id` needs no `finished` guard: `reap` sets it
-/// only after the exit latch and reader EOF, so it exists post-exit by
-/// construction. `pub(crate)` because the recipe-save path needs the same
-/// precedence.
+/// Return the task's best-known session ID in this order: exit scrape,
+/// capture file, spawn-time ID. The scrape runs only after exit and reader
+/// EOF. Capture files can change during resume, clear, or compact events, so
+/// they take precedence over the ID known at spawn.
 pub(crate) fn current_resume_id(task: &Task) -> Option<String> {
     if let Some(id) = &task.scraped_id {
         return Some(id.clone());
@@ -109,10 +102,8 @@ pub(crate) fn current_resume_id(task: &Task) -> Option<String> {
     task.resume_id.clone()
 }
 
-/// The launch env's value of the harness's home variable
-/// (`CLAUDE_CONFIG_DIR` / `CODEX_HOME`): the home root the child sees, so
-/// `instrument` and `correlate_fs` inspect the store the tool actually
-/// uses, not the daemon's own.
+/// Resolve the harness home (`CLAUDE_CONFIG_DIR` or `CODEX_HOME`) from the
+/// child's launch environment.
 fn home_override(env: &[(OsString, OsString)], h: &dyn harness::Harness) -> Option<PathBuf> {
     env.iter()
         .find(|(k, _)| k == h.home_env_var())
@@ -153,10 +144,9 @@ pub struct Supervisor {
     /// TERM→KILL escalation window. `KILL_GRACE` in production; a field so tests
     /// shrink it instead of sleeping through real seconds.
     kill_grace: Duration,
-    /// Installed capture assets plus the root they live under. `None` until
-    /// an agent-CLI spawn first needs them. The root is remembered because
-    /// `install` sweeps `task-*.json`: reinstalling on an unchanged root (a
-    /// reconnect) would destroy live tasks' capture files.
+    /// Installed capture assets and their root. `None` until a supported
+    /// agent spawn needs them. Reusing the active root avoids sweeping live
+    /// task capture files during reconnects.
     capture: Option<(PathBuf, assets::CaptureAssets)>,
 }
 
@@ -335,7 +325,7 @@ impl Supervisor {
             let _ = t.poll_exit();
             // Scrape the tool's exit hint once per task, after both of its
             // gates close: the exit latch and reader-thread EOF. The EOF
-            // gate closes the latch/drain race by construction — every byte
+            // gate closes the latch/drain race by construction: every byte
             // the child wrote is in the grid before the render (see
             // `Task::scrape_exit_hint`).
             t.scrape_exit_hint();
@@ -473,20 +463,13 @@ impl Supervisor {
         self.launch.clone()
     }
 
-    /// Resolve this connection's capture root and install the assets under
-    /// it, once per root. `FLEETCOM_RUNTIME_DIR` from the launch context wins
-    /// verbatim — the `sessions_root` pattern: the daemon's own env is frozen
-    /// from whichever client first autostarted it. Otherwise the platform
-    /// runtime root gains a per-daemon discriminator directory hashed from
-    /// the sessions root (the value that distinguishes daemon instances,
-    /// which are keyed by config dir): two daemons must not share a capture
-    /// root, because `install`'s sweep would delete each other's live capture
-    /// files and task ids collide across daemons.
+    /// Resolve this connection's capture root and install its assets.
+    /// `FLEETCOM_RUNTIME_DIR` from the launch context is used verbatim;
+    /// otherwise the platform root gains a discriminator derived from the
+    /// session root. The active root is reused without reinstalling it.
     ///
-    /// An unchanged root never reinstalls: `install` sweeps `task-*.json`,
-    /// so a reconnect would destroy live tasks' captures. A failed install
-    /// leaves any previous root's assets in place (their tasks' capture
-    /// files stay removable) and the new root simply spawns uninstrumented.
+    /// If installation fails, an existing asset set remains active; with no
+    /// existing set, the spawn proceeds without instrumentation.
     fn ensure_capture_assets(&mut self) {
         let root = if let Some(ctx) = &self.launch
             && let Some((_, dir)) = ctx.env.iter().find(|(k, _)| k == "FLEETCOM_RUNTIME_DIR")
@@ -510,12 +493,9 @@ impl Supervisor {
         }
     }
 
-    /// The one spawn path (spawn, rerun, session load): classify `command`,
-    /// instrument an agent-CLI launch for session capture, and stamp the
-    /// capture fields on the task. `command` lands on the task verbatim; only
-    /// the exec string carries the instrumentation suffix. A command no
-    /// harness claims — or a claimed one whose assets cannot install —
-    /// spawns untouched.
+    /// Spawn one command for direct launches, reruns, and session loads.
+    /// Recognized agent commands receive capture instrumentation only in the
+    /// executed string; the task retains the caller's command verbatim.
     fn spawn_task(
         &mut self,
         id: u64,
@@ -582,12 +562,9 @@ impl Supervisor {
         }
     }
 
-    /// Re-run a finished task in place while preserving its ID, tag, group,
-    /// and name. A captured agent-CLI task re-enters its conversation: the
-    /// stored command is rewritten to resume the best-known session id, so
-    /// rerun continues where the task left off — a fresh conversation is a
-    /// new task instead. The capture file survives (same id, conversation
-    /// continues); only Remove deletes it.
+    /// Rerun a finished task in place, preserving its ID, tag, group, and
+    /// name. Captured agent tasks use the best-known session ID and retain
+    /// their capture file. Starting a fresh conversation requires a new task.
     fn restart(&mut self, id: u64) {
         let Some(i) = self.index_of(id) else {
             self.events
@@ -602,9 +579,7 @@ impl Supervisor {
         let Some(launch) = self.launch_or_refuse() else {
             return;
         };
-        // The resuming command becomes the STORED command too: re-detection
-        // classifies it as resuming, so instrumentation injects only the
-        // capture channel, never a second id.
+        // Store the resuming form so re-detection does not inject another id.
         let (command, cwd) = {
             let old = &self.tasks[i];
             let command = match (old.harness, current_resume_id(old)) {
@@ -636,9 +611,8 @@ impl Supervisor {
         }
     }
 
-    /// Snapshot tasks as `{dir: [entries]}`. Entries preserve spawn order,
-    /// group assignments, and display names; agent-CLI entries save as
-    /// resuming commands (see `recipe_command`).
+    /// Build `{dir: [entries]}` in spawn order, preserving groups and names.
+    /// Agent entries use the command returned by `recipe_command`.
     fn session_config(&self) -> SessionConfig {
         let mut order: Vec<usize> = (0..self.tasks.len()).collect();
         order.sort_by_key(|&i| self.tasks[i].id);
@@ -656,12 +630,9 @@ impl Supervisor {
         cfg
     }
 
-    /// The command a recipe stores for one task. An agent task with a known
-    /// session id saves as the resuming command, so loading the recipe
-    /// re-enters the conversation. The id follows `current_resume_id`
-    /// (scrape > capture > spawn); a task with none falls to the tool's
-    /// on-disk session store (`correlate_fs`), and failing that the plain
-    /// command is stored — the recipe still works, it just starts fresh.
+    /// Return the command stored for one task. Agent commands use the best
+    /// live ID, then filesystem correlation. If neither yields an ID, the
+    /// original command is retained.
     fn recipe_command(&self, t: &Task) -> String {
         let Some(h) = t.harness else {
             return t.command.clone();
@@ -2221,9 +2192,8 @@ mod tests {
     const CAP_ID: &str = "c8c4a5cc-0b32-4ba0-a6b4-6ed08c218e0d";
     const CAP_OTHER: &str = "11111111-2222-4333-8444-555555555555";
 
-    /// Install an executable stub named `name` under `bin` that records
-    /// `FLEETCOM_CAPTURE_FILE` and its argv (one token per line) under `out`,
-    /// then exits. Capture tests never invoke a real agent CLI.
+    /// Install an executable stub that records `FLEETCOM_CAPTURE_FILE` and
+    /// its argv, one token per line, then exits.
     fn install_stub(bin: &Path, name: &str, out: &Path) {
         use std::os::unix::fs::PermissionsExt;
         std::fs::create_dir_all(bin).unwrap();
@@ -2237,10 +2207,7 @@ mod tests {
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
     }
 
-    /// Launch context for stub tests: the stub dir first in `PATH`, a
-    /// portable shell, and a per-test capture root. The env holds nothing
-    /// else, so this process's own environment provably never reaches the
-    /// child or the root resolution.
+    /// Launch context containing only the stub path, shell, and capture root.
     fn agent_ctx(bin: &Path, runtime: &Path, cwd: PathBuf) -> LaunchContext {
         LaunchContext {
             env: vec![
@@ -2258,9 +2225,7 @@ mod tests {
         }
     }
 
-    /// Poll until the stub has written its argv record, then return its
-    /// lines. Waiting on content, not existence: the shell creates the file
-    /// before printf fills it.
+    /// Poll until the stub's argv record contains data, then return its lines.
     fn wait_argv(s: &mut Supervisor, path: &Path) -> Vec<String> {
         assert!(
             reap_until(s, Duration::from_secs(5), |_| std::fs::read_to_string(path)
@@ -2274,9 +2239,8 @@ mod tests {
             .collect()
     }
 
-    /// `agent_ctx` plus extra env pairs: `FLEETCOM_CONFIG_DIR` for recipe
-    /// saves, a harness home override to keep the notify guard and the
-    /// filesystem correlation off this machine's real stores.
+    /// `agent_ctx` plus explicit environment pairs for recipe and harness
+    /// storage tests.
     fn agent_ctx_plus(
         bin: &Path,
         runtime: &Path,
@@ -2290,9 +2254,7 @@ mod tests {
         ctx
     }
 
-    /// Install an executable stub named `name` under `bin` running `body`.
-    /// Unlike `install_stub`, the caller scripts the exact behavior: exit
-    /// hints, flag-file waits, silence.
+    /// Install an executable stub with caller-supplied shell behavior.
     fn install_script(bin: &Path, name: &str, body: &str) {
         use std::os::unix::fs::PermissionsExt;
         std::fs::create_dir_all(bin).unwrap();
@@ -2301,17 +2263,15 @@ mod tests {
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
     }
 
-    /// Save the named recipe and return the JSON text it wrote: the rewrite
-    /// tests assert on the persisted bytes, not just in-memory state.
+    /// Save a recipe and return its persisted JSON.
     fn save_and_read(s: &mut Supervisor, config: &Path, name: &str) -> String {
         s.apply(Command::SaveSession { name: name.into() });
         let _ = s.drain();
         std::fs::read_to_string(config.join("sessions").join(format!("{name}.json"))).unwrap()
     }
 
-    /// Replicas of codex.rs's private `v7_at` test helper and its
-    /// `civil_from_days`: the correlation test fabricates a rollout the way
-    /// codex would have written one, without exporting either.
+    /// Helpers for constructing rollout fixtures accepted by codex
+    /// filesystem correlation.
     fn v7_at(ms: u64, tail: u32) -> String {
         format!(
             "{:08x}-{:04x}-7000-8000-0000000{:05x}",
@@ -2333,22 +2293,18 @@ mod tests {
         (yoe + era * 400 + i64::from(m <= 2), m, d)
     }
 
-    /// The FNV-1a discriminator is deterministic (a daemon finds its own
-    /// capture root again) and separates config dirs (two daemons never
-    /// share one; install's sweep would eat each other's capture files).
+    /// The FNV-1a discriminator is stable and separates distinct config roots.
     #[test]
     fn fnv_discriminator_is_stable_and_distinguishes_roots() {
-        // Published FNV-1a 64 test vectors: the offset basis and "a".
+        // FNV-1a 64-bit vectors for the empty input and "a".
         assert_eq!(fnv1a_hex(b""), "cbf29ce484222325");
         assert_eq!(fnv1a_hex(b"a"), "af63dc4c8601ec8c");
         assert_eq!(fnv1a_hex(b"/cfg/one"), fnv1a_hex(b"/cfg/one"));
         assert_ne!(fnv1a_hex(b"/cfg/one"), fnv1a_hex(b"/cfg/two"));
     }
 
-    /// Spawning `claude` instruments the launch end to end: the stub
-    /// receives a pinned `--session-id` and the shared `--settings` overlay,
-    /// the capture file is named through the env, the settings overlay
-    /// carries the hook, and none of it leaks into the stored command.
+    /// A claude spawn receives a pinned ID, settings overlay, and capture
+    /// environment without changing the stored command.
     #[test]
     fn spawn_claude_pins_an_id_and_layers_settings() {
         let dir = scratch("cap_claude");
@@ -2390,7 +2346,7 @@ mod tests {
 
         let t = &s.tasks[0];
         let cap = runtime.join(format!("task-{}.json", t.id));
-        // FLEETCOM_RUNTIME_DIR is used verbatim: no discriminator directory.
+        // An explicit runtime directory is used without a discriminator.
         assert_eq!(
             std::fs::read_to_string(dir.join("capenv")).unwrap(),
             cap.display().to_string(),
@@ -2406,8 +2362,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A command no harness claims spawns untouched: no harness, no capture
-    /// channel, and no assets ever installed for it.
+    /// An unrecognized command spawns without capture state or assets.
     #[test]
     fn spawn_non_agent_command_is_not_instrumented() {
         let dir = scratch("cap_plain");
@@ -2431,9 +2386,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A resuming launch never gets a second id — claude would reject it —
-    /// but the capture overlay still rides along, and the typed id seeds
-    /// `resume_id`.
+    /// A resuming claude launch retains its target ID and adds only the
+    /// capture overlay.
     #[test]
     fn spawn_resuming_claude_injects_only_the_capture_channel() {
         let dir = scratch("cap_resume");
@@ -2462,10 +2416,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Rerun re-enters the conversation: the capture file's id (the hook
-    /// moved the session after launch) outranks the spawn-time id, the
-    /// stored command becomes the resuming one, and the live capture file
-    /// survives the displaced run's trip through the graveyard.
+    /// Rerun uses the capture-file ID, stores the resuming command, and keeps
+    /// the capture file while the displaced task is reaped.
     #[test]
     fn restart_resumes_the_captured_conversation() {
         use crate::protocol::Lifecycle;
@@ -2511,8 +2463,7 @@ mod tests {
             !argv.iter().any(|a| a == "--session-id"),
             "re-detection classifies the respawn as resuming: no second id"
         );
-        // Same task id, same conversation: the capture file must survive the
-        // old run's graveyard passage — only Remove deletes it.
+        // Rerun retains the capture path while the displaced task is reaped.
         assert!(
             reap_until(&mut s, Duration::from_secs(5), |s| s.graveyard.is_empty()),
             "the displaced run was never collected"
@@ -2524,9 +2475,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Removing a task deletes its capture file: the conversation ends with
-    /// the task, and task ids restart per daemon, so a leftover would be
-    /// misread as a future task's capture.
+    /// Removing a task also removes its capture file.
     #[test]
     fn remove_deletes_the_capture_file() {
         use crate::protocol::Lifecycle;
@@ -2551,9 +2500,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Reconnect safety: a second hello with the same env resolves the same
-    /// capture root, which must never reinstall — install's sweep would
-    /// destroy live tasks' capture files.
+    /// Reconnecting with the active root reuses installed assets and preserves
+    /// live capture files.
     #[test]
     fn reconnect_with_unchanged_root_preserves_capture_files() {
         let dir = scratch("cap_reconnect");
@@ -2584,8 +2532,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Spawning `codex` routes capture through the notify override: `-c`
-    /// plus a `notify=[...]` TOML naming an installed, executable script.
+    /// A codex spawn receives a `notify=[...]` override naming an executable
+    /// capture script.
     #[test]
     fn spawn_codex_installs_the_notify_override() {
         use std::os::unix::fs::PermissionsExt;
@@ -2593,8 +2541,7 @@ mod tests {
         let (bin, runtime) = (dir.join("bin"), dir.join("run"));
         install_stub(&bin, "codex", &dir);
         let mut s = Supervisor::new(24, 80);
-        // CODEX_HOME points into the scratch so the config-notify guard
-        // never reads this machine's real ~/.codex/config.toml.
+        // Keep config lookup within this test's scratch directory.
         s.set_launch_context(agent_ctx_plus(
             &bin,
             &runtime,
@@ -2628,9 +2575,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A claude exit hint in the final terminal text is scraped on the
-    /// exit-latch transition, and a subsequent save rewrites the recipe
-    /// entry into the resuming command.
+    /// A claude exit hint becomes the session ID used by the saved recipe.
     #[test]
     fn exit_hint_is_scraped_and_saved_as_a_resume() {
         let dir = scratch("scrape_exit");
@@ -2668,9 +2613,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Precedence across a task's life: mid-run the capture file outranks
-    /// the launch-injected id; after exit the scraped hint outranks the
-    /// capture file.
+    /// Session-ID precedence is exit scrape, capture file, then spawn-time ID.
     #[test]
     fn resume_id_precedence_scrape_over_capture_over_spawn() {
         let dir = scratch("precedence");
@@ -2737,18 +2680,15 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A codex task that exits silently (no hint, no notify write) still
-    /// saves a resuming recipe when its rollout correlates uniquely in the
-    /// session store named by the launch env's `CODEX_HOME`.
+    /// A silent codex task can use a unique rollout under `CODEX_HOME` when
+    /// live capture channels produce no ID.
     #[test]
     fn save_falls_back_to_fs_correlation_for_a_silent_codex() {
         let dir = scratch("correlate_save");
         let (bin, runtime, config) = (dir.join("bin"), dir.join("run"), dir.join("config"));
         let codex_home = dir.join("codex_home");
         install_stub(&bin, "codex", &dir);
-        // Fabricate the rollout codex would have written: a v7 id embedding
-        // a now-ish instant, filed under the UTC day directory, with the
-        // session_meta cwd matching the task's.
+        // Create a rollout with a current v7 instant and the task's cwd.
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::SystemTime::UNIX_EPOCH)
             .unwrap()
@@ -2802,9 +2742,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// An agent task with no capture write, no exit hint, and no on-disk
-    /// store degrades cleanly: the recipe keeps the plain command and the
-    /// session simply starts fresh on load.
+    /// Without a live or filesystem ID, an agent recipe retains the original
+    /// command.
     #[test]
     fn agent_save_without_any_id_keeps_the_plain_command() {
         let dir = scratch("no_id");
@@ -2844,10 +2783,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// An uncommented `notify` assignment in the user's config.toml
-    /// suppresses fleetcom's `-c notify=` injection — the CLI override
-    /// would silently clobber the user's own notifier — and commenting the
-    /// line restores it.
+    /// An active `notify` assignment suppresses Fleetcom's override; a
+    /// commented assignment does not.
     #[test]
     fn config_toml_notify_guard_suppresses_injection() {
         let dir = scratch("cfg_guard");
@@ -2894,9 +2831,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Non-agent entries pass through a save untouched, in the string
-    /// member form — asserted on the written JSON bytes, not just the
-    /// parsed config.
+    /// Non-agent commands remain plain string entries in persisted JSON.
     #[test]
     fn non_agent_entries_survive_save_as_plain_strings() {
         let dir = scratch("plain_save");
