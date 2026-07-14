@@ -12,7 +12,7 @@ use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
 use crate::frame::{KIND_CONTROL, KIND_HELLO, KIND_SCREEN};
 
 /// Wire-protocol version; the handshake rejects mismatched peers.
-pub const PROTOCOL_VERSION: u32 = 7;
+pub const PROTOCOL_VERSION: u32 = 8;
 
 /// Environment and working directory supplied by the launching client.
 #[derive(Debug, Clone, PartialEq)]
@@ -49,13 +49,15 @@ pub enum Command {
     Kill { id: u64 },
     /// Drop a task from the set entirely (used on already-finished tasks).
     Remove { id: u64 },
-    /// Re-run a finished task with the same id, command, cwd, tag, and group.
-    /// Running tasks reject this request.
+    /// Re-run a finished task with the same id, command, cwd, tag, group, and
+    /// name. Running tasks reject this request.
     Restart { id: u64 },
     /// Set the manual "in use" tag.
     Tag { id: u64, on: bool },
     /// Set a task's group; `None` clears it back to unassigned.
     SetGroup { id: u64, group: Option<String> },
+    /// Set a task's display name; `None` clears it back to the command.
+    SetName { id: u64, name: Option<String> },
     /// Client terminal resized: `rows`×`cols` is the PTY *content* size. The
     /// client has already subtracted the row it reserves for its status bar.
     Resize { rows: u16, cols: u16 },
@@ -159,6 +161,8 @@ pub struct TaskView {
     pub tagged: bool,
     /// Dashboard group; `None` means unassigned.
     pub group: Option<String>,
+    /// Custom display name; `None` means the row shows the command.
+    pub name: Option<String>,
     pub lifecycle: Lifecycle,
     pub preview: String,
     pub started_ago: Duration,
@@ -314,6 +318,14 @@ pub fn encode_command(cmd: &Command) -> (u8, Vec<u8>) {
                 let _ = o.insert("g", g.as_str());
             }
         }
+        Command::SetName { id, name } => {
+            let _ = o.insert("t", "name");
+            let _ = o.insert("id", *id);
+            // Absence of `n` encodes an unnamed task.
+            if let Some(n) = name {
+                let _ = o.insert("n", n.as_str());
+            }
+        }
         Command::Resize { rows, cols } => {
             let _ = o.insert("t", "resize");
             let _ = o.insert("rows", *rows as u64);
@@ -432,6 +444,14 @@ pub fn decode_command(kind: u8, payload: &[u8]) -> Option<Command> {
                 Some(v["g"].as_str()?.to_string())
             },
         },
+        "name" => Command::SetName {
+            id: v["id"].as_u64()?,
+            name: if v["n"].is_null() {
+                None
+            } else {
+                Some(v["n"].as_str()?.to_string())
+            },
+        },
         "resize" => Command::Resize {
             rows: u16_from(&v["rows"])?,
             cols: u16_from(&v["cols"])?,
@@ -519,6 +539,10 @@ pub fn encode_event(ev: &Event) -> (u8, Vec<u8>) {
                 if let Some(g) = &tv.group {
                     let _ = o.insert("group", g.as_str());
                 }
+                // Likewise, the name field is present only for named tasks.
+                if let Some(n) = &tv.name {
+                    let _ = o.insert("name", n.as_str());
+                }
                 let _ = o.insert("life", lifecycle_str(tv.lifecycle));
                 let _ = o.insert("preview", tv.preview.as_str());
                 let _ = o.insert("started_ms", tv.started_ago.as_millis() as u64);
@@ -594,6 +618,12 @@ pub fn decode_event(kind: u8, payload: &[u8]) -> Option<Event> {
                                 None
                             } else {
                                 Some(tv["group"].as_str()?.to_string())
+                            },
+                            // Missing and null name fields both mean unnamed.
+                            name: if tv["name"].is_null() {
+                                None
+                            } else {
+                                Some(tv["name"].as_str()?.to_string())
                             },
                             lifecycle: lifecycle_from(tv["life"].as_str()?)?,
                             preview: tv["preview"].as_str()?.to_string(),
@@ -678,6 +708,11 @@ mod tests {
                 group: Some("infra".into()),
             },
             Command::SetGroup { id: 2, group: None },
+            Command::SetName {
+                id: 2,
+                name: Some("api server".into()),
+            },
+            Command::SetName { id: 2, name: None },
             Command::Resize {
                 rows: 30,
                 cols: 100,
@@ -888,6 +923,8 @@ mod tests {
             r#"{"t":"tasks","tasks":[{"id":1,"command":"x","cwd":"/x","tagged":true,"life":"ok","preview":"","started_ms":0}]}"#,
             // A present group must be a string; only missing/null means unassigned.
             r#"{"t":"tasks","tasks":[{"id":1,"command":"x","cwd":"Lw==","tagged":true,"life":"ok","preview":"","started_ms":0,"group":5}]}"#,
+            // Same for a present name.
+            r#"{"t":"tasks","tasks":[{"id":1,"command":"x","cwd":"Lw==","tagged":true,"life":"ok","preview":"","started_ms":0,"name":5}]}"#,
             r#"{"t":"tasks","tasks":["flat"]}"#,
             // Numeric member in `names`.
             r#"{"t":"sessions","names":["ok",5]}"#,
@@ -917,6 +954,7 @@ mod tests {
                 cwd: PathBuf::from("/home/x"),
                 tagged: true,
                 group: Some("x".into()),
+                name: Some("editor".into()),
                 lifecycle: Lifecycle::Idle,
                 preview: "~ line".into(),
                 started_ago: Duration::from_millis(4200),
@@ -928,6 +966,7 @@ mod tests {
                 cwd: PathBuf::from(OsString::from_vec(b"/srv/\xff\xfe".to_vec())),
                 tagged: false,
                 group: None,
+                name: None,
                 lifecycle: Lifecycle::Active,
                 preview: String::new(),
                 started_ago: Duration::from_millis(10),
@@ -969,6 +1008,33 @@ mod tests {
         );
     }
 
+    /// `SetName` emits `"n"` only for an assignment. A missing or null `"n"`
+    /// decodes as a clear.
+    #[test]
+    fn set_name_wire_form() {
+        let (k, p) = encode_command(&Command::SetName {
+            id: 3,
+            name: Some("api".into()),
+        });
+        assert_eq!(k, KIND_CONTROL);
+        assert_eq!(
+            std::str::from_utf8(&p).unwrap(),
+            r#"{"t":"name","id":3,"n":"api"}"#
+        );
+        let (_, p) = encode_command(&Command::SetName { id: 3, name: None });
+        assert!(!String::from_utf8(p).unwrap().contains("\"n\""));
+        // An explicit null clears, same as an omitted key.
+        assert_eq!(
+            decode_command(KIND_CONTROL, br#"{"t":"name","id":3,"n":null}"#),
+            Some(Command::SetName { id: 3, name: None })
+        );
+        // A present name must be a string.
+        assert_eq!(
+            decode_command(KIND_CONTROL, br#"{"t":"name","id":3,"n":5}"#),
+            None
+        );
+    }
+
     /// Task frames omit `"group"` when unassigned; an absent key decodes as
     /// `None`.
     #[test]
@@ -986,6 +1052,7 @@ mod tests {
             cwd: PathBuf::from("/"),
             tagged: false,
             group: None,
+            name: None,
             lifecycle: Lifecycle::Ok,
             preview: String::new(),
             started_ago: Duration::from_millis(0),
@@ -995,6 +1062,37 @@ mod tests {
         let grouped = r#"{"t":"tasks","tasks":[{"id":1,"command":"x","cwd":"Lw==","tagged":false,"group":"infra","life":"ok","preview":"","started_ms":0}]}"#;
         match decode_event(KIND_CONTROL, grouped.as_bytes()) {
             Some(Event::Tasks(v)) => assert_eq!(v[0].group.as_deref(), Some("infra")),
+            other => panic!("expected tasks event, got {other:?}"),
+        }
+    }
+
+    /// Task frames omit `"name"` when unnamed; an absent key decodes as
+    /// `None`.
+    #[test]
+    fn tasks_frame_name_key_is_optional() {
+        // "Lw==" is the base64 encoding of "/".
+        let unnamed = r#"{"t":"tasks","tasks":[{"id":1,"command":"x","cwd":"Lw==","tagged":false,"life":"ok","preview":"","started_ms":0}]}"#;
+        match decode_event(KIND_CONTROL, unnamed.as_bytes()) {
+            Some(Event::Tasks(v)) => assert_eq!(v[0].name, None),
+            other => panic!("expected tasks event, got {other:?}"),
+        }
+        // Encoding an unnamed task omits the name key.
+        let (_, p) = encode_event(&Event::Tasks(vec![TaskView {
+            id: 1,
+            command: "x".into(),
+            cwd: PathBuf::from("/"),
+            tagged: false,
+            group: None,
+            name: None,
+            lifecycle: Lifecycle::Ok,
+            preview: String::new(),
+            started_ago: Duration::from_millis(0),
+        }]));
+        assert_eq!(std::str::from_utf8(&p).unwrap(), unnamed);
+
+        let named = r#"{"t":"tasks","tasks":[{"id":1,"command":"x","cwd":"Lw==","tagged":false,"name":"build","life":"ok","preview":"","started_ms":0}]}"#;
+        match decode_event(KIND_CONTROL, named.as_bytes()) {
+            Some(Event::Tasks(v)) => assert_eq!(v[0].name.as_deref(), Some("build")),
             other => panic!("expected tasks event, got {other:?}"),
         }
     }
