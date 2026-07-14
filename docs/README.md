@@ -60,7 +60,7 @@ Run `fleetcom`. The first invocation starts the daemon and opens an empty dashbo
   fleetcom   0 running · 0 idle · 0 done      by state · dir · custom
 
   ❯ n run · @ dir · s sort · w save · o load
-  ↑↓ select · enter attach · space peek · n/@ new · s sort · m tag · g group · r rerun · X kill · q detach · Q quit
+  ↑↓ select · enter attach · space peek · n/@ new · s sort · m tag · g group · R rename · r rerun · X kill · q detach · Q quit
 ```
 
 Press `n`, enter a command, and press `Enter`. The command runs in its own PTY and appears under Running. Repeat the process for a second command:
@@ -73,7 +73,7 @@ Press `n`, enter a command, and press `Enter`. The command runs in its own PTY a
   ✻  npm run dev              VITE v5.0  ready in 312 ms         4s
 
   ❯ n run · @ dir · s sort · w save · o load
-  ↑↓ select · enter attach · space peek · n/@ new · s sort · m tag · g group · r rerun · X kill · q detach · Q quit
+  ↑↓ select · enter attach · space peek · n/@ new · s sort · m tag · g group · R rename · r rerun · X kill · q detach · Q quit
 ```
 
 Each row is `glyph · tag · command · latest output · age`. `Space` peeks: a read-only box of the selected task's live screen, without leaving the dashboard:
@@ -118,14 +118,28 @@ Each row is `glyph · tag · command · latest output · age`. `Space` peeks: a 
 
 In custom mode, a new command inherits the selected task's group. The spawn prompt makes that destination explicit (`❯ api ▸ cargo run`). Group assignments belong to task state, so detach and rerun preserve them. The [command reference](commands.md#the-g-group-picker) documents the picker mechanics.
 
+`R` renames the selected task. The prompt opens prefilled with the current name; `Enter` saves, an emptied field reverts the label to the command, and `Esc` cancels. Rows and peek titles then show the name in place of the command:
+
+```text
+  fleetcom   2 running · 0 idle · 0 done      by state · dir · custom
+
+  api
+  ✻ ◆api tests                test result: ok. 42 passed        3m
+
+  Unassigned
+  ✻  npm run dev              VITE v5.0  ready in 312 ms        3m
+```
+
+The attached status bar keeps the real command visible: `[attached] api tests — cargo watch -x test`. Like groups, names live in the daemon, survive detach and rerun, and persist in saved [sessions](sessions.md).
+
 `w`, a name, and `Enter` save the fleet as a [session](sessions.md). `q` then disconnects while the daemon and both jobs continue running. A subsequent `fleetcom` invocation reconstructs the dashboard from the daemon's current task state. `Q` or `fleetcom --kill` stops the jobs (`TERM`, then `KILL` after a two-second grace period) and exits the daemon.
 
 ## Notes & Caveats
 
 - The fleet dies with the daemon. Because the daemon holds each PTY master, daemon termination closes the terminals and the kernel sends `SIGHUP` to every task's process group. A clean shutdown sends `SIGTERM` before `SIGKILL`; a crash or direct `SIGKILL` provides no grace period. HUP-immune jobs (`nohup`, `trap '' HUP`) can survive, but the next daemon neither owns nor displays them. A panic while serving one client only drops that connection.
 - Commands run through the client's non-interactive shell (`$SHELL -c`, or `/bin/sh` when `SHELL` is unset), so functions and aliases from `~/.zshrc` are unavailable.
-- Each launch uses the launching client's environment and working directory, sent once per connection during the hello handshake. Connect from a venv terminal and your spawns, reruns, and session loads all see that venv, whichever client originally autostarted the daemon. Environment is never written to disk; session files store only directories, commands, and group assignments.
-- Client and daemon protocol versions must match. The daemon rejects a mismatch during the handshake instead of accepting semantics it cannot interpret. Recovery requires `fleetcom --kill` followed by a new client invocation; note that `--kill` also terminates every running job.
+- Each launch uses the launching client's environment and working directory, sent once per connection during the hello handshake. Connect from a venv terminal and your spawns, reruns, and session loads all see that venv, whichever client originally autostarted the daemon. Environment is never written to disk; session files store only directories, commands, group assignments, and display names.
+- Client and daemon protocol versions must match. The daemon rejects a mismatch during the handshake instead of accepting semantics it cannot interpret. Custom display names bumped the protocol to v8, so the first client run after that upgrade meets a still-running v7 daemon's refusal. Recovery requires `fleetcom --kill` followed by a new client invocation; note that `--kill` also terminates every running job.
 - The daemon serves one client at a time. A second `fleetcom` prints a waiting notice, then attaches when the active client disconnects (`q`). `Ctrl-C` while waiting aborts without touching the daemon.
 - Shutdown is graceful-first. `X`, `Q`, `--kill`, and daemon signals send `SIGTERM` to the job's *process group* and escalate to `SIGKILL` after two seconds. Fleetcom holds an exited leader unreaped until task removal, which reserves the process-group ID and keeps background children signalable. A child created by `cmd &` in a non-interactive shell remains in that group. A process that calls `setsid` or double-forks out of the group escapes this sweep and must be terminated separately.
 - `--foreground` is ephemeral. It runs the core in-process with no daemon, so the jobs die when you quit and there is nothing to reattach to.

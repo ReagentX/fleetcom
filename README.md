@@ -9,7 +9,7 @@ Running several long-lived commands becomes cumbersome once they span terminal p
 - Runs each command in its own PTY and groups tasks by state, by working directory, or by custom named groups.
 - Provides read-only previews and full interactive attachment.
 - Keeps jobs running after the client disconnects.
-- Saves and reloads task recipes with directories, commands, and group assignments.
+- Saves and reloads task recipes with directories, commands, group assignments, and display names.
 - Launches commands in other directories through the `@` picker.
 
 ## Documentation
@@ -66,6 +66,7 @@ The first ordinary invocation starts the daemon when necessary. `--daemon` is an
 | `s` | cycle grouping: by state / by directory / by custom group |
 | `m` | tag the task "in use" (prioritizes it within the active grouping) |
 | `g` | assign the selected task to a named group (picker: pick, create, or clear) |
+| `R` | rename the selected task: a display name shown in place of the command (an emptied prompt clears it) |
 | `X` | kill a running task (`TERM`, then `KILL` after 2 s), or remove a finished one (Shift-gated); removal sweeps any background processes the job left in its group, with the same `TERM`-then-`KILL` grace |
 | `w` | save the current tasks as a session |
 | `o` | load a saved session |
@@ -101,9 +102,13 @@ Signals target each task's process group. Fleetcom leaves an exited leader unrea
 
 The dashboard groups tasks by state (In use / Running / Completed), working directory, or names assigned with `g`. Custom groups sort by name, with Unassigned last. `@` opens a live directory picker with the current directory first, recently used directories next, and matching subdirectories after them. This provides an explicit launch directory without leaving the dashboard.
 
+### Task names
+
+`R` gives the selected task a display name. The dashboard row and the peek title show the name in place of the command; the attached status bar shows `name — command`, so the underlying command stays visible. An emptied prompt clears the name, and rerun preserves it. Names pass through the same normalization as group labels: control characters stripped, whitespace trimmed, 64 characters at most.
+
 ### Sessions
 
-`w`, `o`, and `fleetcom <name>` save or load named recipes. A recipe retains each task's directory, command, and group assignment. Loading starts new processes; it does not recover the processes that existed when the recipe was saved. Process continuity comes from the daemon, while sessions provide repeatable launches.
+`w`, `o`, and `fleetcom <name>` save or load named recipes. A recipe retains each task's directory, command, group assignment, and display name. Loading starts new processes; it does not recover the processes that existed when the recipe was saved. Process continuity comes from the daemon, while sessions provide repeatable launches.
 
 ## Notes
 

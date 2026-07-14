@@ -1,6 +1,6 @@
 # Sessions
 
-A session records commands, working directories, and optional group assignments for repeatable launches. Loading starts new processes; it does not restore the processes that existed when the file was saved. Live process continuity belongs to the [daemon](README.md#directory--environment-configuration), which keeps jobs running across client disconnects.
+A session records commands, working directories, and each task's optional group assignment and display name for repeatable launches. Loading starts new processes; it does not restore the processes that existed when the file was saved. Live process continuity belongs to the [daemon](README.md#directory--environment-configuration), which keeps jobs running across client disconnects.
 
 ## Storage
 
@@ -18,13 +18,13 @@ The filename derives from the session name. Fleetcom trims leading and trailing 
 
 ## Format
 
-A session is a JSON object that maps each working directory to an ordered list of entries. An ungrouped entry is a command string. A grouped entry is an object containing both fields:
+A session is a JSON object that maps each working directory to an ordered list of entries. An entry with neither a group nor a name is a command string. An entry carrying either is an object with `cmd` plus the optional `group` and `name` fields:
 
 ```json
 {
   "/home/you/work/api": [
     "cargo watch -x test",
-    { "cmd": "cargo run", "group": "api" }
+    { "cmd": "cargo run", "group": "api", "name": "api server" }
   ],
   "/tmp": [
     "top"
@@ -33,16 +33,16 @@ A session is a JSON object that maps each working directory to an ordered list o
 ```
 
 - Keys are directory paths: each task's working directory.
-- Values are ordered lists. A string member is an ungrouped shell command; `{"cmd": ..., "group": ...}` is a command plus the group its task is assigned on load. Order is preserved, and each command runs in its own PTY under that directory.
+- Values are ordered lists. A string member is a bare shell command; the object form adds the group and display name its task receives on load, each written only when set. Order is preserved, and each command runs in its own PTY under that directory.
 - Directories serialize alphabetically. Command order remains stable within each directory.
 
-The schema is a flat map with no version field or metadata, so it remains practical to edit by hand. On load, the daemon removes control characters from group names, trims whitespace, caps names at 64 characters, and maps `Unassigned` to no group. Invalid JSON fails the entire load. Within valid JSON, Fleetcom drops any member that matches neither entry form, including a non-string scalar, an object without a string `cmd`, or an object with a non-string `group`.
+The schema is a flat map with no version field or metadata, so it remains practical to edit by hand. On load, the daemon normalizes group and display names alike: control characters removed, whitespace trimmed, a 64-character cap. `Unassigned` maps to no group but remains a legal display name. Invalid JSON fails the entire load. Within valid JSON, Fleetcom drops any member that matches neither entry form, including a non-string scalar, an object without a string `cmd`, or an object with a non-string `group` or `name`.
 
-Ungrouped commands are written as strings, while grouped commands use the object form. Both forms can appear in the same directory array.
+Commands with neither a group nor a name are written as strings, so a fleet without either produces a file identical to the pre-group format. Both forms can appear in the same directory array, and files that predate groups and names load unchanged.
 
 ## Saving and loading
 
-- Save: `w` in the dashboard, type a name, `Enter`. Writes each task's directory, command, and optional group to `<name>.json`.
+- Save: `w` in the dashboard, type a name, `Enter`. Writes each task's directory, command, and optional group and name to `<name>.json`.
 - Load in-app: `o`, pick from the list, `Enter`.
 - Load at launch: `fleetcom <name>`.
 

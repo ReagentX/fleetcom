@@ -27,7 +27,8 @@ Fleetcom has two control surfaces. Launch arguments select the operating mode; k
 | `s` | Cycle grouping: by state / by directory / by custom group |
 | `m` | Tag the selected task "in use" (toggles) |
 | `g` | Assign the selected task to a group (opens the group picker) |
-| `r` | Rerun a finished task with the same command, directory, tag, and group |
+| `R` | Rename the selected task: a display name shown in place of the command |
+| `r` | Rerun a finished task with the same command, directory, tag, group, and name |
 | `X` | Kill a running task (`TERM`, then `KILL` after 2 s), or remove a finished one |
 | `w` | Save the current tasks as a session |
 | `o` | Load a saved session |
@@ -72,7 +73,7 @@ Tasks retain 2,000 lines of scrollback. While attached to an inline child, wheel
 
 #### Rerun
 
-`r` re-executes a *finished* task with the same command and directory, using the environment of the client that requested the rerun. The task retains its ID, `◆` tag, group, and spawn order; its clock and screen reset. Because lifecycle participates in sorting, the task can move to another section when it starts running again. On a running task, `r` is a no-op because rerunning would require a destructive kill first. The same key works inside peek, keeping the task visible while the next run starts.
+`r` re-executes a *finished* task with the same command and directory, using the environment of the client that requested the rerun. The task retains its ID, `◆` tag, group, name, and spawn order; its clock and screen reset. Because lifecycle participates in sorting, the task can move to another section when it starts running again. On a running task, `r` is a no-op because rerunning would require a destructive kill first. The same key works inside peek, keeping the task visible while the next run starts.
 
 #### Detach vs. quit
 
@@ -91,6 +92,14 @@ Groups belong to task state: an assignment survives client detach and rerun (`r`
 `m` toggles the "in use" tag and marks the task with `◆`. In state mode, tagged tasks form the In use section at the top. In custom mode, a tag moves the task to the top of its existing group rather than creating a global section. Within each group, the order is tagged, running, completed; each bucket then sorts by directory and spawn order.
 
 In custom mode only, a new command inherits the selected task's group, through both `n` and the `@` picker. The spawn prompt shows the destination as `❯ dir ▸ group ▸ command`, each segment present only when it applies: the dir segment for a non-default directory, the group segment when a group will be inherited. State- and dir-mode spawns start unassigned.
+
+#### Renaming
+
+`R` opens a rename prompt prefilled with the selected task's current name, so editing never means retyping. `Enter` saves; an emptied field clears the name, reverting the label to the command; `Esc` cancels. Plain `r` remains rerun.
+
+A named task shows its name in place of the command in the dashboard row and the peek title. The attached status bar shows `name — command`, so the underlying command stays visible.
+
+The daemon normalizes display names exactly like group names: control characters removed, whitespace trimmed, a 64-character cap, and an empty result clears the name. One difference: `Unassigned` is a legal display name — that reservation belongs to the [group picker](#the-g-group-picker).
 
 ## The `@` directory picker
 
@@ -122,7 +131,7 @@ A centered box over the dashboard showing the selected task's live screen (the l
 
 ## Attached
 
-The task owns the terminal, and its status bar reads `[attached] <command>    Ctrl-\ background`. `Ctrl-\` returns to the dashboard; every other key (control chords included) goes to the child.
+The task owns the terminal, and its status bar reads `[attached] <command>    Ctrl-\ background`, or `[attached] <name> — <command>` for a named task. `Ctrl-\` returns to the dashboard; every other key (control chords included) goes to the child.
 
 ## Connection loss
 
