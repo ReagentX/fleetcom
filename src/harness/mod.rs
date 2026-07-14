@@ -37,8 +37,14 @@ const CORRELATE_WINDOW: Duration = Duration::from_secs(30);
 
 /// One agent CLI fleetcom knows how to capture and resume.
 pub trait Harness: Sync {
-    #[allow(dead_code)] // consumed by the exit-scrape/correlation phase
+    #[allow(dead_code)] // test-only: registry routing assertions
     fn name(&self) -> &'static str;
+
+    /// Environment variable overriding the tool's home root (config plus
+    /// session store). The supervisor resolves it from the task's launch
+    /// env so `instrument` and `correlate_fs` inspect the store the child
+    /// actually uses, not the daemon's own.
+    fn home_env_var(&self) -> &'static str;
 
     /// Classify a recipe command string. `None` = not this tool / excluded
     /// subcommand / unparseable (feature no-ops).
@@ -46,18 +52,23 @@ pub trait Harness: Sync {
 
     /// Spawn-time additions: text appended to the shell command, env pairs,
     /// and the session id if this harness can choose one at launch.
-    fn instrument(&self, inv: &Invocation, capture: &CapturePaths) -> SpawnPlan;
+    /// `home_override` is the launch env's [`Harness::home_env_var`] value;
+    /// codex reads the user's config through it before injecting notify.
+    fn instrument(
+        &self,
+        inv: &Invocation,
+        capture: &CapturePaths,
+        home_override: Option<&Path>,
+    ) -> SpawnPlan;
 
     /// Session id from a capture-file payload (hook/notify JSON).
     fn parse_capture(&self, payload: &str) -> Option<String>;
 
     /// Session id from a task's final terminal text (viewport + scrollback).
-    #[allow(dead_code)] // consumed by the exit-scrape/correlation phase
     fn scrape_exit(&self, text: &str) -> Option<String>;
 
     /// Best-effort id from the tool's on-disk session store. Ambiguity is
     /// `None` by design: resuming the wrong conversation is worse than none.
-    #[allow(dead_code)] // consumed by the exit-scrape/correlation phase
     fn correlate_fs(
         &self,
         cwd: &Path,
@@ -389,6 +400,12 @@ mod tests {
         assert!(!within_window(t, t + Duration::from_secs(31)));
         assert!(within_window_ms(5_000, 35_000));
         assert!(!within_window_ms(5_000, 35_001));
+    }
+
+    #[test]
+    fn home_env_vars_name_each_tools_override() {
+        assert_eq!(Claude.home_env_var(), "CLAUDE_CONFIG_DIR");
+        assert_eq!(Codex.home_env_var(), "CODEX_HOME");
     }
 
     #[test]

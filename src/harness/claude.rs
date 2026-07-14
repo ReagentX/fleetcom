@@ -38,6 +38,10 @@ impl Harness for Claude {
         "claude"
     }
 
+    fn home_env_var(&self) -> &'static str {
+        "CLAUDE_CONFIG_DIR"
+    }
+
     fn detect(&self, cmd: &str) -> Option<Invocation> {
         let words = tokenize(cmd)?;
         if Path::new(words.first()?.text.as_str())
@@ -116,7 +120,14 @@ impl Harness for Claude {
         })
     }
 
-    fn instrument(&self, inv: &Invocation, capture: &CapturePaths) -> SpawnPlan {
+    fn instrument(
+        &self,
+        inv: &Invocation,
+        capture: &CapturePaths,
+        // The settings overlay layers additively onto the user's own config,
+        // wherever it lives: no home inspection needed.
+        _home_override: Option<&Path>,
+    ) -> SpawnPlan {
         let mut suffix = String::new();
         let mut injected_id = None;
         if inv.can_inject_id
@@ -372,7 +383,7 @@ mod tests {
     #[test]
     fn instrument_pins_an_id_and_layers_settings_on_fresh_launches() {
         let inv = Claude.detect("claude").unwrap();
-        let plan = Claude.instrument(&inv, &paths());
+        let plan = Claude.instrument(&inv, &paths(), None);
         let id = plan.injected_id.expect("fresh launch pins an id");
         assert!(is_uuid(&id));
         assert_eq!(
@@ -397,7 +408,7 @@ mod tests {
             format!("claude --session-id {ID}"),
         ] {
             let inv = Claude.detect(&cmd).unwrap();
-            let plan = Claude.instrument(&inv, &paths());
+            let plan = Claude.instrument(&inv, &paths(), None);
             assert_eq!(plan.injected_id, None, "{cmd}");
             assert_eq!(
                 plan.args_suffix, " --settings '/tmp/Application Support/fleetcom.json'",
@@ -409,14 +420,14 @@ mod tests {
     #[test]
     fn instrument_defers_to_a_user_supplied_settings_flag() {
         let inv = Claude.detect("claude --settings mine.json").unwrap();
-        let plan = Claude.instrument(&inv, &paths());
+        let plan = Claude.instrument(&inv, &paths(), None);
         assert!(!plan.args_suffix.contains("--settings"));
         assert!(plan.args_suffix.starts_with(" --session-id '"));
 
         let inv = Claude
             .detect(&format!("claude --settings=mine.json --resume {ID}"))
             .unwrap();
-        let plan = Claude.instrument(&inv, &paths());
+        let plan = Claude.instrument(&inv, &paths(), None);
         assert_eq!(plan.args_suffix, "");
         assert_eq!(plan.env.len(), 1, "env still names the capture file");
     }

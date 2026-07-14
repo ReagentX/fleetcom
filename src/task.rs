@@ -206,9 +206,16 @@ pub struct Task {
     pub resume_id: Option<String>,
     /// Where this task's instrumented hook/notify writes its payload.
     pub capture_file: Option<PathBuf>,
+    /// Session id scraped from the exit hint in final terminal text. Set at
+    /// most once, by `scrape_exit_hint`, after the exit latch and reader
+    /// EOF; existing only post-exit, it outranks every mid-run capture
+    /// channel (see the supervisor's `current_resume_id`).
+    pub scraped_id: Option<String>,
+    /// Whether the one-shot exit scrape ran (hit or miss): the render walks
+    /// the full history, so it must not repeat on later reap passes.
+    scraped: bool,
     /// Wallclock twin of `started`: `Harness::correlate_fs` pairs it with
     /// on-disk session timestamps, which `Instant` cannot reach.
-    #[allow(dead_code)] // consumed by the exit-scrape/correlation phase
     pub spawned_at: SystemTime,
     pub exit_code: Option<i32>,
     pub started: Instant,
@@ -416,6 +423,8 @@ impl Task {
             harness: None,
             resume_id: None,
             capture_file: None,
+            scraped_id: None,
+            scraped: false,
             spawned_at: SystemTime::now(),
             exit_code: None,
             started: Instant::now(),
@@ -447,6 +456,30 @@ impl Task {
             self.finished = Some(Instant::now());
         }
         Ok(())
+    }
+
+    /// Scrape the harness's exit hint from this task's final terminal text,
+    /// once, and latch a hit in `scraped_id`. Gated on the exit latch AND
+    /// reader-thread EOF: `handle.is_finished()` flips only after the reader
+    /// hit EOF, i.e. after every byte the child ever wrote was parsed into
+    /// the grid — so the hint cannot still be in flight when the render
+    /// runs. A taken handle (`force_kill` detached it) counts as done:
+    /// scrape whatever text exists. The cost boundary: one full-history
+    /// text render (viewport + scrollback) under the grid lock; `scraped`
+    /// keeps it to at most one per task however often reap calls this.
+    pub(crate) fn scrape_exit_hint(&mut self) {
+        let Some(h) = self.harness else { return };
+        if self.scraped
+            || self.finished.is_none()
+            || self.handle.as_ref().is_some_and(|jh| !jh.is_finished())
+        {
+            return;
+        }
+        self.scraped = true;
+        let text = grid(&self.parser).text_with_history();
+        if let Some(id) = h.scrape_exit(&text) {
+            self.scraped_id = Some(id);
+        }
     }
 
     /// Reap the exited session leader without blocking.
@@ -1143,6 +1176,56 @@ mod tests {
         grid(&t.parser).process(b"\x1b[?1007l");
         assert_eq!(t.input_hints(), (false, true, false));
         t.terminate();
+    }
+
+    /// The exit scrape's reader-EOF gate, made deterministic: the test
+    /// holds the grid lock, so the reader thread cannot finish draining the
+    /// exit hint (and so cannot reach EOF), while `waitid` latches
+    /// `finished` regardless. The scrape must refuse to run in that state —
+    /// the hint is exactly "still in flight" — and must deliver it once the
+    /// reader is released and exits. A regression that drops the gate shows
+    /// up as a self-deadlock on the held FairMutex, not a silent pass.
+    #[test]
+    fn scrape_exit_hint_waits_for_reader_eof() {
+        const ID: &str = "c8c4a5cc-0b32-4ba0-a6b4-6ed08c218e0d";
+        let dir = std::env::temp_dir().join(format!("fleetcom_task_scrape_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let flag = dir.join("flag");
+        let cmd = format!(
+            "until [ -e '{f}' ]; do sleep 0.05; done; \
+             printf 'Resume this session with:\\nclaude --resume {ID}\\n'",
+            f = flag.display()
+        );
+        let mut t = Task::spawn(20, &cmd, &cmd, &here(), 24, 80, &sh_env(), no_waker()).unwrap();
+        t.harness = Some(&crate::harness::Claude);
+
+        // Park the reader before any output exists: it cannot process bytes
+        // — let alone observe EOF — while the test holds the grid lock.
+        let parser = Arc::clone(&t.parser);
+        let guard = parser.lock();
+        std::fs::write(&flag, b"").unwrap();
+        // The child prints the hint and exits; the latch flips while the
+        // hint bytes are still on the reader's side of the held lock.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while t.finished.is_none() && Instant::now() < deadline {
+            t.poll_exit().unwrap();
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(t.finished.is_some(), "child never exited");
+        t.scrape_exit_hint();
+        assert_eq!(t.scraped_id, None, "the scrape must wait for reader EOF");
+
+        // Release the reader: it drains the hint, hits EOF, and exits; the
+        // same call — reap's next pass — now delivers the id.
+        drop(guard);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while t.scraped_id.is_none() && Instant::now() < deadline {
+            t.scrape_exit_hint();
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(t.scraped_id.as_deref(), Some(ID));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A child's cursor-position probe is answered on the wire: the reply

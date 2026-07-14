@@ -250,8 +250,6 @@ impl Emulator {
     /// trimmed. Rows are addressed absolutely (history rows are negative
     /// line indices), so unlike [`Emulator::contents`] the result ignores
     /// how far the user has scrolled the viewport.
-    // Consumed by the harness exit-scrape path; wired in by a later phase.
-    #[allow(dead_code)]
     pub fn text_with_history(&self) -> String {
         let grid = self.term.grid();
         let top = -(grid.history_size() as i32);

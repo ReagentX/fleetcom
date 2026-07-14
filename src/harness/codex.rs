@@ -62,6 +62,10 @@ impl Harness for Codex {
         "codex"
     }
 
+    fn home_env_var(&self) -> &'static str {
+        "CODEX_HOME"
+    }
+
     fn detect(&self, cmd: &str) -> Option<Invocation> {
         let words = tokenize(cmd)?;
         if Path::new(words.first()?.text.as_str())
@@ -94,10 +98,18 @@ impl Harness for Codex {
         })
     }
 
-    fn instrument(&self, inv: &Invocation, capture: &CapturePaths) -> SpawnPlan {
-        // A user-configured notify would be clobbered by a second override;
-        // scrape and correlation remain as capture channels.
-        if has_notify_override(&inv.tokens) {
+    fn instrument(
+        &self,
+        inv: &Invocation,
+        capture: &CapturePaths,
+        home_override: Option<&Path>,
+    ) -> SpawnPlan {
+        // A user-routed notify — on the command line or in config.toml —
+        // must not be clobbered: the `-c notify=` CLI override outranks the
+        // file, so injecting would silently disable the user's own notifier,
+        // and breaking configured notifications to gain capture is the wrong
+        // trade. Scrape and correlation remain as capture channels.
+        if has_notify_override(&inv.tokens) || config_has_notify(home_override) {
             return SpawnPlan::default();
         }
         let toml = format!(
@@ -283,6 +295,35 @@ fn has_notify_override(tokens: &[String]) -> bool {
     })
 }
 
+/// Whether the user's `config.toml` (under `home`, else `~/.codex`) carries
+/// an active top-level `notify` assignment: a line whose first
+/// non-whitespace run — so before any `#` — is `notify`, then optional
+/// blanks, then `=`. Line-based on purpose: a `notify` key inside a TOML
+/// table matches too, which only errs toward not injecting.
+fn config_has_notify(home: Option<&Path>) -> bool {
+    let root = match home {
+        Some(p) => p.to_path_buf(),
+        None => match dirs::home_dir() {
+            Some(h) => h.join(".codex"),
+            None => return false,
+        },
+    };
+    let Ok(text) = fs::read_to_string(root.join("config.toml")) else {
+        return false;
+    };
+    text.lines().any(is_notify_assignment)
+}
+
+/// Whether `line` is an uncommented `notify` assignment: leading blanks,
+/// the bare key `notify`, optional blanks, `=`. Anything else in between —
+/// a `#`, a longer key like `notify_extra` — is not one.
+fn is_notify_assignment(line: &str) -> bool {
+    let Some(rest) = line.trim_start().strip_prefix("notify") else {
+        return false;
+    };
+    rest.trim_start_matches([' ', '\t']).starts_with('=')
+}
+
 /// Escape `s` for a TOML basic string. Backslash and double quote are the
 /// only path bytes TOML would misread; control characters get `\u` escapes.
 fn toml_escape(s: &str) -> String {
@@ -441,10 +482,16 @@ mod tests {
         assert_eq!(inv.known_id, None);
     }
 
+    /// A home path that provably has no `config.toml`, so instrument tests
+    /// never read this machine's real `~/.codex`.
+    fn no_config_home() -> PathBuf {
+        temp("no_config_home")
+    }
+
     #[test]
     fn instrument_installs_the_notify_override() {
         let inv = Codex.detect("codex").unwrap();
-        let plan = Codex.instrument(&inv, &paths());
+        let plan = Codex.instrument(&inv, &paths(), Some(&no_config_home()));
         assert_eq!(
             plan.args_suffix,
             r#" -c 'notify=["/tmp/Application Support/notify.sh"]'"#
@@ -469,7 +516,7 @@ mod tests {
         ] {
             let inv = Codex.detect(cmd).unwrap();
             assert_eq!(
-                Codex.instrument(&inv, &paths()),
+                Codex.instrument(&inv, &paths(), Some(&no_config_home())),
                 SpawnPlan::default(),
                 "{cmd}"
             );
@@ -478,7 +525,64 @@ mod tests {
         let inv = Codex
             .detect("codex -c model_reasoning_effort=high")
             .unwrap();
-        assert!(!Codex.instrument(&inv, &paths()).args_suffix.is_empty());
+        assert!(
+            !Codex
+                .instrument(&inv, &paths(), Some(&no_config_home()))
+                .args_suffix
+                .is_empty()
+        );
+    }
+
+    /// The config.toml guard: an active top-level `notify` assignment
+    /// suppresses injection entirely; commented lines, longer keys, and a
+    /// missing file do not.
+    #[test]
+    fn instrument_defers_to_a_config_toml_notify() {
+        let home = temp("cfg_notify");
+        let inv = Codex.detect("codex").unwrap();
+
+        // Missing file (and missing home dir): injection proceeds.
+        assert!(!config_has_notify(Some(&home)));
+        assert!(
+            !Codex
+                .instrument(&inv, &paths(), Some(&home))
+                .args_suffix
+                .is_empty()
+        );
+
+        fs::create_dir_all(&home).unwrap();
+        let cfg = home.join("config.toml");
+        for active in [
+            "notify = [\"/my/thing\"]\n",
+            "notify=[\"/my/thing\"]\n",
+            "\tnotify\t= [\"/my/thing\"] # mine\n",
+            "model = \"gpt-5\"\nnotify = [\"/my/thing\"]\n",
+        ] {
+            fs::write(&cfg, active).unwrap();
+            assert!(config_has_notify(Some(&home)), "{active:?}");
+            assert_eq!(
+                Codex.instrument(&inv, &paths(), Some(&home)),
+                SpawnPlan::default(),
+                "{active:?}"
+            );
+        }
+        for inert in [
+            "# notify = [\"/my/thing\"]\n",
+            "  # notify = [\"/my/thing\"]\n",
+            "notify_extra = 1\n",
+            "notify\n",
+        ] {
+            fs::write(&cfg, inert).unwrap();
+            assert!(!config_has_notify(Some(&home)), "{inert:?}");
+            assert!(
+                !Codex
+                    .instrument(&inv, &paths(), Some(&home))
+                    .args_suffix
+                    .is_empty(),
+                "{inert:?}"
+            );
+        }
+        let _ = fs::remove_dir_all(&home);
     }
 
     #[test]
@@ -497,7 +601,7 @@ mod tests {
             codex_notify: PathBuf::from(r#"/Odd Path/it's "here"\now"#),
         };
         let inv = Codex.detect("codex").unwrap();
-        let plan = Codex.instrument(&inv, &paths);
+        let plan = Codex.instrument(&inv, &paths, Some(&no_config_home()));
         let out = std::process::Command::new("sh")
             .arg("-c")
             .arg(format!("printf '%s\\n'{}", plan.args_suffix))
