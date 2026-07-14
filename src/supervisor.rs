@@ -2863,7 +2863,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// An active `notify` assignment suppresses Fleetcom's override; a
+    /// An active `notify` assignment suppresses `fleetcom`'s override; a
     /// commented assignment does not.
     #[test]
     fn config_toml_notify_guard_suppresses_injection() {

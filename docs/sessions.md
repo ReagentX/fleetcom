@@ -4,7 +4,7 @@ A session records commands, working directories, and each task's optional group 
 
 ## Storage
 
-Fleetcom stores one JSON file per session. The session directory resolves in this order:
+`fleetcom` stores one JSON file per session. The session directory resolves in this order:
 
 | Condition | Session directory |
 | -- | -- |
@@ -14,7 +14,7 @@ Fleetcom stores one JSON file per session. The session directory resolves in thi
 
 The first save creates the directory. This matches the [configuration path resolution](README.md#config-directory-sessions) used by save, list, and load.
 
-The filename derives from the session name. Fleetcom trims leading and trailing whitespace, replaces control characters and any of `* " / \ < > : | ? .` with `_`, and caps the result at 255 characters. As a result, `my/session` becomes `my_session.json`, while `a.b` becomes `a_b.json`. Replacing `.` prevents the session name from supplying another extension.
+The filename derives from the session name. `fleetcom` trims leading and trailing whitespace, replaces control characters and any of `* " / \ < > : | ? .` with `_`, and caps the result at 255 characters. As a result, `my/session` becomes `my_session.json`, while `a.b` becomes `a_b.json`. Replacing `.` prevents the session name from supplying another extension.
 
 ## Format
 
@@ -36,11 +36,11 @@ A session is a JSON object that maps each working directory to an ordered list o
 - Values are ordered lists. A string member is a bare shell command; the object form adds the optional group and display name assigned on load. Order is preserved, and each command runs in its own PTY under that directory.
 - Directories serialize alphabetically. Command order remains stable within each directory.
 
-The schema is a flat map with no version field or metadata, so it remains practical to edit by hand. On load, the daemon removes control characters, trims surrounding whitespace, and limits group and display names to 64 characters. `Unassigned` maps to no group but remains a legal display name. Invalid JSON fails the entire load. Within valid JSON, Fleetcom drops any member that matches neither entry form, including a non-string scalar, an object without a string `cmd`, or an object with a non-string `group` or `name`.
+The schema is a flat map with no version field or metadata, so it remains practical to edit by hand. On load, the daemon removes control characters, trims surrounding whitespace, and limits group and display names to 64 characters. `Unassigned` maps to no group but remains a legal display name. Invalid JSON fails the entire load. Within valid JSON, `fleetcom` drops any member that matches neither entry form, including a non-string scalar, an object without a string `cmd`, or an object with a non-string `group` or `name`.
 
 Commands with neither a group nor a name use the string form. String and object entries can appear in the same directory array.
 
-A bare agent command does not identify its conversation. When Fleetcom captures an ID for `claude` or `codex`, it saves the resuming form instead. The result remains an ordinary command string that can run directly in a shell:
+A bare agent command does not identify its conversation. When `fleetcom` captures an ID for `claude` or `codex`, it saves the resuming form instead. The result remains an ordinary command string that can run directly in a shell:
 
 ```json
 {
@@ -57,4 +57,4 @@ A bare agent command does not identify its conversation. When Fleetcom captures 
 - Load in-app: `o`, pick from the list, `Enter`.
 - Load at launch: `fleetcom <name>`.
 
-Loading always spawns new processes from the stored commands. Existing jobs remain daemon state and never enter the session file. [Agent session resume](agent-resume.md) documents how supported agent commands preserve their conversations across that relaunch.
+Loading always spawns new processes from the stored commands. Existing jobs remain daemon state and never enter the session file. [Agent session resume](src/harness/agent-resume.md) documents how supported agent commands preserve their conversations across that relaunch.

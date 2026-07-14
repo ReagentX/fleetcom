@@ -1,4 +1,4 @@
-//! Fleetcom reconstructs each task's terminal state from raw PTY output.
+//! `fleetcom` reconstructs each task's terminal state from raw PTY output.
 //! `alacritty_terminal` provides the parser, visible grid, and scrollback.
 
 use std::{
@@ -75,7 +75,7 @@ impl Dimensions for GridSize {
     }
 }
 
-/// Default-deny allowlist for backend-generated probe responses. Fleetcom
+/// Default-deny allowlist for backend-generated probe responses. `fleetcom`
 /// forwards only CPR (`ESC[<row>;<col>R`), DSR-5 (`ESC[0n`), and primary DA
 /// (`ESC[?<params>c`) responses.
 fn allowed_probe_response(resp: &str) -> bool {

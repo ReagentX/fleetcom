@@ -6,7 +6,7 @@
 //! - `claude`: `--settings <claude-settings.json>` layers a `SessionStart` hook
 //!   (`cat > "$FLEETCOM_CAPTURE_FILE"`) over the user's settings. `claude`
 //!   sends the hook a JSON payload on stdin and runs it with the task's env,
-//!   where Fleetcom sets [`CAPTURE_ENV`](super::CAPTURE_ENV). The hook fires
+//!   where `fleetcom` sets [`CAPTURE_ENV`](super::CAPTURE_ENV). The hook fires
 //!   on startup, resume, clear, and compact, each time overwriting the
 //!   capture file with the current session payload.
 //! - `codex`: `-c notify=["<codex-notify.sh>"]` names an executable that

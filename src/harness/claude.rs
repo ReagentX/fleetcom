@@ -3,7 +3,7 @@
 //! scans final terminal text for `claude --resume <uuid>`, and correlates
 //! transcripts under `<claude-home>/projects/<cwd-slug>/<uuid>.jsonl`.
 //!
-//! Fleetcom does not pin launches that contain `--resume`, `--continue`,
+//! `fleetcom` does not pin launches that contain `--resume`, `--continue`,
 //! `--fork-session`, or `--session-id`.
 
 use std::{fs, path::Path, time::SystemTime};

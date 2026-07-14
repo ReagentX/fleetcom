@@ -1,6 +1,6 @@
 # Commands
 
-Fleetcom has two control surfaces. Launch arguments select the operating mode; keys control the dashboard and its overlays.
+`fleetcom` has two control surfaces. Launch arguments select the operating mode; keys control the dashboard and its overlays.
 
 ## Invocation
 
@@ -60,8 +60,8 @@ While attached, `Ctrl-\` returns to the dashboard. Every other key, including `C
 Modified Enter, paste, and mouse input require state-dependent encoding:
 
 - Shift+Enter and Alt+Enter are sent as `ESC CR`, which is distinct from plain Enter. Shift requires a terminal that reports modified keys; terminals that do not report it send plain `CR`.
-- Paste travels as one message. Bracketed-paste-aware children receive paste markers with embedded terminators removed; other children receive line endings as `CR`. Fleetcom text fields strip control characters.
-- Mouse-protocol children receive clicks, drags, releases, and wheel events in the negotiated encoding. Full-screen children without a mouse protocol use alternate scroll. For inline children without a mouse protocol, wheel-up enters Fleetcom's scrollback view. When Fleetcom captures the mouse (for mouse-protocol children, inline children, or scrollback), terminal selection requires the terminal's selection-override modifier. Otherwise, drag selects normally.
+- Paste travels as one message. Bracketed-paste-aware children receive paste markers with embedded terminators removed; other children receive line endings as `CR`. `fleetcom` text fields strip control characters.
+- Mouse-protocol children receive clicks, drags, releases, and wheel events in the negotiated encoding. Full-screen children without a mouse protocol use alternate scroll. For inline children without a mouse protocol, wheel-up enters `fleetcom`'s scrollback view. When `fleetcom` captures the mouse (for mouse-protocol children, inline children, or scrollback), terminal selection requires the terminal's selection-override modifier. Otherwise, drag selects normally.
 
 #### Scrollback
 

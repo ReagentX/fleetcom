@@ -1,12 +1,12 @@
 # fleetcom Documentation
 
-Fleetcom keeps durable session recipes separate from ephemeral daemon state. This guide documents both storage paths, the build workflow, and a complete first run.
+`fleetcom` keeps durable session recipes separate from ephemeral daemon state. This guide documents both storage paths, the build workflow, and a complete first run.
 
 ## Index
 
 - [Commands](commands.md): every key and launch flag, including the routing mechanics
 - [Sessions](sessions.md): the task recipe format and where it lives
-- [Agent session resume](agent-resume.md): how Fleetcom captures `claude` and `codex` conversation IDs and rewrites saved commands
+- [Agent session resume](src/harness/agent-resume.md): how `fleetcom` captures `claude` and `codex` conversation IDs and rewrites saved commands
 - [Directory & Environment Configuration](#directory--environment-configuration): the socket, the lock, and the session paths
 - [Sample Usage Session](#sample-usage-session): a first run, start to finish
 - [Notes & Caveats](#notes--caveats): process and protocol boundaries
@@ -23,11 +23,11 @@ From a repository clone:
 
 ## Directory & Environment Configuration
 
-Fleetcom separates runtime state from configuration. Runtime state contains the daemon socket and lock; configuration contains durable session recipes.
+`fleetcom` separates runtime state from configuration. Runtime state contains the daemon socket and lock; configuration contains durable session recipes.
 
 ### Runtime directory (socket + lock)
 
-The runtime directory holds `default.sock`, the mode-`0600` client↔daemon socket, and `daemon.lock`, the single-instance `flock`. The daemon records its PID in the lock file; `--kill` uses that PID rather than waiting for the socket. Fleetcom creates the directory with mode `0700`. An existing path must be a real directory owned by the current user, so symlinks and directories owned by another user are rejected.
+The runtime directory holds `default.sock`, the mode-`0600` client↔daemon socket, and `daemon.lock`, the single-instance `flock`. The daemon records its PID in the lock file; `--kill` uses that PID rather than waiting for the socket. `fleetcom` creates the directory with mode `0700`. An existing path must be a real directory owned by the current user, so symlinks and directories owned by another user are rejected.
 
 Resolved in this order:
 
@@ -142,6 +142,6 @@ The attached status bar shows both: `[attached] api tests · cargo watch -x test
 - Each launch uses the launching client's environment and working directory, sent once per connection during the hello handshake. Connect from a venv terminal and your spawns, reruns, and session loads all see that venv, whichever client originally autostarted the daemon. Environment is never written to disk; session files store only directories, commands, group assignments, and display names.
 - Client and daemon protocol versions must match. The daemon rejects a mismatch during the handshake. Stop an incompatible daemon with `fleetcom --kill`, which also terminates every running job, then start a new client.
 - The daemon serves one client at a time. A second `fleetcom` prints a waiting notice, then attaches when the active client disconnects (`q`). `Ctrl-C` while waiting aborts without touching the daemon.
-- Shutdown is graceful-first. `X`, `Q`, `--kill`, and daemon signals send `SIGTERM` to the job's *process group* and escalate to `SIGKILL` after two seconds. Fleetcom holds an exited leader unreaped until task removal, which reserves the process-group ID and keeps background children signalable. A child created by `cmd &` in a non-interactive shell remains in that group. A process that calls `setsid` or double-forks out of the group escapes this sweep and must be terminated separately.
+- Shutdown is graceful-first. `X`, `Q`, `--kill`, and daemon signals send `SIGTERM` to the job's *process group* and escalate to `SIGKILL` after two seconds. `fleetcom` holds an exited leader unreaped until task removal, which reserves the process-group ID and keeps background children signalable. A child created by `cmd &` in a non-interactive shell remains in that group. A process that calls `setsid` or double-forks out of the group escapes this sweep and must be terminated separately.
 - `--foreground` is ephemeral. It runs the core in-process with no daemon, so the jobs die when you quit and there is nothing to reattach to.
 - Signalling the daemon is a clean shutdown. `SIGTERM`/`SIGINT`/`SIGHUP` to the daemon group-kill every job, remove the socket, and exit. This is the same teardown as `Q` or `fleetcom --kill`.
