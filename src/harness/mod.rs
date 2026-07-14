@@ -192,10 +192,15 @@ pub(crate) struct Word {
 /// Split `cmd` into shell words: unquoted whitespace separates, single- and
 /// double-quoted spans are literal (no expansion). Refuses (`None`) any
 /// command containing, outside quotes, a construct whose meaning this module
-/// cannot account for: `| ; & < > $` backtick `( ) \`, a newline or carriage
-/// return, an unterminated quote, or an `=` in the first word (env-prefix
-/// form). A `$` inside double quotes is accepted as literal text: the
-/// original bytes pass through untouched, so the shell still owns it.
+/// cannot account for: `| ; & < > $ #` backtick `( ) \`, a newline or
+/// carriage return, an unterminated quote, or an `=` in the first word
+/// (env-prefix form). An unquoted `#` comments out the rest of the line, so
+/// appended flags would be recorded but never execute. A word that resolves
+/// to exactly `--` is refused even when quoted: the shell strips quotes
+/// before argv, the CLI reads `--` as the flag terminator either way, and
+/// appended flags would land in prompt text. A `$` inside double quotes is
+/// accepted as literal text: the original bytes pass through untouched, so
+/// the shell still owns it.
 pub(crate) fn tokenize(cmd: &str) -> Option<Vec<Word>> {
     let mut words: Vec<Word> = Vec::new();
     let mut cur: Option<Word> = None;
@@ -204,6 +209,9 @@ pub(crate) fn tokenize(cmd: &str) -> Option<Vec<Word>> {
         match c {
             ' ' | '\t' => {
                 if let Some(mut w) = cur.take() {
+                    if w.text == "--" {
+                        return None;
+                    }
                     w.end = i;
                     words.push(w);
                 }
@@ -227,7 +235,7 @@ pub(crate) fn tokenize(cmd: &str) -> Option<Vec<Word>> {
                     }
                 }
             }
-            '|' | ';' | '&' | '<' | '>' | '$' | '`' | '(' | ')' | '\\' | '\n' | '\r' => {
+            '|' | ';' | '&' | '<' | '>' | '$' | '#' | '`' | '(' | ')' | '\\' | '\n' | '\r' => {
                 return None;
             }
             '=' if words.is_empty() => return None,
@@ -243,6 +251,9 @@ pub(crate) fn tokenize(cmd: &str) -> Option<Vec<Word>> {
         }
     }
     if let Some(mut w) = cur.take() {
+        if w.text == "--" {
+            return None;
+        }
         w.end = cmd.len();
         words.push(w);
     }
@@ -353,6 +364,28 @@ mod tests {
         }
         // `=` outside the first word is ordinary flag syntax.
         assert!(tokenize("claude --resume=abc").is_some());
+    }
+
+    /// An unquoted `#` hides appended flags behind a comment; a bare `--`
+    /// word turns them into prompt text. Both refuse; quoted prompt text
+    /// containing either stays fine.
+    #[test]
+    fn tokenize_refuses_comments_and_the_flag_terminator() {
+        for cmd in [
+            "claude # note",
+            "claude fix#3",
+            "claude -- foo",
+            "codex -- foo",
+            // Quote removal still hands the CLI a bare `--` in argv.
+            "claude '--' foo",
+        ] {
+            assert_eq!(tokenize(cmd), None, "{cmd:?} must be refused");
+        }
+        // Inside quotes both are prompt text, not shell or clap syntax.
+        let words = tokenize("claude 'fix bug #3'").unwrap();
+        assert_eq!(words[1].text, "fix bug #3");
+        let words = tokenize("codex 'run -- now'").unwrap();
+        assert_eq!(words[1].text, "run -- now");
     }
 
     /// Shell quoting preserves spaces and embedded single quotes.

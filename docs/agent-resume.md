@@ -38,7 +38,7 @@ Fleetcom cannot choose a codex ID at launch. Instead, it appends a `notify` over
 
 `codex` invokes the program after each turn and passes notification JSON as the final argument. The script replaces `$FLEETCOM_CAPTURE_FILE` with that argument. If the variable is unset, the script exits successfully without writing. Fleetcom parses only `"type":"agent-turn-complete"` payloads and reads the ID from `thread-id`.
 
-Fleetcom skips the override and capture environment when the command already contains `-c notify=` or `--config notify=`, or when `<codex-home>/config.toml` contains an uncommented `notify` assignment. Because the check is line-based rather than TOML-aware, it also treats a `notify` key inside a table as configured. Exit scraping and store correlation remain available.
+Fleetcom skips the override and capture environment when the command already contains `-c notify=` or `--config notify=`, when `<codex-home>/config.toml` contains an uncommented `notify` assignment, or when the effective profile's `<codex-home>/<profile>.config.toml` does. The effective profile is the command line's `-p`/`--profile` value, or failing that a top-level `profile = "name"` key in `config.toml`. Because the checks are line-based rather than TOML-aware, they also treat a `notify` or `profile` key inside a table as configured. Exit scraping and store correlation remain available.
 
 The exit scraper recognizes `codex resume <uuid>` and `codex resume, then select <name> (<uuid>)`, taking the last valid UUID rather than the display name. Filesystem correlation searches `<codex-home>/sessions/YYYY/MM/DD/rollout-<local-ts>-<uuid>.jsonl`. Because the directories use local dates, Fleetcom probes the UTC date ±2 days. It then compares the v7 UUID's embedded millisecond timestamp and requires the first `session_meta` record to contain the task's working directory.
 
@@ -67,7 +67,9 @@ Fleetcom preserves the original command whenever capture is unavailable or ambig
 
 | Situation | Behavior |
 | -- | -- |
-| Shell constructs in the command: <code>\| ; & < > $ ` ( ) \\</code>, newlines, a leading `VAR=` prefix, unterminated quotes | Not detected. Spawns and saves as the plain command; no instrumentation at all. |
+| Shell constructs in the command: <code>\| ; & < > $ # ` ( ) \\</code>, newlines, a leading `VAR=` prefix, unterminated quotes | Not detected. Spawns and saves as the plain command; no instrumentation at all. |
+| An unquoted `#`, or a word that resolves to a standalone `--` | Not detected. `#` comments out appended flags; `--` turns them into prompt text. Either would record a session the command never ran. |
+| codex: a top-level flag outside the known table (e.g. one added upstream after this release) | Not detected. Prevents misreading the flag's value as the subcommand and corrupting the rewrite; capture returns once the table learns the flag. |
 | Non-conversation subcommands (claude: `mcp`, `doctor`, `config`, …; codex: `exec`, `login`, `apply`, …) | Not detected. |
 | Capture assets cannot install and no asset set is active | Spawns untouched. |
 | codex: the user routes `notify` (command line or `config.toml`) | No injection; exit scrape and store correlation remain. |

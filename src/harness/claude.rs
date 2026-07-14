@@ -58,6 +58,13 @@ impl Harness for Claude {
             // misread as the subcommand positional. Other flags' values are
             // not modeled; a value that collides with a blocklist word makes
             // the command opaque, which errs toward no-op.
+            //
+            // Claude tolerates unmodeled flags where codex cannot: its rewrite
+            // appends `--resume '<id>'` at the end, and claude's flags are
+            // order-insensitive, so a mis-skipped value cannot displace a
+            // positional or splice a duplicate subcommand. Codex instead
+            // inserts a positional `resume` whose placement depends on reading
+            // the value flags exactly, so it refuses on any unknown flag.
             if t == "--resume" || t == "-r" {
                 can_inject_id = false;
                 if let Some(next) = words.get(i + 1).map(|w| w.text.as_str())

@@ -44,9 +44,59 @@ const BLOCKLIST: &[&str] = &[
     "help",
 ];
 
-/// Flags with separate values that detection skips while locating a
-/// subcommand or prompt.
-const VALUE_FLAGS: &[&str] = &["-c", "--config", "-m", "--model", "-p", "--profile"];
+/// Codex top-level flags that take a separate value. `first_positional`
+/// skips the flag and its value while locating the subcommand or prompt;
+/// each also accepts the `--flag=value` spelling, handled inline.
+const VALUE_FLAGS: &[&str] = &[
+    "-c",
+    "--config",
+    "-m",
+    "--model",
+    "-p",
+    "--profile",
+    "-i",
+    "--image",
+    "-s",
+    "--sandbox",
+    "-a",
+    "--ask-for-approval",
+    "-C",
+    "--cd",
+    "--add-dir",
+    "--enable",
+    "--disable",
+    "--local-provider",
+    "--remote",
+    "--remote-auth-token-env",
+];
+
+/// Codex top-level flags that take no value.
+const BOOL_FLAGS: &[&str] = &[
+    "--oss",
+    "--search",
+    "--no-alt-screen",
+    "--strict-config",
+    "--last",
+    "--all",
+    "--include-non-interactive",
+    "--dangerously-bypass-approvals-and-sandbox",
+    "--dangerously-bypass-hook-trust",
+    "-h",
+    "--help",
+    "-V",
+    "--version",
+];
+
+/// Whether `flag` (a `-`-prefixed token, `--flag=value` already split to its
+/// name) is a known codex top-level flag. A flag in neither table makes the
+/// command opaque: `detect` returns `None`, so it spawns and saves plain.
+/// This is deliberate. An unknown value-taking flag would desynchronize the
+/// positional walk — misreading its value as the subcommand or prompt — and
+/// corrupt the rewrite. The tradeoff: a codex flag added upstream after this
+/// list costs capture until the list learns it, never a corrupted recipe.
+fn is_known_flag(flag: &str) -> bool {
+    VALUE_FLAGS.contains(&flag) || BOOL_FLAGS.contains(&flag)
+}
 
 pub struct Codex;
 
@@ -69,19 +119,28 @@ impl Harness for Codex {
             return None;
         }
         let mut known_id: Option<String> = None;
-        if let Some(si) = first_positional(&words, 1) {
-            let sub = words[si].text.as_str();
-            if BLOCKLIST.contains(&sub) {
-                return None;
-            }
-            // `resume <uuid>` targets a known conversation; `resume <name>`
-            // and bare `resume` leave the user's target untouched. Any other
-            // positional is a prompt.
-            if sub == "resume"
-                && let Some(ti) = first_positional(&words, si + 1)
-                && is_uuid(&words[ti].text)
-            {
-                known_id = Some(words[ti].text.clone());
+        match first_positional(&words, 1) {
+            // An unrecognized flag makes the command opaque: refuse rather
+            // than risk misreading its value as the subcommand.
+            Scan::Opaque => return None,
+            Scan::Exhausted => {}
+            Scan::Positional(si) => {
+                let sub = words[si].text.as_str();
+                if BLOCKLIST.contains(&sub) {
+                    return None;
+                }
+                // `resume <uuid>` targets a known conversation; `resume
+                // <name>` and bare `resume` leave the user's target
+                // untouched. Any other positional is a prompt.
+                if sub == "resume" {
+                    match first_positional(&words, si + 1) {
+                        Scan::Opaque => return None,
+                        Scan::Positional(ti) if is_uuid(&words[ti].text) => {
+                            known_id = Some(words[ti].text.clone());
+                        }
+                        _ => {}
+                    }
+                }
             }
         }
         Some(Invocation {
@@ -99,7 +158,7 @@ impl Harness for Codex {
     ) -> SpawnPlan {
         // Preserve an existing notify route. Exit scraping and filesystem
         // correlation remain available without an injected notifier.
-        if has_notify_override(&inv.tokens) || config_has_notify(home_override) {
+        if has_notify_override(&inv.tokens) || config_has_notify(home_override, &inv.tokens) {
             return SpawnPlan::default();
         }
         let toml = format!(
@@ -222,9 +281,15 @@ impl Harness for Codex {
         if words.is_empty() {
             return cmd.to_string();
         }
-        let Some(si) = first_positional(&words, 1) else {
+        let si = match first_positional(&words, 1) {
+            // Opaque: an unknown flag. detect already refused it, so this is
+            // defensive; leave the command untouched.
+            Scan::Opaque => return cmd.to_string(),
             // Flags only: the resume subcommand slots in after the program.
-            return splice_insert(cmd, words[0].end, &format!(" resume {}", shell_quote(id)));
+            Scan::Exhausted => {
+                return splice_insert(cmd, words[0].end, &format!(" resume {}", shell_quote(id)));
+            }
+            Scan::Positional(si) => si,
         };
         let sub = words[si].text.as_str();
         if BLOCKLIST.contains(&sub) {
@@ -235,36 +300,94 @@ impl Harness for Codex {
             return splice_insert(cmd, words[0].end, &format!(" resume {}", shell_quote(id)));
         }
         match first_positional(&words, si + 1) {
-            Some(ti) if is_uuid(&words[ti].text) => {
+            Scan::Opaque => cmd.to_string(),
+            Scan::Positional(ti) if is_uuid(&words[ti].text) => {
                 let mut out = cmd.to_string();
                 out.replace_range(words[ti].start..words[ti].end, id);
                 out
             }
             // A session name still resolves; the user's target stands.
-            Some(_) => cmd.to_string(),
+            Scan::Positional(_) => cmd.to_string(),
             // Bare `resume` at the end of the command gains the target.
-            None if si + 1 == words.len() => format!("{cmd} {}", shell_quote(id)),
+            Scan::Exhausted if si + 1 == words.len() => format!("{cmd} {}", shell_quote(id)),
             // Flags after `resume` (e.g. --last) pick their own target;
             // adding an id would fight them.
-            None => cmd.to_string(),
+            Scan::Exhausted => cmd.to_string(),
         }
     }
 }
 
-/// Index of the first non-flag token at or after `from`, skipping the values
-/// of [`VALUE_FLAGS`].
-fn first_positional(words: &[Word], mut from: usize) -> Option<usize> {
+/// Outcome of a positional scan. Distinguishing `Exhausted` (only known
+/// flags remained) from `Opaque` (an unrecognized flag) lets callers refuse
+/// a command they cannot parse instead of guessing a subcommand.
+enum Scan {
+    /// First non-flag token, at this index.
+    Positional(usize),
+    /// End of the words with no positional; every flag was recognized.
+    Exhausted,
+    /// An unrecognized flag: the command is opaque and must not be rewritten.
+    Opaque,
+}
+
+/// Whether `flag` consumes the following token as a separate value, is
+/// self-contained (bool, or an attached `--flag=value` / `-fvalue`), or is
+/// unrecognized.
+enum FlagKind {
+    SeparateValue,
+    SelfContained,
+    Unknown,
+}
+
+/// Classify a `-`-prefixed token against the strict flag tables. The
+/// `--flag=value`, `-fvalue`, and `-f=value` spellings are self-contained: a
+/// value fused into the token can never desync the positional walk, so only
+/// the flag name needs to be known.
+fn classify_flag(t: &str) -> FlagKind {
+    if VALUE_FLAGS.contains(&t) {
+        return FlagKind::SeparateValue;
+    }
+    if BOOL_FLAGS.contains(&t) {
+        return FlagKind::SelfContained;
+    }
+    // Short flag with a directly attached value (`-cvalue`, `-c=value`). The
+    // value may itself contain `=`, so this must precede the `--flag=value`
+    // split below.
+    // `get` rather than indexing: a multibyte char straight after the dash
+    // (`-éx`) has no byte-2 boundary, and a recipe command must never be
+    // able to panic the supervisor. No boundary there also means no ASCII
+    // short flag, so falling through to Unknown is the correct reading.
+    if t.starts_with('-')
+        && !t.starts_with("--")
+        && t.len() > 2
+        && t.get(..2).is_some_and(|p| VALUE_FLAGS.contains(&p))
+    {
+        return FlagKind::SelfContained;
+    }
+    // Long flag with an attached assignment: `--config=notify=…`.
+    if let Some((name, _)) = t.split_once('=')
+        && is_known_flag(name)
+    {
+        return FlagKind::SelfContained;
+    }
+    FlagKind::Unknown
+}
+
+/// Scan for the first non-flag token at or after `from`, skipping each known
+/// flag (and the separate value of a [`VALUE_FLAGS`] entry). An unrecognized
+/// flag stops the scan with [`Scan::Opaque`].
+fn first_positional(words: &[Word], mut from: usize) -> Scan {
     while from < words.len() {
         let t = words[from].text.as_str();
-        if VALUE_FLAGS.contains(&t) {
-            from += 2;
-        } else if t.starts_with('-') {
-            from += 1;
-        } else {
-            return Some(from);
+        if !t.starts_with('-') {
+            return Scan::Positional(from);
+        }
+        match classify_flag(t) {
+            FlagKind::SeparateValue => from += 2,
+            FlagKind::SelfContained => from += 1,
+            FlagKind::Unknown => return Scan::Opaque,
         }
     }
-    None
+    Scan::Exhausted
 }
 
 /// Whether the command already routes notifications through `-c notify=…`,
@@ -282,10 +405,15 @@ fn has_notify_override(tokens: &[String]) -> bool {
     })
 }
 
-/// Whether `config.toml` under `home` (or `~/.codex`) contains an
-/// uncommented `notify` assignment. This conservative line-based check also
-/// matches `notify` keys inside TOML tables.
-fn config_has_notify(home: Option<&Path>) -> bool {
+/// Whether the user already routes `notify` through `config.toml` or the
+/// effective profile's config file. Codex layers `<home>/<profile>.config.toml`
+/// over `config.toml`, and the profile can be named on the command line
+/// (`-p`/`--profile`) or by a top-level `profile = "name"` in `config.toml`,
+/// with the command line winning. A `notify` in either file counts, so the
+/// CLI override never clobbers a profile-scoped route. The line-based checks
+/// are conservative: they also match a `notify`/`profile` key inside a TOML
+/// table, which only errs toward not injecting.
+fn config_has_notify(home: Option<&Path>, tokens: &[String]) -> bool {
     let root = match home {
         Some(p) => p.to_path_buf(),
         None => match dirs::home_dir() {
@@ -293,10 +421,75 @@ fn config_has_notify(home: Option<&Path>) -> bool {
             None => return false,
         },
     };
-    let Ok(text) = fs::read_to_string(root.join("config.toml")) else {
+    let config_text = fs::read_to_string(root.join("config.toml")).unwrap_or_default();
+    if config_text.lines().any(is_notify_assignment) {
+        return true;
+    }
+    // Command line `-p`/`--profile` overrides `config.toml`'s own `profile`.
+    let Some(profile) = cli_profile(tokens).or_else(|| config_profile(&config_text)) else {
+        return false;
+    };
+    let Ok(text) = fs::read_to_string(root.join(format!("{profile}.config.toml"))) else {
         return false;
     };
     text.lines().any(is_notify_assignment)
+}
+
+/// Effective profile named on the command line, or `None`. Accepts `-p x`,
+/// `--profile x`, `--profile=x`, `-px`, and `-p=x`; the last occurrence wins,
+/// matching clap's override semantics.
+fn cli_profile(tokens: &[String]) -> Option<String> {
+    let mut profile = None;
+    let mut i = 1;
+    while i < tokens.len() {
+        let t = tokens[i].as_str();
+        if (t == "-p" || t == "--profile")
+            && let Some(v) = tokens.get(i + 1)
+        {
+            profile = Some(v.clone());
+            i += 2;
+            continue;
+        } else if let Some(v) = t.strip_prefix("--profile=") {
+            profile = Some(v.to_string());
+        } else if let Some(v) = t.strip_prefix("-p").filter(|_| t != "-p") {
+            // `-px` or `-p=x`.
+            profile = Some(v.strip_prefix('=').unwrap_or(v).to_string());
+        }
+        i += 1;
+    }
+    profile.filter(|p| !p.is_empty())
+}
+
+/// Top-level `profile = "name"` assignment in `config.toml` text, unquoted.
+/// Bare (`profile = name`) and quoted forms are both accepted; a trailing
+/// comment is dropped.
+fn config_profile(text: &str) -> Option<String> {
+    for line in text.lines() {
+        let Some(rest) = line.trim_start().strip_prefix("profile") else {
+            continue;
+        };
+        let Some(rest) = rest.trim_start_matches([' ', '\t']).strip_prefix('=') else {
+            continue;
+        };
+        let val = unquote_toml(rest.trim());
+        if !val.is_empty() {
+            return Some(val);
+        }
+    }
+    None
+}
+
+/// Unquote a TOML scalar: a `"…"` or `'…'` string yields its contents; a bare
+/// value yields its first whitespace/`#`-delimited token.
+fn unquote_toml(s: &str) -> String {
+    for q in ['"', '\''] {
+        if let Some(rest) = s.strip_prefix(q)
+            && let Some(end) = rest.find(q)
+        {
+            return rest[..end].to_string();
+        }
+    }
+    s.split([' ', '\t', '#']).next().unwrap_or("").to_string()
 }
 
 /// Whether `line` begins with an uncommented bare `notify` assignment.
@@ -519,7 +712,7 @@ mod tests {
         let inv = Codex.detect("codex").unwrap();
 
         // Missing file (and missing home dir): injection proceeds.
-        assert!(!config_has_notify(Some(&home)));
+        assert!(!config_has_notify(Some(&home), &inv.tokens));
         assert!(
             !Codex
                 .instrument(&inv, &paths(), Some(&home))
@@ -536,7 +729,7 @@ mod tests {
             "model = \"gpt-5\"\nnotify = [\"/my/thing\"]\n",
         ] {
             fs::write(&cfg, active).unwrap();
-            assert!(config_has_notify(Some(&home)), "{active:?}");
+            assert!(config_has_notify(Some(&home), &inv.tokens), "{active:?}");
             assert_eq!(
                 Codex.instrument(&inv, &paths(), Some(&home)),
                 SpawnPlan::default(),
@@ -550,7 +743,7 @@ mod tests {
             "notify\n",
         ] {
             fs::write(&cfg, inert).unwrap();
-            assert!(!config_has_notify(Some(&home)), "{inert:?}");
+            assert!(!config_has_notify(Some(&home), &inv.tokens), "{inert:?}");
             assert!(
                 !Codex
                     .instrument(&inv, &paths(), Some(&home))
@@ -661,6 +854,103 @@ mod tests {
         assert_eq!(Codex.resume_command("codex exec 'x'", ID), "codex exec 'x'");
         assert_eq!(Codex.resume_command("codex; ls", ID), "codex; ls");
         assert_eq!(Codex.resume_command("codex", "not-an-id"), "codex");
+    }
+
+    #[test]
+    fn detect_refuses_unknown_flags_and_skips_value_flags() {
+        // A multibyte char after the dash must classify (as Unknown), not
+        // panic on a byte-boundary slice.
+        assert!(Codex.detect("codex -\u{e9}x").is_none());
+        // A value-taking flag with a separate value no longer desyncs the
+        // walk: the subcommand after its value is read correctly.
+        let inv = Codex
+            .detect(&format!("codex --sandbox workspace-write resume {ID}"))
+            .unwrap();
+        assert_eq!(inv.known_id.as_deref(), Some(ID));
+
+        // Corruption case (a): `exec` is correctly the subcommand, not the
+        // value, and stays blocklisted.
+        assert!(
+            Codex
+                .detect("codex --sandbox workspace-write exec 'do x'")
+                .is_none()
+        );
+
+        // `--flag=value` and `-fvalue` spellings are self-contained.
+        assert!(
+            Codex
+                .detect("codex --sandbox=workspace-write 'prompt'")
+                .is_some()
+        );
+        assert!(Codex.detect("codex -sworkspace-write 'prompt'").is_some());
+
+        // A flag in neither table makes the command opaque, anywhere it sits.
+        assert!(Codex.detect("codex --made-up-flag x").is_none());
+        assert!(
+            Codex
+                .detect(&format!("codex --made-up-flag x resume {ID}"))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn resume_command_never_corrupts_after_a_value_flag() {
+        // Corruption case (a): the value flag's argument is not misread as a
+        // subcommand, so no stray `resume` precedes the blocklisted one.
+        assert_eq!(
+            Codex.resume_command("codex --sandbox workspace-write exec 'x'", ID),
+            "codex --sandbox workspace-write exec 'x'"
+        );
+
+        // Corruption case (b): the existing uuid target is replaced in place,
+        // never doubled with a second `resume`.
+        let cmd = format!("codex --sandbox workspace-write resume {OTHER}");
+        let out = Codex.resume_command(&cmd, ID);
+        assert_eq!(out, format!("codex --sandbox workspace-write resume {ID}"));
+        assert_eq!(out.matches("resume").count(), 1);
+
+        // An unknown flag leaves the command untouched.
+        assert_eq!(
+            Codex.resume_command("codex --made-up-flag x", ID),
+            "codex --made-up-flag x"
+        );
+    }
+
+    #[test]
+    fn config_has_notify_resolves_profiles() {
+        let home = temp("profile_notify");
+        fs::create_dir_all(&home).unwrap();
+        let cfg = home.join("config.toml");
+        let team = home.join("team.config.toml");
+
+        // notify lives in the profile file; `-p team` on the CLI selects it.
+        fs::write(&cfg, "model = \"gpt-5\"\n").unwrap();
+        fs::write(&team, "notify = [\"/team/hook\"]\n").unwrap();
+        let inv = Codex.detect("codex -p team").unwrap();
+        assert!(config_has_notify(Some(&home), &inv.tokens));
+        assert_eq!(
+            Codex.instrument(&inv, &paths(), Some(&home)),
+            SpawnPlan::default()
+        );
+
+        // Profile selected by config.toml's own `profile` key, no `-p`.
+        let bare = vec!["codex".to_string()];
+        fs::write(&cfg, "profile = \"team\"\n").unwrap();
+        assert!(config_has_notify(Some(&home), &bare));
+        // Bare (unquoted) value with a trailing comment resolves too.
+        fs::write(&cfg, "profile = team # mine\n").unwrap();
+        assert!(config_has_notify(Some(&home), &bare));
+
+        // Commented-out notify in the profile file still injects.
+        fs::write(&cfg, "profile = \"team\"\n").unwrap();
+        fs::write(&team, "# notify = [\"/team/hook\"]\n").unwrap();
+        assert!(!config_has_notify(Some(&home), &bare));
+
+        // A missing profile file still injects.
+        fs::write(&cfg, "profile = \"ghost\"\n").unwrap();
+        assert!(!config_has_notify(Some(&home), &bare));
+
+        let _ = fs::remove_dir_all(&home);
     }
 
     #[test]
