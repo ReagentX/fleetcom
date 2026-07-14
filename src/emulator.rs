@@ -246,25 +246,33 @@ impl Emulator {
     }
 
     /// Return every retained row as plain text, from the oldest scrollback
-    /// row through the viewport. Each grid row becomes one line with trailing
-    /// blanks removed. Absolute row addressing makes the result independent
-    /// of the viewport's current scroll offset.
+    /// row through the viewport, one line per logical line: a row whose last
+    /// cell carries `WRAPLINE` soft-wrapped mid-line, so its continuation
+    /// row joins it with no separator and a hint printed past the grid
+    /// width scrapes back as the one line the child wrote. Trailing blanks
+    /// are trimmed from unwrapped rows only — a wrapped row is full to the
+    /// last column by construction, so its trailing cells are content.
+    /// Absolute row addressing makes the result independent of the
+    /// viewport's current scroll offset.
     pub fn text_with_history(&self) -> String {
         let grid = self.term.grid();
         let top = -(grid.history_size() as i32);
         let bottom = grid.screen_lines() as i32 - 1;
+        let last_col = grid.columns() - 1;
         let mut out = String::new();
         for row in top..=bottom {
-            if row > top {
-                out.push('\n');
-            }
             let row_start = out.len();
             let line = &grid[Line(row)];
             for col in 0..grid.columns() {
                 let cell = &line[Column(col)];
-                // Wide-char spacers duplicate their neighbor; tabs render
-                // as the spaces they displayed as.
-                if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
+                // Wide-char spacers duplicate their neighbor; the leading
+                // variant is the blank left in the last column when a wide
+                // glyph wrapped instead of splitting. Tabs render as the
+                // spaces they displayed as.
+                if cell
+                    .flags
+                    .intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER)
+                {
                     continue;
                 }
                 out.push(if cell.c == '\t' { ' ' } else { cell.c });
@@ -272,8 +280,17 @@ impl Emulator {
                     out.extend(zerowidth.iter());
                 }
             }
+            // A soft-wrapped row continues into the next: no newline, and no
+            // trim, since a space in its last column is content the child
+            // wrote, not padding.
+            if line[Column(last_col)].flags.contains(Flags::WRAPLINE) {
+                continue;
+            }
             while out.len() > row_start && out.ends_with(' ') {
                 out.pop();
+            }
+            if row < bottom {
+                out.push('\n');
             }
         }
         out
@@ -574,6 +591,60 @@ mod tests {
         // The view offset must not change what is reported.
         emu.set_scrollback(usize::MAX);
         assert_eq!(emu.text_with_history(), full);
+    }
+
+    /// The exit-hint scrape depends on this: a line the child printed past
+    /// the grid width soft-wraps, and the wrapped rows must join back into
+    /// the one line the child wrote — no synthetic newline through the
+    /// UUID — while explicit newlines still separate logical lines.
+    #[test]
+    fn text_with_history_joins_soft_wrapped_rows() {
+        let mut emu = Emulator::new(6, 20, 100);
+        let hint = "claude --resume 123e4567-e89b-42d3-a456-426614174000";
+        emu.process(format!("before\r\n{hint}\r\nafter").as_bytes());
+        let full = emu.text_with_history();
+        assert!(
+            full.contains(hint),
+            "52 chars over 3 rows at 20 columns must come back unbroken: {full:?}"
+        );
+        // Explicit newlines still bound logical lines on both sides.
+        assert!(full.contains(&format!("before\n{hint}\nafter")));
+    }
+
+    /// The codex named-thread hint wraps at ordinary 80-column widths; the
+    /// full sentence with `(<uuid>)` must survive as one line.
+    #[test]
+    fn text_with_history_joins_codex_hint_across_rows() {
+        let mut emu = Emulator::new(8, 40, 100);
+        let hint = "To continue this session, run codex resume, then select \
+                    mythic-otter (123e4567-e89b-42d3-a456-426614174000)";
+        emu.process(hint.as_bytes());
+        assert!(
+            emu.text_with_history().contains(hint),
+            "the hint spans 3 rows at 40 columns and must join unbroken"
+        );
+    }
+
+    /// Wrap markers travel with rows into scrollback: a wrapped line pushed
+    /// off the live screen still joins, including across the history to
+    /// viewport boundary.
+    #[test]
+    fn text_with_history_joins_wrapped_rows_in_scrollback() {
+        let mut emu = Emulator::new(4, 20, 100);
+        let hint = "claude --resume 123e4567-e89b-42d3-a456-426614174000";
+        emu.process(format!("{hint}\r\n").as_bytes());
+        for i in 0..6 {
+            emu.process(format!("pad {i}\r\n").as_bytes());
+        }
+        let full = emu.text_with_history();
+        assert!(
+            !emu.contents().contains("claude"),
+            "premise: the hint scrolled fully into history"
+        );
+        assert!(
+            full.contains(hint),
+            "history rows keep their wrap markers: {full:?}"
+        );
     }
 
     /// Top-anchored region scrollback remains reachable after shrinking and
