@@ -13,6 +13,10 @@ mod frame;
 // Differential emulator tests over recorded PTY output.
 #[cfg(test)]
 mod golden;
+// Agent-CLI session capture. Pure logic; later phases wire it into spawn,
+// exit, and recipe-save paths — until then nothing consumes it.
+#[allow(dead_code)]
+mod harness;
 mod path;
 mod protocol;
 mod serialize;

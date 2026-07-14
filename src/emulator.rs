@@ -10,8 +10,11 @@ use alacritty_terminal::{
     Term,
     event::{Event, EventListener},
     grid::{Dimensions, Scroll},
-    index::Line,
-    term::{Config, TermMode, cell::Cell},
+    index::{Column, Line},
+    term::{
+        Config, TermMode,
+        cell::{Cell, Flags},
+    },
     vte::ansi::Processor,
 };
 
@@ -240,6 +243,43 @@ impl Emulator {
     /// Plain-text contents of the visible screen, one line per row.
     pub fn contents(&self) -> String {
         crate::serialize::contents(&self.term)
+    }
+
+    /// Plain text of every retained row — oldest scrollback row first
+    /// through the last viewport row — one line per row, trailing blanks
+    /// trimmed. Rows are addressed absolutely (history rows are negative
+    /// line indices), so unlike [`Emulator::contents`] the result ignores
+    /// how far the user has scrolled the viewport.
+    // Consumed by the harness exit-scrape path; wired in by a later phase.
+    #[allow(dead_code)]
+    pub fn text_with_history(&self) -> String {
+        let grid = self.term.grid();
+        let top = -(grid.history_size() as i32);
+        let bottom = grid.screen_lines() as i32 - 1;
+        let mut out = String::new();
+        for row in top..=bottom {
+            if row > top {
+                out.push('\n');
+            }
+            let row_start = out.len();
+            let line = &grid[Line(row)];
+            for col in 0..grid.columns() {
+                let cell = &line[Column(col)];
+                // Wide-char spacers duplicate their neighbor; tabs render
+                // as the spaces they displayed as.
+                if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
+                    continue;
+                }
+                out.push(if cell.c == '\t' { ' ' } else { cell.c });
+                if let Some(zerowidth) = cell.zerowidth() {
+                    out.extend(zerowidth.iter());
+                }
+            }
+            while out.len() > row_start && out.ends_with(' ') {
+                out.pop();
+            }
+        }
+        out
     }
 
     /// Which mouse events the child asked for; the most recent DECSET wins
@@ -517,6 +557,26 @@ mod tests {
         assert_eq!(emu.scrollback(), 9, "over-scroll clamps at history");
         emu.set_scrollback(0);
         assert_eq!(emu.scrollback(), 0);
+    }
+
+    /// Rows scrolled out of the viewport stay reachable through the full
+    /// retained text, oldest first, while the visible screen loses them.
+    #[test]
+    fn text_with_history_includes_scrolled_off_rows() {
+        let mut emu = Emulator::new(4, 10, 100);
+        for i in 0..12 {
+            emu.process(format!("l{i}\r\n").as_bytes());
+        }
+        // 12 newlines on a 4-row screen: the first rows are history now.
+        assert!(!emu.contents().contains("l0"));
+        let full = emu.text_with_history();
+        assert!(full.starts_with("l0"), "oldest history row leads");
+        assert!(full.contains("l11"), "the live screen is included");
+        // 9 history rows plus the 4-row viewport, one line per row.
+        assert_eq!(full.split('\n').count(), 13);
+        // The view offset must not change what is reported.
+        emu.set_scrollback(usize::MAX);
+        assert_eq!(emu.text_with_history(), full);
     }
 
     /// Top-anchored region scrollback remains reachable after shrinking and
