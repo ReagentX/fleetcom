@@ -2,14 +2,18 @@
 //! installs those assets and allocates one capture path per task run. The
 //! supervisor installs each root once per daemon lifetime and reuses it.
 //!
-//! Assets and capture files both live under `<root>/<pid>`. `--foreground`
-//! lets several fleetcom processes share one root, and each allocates task
-//! ids from 1, so an unshared namespace per process is the only thing
-//! keeping their `task-<id>-<run>.json` paths apart. Assets get the same
-//! isolation: a root-level copy would be rewritten by every process's
-//! install, so a concurrent install could expose a truncated script to
-//! another process's in-flight turn, and two fleetcom versions sharing a
-//! root would overwrite each other's implementation.
+//! Assets and capture files both live under `<root>/<pid>-<nonce>`, one
+//! namespace per fleetcom incarnation. `--foreground` lets several fleetcom
+//! processes share one root, and each allocates task ids from 1, so an
+//! unshared namespace per process is the only thing keeping their
+//! `task-<id>-<run>.json` paths apart — and pid alone cannot key it: a
+//! reused pid would land the new process in a dead predecessor's retained
+//! namespace, where the predecessor's `task-1-0.json` is exactly the new
+//! first task's path. Assets get the same isolation: a root-level copy
+//! would be rewritten by every process's install, so a concurrent install
+//! could expose a truncated script to another process's in-flight turn,
+//! and two fleetcom versions sharing a root would overwrite each other's
+//! implementation.
 //!
 //! Asset contracts:
 //! - `claude`: `--settings <claude-settings.json>` layers a `SessionStart` hook
@@ -89,18 +93,25 @@ pub fn runtime_root(override_dir: Option<&Path>) -> Option<PathBuf> {
 /// One process's paths in an installed capture-asset tree.
 #[derive(Debug)]
 pub struct CaptureAssets {
-    /// This process's capture namespace: `<root>/<pid>`.
+    /// This incarnation's capture namespace: `<root>/<pid>-<nonce>`.
     dir: PathBuf,
     claude_settings: PathBuf,
     codex_notify: PathBuf,
 }
 
 impl CaptureAssets {
-    /// Create `root` and `<root>/<pid>` with mode `0700` and write both
-    /// assets inside the namespace: the settings file with mode `0600`, the
-    /// directly executed notify script `0700`.
+    /// Create `root` and a fresh `<root>/<pid>-<nonce>` namespace with mode
+    /// `0700` and write both assets inside it: the settings file with mode
+    /// `0600`, the directly executed notify script `0700`.
     ///
-    /// Nothing under `root` is ever deleted here. Per-pid namespaces already
+    /// The nonce (12 hex chars of a fresh v4 UUID) keys the namespace to
+    /// this incarnation, so it collides with nothing by construction —
+    /// including a dead predecessor's namespace after pid reuse, whose
+    /// retained `task-1-0.json` would otherwise be exactly this process's
+    /// first task's path. The pid prefix survives purely for debuggability;
+    /// nothing parses these names.
+    ///
+    /// Nothing under `root` is ever deleted here. Per-incarnation namespaces
     /// isolate every process by construction, so a startup sweep would
     /// protect nothing and can only break live captures: a foreign namespace
     /// with a dead-looking owner may serve agents that survived a fleetcom
@@ -109,7 +120,7 @@ impl CaptureAssets {
     /// turn by an older fleetcom sharing the root, and root-level
     /// `task-*.json` files are that version's live capture files. Stale data
     /// is bytes; a wrong deletion is a broken live capture. The litter bound
-    /// is one few-KB namespace per fleetcom process lifetime per root. If
+    /// is one few-KB namespace per fleetcom incarnation per root. If
     /// collection is ever wanted it belongs in a clean-shutdown path, where
     /// "my tasks are dead" is knowledge rather than a startup guess about
     /// other processes.
@@ -124,19 +135,24 @@ impl CaptureAssets {
         // Recursive creation retains a pre-existing directory's permissions.
         fs::set_permissions(root, fs::Permissions::from_mode(0o700))?;
 
-        // A pre-existing directory bearing our pid is a dead predecessor's
-        // (pid reuse). Write into it rather than rebuild it: a surviving
-        // agent of that process may still exec paths inside, and the writes
-        // below overwrite the assets with identical-per-version content —
-        // the least-destructive reconciliation. Its stale task files are
-        // unreachable from this process anyway: `current_resume_id` reads
-        // only capture paths stored on live `Task` structs, never a
-        // directory scan, and our run keys differ at worst.
-        let dir = root.join(pid.to_string());
-        fs::DirBuilder::new()
-            .recursive(true)
-            .mode(0o700)
-            .create(&dir)?;
+        // 12 hex chars of a v4 UUID, dashes stripped: the first 6 bytes,
+        // all random (the version and variant nibbles land at stripped
+        // indices 12 and 16). 48 bits against a collision set of "retained
+        // namespaces for this pid in this root" — a handful — while keeping
+        // the directory name short enough to eyeball. No urandom means no
+        // unique namespace: fail the install (which disables capture for
+        // the spawn) rather than risk sharing a predecessor's directory.
+        let nonce: String = super::uuid_v4()
+            .ok_or_else(|| io::Error::other("no /dev/urandom for the namespace nonce"))?
+            .chars()
+            .filter(|c| *c != '-')
+            .take(12)
+            .collect();
+        // The name is fresh by construction, so the non-recursive create
+        // fails loudly on the impossible collision instead of writing into
+        // a foreign namespace.
+        let dir = root.join(format!("{pid}-{nonce}"));
+        fs::DirBuilder::new().mode(0o700).create(&dir)?;
         fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))?;
 
         let claude_settings = dir.join("claude-settings.json");
@@ -191,6 +207,25 @@ mod tests {
         fs::metadata(p).unwrap().permissions().mode() & 0o777
     }
 
+    /// The namespace the assets landed in, shape-checked: a direct child of
+    /// `root` named `<pid>-<12 lowercase hex>`.
+    fn namespace(assets: &CaptureAssets, root: &Path) -> PathBuf {
+        let ns = assets.claude_settings.parent().unwrap();
+        assert_eq!(ns.parent(), Some(root), "namespace must sit under root");
+        let name = ns.file_name().unwrap().to_str().unwrap();
+        let nonce = name
+            .strip_prefix(&format!("{}-", std::process::id()))
+            .expect("namespace must carry the pid prefix");
+        assert_eq!(nonce.len(), 12, "nonce must be 12 chars: {name:?}");
+        assert!(
+            nonce
+                .bytes()
+                .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()),
+            "nonce must be lowercase hex: {name:?}"
+        );
+        ns.to_path_buf()
+    }
+
     #[test]
     fn runtime_root_prefers_the_override_verbatim() {
         let dir = Path::new("/custom/run dir");
@@ -207,7 +242,7 @@ mod tests {
         let root = base.join("nested");
         let assets = CaptureAssets::install(&root, std::process::id()).unwrap();
 
-        let ns = root.join(std::process::id().to_string());
+        let ns = namespace(&assets, &root);
         assert_eq!(mode(&root), 0o700);
         assert_eq!(mode(&ns), 0o700);
         assert_eq!(assets.claude_settings, ns.join("claude-settings.json"));
@@ -217,27 +252,35 @@ mod tests {
         let _ = fs::remove_dir_all(&base);
     }
 
-    /// Reinstalling with the same pid overwrites the assets in place and
-    /// reasserts every mode, healing corruption without touching anything
-    /// else in the namespace.
+    /// Every install mints a fresh namespace with pristine assets and
+    /// reasserts the root mode; an earlier namespace — corrupted or not —
+    /// survives untouched.
     #[test]
-    fn install_is_idempotent_and_heals_corrupted_assets() {
-        let root = temp("heal");
+    fn install_mints_a_fresh_namespace_per_call() {
+        let root = temp("fresh");
         let first = CaptureAssets::install(&root, std::process::id()).unwrap();
-        let settings = fs::read_to_string(&first.claude_settings).unwrap();
-        let script = fs::read_to_string(&first.codex_notify).unwrap();
-
         fs::write(&first.claude_settings, "garbage").unwrap();
-        fs::write(&first.codex_notify, "garbage").unwrap();
-        fs::set_permissions(&first.codex_notify, fs::Permissions::from_mode(0o644)).unwrap();
         fs::set_permissions(&root, fs::Permissions::from_mode(0o755)).unwrap();
 
         let second = CaptureAssets::install(&root, std::process::id()).unwrap();
+        assert_ne!(
+            namespace(&first, &root),
+            namespace(&second, &root),
+            "the same pid must get a distinct namespace per install"
+        );
         assert_eq!(
             fs::read_to_string(&second.claude_settings).unwrap(),
-            settings
+            claude_settings_json()
         );
-        assert_eq!(fs::read_to_string(&second.codex_notify).unwrap(), script);
+        assert_eq!(
+            fs::read_to_string(&second.codex_notify).unwrap(),
+            CODEX_NOTIFY_SCRIPT
+        );
+        assert_eq!(
+            fs::read_to_string(&first.claude_settings).unwrap(),
+            "garbage",
+            "install must never write into an earlier namespace"
+        );
         assert_eq!(mode(&root), 0o700);
         assert_eq!(mode(&second.claude_settings), 0o600);
         assert_eq!(mode(&second.codex_notify), 0o700);
@@ -251,7 +294,7 @@ mod tests {
     #[test]
     fn install_never_deletes_foreign_or_legacy_files() {
         let root = temp("retain");
-        let foreign = root.join("99999");
+        let foreign = root.join("99999-0123456789ab");
         fs::create_dir_all(&foreign).unwrap();
         fs::write(foreign.join("task-1-0.json"), "{}").unwrap();
         fs::write(root.join("task-1-0.json"), "{}").unwrap();
@@ -281,24 +324,37 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
-    /// Pid reuse: a dead predecessor's directory bearing our pid is written
-    /// into, not rebuilt. Its stale task file survives (a surviving agent of
-    /// the dead process may still reference the namespace) while the assets
-    /// heal to current content and modes.
+    /// Pid reuse: a dead predecessor's namespace bearing our pid is neither
+    /// entered nor touched. The nonce lands the new incarnation in a fresh
+    /// directory, so the predecessor's `task-1-0.json` — the exact path our
+    /// first task would have used under pid-only keying — stays its own,
+    /// and its assets stay byte-identical for any agent that survived the
+    /// predecessor's crash.
     #[test]
-    fn install_into_a_reused_pid_namespace_keeps_stale_task_files() {
+    fn install_after_pid_reuse_leaves_the_predecessor_namespace_alone() {
         let root = temp("reuse");
-        let ns = root.join(std::process::id().to_string());
-        fs::create_dir_all(&ns).unwrap();
-        fs::write(ns.join("task-1-0.json"), "{}").unwrap();
-        fs::write(ns.join("claude-settings.json"), "garbage").unwrap();
-        fs::write(ns.join("codex-notify.sh"), "garbage").unwrap();
-        fs::set_permissions(&ns, fs::Permissions::from_mode(0o755)).unwrap();
+        let stale = root.join(format!("{}-00000000dead", std::process::id()));
+        fs::create_dir_all(&stale).unwrap();
+        fs::write(stale.join("task-1-0.json"), "predecessor").unwrap();
+        fs::write(stale.join("claude-settings.json"), "old settings").unwrap();
+        fs::write(stale.join("codex-notify.sh"), "old script").unwrap();
 
         let assets = CaptureAssets::install(&root, std::process::id()).unwrap();
-        assert!(
-            ns.join("task-1-0.json").exists(),
-            "a predecessor's task file must survive pid reuse"
+        let ns = namespace(&assets, &root);
+        assert_ne!(ns, stale, "a reused pid must get a fresh namespace");
+        assert_eq!(
+            fs::read_to_string(stale.join("task-1-0.json")).unwrap(),
+            "predecessor",
+            "the predecessor's capture file must survive verbatim"
+        );
+        assert_eq!(
+            fs::read_to_string(stale.join("claude-settings.json")).unwrap(),
+            "old settings",
+            "the predecessor's assets must survive verbatim"
+        );
+        assert_eq!(
+            fs::read_to_string(stale.join("codex-notify.sh")).unwrap(),
+            "old script"
         );
         assert_eq!(
             fs::read_to_string(&assets.claude_settings).unwrap(),
@@ -309,8 +365,6 @@ mod tests {
             CODEX_NOTIFY_SCRIPT
         );
         assert_eq!(mode(&ns), 0o700);
-        assert_eq!(mode(&assets.claude_settings), 0o600);
-        assert_eq!(mode(&assets.codex_notify), 0o700);
         let _ = fs::remove_dir_all(&root);
     }
 
@@ -490,10 +544,10 @@ mod tests {
     }
 
     #[test]
-    fn paths_for_names_the_task_file_under_the_pid_namespace() {
+    fn paths_for_names_the_task_file_under_the_incarnation_namespace() {
         let root = temp("paths");
         let assets = CaptureAssets::install(&root, std::process::id()).unwrap();
-        let ns = root.join(std::process::id().to_string());
+        let ns = namespace(&assets, &root);
         let paths = assets.paths_for(7, 0);
         assert_eq!(paths.capture_file, ns.join("task-7-0.json"));
         // The run discriminates: a restarted task gets a different file.

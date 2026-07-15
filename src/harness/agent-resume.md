@@ -15,18 +15,18 @@ That is six shapes in total. Everything else is opaque: no instrumentation, no r
 
 ## How capture works
 
-Each `fleetcom` process owns one namespace under the capture root: `<root>/<pid>` (see [environment variables](#environment-variables) for the root). The first supported task installs it, once per root per daemon lifetime: the root and namespace use mode `0700`, and both assets are written inside the namespace, `claude-settings.json` with mode `0600` and `codex-notify.sh` with mode `0700`. Nothing outside a namespace references its paths, so concurrent processes and differing `fleetcom` versions sharing a root cannot rewrite each other's assets.
+Each `fleetcom` incarnation owns one namespace under the capture root: `<root>/<pid>-<nonce>` (see [environment variables](#environment-variables) for the root), where the nonce is 12 hex chars of a fresh v4 UUID and the pid prefix exists purely for debuggability — nothing parses these names. The first supported task installs it, once per root per daemon lifetime: the root and namespace use mode `0700`, and both assets are written inside the namespace, `claude-settings.json` with mode `0600` and `codex-notify.sh` with mode `0700`. The nonce makes the namespace collide with nothing, including a dead predecessor's after pid reuse — whose retained `task-1-0.json` would otherwise be exactly the new process's first capture path — and nothing outside a namespace references its paths, so concurrent processes, differing `fleetcom` versions sharing a root, and pid-reusing successors cannot rewrite or misread each other's files.
 
-Each instrumented task run gets `<root>/<pid>/task-<id>-<run>.json`. For Claude and Codex capture, `fleetcom` exposes the path through `FLEETCOM_CAPTURE_FILE`; the injected hook or notifier overwrites the file with JSON containing the conversation ID. The file is keyed by task and run: a restart bumps the run, so the fresh run cannot read the old run's file, and a lingering old process writes only its own superseded path.
+Each instrumented task run gets `<root>/<pid>-<nonce>/task-<id>-<run>.json`. For Claude and Codex capture, `fleetcom` exposes the path through `FLEETCOM_CAPTURE_FILE`; the injected hook or notifier overwrites the file with JSON containing the conversation ID. The file is keyed by task and run: a restart bumps the run, so the fresh run cannot read the old run's file, and a lingering old process writes only its own superseded path.
 
-Installation deletes nothing under the root. Per-pid namespaces isolate every process by construction, so a garbage sweep would protect nothing — and every deletion it could make risks a live capture: a namespace with a dead-looking owner may serve agents that survived a `fleetcom` crash (a SIGKILLed daemon never signals its children, and their notify script lives at that path), root-level `claude-settings.json`/`codex-notify.sh` are exec'd every turn by an older `fleetcom` sharing the root, and root-level `task-*.json` files are that version's live capture files. Stale data is bytes; a wrong deletion is a broken live capture. The litter bound is one few-KB namespace per `fleetcom` process lifetime per root.
+Installation deletes nothing under the root. Per-incarnation namespaces isolate every process by construction, so a garbage sweep would protect nothing — and every deletion it could make risks a live capture: a namespace with a dead-looking owner may serve agents that survived a `fleetcom` crash (a SIGKILLed daemon never signals its children, and their notify script lives at that path), root-level `claude-settings.json`/`codex-notify.sh` are exec'd every turn by an older `fleetcom` sharing the root, and root-level `task-*.json` files are that version's live capture files. Stale data is bytes; a wrong deletion is a broken live capture. The litter bound is one few-KB namespace per `fleetcom` incarnation per root.
 
 ### `claude`
 
 A bare launch receives both arguments below when UUID generation succeeds. The canonical resume form receives only the `--settings` addition; it already targets its conversation.
 
 ```
---session-id '<new v4 UUID>' --settings '<root>/<pid>/claude-settings.json'
+--session-id '<new v4 UUID>' --settings '<root>/<pid>-<nonce>/claude-settings.json'
 ```
 
 `--session-id` pins the ID before the child produces output. The generated settings file defines one `SessionStart` hook:
@@ -44,7 +44,7 @@ Two fallback channels require no injection. After exit, `fleetcom` scans the fin
 `codex` does not expose an ID that `fleetcom` can choose at launch. `fleetcom` instead appends a `notify` override to both accepted shapes:
 
 ```
--c 'notify=["<root>/<pid>/codex-notify.sh"]'
+-c 'notify=["<root>/<pid>-<nonce>/codex-notify.sh"]'
 ```
 
 After each turn, `codex` invokes the program with notification JSON as its final argument. The script writes that argument to `$FLEETCOM_CAPTURE_FILE`, replacing the previous payload; if the variable is unset, it skips the write. `fleetcom` accepts only `"type":"agent-turn-complete"` payloads and reads the ID from `thread-id`.

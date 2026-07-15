@@ -474,10 +474,11 @@ impl Supervisor {
     /// `FLEETCOM_RUNTIME_DIR` is used verbatim; the fallback root includes a
     /// session-root discriminator. Canonical roots are installed once per
     /// daemon lifetime.
-    /// Capture files and assets land in this process's pid namespace under
-    /// the root, so concurrent supervisors sharing a root (a daemon plus
-    /// `--foreground` runs) cannot cross-wire each other's captures or
-    /// rewrite each other's assets.
+    /// Capture files and assets land in this incarnation's `<pid>-<nonce>`
+    /// namespace under the root, so concurrent supervisors sharing a root (a
+    /// daemon plus `--foreground` runs) — and a later process reusing a dead
+    /// supervisor's pid — cannot cross-wire each other's captures or rewrite
+    /// each other's assets.
     /// Installation failure disables instrumentation for the spawn.
     fn ensure_capture_assets(&mut self) -> Option<&assets::CaptureAssets> {
         let root = if let Some(ctx) = &self.launch
@@ -2370,22 +2371,40 @@ mod tests {
         );
 
         let t = &s.tasks[0];
-        let cap = runtime
-            .join(std::process::id().to_string())
-            .join(format!("task-{}-0.json", t.id));
+        let cap = t.capture_file.clone().expect("capture file set");
         // An explicit runtime directory is used without a discriminator;
-        // capture files sit in this process's pid namespace under it.
+        // capture files sit in this incarnation's `<pid>-<nonce>` namespace
+        // directly under it.
+        let ns = cap.parent().expect("capture file must sit in a namespace");
+        assert_eq!(ns.parent(), Some(runtime.as_path()));
+        assert!(
+            ns.file_name()
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .starts_with(&format!("{}-", std::process::id())),
+            "the namespace must carry this process's pid prefix: {ns:?}"
+        );
+        assert_eq!(
+            cap.file_name().unwrap().to_str().unwrap(),
+            format!("task-{}-0.json", t.id),
+            "the capture file must be keyed by task and run"
+        );
+        assert_eq!(
+            settings.parent(),
+            Some(ns),
+            "assets and captures must share the namespace"
+        );
         assert_eq!(
             std::fs::read_to_string(dir.join("capenv")).unwrap(),
             cap.display().to_string(),
-            "the capture env must name task-<id>-<run>.json under the root's pid namespace"
+            "the capture env must name task-<id>-<run>.json under the incarnation namespace"
         );
         assert_eq!(
             t.command, "claude",
             "instrumentation must never leak into the stored command"
         );
         assert_eq!(t.resume_id.as_deref(), Some(id.as_str()));
-        assert_eq!(t.capture_file.as_deref(), Some(cap.as_path()));
         assert!(t.harness.is_some());
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2656,11 +2675,14 @@ mod tests {
             cap_a.exists(),
             "returning to a known root must not disturb its live captures"
         );
+        let ns_b = s.tasks[1]
+            .capture_file
+            .as_deref()
+            .and_then(|c| c.parent())
+            .expect("the root-B spawn must have a namespaced capture file");
+        assert!(ns_b.starts_with(&root_b), "root B owns its namespace");
         assert!(
-            root_b
-                .join(std::process::id().to_string())
-                .join("claude-settings.json")
-                .is_file(),
+            ns_b.join("claude-settings.json").is_file(),
             "the interleaved root must keep its own namespaced assets"
         );
         let _ = std::fs::remove_dir_all(&dir);
@@ -2695,8 +2717,11 @@ mod tests {
             cwd: dir.clone(),
             group: None,
         });
-        let decoy = root_b
-            .join(std::process::id().to_string())
+        let decoy = s.tasks[1]
+            .capture_file
+            .as_deref()
+            .and_then(|c| c.parent())
+            .expect("the root-B spawn must have a namespaced capture file")
             .join(format!("task-{id}-0.json"));
         std::fs::write(&decoy, "{}").unwrap();
 
@@ -3253,16 +3278,12 @@ mod tests {
 
         // The stub invokes the injected notify script the way codex would.
         let payload = format!(r#"{{"type":"agent-turn-complete","thread-id":"{CAP_ID}"}}"#);
+        // The notify script sits beside the capture file, in a namespace
+        // whose nonce is unknowable before spawn: derive it from the env.
         install_script(
             &bin,
             "codex",
-            &format!(
-                "'{script}' '{payload}'",
-                script = runtime
-                    .join(std::process::id().to_string())
-                    .join("codex-notify.sh")
-                    .display(),
-            ),
+            &format!("\"${{FLEETCOM_CAPTURE_FILE%/*}}/codex-notify.sh\" '{payload}'"),
         );
         let mut s = Supervisor::new(24, 80);
         let mut ctx = agent_ctx_plus(&bin, &runtime, dir.clone(), &[("CODEX_HOME", &codex_home)]);
@@ -3371,13 +3392,9 @@ mod tests {
             &format!(
                 "printf '%s\\n' \"$@\" > '{out}/argv'\n\
                  printf '%s' \"${chain}\" > '{out}/chainenv'\n\
-                 '{script}' '{payload}'",
+                 \"${{FLEETCOM_CAPTURE_FILE%/*}}/codex-notify.sh\" '{payload}'",
                 out = dir.display(),
                 chain = NOTIFY_CHAIN_ENV,
-                script = runtime
-                    .join(std::process::id().to_string())
-                    .join("codex-notify.sh")
-                    .display(),
             ),
         );
         let mut s = Supervisor::new(24, 80);

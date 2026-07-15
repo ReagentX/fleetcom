@@ -226,17 +226,14 @@ fn save_once(stream: &mut UnixStream, recipe: &Path, name: &str) -> String {
 }
 
 /// Whether the daemon's capture namespace holds a non-empty per-run capture
-/// file. Capture files and assets live under `<runtime>/<pid>/`; nothing
-/// sits at the root, so any numeric namespace here is the daemon's.
+/// file. Capture files and assets live under `<runtime>/<pid>-<nonce>/`;
+/// nothing sits at the root, so any subdirectory here is a daemon
+/// incarnation's namespace.
 fn has_capture(runtime: &Path) -> bool {
     std::fs::read_dir(runtime).is_ok_and(|namespaces| {
         namespaces
             .flatten()
-            .filter(|ns| {
-                ns.file_name()
-                    .to_str()
-                    .is_some_and(|n| n.parse::<u32>().is_ok())
-            })
+            .filter(|ns| ns.path().is_dir())
             .any(|ns| {
                 std::fs::read_dir(ns.path()).is_ok_and(|files| {
                     files.flatten().any(|e| {
@@ -283,14 +280,26 @@ fn claude_spawn_save_load_resumes_the_conversation() {
     });
     let id = value_after(&argv, "--session-id").to_string();
     assert_eq!(id.len(), 36, "pinned id must be uuid-shaped: {argv:?}");
-    let settings = s
-        .runtime()
-        .join(daemon.0.id().to_string())
-        .join("claude-settings.json");
+    let settings = PathBuf::from(value_after(&argv, "--settings"));
+    let runtime = s.runtime();
+    let ns = settings
+        .parent()
+        .expect("the overlay must sit in a namespace");
     assert_eq!(
-        value_after(&argv, "--settings"),
-        settings.display().to_string(),
-        "the overlay must sit in the daemon's pid namespace under the hello's runtime root: {argv:?}"
+        ns.parent(),
+        Some(runtime.as_path()),
+        "the namespace must sit under the hello's runtime root: {argv:?}"
+    );
+    assert!(
+        ns.file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.starts_with(&format!("{}-", daemon.0.id()))),
+        "the namespace must carry the daemon's pid prefix: {argv:?}"
+    );
+    assert_eq!(
+        settings.file_name().and_then(|n| n.to_str()),
+        Some("claude-settings.json"),
+        "the overlay must be the installed settings file: {argv:?}"
     );
     assert!(
         settings.is_file(),
@@ -343,17 +352,33 @@ fn codex_capture_file_drives_save_and_load_resumes() {
     stream.write_all(&spawn_frame("codex", &s.work())).unwrap();
     let rec = s.record("codex");
     let argv = wait_run(&rec, 0, |a| a.iter().any(|t| t.starts_with("notify=[")));
-    let notify = format!(
-        r#"notify=["{}"]"#,
-        s.runtime()
-            .join(daemon.0.id().to_string())
-            .join("codex-notify.sh")
-            .display()
+    let notify = value_after(&argv, "-c").to_string();
+    let script = notify
+        .strip_prefix(r#"notify=[""#)
+        .and_then(|v| v.strip_suffix(r#""]"#))
+        .map(PathBuf::from)
+        .unwrap_or_else(|| panic!("spawn must route notify at one script: {argv:?}"));
+    let runtime = s.runtime();
+    let ns = script.parent().expect("the script must sit in a namespace");
+    assert_eq!(
+        ns.parent(),
+        Some(runtime.as_path()),
+        "the namespace must sit under the hello's runtime root: {argv:?}"
+    );
+    assert!(
+        ns.file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.starts_with(&format!("{}-", daemon.0.id()))),
+        "the namespace must carry the daemon's pid prefix: {argv:?}"
     );
     assert_eq!(
-        value_after(&argv, "-c"),
-        notify,
-        "spawn must route notify at the installed script: {argv:?}"
+        script.file_name().and_then(|n| n.to_str()),
+        Some("codex-notify.sh"),
+        "the override must name the installed script: {argv:?}"
+    );
+    assert!(
+        script.is_file(),
+        "the daemon's namespace must hold the installed notify script"
     );
 
     // The stub exits silently, so its capture write is the only id channel;
