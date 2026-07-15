@@ -223,7 +223,12 @@ pub struct Task {
     /// Whether the group has received the one SIGKILL escalation.
     kill_sent: bool,
     /// Whether the leader has been reaped; its process group must not be
-    /// signalled afterward because the ID may have been reused.
+    /// signalled afterward because the ID may have been reused (`terminate`
+    /// and `force_kill` gate on this). The signal-0 existence probe
+    /// (`group_gone`) is the one carve-out: it delivers nothing, so a
+    /// recycled ID cannot be harmed, and its errors are one-sided; ESRCH is
+    /// conclusive while a stale "exists" only extends a wait that stays
+    /// bounded by the shutdown grace.
     reaped: bool,
 }
 
@@ -433,7 +438,8 @@ impl Task {
     /// reaping it. `WNOWAIT` leaves the zombie in place, which is what keeps
     /// the pid (and therefore the pgid) reserved so the group stays signalable
     /// for the task's whole life; see the `reaped` field. The zombie is
-    /// collected exactly once, at teardown (`collect`).
+    /// collected exactly once: at teardown (`collect`), or by the shutdown
+    /// emptiness probe (`group_gone`).
     pub fn poll_exit(&mut self) -> io::Result<()> {
         if self.finished.is_some() || self.reaped {
             return Ok(());
@@ -716,6 +722,55 @@ impl Task {
         // clone drops when it exits, closing the queue.
         self.input_tx.take();
     }
+
+    /// Whether this task's process group is observably gone: leader reaped
+    /// and a signal-0 group probe answering ESRCH. The shutdown wait's exit
+    /// test; nothing else may call it, because it spends the zombie.
+    ///
+    /// The order inside one call is load-bearing. An unreaped zombie leader
+    /// keeps the group answering kill-style probes regardless of member
+    /// count (Linux reports it Ok, macOS EPERM, never ESRCH), so emptiness
+    /// is unobservable until the leader is reaped: reap first, probe second,
+    /// in the same pass, before the freed pid could plausibly recycle. Later
+    /// calls re-probe a long-reaped ID, which is safe only because the
+    /// probe's errors are one-sided: surviving members keep the pgid
+    /// reserved (a pid still serving as a live group's ID is not reissued),
+    /// so "exists" stays truthful while anyone remains; a recycled ID
+    /// misreads only as "exists", a bounded wait, never a stray signal; and
+    /// ESRCH cannot be wrong, since an ID with no group behind it cannot be
+    /// this group with members. Real signals get no such carve-out (see
+    /// `reaped`).
+    ///
+    /// The reap spends the pgid reservation `force_kill` relies on: a group
+    /// that still has members afterward can no longer be KILL-escalated, so
+    /// TERM-refusing members outlive shutdown and reparent to init. That is
+    /// the price of observing emptiness at all; the graveyard declines to
+    /// pay it and keeps its zombies until `kill_sent` (see
+    /// `Supervisor::reap`).
+    pub(crate) fn group_gone(&mut self) -> bool {
+        let Some(pid) = self.pid else {
+            // No pid was ever known: nothing waitable or signalable exists.
+            return true;
+        };
+        if self.finished.is_none() {
+            // A live leader is a live group; the zombie-spending reap below
+            // must never run before the leader has exited.
+            return false;
+        }
+        if !self.reaped {
+            self.collect();
+            if !self.reaped {
+                // Transient waitid failure: hold shutdown and retry next pass.
+                return false;
+            }
+        }
+        // Only ESRCH reads as gone. Ok is a live signalable member; EPERM is
+        // a member that exists but is beyond our signals. Both hold the wait.
+        matches!(
+            killpg(Pid::from_raw(pid as i32), None::<Signal>),
+            Err(nix::errno::Errno::ESRCH)
+        )
+    }
 }
 
 impl Drop for Task {
@@ -904,6 +959,80 @@ mod tests {
         }
         assert!(t.try_collect(), "KILLed leader was never collected");
         assert_eq!(t.exit_code, Some(137));
+    }
+
+    /// The shutdown probe reaps the exited leader, then probes the group in
+    /// the same pass: a zombie-only group turns gone in that one call. The
+    /// pre-reap assertions pin why the reap must come first: the zombie
+    /// alone keeps the group id resolvable for kill-style probes.
+    #[test]
+    fn group_gone_reaps_then_probes_past_the_zombie() {
+        use nix::errno::Errno;
+        let mut t = spawn(30, "exit 0");
+        wait_finished(&mut t);
+        let pgid = Pid::from_raw(t.pid.expect("spawn always yields a pid") as i32);
+        // Zombie in place: the probe answer is Ok on Linux, EPERM on macOS,
+        // never ESRCH, so emptiness is invisible before the reap.
+        assert_ne!(
+            killpg(pgid, None::<Signal>),
+            Err(Errno::ESRCH),
+            "an unreaped zombie must keep the group id resolvable"
+        );
+        assert!(
+            t.group_gone(),
+            "a zombie-only group must probe gone in one reap+probe pass"
+        );
+        // The probe spent the zombie: the group id no longer resolves.
+        assert_eq!(killpg(pgid, None::<Signal>), Err(Errno::ESRCH));
+    }
+
+    /// A member that survives the leader holds the probe after the reap,
+    /// and the probe turns gone once that member dies.
+    #[test]
+    fn group_gone_holds_while_a_member_survives() {
+        use nix::sys::signal::kill;
+        let dir = std::env::temp_dir().join(format!("fleetcom_task_gone_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let spid = dir.join("spid");
+        // `trap '' HUP` first: the `&` child must survive its session
+        // leader's exit to be a straggler (see the terminate test above).
+        let cmd = format!("trap '' HUP; sleep 300 & echo $! > {}", spid.display());
+        let mut t = Task::spawn(31, &cmd, &cmd, &here(), 24, 80, &sh_env(), no_waker()).unwrap();
+        wait_finished(&mut t);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut straggler = None;
+        while straggler.is_none() && Instant::now() < deadline {
+            straggler = std::fs::read_to_string(&spid)
+                .ok()
+                .and_then(|s| s.trim().parse::<i32>().ok());
+            thread::sleep(Duration::from_millis(10));
+        }
+        let straggler = Pid::from_raw(straggler.expect("straggler pid never written"));
+
+        assert!(!t.group_gone(), "a surviving member must hold the probe");
+        assert!(t.reaped, "the probe reaps the exited leader to see past it");
+
+        let _ = kill(straggler, Signal::SIGKILL);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !t.group_gone() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            t.group_gone(),
+            "the group must probe gone once its last member dies"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `finished` gates the zombie-spending reap: a leader that has not
+    /// exited is never reaped (or waited on) by the probe.
+    #[test]
+    fn group_gone_never_reaps_a_live_leader() {
+        let mut t = spawn(32, "sleep 300");
+        assert!(!t.group_gone(), "a live leader is a live group");
+        assert!(!t.reaped, "the probe must not reap a running leader");
+        t.terminate();
     }
 
     /// Paste encoding follows the child's DECSET 2004 opt-in: markers only
