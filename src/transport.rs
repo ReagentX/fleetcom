@@ -8,15 +8,11 @@ use std::{
         mpsc::{Receiver, Sender, TryRecvError, channel},
     },
     thread::{self, JoinHandle},
-    time::Duration,
 };
-
-/// Maximum time allowed for one command-frame write to the daemon.
-const SEND_TIMEOUT: Duration = Duration::from_secs(5);
 
 use crate::{
     core::{Wake, run_loop},
-    frame::{read_frame, write_frame},
+    frame::{SEND_TIMEOUT, read_frame, write_frame},
     protocol::{Command, Event, decode_event, encode_command},
     supervisor::Supervisor,
 };

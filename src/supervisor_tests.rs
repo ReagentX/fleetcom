@@ -494,7 +494,7 @@ fn clear_watch_stops_screen_stream_and_resets_dedup() {
 /// carried over), and the command really re-executes (the marker file
 /// gains one line per run).
 #[test]
-fn restart_reruns_finished_task_in_place() {
+fn rerun_replaces_finished_task_in_place() {
     use crate::protocol::Lifecycle;
     let dir = scratch("restart");
     let marker = dir.join("marker");
@@ -686,7 +686,7 @@ fn spawn_carries_a_normalized_group_from_birth() {
 
 /// Restart preserves the task's group and tag.
 #[test]
-fn restart_carries_the_group_over() {
+fn rerun_carries_the_group_over() {
     use crate::protocol::Lifecycle;
     let mut s = sup(24, 80);
     s.apply(Command::Spawn {
@@ -713,7 +713,7 @@ fn restart_carries_the_group_over() {
 
 /// Restart preserves the task's name.
 #[test]
-fn restart_carries_the_name_over() {
+fn rerun_carries_the_name_over() {
     use crate::protocol::Lifecycle;
     let mut s = sup(24, 80);
     s.apply(Command::Spawn {
@@ -745,7 +745,7 @@ fn restart_carries_the_name_over() {
 /// `Restart` never kills: a running task is refused with a status notice
 /// and keeps running. An unknown id gets a notice too, not a panic.
 #[test]
-fn restart_refuses_running_task_and_unknown_id() {
+fn rerun_refuses_running_task_and_unknown_id() {
     use crate::protocol::Lifecycle;
     let mut s = sup(24, 80);
     s.apply(Command::Spawn {
@@ -787,7 +787,7 @@ fn restart_refuses_running_task_and_unknown_id() {
 /// screen, so only the fingerprint reset makes this pass: without it the
 /// fresh screen would be skipped as "unchanged".
 #[test]
-fn restart_watched_task_resends_screen() {
+fn rerun_watched_task_resends_screen() {
     use crate::protocol::Lifecycle;
     let mut s = sup(24, 80);
     s.apply(Command::Spawn {
@@ -1042,7 +1042,7 @@ fn remove_sweeps_stragglers_of_an_exited_leader() {
 /// The old run's HUP-immune straggler dies of the TERM while the fresh run
 /// (same id) is already up.
 #[test]
-fn restart_sweeps_stragglers_of_the_old_run() {
+fn rerun_sweeps_stragglers_of_the_old_run() {
     use nix::sys::signal::kill;
     let dir = scratch("restart_sweep");
     let (spid, ready) = (dir.join("spid"), dir.join("ready"));
@@ -1759,7 +1759,7 @@ fn spawn_resuming_claude_injects_only_the_capture_channel() {
 /// Rerun prefers the capture-file ID, stores the resulting resume command,
 /// and retains the displaced run's capture file while that run is reaped.
 #[test]
-fn restart_resumes_the_captured_conversation() {
+fn rerun_resumes_the_captured_conversation() {
     use crate::protocol::Lifecycle;
     let dir = scratch("cap_restart");
     let (bin, runtime) = (dir.join("bin"), dir.join("run"));
@@ -1818,7 +1818,7 @@ fn restart_resumes_the_captured_conversation() {
 /// A rerun uses a new capture path, so the displaced run's payload and
 /// later writes cannot affect the replacement.
 #[test]
-fn restart_cannot_read_the_old_runs_stale_capture() {
+fn rerun_cannot_read_the_old_runs_stale_capture() {
     let dir = scratch("cap_stale_run");
     let (bin, runtime, config) = (dir.join("bin"), dir.join("run"), dir.join("config"));
     // The session drifts to CAP_ID mid-run and the exit hint reports it.
@@ -2211,7 +2211,7 @@ fn save_scrapes_a_finished_task_without_reap() {
 /// Restarting between process exit and the next reap tick latches the exit,
 /// scrapes the hint, and resumes that session.
 #[test]
-fn restart_scrapes_a_finished_task_without_reap() {
+fn rerun_scrapes_a_finished_task_without_reap() {
     let dir = scratch("restart_sync_scrape");
     let (bin, runtime) = (dir.join("bin"), dir.join("run"));
     install_script(

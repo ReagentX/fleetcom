@@ -19,6 +19,9 @@ pub struct SessionEntry {
 /// Session recipe mapping directories to ordered entries.
 pub type SessionConfig = BTreeMap<String, Vec<SessionEntry>>;
 
+/// Env var overriding the config root that session recipes live under.
+pub const FLEETCOM_CONFIG_DIR: &str = "FLEETCOM_CONFIG_DIR";
+
 /// Characters replaced with `_` in session filenames.
 const DISALLOWED: &[char] = &['*', '"', '/', '\\', '<', '>', ':', '|', '?', '.'];
 
@@ -37,12 +40,14 @@ fn sanitize(name: &str) -> String {
         .collect()
 }
 
-/// `<config>/fleetcom/sessions`, overridable with `FLEETCOM_CONFIG_DIR`.
-pub fn sessions_dir() -> Option<PathBuf> {
-    if let Ok(dir) = std::env::var("FLEETCOM_CONFIG_DIR") {
-        return Some(PathBuf::from(dir).join("sessions"));
-    }
-    dirs::config_dir().map(|c| c.join("fleetcom").join("sessions"))
+/// Session-recipe directory: `<config root>/sessions`. A caller-supplied
+/// `root` wins (the supervisor passes the connecting client's
+/// [`FLEETCOM_CONFIG_DIR`]); otherwise the same var from this process's env,
+/// else `dirs::config_dir()/fleetcom`.
+pub fn sessions_dir(root: Option<PathBuf>) -> Option<PathBuf> {
+    root.or_else(|| std::env::var(FLEETCOM_CONFIG_DIR).ok().map(PathBuf::from))
+        .or_else(|| dirs::config_dir().map(|c| c.join("fleetcom")))
+        .map(|base| base.join("sessions"))
 }
 
 fn to_json(cfg: &SessionConfig) -> String {

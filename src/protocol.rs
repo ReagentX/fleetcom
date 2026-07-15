@@ -32,6 +32,14 @@ impl LaunchContext {
     }
 }
 
+/// Look up `key` in a captured environment slice (the [`LaunchContext::env`]
+/// shape every spawn path carries).
+pub fn env_get<'a>(env: &'a [(OsString, OsString)], key: &str) -> Option<&'a OsStr> {
+    env.iter()
+        .find(|(k, _)| k == key)
+        .map(|(_, v)| v.as_os_str())
+}
+
 /// A client→core request. Every mutation of the task set is one of these; the
 /// client never touches a `Task` directly. Fire-and-forget: results come back
 /// as `Event`s, never as return values. The handshake uses `KIND_HELLO`, not a
@@ -221,6 +229,35 @@ fn u16_from(v: &jzon::JsonValue) -> Option<u16> {
     u16::try_from(v.as_u64()?).ok()
 }
 
+/// Decode an optional-string field: missing and null both mean the cleared
+/// state (`Some(None)`), a string is the set state, and any other type
+/// rejects the message (`None`).
+fn opt_str(v: &jzon::JsonValue) -> Option<Option<String>> {
+    if v.is_null() {
+        return Some(None);
+    }
+    Some(Some(v.as_str()?.to_string()))
+}
+
+/// Insert `key` only when the optional field is set; absence encodes `None`
+/// on the wire (see [`opt_str`]).
+fn insert_opt_str(o: &mut jzon::JsonValue, key: &str, val: &Option<String>) {
+    if let Some(s) = val {
+        let _ = o.insert(key, s.as_str());
+    }
+}
+
+/// Decode a JSON array of strings one-to-one. A non-string member rejects
+/// the whole array, preserving the mapping between encoded and decoded
+/// positions.
+fn str_vec(v: &jzon::JsonValue) -> Option<Vec<String>> {
+    let mut out = Vec::with_capacity(v.len());
+    for m in v.members() {
+        out.push(m.as_str()?.to_string());
+    }
+    Some(out)
+}
+
 fn lifecycle_str(l: Lifecycle) -> &'static str {
     match l {
         Lifecycle::Active => "active",
@@ -301,9 +338,7 @@ pub fn encode_command(cmd: &Command) -> (u8, Vec<u8>) {
             let _ = o.insert("t", "spawn");
             let _ = o.insert("command", command.as_str());
             let _ = o.insert("cwd", path_b64(cwd));
-            if let Some(g) = group {
-                let _ = o.insert("group", g.as_str());
-            }
+            insert_opt_str(&mut o, "group", group);
         }
         Command::Kill { id } => {
             let _ = o.insert("t", "kill");
@@ -326,17 +361,13 @@ pub fn encode_command(cmd: &Command) -> (u8, Vec<u8>) {
             let _ = o.insert("t", "group");
             let _ = o.insert("id", *id);
             // Absence of `g` encodes an unassigned task.
-            if let Some(g) = group {
-                let _ = o.insert("g", g.as_str());
-            }
+            insert_opt_str(&mut o, "g", group);
         }
         Command::SetName { id, name } => {
             let _ = o.insert("t", "name");
             let _ = o.insert("id", *id);
             // Absence of `n` encodes an unnamed task.
-            if let Some(n) = name {
-                let _ = o.insert("n", n.as_str());
-            }
+            insert_opt_str(&mut o, "n", name);
         }
         Command::Resize { rows, cols } => {
             let _ = o.insert("t", "resize");
@@ -429,11 +460,7 @@ pub fn decode_command(kind: u8, payload: &[u8]) -> Option<Command> {
             command: v["command"].as_str()?.to_string(),
             cwd: path_from_b64(&v["cwd"])?,
             // Missing and null group fields both decode as unassigned.
-            group: if v["group"].is_null() {
-                None
-            } else {
-                Some(v["group"].as_str()?.to_string())
-            },
+            group: opt_str(&v["group"])?,
         },
         "kill" => Command::Kill {
             id: v["id"].as_u64()?,
@@ -450,19 +477,11 @@ pub fn decode_command(kind: u8, payload: &[u8]) -> Option<Command> {
         },
         "group" => Command::SetGroup {
             id: v["id"].as_u64()?,
-            group: if v["g"].is_null() {
-                None
-            } else {
-                Some(v["g"].as_str()?.to_string())
-            },
+            group: opt_str(&v["g"])?,
         },
         "name" => Command::SetName {
             id: v["id"].as_u64()?,
-            name: if v["n"].is_null() {
-                None
-            } else {
-                Some(v["n"].as_str()?.to_string())
-            },
+            name: opt_str(&v["n"])?,
         },
         "resize" => Command::Resize {
             rows: u16_from(&v["rows"])?,
@@ -547,14 +566,9 @@ pub fn encode_event(ev: &Event) -> (u8, Vec<u8>) {
                 let _ = o.insert("command", tv.command.as_str());
                 let _ = o.insert("cwd", path_b64(&tv.cwd));
                 let _ = o.insert("tagged", tv.tagged);
-                // The group field is present only for assigned tasks.
-                if let Some(g) = &tv.group {
-                    let _ = o.insert("group", g.as_str());
-                }
-                // The name field is present only for named tasks.
-                if let Some(n) = &tv.name {
-                    let _ = o.insert("name", n.as_str());
-                }
+                // Group and name fields are present only when set.
+                insert_opt_str(&mut o, "group", &tv.group);
+                insert_opt_str(&mut o, "name", &tv.name);
                 let _ = o.insert("life", lifecycle_str(tv.lifecycle));
                 let _ = o.insert("preview", tv.preview.as_str());
                 let _ = o.insert("started_ms", tv.started_ago.as_millis() as u64);
@@ -625,18 +639,9 @@ pub fn decode_event(kind: u8, payload: &[u8]) -> Option<Event> {
                             command: tv["command"].as_str()?.to_string(),
                             cwd: path_from_b64(&tv["cwd"])?,
                             tagged: tv["tagged"].as_bool()?,
-                            // Missing and null group fields both mean unassigned.
-                            group: if tv["group"].is_null() {
-                                None
-                            } else {
-                                Some(tv["group"].as_str()?.to_string())
-                            },
-                            // Missing and null name fields both mean unnamed.
-                            name: if tv["name"].is_null() {
-                                None
-                            } else {
-                                Some(tv["name"].as_str()?.to_string())
-                            },
+                            // Missing and null both mean unassigned/unnamed.
+                            group: opt_str(&tv["group"])?,
+                            name: opt_str(&tv["name"])?,
                             lifecycle: lifecycle_from(tv["life"].as_str()?)?,
                             preview: tv["preview"].as_str()?.to_string(),
                             started_ago: Duration::from_millis(tv["started_ms"].as_u64()?),
@@ -645,15 +650,7 @@ pub fn decode_event(kind: u8, payload: &[u8]) -> Option<Event> {
                     Some(Event::Tasks(views))
                 }
                 "status" => Some(Event::Status(v["msg"].as_str()?.to_string())),
-                "sessions" => {
-                    // Preserve the one-to-one mapping between encoded and
-                    // decoded names. A non-string member invalidates the event.
-                    let mut names = Vec::with_capacity(v["names"].len());
-                    for n in v["names"].members() {
-                        names.push(n.as_str()?.to_string());
-                    }
-                    Some(Event::Sessions(names))
-                }
+                "sessions" => Some(Event::Sessions(str_vec(&v["names"])?)),
                 _ => None,
             }
         }
@@ -663,12 +660,7 @@ pub fn decode_event(kind: u8, payload: &[u8]) -> Option<Event> {
             let formatted = payload.get(4 + hlen..)?.to_vec();
             let h = jzon::parse(std::str::from_utf8(header_bytes).ok()?).ok()?;
             let cursor = (u16_from(&h["cursor"][0])?, u16_from(&h["cursor"][1])?);
-            // Preserve the one-to-one mapping between encoded and decoded rows.
-            // A non-string row invalidates the event.
-            let mut lines = Vec::with_capacity(h["lines"].len());
-            for l in h["lines"].members() {
-                lines.push(l.as_str()?.to_string());
-            }
+            let lines = str_vec(&h["lines"])?;
             Some(Event::Screen(ScreenView {
                 id: h["id"].as_u64()?,
                 lines,

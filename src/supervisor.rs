@@ -17,7 +17,7 @@ use crate::{
     core::{Wake, Waker},
     harness::{self, assets},
     path,
-    protocol::{Command, Event, LaunchContext, ScreenView, ScrollAction, TaskView},
+    protocol::{Command, Event, LaunchContext, ScreenView, ScrollAction, TaskView, env_get},
     session::{self, SessionConfig, SessionEntry},
     task::Task,
 };
@@ -114,11 +114,7 @@ fn scrape_now(t: &mut Task) {
 /// override wins, followed by `$HOME/<tool dot directory>`; neither yields
 /// `None` so the harness can apply its platform-home fallback.
 fn harness_home(env: &[(OsString, OsString)], h: &dyn harness::Harness) -> Option<PathBuf> {
-    let val = |key: &str| {
-        env.iter()
-            .find(|(k, _)| k == key)
-            .map(|(_, v)| PathBuf::from(v))
-    };
+    let val = |key: &str| env_get(env, key).map(PathBuf::from);
     val(h.home_env_var()).or_else(|| Some(val("HOME")?.join(h.home_dot_dir())))
 }
 
@@ -227,7 +223,7 @@ impl Supervisor {
                 command,
                 cwd,
                 group,
-            } => self.spawn(&command, cwd, normalize_group(group)),
+            } => self.spawn(&command, cwd, group),
             Command::Kill { id } => {
                 if let Some(t) = self.by_id_mut(id) {
                     t.terminate();
@@ -246,7 +242,7 @@ impl Supervisor {
                     self.graveyard.push(t);
                 }
             }
-            Command::Restart { id } => self.restart(id),
+            Command::Restart { id } => self.rerun(id),
             Command::Tag { id, on } => {
                 if let Some(t) = self.by_id_mut(id) {
                     t.tagged = on;
@@ -455,12 +451,17 @@ impl Supervisor {
 
     // --- internals ------------------------------------------------------------
 
+    /// Queue a one-line notice for the client's status line.
+    fn status(&mut self, msg: impl Into<String>) {
+        self.events.push(Event::Status(msg.into()));
+    }
+
     /// Report the task and message size for a bounded writer-queue refusal.
     fn notice_refused(&mut self, id: u64, what: &str, len: usize) {
-        self.events.push(Event::Status(format!(
+        self.status(format!(
             "task {id} is not reading input; dropped {} {what}",
             crate::format::bytes(len)
-        )));
+        ));
     }
 
     fn index_of(&self, id: u64) -> Option<usize> {
@@ -474,11 +475,16 @@ impl Supervisor {
     /// Return the launch context, or report that spawning is unavailable.
     fn launch_or_refuse(&mut self) -> Option<LaunchContext> {
         if self.launch.is_none() {
-            self.events.push(Event::Status(
-                "no launch context; reconnect and retry".into(),
-            ));
+            self.status("no launch context; reconnect and retry");
         }
         self.launch.clone()
+    }
+
+    /// Path-valued env override from the installed launch context; `None`
+    /// when no context is installed or the key is absent.
+    fn launch_env_path(&self, key: &str) -> Option<PathBuf> {
+        let ctx = self.launch.as_ref()?;
+        env_get(&ctx.env, key).map(PathBuf::from)
     }
 
     /// Resolve and install capture assets for the current launch context.
@@ -486,20 +492,17 @@ impl Supervisor {
     /// partitioned by session directory. Assets are cached by canonical root,
     /// and installation failure disables instrumentation for the spawn.
     fn ensure_capture_assets(&mut self) -> Option<&assets::CaptureAssets> {
-        let root = if let Some(ctx) = &self.launch
-            && let Some((_, dir)) = ctx.env.iter().find(|(k, _)| k == "FLEETCOM_RUNTIME_DIR")
-        {
-            Some(PathBuf::from(dir))
-        } else {
-            assets::runtime_root(None).map(|base| {
-                let key = self
-                    .sessions_root()
-                    .map(PathBuf::into_os_string)
-                    .unwrap_or_default();
-                base.join(fnv1a_hex(key.as_encoded_bytes()))
-            })
-        };
-        let root = root?;
+        let root = self
+            .launch_env_path(crate::daemon::FLEETCOM_RUNTIME_DIR)
+            .or_else(|| {
+                assets::runtime_root(None).map(|base| {
+                    let key = self
+                        .sessions_root()
+                        .map(PathBuf::into_os_string)
+                        .unwrap_or_default();
+                    base.join(fnv1a_hex(key.as_encoded_bytes()))
+                })
+            })?;
         if let Ok(key) = std::fs::canonicalize(&root)
             && self.capture.contains_key(&key)
         {
@@ -521,84 +524,89 @@ impl Supervisor {
         cwd: &Path,
         env: &[(OsString, OsString)],
     ) -> io::Result<Task> {
-        if let Some((h, inv)) = harness::detect(command) {
-            let paths = self.ensure_capture_assets().map(|a| a.paths_for(id, run));
-            if let Some(paths) = paths {
-                let home = harness_home(env, h);
-                let plan = h.instrument(&inv, &paths, home.as_deref());
-                let exec = format!("{command}{}", plan.args_suffix);
-                let mut env = env.to_vec();
-                env.extend(plan.env);
-                let mut task = Task::spawn(
-                    id,
-                    command,
-                    &exec,
-                    cwd,
-                    self.rows,
-                    self.cols,
-                    &env,
-                    Arc::clone(&self.waker),
-                )?;
-                task.harness = Some(h);
-                // Preserve the launch-time store for later correlation.
-                task.harness_home = home;
-                task.capture_file = Some(paths.capture_file);
-                task.resume_id = plan.injected_id.or_else(|| inv.known_id());
-                task.run = run;
-                return Ok(task);
-            }
+        // Instrumentation, when active, contributes an exec suffix, extra env,
+        // and post-spawn metadata; a plain command contributes nothing. A
+        // detected harness without capture assets (install failure) spawns
+        // plain: instrumentation is disabled, not the task.
+        let mut exec = std::borrow::Cow::Borrowed(command);
+        let mut env = std::borrow::Cow::Borrowed(env);
+        let mut meta = None;
+        if let Some((h, inv)) = harness::detect(command)
+            && let Some(paths) = self.ensure_capture_assets().map(|a| a.paths_for(id, run))
+        {
+            let home = harness_home(&env, h);
+            let plan = h.instrument(&inv, &paths, home.as_deref());
+            exec = format!("{command}{}", plan.args_suffix).into();
+            env.to_mut().extend(plan.env);
+            let resume_id = plan.injected_id.or_else(|| inv.known_id());
+            meta = Some((h, home, paths.capture_file, resume_id));
         }
         let mut task = Task::spawn(
             id,
             command,
-            command,
+            &exec,
             cwd,
             self.rows,
             self.cols,
-            env,
+            &env,
             Arc::clone(&self.waker),
         )?;
+        if let Some((h, home, capture_file, resume_id)) = meta {
+            task.harness = Some(h);
+            // Preserve the launch-time store for later correlation.
+            task.harness_home = home;
+            task.capture_file = Some(capture_file);
+            task.resume_id = resume_id;
+        }
         task.run = run;
         Ok(task)
     }
 
+    /// Spawn under the next id and admit the task to the set, normalizing its
+    /// labels. The caller owns the `MAX_TASKS` gate and failure reporting,
+    /// which differ between direct spawns and session loads.
+    fn admit(
+        &mut self,
+        command: &str,
+        cwd: &Path,
+        env: &[(OsString, OsString)],
+        group: Option<String>,
+        name: Option<String>,
+    ) -> io::Result<()> {
+        let mut task = self.spawn_task(self.next_id, 0, command, cwd, env)?;
+        task.group = normalize_group(group);
+        task.name = normalize_label(name);
+        self.next_id += 1;
+        self.tasks.push(task);
+        Ok(())
+    }
+
     fn spawn(&mut self, command: &str, cwd: PathBuf, group: Option<String>) {
         if self.tasks.len() >= MAX_TASKS {
-            self.events.push(Event::Status(format!(
-                "task limit reached ({MAX_TASKS}), not spawning"
-            )));
+            self.status(format!("task limit reached ({MAX_TASKS}), not spawning"));
             return;
         }
         let Some(launch) = self.launch_or_refuse() else {
             return;
         };
-        match self.spawn_task(self.next_id, 0, command, &cwd, &launch.env) {
-            Ok(mut task) => {
-                task.group = group;
-                self.next_id += 1;
-                self.tasks.push(task);
-            }
-            Err(e) => self
-                .events
-                .push(Event::Status(format!("spawn failed: {e}"))),
+        if let Err(e) = self.admit(command, &cwd, &launch.env, group, None) {
+            self.status(format!("spawn failed: {e}"));
         }
     }
 
     /// Rerun a finished task in place while preserving its ID, tag, group, and
     /// name. If the task has a captured agent session, the replacement resumes
     /// the best-known ID.
-    fn restart(&mut self, id: u64) {
+    fn rerun(&mut self, id: u64) {
         let Some(i) = self.index_of(id) else {
-            self.events
-                .push(Event::Status(format!("rerun: no task {id}")));
+            self.status(format!("rerun: no task {id}"));
             return;
         };
         // Latch a recent exit and scrape its drained terminal before choosing
         // the rerun command.
         scrape_now(&mut self.tasks[i]);
         if self.tasks[i].finished.is_none() {
-            self.events
-                .push(Event::Status("rerun: task is still running".into()));
+            self.status("rerun: task is still running");
             return;
         }
         let Some(launch) = self.launch_or_refuse() else {
@@ -633,9 +641,7 @@ impl Supervisor {
                     self.last_screen = None;
                 }
             }
-            Err(e) => self
-                .events
-                .push(Event::Status(format!("spawn failed: {e}"))),
+            Err(e) => self.status(format!("spawn failed: {e}")),
         }
     }
 
@@ -683,12 +689,7 @@ impl Supervisor {
     /// `dirs::config_dir()`: resolving `dirs` against a foreign env would mean
     /// reimplementing it, and `FLEETCOM_CONFIG_DIR` is the supported override.
     fn sessions_root(&self) -> Option<PathBuf> {
-        if let Some(ctx) = &self.launch
-            && let Some((_, dir)) = ctx.env.iter().find(|(k, _)| k == "FLEETCOM_CONFIG_DIR")
-        {
-            return Some(PathBuf::from(dir).join("sessions"));
-        }
-        session::sessions_dir()
+        session::sessions_dir(self.launch_env_path(session::FLEETCOM_CONFIG_DIR))
     }
 
     fn save_session(&mut self, name: &str) {
@@ -707,7 +708,7 @@ impl Supervisor {
             Some(Err(e)) => format!("save failed: {e}"),
             None => "save failed: no config directory available".to_string(),
         };
-        self.events.push(Event::Status(status));
+        self.status(status);
     }
 
     /// Answer `ListSessions` with the recipe names under this connection's
@@ -730,8 +731,7 @@ impl Supervisor {
         {
             Some(Ok(c)) => c,
             _ => {
-                self.events
-                    .push(Event::Status(format!("session '{name}' not found")));
+                self.status(format!("session '{name}' not found"));
                 return;
             }
         };
@@ -750,14 +750,17 @@ impl Supervisor {
                     skipped += 1;
                     continue;
                 }
-                if let Ok(mut task) =
-                    self.spawn_task(self.next_id, 0, &entry.cmd, &resolved, &launch.env)
+                // `admit` normalizes the persisted labels before assignment.
+                if self
+                    .admit(
+                        &entry.cmd,
+                        &resolved,
+                        &launch.env,
+                        entry.group.clone(),
+                        entry.name.clone(),
+                    )
+                    .is_ok()
                 {
-                    // Normalize persisted labels before assigning them.
-                    task.group = normalize_group(entry.group.clone());
-                    task.name = normalize_label(entry.name.clone());
-                    self.next_id += 1;
-                    self.tasks.push(task);
                     spawned += 1;
                 }
             }
@@ -769,7 +772,7 @@ impl Supervisor {
         } else {
             format!("loaded '{name}': {spawned} task(s)")
         };
-        self.events.push(Event::Status(status));
+        self.status(status);
     }
 }
 

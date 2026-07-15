@@ -24,7 +24,7 @@ use rustix::process::{WaitId, WaitIdOptions, waitid};
 use crate::{
     core::{Wake, Waker},
     emulator::Emulator,
-    protocol::{Lifecycle, MouseKind, ScrollAction},
+    protocol::{Lifecycle, MouseKind, ScrollAction, env_get},
 };
 
 /// Number of history rows retained by each task's terminal grid.
@@ -200,7 +200,7 @@ pub struct Task {
     pub harness: Option<&'static dyn crate::harness::Harness>,
     /// Harness home resolved from this run's launch environment.
     pub harness_home: Option<PathBuf>,
-    /// Spawn generation used to give each rerun a distinct capture path.
+    /// Run number used to give each rerun a distinct capture path.
     pub run: u32,
     /// Session ID injected or recognized at spawn. Later capture data or an
     /// exit hint can supersede it.
@@ -250,19 +250,33 @@ fn grid(parser: &FairMutex<Emulator>) -> impl std::ops::DerefMut<Target = Emulat
     parser.lock()
 }
 
+/// Admit one whole message to a writer queue bounded by `MAX_PENDING_WRITE`,
+/// or refuse it whole. The cap check and the `fetch_add` are separate
+/// operations, so racing admitters can overshoot the cap by one message (see
+/// `Task::pending_write`). A failed send means the worker exited; the
+/// compensating `fetch_sub` removes that admission so the count never leaks.
+fn admit_write(
+    tx: &Sender<Vec<u8>>,
+    pending: &AtomicUsize,
+    msg: Vec<u8>,
+) -> Result<(), WriteRefused> {
+    let len = msg.len();
+    if pending.load(Ordering::Acquire) + len > MAX_PENDING_WRITE {
+        return Err(WriteRefused { len });
+    }
+    pending.fetch_add(len, Ordering::Release);
+    if tx.send(msg).is_err() {
+        pending.fetch_sub(len, Ordering::Release);
+    }
+    Ok(())
+}
+
 /// Queue allowlisted probe replies on the PTY writer worker. Replies use the
 /// normal pending-byte accounting and are dropped when the queue is full.
 fn forward_probe_replies(tx: &Sender<Vec<u8>>, pending: &AtomicUsize, replies: Vec<String>) {
     for reply in replies {
-        let len = reply.len();
-        if pending.load(Ordering::Acquire) + len > MAX_PENDING_WRITE {
-            continue;
-        }
-        pending.fetch_add(len, Ordering::Release);
-        if tx.send(reply.into_bytes()).is_err() {
-            // The worker has exited; remove the failed admission.
-            pending.fetch_sub(len, Ordering::Release);
-        }
+        // Drop-when-full: a refused probe reply is not worth a notice.
+        let _ = admit_write(tx, pending, reply.into_bytes());
     }
 }
 
@@ -305,10 +319,8 @@ impl Task {
         // the *first* client's env, the exact coupling per-connection context
         // exists to remove. A client env without SHELL gets the portable
         // default.
-        let shell = env
-            .iter()
-            .find(|(k, _)| k == "SHELL")
-            .map(|(_, v)| v.clone())
+        let shell = env_get(env, "SHELL")
+            .map(OsString::from)
             .unwrap_or_else(|| "/bin/sh".into());
         let mut cmd = CommandBuilder::new(shell);
         // Use a non-interactive shell. Interactive startup files, aliases, and
@@ -615,16 +627,7 @@ impl Task {
         let Some(tx) = &self.input_tx else {
             return Ok(());
         };
-        let len = msg.len();
-        if self.pending_write.load(Ordering::Acquire) + len > MAX_PENDING_WRITE {
-            return Err(WriteRefused { len });
-        }
-        self.pending_write.fetch_add(len, Ordering::Release);
-        if tx.send(msg).is_err() {
-            // The worker has exited; remove the failed admission from the count.
-            self.pending_write.fetch_sub(len, Ordering::Release);
-        }
-        Ok(())
+        admit_write(tx, &self.pending_write, msg)
     }
 
     /// Move the scrollback viewport, clamped to retained history.

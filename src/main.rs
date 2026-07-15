@@ -255,11 +255,12 @@ fn emit_restore_sequences(out: &mut impl io::Write, kitty_pushed: bool) -> io::R
     )
 }
 
-/// Route external termination signals into the app's quit flag so the loop
-/// runs its normal teardown (kill jobs, restore terminal) instead of dying in
-/// raw mode. `flag::register` only stores into an atomic, so it stays within
+/// Route external termination signals (SIGTERM/SIGHUP/SIGINT) into a quit
+/// flag so the observing loop runs its normal teardown — the client restores
+/// the terminal instead of dying in raw mode, the daemon kills its jobs
+/// cleanly. `flag::register` only stores into an atomic, so it stays within
 /// `#![forbid(unsafe_code)]`.
-fn install_signal_handlers(flag: Arc<AtomicBool>) -> io::Result<()> {
+pub(crate) fn install_signal_handlers(flag: Arc<AtomicBool>) -> io::Result<()> {
     use signal_hook::consts::{SIGHUP, SIGINT, SIGTERM};
     signal_hook::flag::register(SIGTERM, Arc::clone(&flag))?;
     signal_hook::flag::register(SIGHUP, Arc::clone(&flag))?;
