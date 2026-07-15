@@ -129,8 +129,11 @@ pub struct Supervisor {
     /// leader's zombie is collected. Invisible to `tick` snapshots, so the row
     /// disappears instantly while the sweep runs behind it.
     ///
-    /// Entries remain through `kill_grace` because group emptiness cannot be
-    /// reliably observed before escalation. `shutdown_all` waits for them.
+    /// Entries remain through `kill_grace` because observing group emptiness
+    /// would cost the escalation: the probe (`Task::group_gone`) must reap
+    /// the leader to see past its zombie, and a reaped group can no longer
+    /// be KILLed. Entries therefore keep their zombie until `kill_sent`, and
+    /// `shutdown_all` counts the graveyard instead of probing it.
     graveyard: Vec<Task>,
     next_id: u64,
     /// PTY content size (rows already minus the client's status bar). Every task
@@ -346,25 +349,38 @@ impl Supervisor {
         self.graveyard.retain_mut(|t| !t.try_collect());
     }
 
-    /// Kill every task for the quit path: TERM all groups at once, wait out one
-    /// shared grace (exiting early after all leaders and graveyard entries are
-    /// collected), then SIGKILL the stragglers. Blocking is bounded by the
-    /// grace. Anything the final KILLs don't collect (a leader in
-    /// uninterruptible sleep) reparents to init when the daemon exits moments
-    /// later; blocking on it here could wedge shutdown forever.
+    /// Kill every task for the quit path: TERM all groups at once, wait out
+    /// one shared grace, then SIGKILL the stragglers. The wait exits early
+    /// once `swept` proves there is nothing left to wait for; a task's
+    /// `finished` alone cannot gate it, because leader exit says nothing
+    /// about the rest of the group (`cmd & exit 0` leaves members behind),
+    /// and a leader-only predicate KILLed those members the instant the last
+    /// leader happened to be done, skipping the TERM grace entirely.
+    /// Blocking is bounded by the grace. Anything the final KILLs don't
+    /// collect (a leader in uninterruptible sleep) reparents to init when
+    /// the daemon exits moments later, as do TERM-refusing members of a
+    /// group whose leader the emptiness probe reaped (see
+    /// `Task::group_gone`); blocking on either could wedge shutdown forever.
     fn shutdown_all(&mut self) {
         for t in &mut self.tasks {
             t.terminate();
         }
         let deadline = Instant::now() + self.kill_grace;
-        while (self.tasks.iter().any(|t| t.finished.is_none()) || !self.graveyard.is_empty())
-            && Instant::now() < deadline
-        {
+        while !self.swept() && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(25));
             self.reap();
         }
         self.tasks.clear(); // Drop force-kills whatever is left
         self.graveyard.clear();
+    }
+
+    /// Shutdown's exit test: every live task's process group probes gone and
+    /// the graveyard has drained. Graveyard entries are counted, not probed:
+    /// probing reaps the leader, and a reaped group forfeits the KILL its
+    /// pending escalation still owes (`Task::try_collect`'s `kill_sent` gate
+    /// exists for the same reason); they leave through `reap` as always.
+    fn swept(&mut self) -> bool {
+        self.graveyard.is_empty() && self.tasks.iter_mut().all(Task::group_gone)
     }
 
     /// One step of the core's own loop: reap exits, then emit a fresh task
@@ -1928,6 +1944,81 @@ mod tests {
             "straggler survived shutdown"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The defect the group probe fixes: every leader exits at birth after
+    /// backgrounding a TERM-refusing child, so the old leader-only predicate
+    /// saw nothing to wait for and Drop KILLed the child instantly. Shutdown
+    /// must instead hold the full grace while the group probes non-empty;
+    /// the child, unreachable by KILL once the probe reaped its leader,
+    /// survives to reparent.
+    #[test]
+    fn shutdown_holds_the_grace_for_members_of_an_exited_leader() {
+        use nix::sys::signal::{Signal, kill};
+        let dir = scratch("shutdown_leaderless");
+        let (spid, ready) = (dir.join("spid"), dir.join("ready"));
+        let mut s = sup(24, 80);
+        s.set_kill_grace(Duration::from_millis(400));
+        hello_with_sh(&mut s, dir.clone());
+        let id = spawn_ready(
+            &mut s,
+            format!(
+                "trap '' HUP; (trap '' TERM; exec sleep 300) & echo $! > {sp}; echo r > {r}",
+                sp = spid.display(),
+                r = ready.display()
+            ),
+            dir.clone(),
+            &ready,
+        );
+        let straggler = read_pid(&spid);
+        assert!(reap_until(&mut s, Duration::from_secs(5), |s| {
+            s.tasks.iter().all(|t| t.id != id || t.finished.is_some())
+        }));
+        assert!(kill(straggler, None).is_ok(), "straggler should be alive");
+
+        let t0 = Instant::now();
+        s.apply(Command::Shutdown);
+        let elapsed = t0.elapsed();
+        let survived = kill(straggler, None).is_ok();
+        // Clean up the reparented survivor before asserting.
+        let _ = kill(straggler, Signal::SIGKILL);
+        assert!(
+            elapsed >= Duration::from_millis(400),
+            "shutdown returned in {elapsed:?} with a non-empty group: the grace was skipped"
+        );
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "shutdown took {elapsed:?}: not bounded by the 400 ms grace"
+        );
+        assert!(
+            survived,
+            "the straggler was KILLed instead of receiving the TERM grace"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Prompt exit, pinned: leaders exited long ago and left empty groups,
+    /// so shutdown returns in a few probe passes, nowhere near the grace.
+    #[test]
+    fn shutdown_is_prompt_when_every_group_is_already_empty() {
+        let mut s = sup(24, 80);
+        for _ in 0..2 {
+            s.apply(Command::Spawn {
+                command: "true".into(),
+                cwd: here(),
+                group: None,
+            });
+        }
+        assert!(reap_until(&mut s, Duration::from_secs(5), |s| {
+            s.tasks.len() == 2 && s.tasks.iter().all(|t| t.finished.is_some())
+        }));
+        let t0 = Instant::now();
+        s.apply(Command::Shutdown);
+        assert!(
+            t0.elapsed() < Duration::from_millis(500),
+            "shutdown of already-empty groups took {:?}: the early exit is gone",
+            t0.elapsed()
+        );
     }
 
     /// Session paths follow the connection's launch context: a hello env
