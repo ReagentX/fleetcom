@@ -1,6 +1,6 @@
 # Sessions
 
-A session records commands, working directories, and each task's optional group assignment and display name for repeatable launches. Loading starts new processes; it does not restore the processes that existed when the file was saved. Live process continuity belongs to the [daemon](README.md#directory--environment-configuration), which keeps jobs running across client disconnects.
+A session is a launch recipe, not a process snapshot. It records commands, working directories, and each task's optional group assignment and display name. Loading always starts new processes. Live process continuity belongs to the [daemon](README.md#storage-paths), which keeps jobs running across client disconnects.
 
 ## Storage
 
@@ -36,7 +36,7 @@ A session is a JSON object that maps each working directory to an ordered list o
 - Values are ordered lists. A string member is a bare shell command; the object form adds the optional group and display name assigned on load. Order is preserved, and each command runs in its own PTY under that directory.
 - Directories serialize alphabetically. Command order remains stable within each directory.
 
-The schema is a flat map with no version field or metadata, so it remains practical to edit by hand. On load, the daemon removes control characters, trims surrounding whitespace, and limits group and display names to 64 characters. `Unassigned` maps to no group but remains a legal display name. Invalid JSON fails the entire load. Within valid JSON, `fleetcom` drops any member that matches neither entry form, including a non-string scalar, an object without a string `cmd`, or an object with a non-string `group` or `name`.
+The schema is a flat map with no version field or metadata, which keeps manual edits practical. On load, the daemon removes control characters, trims surrounding whitespace, and limits group and display names to 64 characters. `Unassigned` maps to no group but remains a legal display name. Invalid JSON fails the entire load. Within valid JSON, `fleetcom` drops any member that matches neither entry form, including a non-string scalar, an object without a string `cmd`, or an object with a non-string `group` or `name`.
 
 Commands with neither a group nor a name use the string form. String and object entries can appear in the same directory array.
 

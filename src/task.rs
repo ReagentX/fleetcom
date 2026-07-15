@@ -1081,8 +1081,8 @@ mod tests {
     }
 
     /// Wheel routing follows the child's own escape sequences: nothing for an
-    /// inline child, alternate-scroll arrows for a full-screen one, real mouse
-    /// events once a protocol is requested, in the negotiated encoding.
+    /// inline child, alternate-scroll arrows for a full-screen one, and encoded
+    /// mouse events once the child requests a protocol.
     #[test]
     fn wheel_routes_by_child_state() {
         let up = MouseKind::WheelUp;

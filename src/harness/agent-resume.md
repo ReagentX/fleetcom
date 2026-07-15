@@ -1,8 +1,8 @@
 # Agent session resume
 
-Session files preserve launch commands, not application state. This is usually
-the correct boundary, but it is problematic for agent CLIs: relaunching a bare
-`claude`, `codex`, or `grok` command starts another conversation.
+Session files preserve launch commands, not application state. That boundary is
+problematic for agent CLIs because relaunching a bare `claude`, `codex`, or
+`grok` command starts another conversation.
 
 To preserve that conversation, `fleetcom` captures a validated ID and builds the
 resume command used by session save or rerun (`r`). Instrumentation changes only
@@ -10,7 +10,7 @@ the string executed through `$SHELL -c`; direct spawns and session loads still
 display the requested command. Rerun displays the generated resume command
 because that command becomes the task's new launch recipe.
 
-## Detection boundary
+## Accepted command boundary
 
 The capture boundary is intentionally narrow. Only these forms participate:
 
@@ -47,7 +47,7 @@ selecting an existing namespace. The run number gives each rerun a distinct
 capture file; as a result, a displaced process cannot overwrite the replacement
 run's session state. Installation leaves every other root entry unchanged.
 
-## How each tool exposes an ID
+## Evidence sources
 
 ### `claude`
 
@@ -111,7 +111,7 @@ After exit, the harness scans retained terminal text for the last
 correlation checks `<grok-home>/sessions/<encoded-cwd>/<uuid>/`, where `/` is
 encoded as `%2F` and `%` as `%25`.
 
-## Resolving conflicting IDs
+## ID precedence
 
 Several channels can identify different conversations during one task. To make
 the result deterministic, `fleetcom` chooses the first available ID in this
@@ -136,7 +136,7 @@ original command remains unchanged. A rerun increments the run number before
 spawning its replacement, so capture data from the displaced run cannot affect
 the new run.
 
-## Security boundary
+## Validation boundary
 
 Every captured value eventually enters a shell command, which makes validation
 the security boundary. Accepted IDs contain exactly lowercase hexadecimal

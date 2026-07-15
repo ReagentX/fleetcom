@@ -55,9 +55,8 @@ use crate::{
 /// client's bounded (`reconnect`) side.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// How long the startup client gives the daemon to ack before concluding it
-/// is busy serving another client and announcing the wait. A free daemon acks
-/// in microseconds.
+/// Probe duration before a startup client reports that the daemon is busy
+/// serving another client. The handshake continues waiting after the notice.
 const HELLO_PROBE: Duration = Duration::from_secs(1);
 
 /// Env var overriding the per-user runtime directory (socket, lock, and the
@@ -178,7 +177,7 @@ fn check_hello_ack(kind: u8, payload: &[u8]) -> io::Result<()> {
 /// this process's protocol version and launch context, require the daemon's
 /// ack. Every launch this connection makes then runs under *this* client's
 /// env, and a version mismatch surfaces as one actionable error here instead
-/// of a silently wrong environment later.
+/// of applying requests under an unverified environment.
 ///
 /// The daemon serves one client at a time, so a slow handshake means "queued
 /// behind another client", not failure: announce it and wait without a
@@ -293,7 +292,7 @@ fn spawn_daemon() -> io::Result<()> {
 /// socket: the daemon serves one client at a time, so a `Shutdown` *frame*
 /// would sit in the accept backlog until an attached client detached.
 /// `--kill` must work while someone else is attached. The pid comes from the
-/// lock file (trustworthy while the flock is held: the holder wrote it), and
+/// lock file, which is authoritative while the writer holds the flock, and
 /// daemon exit releases the flock, so acquiring it is the completion signal.
 /// A no-op (with a message) if no daemon is running.
 pub fn run_kill() -> io::Result<()> {
@@ -610,7 +609,7 @@ mod tests {
     use crate::testutil::temp;
 
     /// A symlink at the runtime-dir path is the planted shared-`/tmp` attack:
-    /// it must be rejected even when its target is a real directory, or the
+    /// it must be rejected even when its target is a directory, or the
     /// daemon (and the client's `daemon.log` create) would write through it.
     #[test]
     fn ensure_runtime_dir_rejects_symlink() {

@@ -1,8 +1,8 @@
 //! Length-prefixed, kind-tagged framing over a byte stream: `[u32 len][u8 kind]
 //! [payload]`, `len` counting the payload only. `read_frame` uses `read_exact`,
 //! so a frame split across partial socket reads reassembles correctly. `kind`
-//! separates jzon control frames from the raw-bytes screen frames, so
-//! high-frequency pane data pays no base64/number-array tax.
+//! separates jzon control frames from raw screen frames, keeping formatted pane
+//! bytes out of base64 or JSON number arrays.
 
 use std::{
     io::{self, Read, Write},
@@ -23,16 +23,14 @@ pub const KIND_HELLO: u8 = 3;
 /// verify that their maximum encoded payload fits.
 pub const MAX_FRAME: u32 = 64 * 1024 * 1024;
 
-/// Maximum time one frame write to a socket peer may block. A peer that
-/// stops draining its socket (crashed, SIGSTOPped, hostile) must not wedge
-/// the writer: the daemon's event writes and the client's command writes
-/// both cap here and treat expiry as a dead connection.
+/// Maximum time one frame write to a socket peer may block. A stalled peer can
+/// stop draining its socket, so daemon event writes and client command writes
+/// both use this cap and treat expiry as a dead connection.
 pub const SEND_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Write one frame and flush. Flushing per frame keeps latency low: the peer sees
-/// each command/event immediately. A firehose can't drown the socket because the
-/// core loop already coalesces screen emission to one frame per `FRAME_MIN` (see
-/// `core::run_loop`). The flush here is per *emitted* frame, not per output byte.
+/// Write and flush one frame. The core loop coalesces screen emission to one
+/// frame per `FRAME_MIN` (see `core::run_loop`), so flushing applies to emitted
+/// frames rather than individual PTY output bytes.
 pub fn write_frame(w: &mut impl Write, kind: u8, payload: &[u8]) -> io::Result<()> {
     // Reject an oversized payload before writing any part of the frame.
     let len = u32::try_from(payload.len())

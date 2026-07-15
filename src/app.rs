@@ -189,16 +189,15 @@ pub struct App {
     input_tx: Option<Sender<CtEvent>>,
     /// Wake notifications from the input and transport reader threads.
     wait_rx: Receiver<()>,
-    /// Kept so `run` can hand the stdin thread a poker, and `reconnect` a fresh
-    /// transport one.
+    /// Wake sender shared with the stdin thread and replacement transports.
     wait_tx: Sender<()>,
     /// Set by an external SIGTERM/SIGHUP/SIGINT; the loop treats it as quit so
     /// teardown runs and the terminal is restored.
     term_signal: Arc<AtomicBool>,
     should_quit: bool,
     /// How to leave when `should_quit` fires: `q`/Ctrl-C/signals disconnect
-    /// (daemon + jobs survive), `Q` quits and kills. Defaults to the safe
-    /// `Disconnect` so an unexpected exit never reaps the daemon.
+    /// while `Q` kills the jobs. The default is `Disconnect`, which preserves
+    /// daemon-owned jobs on an unexpected client exit.
     exit_intent: ExitIntent,
     /// Whether the client currently captures terminal mouse events.
     mouse_captured: bool,
@@ -233,12 +232,10 @@ fn step_down(sel: usize, len: usize) -> usize {
 }
 
 /// Dashboard grouping bucket: 0 tagged, 1 live, 2 parked live, 3 completed.
-/// Tagged wins over everything; completed is classified by `lifecycle`, never
-/// by trusting `parked == false`, so a core that ever shipped both signals
-/// still lands finished tasks in Completed. Placement follows `parked` — the
-/// core's 10 s debounced quiet signal — not the instantaneous
-/// `Lifecycle::Idle`: `top`-cadence output flaps the 600 ms glyph edge, and
-/// the glyph may flicker but the row must not change sections.
+/// Tagged tasks always use bucket 0, and finished lifecycle states use bucket
+/// 3. Live tasks use `parked`, the core's 10 s quiet signal, to select bucket 1
+/// or 2. `Lifecycle::Idle` uses a 600 ms edge, so a `top`-cadence task may
+/// change glyphs without changing sections.
 fn bucket(v: &TaskView) -> u8 {
     if v.tagged {
         0
@@ -295,8 +292,8 @@ impl App {
         }
     }
 
-    /// `--foreground`: run the core in-process on a thread (no daemon). A
-    /// non-daemon escape hatch, and the deterministic target the UI harnesses use.
+    /// `--foreground`: run the core in-process on a thread. This mode has no
+    /// daemon and gives UI tests a deterministic transport.
     pub fn new_foreground(rows: u16, cols: u16) -> App {
         App::assemble(rows, cols, |pr, c, wait_tx| {
             Box::new(ThreadTransport::spawn(Supervisor::new(pr, c), wait_tx))
@@ -398,8 +395,8 @@ impl App {
     }
 
     /// The watched task's screen, but only if it's the one `id` expects. Guards
-    /// against painting a stale screen for the wrong task on the frame a watch
-    /// switches (a real race once the core is across a socket).
+    /// against painting a stale screen for the wrong task while a socket-backed
+    /// watch switches targets.
     pub fn screen_for(&self, id: u64) -> Option<&ScreenView> {
         self.focused_screen.as_ref().filter(|s| s.id == id)
     }
@@ -1885,7 +1882,7 @@ mod tests {
     }
 
     /// An App whose core's session root is pinned to `dir` via the launch
-    /// context, so these tests never read this process's real config dir.
+    /// context, so these tests never read the host process's config directory.
     fn app_with_config_dir(dir: &Path) -> App {
         App::new_local_with_ctx(
             30,

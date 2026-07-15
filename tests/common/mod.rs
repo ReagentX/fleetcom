@@ -212,8 +212,8 @@ pub fn start_daemon_raw(
     (dir, daemon, stream)
 }
 
-/// `start_daemon_raw` plus the standard handshake: the connection is ready for
-/// commands, exactly like a real client's.
+/// `start_daemon_raw` plus the standard handshake, leaving a connection ready
+/// for commands from the integration-test client.
 pub fn start_daemon(
     tag: &str,
     configure: impl FnOnce(&mut Command),

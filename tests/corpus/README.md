@@ -3,7 +3,8 @@
 Synthetic escape sequences isolate parser rules, but they do not reproduce the
 state transitions emitted by real terminal programs. This corpus keeps their
 raw PTY output so the emulator tests can replay those transitions byte for
-byte.
+byte. The fixtures provide the evidence for display, parser, and resume-hint
+assertions that would otherwise depend on synthetic approximations.
 
 ## Capture method
 
@@ -27,7 +28,7 @@ feed the bytes to the emulator verbatim.
 | `dec_scrollregion.bin` | `printf` output with DEC line drawing (`ESC ( 0`) and `CSI 5;20r` | DEC charset translation; the non-top-anchored region does not scroll, and the later full-screen scroll retains one row |
 | `topregion_scroll.bin` | `printf` output with `CSI 1;20r`, 34 newlines through the bottom margin, and an isolation line below the region | top-anchored-region retention pinned at 35: 34 region scrolls plus the row preserved by `ESC[2J` |
 
-## Test classification
+## What the fixtures prove
 
 The fixtures provide evidence for three distinct boundaries:
 

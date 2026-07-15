@@ -41,7 +41,7 @@ pub fn env_get<'a>(env: &'a [(OsString, OsString)], key: &str) -> Option<&'a OsS
 }
 
 /// A client→core request. Every mutation of the task set is one of these; the
-/// client never touches a `Task` directly. Fire-and-forget: results come back
+/// client never touches a `Task` directly. Results come back
 /// as `Event`s, never as return values. The handshake uses `KIND_HELLO`, not a
 /// command.
 #[derive(Debug, Clone, PartialEq)]
@@ -576,7 +576,7 @@ pub fn decode_command(kind: u8, payload: &[u8]) -> Option<Command> {
 
 /// Serialize an event to `(kind, payload)`. `Tasks`/`Status` are jzon control
 /// frames; `Screen` is a `KIND_SCREEN` frame (`[u32 header_len][jzon header]
-/// [raw formatted bytes]`), so the formatted firehose stays raw.
+/// [raw formatted bytes]`), so formatted output remains raw.
 pub fn encode_event(ev: &Event) -> (u8, Vec<u8>) {
     match ev {
         Event::HelloOk => {

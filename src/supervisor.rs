@@ -723,8 +723,8 @@ impl Supervisor {
     }
 
     /// Spawn every command in the named session, each in its (existing) dir.
-    /// Missing dirs are skipped rather than spawning tasks doomed to fail on
-    /// chdir.
+    /// Missing directories are skipped because the task cannot change into
+    /// them before spawning.
     fn load_session(&mut self, name: &str) {
         let cfg = match self
             .sessions_root()

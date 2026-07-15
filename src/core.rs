@@ -10,8 +10,8 @@
 //! within a frame of the child emitting it. Two timers
 //! bound the extremes, neither on the interactive path:
 //!
-//! - `FRAME_MIN` caps screen emission under a firehose (a watched `yes`): a burst
-//!   of output coalesces into at most one screen per interval.
+//! - `FRAME_MIN` caps screen emission under sustained output (a watched `yes`):
+//!   a burst coalesces into at most one screen per interval.
 //! - `FALLBACK` is the idle backstop for the *time-based* dashboard state
 //!   (`started_ago`, the Active→Idle edge) that no wake announces, and the ceiling
 //!   on how long a missed wake could stall a repaint.
@@ -59,7 +59,7 @@ pub enum LoopExit {
     ClientGone,
 }
 
-/// Screen-emission ceiling: coalesce a firehose to at most one screen per
+/// Screen-emission ceiling: coalesce sustained output to at most one screen per
 /// interval. 8 ms limits emission to 125 frames per second and bounds the work
 /// a watched `yes` can induce.
 const FRAME_MIN: Duration = Duration::from_millis(8);
@@ -193,9 +193,9 @@ mod tests {
     }
 
     /// A keystroke to a watched task echoes back as a `Screen` event within a
-    /// frame, not on the idle backstop. Exercises the real path (a live PTY, its
+    /// frame, not on the idle backstop. Exercises a live PTY, its
     /// reader thread signalling the waker, `run_loop` waking and ticking), so it
-    /// fails loudly if the waker wiring breaks (echo would then only surface on
+    /// fails if the waker wiring breaks because echo would then surface on
     /// the 200 ms backstop).
     #[test]
     fn watched_input_echoes_without_polling_delay() {
