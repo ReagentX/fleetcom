@@ -4,20 +4,16 @@
 //! filesystem fallback correlates
 //! `<claude-home>/projects/<cwd-slug>/<uuid>.jsonl` transcripts.
 
-use std::{fs, path::Path, time::SystemTime};
+use std::{path::Path, time::SystemTime};
 
 use super::{
-    CAPTURE_ENV, CapturePaths, Harness, Invocation, SpawnPlan, detect_shape, is_uuid, leading_uuid,
-    resume_shape, shell_quote, uuid_v4, within_window,
+    CAPTURE_ENV, CapturePaths, Harness, Invocation, SpawnPlan, detect_shape, is_uuid, last_hint,
+    pin_plan, resume_shape, shell_quote, unique_in_window,
 };
 
 pub struct Claude;
 
 impl Harness for Claude {
-    fn name(&self) -> &'static str {
-        "claude"
-    }
-
     fn home_env_var(&self) -> &'static str {
         "CLAUDE_CONFIG_DIR"
     }
@@ -37,27 +33,15 @@ impl Harness for Claude {
         // The settings overlay does not depend on the Claude home path.
         _home: Option<&Path>,
     ) -> SpawnPlan {
-        let mut suffix = String::new();
-        let mut injected_id = None;
-        // The resume form already targets its conversation; only a bare
-        // launch pins a fresh ID.
-        if *inv == Invocation::Bare
-            && let Some(id) = uuid_v4()
-        {
-            suffix.push_str(" --session-id ");
-            suffix.push_str(&shell_quote(&id));
-            injected_id = Some(id);
-        }
-        suffix.push_str(" --settings ");
-        suffix.push_str(&shell_quote(&capture.claude_settings.to_string_lossy()));
-        SpawnPlan {
-            args_suffix: suffix,
-            env: vec![(
-                CAPTURE_ENV.into(),
-                capture.capture_file.clone().into_os_string(),
-            )],
-            injected_id,
-        }
+        let mut plan = pin_plan(inv);
+        plan.args_suffix.push_str(" --settings ");
+        plan.args_suffix
+            .push_str(&shell_quote(&capture.claude_settings.to_string_lossy()));
+        plan.env = vec![(
+            CAPTURE_ENV.into(),
+            capture.capture_file.clone().into_os_string(),
+        )];
+        plan
     }
 
     fn parse_capture(&self, payload: &str) -> Option<String> {
@@ -68,47 +52,19 @@ impl Harness for Claude {
 
     fn scrape_exit(&self, text: &str) -> Option<String> {
         // The last valid hint names the conversation at exit.
-        const HINT: &str = "claude --resume ";
-        let mut last = None;
-        for (i, _) in text.match_indices(HINT) {
-            if let Some(id) = leading_uuid(&text[i + HINT.len()..]) {
-                last = Some(id.to_string());
-            }
-        }
-        last
+        last_hint(text, &["claude --resume "])
     }
 
     fn correlate_fs(&self, cwd: &Path, spawned: SystemTime, home: Option<&Path>) -> Option<String> {
-        // Fall back to this process's home only when the launch environment
-        // supplied neither the tool-specific override nor HOME.
-        let root = match home {
-            Some(p) => p.to_path_buf(),
-            None => dirs::home_dir()?.join(".claude"),
-        };
-        let dir = root.join("projects").join(slug(cwd)?);
-        let mut candidates: Vec<String> = Vec::new();
-        for entry in fs::read_dir(dir).ok()?.flatten() {
+        let dir = self.home_root(home)?.join("projects").join(slug(cwd)?);
+        unique_in_window(dir, spawned, |entry| {
+            // A transcript's stem is its session ID.
             let path = entry.path();
             if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
-                continue;
+                return None;
             }
-            // Entries without creation times cannot be correlated by window.
-            let Ok(created) = entry.metadata().and_then(|m| m.created()) else {
-                continue;
-            };
-            if !within_window(created, spawned) {
-                continue;
-            }
-            if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
-                candidates.push(stem.to_string());
-            }
-        }
-        // Several in-window transcripts cannot be told apart; a stray
-        // non-uuid stem still counts against uniqueness.
-        match candidates.as_slice() {
-            [only] if is_uuid(only) => Some(only.clone()),
-            _ => None,
-        }
+            Some(path.file_stem()?.to_str()?.to_string())
+        })
     }
 
     fn resume_command(&self, cmd: &str, id: &str) -> String {
@@ -130,77 +86,30 @@ fn slug(cwd: &Path) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
+    use std::{fs, path::PathBuf};
 
+    use super::super::testutil::{ID, OTHER, paths};
     use super::*;
-    use crate::emulator::Emulator;
+    use crate::testutil::{corpus_emulator, temp};
 
-    const ID: &str = "c8c4a5cc-0b32-4ba0-a6b4-6ed08c218e0d";
-    const OTHER: &str = "11111111-2222-4333-8444-555555555555";
-
-    fn paths() -> CapturePaths {
-        CapturePaths {
-            capture_file: PathBuf::from("/tmp/cap/session.json"),
-            claude_settings: PathBuf::from("/tmp/Application Support/fleetcom.json"),
-            codex_notify: PathBuf::from("/tmp/cap/notify.sh"),
-        }
-    }
-
-    fn temp(tag: &str) -> PathBuf {
-        let d = std::env::temp_dir().join(format!("fleetcom_claude_test_{tag}"));
-        let _ = fs::remove_dir_all(&d);
-        d
-    }
-
-    #[test]
-    fn detect_accepts_the_two_authored_shapes() {
-        assert_eq!(Claude.detect("claude"), Some(Invocation::Bare));
-        assert_eq!(
-            Claude.detect("/usr/local/bin/claude"),
-            Some(Invocation::Bare)
-        );
-        for cmd in [
-            format!("claude --resume {ID}"),
-            format!("claude --resume '{ID}'"),
-            format!("/usr/local/bin/claude --resume '{ID}'"),
-        ] {
-            assert_eq!(
-                Claude.detect(&cmd),
-                Some(Invocation::Resume(ID.into())),
-                "{cmd}"
-            );
-        }
-    }
-
-    /// Prompts, flags, alternate resume forms, subcommands, and shell syntax
-    /// stay opaque and are never rewritten.
+    /// Claude-specific opaque shapes: flags, `--continue`/`-c`, subcommands,
+    /// the short/`=` resume spellings, and `--session-id`. The syntax shared
+    /// by every harness is covered by the table test in `harness::tests`.
     #[test]
     fn everything_else_is_opaque_and_never_rewritten() {
         let opaque: Vec<String> = [
-            "claude 'fix the tests'",
             "claude --model opus",
             "claude --continue",
             "claude -c",
-            "claude --resume",
-            "claude --resume not-a-uuid",
-            "claude --resume $ID",
             "claude mcp list",
-            "claude | tee log",
-            "claude; ls",
-            "FOO=bar claude",
             "claudius",
-            "codex",
-            "",
         ]
         .iter()
         .map(|s| s.to_string())
         .chain([
             format!("claude -r {ID}"),
-            format!("claude --resume={ID}"),
             format!("claude --resume {ID} --model opus"),
-            format!("claude --resume '{ID}' 'and do x'"),
             format!("claude --session-id {ID}"),
-            format!("claude --resume {ID}ff"),
         ])
         .collect();
         for cmd in opaque {
@@ -277,33 +186,9 @@ mod tests {
         assert_eq!(Claude.scrape_exit(&format!("claude --resume {ID}ff")), None);
     }
 
-    /// Both accepted shapes produce the canonical resume form while preserving
-    /// the program word as typed.
-    #[test]
-    fn resume_command_regenerates_the_canonical_form() {
-        assert_eq!(
-            Claude.resume_command("claude", ID),
-            format!("claude --resume '{ID}'")
-        );
-        assert_eq!(
-            Claude.resume_command("/usr/local/bin/claude", ID),
-            format!("/usr/local/bin/claude --resume '{ID}'")
-        );
-        assert_eq!(
-            Claude.resume_command(&format!("claude --resume '{OTHER}'"), ID),
-            format!("claude --resume '{ID}'")
-        );
-        assert_eq!(
-            Claude.resume_command(&format!("claude --resume {OTHER}"), ID),
-            format!("claude --resume '{ID}'")
-        );
-        // Invalid IDs leave the command unchanged.
-        assert_eq!(Claude.resume_command("claude", "evil'"), "claude");
-    }
-
     #[test]
     fn correlate_fs_requires_a_unique_in_window_transcript() {
-        let home = temp("correlate");
+        let home = temp("claude_correlate");
         // Slug: `/` and `.` both become `-`.
         let cwd = Path::new("/a/b.c");
         let dir = home.join("projects").join("-a-b-c");
@@ -332,7 +217,7 @@ mod tests {
 
     #[test]
     fn correlate_fs_rejects_a_unique_non_uuid_stem() {
-        let home = temp("nonuuid");
+        let home = temp("claude_nonuuid");
         let cwd = Path::new("/w");
         let dir = home.join("projects").join("-w");
         fs::create_dir_all(&dir).unwrap();
@@ -347,7 +232,7 @@ mod tests {
     /// The scraper recovers the exit-hint ID from the corpus terminal bytes.
     #[test]
     fn corpus_scrape_recovers_the_exit_hint_id() {
-        let mut emu = Emulator::new(40, 120, 2000);
+        let mut emu = corpus_emulator();
         emu.process(include_bytes!("../../tests/corpus/claude_resume.bin"));
         assert_eq!(
             Claude.scrape_exit(&emu.text_with_history()).as_deref(),

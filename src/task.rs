@@ -24,7 +24,7 @@ use rustix::process::{WaitId, WaitIdOptions, waitid};
 use crate::{
     core::{Wake, Waker},
     emulator::Emulator,
-    protocol::{Lifecycle, MouseKind, ScrollAction},
+    protocol::{Lifecycle, MouseKind, ScrollAction, env_get},
 };
 
 /// Number of history rows retained by each task's terminal grid.
@@ -58,7 +58,7 @@ const PASTE_END: &[u8] = b"\x1b[201~";
 /// terminators stripped, content otherwise verbatim. Legacy: no markers, and
 /// line endings (`\r\n` and bare `\n`) become `\r` (the byte Enter sends),
 /// because a legacy line editor reads `\n` as ^J, not as end-of-line.
-pub fn paste_bytes(bracketed: bool, content: &[u8]) -> Vec<u8> {
+fn paste_bytes(bracketed: bool, content: &[u8]) -> Vec<u8> {
     if bracketed {
         let mut out = Vec::with_capacity(content.len() + 2 * PASTE_END.len() + 6);
         out.extend_from_slice(b"\x1b[200~");
@@ -94,7 +94,7 @@ pub fn paste_bytes(bracketed: bool, content: &[u8]) -> Vec<u8> {
 /// no mouse protocol, wheel actions become alternate-scroll arrows when the
 /// alternate screen and DECSET 1007 are both active. DECSET 1007 defaults on;
 /// see [`Emulator::alternate_scroll`]. Unsupported actions return `None`.
-pub fn mouse_bytes(emu: &Emulator, kind: MouseKind, col: u16, row: u16) -> Option<Vec<u8>> {
+fn mouse_bytes(emu: &Emulator, kind: MouseKind, col: u16, row: u16) -> Option<Vec<u8>> {
     use crate::emulator::{MouseProtocolEncoding, MouseProtocolMode};
     let mode = emu.mouse_protocol_mode();
     if mode != MouseProtocolMode::None {
@@ -200,7 +200,7 @@ pub struct Task {
     pub harness: Option<&'static dyn crate::harness::Harness>,
     /// Harness home resolved from this run's launch environment.
     pub harness_home: Option<PathBuf>,
-    /// Spawn generation used to give each rerun a distinct capture path.
+    /// Run number used to give each rerun a distinct capture path.
     pub run: u32,
     /// Session ID injected or recognized at spawn. Later capture data or an
     /// exit hint can supersede it.
@@ -214,7 +214,7 @@ pub struct Task {
     scraped: bool,
     /// Wall-clock spawn time used for filesystem correlation.
     pub spawned_at: SystemTime,
-    pub exit_code: Option<i32>,
+    exit_code: Option<i32>,
     pub started: Instant,
     pub finished: Option<Instant>,
     /// When SIGTERM was sent (`terminate`): the start of the grace window the
@@ -250,19 +250,33 @@ fn grid(parser: &FairMutex<Emulator>) -> impl std::ops::DerefMut<Target = Emulat
     parser.lock()
 }
 
+/// Admit one whole message to a writer queue bounded by `MAX_PENDING_WRITE`,
+/// or refuse it whole. The cap check and the `fetch_add` are separate
+/// operations, so racing admitters can overshoot the cap by one message (see
+/// `Task::pending_write`). A failed send means the worker exited; the
+/// compensating `fetch_sub` removes that admission so the count never leaks.
+fn admit_write(
+    tx: &Sender<Vec<u8>>,
+    pending: &AtomicUsize,
+    msg: Vec<u8>,
+) -> Result<(), WriteRefused> {
+    let len = msg.len();
+    if pending.load(Ordering::Acquire) + len > MAX_PENDING_WRITE {
+        return Err(WriteRefused { len });
+    }
+    pending.fetch_add(len, Ordering::Release);
+    if tx.send(msg).is_err() {
+        pending.fetch_sub(len, Ordering::Release);
+    }
+    Ok(())
+}
+
 /// Queue allowlisted probe replies on the PTY writer worker. Replies use the
 /// normal pending-byte accounting and are dropped when the queue is full.
 fn forward_probe_replies(tx: &Sender<Vec<u8>>, pending: &AtomicUsize, replies: Vec<String>) {
     for reply in replies {
-        let len = reply.len();
-        if pending.load(Ordering::Acquire) + len > MAX_PENDING_WRITE {
-            continue;
-        }
-        pending.fetch_add(len, Ordering::Release);
-        if tx.send(reply.into_bytes()).is_err() {
-            // The worker has exited; remove the failed admission.
-            pending.fetch_sub(len, Ordering::Release);
-        }
+        // Drop-when-full: a refused probe reply is not worth a notice.
+        let _ = admit_write(tx, pending, reply.into_bytes());
     }
 }
 
@@ -305,10 +319,8 @@ impl Task {
         // the *first* client's env, the exact coupling per-connection context
         // exists to remove. A client env without SHELL gets the portable
         // default.
-        let shell = env
-            .iter()
-            .find(|(k, _)| k == "SHELL")
-            .map(|(_, v)| v.clone())
+        let shell = env_get(env, "SHELL")
+            .map(OsString::from)
             .unwrap_or_else(|| "/bin/sh".into());
         let mut cmd = CommandBuilder::new(shell);
         // Use a non-interactive shell. Interactive startup files, aliases, and
@@ -615,16 +627,7 @@ impl Task {
         let Some(tx) = &self.input_tx else {
             return Ok(());
         };
-        let len = msg.len();
-        if self.pending_write.load(Ordering::Acquire) + len > MAX_PENDING_WRITE {
-            return Err(WriteRefused { len });
-        }
-        self.pending_write.fetch_add(len, Ordering::Release);
-        if tx.send(msg).is_err() {
-            // The worker has exited; remove the failed admission from the count.
-            self.pending_write.fetch_sub(len, Ordering::Release);
-        }
-        Ok(())
+        admit_write(tx, &self.pending_write, msg)
     }
 
     /// Move the scrollback viewport, clamped to retained history.
@@ -789,6 +792,7 @@ impl Drop for Task {
 mod tests {
     use super::*;
     use crate::protocol::MouseBtn;
+    use crate::testutil::{read_pid, temp, wait_until};
 
     fn here() -> PathBuf {
         std::env::current_dir().unwrap()
@@ -829,14 +833,13 @@ mod tests {
     }
 
     fn wait_finished(t: &mut Task) {
-        for _ in 0..100 {
-            t.poll_exit().unwrap();
-            if t.finished.is_some() {
-                return;
-            }
-            thread::sleep(Duration::from_millis(20));
-        }
-        panic!("task never finished");
+        assert!(
+            wait_until(Duration::from_secs(5), || {
+                t.poll_exit().unwrap();
+                t.finished.is_some()
+            }),
+            "task never finished"
+        );
     }
 
     /// End-to-end plumbing: spawn under a PTY, the reader thread feeds the
@@ -845,14 +848,11 @@ mod tests {
     fn spawn_reads_output_and_exits_zero() {
         let mut t = spawn(1, "printf 'alpha\\nomega\\n'");
         let mut preview = String::new();
-        for _ in 0..100 {
+        wait_until(Duration::from_secs(5), || {
             t.poll_exit().unwrap();
             preview = t.preview();
-            if t.finished.is_some() && preview.contains("omega") {
-                break;
-            }
-            thread::sleep(Duration::from_millis(20));
-        }
+            t.finished.is_some() && preview.contains("omega")
+        });
         assert_eq!(t.exit_code, Some(0));
         assert!(preview.contains("omega"), "preview was {preview:?}");
         t.terminate();
@@ -914,10 +914,7 @@ mod tests {
     #[test]
     fn terminate_reaches_stragglers_after_leader_exit() {
         use nix::sys::signal::kill;
-        let dir =
-            std::env::temp_dir().join(format!("fleetcom_task_straggler_{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = temp("task_straggler");
         let spid = dir.join("spid");
         // `trap '' HUP` first: the ignore is inherited by the `&` child, which
         // must survive its session leader's exit (leader death HUPs the
@@ -925,24 +922,12 @@ mod tests {
         let cmd = format!("trap '' HUP; sleep 300 & echo $! > {}", spid.display());
         let mut t = Task::spawn(5, &cmd, &cmd, &here(), 24, 80, &sh_env(), no_waker()).unwrap();
         wait_finished(&mut t); // leader exits as soon as the background job is up
-        let deadline = Instant::now() + Duration::from_secs(5);
-        let mut straggler = None;
-        while straggler.is_none() && Instant::now() < deadline {
-            straggler = std::fs::read_to_string(&spid)
-                .ok()
-                .and_then(|s| s.trim().parse::<i32>().ok());
-            thread::sleep(Duration::from_millis(10));
-        }
-        let straggler = Pid::from_raw(straggler.expect("straggler pid never written"));
+        let straggler = read_pid(&spid);
         assert!(kill(straggler, None).is_ok(), "straggler should be alive");
 
         t.terminate(); // leader already finished: the group signal must still fire
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while kill(straggler, None).is_ok() && Instant::now() < deadline {
-            thread::sleep(Duration::from_millis(10));
-        }
         assert!(
-            kill(straggler, None).is_err(),
+            wait_until(Duration::from_secs(5), || kill(straggler, None).is_err()),
             "TERM after leader exit never reached the straggler"
         );
         let _ = std::fs::remove_dir_all(&dir);
@@ -953,11 +938,10 @@ mod tests {
     fn killed_leader_latches_137_via_collect() {
         let mut t = spawn(8, "sleep 300");
         t.force_kill(); // sets kill_sent, so try_collect may reap
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while !t.try_collect() && Instant::now() < deadline {
-            thread::sleep(Duration::from_millis(10));
-        }
-        assert!(t.try_collect(), "KILLed leader was never collected");
+        assert!(
+            wait_until(Duration::from_secs(5), || t.try_collect()),
+            "KILLed leader was never collected"
+        );
         assert_eq!(t.exit_code, Some(137));
     }
 
@@ -991,35 +975,21 @@ mod tests {
     #[test]
     fn group_gone_holds_while_a_member_survives() {
         use nix::sys::signal::kill;
-        let dir = std::env::temp_dir().join(format!("fleetcom_task_gone_{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = temp("task_gone");
         let spid = dir.join("spid");
         // `trap '' HUP` first: the `&` child must survive its session
         // leader's exit to be a straggler (see the terminate test above).
         let cmd = format!("trap '' HUP; sleep 300 & echo $! > {}", spid.display());
         let mut t = Task::spawn(31, &cmd, &cmd, &here(), 24, 80, &sh_env(), no_waker()).unwrap();
         wait_finished(&mut t);
-        let deadline = Instant::now() + Duration::from_secs(5);
-        let mut straggler = None;
-        while straggler.is_none() && Instant::now() < deadline {
-            straggler = std::fs::read_to_string(&spid)
-                .ok()
-                .and_then(|s| s.trim().parse::<i32>().ok());
-            thread::sleep(Duration::from_millis(10));
-        }
-        let straggler = Pid::from_raw(straggler.expect("straggler pid never written"));
+        let straggler = read_pid(&spid);
 
         assert!(!t.group_gone(), "a surviving member must hold the probe");
         assert!(t.reaped, "the probe reaps the exited leader to see past it");
 
         let _ = kill(straggler, Signal::SIGKILL);
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while !t.group_gone() && Instant::now() < deadline {
-            thread::sleep(Duration::from_millis(10));
-        }
         assert!(
-            t.group_gone(),
+            wait_until(Duration::from_secs(5), || t.group_gone()),
             "the group must probe gone once its last member dies"
         );
         let _ = std::fs::remove_dir_all(&dir);
@@ -1268,15 +1238,11 @@ mod tests {
         let mut t = spawn(10, "cat");
         t.send_input(b"zqfirstqz\n").unwrap();
         t.send_input(b"zqsecondqz\n").unwrap();
-        let deadline = Instant::now() + Duration::from_secs(5);
         let mut contents = String::new();
-        while Instant::now() < deadline {
+        wait_until(Duration::from_secs(5), || {
             contents = grid(&t.parser).contents();
-            if contents.contains("zqsecondqz") {
-                break;
-            }
-            thread::sleep(Duration::from_millis(10));
-        }
+            contents.contains("zqsecondqz")
+        });
         let first = contents
             .find("zqfirstqz")
             .expect("first message never echoed");
@@ -1306,9 +1272,7 @@ mod tests {
     #[test]
     fn scrape_exit_hint_waits_for_reader_eof() {
         const ID: &str = "c8c4a5cc-0b32-4ba0-a6b4-6ed08c218e0d";
-        let dir = std::env::temp_dir().join(format!("fleetcom_task_scrape_{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = temp("task_scrape");
         let flag = dir.join("flag");
         let cmd = format!(
             "until [ -e '{f}' ]; do sleep 0.05; done; \
@@ -1325,22 +1289,22 @@ mod tests {
         std::fs::write(&flag, b"").unwrap();
         // The process can exit while its hint remains blocked in the reader.
         // The long deadline bounds failure without constraining loaded CI.
-        let deadline = Instant::now() + Duration::from_secs(60);
-        while t.finished.is_none() && Instant::now() < deadline {
-            t.poll_exit().unwrap();
-            thread::sleep(Duration::from_millis(10));
-        }
-        assert!(t.finished.is_some(), "child never exited");
+        assert!(
+            wait_until(Duration::from_secs(60), || {
+                t.poll_exit().unwrap();
+                t.finished.is_some()
+            }),
+            "child never exited"
+        );
         t.scrape_exit_hint();
         assert_eq!(t.scraped_id, None, "the scrape must wait for reader EOF");
 
         // Release the reader so it can parse the hint and reach EOF.
         drop(guard);
-        let deadline = Instant::now() + Duration::from_secs(60);
-        while t.scraped_id.is_none() && Instant::now() < deadline {
+        wait_until(Duration::from_secs(60), || {
             t.scrape_exit_hint();
-            thread::sleep(Duration::from_millis(10));
-        }
+            t.scraped_id.is_some()
+        });
         assert_eq!(t.scraped_id.as_deref(), Some(ID));
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1353,9 +1317,7 @@ mod tests {
     /// bytes would arrive first and the assertion would see `ESC[>...`.
     #[test]
     fn probe_replies_reach_the_child_through_the_allowlist() {
-        let dir = std::env::temp_dir().join(format!("fleetcom_task_probe_{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = temp("task_probe");
         let out = dir.join("out");
         // Raw-ish input: the CPR reply has no newline, so canonical mode
         // would never hand it to the child.
@@ -1365,15 +1327,11 @@ mod tests {
             out.display()
         );
         let mut t = Task::spawn(11, &cmd, &cmd, &here(), 24, 80, &sh_env(), no_waker()).unwrap();
-        let deadline = Instant::now() + Duration::from_secs(5);
         let mut got = Vec::new();
-        while Instant::now() < deadline {
+        wait_until(Duration::from_secs(5), || {
             got = std::fs::read(&out).unwrap_or_default();
-            if got.len() >= 11 {
-                break;
-            }
-            thread::sleep(Duration::from_millis(20));
-        }
+            got.len() >= 11
+        });
         assert!(
             got.starts_with(b"\x1b[?6c\x1b["),
             "child must read the primary DA reply first (no secondary-DA \

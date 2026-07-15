@@ -36,7 +36,7 @@ use std::fmt::Write as _;
 
 use alacritty_terminal::{
     Term,
-    grid::Dimensions,
+    grid::{Dimensions, Row},
     index::{Column, Line},
     term::{
         TermMode,
@@ -119,22 +119,12 @@ pub fn formatted<T>(term: &Term<T>) -> (Vec<u8>, (u16, u16), bool) {
         let mut col = 0;
         while col < cols {
             let cell = &line[Column(col)];
-            // A paired spacer is recreated implicitly by the wide glyph one
-            // cell to its left; emitting it too would double-write.
-            if cell.flags.contains(Flags::WIDE_CHAR_SPACER)
-                && col > 0
-                && line[Column(col - 1)].flags.contains(Flags::WIDE_CHAR)
-            {
+            if paired_spacer(line, col) {
                 col += 1;
                 continue;
             }
             sync_sgr(&mut buf, &mut state, cell);
-            let paired_wide = cell.flags.contains(Flags::WIDE_CHAR)
-                && col + 1 < cols
-                && line[Column(col + 1)]
-                    .flags
-                    .contains(Flags::WIDE_CHAR_SPACER);
-            if paired_wide {
+            if paired_wide(line, col, cols) {
                 push_char(&mut buf, cell);
                 // The glyph writes its own spacer with identical attributes.
                 col += 2;
@@ -183,10 +173,7 @@ pub fn formatted<T>(term: &Term<T>) -> (Vec<u8>, (u16, u16), bool) {
         let line = &grid[point.line];
         // If the last column holds a paired spacer the write that set the
         // flag was the wide glyph one cell left; rewrite that instead.
-        let (base_col, base) = if last > 0
-            && line[Column(last)].flags.contains(Flags::WIDE_CHAR_SPACER)
-            && line[Column(last - 1)].flags.contains(Flags::WIDE_CHAR)
-        {
+        let (base_col, base) = if paired_spacer(line, last) {
             (last - 1, &line[Column(last - 1)])
         } else {
             (last, &line[Column(last)])
@@ -245,20 +232,12 @@ pub fn contents<T>(term: &Term<T>) -> String {
         let line = &grid[Line(row as i32 - offset)];
         for col in 0..cols {
             let cell = &line[Column(col)];
-            if cell.flags.contains(Flags::WIDE_CHAR_SPACER)
-                && col > 0
-                && line[Column(col - 1)].flags.contains(Flags::WIDE_CHAR)
-            {
+            if paired_spacer(line, col) {
                 continue;
             }
-            let paired_wide = cell.flags.contains(Flags::WIDE_CHAR)
-                && col + 1 < cols
-                && line[Column(col + 1)]
-                    .flags
-                    .contains(Flags::WIDE_CHAR_SPACER);
             // Same normalizations as `formatted` so both views agree.
             if cell.c == '\t'
-                || (!paired_wide
+                || (!paired_wide(line, col, cols)
                     && cell
                         .flags
                         .intersects(Flags::WIDE_CHAR | Flags::WIDE_CHAR_SPACER))
@@ -267,9 +246,7 @@ pub fn contents<T>(term: &Term<T>) -> String {
             } else {
                 out.push(cell.c);
             }
-            if let Some(zerowidth) = cell.zerowidth() {
-                out.extend(zerowidth.iter());
-            }
+            push_zerowidth(&mut out, cell);
         }
         while out.len() > row_start && out.ends_with(' ') {
             out.pop();
@@ -281,6 +258,26 @@ pub fn contents<T>(term: &Term<T>) -> String {
 /// Absolute cursor address from zero-based coordinates.
 fn cup(buf: &mut String, row: usize, col: usize) {
     let _ = write!(buf, "\x1b[{};{}H", row + 1, col + 1);
+}
+
+/// Whether `line[col]` is a spacer paired with a wide glyph in the cell to
+/// its left. Such a spacer is recreated implicitly by writing the glyph;
+/// emitting it too would double-write.
+fn paired_spacer(line: &Row<Cell>, col: usize) -> bool {
+    line[Column(col)].flags.contains(Flags::WIDE_CHAR_SPACER)
+        && col > 0
+        && line[Column(col - 1)].flags.contains(Flags::WIDE_CHAR)
+}
+
+/// Whether `line[col]` is a wide glyph paired with its spacer in the cell to
+/// its right; writing the glyph recreates both cells with identical
+/// attributes. An unpaired half is an orphan (see the module docs).
+fn paired_wide(line: &Row<Cell>, col: usize, cols: usize) -> bool {
+    line[Column(col)].flags.contains(Flags::WIDE_CHAR)
+        && col + 1 < cols
+        && line[Column(col + 1)]
+            .flags
+            .contains(Flags::WIDE_CHAR_SPACER)
 }
 
 /// Base character plus any zero-width marks stored in the cell's extras.
@@ -339,8 +336,8 @@ fn sync_sgr(buf: &mut String, state: &mut Sgr, cell: &Cell) {
     if want.flags.contains(Flags::STRIKEOUT) {
         buf.push_str(";9");
     }
-    push_fg(buf, want.fg);
-    push_bg(buf, want.bg);
+    push_color(buf, want.fg, 30);
+    push_color(buf, want.bg, 40);
     if let Some(color) = want.underline {
         push_underline_color(buf, color);
     }
@@ -348,54 +345,35 @@ fn sync_sgr(buf: &mut String, state: &mut Sgr, cell: &Cell) {
     *state = want;
 }
 
-fn push_fg(buf: &mut String, color: Color) {
+/// Foreground and background SGR parameters share one shape at different
+/// bases (30/40): named colors at `base+i`, bright at `base+60`, and the
+/// indexed (`;5;`) and RGB (`;2;`) forms introduced by `base+8` (38/48).
+fn push_color(buf: &mut String, color: Color, base: u16) {
+    let base = base as usize;
     match color {
         Color::Named(named) => match named as usize {
             // Black..=White and BrightBlack..=BrightWhite carry their ANSI
             // index as the enum discriminant.
             i @ 0..=7 => {
-                let _ = write!(buf, ";{}", 30 + i);
+                let _ = write!(buf, ";{}", base + i);
             }
             i @ 8..=15 => {
-                let _ = write!(buf, ";{}", 90 + i - 8);
+                let _ = write!(buf, ";{}", base + 60 + i - 8);
             }
             // DimBlack..=DimWhite are renderer-side names the parser never
             // stores in cells; mapped to their base color defensively.
             i @ 259..=266 => {
-                let _ = write!(buf, ";{}", 30 + i - 259);
+                let _ = write!(buf, ";{}", base + i - 259);
             }
             // Foreground (and the other special names): SGR 0 already
             // restored the default.
             _ => {}
         },
         Color::Indexed(i) => {
-            let _ = write!(buf, ";38;5;{i}");
+            let _ = write!(buf, ";{};5;{i}", base + 8);
         }
         Color::Spec(rgb) => {
-            let _ = write!(buf, ";38;2;{};{};{}", rgb.r, rgb.g, rgb.b);
-        }
-    }
-}
-
-fn push_bg(buf: &mut String, color: Color) {
-    match color {
-        Color::Named(named) => match named as usize {
-            i @ 0..=7 => {
-                let _ = write!(buf, ";{}", 40 + i);
-            }
-            i @ 8..=15 => {
-                let _ = write!(buf, ";{}", 100 + i - 8);
-            }
-            i @ 259..=266 => {
-                let _ = write!(buf, ";{}", 40 + i - 259);
-            }
-            _ => {}
-        },
-        Color::Indexed(i) => {
-            let _ = write!(buf, ";48;5;{i}");
-        }
-        Color::Spec(rgb) => {
-            let _ = write!(buf, ";48;2;{};{};{}", rgb.r, rgb.g, rgb.b);
+            let _ = write!(buf, ";{};2;{};{};{}", base + 8, rgb.r, rgb.g, rgb.b);
         }
     }
 }
@@ -427,11 +405,7 @@ mod tests {
     };
 
     use super::*;
-
-    /// Corpus fixtures were captured under a 40-row, 120-column PTY
-    /// (tests/corpus/README.md).
-    const CORPUS_LINES: usize = 40;
-    const CORPUS_COLS: usize = 120;
+    use crate::testutil::{CORPUS_COLS, CORPUS_LINES};
 
     /// Flags replay can never set: CUP-per-row emission performs no soft
     /// wraps, so wrap bookkeeping (soft-wrap marker and the spacer left when a
@@ -483,14 +457,8 @@ mod tests {
                 let s = &sline[Column(col)];
                 let r = &rline[Column(col)];
 
-                let paired_spacer = s.flags.contains(Flags::WIDE_CHAR_SPACER)
-                    && col > 0
-                    && sline[Column(col - 1)].flags.contains(Flags::WIDE_CHAR);
-                let paired_wide = s.flags.contains(Flags::WIDE_CHAR)
-                    && col + 1 < cols
-                    && sline[Column(col + 1)]
-                        .flags
-                        .contains(Flags::WIDE_CHAR_SPACER);
+                let paired_spacer = paired_spacer(sline, col);
+                let paired_wide = paired_wide(sline, col, cols);
                 let orphan_wide = s.flags.contains(Flags::WIDE_CHAR) && !paired_wide;
                 let orphan_spacer = s.flags.contains(Flags::WIDE_CHAR_SPACER) && !paired_spacer;
                 let phantom_tab = offset == 0

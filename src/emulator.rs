@@ -237,12 +237,12 @@ impl Emulator {
     /// The visible screen as ANSI bytes, plus cursor position and whether the
     /// child hid the cursor.
     pub fn formatted(&self) -> (Vec<u8>, (u16, u16), bool) {
-        crate::serialize::formatted(&self.term)
+        crate::ansi::formatted(&self.term)
     }
 
     /// Plain-text contents of the visible screen, one line per row.
     pub fn contents(&self) -> String {
-        crate::serialize::contents(&self.term)
+        crate::ansi::contents(&self.term)
     }
 
     /// Reconstruct retained terminal text from the oldest history row through

@@ -6,13 +6,9 @@ mod common;
 
 use std::{io::Write, time::Duration};
 
-use nix::{
-    sys::signal::{Signal, kill},
-    unistd::Pid,
-};
-
 use common::{
-    PROTOCOL_VERSION, b64, control_frame, hello_frame, read_frame, start_daemon_raw, wait_until,
+    PROTOCOL_VERSION, hello_frame, read_frame, spawn_frame, start_daemon_raw, stop_daemon,
+    wait_until,
 };
 
 #[test]
@@ -44,12 +40,13 @@ fn spawn_runs_under_the_hello_env() {
     );
 
     let out = dir.join("out");
-    let spawn = format!(
-        r#"{{"t":"spawn","command":"printf '%s:%s' \"$FLEETCOM_MARKER\" \"${{FLEETCOM_DAEMON_ONLY:-absent}}\" > {out}","cwd":"{cwd}"}}"#,
-        out = out.display(),
-        cwd = b64(cwd.as_bytes()),
+    let command = format!(
+        r#"printf '%s:%s' "$FLEETCOM_MARKER" "${{FLEETCOM_DAEMON_ONLY:-absent}}" > {}"#,
+        out.display()
     );
-    stream.write_all(&control_frame(&spawn)).unwrap();
+    stream
+        .write_all(&spawn_frame(&command, dir.as_path()))
+        .unwrap();
 
     let wrote = wait_until(Duration::from_secs(5), || {
         std::fs::read_to_string(&out).is_ok_and(|c| !c.is_empty())
@@ -62,10 +59,6 @@ fn spawn_runs_under_the_hello_env() {
     );
 
     // Clean shutdown; the job already exited on its own.
-    kill(Pid::from_raw(daemon.0.id() as i32), Signal::SIGTERM).unwrap();
-    let exited = wait_until(Duration::from_secs(10), || {
-        daemon.0.try_wait().map(|s| s.is_some()).unwrap_or(false)
-    });
-    assert!(exited, "daemon did not exit on SIGTERM");
+    stop_daemon(&mut daemon);
     let _ = std::fs::remove_dir_all(&dir);
 }

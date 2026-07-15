@@ -19,11 +19,14 @@ pub struct SessionEntry {
 /// Session recipe mapping directories to ordered entries.
 pub type SessionConfig = BTreeMap<String, Vec<SessionEntry>>;
 
+/// Env var overriding the config root that session recipes live under.
+pub const FLEETCOM_CONFIG_DIR: &str = "FLEETCOM_CONFIG_DIR";
+
 /// Characters replaced with `_` in session filenames.
 const DISALLOWED: &[char] = &['*', '"', '/', '\\', '<', '>', ':', '|', '?', '.'];
 
 /// Make `name` safe as a bare filename.
-pub fn sanitize(name: &str) -> String {
+fn sanitize(name: &str) -> String {
     name.trim()
         .chars()
         .map(|c| {
@@ -37,12 +40,14 @@ pub fn sanitize(name: &str) -> String {
         .collect()
 }
 
-/// `<config>/fleetcom/sessions`, overridable with `FLEETCOM_CONFIG_DIR`.
-pub fn sessions_dir() -> Option<PathBuf> {
-    if let Ok(dir) = std::env::var("FLEETCOM_CONFIG_DIR") {
-        return Some(PathBuf::from(dir).join("sessions"));
-    }
-    dirs::config_dir().map(|c| c.join("fleetcom").join("sessions"))
+/// Session-recipe directory: `<config root>/sessions`. A caller-supplied
+/// `root` wins (the supervisor passes the connecting client's
+/// [`FLEETCOM_CONFIG_DIR`]); otherwise the same var from this process's env,
+/// else `dirs::config_dir()/fleetcom`.
+pub fn sessions_dir(root: Option<PathBuf>) -> Option<PathBuf> {
+    root.or_else(|| std::env::var(FLEETCOM_CONFIG_DIR).ok().map(PathBuf::from))
+        .or_else(|| dirs::config_dir().map(|c| c.join("fleetcom")))
+        .map(|base| base.join("sessions"))
 }
 
 fn to_json(cfg: &SessionConfig) -> String {
@@ -139,12 +144,7 @@ pub fn list_in(dir: &Path) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn temp(tag: &str) -> PathBuf {
-        let d = std::env::temp_dir().join(format!("fleetcom_session_test_{tag}"));
-        let _ = fs::remove_dir_all(&d);
-        d
-    }
+    use crate::testutil::temp;
 
     /// Unadorned entry: the plain-string member form.
     fn e(cmd: &str) -> SessionEntry {
@@ -184,7 +184,7 @@ mod tests {
 
     #[test]
     fn round_trips_dirs_and_commands() {
-        let dir = temp("roundtrip");
+        let dir = temp("session_roundtrip");
         let mut cfg = SessionConfig::new();
         cfg.insert("~/proj".into(), vec![e("cargo test"), e("vim")]);
         cfg.insert("/tmp".into(), vec![e("top")]);
@@ -198,7 +198,7 @@ mod tests {
     /// Mixed string and object entries survive one serialization round trip.
     #[test]
     fn round_trips_mixed_grouped_and_ungrouped_entries() {
-        let dir = temp("mixed");
+        let dir = temp("session_mixed");
         let mut cfg = SessionConfig::new();
         cfg.insert(
             "~/proj".into(),
@@ -213,7 +213,7 @@ mod tests {
     /// Every group/name combination survives serialization.
     #[test]
     fn round_trips_named_entries() {
-        let dir = temp("named");
+        let dir = temp("session_named");
         let mut cfg = SessionConfig::new();
         cfg.insert(
             "~/proj".into(),

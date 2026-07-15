@@ -10,7 +10,7 @@ use crossterm::{
 };
 
 use crate::{
-    app::{App, DirKind, GroupMode, Mode, Row, scroll_window},
+    app::{App, DirKind, GroupMode, Mode, Row},
     format::{pad, rel_time, truncate},
     protocol::{Lifecycle, TaskView},
 };
@@ -59,6 +59,17 @@ fn dim(out: &mut impl Write, y: u16, s: &str, cols: usize) -> io::Result<()> {
         out,
         MoveTo(0, y),
         SetAttribute(Attribute::Dim),
+        Print(pad(s, cols)),
+        SetAttribute(Attribute::Reset)
+    )
+}
+
+/// Paint a full-width reverse-video line: selection and focused-field styling.
+fn rev(out: &mut impl Write, y: u16, s: &str, cols: usize) -> io::Result<()> {
+    queue!(
+        out,
+        MoveTo(0, y),
+        SetAttribute(Attribute::Reverse),
         Print(pad(s, cols)),
         SetAttribute(Attribute::Reset)
     )
@@ -150,13 +161,7 @@ fn render_dashboard(out: &mut impl Write, app: &App) -> io::Result<()> {
                 let v = &app.views[*ti];
                 let line = task_row(v, cols);
                 if app.selected_id == Some(v.id) {
-                    queue!(
-                        out,
-                        MoveTo(0, y),
-                        SetAttribute(Attribute::Reverse),
-                        Print(pad(&line, cols)),
-                        SetAttribute(Attribute::Reset)
-                    )?;
+                    rev(out, y, &line, cols)?;
                 } else {
                     put(out, y, &line, cols)?;
                 }
@@ -372,54 +377,89 @@ fn render_peek(out: &mut impl Write, app: &App) -> io::Result<()> {
     Ok(())
 }
 
-/// The `@` picker: a bottom panel over the dashboard. A typed-path input plus
-/// the matching subdirectories, `dir_sel` highlighted.
-fn render_pickdir(out: &mut impl Write, app: &App) -> io::Result<()> {
+/// The varying content of a bottom-panel picker; `render_panel` owns the
+/// shared skeleton.
+struct Panel<'a> {
+    /// Header line, painted reverse-video as the focused field.
+    header: String,
+    /// Preformatted row labels; the skeleton indents and `▸`-marks them.
+    labels: &'a [String],
+    /// Index of the highlighted row.
+    sel: usize,
+    /// Row cap before the list scrolls.
+    max_rows: usize,
+    /// Footer hint; the skeleton appends the `x/y` position when clipped.
+    hint: String,
+    /// Dim placeholder shown instead of rows when `labels` is empty.
+    empty: Option<&'a str>,
+    /// Cursor column on the header line; `None` hides the cursor.
+    cursor: Option<u16>,
+}
+
+/// Bottom-panel skeleton shared by the dir, group, and session pickers,
+/// anchored above the footer and sized so the selected row stays visible.
+fn render_panel(out: &mut impl Write, app: &App, p: &Panel) -> io::Result<()> {
     let cols = app.cols as usize;
     let rows = app.rows;
-    let total = app.dir_candidates.len();
+    let total = p.labels.len();
 
-    let max_list = 8usize.min((rows as usize).saturating_sub(4)).max(1);
-    // Keep the selected directory visible.
-    let (start, visible) = scroll_window(app.dir_sel, total, max_list);
+    let max_list = p.max_rows.min((rows as usize).saturating_sub(4)).max(1);
+    // Keep the selected row visible.
+    let (start, visible) = scroll_window(p.sel, total, max_list);
     let body = visible.max(1);
     let panel_h = (body + 2) as u16;
     let top = rows.saturating_sub(panel_h).max(2);
 
-    // Input line as a focused field.
-    queue!(
-        out,
-        MoveTo(0, top),
-        SetAttribute(Attribute::Reverse),
-        Print(pad(&format!("  @ {}   ", app.dir_input), cols)),
-        SetAttribute(Attribute::Reset)
-    )?;
+    rev(out, top, &p.header, cols)?;
 
     if total == 0 {
-        dim(out, top + 1, "    (no matching directories)", cols)?;
+        if let Some(msg) = p.empty {
+            dim(out, top + 1, msg, cols)?;
+        }
     } else {
         for row in 0..visible {
             let idx = start + row;
             let y = top + 1 + row as u16;
-            let c = &app.dir_candidates[idx];
-            let marker = if idx == app.dir_sel { "▸ " } else { "  " };
-            // Don't double the slash if the label is already a rooted path.
-            let sep = if c.label.ends_with('/') { "" } else { "/" };
-            let line = format!("    {marker}{}{sep}", c.label);
-            if idx == app.dir_sel {
-                queue!(
-                    out,
-                    MoveTo(0, y),
-                    SetAttribute(Attribute::Reverse),
-                    Print(pad(&line, cols)),
-                    SetAttribute(Attribute::Reset)
-                )?;
+            let marker = if idx == p.sel { "▸ " } else { "  " };
+            let line = format!("    {marker}{}", p.labels[idx]);
+            if idx == p.sel {
+                rev(out, y, &line, cols)?;
             } else {
                 put(out, y, &line, cols)?;
             }
         }
     }
 
+    let pos = if total > visible {
+        format!(" · {}/{}", p.sel + 1, total)
+    } else {
+        String::new()
+    };
+    dim(
+        out,
+        top + 1 + body as u16,
+        &format!("  {}{pos}", p.hint),
+        cols,
+    )?;
+
+    match p.cursor {
+        Some(cx) => queue!(out, MoveTo(cx, top), Show),
+        None => queue!(out, Hide),
+    }
+}
+
+/// The `@` picker: a bottom panel over the dashboard. A typed-path input plus
+/// the matching subdirectories, `dir_sel` highlighted.
+fn render_pickdir(out: &mut impl Write, app: &App) -> io::Result<()> {
+    let labels: Vec<String> = app
+        .dir_candidates
+        .iter()
+        .map(|c| {
+            // Don't double the slash if the label is already a rooted path.
+            let sep = if c.label.ends_with('/') { "" } else { "/" };
+            format!("{}{sep}", c.label)
+        })
+        .collect();
     // Hint reflects what Enter does on the highlighted row.
     let action = match app.dir_candidates.get(app.dir_sel).map(|c| c.kind) {
         Some(DirKind::Use) => "enter run here",
@@ -427,71 +467,36 @@ fn render_pickdir(out: &mut impl Write, app: &App) -> io::Result<()> {
         Some(DirKind::Into) => "enter/tab open",
         None => "",
     };
-    let pos = if total > visible {
-        format!(" · {}/{}", app.dir_sel + 1, total)
-    } else {
-        String::new()
-    };
-    dim(
-        out,
-        top + 1 + body as u16,
-        &format!("  {action} · ↑↓ pick · esc{pos}"),
-        cols,
-    )?;
-
-    let cx = truncate(&format!("  @ {}", app.dir_input), cols)
+    let cx = truncate(&format!("  @ {}", app.dir_input), app.cols as usize)
         .chars()
         .count() as u16;
-    queue!(out, MoveTo(cx, top), Show)?;
-    Ok(())
+    render_panel(
+        out,
+        app,
+        &Panel {
+            header: format!("  @ {}   ", app.dir_input),
+            labels: &labels,
+            sel: app.dir_sel,
+            max_rows: 8,
+            hint: format!("{action} · ↑↓ pick · esc"),
+            empty: Some("    (no matching directories)"),
+            cursor: Some(cx),
+        },
+    )
 }
 
-/// Render the `g` picker as a bottom panel over the dashboard. It contains the
-/// typed name and matching groups, with `group_sel` highlighted. Row 0 always
-/// provides Unassigned, so the list cannot be empty.
+/// The `g` picker: a bottom panel with the typed name and matching groups,
+/// `group_sel` highlighted. Row 0 always provides Unassigned, so the list
+/// cannot be empty.
 fn render_pickgroup(out: &mut impl Write, app: &App) -> io::Result<()> {
-    let cols = app.cols as usize;
-    let rows = app.rows;
-    let total = app.group_candidates.len();
-
-    let max_list = 8usize.min((rows as usize).saturating_sub(4)).max(1);
-    // Keep the selected group visible.
-    let (start, visible) = scroll_window(app.group_sel, total, max_list);
-    let body = visible.max(1);
-    let panel_h = (body + 2) as u16;
-    let top = rows.saturating_sub(panel_h).max(2);
-
-    // Input line as a focused field.
-    queue!(
-        out,
-        MoveTo(0, top),
-        SetAttribute(Attribute::Reverse),
-        Print(pad(&format!("  g {}   ", app.group_input), cols)),
-        SetAttribute(Attribute::Reset)
-    )?;
-
-    for row in 0..visible {
-        let idx = start + row;
-        let y = top + 1 + row as u16;
-        let c = &app.group_candidates[idx];
-        let marker = if idx == app.group_sel { "▸ " } else { "  " };
-        let line = format!("    {marker}{}", c.label);
-        if idx == app.group_sel {
-            queue!(
-                out,
-                MoveTo(0, y),
-                SetAttribute(Attribute::Reverse),
-                Print(pad(&line, cols)),
-                SetAttribute(Attribute::Reset)
-            )?;
-        } else {
-            put(out, y, &line, cols)?;
-        }
-    }
-
+    let labels: Vec<String> = app
+        .group_candidates
+        .iter()
+        .map(|c| c.label.clone())
+        .collect();
     // Hint reflects what Enter does: create when the typed text matches nothing
     // (nothing matched), otherwise act on the highlighted row.
-    let action = if !app.group_input.is_empty() && total < 2 {
+    let action = if !app.group_input.is_empty() && app.group_candidates.len() < 2 {
         "enter create"
     } else {
         match app.group_candidates.get(app.group_sel) {
@@ -500,80 +505,39 @@ fn render_pickgroup(out: &mut impl Write, app: &App) -> io::Result<()> {
             None => "",
         }
     };
-    let pos = if total > visible {
-        format!(" · {}/{}", app.group_sel + 1, total)
-    } else {
-        String::new()
-    };
-    dim(
-        out,
-        top + 1 + body as u16,
-        &format!("  {action} · ↑↓ pick · esc{pos}"),
-        cols,
-    )?;
-
-    let cx = truncate(&format!("  g {}", app.group_input), cols)
+    let cx = truncate(&format!("  g {}", app.group_input), app.cols as usize)
         .chars()
         .count() as u16;
-    queue!(out, MoveTo(cx, top), Show)?;
-    Ok(())
+    render_panel(
+        out,
+        app,
+        &Panel {
+            header: format!("  g {}   ", app.group_input),
+            labels: &labels,
+            sel: app.group_sel,
+            max_rows: 8,
+            hint: format!("{action} · ↑↓ pick · esc"),
+            empty: None,
+            cursor: Some(cx),
+        },
+    )
 }
 
 /// The `o` load-session picker: a bottom panel listing saved session names.
 fn render_session_picker(out: &mut impl Write, app: &App) -> io::Result<()> {
-    let cols = app.cols as usize;
-    let rows = app.rows;
-    let total = app.session_names.len();
-
-    let max_list = 10usize.min((rows as usize).saturating_sub(4)).max(1);
-    let (start, visible) = scroll_window(app.session_sel, total, max_list);
-    let body = visible.max(1);
-    let panel_h = (body + 2) as u16;
-    let top = rows.saturating_sub(panel_h).max(2);
-
-    queue!(
+    render_panel(
         out,
-        MoveTo(0, top),
-        SetAttribute(Attribute::Reverse),
-        Print(pad("  load session", cols)),
-        SetAttribute(Attribute::Reset)
-    )?;
-
-    if total == 0 {
-        dim(out, top + 1, "    (no saved sessions)", cols)?;
-    } else {
-        for row in 0..visible {
-            let idx = start + row;
-            let y = top + 1 + row as u16;
-            let marker = if idx == app.session_sel { "▸ " } else { "  " };
-            let line = format!("    {marker}{}", app.session_names[idx]);
-            if idx == app.session_sel {
-                queue!(
-                    out,
-                    MoveTo(0, y),
-                    SetAttribute(Attribute::Reverse),
-                    Print(pad(&line, cols)),
-                    SetAttribute(Attribute::Reset)
-                )?;
-            } else {
-                put(out, y, &line, cols)?;
-            }
-        }
-    }
-
-    let pos = if total > visible {
-        format!(" · {}/{}", app.session_sel + 1, total)
-    } else {
-        String::new()
-    };
-    dim(
-        out,
-        top + 1 + body as u16,
-        &format!("  ↑↓ pick · enter load · esc{pos}"),
-        cols,
-    )?;
-    queue!(out, Hide)?;
-    Ok(())
+        app,
+        &Panel {
+            header: "  load session".to_string(),
+            labels: &app.session_names,
+            sel: app.session_sel,
+            max_rows: 10,
+            hint: "↑↓ pick · enter load · esc".to_string(),
+            empty: Some("    (no saved sessions)"),
+            cursor: None,
+        },
+    )
 }
 
 /// Center `s` in `width` columns (a full-width string, so it overwrites the row).
@@ -636,13 +600,7 @@ fn render_attached(out: &mut impl Write, app: &App) -> io::Result<()> {
             format!("  [scroll ↑{n}] {title}    Esc live · PgUp/PgDn move · Ctrl-\\ background")
         }
     };
-    queue!(
-        out,
-        MoveTo(0, app.rows.saturating_sub(1)),
-        SetAttribute(Attribute::Reverse),
-        Print(pad(&bar, cols)),
-        SetAttribute(Attribute::Reset)
-    )?;
+    rev(out, app.rows.saturating_sub(1), &bar, cols)?;
 
     // Place the real cursor where the child's is, so typing feels native.
     match screen {
@@ -652,9 +610,32 @@ fn render_attached(out: &mut impl Write, app: &App) -> io::Result<()> {
     Ok(())
 }
 
+/// Visible `(start, count)` window that includes the selected list item.
+pub fn scroll_window(sel: usize, total: usize, max: usize) -> (usize, usize) {
+    if total == 0 || max == 0 {
+        return (0, 0);
+    }
+    let count = total.min(max);
+    let start = if sel >= count { sel + 1 - count } else { 0 };
+    (start, count)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scroll_window_keeps_selection_visible() {
+        assert_eq!(scroll_window(0, 5, 8), (0, 5)); // fits, no scroll
+        assert_eq!(scroll_window(4, 5, 8), (0, 5));
+        assert_eq!(scroll_window(7, 20, 8), (0, 8)); // last row of first window
+        assert_eq!(scroll_window(8, 20, 8), (1, 8)); // scrolls one
+        assert_eq!(scroll_window(19, 20, 8), (12, 8)); // last item
+        for sel in 0..20 {
+            let (start, count) = scroll_window(sel, 20, 8);
+            assert!(sel >= start && sel < start + count, "sel {sel} off-window");
+        }
+    }
 
     /// Directory and group destinations appear only when present.
     #[test]

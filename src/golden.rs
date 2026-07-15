@@ -3,8 +3,8 @@
 //! (`tests/corpus`) and report the exact row, cell, or count on a mismatch.
 //!
 //! **Displayed state.** Each fixture pins every final plain-text row via
-//! [`serialize::contents`], cursor position and visibility via
-//! [`serialize::formatted`], and selected styled cells for the fixture's
+//! [`ansi::contents`], cursor position and visibility via
+//! [`ansi::formatted`], and selected styled cells for the fixture's
 //! purpose (see `tests/corpus/README.md`).
 //!
 //! **Parser semantics.** Targeted fixtures pin exact scrollback retention,
@@ -19,11 +19,10 @@ use alacritty_terminal::{
     vte::ansi::{Color, NamedColor, Processor, Rgb},
 };
 
-use crate::serialize;
-
-/// Corpus dimensions: 40 rows by 120 columns.
-const LINES: usize = 40;
-const COLS: usize = 120;
+use crate::{
+    ansi,
+    testutil::{CORPUS_COLS as COLS, CORPUS_LINES as LINES},
+};
 
 fn alacritty(bytes: &[u8]) -> Term<VoidListener> {
     let mut term = Term::new(Config::default(), &TermSize::new(COLS, LINES), VoidListener);
@@ -44,7 +43,7 @@ fn assert_screen(
         !al.mode().contains(TermMode::ALT_SCREEN),
         "{fixture}: primary screen active"
     );
-    let text = serialize::contents(al);
+    let text = ansi::contents(al);
     let got: Vec<&str> = text.split('\n').collect();
     assert_eq!(got.len(), LINES, "{fixture}: plain-text row count");
     for (row, line) in got.iter().enumerate() {
@@ -54,7 +53,7 @@ fn assert_screen(
             .unwrap_or("");
         assert_eq!(*line, expected, "{fixture}: plain text at row {row}");
     }
-    let (_, pos, hidden) = serialize::formatted(al);
+    let (_, pos, hidden) = ansi::formatted(al);
     assert_eq!(pos, cursor, "{fixture}: cursor position");
     assert!(!hidden, "{fixture}: cursor visibility");
 }
@@ -558,7 +557,7 @@ fn semantic_dec_scrollregion_charset_translation() {
 
     // Visible screen: box body translated, ASCII rows verbatim, the rest
     // blank.
-    let al_text = serialize::contents(&al);
+    let al_text = ansi::contents(&al);
     let al_rows: Vec<&str> = al_text.split('\n').collect();
     assert_eq!(al_rows[0], "│     │");
     assert_eq!(al_rows[1], "└─────┘");

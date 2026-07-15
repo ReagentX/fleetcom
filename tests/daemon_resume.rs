@@ -7,13 +7,14 @@ mod common;
 
 use std::{
     io::Write,
-    os::unix::{ffi::OsStrExt, fs::PermissionsExt, net::UnixStream},
+    os::unix::{fs::PermissionsExt, net::UnixStream},
     path::{Path, PathBuf},
     time::Duration,
 };
 
 use common::{
-    KillOnDrop, b64, control_frame, read_frame, shake_hands_env, start_daemon_raw, wait_until,
+    control_frame, read_frame, shake_hands_env, spawn_frame, start_daemon_raw, stop_daemon,
+    wait_until,
 };
 
 /// Delimiter separating argv records in a stub's append-only output.
@@ -202,14 +203,6 @@ fn value_after<'a>(argv: &'a [String], flag: &str) -> &'a str {
         .unwrap_or_else(|| panic!("{flag} carries no value: {argv:?}"))
 }
 
-/// Build a spawn control frame with a base64-encoded working directory.
-fn spawn_frame(command: &str, cwd: &Path) -> Vec<u8> {
-    control_frame(&format!(
-        r#"{{"t":"spawn","command":"{command}","cwd":"{}"}}"#,
-        b64(cwd.as_os_str().as_bytes())
-    ))
-}
-
 /// Save once and return the persisted recipe. Each caller first waits for its
 /// ID channel, and the daemon scrapes finished tasks before reading IDs. As a
 /// result, one save must already contain the resume form.
@@ -250,19 +243,6 @@ fn has_capture(runtime: &Path) -> bool {
     })
 }
 
-/// Send SIGTERM and require the daemon to exit cleanly.
-fn stop_daemon(daemon: &mut KillOnDrop) {
-    nix::sys::signal::kill(
-        nix::unistd::Pid::from_raw(daemon.0.id() as i32),
-        nix::sys::signal::Signal::SIGTERM,
-    )
-    .unwrap();
-    let exited = wait_until(Duration::from_secs(10), || {
-        daemon.0.try_wait().map(|s| s.is_some()).unwrap_or(false)
-    });
-    assert!(exited, "daemon did not exit on SIGTERM");
-}
-
 /// Claude instrumentation captures an ID without leaking its injected flags
 /// into the recipe, then reloads the same conversation.
 #[test]
@@ -281,25 +261,17 @@ fn claude_spawn_save_load_resumes_the_conversation() {
     let id = value_after(&argv, "--session-id").to_string();
     assert_eq!(id.len(), 36, "pinned id must be uuid-shaped: {argv:?}");
     let settings = PathBuf::from(value_after(&argv, "--settings"));
-    let runtime = s.runtime();
+    // The namespace layout itself is pinned by the supervisor capture unit
+    // tests; the integration-only facts are the DAEMON's pid in the
+    // namespace name (a cross-process fact) and the asset existing on disk.
     let ns = settings
         .parent()
         .expect("the overlay must sit in a namespace");
-    assert_eq!(
-        ns.parent(),
-        Some(runtime.as_path()),
-        "the namespace must sit under the hello's runtime root: {argv:?}"
-    );
     assert!(
         ns.file_name()
             .and_then(|n| n.to_str())
             .is_some_and(|n| n.starts_with(&format!("{}-", daemon.0.id()))),
         "the namespace must carry the daemon's pid prefix: {argv:?}"
-    );
-    assert_eq!(
-        settings.file_name().and_then(|n| n.to_str()),
-        Some("claude-settings.json"),
-        "the overlay must be the installed settings file: {argv:?}"
     );
     assert!(
         settings.is_file(),
@@ -358,23 +330,15 @@ fn codex_capture_file_drives_save_and_load_resumes() {
         .and_then(|v| v.strip_suffix(r#""]"#))
         .map(PathBuf::from)
         .unwrap_or_else(|| panic!("spawn must route notify at one script: {argv:?}"));
-    let runtime = s.runtime();
+    // The namespace layout itself is pinned by the supervisor capture unit
+    // tests; the integration-only facts are the DAEMON's pid in the
+    // namespace name (a cross-process fact) and the asset existing on disk.
     let ns = script.parent().expect("the script must sit in a namespace");
-    assert_eq!(
-        ns.parent(),
-        Some(runtime.as_path()),
-        "the namespace must sit under the hello's runtime root: {argv:?}"
-    );
     assert!(
         ns.file_name()
             .and_then(|n| n.to_str())
             .is_some_and(|n| n.starts_with(&format!("{}-", daemon.0.id()))),
         "the namespace must carry the daemon's pid prefix: {argv:?}"
-    );
-    assert_eq!(
-        script.file_name().and_then(|n| n.to_str()),
-        Some("codex-notify.sh"),
-        "the override must name the installed script: {argv:?}"
     );
     assert!(
         script.is_file(),

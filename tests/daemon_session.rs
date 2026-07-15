@@ -11,7 +11,7 @@ use std::{
 
 use common::{
     PROTOCOL_VERSION, control_frame, hello_frame, read_frame, start_daemon, start_daemon_raw,
-    wait_until,
+    stop_daemon, wait_until,
 };
 
 #[test]
@@ -42,15 +42,7 @@ fn load_session_resolves_relative_dirs_against_the_client_cwd() {
         "recipe dir 'sub' did not resolve against the client's cwd"
     );
 
-    nix::sys::signal::kill(
-        nix::unistd::Pid::from_raw(daemon.0.id() as i32),
-        nix::sys::signal::Signal::SIGTERM,
-    )
-    .unwrap();
-    let exited = wait_until(Duration::from_secs(10), || {
-        daemon.0.try_wait().map(|s| s.is_some()).unwrap_or(false)
-    });
-    assert!(exited, "daemon did not exit on SIGTERM");
+    stop_daemon(&mut daemon);
     let _ = std::fs::remove_dir_all(&dir);
     let _ = std::fs::remove_dir_all(&config);
 }
@@ -127,15 +119,7 @@ fn session_commands_follow_the_hello_config_dir() {
         "list must not see the daemon-env dir's recipe: {sessions}"
     );
 
-    nix::sys::signal::kill(
-        nix::unistd::Pid::from_raw(daemon.0.id() as i32),
-        nix::sys::signal::Signal::SIGTERM,
-    )
-    .unwrap();
-    let exited = wait_until(Duration::from_secs(10), || {
-        daemon.0.try_wait().map(|s| s.is_some()).unwrap_or(false)
-    });
-    assert!(exited, "daemon did not exit on SIGTERM");
+    stop_daemon(&mut daemon);
     let _ = std::fs::remove_dir_all(&dir);
     let _ = std::fs::remove_dir_all(&daemon_cfg);
     let _ = std::fs::remove_dir_all(&client_cfg);

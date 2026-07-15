@@ -147,16 +147,10 @@ mod tests {
         process::{Command, Stdio},
     };
 
+    use super::super::testutil::ID;
     use super::super::{CAPTURE_ENV, NOTIFY_CHAIN_ENV};
     use super::*;
-
-    const ID: &str = "c8c4a5cc-0b32-4ba0-a6b4-6ed08c218e0d";
-
-    fn temp(tag: &str) -> PathBuf {
-        let d = std::env::temp_dir().join(format!("fleetcom_assets_test_{tag}"));
-        let _ = fs::remove_dir_all(&d);
-        d
-    }
+    use crate::testutil::temp;
 
     fn mode(p: &Path) -> u32 {
         fs::metadata(p).unwrap().permissions().mode() & 0o777
@@ -192,9 +186,9 @@ mod tests {
 
     #[test]
     fn install_creates_the_tree_with_exact_modes() {
-        // A nested root proves the recursive create.
-        let base = temp("modes");
-        let root = base.join("nested");
+        // A root two levels below the scratch dir proves the recursive create.
+        let base = temp("assets_modes");
+        let root = base.join("nested").join("deeper");
         let assets = CaptureAssets::install(&root, std::process::id()).unwrap();
 
         let ns = namespace(&assets, &root);
@@ -211,7 +205,7 @@ mod tests {
     /// leaves existing namespaces unchanged.
     #[test]
     fn install_mints_a_fresh_namespace_per_call() {
-        let root = temp("fresh");
+        let root = temp("assets_fresh");
         let first = CaptureAssets::install(&root, std::process::id()).unwrap();
         fs::write(&first.claude_settings, "garbage").unwrap();
         fs::set_permissions(&root, fs::Permissions::from_mode(0o755)).unwrap();
@@ -244,7 +238,7 @@ mod tests {
     /// Installation leaves every pre-existing root entry unchanged.
     #[test]
     fn install_never_deletes_foreign_or_legacy_files() {
-        let root = temp("retain");
+        let root = temp("assets_retain");
         let foreign = root.join("99999-0123456789ab");
         fs::create_dir_all(&foreign).unwrap();
         fs::write(foreign.join("task-1-0.json"), "{}").unwrap();
@@ -278,7 +272,7 @@ mod tests {
     /// A matching PID prefix does not cause an existing namespace to be reused.
     #[test]
     fn install_after_pid_reuse_leaves_the_predecessor_namespace_alone() {
-        let root = temp("reuse");
+        let root = temp("assets_reuse");
         let stale = root.join(format!("{}-00000000dead", std::process::id()));
         fs::create_dir_all(&stale).unwrap();
         fs::write(stale.join("task-1-0.json"), "predecessor").unwrap();
@@ -318,7 +312,7 @@ mod tests {
     /// no capture path or chain, it exits without producing output.
     #[test]
     fn notify_script_writes_the_argument_verbatim() {
-        let root = temp("notify");
+        let root = temp("assets_notify");
         let assets = CaptureAssets::install(&root, std::process::id()).unwrap();
         let cap = assets.paths_for(1, 0).capture_file;
         let payload = r#"{"type":"agent-turn-complete","turn-id":"t1"}"#;
@@ -381,7 +375,7 @@ mod tests {
     /// followed by the payload. Spaces within an argument remain intact.
     #[test]
     fn notify_script_chains_the_displaced_notifier() {
-        let root = temp("chain");
+        let root = temp("assets_chain");
         let assets = CaptureAssets::install(&root, std::process::id()).unwrap();
         let cap = assets.paths_for(3, 0).capture_file;
         let notifier = root.join("Fake App.app").join("Sky Client");
@@ -412,7 +406,7 @@ mod tests {
     /// passes through.
     #[test]
     fn notify_script_capture_survives_a_failing_chain() {
-        let root = temp("chain_fail");
+        let root = temp("assets_chain_fail");
         let assets = CaptureAssets::install(&root, std::process::id()).unwrap();
         let cap = assets.paths_for(4, 0).capture_file;
         let notifier = root.join("failing");
@@ -434,7 +428,7 @@ mod tests {
     /// Without a capture path, the script still execs the configured chain.
     #[test]
     fn notify_script_chains_without_a_capture_path() {
-        let root = temp("chain_nocap");
+        let root = temp("assets_chain_nocap");
         let assets = CaptureAssets::install(&root, std::process::id()).unwrap();
         let notifier = root.join("bare");
         let record = root.join("record");
@@ -455,7 +449,7 @@ mod tests {
     /// the configured capture file.
     #[test]
     fn hook_command_from_settings_copies_stdin_to_the_capture_file() {
-        let root = temp("hook");
+        let root = temp("assets_hook");
         let assets = CaptureAssets::install(&root, std::process::id()).unwrap();
         let cap = assets.paths_for(2, 0).capture_file;
 
@@ -489,7 +483,7 @@ mod tests {
 
     #[test]
     fn paths_for_names_the_task_file_under_the_incarnation_namespace() {
-        let root = temp("paths");
+        let root = temp("assets_paths");
         let assets = CaptureAssets::install(&root, std::process::id()).unwrap();
         let ns = namespace(&assets, &root);
         let paths = assets.paths_for(7, 0);

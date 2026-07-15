@@ -5,47 +5,14 @@
 
 mod common;
 
-use std::{
-    io::Write,
-    time::{Duration, Instant},
-};
+use std::time::{Duration, Instant};
 
 use nix::{
     sys::signal::{Signal, kill, killpg},
     unistd::Pid,
 };
 
-use common::{b64, control_frame, start_daemon, wait_until};
-
-/// Spawn `command` (which must write its own `$$` to `pidfile`) and return the
-/// job's leader pid (== pgid: portable-pty `setsid`s it).
-fn spawn_job(
-    stream: &mut std::os::unix::net::UnixStream,
-    cwd: &std::path::Path,
-    pidfile: &std::path::Path,
-    command: &str,
-) -> Pid {
-    let spawn = format!(
-        r#"{{"t":"spawn","command":"{command}","cwd":"{cwd}"}}"#,
-        cwd = b64(cwd.display().to_string().as_bytes()),
-    );
-    stream.write_all(&control_frame(&spawn)).unwrap();
-    assert!(
-        wait_until(Duration::from_secs(5), || {
-            std::fs::read_to_string(pidfile)
-                .map(|s| !s.trim().is_empty())
-                .unwrap_or(false)
-        }),
-        "the job never wrote its pid"
-    );
-    Pid::from_raw(
-        std::fs::read_to_string(pidfile)
-            .unwrap()
-            .trim()
-            .parse::<i32>()
-            .unwrap(),
-    )
-}
+use common::{spawn_job, start_daemon, wait_until};
 
 #[test]
 fn ordinary_jobs_die_with_a_sigkilled_daemon() {

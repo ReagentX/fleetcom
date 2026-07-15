@@ -4,7 +4,10 @@
 //! separates jzon control frames from the raw-bytes screen frames, so
 //! high-frequency pane data pays no base64/number-array tax.
 
-use std::io::{self, Read, Write};
+use std::{
+    io::{self, Read, Write},
+    time::Duration,
+};
 
 /// jzon-encoded control data (a `Command`, or a `Tasks`/`Status` event).
 pub const KIND_CONTROL: u8 = 1;
@@ -19,6 +22,12 @@ pub const KIND_HELLO: u8 = 3;
 /// This bounds allocations from untrusted length prefixes and lets producers
 /// verify that their maximum encoded payload fits.
 pub const MAX_FRAME: u32 = 64 * 1024 * 1024;
+
+/// Maximum time one frame write to a socket peer may block. A peer that
+/// stops draining its socket (crashed, SIGSTOPped, hostile) must not wedge
+/// the writer: the daemon's event writes and the client's command writes
+/// both cap here and treat expiry as a dead connection.
+pub const SEND_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Write one frame and flush. Flushing per frame keeps latency low: the peer sees
 /// each command/event immediately. A firehose can't drown the socket because the

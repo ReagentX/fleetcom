@@ -14,12 +14,13 @@ use std::{
 };
 
 use crossterm::{
+    cursor::MoveTo,
     event::{
         self, DisableMouseCapture, EnableMouseCapture, Event as CtEvent, KeyCode, KeyEvent,
         KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
     },
     execute,
-    style::Print,
+    terminal::{Clear, ClearType},
 };
 
 use crate::{
@@ -201,29 +202,34 @@ pub struct App {
     exit_intent: ExitIntent,
     /// Whether the client currently captures terminal mouse events.
     mouse_captured: bool,
-    /// The alternate-scroll state last applied to the terminal.
-    alt_scroll: bool,
     /// Whether the attached task is displaying scrollback.
     view_scroll: bool,
 }
 
-/// Return `(mouse_capture, alt_scroll)` for the attached view. Scrollback,
-/// inline views, and children that disable alternate scroll capture the mouse.
-fn desired_input_modes(attached: Option<&ScreenView>, view_scroll: bool) -> (bool, bool) {
+/// Whether the attached view captures the mouse. Scrollback, inline views,
+/// and children that disable alternate scroll capture it; host-side alternate
+/// scroll (DECSET 1007) is main.rs's setup/restore concern, not per-view.
+fn desired_mouse_capture(attached: Option<&ScreenView>, view_scroll: bool) -> bool {
     if view_scroll {
-        return (true, true);
+        return true;
     }
     match attached {
         // Capture and forward mouse events requested by the child.
-        Some(s) if s.wants_mouse => (true, true),
+        Some(s) if s.wants_mouse => true,
         // Let the terminal convert wheel events to arrow keys.
-        Some(s) if s.alt_screen && s.alt_scroll => (false, true),
+        Some(s) if s.alt_screen && s.alt_scroll => false,
         // Capture wheel events when the child disables alternate scroll.
-        Some(s) if s.alt_screen => (true, true),
+        Some(s) if s.alt_screen => true,
         // Capture wheel-up to enter scrollback for inline children.
-        Some(_) => (true, true),
-        None => (false, true),
+        Some(_) => true,
+        None => false,
     }
+}
+
+/// One Down keypress over a picker list: advance, clamped to the last row.
+/// Safe on an empty list because every picker pins its selection to 0 there.
+fn step_down(sel: usize, len: usize) -> usize {
+    (sel + 1).min(len.saturating_sub(1))
 }
 
 /// Dashboard grouping bucket: tagged tasks first, then live, then completed.
@@ -345,7 +351,6 @@ impl App {
             term_signal: Arc::new(AtomicBool::new(false)),
             should_quit: false,
             mouse_captured: false,
-            alt_scroll: true,
             view_scroll: false,
             exit_intent: ExitIntent::Disconnect,
         }
@@ -374,10 +379,14 @@ impl App {
         Arc::clone(&self.term_signal)
     }
 
+    /// The `views` index of the task with `id`, if it is still in the snapshot.
+    fn task_index(&self, id: u64) -> Option<usize> {
+        self.views.iter().position(|v| v.id == id)
+    }
+
     /// The `views` index of the attached task, resolved from its id.
     pub fn focused_task(&self) -> Option<usize> {
-        let id = self.focused_id?;
-        self.views.iter().position(|v| v.id == id)
+        self.task_index(self.focused_id?)
     }
 
     /// The watched task's screen, but only if it's the one `id` expects. Guards
@@ -468,8 +477,7 @@ impl App {
 
     /// The `views` index currently under the selection cursor.
     pub fn selected_task(&self) -> Option<usize> {
-        let id = self.selected_id?;
-        self.views.iter().position(|v| v.id == id)
+        self.task_index(self.selected_id?)
     }
 
     /// Row of the selected id within `order`, if present.
@@ -481,7 +489,7 @@ impl App {
     /// Keep selection valid: if nothing is selected or the selected task is
     /// gone, fall back to the first row. Runs each tick before rendering.
     fn resolve_selection(&mut self) {
-        let present = matches!(self.selected_id, Some(id) if self.views.iter().any(|v| v.id == id));
+        let present = matches!(self.selected_id, Some(id) if self.task_index(id).is_some());
         if !present {
             self.selected_id = self.display_order().first().map(|&i| self.views[i].id);
         }
@@ -752,8 +760,8 @@ impl App {
         // Mark the pinned target's group even if dashboard selection changes.
         let current = self
             .group_target
-            .and_then(|id| self.views.iter().find(|v| v.id == id))
-            .and_then(|v| v.group.clone());
+            .and_then(|id| self.task_index(id))
+            .and_then(|i| self.views[i].group.clone());
         let mark = |name: &str, is_current: bool| {
             if is_current {
                 format!("{name} (current)")
@@ -812,8 +820,10 @@ impl App {
         }
     }
 
-    /// Clear the rename state and return to the dashboard.
-    fn close_rename_prompt(&mut self) {
+    /// Clear the text-prompt state and return to the dashboard. Dropping
+    /// `rename_target` is a no-op for the other prompts: only the rename flow
+    /// sets it, and it re-arms on every open.
+    fn close_prompt(&mut self) {
         self.input.clear();
         self.rename_target = None;
         self.mode = Mode::Dashboard;
@@ -921,20 +931,16 @@ impl App {
         }
     }
 
-    fn on_key_savesession(&mut self, k: KeyEvent) {
+    /// Shared editing for the single-line text prompts: Enter runs `submit`
+    /// with the trimmed input and closes; Esc closes without submitting.
+    fn on_key_textinput(&mut self, k: KeyEvent, submit: fn(&mut App, &str)) {
         match k.code {
             KeyCode::Enter => {
-                let name = self.input.trim().to_string();
-                if !name.is_empty() {
-                    self.save_session(&name);
-                }
-                self.input.clear();
-                self.mode = Mode::Dashboard;
+                let text = self.input.trim().to_string();
+                submit(self, &text);
+                self.close_prompt();
             }
-            KeyCode::Esc => {
-                self.input.clear();
-                self.mode = Mode::Dashboard;
-            }
+            KeyCode::Esc => self.close_prompt(),
             KeyCode::Backspace => {
                 self.input.pop();
             }
@@ -943,24 +949,23 @@ impl App {
         }
     }
 
+    fn on_key_savesession(&mut self, k: KeyEvent) {
+        self.on_key_textinput(k, |app, name| {
+            if !name.is_empty() {
+                app.save_session(name);
+            }
+        });
+    }
+
     fn on_key_rename(&mut self, k: KeyEvent) {
-        match k.code {
-            KeyCode::Enter => {
-                // Whitespace-only input clears the name; the supervisor applies
-                // the remaining label normalization.
-                let name = Some(self.input.trim().to_string()).filter(|s| !s.is_empty());
-                if let Some(id) = self.rename_target {
-                    self.transport.send(Command::SetName { id, name });
-                }
-                self.close_rename_prompt();
+        self.on_key_textinput(k, |app, name| {
+            // Whitespace-only input clears the name; the supervisor applies
+            // the remaining label normalization.
+            let name = Some(name.to_string()).filter(|s| !s.is_empty());
+            if let Some(id) = app.rename_target {
+                app.transport.send(Command::SetName { id, name });
             }
-            KeyCode::Esc => self.close_rename_prompt(),
-            KeyCode::Backspace => {
-                self.input.pop();
-            }
-            KeyCode::Char(c) => self.input.push(c),
-            _ => {}
-        }
+        });
     }
 
     fn on_key_loadsession(&mut self, k: KeyEvent) {
@@ -968,9 +973,7 @@ impl App {
             KeyCode::Esc => self.mode = Mode::Dashboard,
             KeyCode::Up => self.session_sel = self.session_sel.saturating_sub(1),
             KeyCode::Down => {
-                if !self.session_names.is_empty() {
-                    self.session_sel = (self.session_sel + 1).min(self.session_names.len() - 1);
-                }
+                self.session_sel = step_down(self.session_sel, self.session_names.len())
             }
             KeyCode::Enter => {
                 if let Some(name) = self.session_names.get(self.session_sel).cloned() {
@@ -990,11 +993,7 @@ impl App {
                 self.mode = Mode::Dashboard;
             }
             KeyCode::Up => self.dir_sel = self.dir_sel.saturating_sub(1),
-            KeyCode::Down => {
-                if !self.dir_candidates.is_empty() {
-                    self.dir_sel = (self.dir_sel + 1).min(self.dir_candidates.len() - 1);
-                }
-            }
+            KeyCode::Down => self.dir_sel = step_down(self.dir_sel, self.dir_candidates.len()),
             KeyCode::Tab | KeyCode::Right => {
                 // Descend into the highlighted dir; a no-op on the current-dir row.
                 if let Some(c) = self.dir_candidates.get(self.dir_sel)
@@ -1032,9 +1031,7 @@ impl App {
             KeyCode::Esc => self.close_group_picker(),
             KeyCode::Up => self.group_sel = self.group_sel.saturating_sub(1),
             KeyCode::Down => {
-                if !self.group_candidates.is_empty() {
-                    self.group_sel = (self.group_sel + 1).min(self.group_candidates.len() - 1);
-                }
+                self.group_sel = step_down(self.group_sel, self.group_candidates.len())
             }
             KeyCode::Enter => {
                 // Enter assigns the highlighted group, or creates the typed
@@ -1064,25 +1061,11 @@ impl App {
     }
 
     fn on_key_spawn(&mut self, k: KeyEvent) {
-        match k.code {
-            KeyCode::Enter => {
-                let cmd = self.input.trim().to_string();
-                if !cmd.is_empty() {
-                    self.spawn_task(&cmd);
-                }
-                self.input.clear();
-                self.mode = Mode::Dashboard;
+        self.on_key_textinput(k, |app, cmd| {
+            if !cmd.is_empty() {
+                app.spawn_task(cmd);
             }
-            KeyCode::Esc => {
-                self.input.clear();
-                self.mode = Mode::Dashboard;
-            }
-            KeyCode::Backspace => {
-                self.input.pop();
-            }
-            KeyCode::Char(c) => self.input.push(c),
-            _ => {}
-        }
+        });
     }
 
     fn on_key_peek(&mut self, k: KeyEvent) {
@@ -1107,11 +1090,6 @@ impl App {
             // The watch change resets the task viewport.
             self.view_scroll = false;
             // Repaint from scratch next tick; wipe the child's screen now.
-            use crossterm::{
-                cursor::MoveTo,
-                execute,
-                terminal::{Clear, ClearType},
-            };
             let _ = execute!(out, Clear(ClearType::All), MoveTo(0, 0));
             return Ok(());
         }
@@ -1269,7 +1247,7 @@ impl App {
             _ => None,
         };
         let view = self.mode == Mode::Attached && self.view_scroll;
-        let (capture, alt_scroll) = desired_input_modes(attached, view);
+        let capture = desired_mouse_capture(attached, view);
         if capture != self.mouse_captured {
             if capture {
                 execute!(out, EnableMouseCapture)?;
@@ -1277,15 +1255,6 @@ impl App {
                 execute!(out, DisableMouseCapture)?;
             }
             self.mouse_captured = capture;
-        }
-        if alt_scroll != self.alt_scroll {
-            let seq = if alt_scroll {
-                "\x1b[?1007h"
-            } else {
-                "\x1b[?1007l"
-            };
-            execute!(out, Print(seq))?;
-            self.alt_scroll = alt_scroll;
         }
         Ok(())
     }
@@ -1436,20 +1405,14 @@ fn list_dirs(base: &Path, partial: &str) -> Vec<String> {
     out
 }
 
-/// Visible `(start, count)` window that includes the selected list item.
-pub fn scroll_window(sel: usize, total: usize, max: usize) -> (usize, usize) {
-    if total == 0 || max == 0 {
-        return (0, 0);
-    }
-    let count = total.min(max);
-    let start = if sel >= count { sel + 1 - count } else { 0 };
-    (start, count)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::transport::LocalTransport;
+    use crate::{
+        testutil::{temp, wait_until},
+        transport::LocalTransport,
+        ui::scroll_window,
+    };
 
     impl App {
         /// A synchronous App: the supervisor ticks inline on `poll`, so `send`
@@ -1680,8 +1643,7 @@ mod tests {
     #[test]
     fn custom_mode_clusters_by_dir_within_group() {
         let mut app = App::new_local(30, 100);
-        let base = std::env::temp_dir().join(format!("fleetcom_app_cg_{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&base);
+        let base = temp("app_cg");
         let (dir_a, dir_b) = (base.join("a"), base.join("b"));
         std::fs::create_dir_all(&dir_a).unwrap();
         std::fs::create_dir_all(&dir_b).unwrap();
@@ -1707,18 +1669,13 @@ mod tests {
         let mut app = App::new_local(30, 100);
         let inv = app.invocation_dir.clone();
         app.spawn_in("true", inv); // exits ~immediately
-        for _ in 0..100 {
+        wait_until(Duration::from_secs(5), || {
             app.pump();
-            let done = app
-                .views
+            app.views
                 .first()
                 .map(|v| matches!(v.lifecycle, Lifecycle::Ok | Lifecycle::Failed))
-                .unwrap_or(false);
-            if done {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(20));
-        }
+                .unwrap_or(false)
+        });
         assert!(matches!(
             app.views[0].lifecycle,
             Lifecycle::Ok | Lifecycle::Failed
@@ -1738,23 +1695,16 @@ mod tests {
     #[test]
     fn rerun_key_is_gated_to_finished_tasks() {
         let mut app = App::new_local(30, 100);
-        let dir = std::env::temp_dir().join(format!("fleetcom_app_rerun_{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = temp("app_rerun");
         let marker = dir.join("marker");
         app.spawn_in("sleep 30", dir.clone()); // id 1: stays running
         app.spawn_in(&format!("echo run >> {}", marker.display()), dir.clone()); // id 2
-        for _ in 0..200 {
+        wait_until(Duration::from_secs(5), || {
             app.pump();
-            let done = app
-                .views
+            app.views
                 .iter()
-                .any(|v| v.id == 2 && matches!(v.lifecycle, Lifecycle::Ok));
-            if done {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(20));
-        }
+                .any(|v| v.id == 2 && matches!(v.lifecycle, Lifecycle::Ok))
+        });
 
         // Running selection: `r` must send nothing (and thus kill nothing).
         app.selected_id = Some(1);
@@ -1771,16 +1721,12 @@ mod tests {
         // Finished selection: `r` reruns it under the same id.
         app.selected_id = Some(2);
         app.on_key_dashboard(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE));
-        for _ in 0..200 {
+        wait_until(Duration::from_secs(5), || {
             app.pump();
-            let reran = std::fs::read_to_string(&marker)
+            std::fs::read_to_string(&marker)
                 .map(|s| s.lines().count() == 2)
-                .unwrap_or(false);
-            if reran {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(20));
-        }
+                .unwrap_or(false)
+        });
         assert_eq!(
             std::fs::read_to_string(&marker).unwrap().lines().count(),
             2,
@@ -1795,8 +1741,7 @@ mod tests {
 
     /// Scratch config dir with the given pre-written (empty) session recipes.
     fn session_scratch(tag: &str, names: &[&str]) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("fleetcom_app_{tag}_{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir = temp(&format!("app_{tag}"));
         std::fs::create_dir_all(dir.join("sessions")).unwrap();
         for n in names {
             std::fs::write(dir.join("sessions").join(format!("{n}.json")), "{}").unwrap();
@@ -1980,19 +1925,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn scroll_window_keeps_selection_visible() {
-        assert_eq!(scroll_window(0, 5, 8), (0, 5)); // fits, no scroll
-        assert_eq!(scroll_window(4, 5, 8), (0, 5));
-        assert_eq!(scroll_window(7, 20, 8), (0, 8)); // last row of first window
-        assert_eq!(scroll_window(8, 20, 8), (1, 8)); // scrolls one
-        assert_eq!(scroll_window(19, 20, 8), (12, 8)); // last item
-        for sel in 0..20 {
-            let (start, count) = scroll_window(sel, 20, 8);
-            assert!(sel >= start && sel < start + count, "sel {sel} off-window");
-        }
-    }
-
     /// Modified Enter must stay distinguishable on the wire: `\x1b\r` (the
     /// meta-prefix encoding), never flattened to the bare `\r` that submits.
     #[test]
@@ -2071,7 +2003,7 @@ mod tests {
         assert!(app.mode == Mode::Spawn, "paste must not submit");
     }
 
-    /// Select capture and alternate-scroll modes by screen type.
+    /// Select mouse capture by screen type.
     #[test]
     fn input_modes_match_screen_type() {
         let screen = |wants_mouse, alt_screen, alt_scroll| ScreenView {
@@ -2086,37 +2018,37 @@ mod tests {
             scrollback: 0,
         };
         // No attached screen: keep native selection available.
-        assert_eq!(desired_input_modes(None, false), (false, true));
+        assert!(!desired_mouse_capture(None, false));
         // Mouse-aware child: capture.
-        assert_eq!(
-            desired_input_modes(Some(&screen(true, true, true)), false),
-            (true, true)
-        );
-        assert_eq!(
-            desired_input_modes(Some(&screen(true, false, false)), false),
-            (true, true)
-        );
+        assert!(desired_mouse_capture(
+            Some(&screen(true, true, true)),
+            false
+        ));
+        assert!(desired_mouse_capture(
+            Some(&screen(true, false, false)),
+            false
+        ));
         // Full-screen child with alternate scroll enabled.
-        assert_eq!(
-            desired_input_modes(Some(&screen(false, true, true)), false),
-            (false, true)
-        );
+        assert!(!desired_mouse_capture(
+            Some(&screen(false, true, true)),
+            false
+        ));
         // Full-screen child with alternate scroll disabled.
-        assert_eq!(
-            desired_input_modes(Some(&screen(false, true, false)), false),
-            (true, true)
-        );
+        assert!(desired_mouse_capture(
+            Some(&screen(false, true, false)),
+            false
+        ));
         // Inline child: capture wheel-up to enter scrollback.
-        assert_eq!(
-            desired_input_modes(Some(&screen(false, false, false)), false),
-            (true, true)
-        );
+        assert!(desired_mouse_capture(
+            Some(&screen(false, false, false)),
+            false
+        ));
         // The scroll view overrides everything: the wheel must scroll it.
-        assert_eq!(
-            desired_input_modes(Some(&screen(false, false, false)), true),
-            (true, true)
-        );
-        assert_eq!(desired_input_modes(None, true), (true, true));
+        assert!(desired_mouse_capture(
+            Some(&screen(false, false, false)),
+            true
+        ));
+        assert!(desired_mouse_capture(None, true));
     }
 
     /// Wheel-up enters scrollback for inline children, but forwards for
@@ -2163,10 +2095,7 @@ mod tests {
     /// Attached wheel input follows the child's DECSET 1007 state.
     #[test]
     fn attached_wheel_honors_the_childs_1007_veto() {
-        use std::time::Instant;
-        let dir = std::env::temp_dir().join(format!("fleetcom_app_1007_{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = temp("app_1007");
 
         let wheel_up = MouseEvent {
             kind: MouseEventKind::ScrollUp,
@@ -2195,23 +2124,18 @@ mod tests {
             let id = app.focused_id.expect("attached");
             app.set_watch(Some(id));
             // Wait for the child's terminal modes to reach the client.
-            let deadline = Instant::now() + Duration::from_secs(5);
-            loop {
-                app.pump();
-                if matches!(
-                    app.screen_for(id),
-                    Some(s) if s.alt_screen && s.alt_scroll != veto
-                ) {
-                    break;
-                }
-                assert!(
-                    Instant::now() < deadline,
-                    "gate state (veto: {veto}) never reached the client"
-                );
-                std::thread::sleep(Duration::from_millis(10));
-            }
+            assert!(
+                wait_until(Duration::from_secs(5), || {
+                    app.pump();
+                    matches!(
+                        app.screen_for(id),
+                        Some(s) if s.alt_screen && s.alt_scroll != veto
+                    )
+                }),
+                "gate state (veto: {veto}) never reached the client"
+            );
             // Disabled alternate scroll captures the wheel; enabled does not.
-            assert_eq!(desired_input_modes(app.screen_for(id), false), (veto, true));
+            assert_eq!(desired_mouse_capture(app.screen_for(id), false), veto);
             app.on_mouse(wheel_up);
             if veto {
                 // The sentinel follows the wheel on the writer queue.
@@ -2220,15 +2144,11 @@ mod tests {
                     bytes: b"zzz".to_vec(),
                 });
             }
-            let deadline = Instant::now() + Duration::from_secs(5);
             let mut got = Vec::new();
-            while Instant::now() < deadline {
+            wait_until(Duration::from_secs(5), || {
                 got = std::fs::read(&out).unwrap_or_default();
-                if got.len() >= take {
-                    break;
-                }
-                std::thread::sleep(Duration::from_millis(20));
-            }
+                got.len() >= take
+            });
             got
         };
 

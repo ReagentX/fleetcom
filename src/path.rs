@@ -20,7 +20,7 @@ pub fn abbreviate(path: &Path) -> String {
 }
 
 /// Expand a leading `~` (alone or `~/…`) to `$HOME`.
-pub fn expand_tilde(s: &str) -> String {
+fn expand_tilde(s: &str) -> String {
     if let Some(rest) = s.strip_prefix('~')
         && (rest.is_empty() || rest.starts_with('/'))
         && let Ok(home) = std::env::var("HOME")
@@ -31,7 +31,7 @@ pub fn expand_tilde(s: &str) -> String {
 }
 
 /// Collapse `.` and `..` without resolving symlinks: `/a/b/../c` becomes `/a/c`.
-pub fn lexical_clean(p: &Path) -> PathBuf {
+fn lexical_clean(p: &Path) -> PathBuf {
     let mut out = PathBuf::new();
     for comp in p.components() {
         match comp {

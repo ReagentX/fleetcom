@@ -21,7 +21,7 @@ mod grok;
 
 use std::{
     ffi::OsString,
-    fs::File,
+    fs::{self, File},
     io::Read,
     path::{Path, PathBuf},
     time::{Duration, SystemTime},
@@ -29,6 +29,9 @@ use std::{
 
 pub use claude::Claude;
 pub use codex::Codex;
+// Test-only: `testutil::write_rollout` derives day directories from it.
+#[cfg(test)]
+pub(crate) use codex::civil_from_days;
 pub use grok::Grok;
 
 /// Environment variable naming the capture file used by injected assets.
@@ -44,15 +47,22 @@ const CORRELATE_WINDOW: Duration = Duration::from_secs(30);
 
 /// Detection, capture, correlation, and resume behavior for one agent CLI.
 pub trait Harness: Sync {
-    #[allow(dead_code)] // test-only: registry routing assertions
-    fn name(&self) -> &'static str;
-
     /// Environment variable overriding the tool's home root. The supervisor
     /// resolves it from the launch context used for instrumentation or save.
     fn home_env_var(&self) -> &'static str;
 
     /// The tool's directory name under the launched process's `$HOME`.
     fn home_dot_dir(&self) -> &'static str;
+
+    /// Resolve the tool's home root. `home` follows the `instrument` contract:
+    /// falling back to this process's home happens only when the launch
+    /// environment supplied neither the tool-specific override nor `HOME`.
+    fn home_root(&self, home: Option<&Path>) -> Option<PathBuf> {
+        match home {
+            Some(p) => Some(p.to_path_buf()),
+            None => Some(dirs::home_dir()?.join(self.home_dot_dir())),
+        }
+    }
 
     /// Classify a command. Return `None` for another tool or an unsupported
     /// command shape.
@@ -206,6 +216,23 @@ pub(crate) fn leading_uuid(s: &str) -> Option<&str> {
     }
 }
 
+/// Extract the ID after the last valid resume hint in `text`. Every
+/// occurrence of every `hints` prefix competes when a strict UUID follows it,
+/// and the largest byte offset wins across prefixes.
+pub(crate) fn last_hint(text: &str, hints: &[&str]) -> Option<String> {
+    let mut last: Option<(usize, String)> = None;
+    for hint in hints {
+        for (i, _) in text.match_indices(hint) {
+            if let Some(id) = leading_uuid(&text[i + hint.len()..])
+                && last.as_ref().is_none_or(|(j, _)| i > *j)
+            {
+                last = Some((i, id.to_string()));
+            }
+        }
+    }
+    last.map(|(_, id)| id)
+}
+
 /// Generate a v4 UUID from `/dev/urandom`. A read failure returns `None`, which
 /// lets the caller launch without pinning an ID.
 pub(crate) fn uuid_v4() -> Option<String> {
@@ -227,6 +254,20 @@ pub(crate) fn uuid_v4() -> Option<String> {
     Some(out)
 }
 
+/// Spawn plan for the launch-time ID pin: a bare launch pins a fresh v4 UUID
+/// through `--session-id`, the resume form already targets its conversation,
+/// and a `uuid_v4` failure launches without pinning.
+pub(crate) fn pin_plan(inv: &Invocation) -> SpawnPlan {
+    let mut plan = SpawnPlan::default();
+    if *inv == Invocation::Bare
+        && let Some(id) = uuid_v4()
+    {
+        plan.args_suffix = format!(" --session-id {}", shell_quote(&id));
+        plan.injected_id = Some(id);
+    }
+    plan
+}
+
 /// Whether `a` and `b` differ by at most [`CORRELATE_WINDOW`].
 pub(crate) fn within_window(a: SystemTime, b: SystemTime) -> bool {
     match a.duration_since(b) {
@@ -240,16 +281,162 @@ pub(crate) fn within_window_ms(a: u128, b: u128) -> bool {
     a.abs_diff(b) <= CORRELATE_WINDOW.as_millis()
 }
 
+/// Return the sole `candidate` in `dir` created within [`CORRELATE_WINDOW`]
+/// of `spawned`. `candidate` names an entry or skips it; entries without
+/// creation times cannot be correlated by window and are skipped too. Several
+/// in-window candidates cannot be told apart, and a stray non-uuid candidate
+/// still counts against uniqueness: both return `None`.
+pub(crate) fn unique_in_window(
+    dir: PathBuf,
+    spawned: SystemTime,
+    candidate: impl Fn(&fs::DirEntry) -> Option<String>,
+) -> Option<String> {
+    let mut candidates: Vec<String> = Vec::new();
+    for entry in fs::read_dir(dir).ok()?.flatten() {
+        let Some(name) = candidate(&entry) else {
+            continue;
+        };
+        let Ok(created) = entry.metadata().and_then(|m| m.created()) else {
+            continue;
+        };
+        if !within_window(created, spawned) {
+            continue;
+        }
+        candidates.push(name);
+    }
+    match candidates.as_slice() {
+        [only] if is_uuid(only) => Some(only.clone()),
+        _ => None,
+    }
+}
+
 /// Single-quote `s` for `$SHELL -c`, encoding embedded `'` as `'\''`.
 pub(crate) fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
+/// Fixtures shared by the per-harness test modules and the supervisor's
+/// capture suite.
+#[cfg(test)]
+pub(crate) mod testutil {
+    use std::path::PathBuf;
+
+    use super::CapturePaths;
+
+    /// Strict v4 UUID used wherever a valid session ID is needed.
+    pub(crate) const ID: &str = "c8c4a5cc-0b32-4ba0-a6b4-6ed08c218e0d";
+    /// A second distinct ID for last-hint, requote, and ambiguity cases.
+    pub(crate) const OTHER: &str = "11111111-2222-4333-8444-555555555555";
+
+    /// Capture-path fixture. The spaced `claude_settings` and `codex_notify`
+    /// paths keep the shell- and TOML-quoting assertions honest.
+    pub(crate) fn paths() -> CapturePaths {
+        CapturePaths {
+            capture_file: PathBuf::from("/tmp/cap/session.json"),
+            claude_settings: PathBuf::from("/tmp/Application Support/fleetcom.json"),
+            codex_notify: PathBuf::from("/tmp/Application Support/notify.sh"),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use super::testutil::{ID, OTHER};
     use super::*;
 
-    const ID: &str = "c8c4a5cc-0b32-4ba0-a6b4-6ed08c218e0d";
+    /// Harness, program word, selector, and path prefix for the shape tests
+    /// shared by every harness. Codex's resume selector is a subcommand, not
+    /// a flag.
+    static SHAPES: [(&dyn Harness, &str, &str, &str); 3] = [
+        (&Claude, "claude", "--resume", "/usr/local/bin"),
+        (&Codex, "codex", "resume", "/opt/bin"),
+        (&Grok, "grok", "--resume", "/usr/local/bin"),
+    ];
+
+    /// Each harness accepts exactly its bare program word (plain or path
+    /// form) and its canonical resume form (bare or quoted ID).
+    #[test]
+    fn every_harness_detects_the_two_authored_shapes() {
+        for &(h, prog, sel, path) in &SHAPES {
+            assert_eq!(h.detect(prog), Some(Invocation::Bare), "{prog}");
+            assert_eq!(
+                h.detect(&format!("{path}/{prog}")),
+                Some(Invocation::Bare),
+                "{prog}"
+            );
+            for cmd in [
+                format!("{prog} {sel} {ID}"),
+                format!("{prog} {sel} '{ID}'"),
+                format!("{path}/{prog} {sel} '{ID}'"),
+            ] {
+                assert_eq!(h.detect(&cmd), Some(Invocation::Resume(ID.into())), "{cmd}");
+            }
+        }
+    }
+
+    /// Both accepted shapes regenerate the canonical resume form while
+    /// preserving the program word as typed; invalid IDs leave the command
+    /// unchanged.
+    #[test]
+    fn every_harness_regenerates_the_canonical_resume_form() {
+        for &(h, prog, sel, path) in &SHAPES {
+            let canonical = format!("{prog} {sel} '{ID}'");
+            assert_eq!(h.resume_command(prog, ID), canonical, "{prog}");
+            assert_eq!(
+                h.resume_command(&format!("{path}/{prog}"), ID),
+                format!("{path}/{prog} {sel} '{ID}'")
+            );
+            assert_eq!(
+                h.resume_command(&format!("{prog} {sel} '{OTHER}'"), ID),
+                canonical
+            );
+            assert_eq!(
+                h.resume_command(&format!("{prog} {sel} {OTHER}"), ID),
+                canonical
+            );
+            for bad in ["evil'", "not-an-id"] {
+                assert_eq!(h.resume_command(prog, bad), prog, "{prog} {bad:?}");
+            }
+        }
+    }
+
+    /// Shared shell-syntax shapes are opaque for every harness and are never
+    /// rewritten: prompts, a bare or malformed selector, `=`-joined IDs,
+    /// quoted-ID-plus-prompt, token-extending IDs, pipes, separators, env
+    /// prefixes, other tools, and the empty command. Harness-specific
+    /// opacity cases stay in each harness's own test module.
+    #[test]
+    fn every_harness_keeps_shared_shell_syntax_opaque() {
+        for &(h, prog, sel, _) in &SHAPES {
+            let opaque = [
+                format!("{prog} 'fix the tests'"),
+                format!("{prog} {sel}"),
+                format!("{prog} {sel} not-a-uuid"),
+                format!("{prog} {sel} $ID"),
+                format!("{prog} {sel}={ID}"),
+                format!("{prog} {sel} '{ID}' 'and do x'"),
+                format!("{prog} {sel} {ID}ff"),
+                format!("{prog} | tee log"),
+                format!("{prog}; ls"),
+                format!("FOO=bar {prog}"),
+                String::new(),
+            ];
+            for cmd in opaque {
+                assert_eq!(h.detect(&cmd), None, "{cmd:?} must be opaque");
+                assert_eq!(
+                    h.resume_command(&cmd, ID),
+                    cmd,
+                    "an opaque command must never be rewritten"
+                );
+            }
+            // Another tool's program word never matches.
+            for other in ["claude", "codex", "grok"] {
+                if other != prog {
+                    assert_eq!(h.detect(other), None, "{other:?} is not {prog}");
+                }
+            }
+        }
+    }
 
     #[test]
     fn is_uuid_accepts_only_the_strict_shape() {
@@ -389,13 +576,13 @@ mod tests {
     #[test]
     fn registry_detect_routes_to_the_matching_harness() {
         let (h, inv) = detect("claude").unwrap();
-        assert_eq!(h.name(), "claude");
+        assert_eq!(h.home_dot_dir(), ".claude");
         assert_eq!(inv, Invocation::Bare);
         let (h, inv) = detect(&format!("codex resume {ID}")).unwrap();
-        assert_eq!(h.name(), "codex");
+        assert_eq!(h.home_dot_dir(), ".codex");
         assert_eq!(inv, Invocation::Resume(ID.into()));
         let (h, inv) = detect("grok").unwrap();
-        assert_eq!(h.name(), "grok");
+        assert_eq!(h.home_dot_dir(), ".grok");
         assert_eq!(inv, Invocation::Bare);
         assert!(detect("vim").is_none());
         assert!(detect("").is_none());

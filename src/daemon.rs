@@ -43,10 +43,10 @@ use nix::{
 
 use crate::{
     core::{LoopExit, Wake, run_loop},
-    frame::{MAX_FRAME, read_frame, write_frame},
+    frame::{MAX_FRAME, SEND_TIMEOUT, read_frame, write_frame},
     protocol::{
         Command, Event, LaunchContext, PROTOCOL_VERSION, decode_command, decode_event,
-        decode_hello, encode_command, encode_event, encode_hello,
+        decode_hello, encode_command, encode_event, encode_hello, hello_version,
     },
     supervisor::Supervisor,
 };
@@ -60,6 +60,10 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 /// in microseconds.
 const HELLO_PROBE: Duration = Duration::from_secs(1);
 
+/// Env var overriding the per-user runtime directory (socket, lock, and the
+/// capture-asset root the supervisor derives from it).
+pub const FLEETCOM_RUNTIME_DIR: &str = "FLEETCOM_RUNTIME_DIR";
+
 /// Per-user directory holding the socket. `FLEETCOM_RUNTIME_DIR` overrides it
 /// (tests point it at an isolated temp dir); else `$XDG_RUNTIME_DIR/fleetcom`
 /// (per-user on Linux); else `$TMPDIR/fleetcom-$uid`, the macOS path, where
@@ -67,7 +71,7 @@ const HELLO_PROBE: Duration = Duration::from_secs(1);
 /// XDG-less Linux.
 fn runtime_dir() -> PathBuf {
     resolve_runtime_dir(
-        std::env::var("FLEETCOM_RUNTIME_DIR").ok(),
+        std::env::var(FLEETCOM_RUNTIME_DIR).ok(),
         std::env::var("XDG_RUNTIME_DIR").ok(),
         std::env::temp_dir(),
         nix::unistd::getuid().as_raw(),
@@ -373,7 +377,7 @@ fn kill_via_socket() -> io::Result<()> {
 pub fn run_daemon() -> io::Result<()> {
     let dir = runtime_dir();
     ensure_runtime_dir(&dir)?; // private 0700 directory
-    let path = dir.join("default.sock");
+    let path = socket_path();
 
     // Only the holder of `daemon.lock` may own the
     // socket. A concurrent autostart (two clients racing to spawn a daemon) or a
@@ -415,15 +419,10 @@ pub fn run_daemon() -> io::Result<()> {
     // branch below and inside `run_loop` while a client is being served; both
     // observe it within ~200 ms.
     let term = Arc::new(AtomicBool::new(false));
-    {
-        use signal_hook::consts::{SIGHUP, SIGINT, SIGTERM};
-        signal_hook::flag::register(SIGTERM, Arc::clone(&term))?;
-        signal_hook::flag::register(SIGINT, Arc::clone(&term))?;
-        // The daemon is detached in its own process group, so a SIGHUP here is
-        // someone's explicit `kill -HUP`: there is no reload semantic, treat it
-        // as shutdown like the rest.
-        signal_hook::flag::register(SIGHUP, Arc::clone(&term))?;
-    }
+    // The daemon is detached in its own process group, so a SIGHUP here is
+    // someone's explicit `kill -HUP`: there is no reload semantic, treat it
+    // as shutdown like the rest.
+    crate::install_signal_handlers(Arc::clone(&term))?;
 
     // Non-blocking accept lets the daemon reap exited jobs while idle:
     // between clients it would otherwise block in accept() and never call
@@ -488,18 +487,6 @@ enum ServeOutcome {
     Disconnected,
     /// Client asked to kill everything and stop the daemon.
     Shutdown,
-}
-
-/// Extract a claimed protocol version for mismatch reporting.
-/// Accepts hello-kind frames and control frames with a `hello` discriminant,
-/// even when the remaining fields do not satisfy [`decode_hello`].
-fn hello_version(kind: u8, payload: &[u8]) -> Option<u32> {
-    let v = jzon::parse(std::str::from_utf8(payload).ok()?).ok()?;
-    match kind {
-        crate::frame::KIND_HELLO => v["v"].as_u32(),
-        crate::frame::KIND_CONTROL if v["t"].as_str() == Some("hello") => v["v"].as_u32(),
-        _ => None,
-    }
 }
 
 /// Read and validate the connection-opening hello frame.
@@ -599,7 +586,7 @@ fn serve_client(sup: &mut Supervisor, stream: UnixStream, stop: &AtomicBool) -> 
     // blocked forever on a full send buffer would freeze reads, ticks, reaping,
     // and `accept`, and `--kill` could never get in. Cap how long one event
     // write may block; a timeout surfaces as an error below and drops the client.
-    let _ = write.set_write_timeout(Some(Duration::from_secs(5)));
+    let _ = write.set_write_timeout(Some(SEND_TIMEOUT));
     let outcome = catch_unwind(AssertUnwindSafe(|| {
         run_loop(sup, &wake_rx, stop, |ev| send_event(&mut write, ev))
     }));
@@ -624,21 +611,14 @@ fn serve_client(sup: &mut Supervisor, stream: UnixStream, stop: &AtomicBool) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn temp(tag: &str) -> PathBuf {
-        let d =
-            std::env::temp_dir().join(format!("fleetcom_daemon_test_{tag}_{}", std::process::id()));
-        let _ = fs::remove_dir_all(&d);
-        fs::create_dir_all(&d).unwrap();
-        d
-    }
+    use crate::testutil::temp;
 
     /// A symlink at the runtime-dir path is the planted shared-`/tmp` attack:
     /// it must be rejected even when its target is a real directory, or the
     /// daemon (and the client's `daemon.log` create) would write through it.
     #[test]
     fn ensure_runtime_dir_rejects_symlink() {
-        let base = temp("symlink");
+        let base = temp("daemon_symlink");
         let target = base.join("target");
         fs::create_dir(&target).unwrap();
         let link = base.join("runtime");
@@ -649,7 +629,7 @@ mod tests {
 
     #[test]
     fn ensure_runtime_dir_rejects_plain_file() {
-        let base = temp("file");
+        let base = temp("daemon_file");
         let path = base.join("runtime");
         fs::write(&path, b"x").unwrap();
         assert!(ensure_runtime_dir(&path).is_err());
@@ -747,7 +727,7 @@ mod tests {
     /// steady-state daemon restart path).
     #[test]
     fn ensure_runtime_dir_creates_private_dir() {
-        let base = temp("create");
+        let base = temp("daemon_create");
         let path = base.join("runtime");
         ensure_runtime_dir(&path).unwrap();
         let mode = fs::symlink_metadata(&path).unwrap().permissions().mode();
