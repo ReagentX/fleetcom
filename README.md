@@ -102,7 +102,7 @@ Signals target each task's process group. `fleetcom` leaves an exited leader unr
 
 ### Grouping and launch targets
 
-The dashboard groups tasks by state (In use / Running / Completed), working directory, or names assigned with `g`. Custom groups sort by name, with Unassigned last. `@` opens a live directory picker with the current directory first, recently used directories next, and matching subdirectories after them. This provides an explicit launch directory without leaving the dashboard.
+The dashboard groups tasks by state (In use / Running / Idle / Completed), working directory, or names assigned with `g`. A running task moves to Idle after 10 s without output. That window is deliberately wider than the 600 ms that flips the row glyph between `✻` and `∙`: a tool like `top` that prints every 1–2 s flaps the glyph but never goes 10 s quiet, so it stays under Running. The glyph is the instantaneous signal; the section is the settled one. Custom groups sort by name, with Unassigned last. `@` opens a live directory picker with the current directory first, recently used directories next, and matching subdirectories after them. This provides an explicit launch directory without leaving the dashboard.
 
 ### Task names
 

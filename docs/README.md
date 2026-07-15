@@ -77,7 +77,7 @@ Press `n`, enter a command, and press `Enter`. The command runs in its own PTY a
   ↑↓ select · enter attach · space peek · n/@ new · s sort · m tag · g group · R rename · r rerun · X kill · q detach · Q quit
 ```
 
-Each row is `glyph · tag · command · latest output · age`. `Space` peeks: a read-only box of the selected task's live screen, without leaving the dashboard:
+Each row is `glyph · tag · command · latest output · age`. The age counts from the task's last meaningful edge: launch while running, last output once idle, exit once completed. `Space` peeks: a read-only box of the selected task's live screen, without leaving the dashboard:
 
 ```text
   ┌─ cargo watch -x test ───────────────────────────────┐
