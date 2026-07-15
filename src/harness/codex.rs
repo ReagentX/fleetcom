@@ -1,4 +1,4 @@
-//! For eligible `codex` commands, this harness captures IDs through an injected
+//! For accepted `codex` commands, this harness captures IDs through an injected
 //! `notify` override, chains compatible configured notifiers, scans both
 //! resume-hint forms, and correlates rollout files under
 //! `<codex-home>/sessions/YYYY/MM/DD/rollout-<local-ts>-<uuid>.jsonl`.
@@ -12,90 +12,8 @@ use std::{
 };
 
 use super::{
-    CAPTURE_ENV, CapturePaths, FlagTable, Harness, Invocation, NOTIFY_CHAIN_ENV, Scan, SpawnPlan,
-    is_uuid, leading_uuid, shell_quote, splice_insert, tokenize, within_window_ms,
-};
-
-/// Subcommands excluded from session capture.
-const BLOCKLIST: &[&str] = &[
-    "exec",
-    "e", // alias of exec
-    "review",
-    "login",
-    "logout",
-    "mcp",
-    "plugin",
-    "mcp-server",
-    "app-server",
-    "remote-control",
-    "app",
-    "completion",
-    "update",
-    "doctor",
-    "sandbox",
-    "debug",
-    "apply",
-    "a", // alias of apply
-    "archive",
-    "delete",
-    "unarchive",
-    "fork",
-    "cloud",
-    "exec-server",
-    "features",
-    "help",
-];
-
-/// Top-level `codex` flags that consume a separate value. `first_positional`
-/// skips both tokens while locating the subcommand or prompt. Attached values
-/// such as `--flag=value` are handled inline.
-const VALUE_FLAGS: &[&str] = &[
-    "-c",
-    "--config",
-    "-m",
-    "--model",
-    "-p",
-    "--profile",
-    "-i",
-    "--image",
-    "-s",
-    "--sandbox",
-    "-a",
-    "--ask-for-approval",
-    "-C",
-    "--cd",
-    "--add-dir",
-    "--enable",
-    "--disable",
-    "--local-provider",
-    "--remote",
-    "--remote-auth-token-env",
-];
-
-/// Top-level `codex` flags that consume no value.
-const BOOL_FLAGS: &[&str] = &[
-    "--oss",
-    "--search",
-    "--no-alt-screen",
-    "--strict-config",
-    "--last",
-    "--all",
-    "--include-non-interactive",
-    "--dangerously-bypass-approvals-and-sandbox",
-    "--dangerously-bypass-hook-trust",
-    "-h",
-    "--help",
-    "-V",
-    "--version",
-];
-
-/// Codex has no optional-value or variadic top-level flags, so those tables
-/// are empty. A flag in neither table makes the command opaque.
-const TABLE: FlagTable = FlagTable {
-    value: VALUE_FLAGS,
-    optional: &[],
-    variadic: &[],
-    boolean: BOOL_FLAGS,
+    CAPTURE_ENV, CapturePaths, Harness, Invocation, NOTIFY_CHAIN_ENV, SpawnPlan, detect_shape,
+    is_uuid, leading_uuid, resume_shape, shell_quote, within_window_ms,
 };
 
 pub struct Codex;
@@ -110,59 +28,18 @@ impl Harness for Codex {
     }
 
     fn detect(&self, cmd: &str) -> Option<Invocation> {
-        let words = tokenize(cmd)?;
-        if Path::new(words.first()?.text.as_str())
-            .file_name()?
-            .to_str()?
-            != "codex"
-        {
-            return None;
-        }
-        let mut known_id: Option<String> = None;
-        match TABLE.first_positional(&words, 1) {
-            // An unrecognized flag makes the command opaque: refuse rather
-            // than risk misreading its value as the subcommand.
-            Scan::Opaque => return None,
-            Scan::Exhausted => {}
-            Scan::Positional(si) => {
-                let sub = words[si].text.as_str();
-                if BLOCKLIST.contains(&sub) {
-                    return None;
-                }
-                // `resume <uuid>` targets a known conversation; `resume
-                // <name>` and bare `resume` leave the user's target
-                // untouched. Any other positional is a prompt.
-                if sub == "resume" {
-                    match TABLE.first_positional(&words, si + 1) {
-                        Scan::Opaque => return None,
-                        Scan::Positional(ti) if is_uuid(&words[ti].text) => {
-                            known_id = Some(words[ti].text.clone());
-                        }
-                        _ => {}
-                    }
-                }
-            }
-        }
-        Some(Invocation {
-            tokens: words.into_iter().map(|w| w.text).collect(),
-            known_id,
-            can_inject_id: false,
-        })
+        detect_shape(cmd, "codex", "resume")
     }
 
     fn instrument(
         &self,
-        inv: &Invocation,
+        // Both accepted shapes take the same injection; codex cannot pin an
+        // ID at launch either way.
+        _inv: &Invocation,
         capture: &CapturePaths,
         home_override: Option<&Path>,
     ) -> SpawnPlan {
-        // A notify override in the command tokens is per-invocation intent;
-        // never chain over it. Exit scraping and filesystem correlation
-        // still apply without an injected notifier.
-        if has_notify_override(&inv.tokens) {
-            return SpawnPlan::default();
-        }
-        let chain = match config_notify_route(home_override, &inv.tokens) {
+        let chain = match config_notify_route(home_override) {
             NotifyRoute::Vacant => None,
             // A routed notifier rides along: the injected script execs this
             // argv, payload appended, after the capture write.
@@ -286,63 +163,8 @@ impl Harness for Codex {
     }
 
     fn resume_command(&self, cmd: &str, id: &str) -> String {
-        if !is_uuid(id) {
-            return cmd.to_string();
-        }
-        let Some(words) = tokenize(cmd) else {
-            return cmd.to_string();
-        };
-        if words.is_empty() {
-            return cmd.to_string();
-        }
-        let si = match TABLE.first_positional(&words, 1) {
-            // An unknown flag leaves the command unchanged.
-            Scan::Opaque => return cmd.to_string(),
-            // Flags only: the resume subcommand slots in after the program.
-            Scan::Exhausted => {
-                return splice_insert(cmd, words[0].end, &format!(" resume {}", shell_quote(id)));
-            }
-            Scan::Positional(si) => si,
-        };
-        let sub = words[si].text.as_str();
-        if BLOCKLIST.contains(&sub) {
-            return cmd.to_string();
-        }
-        if sub != "resume" {
-            // Prompt positional: `resume <id>` precedes it; the prompt stays.
-            return splice_insert(cmd, words[0].end, &format!(" resume {}", shell_quote(id)));
-        }
-        match TABLE.first_positional(&words, si + 1) {
-            Scan::Opaque => cmd.to_string(),
-            Scan::Positional(ti) if is_uuid(&words[ti].text) => {
-                let mut out = cmd.to_string();
-                out.replace_range(words[ti].start..words[ti].end, id);
-                out
-            }
-            // A named target remains unchanged.
-            Scan::Positional(_) => cmd.to_string(),
-            // Bare `resume` at the end of the command gains the target.
-            Scan::Exhausted if si + 1 == words.len() => format!("{cmd} {}", shell_quote(id)),
-            // Flags after `resume` (for example, `--last`) select their own
-            // target, so no ID is added.
-            Scan::Exhausted => cmd.to_string(),
-        }
+        resume_shape(cmd, "codex", "resume", id)
     }
-}
-
-/// Whether the command already routes notifications through `-c notify=…`,
-/// `-cnotify=…`, `-c=notify=…`, `--config notify=…`, or `--config=notify=…`.
-fn has_notify_override(tokens: &[String]) -> bool {
-    tokens.iter().enumerate().skip(1).any(|(i, t)| {
-        if (t == "-c" || t == "--config")
-            && tokens.get(i + 1).is_some_and(|v| v.starts_with("notify="))
-        {
-            return true;
-        }
-        t.strip_prefix("--config=")
-            .or_else(|| t.strip_prefix("-c"))
-            .is_some_and(|v| v.trim_start_matches('=').starts_with("notify="))
-    })
 }
 
 /// How `instrument` must treat the user's configured notify route.
@@ -359,12 +181,12 @@ enum NotifyRoute {
 }
 
 /// Classify the `notify` route in `config.toml` and the effective profile
-/// config. The profile file's assignment overrides the base file's. The last
-/// command-line `-p`/`--profile` wins; otherwise the first line-based
-/// `profile` assignment in `config.toml` selects the profile. Line-based
-/// checks also match assignments inside TOML tables, so two `notify` lines
-/// in one file are ambiguous and read as [`NotifyRoute::Opaque`].
-fn config_notify_route(home: Option<&Path>, tokens: &[String]) -> NotifyRoute {
+/// config. The profile file's assignment overrides the base file's; the first
+/// line-based `profile` assignment in `config.toml` selects the profile.
+/// Line-based checks also match assignments inside TOML tables, so two
+/// `notify` lines in one file are ambiguous and read as
+/// [`NotifyRoute::Opaque`].
+fn config_notify_route(home: Option<&Path>) -> NotifyRoute {
     let root = match home {
         Some(p) => p.to_path_buf(),
         None => match dirs::home_dir() {
@@ -373,8 +195,7 @@ fn config_notify_route(home: Option<&Path>, tokens: &[String]) -> NotifyRoute {
         },
     };
     let config_text = fs::read_to_string(root.join("config.toml")).unwrap_or_default();
-    let profile_text = cli_profile(tokens)
-        .or_else(|| config_profile(&config_text))
+    let profile_text = config_profile(&config_text)
         .and_then(|p| fs::read_to_string(root.join(format!("{p}.config.toml"))).ok())
         .unwrap_or_default();
     for text in [&profile_text, &config_text] {
@@ -401,30 +222,6 @@ fn route_for(value: &str) -> NotifyRoute {
         }
         _ => NotifyRoute::Opaque,
     }
-}
-
-/// Effective profile named on the command line, or `None`. Accepts `-p x`,
-/// `--profile x`, `--profile=x`, `-px`, and `-p=x`; the last occurrence wins.
-fn cli_profile(tokens: &[String]) -> Option<String> {
-    let mut profile = None;
-    let mut i = 1;
-    while i < tokens.len() {
-        let t = tokens[i].as_str();
-        if (t == "-p" || t == "--profile")
-            && let Some(v) = tokens.get(i + 1)
-        {
-            profile = Some(v.clone());
-            i += 2;
-            continue;
-        } else if let Some(v) = t.strip_prefix("--profile=") {
-            profile = Some(v.to_string());
-        } else if let Some(v) = t.strip_prefix("-p").filter(|_| t != "-p") {
-            // `-px` or `-p=x`.
-            profile = Some(v.strip_prefix('=').unwrap_or(v).to_string());
-        }
-        i += 1;
-    }
-    profile.filter(|p| !p.is_empty())
 }
 
 /// First line-based `profile = name` assignment in `config.toml`. Bare and
@@ -639,42 +436,63 @@ mod tests {
     }
 
     #[test]
-    fn detect_matches_on_the_basename_only() {
-        assert!(Codex.detect("codex").is_some());
-        assert!(Codex.detect("/opt/bin/codex 'do x'").is_some());
-        assert!(Codex.detect("codexx").is_none());
-        assert!(Codex.detect("claude").is_none());
-    }
-
-    #[test]
-    fn detect_refuses_blocklisted_subcommands_and_shell_syntax() {
-        for sub in BLOCKLIST {
-            assert!(
-                Codex.detect(&format!("codex {sub}")).is_none(),
-                "{sub} must be refused"
+    fn detect_accepts_the_two_authored_shapes() {
+        assert_eq!(Codex.detect("codex"), Some(Invocation::Bare));
+        assert_eq!(Codex.detect("/opt/bin/codex"), Some(Invocation::Bare));
+        for cmd in [
+            format!("codex resume {ID}"),
+            format!("codex resume '{ID}'"),
+            format!("/opt/bin/codex resume '{ID}'"),
+        ] {
+            assert_eq!(
+                Codex.detect(&cmd),
+                Some(Invocation::Resume(ID.into())),
+                "{cmd}"
             );
         }
-        assert!(Codex.detect("codex exec 'do x'").is_none());
-        assert!(Codex.detect("codex; ls").is_none());
-        // Value flags are skipped when locating the subcommand.
-        assert!(Codex.detect("codex -m gpt-5 exec").is_none());
-        // A prompt positional is allowed.
-        assert!(Codex.detect("codex 'fix the tests'").is_some());
     }
 
+    /// Shapes `fleetcom` did not author are opaque: no detection, no rewrite.
+    /// The pile includes shapes earlier revisions accepted — prompts, tabled
+    /// flags, bare and named `resume`, `-c` overrides — now saved verbatim.
     #[test]
-    fn detect_reads_resume_targets() {
-        let inv = Codex.detect(&format!("codex resume {ID}")).unwrap();
-        assert_eq!(inv.known_id.as_deref(), Some(ID));
-        assert!(!inv.can_inject_id, "codex cannot pin an id at launch");
-
-        // Named target and bare resume: detected, target left to codex.
-        for cmd in ["codex resume my-thread", "codex resume"] {
-            let inv = Codex.detect(cmd).unwrap();
-            assert_eq!(inv.known_id, None, "{cmd}");
+    fn everything_else_is_opaque_and_never_rewritten() {
+        let opaque: Vec<String> = [
+            "codex 'fix the tests'",
+            "codex resume",
+            "codex resume my-thread",
+            "codex resume --last",
+            "codex -m gpt-5",
+            "codex -m gpt-5 'do x'",
+            "codex e 'x'",
+            "codex exec 'x'",
+            "codex a",
+            "codex -p team",
+            r#"codex -c 'notify=["/my/hook"]'"#,
+            "codex; ls",
+            "codex -\u{e9}x",
+            "codexx",
+            "claude",
+            "",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .chain([
+            format!("codex resume {ID} -m gpt-5"),
+            format!("codex resume '{ID}' 'and do x'"),
+            format!("codex -m gpt-5 resume {ID}"),
+            format!("codex resume {ID}ff"),
+            format!("codex --resume {ID}"),
+        ])
+        .collect();
+        for cmd in opaque {
+            assert_eq!(Codex.detect(&cmd), None, "{cmd:?} must be opaque");
+            assert_eq!(
+                Codex.resume_command(&cmd, ID),
+                cmd,
+                "an opaque command must never be rewritten"
+            );
         }
-        let inv = Codex.detect("codex 'just a prompt'").unwrap();
-        assert_eq!(inv.known_id, None);
     }
 
     /// Scratch home without a `config.toml`.
@@ -682,49 +500,27 @@ mod tests {
         temp("no_config_home")
     }
 
+    /// Both accepted shapes receive the same injection: codex cannot pin an
+    /// ID at launch, so the notify override is the only channel.
     #[test]
     fn instrument_installs_the_notify_override() {
-        let inv = Codex.detect("codex").unwrap();
-        let plan = Codex.instrument(&inv, &paths(), Some(&no_config_home()));
-        assert_eq!(
-            plan.args_suffix,
-            r#" -c 'notify=["/tmp/Application Support/notify.sh"]'"#
-        );
-        assert_eq!(plan.injected_id, None);
-        assert_eq!(
-            plan.env,
-            vec![(
-                CAPTURE_ENV.into(),
-                PathBuf::from("/tmp/cap/session.json").into_os_string()
-            )]
-        );
-    }
-
-    #[test]
-    fn instrument_skips_a_user_notify_override_entirely() {
-        for cmd in [
-            r#"codex -c 'notify=["/my/hook"]'"#,
-            r#"codex --config 'notify=["/my/hook"]'"#,
-            r#"codex --config='notify=["/my/hook"]'"#,
-            r#"codex '-cnotify=["/my/hook"]'"#,
-        ] {
-            let inv = Codex.detect(cmd).unwrap();
+        for cmd in ["codex".to_string(), format!("codex resume {ID}")] {
+            let inv = Codex.detect(&cmd).unwrap();
+            let plan = Codex.instrument(&inv, &paths(), Some(&no_config_home()));
             assert_eq!(
-                Codex.instrument(&inv, &paths(), Some(&no_config_home())),
-                SpawnPlan::default(),
+                plan.args_suffix, r#" -c 'notify=["/tmp/Application Support/notify.sh"]'"#,
+                "{cmd}"
+            );
+            assert_eq!(plan.injected_id, None, "{cmd}");
+            assert_eq!(
+                plan.env,
+                vec![(
+                    CAPTURE_ENV.into(),
+                    PathBuf::from("/tmp/cap/session.json").into_os_string()
+                )],
                 "{cmd}"
             );
         }
-        // Unrelated -c overrides do not suppress injection.
-        let inv = Codex
-            .detect("codex -c model_reasoning_effort=high")
-            .unwrap();
-        assert!(
-            !Codex
-                .instrument(&inv, &paths(), Some(&no_config_home()))
-                .args_suffix
-                .is_empty()
-        );
     }
 
     /// A parseable `notify` assignment is chained through
@@ -966,102 +762,28 @@ mod tests {
         assert_eq!(Codex.scrape_exit(&both).as_deref(), Some(ID));
     }
 
+    /// Both authored shapes rewrite to the same canonical resume form; the
+    /// program word survives as typed.
     #[test]
-    fn resume_command_inserts_replaces_or_defers() {
-        // Fresh launch: resume slots in directly after the program, flags
-        // and prompt preserved byte for byte.
+    fn resume_command_regenerates_the_canonical_form() {
         assert_eq!(
             Codex.resume_command("codex", ID),
             format!("codex resume '{ID}'")
         );
         assert_eq!(
-            Codex.resume_command("codex -m gpt-5 'do x'", ID),
-            format!("codex resume '{ID}' -m gpt-5 'do x'")
+            Codex.resume_command("/opt/bin/codex", ID),
+            format!("/opt/bin/codex resume '{ID}'")
         );
-        // An existing uuid target is replaced in place.
         assert_eq!(
-            Codex.resume_command(&format!("codex resume {OTHER} -m gpt-5"), ID),
-            format!("codex resume {ID} -m gpt-5")
-        );
-        // Named targets remain unchanged.
-        assert_eq!(
-            Codex.resume_command("codex resume my-thread", ID),
-            "codex resume my-thread"
-        );
-        // Bare resume gains the captured target.
-        assert_eq!(
-            Codex.resume_command("codex resume", ID),
+            Codex.resume_command(&format!("codex resume '{OTHER}'"), ID),
             format!("codex resume '{ID}'")
         );
-        // `resume --last` picks its own target; leave it alone.
         assert_eq!(
-            Codex.resume_command("codex resume --last", ID),
-            "codex resume --last"
+            Codex.resume_command(&format!("codex resume {OTHER}"), ID),
+            format!("codex resume '{ID}'")
         );
-        // Blocklisted and unparseable commands pass through unchanged.
-        assert_eq!(Codex.resume_command("codex exec 'x'", ID), "codex exec 'x'");
-        // A subcommand alias (`e` for exec, `a` for apply) is blocklisted too,
-        // so it is never rewritten into `codex resume '<id>' e …`.
-        assert_eq!(Codex.resume_command("codex e 'x'", ID), "codex e 'x'");
-        assert_eq!(Codex.resume_command("codex a", ID), "codex a");
-        assert_eq!(Codex.resume_command("codex; ls", ID), "codex; ls");
+        // Invalid IDs leave the command unchanged.
         assert_eq!(Codex.resume_command("codex", "not-an-id"), "codex");
-    }
-
-    #[test]
-    fn detect_refuses_unknown_flags_and_skips_value_flags() {
-        // A multibyte char after the dash must classify (as Unknown), not
-        // panic on a byte-boundary slice.
-        assert!(Codex.detect("codex -\u{e9}x").is_none());
-        // A separate flag value is skipped before locating the subcommand.
-        let inv = Codex
-            .detect(&format!("codex --sandbox workspace-write resume {ID}"))
-            .unwrap();
-        assert_eq!(inv.known_id.as_deref(), Some(ID));
-
-        // `exec` remains the blocklisted subcommand after a value flag.
-        assert!(
-            Codex
-                .detect("codex --sandbox workspace-write exec 'do x'")
-                .is_none()
-        );
-
-        // `--flag=value` and `-fvalue` spellings are self-contained.
-        assert!(
-            Codex
-                .detect("codex --sandbox=workspace-write 'prompt'")
-                .is_some()
-        );
-        assert!(Codex.detect("codex -sworkspace-write 'prompt'").is_some());
-
-        // A flag in neither table makes the command opaque, anywhere it sits.
-        assert!(Codex.detect("codex --made-up-flag x").is_none());
-        assert!(
-            Codex
-                .detect(&format!("codex --made-up-flag x resume {ID}"))
-                .is_none()
-        );
-    }
-
-    #[test]
-    fn resume_command_never_corrupts_after_a_value_flag() {
-        // The value flag's argument is not treated as the subcommand.
-        assert_eq!(
-            Codex.resume_command("codex --sandbox workspace-write exec 'x'", ID),
-            "codex --sandbox workspace-write exec 'x'"
-        );
-
-        // The existing UUID target is replaced in place.
-        let cmd = format!("codex --sandbox workspace-write resume {OTHER}");
-        let out = Codex.resume_command(&cmd, ID);
-        assert_eq!(out, format!("codex --sandbox workspace-write resume {ID}"));
-        assert_eq!(out.matches("resume").count(), 1);
-
-        // An unknown flag leaves the command untouched.
-        assert_eq!(
-            Codex.resume_command("codex --made-up-flag x", ID),
-            "codex --made-up-flag x"
-        );
     }
 
     #[test]
@@ -1072,11 +794,12 @@ mod tests {
         let team = home.join("team.config.toml");
         let team_route = NotifyRoute::Chain(vec!["/team/hook".to_string()]);
 
-        // notify lives in the profile file; `-p team` on the CLI selects it.
-        fs::write(&cfg, "model = \"gpt-5\"\n").unwrap();
+        // notify lives in the profile file selected by config.toml's own
+        // `profile` key.
+        fs::write(&cfg, "profile = \"team\"\n").unwrap();
         fs::write(&team, "notify = [\"/team/hook\"]\n").unwrap();
-        let inv = Codex.detect("codex -p team").unwrap();
-        assert_eq!(config_notify_route(Some(&home), &inv.tokens), team_route);
+        assert_eq!(config_notify_route(Some(&home)), team_route);
+        let inv = Codex.detect("codex").unwrap();
         let plan = Codex.instrument(&inv, &paths(), Some(&home));
         assert!(
             plan.env
@@ -1085,32 +808,28 @@ mod tests {
             plan.env
         );
 
-        // Profile selected by config.toml's own `profile` key, no `-p`.
-        let bare = vec!["codex".to_string()];
-        fs::write(&cfg, "profile = \"team\"\n").unwrap();
-        assert_eq!(config_notify_route(Some(&home), &bare), team_route);
         // Bare (unquoted) value with a trailing comment resolves too.
         fs::write(&cfg, "profile = team # mine\n").unwrap();
-        assert_eq!(config_notify_route(Some(&home), &bare), team_route);
+        assert_eq!(config_notify_route(Some(&home)), team_route);
 
         // The profile file's assignment overrides the base file's.
         fs::write(&cfg, "profile = \"team\"\nnotify = [\"/base/hook\"]\n").unwrap();
-        assert_eq!(config_notify_route(Some(&home), &bare), team_route);
+        assert_eq!(config_notify_route(Some(&home)), team_route);
 
         // Commented out in the profile file: the base assignment stands.
         fs::write(&team, "# notify = [\"/team/hook\"]\n").unwrap();
         assert_eq!(
-            config_notify_route(Some(&home), &bare),
+            config_notify_route(Some(&home)),
             NotifyRoute::Chain(vec!["/base/hook".to_string()])
         );
 
         // No assignment anywhere: vacant, plain injection.
         fs::write(&cfg, "profile = \"team\"\n").unwrap();
-        assert_eq!(config_notify_route(Some(&home), &bare), NotifyRoute::Vacant);
+        assert_eq!(config_notify_route(Some(&home)), NotifyRoute::Vacant);
 
         // A missing profile file leaves only the base config.
         fs::write(&cfg, "profile = \"ghost\"\n").unwrap();
-        assert_eq!(config_notify_route(Some(&home), &bare), NotifyRoute::Vacant);
+        assert_eq!(config_notify_route(Some(&home)), NotifyRoute::Vacant);
 
         let _ = fs::remove_dir_all(&home);
     }

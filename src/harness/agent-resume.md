@@ -2,7 +2,16 @@
 
 Saving a `fleetcom` session preserves commands, not the application state behind them. For agent CLIs, that means relaunching a bare `claude`, `codex`, or `grok` command starts another conversation. `fleetcom` associates an ID with the task, then uses it when saving a [session recipe](../../docs/sessions.md) or rerunning a finished task with `r`.
 
-For direct spawns and session loads, capture flags affect only the string passed to `$SHELL -c`; the task retains the requested command for display and as the source for saved commands. A rerun stores and displays the generated resume command. When capture succeeds, saved and rerun commands use forms such as `claude --resume '<id>'`, `codex resume '<id>'`, or `grok --resume '<id>'`. When capture fails or produces an ambiguous result, `fleetcom` keeps the task's command unchanged.
+For direct spawns and session loads, capture flags affect only the string passed to `$SHELL -c`; the task retains the requested command for display and as the source for saved commands. A rerun stores and displays the generated resume command. When capture succeeds, saved and rerun commands use the forms `claude --resume '<id>'`, `codex resume '<id>'`, and `grok --resume '<id>'`. When capture fails or produces an ambiguous result, `fleetcom` keeps the task's command unchanged.
+
+## What `fleetcom` rewrites
+
+A command participates in capture only when it is a shape `fleetcom` itself authors:
+
+- The bare program word: `claude`, `codex`, or `grok`. A path form (`/usr/local/bin/claude`) matches by basename when the word carries no shell syntax.
+- The canonical resume form, ending the line: `claude --resume <uuid>`, `grok --resume <uuid>`, or `codex resume <uuid>`. The UUID may be single-quoted — `fleetcom`'s own output — or bare, as retyped from a hint. It must pass the strict validator below.
+
+That is six shapes in total. Everything else is opaque: no instrumentation, no rewrite, and the recipe stores the user's bytes verbatim. The policy is deliberate — `fleetcom` only rewrites what it authored. Flagged launches (`claude --model opus`), prompt launches (`claude 'fix the tests'`), alternate resume spellings (`-r`, `--resume=<uuid>`), subcommands, and hand-augmented resume entries get no capture at all; earlier revisions parsed many of these through per-CLI flag tables and rewrote them in place. As the maintainer put it: "if a user wants a command that specific we probably shouldn't rewrite it anyway."
 
 ## How capture works
 
@@ -12,25 +21,25 @@ The first supported task for a capture root installs `claude-settings.json` with
 
 ### `claude`
 
-A fresh launch without session-selection flags receives both arguments below when UUID generation succeeds. A resuming launch receives the `--settings` addition but no new session ID. `fleetcom` does not add the generated settings file when the command already has `--settings`.
+A bare launch receives both arguments below when UUID generation succeeds. The canonical resume form receives only the `--settings` addition; it already targets its conversation.
 
 ```
 --session-id '<new v4 UUID>' --settings '<root>/claude-settings.json'
 ```
 
-`--session-id` pins the ID before the child produces output. `fleetcom` does not add it when the command already contains `--resume`, `--continue`, `--fork-session`, or `--session-id`. The generated settings file defines one `SessionStart` hook:
+`--session-id` pins the ID before the child produces output. The generated settings file defines one `SessionStart` hook:
 
 ```json
 {"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"cat > \"$FLEETCOM_CAPTURE_FILE\""}]}]}}
 ```
 
-`claude` runs the hook with the task environment and sends a JSON payload (`session_id`, `hook_event_name`, `source`, …) on stdin. The hook fires for `startup`, `resume`, `clear`, and `compact`, so each event replaces the capture file with the current ID. An existing `--settings` argument disables only this hook; launch-time pinning, exit scraping, and store correlation remain available.
+`claude` runs the hook with the task environment and sends a JSON payload (`session_id`, `hook_event_name`, `source`, …) on stdin. The hook fires for `startup`, `resume`, `clear`, and `compact`, so each event replaces the capture file with the current ID.
 
 Two fallback channels require no injection. After exit, `fleetcom` scans the final viewport and scrollback for the last `claude --resume <uuid>` hint. The scan waits for both the process-exit latch and reader-thread EOF, so the terminal grid holds every child byte before scraping begins. At save time, `fleetcom` can also inspect `<claude-home>/projects/<cwd-slug>/<uuid>.jsonl`, where `<cwd-slug>` is the absolute working directory with `/` and `.` replaced by `-`.
 
 ### `codex`
 
-`codex` does not expose an ID that `fleetcom` can choose at launch. `fleetcom` instead appends a `notify` override:
+`codex` does not expose an ID that `fleetcom` can choose at launch. `fleetcom` instead appends a `notify` override to both accepted shapes:
 
 ```
 -c 'notify=["<root>/codex-notify.sh"]'
@@ -38,9 +47,9 @@ Two fallback channels require no injection. After exit, `fleetcom` scans the fin
 
 After each turn, `codex` invokes the program with notification JSON as its final argument. The script writes that argument to `$FLEETCOM_CAPTURE_FILE`, replacing the previous payload; if the variable is unset, it skips the write. `fleetcom` accepts only `"type":"agent-turn-complete"` payloads and reads the ID from `thread-id`.
 
-When `<codex-home>/config.toml` or the effective profile's `<codex-home>/<profile>.config.toml` assigns `notify` a one-line TOML array of basic strings, `fleetcom` injects its script and passes the displaced argv through `FLEETCOM_NOTIFY_CHAIN`, newline-joined. After writing the capture file, the script execs that argv with the notification JSON appended. The profile file overrides the base file; the last command-line `-p`/`--profile` value selects the profile, or the first line-based `profile = "name"` assignment in `config.toml` applies when the command has no profile flag.
+When `<codex-home>/config.toml` or the effective profile's `<codex-home>/<profile>.config.toml` assigns `notify` a one-line TOML array of basic strings, `fleetcom` injects its script and passes the displaced argv through `FLEETCOM_NOTIFY_CHAIN`, newline-joined. After writing the capture file, the script execs that argv with the notification JSON appended. The profile file overrides the base file; the first line-based `profile = "name"` assignment in `config.toml` selects the profile.
 
-Two cases skip the override and capture environment. A `-c notify=` or `--config notify=` in the command is not overridden. Configuration also remains untouched when `notify` is not a one-line array of basic strings, is empty, or contains an empty or newline-bearing element that cannot be represented by the chain encoding.
+Configuration remains untouched when `notify` is not a one-line array of basic strings, is empty, or contains an empty or newline-bearing element that cannot be represented by the chain encoding.
 
 These checks are line-based, not TOML-aware: a `notify` or `profile` key inside a table counts, and two `notify` assignment lines in one file read as ambiguous and skip injection. Exit scraping and store correlation remain available without injection.
 
@@ -48,7 +57,7 @@ The exit scraper recognizes both `codex resume <uuid>` and `codex resume, then s
 
 ### `grok`
 
-Like `claude`, a fresh `grok` launch is pinned with `--session-id '<new v4 UUID>'`, which `fleetcom` skips when the command already contains `--resume`, `--continue`, `--fork-session`, or `--session-id`. The Grok harness has no live capture channel, so an in-TUI `/resume` to another session is available only from the exit scrape.
+Like `claude`, a bare `grok` launch is pinned with `--session-id '<new v4 UUID>'`. The canonical resume form receives nothing. The Grok harness has no live capture channel, so an in-TUI `/resume` to another session is available only from the exit scrape.
 
 After exit, `fleetcom` scans the final viewport and scrollback for the last `grok -r <uuid>` or `grok --resume <uuid>` hint. At save time, it can also inspect `<grok-home>/sessions/<encoded-cwd>/`, where `<encoded-cwd>` is the absolute working directory percent-encoded (`/` and `%` encode; `.` stays literal) and each session is a directory named by its UUID.
 
@@ -58,7 +67,7 @@ Several channels can report different IDs during one task. `fleetcom` resolves t
 
 1. Exit-hint scrape. Available after process exit and reader EOF.
 2. Capture file. May be rewritten while the task runs.
-3. Spawn-time ID. The `--session-id` `fleetcom` pinned, or the ID already present in the command.
+3. Spawn-time ID. The `--session-id` `fleetcom` pinned, or the ID targeted by the canonical resume form.
 4. On-disk store correlation (save-time only). `fleetcom` searches for a transcript created within ±30 s of the spawn from the task's working directory. Exactly one candidate must match.
 
 ## Saved commands
@@ -66,27 +75,21 @@ Several channels can report different IDs during one task. `fleetcom` resolves t
 Saving and rerunning use `resume_command` to rewrite the task command; the [recipe format](../../docs/sessions.md#format) remains unchanged:
 
 - The stored entry is a plain runnable string: `claude --resume '<id>'` can run directly in a shell.
-- `claude`: an existing UUID passed through `--resume` or `-r` is replaced in place; otherwise `--resume '<id>'` is appended. Any `--session-id` flag is removed.
-- `codex`: an existing UUID target is replaced. Fresh commands insert `resume '<id>'` after the program, and bare `codex resume` gains the ID. Named targets (`codex resume my-thread`) and self-targeting forms (`codex resume --last`) remain unchanged.
-- `grok`: a UUID passed through `--resume`/`-r` is replaced in place. A bare `--resume`/`-r` (picker/most-recent form) receives the captured ID on that flag. A flag followed by a non-UUID target leaves the command unchanged. Otherwise `--resume '<id>'` is appended, and any `--session-id` or `-s` flag is removed.
-- Rerun (`r`) applies the same rewrite and stores the resuming command. Re-detection then treats the task as a resume and does not inject another ID.
-- A stale ID fails inside the task's PTY, where the error remains visible. Since the recipe is ordinary JSON, the ID or resume flag can be edited by hand.
+- Rewriting is pure string construction: the program word as typed, the resume selector, and the quoted ID — `claude --resume '<id>'`, `codex resume '<id>'`, `grok --resume '<id>'`. A bare command gains the selector and ID; a canonical resume form regenerates with the new ID.
+- Rerun (`r`) applies the same rewrite and stores the resuming command. Re-detection then reads the stored command as the canonical resume form and does not inject another ID.
+- A stale ID fails inside the task's PTY, where the error remains visible. Since the recipe is ordinary JSON, the ID can be edited by hand — but a hand-augmented entry (extra flags, a prompt) is no longer a shape `fleetcom` authored, so it runs and saves verbatim from then on.
 
 ## Failure behavior
 
-`fleetcom` preserves the original command whenever capture is unavailable or ambiguous: a bare agent command starts a fresh conversation.
+`fleetcom` preserves the original command whenever a command is opaque or capture is unavailable or ambiguous: a bare agent command starts a fresh conversation.
 
 | Situation | Behavior |
 | -- | -- |
-| Outside quotes: <code>\| ; & < > $ # ` ( ) \\</code> or a newline; an unquoted `=` in the first word; unterminated quotes | Not detected. Spawns and saves as the plain command. |
-| Inside double quotes: `$`, backtick, or `\` | Not detected. The shell expands or unescapes them, so the classified tokens would diverge from the CLI's argv (`codex "$MODE"` can run `codex exec`). Single-quoted content stays literal and is unaffected. |
-| A word that resolves to a standalone `--` | Not detected because appended flags would become prompt text. |
-| A top-level flag outside the tool's known flag table (`claude`, `codex`, `grok`) | Not detected because its value cannot be distinguished safely from a subcommand or prompt. The command spawns and saves unchanged. |
-| Non-conversation subcommands (`claude`: `mcp`, `doctor`, `config`, …; `codex`: `exec`, `login`, `apply`, …; `grok`: `sessions`, `login`, `mcp`, …) | Not detected. |
+| Not one of the six authored shapes (bare `claude`/`codex`/`grok`, or their canonical resume forms) | Opaque: spawns and saves verbatim, with no instrumentation and no rewrite. This covers flagged launches, prompt launches, alternate resume spellings (`-r`, `--resume=`), subcommands, shell syntax, and hand-augmented resume entries. |
 | Capture assets cannot be installed for the selected root | Spawns untouched. |
-| `codex`: `-c notify=` in the command, or a config `notify` value the chain cannot carry | No injection; exit scrape and store correlation remain. A parseable config `notify` chains instead: capture plus the user's notifier. |
-| `claude`: the user passes `--settings` | No overlay hook; the pinned ID, exit scrape, and store correlation remain. |
-| `grok`: every command | No live capture channel is injected; the pinned ID, exit scrape, and store correlation remain. |
+| `codex`: a config `notify` value the chain cannot carry | No injection; exit scrape and store correlation remain. A parseable config `notify` chains instead: capture plus the user's notifier. |
+| `claude`: every accepted launch | The overlay hook, pinned ID (bare only), exit scrape, and store correlation apply. |
+| `grok`: every accepted launch | No live capture channel is injected; the pinned ID (bare only), exit scrape, and store correlation remain. |
 | No ID captured by save time | Store correlation is tried; on failure the original command is stored. |
 | Store correlation is ambiguous, or a `claude` transcript lacks a creation time | The original command is stored. |
 
@@ -102,12 +105,12 @@ Each supported tool implements the `Harness` trait ([`mod.rs`](mod.rs)) and regi
 
 - `name`: registry identity.
 - `home_env_var`: the env var overriding the tool's home root (`CLAUDE_CONFIG_DIR`, `CODEX_HOME`, or `GROK_HOME`); resolved from the connection's launch context during instrumentation and save-time correlation.
-- `detect`: classify the command, any targeted ID, and whether launch-time pinning is allowed. Blocklisted subcommands and unsupported shell syntax return `None`.
+- `detect`: classify the command as the bare program word or the canonical resume form; anything else returns `None`.
 - `instrument`: return the argument suffix, environment pairs, and optional pinned ID. This is also where configuration routing, such as the codex notify chain-or-skip classification, applies.
 - `parse_capture`: extract an ID from a capture-file payload.
 - `scrape_exit`: extract the last valid ID from final terminal text.
 - `correlate_fs`: find a unique ID in the on-disk store. Ambiguity returns `None`.
-- `resume_command`: rewrite a command into its resuming form while preserving unrelated bytes.
+- `resume_command`: rewrite an accepted command into its canonical resuming form.
 
 Each harness must define these tool-specific behaviors:
 
@@ -115,7 +118,7 @@ Each harness must define these tool-specific behaviors:
 - Live capture support. Whether a hook, notify program, or equivalent can be injected without replacing the user's configuration.
 - Exit-hint shape. The plain-text pattern recognized after terminal emulation.
 - On-disk store layout. The path scheme, timestamp semantics, and working-directory metadata used for correlation.
-- Launch-time pinning. Whether an ID can be fixed at spawn, and which flag combinations reject it.
+- Launch-time pinning. Whether an ID can be fixed at the spawn of a bare launch.
 
 Tests cover three boundaries:
 

@@ -1,117 +1,14 @@
-//! For eligible `claude` launches, this harness pins a v4 UUID with
-//! `--session-id`, adds a `SessionStart` hook when the command has no
+//! For accepted `claude` launches, this harness pins a v4 UUID with
+//! `--session-id` (bare launches only), layers a `SessionStart` hook through
 //! `--settings`, scans final terminal text for `claude --resume <uuid>`, and
 //! correlates transcripts under
 //! `<claude-home>/projects/<cwd-slug>/<uuid>.jsonl`.
-//!
-//! `fleetcom` does not pin launches that contain `--resume`, `--continue`,
-//! `--fork-session`, or `--session-id`.
 
 use std::{fs, path::Path, time::SystemTime};
 
 use super::{
-    CAPTURE_ENV, CapturePaths, FlagTable, Harness, Invocation, SpawnPlan, erase_start, is_uuid,
-    leading_uuid, shell_quote, tokenize, uuid_v4, within_window,
-};
-
-/// Subcommands that do not start or resume an interactive conversation.
-const BLOCKLIST: &[&str] = &[
-    "agents",
-    "auth",
-    "auto-mode",
-    "config",
-    "doctor",
-    "gateway",
-    "install",
-    "mcp",
-    "migrate-installer",
-    "plugin",
-    "plugins", // alias of plugin
-    "project",
-    "setup-token",
-    "ultrareview",
-    "update",
-    "upgrade", // alias of update
-];
-
-/// Top-level `claude` flags grouped by value consumption. `detect` handles
-/// session-selection flags before consulting this table. Any unlisted flag
-/// makes the command opaque.
-const FLAGS: FlagTable = FlagTable {
-    value: &[
-        "--agent",
-        "--agents",
-        "--append-system-prompt",
-        "--debug-file",
-        "--effort",
-        "--fallback-model",
-        "--input-format",
-        "--json-schema",
-        "--max-budget-usd",
-        "--model",
-        "-n",
-        "--name",
-        "--output-format",
-        "--permission-mode",
-        "--remote-control-session-name-prefix",
-        "--session-id",
-        "--setting-sources",
-        "--settings",
-        "--system-prompt",
-    ],
-    optional: &[
-        "-d",
-        "--debug",
-        "--from-pr",
-        "--prompt-suggestions",
-        "--remote-control",
-        "-r",
-        "--resume",
-        "-w",
-        "--worktree",
-    ],
-    variadic: &[
-        "--add-dir",
-        "--allowedTools",
-        "--allowed-tools",
-        "--betas",
-        "--disallowedTools",
-        "--disallowed-tools",
-        "--file",
-        "--mcp-config",
-        "--tools",
-    ],
-    boolean: &[
-        "--allow-dangerously-skip-permissions",
-        "--ax-screen-reader",
-        "--background",
-        "--bare",
-        "--bg",
-        "--brief",
-        "--chrome",
-        "-c",
-        "--continue",
-        "--dangerously-skip-permissions",
-        "--disable-slash-commands",
-        "--exclude-dynamic-system-prompt-sections",
-        "--fork-session",
-        "-h",
-        "--help",
-        "--ide",
-        "--include-hook-events",
-        "--include-partial-messages",
-        "--no-chrome",
-        "--no-session-persistence",
-        "-p",
-        "--print",
-        "--replay-user-messages",
-        "--safe-mode",
-        "--strict-mcp-config",
-        "--tmux",
-        "--verbose",
-        "-v",
-        "--version",
-    ],
+    CAPTURE_ENV, CapturePaths, Harness, Invocation, SpawnPlan, detect_shape, is_uuid, leading_uuid,
+    resume_shape, shell_quote, uuid_v4, within_window,
 };
 
 pub struct Claude;
@@ -126,84 +23,7 @@ impl Harness for Claude {
     }
 
     fn detect(&self, cmd: &str) -> Option<Invocation> {
-        let words = tokenize(cmd)?;
-        if Path::new(words.first()?.text.as_str())
-            .file_name()?
-            .to_str()?
-            != "claude"
-        {
-            return None;
-        }
-        let mut known_id: Option<String> = None;
-        let mut can_inject_id = true;
-        let mut saw_positional = false;
-        let mut i = 1;
-        while i < words.len() {
-            let t = words[i].text.as_str();
-            if !t.starts_with('-') {
-                // First positional: a subcommand or a prompt string.
-                if !saw_positional {
-                    if BLOCKLIST.contains(&t) {
-                        return None;
-                    }
-                    saw_positional = true;
-                }
-                i += 1;
-                continue;
-            }
-            // Session-selection flags disable launch pinning and may carry a
-            // target UUID.
-            if t == "--resume" || t == "-r" {
-                can_inject_id = false;
-                if let Some(next) = words.get(i + 1).map(|w| w.text.as_str())
-                    && !next.starts_with('-')
-                {
-                    if is_uuid(next) && known_id.is_none() {
-                        known_id = Some(next.to_string());
-                    }
-                    i += 2;
-                    continue;
-                }
-            } else if let Some(v) = t
-                .strip_prefix("--resume=")
-                .or_else(|| t.strip_prefix("-r="))
-            {
-                can_inject_id = false;
-                if is_uuid(v) && known_id.is_none() {
-                    known_id = Some(v.to_string());
-                }
-            } else if t == "--continue" || t == "-c" || t == "--fork-session" {
-                can_inject_id = false;
-            } else if t == "--session-id" {
-                // A user-pinned ID is also the known resume target.
-                can_inject_id = false;
-                if let Some(next) = words.get(i + 1).map(|w| w.text.as_str())
-                    && !next.starts_with('-')
-                {
-                    if is_uuid(next) && known_id.is_none() {
-                        known_id = Some(next.to_string());
-                    }
-                    i += 2;
-                    continue;
-                }
-            } else if let Some(v) = t.strip_prefix("--session-id=") {
-                can_inject_id = false;
-                if is_uuid(v) && known_id.is_none() {
-                    known_id = Some(v.to_string());
-                }
-            } else {
-                // Any other flag: skip the value it consumes so it cannot
-                // shadow the subcommand. An unmodeled flag refuses.
-                i = FLAGS.skip_flag(&words, i)?;
-                continue;
-            }
-            i += 1;
-        }
-        Some(Invocation {
-            tokens: words.into_iter().map(|w| w.text).collect(),
-            known_id,
-            can_inject_id,
-        })
+        detect_shape(cmd, "claude", "--resume")
     }
 
     fn instrument(
@@ -215,22 +35,17 @@ impl Harness for Claude {
     ) -> SpawnPlan {
         let mut suffix = String::new();
         let mut injected_id = None;
-        if inv.can_inject_id
+        // The resume form already targets its conversation; only a bare
+        // launch pins a fresh ID.
+        if *inv == Invocation::Bare
             && let Some(id) = uuid_v4()
         {
             suffix.push_str(" --session-id ");
             suffix.push_str(&shell_quote(&id));
             injected_id = Some(id);
         }
-        // A user-supplied settings source disables only the overlay hook.
-        // Launch-time IDs, exit scraping, and filesystem correlation remain.
-        let has_settings = inv.tokens[1..]
-            .iter()
-            .any(|t| t == "--settings" || t.starts_with("--settings="));
-        if !has_settings {
-            suffix.push_str(" --settings ");
-            suffix.push_str(&shell_quote(&capture.claude_settings.to_string_lossy()));
-        }
+        suffix.push_str(" --settings ");
+        suffix.push_str(&shell_quote(&capture.claude_settings.to_string_lossy()));
         SpawnPlan {
             args_suffix: suffix,
             env: vec![(
@@ -296,65 +111,7 @@ impl Harness for Claude {
     }
 
     fn resume_command(&self, cmd: &str, id: &str) -> String {
-        if !is_uuid(id) {
-            return cmd.to_string();
-        }
-        // Preserve commands whose shell syntax this module cannot parse.
-        let Some(words) = tokenize(cmd) else {
-            return cmd.to_string();
-        };
-        let mut edits: Vec<(usize, usize, String)> = Vec::new();
-        let mut replaced = false;
-        let mut i = 1;
-        while i < words.len() {
-            let t = words[i].text.as_str();
-            if t == "--resume" || t == "-r" {
-                if let Some(next) = words.get(i + 1)
-                    && is_uuid(&next.text)
-                {
-                    edits.push((next.start, next.end, id.to_string()));
-                    replaced = true;
-                    i += 2;
-                    continue;
-                }
-            } else if let Some((flag, v)) = t
-                .split_once('=')
-                .filter(|(f, _)| *f == "--resume" || *f == "-r")
-            {
-                if is_uuid(v) {
-                    edits.push((words[i].start, words[i].end, format!("{flag}={id}")));
-                    replaced = true;
-                }
-            } else if t == "--session-id" {
-                // A resume command cannot retain a pinned session ID.
-                let start = words[i].start;
-                let end = match words.get(i + 1) {
-                    Some(next) if !next.text.starts_with('-') => {
-                        i += 1;
-                        next.end
-                    }
-                    _ => words[i].end,
-                };
-                edits.push((erase_start(cmd, start), end, String::new()));
-            } else if t.starts_with("--session-id=") {
-                edits.push((
-                    erase_start(cmd, words[i].start),
-                    words[i].end,
-                    String::new(),
-                ));
-            }
-            i += 1;
-        }
-        let mut out = cmd.to_string();
-        edits.sort_by_key(|&(start, _, _)| std::cmp::Reverse(start));
-        for (start, end, replacement) in edits {
-            out.replace_range(start..end, &replacement);
-        }
-        if !replaced {
-            out.push_str(" --resume ");
-            out.push_str(&shell_quote(id));
-        }
-        out
+        resume_shape(cmd, "claude", "--resume", id)
     }
 }
 
@@ -394,99 +151,72 @@ mod tests {
     }
 
     #[test]
-    fn detect_matches_on_the_basename_only() {
-        assert!(Claude.detect("claude").is_some());
-        assert!(Claude.detect("/usr/local/bin/claude 'do x'").is_some());
-        assert!(Claude.detect("claudius").is_none());
-        assert!(Claude.detect("codex").is_none());
-        assert!(Claude.detect("").is_none());
-    }
-
-    #[test]
-    fn detect_refuses_blocklisted_subcommands_and_shell_syntax() {
-        for sub in BLOCKLIST {
-            assert!(
-                Claude.detect(&format!("claude {sub}")).is_none(),
-                "{sub} must be refused"
-            );
-        }
-        assert!(Claude.detect("claude mcp list").is_none());
-        assert!(Claude.detect("claude | tee log").is_none());
-        // A prompt positional is not a subcommand.
-        assert!(Claude.detect("claude 'fix the tests'").is_some());
-        // A quoted blocklist word is still the same token text: opaque.
-        assert!(Claude.detect("claude 'update'").is_none());
-    }
-
-    #[test]
-    fn detect_classifies_fresh_and_resuming_launches() {
-        let fresh = Claude.detect("claude 'add tests'").unwrap();
-        assert_eq!(fresh.known_id, None);
-        assert!(fresh.can_inject_id);
-
+    fn detect_accepts_the_two_authored_shapes() {
+        assert_eq!(Claude.detect("claude"), Some(Invocation::Bare));
+        assert_eq!(
+            Claude.detect("/usr/local/bin/claude"),
+            Some(Invocation::Bare)
+        );
         for cmd in [
             format!("claude --resume {ID}"),
-            format!("claude --resume={ID}"),
-            format!("claude -r {ID}"),
-            format!("claude --session-id {ID}"),
-            format!("claude --session-id={ID}"),
+            format!("claude --resume '{ID}'"),
+            format!("/usr/local/bin/claude --resume '{ID}'"),
         ] {
-            let inv = Claude.detect(&cmd).unwrap();
-            assert_eq!(inv.known_id.as_deref(), Some(ID), "{cmd}");
-            assert!(!inv.can_inject_id, "{cmd}");
+            assert_eq!(
+                Claude.detect(&cmd),
+                Some(Invocation::Resume(ID.into())),
+                "{cmd}"
+            );
         }
+    }
 
-        // Continue, fork, and non-UUID resume targets disable launch pinning.
-        for cmd in [
+    /// Shapes `fleetcom` did not author are opaque: no detection, no rewrite.
+    /// The pile includes shapes earlier revisions accepted — prompts, tabled
+    /// flags, `--continue`, `-r`, `--resume=` — now saved verbatim.
+    #[test]
+    fn everything_else_is_opaque_and_never_rewritten() {
+        let opaque: Vec<String> = [
+            "claude 'fix the tests'",
+            "claude --model opus",
             "claude --continue",
             "claude -c",
-            "claude --fork-session",
             "claude --resume",
             "claude --resume not-a-uuid",
-        ] {
-            let inv = Claude.detect(cmd).unwrap();
-            assert_eq!(inv.known_id, None, "{cmd}");
-            assert!(!inv.can_inject_id, "{cmd}");
+            "claude --resume $ID",
+            "claude mcp list",
+            "claude | tee log",
+            "claude; ls",
+            "FOO=bar claude",
+            "claudius",
+            "codex",
+            "",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .chain([
+            format!("claude -r {ID}"),
+            format!("claude --resume={ID}"),
+            format!("claude --resume {ID} --model opus"),
+            format!("claude --resume '{ID}' 'and do x'"),
+            format!("claude --session-id {ID}"),
+            format!("claude --resume {ID}ff"),
+        ])
+        .collect();
+        for cmd in opaque {
+            assert_eq!(Claude.detect(&cmd), None, "{cmd:?} must be opaque");
+            assert_eq!(
+                Claude.resume_command(&cmd, ID),
+                cmd,
+                "an opaque command must never be rewritten"
+            );
         }
     }
 
-    /// An unmodeled flag's value must not shadow a subcommand: the strict
-    /// table skips each known flag's value and refuses an unknown flag.
     #[test]
-    fn detect_refuses_unknown_flags_and_skips_value_flags() {
-        // `--model` consumes `opus`, leaving `plugin` as the subcommand.
-        assert!(Claude.detect("claude --model opus plugin list").is_none());
-        assert!(Claude.detect("claude --model=opus plugin").is_none());
-        assert!(Claude.detect("claude -n myname plugin").is_none());
-        // A value flag before an ordinary prompt remains eligible.
-        assert!(Claude.detect("claude --model opus 'do x'").is_some());
-        // A variadic flag consumes its list, then the prompt stands.
-        assert!(Claude.detect("claude --add-dir /a /b 'do x'").is_some());
-        // An optional-value flag binds a following non-flag token, so it is
-        // the debug filter, not a subcommand.
-        assert!(Claude.detect("claude -d plugin").is_some());
-        // But an optional flag before another flag does not bind it; `--model`
-        // then eats `opus` and `plugin` is the subcommand: refuse.
-        assert!(
-            Claude
-                .detect("claude --debug --model opus plugin")
-                .is_none()
-        );
-        // An unmodeled flag makes the whole command opaque.
-        assert!(Claude.detect("claude --made-up-flag x").is_none());
-        // A value flag still yields the resume target that follows it.
-        let inv = Claude
-            .detect(&format!("claude --model opus --resume {ID}"))
-            .unwrap();
-        assert_eq!(inv.known_id.as_deref(), Some(ID));
-        assert!(!inv.can_inject_id);
-    }
-
-    #[test]
-    fn instrument_pins_an_id_and_layers_settings_on_fresh_launches() {
+    fn instrument_pins_an_id_and_layers_settings_on_bare_launches() {
         let inv = Claude.detect("claude").unwrap();
         let plan = Claude.instrument(&inv, &paths(), None);
-        let id = plan.injected_id.expect("fresh launch pins an id");
+        let id = plan.injected_id.expect("a bare launch pins an id");
         assert!(is_uuid(&id));
         assert_eq!(
             plan.args_suffix,
@@ -501,36 +231,17 @@ mod tests {
         );
     }
 
+    /// The resume form already targets its conversation: the settings overlay
+    /// rides along, and no second ID is pinned.
     #[test]
-    fn instrument_never_pins_alongside_resume_continue_or_a_user_id() {
-        for cmd in [
-            format!("claude --resume {ID}"),
-            "claude --continue".to_string(),
-            "claude --fork-session".to_string(),
-            format!("claude --session-id {ID}"),
-        ] {
-            let inv = Claude.detect(&cmd).unwrap();
-            let plan = Claude.instrument(&inv, &paths(), None);
-            assert_eq!(plan.injected_id, None, "{cmd}");
-            assert_eq!(
-                plan.args_suffix, " --settings '/tmp/Application Support/fleetcom.json'",
-                "{cmd}"
-            );
-        }
-    }
-
-    #[test]
-    fn instrument_defers_to_a_user_supplied_settings_flag() {
-        let inv = Claude.detect("claude --settings mine.json").unwrap();
+    fn instrument_adds_only_settings_to_the_resume_form() {
+        let inv = Claude.detect(&format!("claude --resume {ID}")).unwrap();
         let plan = Claude.instrument(&inv, &paths(), None);
-        assert!(!plan.args_suffix.contains("--settings"));
-        assert!(plan.args_suffix.starts_with(" --session-id '"));
-
-        let inv = Claude
-            .detect(&format!("claude --settings=mine.json --resume {ID}"))
-            .unwrap();
-        let plan = Claude.instrument(&inv, &paths(), None);
-        assert_eq!(plan.args_suffix, "");
+        assert_eq!(plan.injected_id, None);
+        assert_eq!(
+            plan.args_suffix,
+            " --settings '/tmp/Application Support/fleetcom.json'"
+        );
         assert_eq!(plan.env.len(), 1, "env still names the capture file");
     }
 
@@ -565,40 +276,25 @@ mod tests {
         assert_eq!(Claude.scrape_exit(&format!("claude --resume {ID}ff")), None);
     }
 
+    /// Both authored shapes rewrite to the same canonical resume form; the
+    /// program word survives as typed.
     #[test]
-    fn resume_command_appends_replaces_and_strips_session_id() {
-        // Fresh command: append a quoted ID.
+    fn resume_command_regenerates_the_canonical_form() {
         assert_eq!(
             Claude.resume_command("claude", ID),
             format!("claude --resume '{ID}'")
         );
-        // Prompt bytes, including quotes, survive untouched.
         assert_eq!(
-            Claude.resume_command("claude 'fix the bug' --model opus", ID),
-            format!("claude 'fix the bug' --model opus --resume '{ID}'")
-        );
-        // UUIDs passed through either resume flag are replaced in place.
-        assert_eq!(
-            Claude.resume_command(&format!("claude --resume {OTHER} -v"), ID),
-            format!("claude --resume {ID} -v")
+            Claude.resume_command("/usr/local/bin/claude", ID),
+            format!("/usr/local/bin/claude --resume '{ID}'")
         );
         assert_eq!(
-            Claude.resume_command(&format!("claude --resume={OTHER}"), ID),
-            format!("claude --resume={ID}")
-        );
-        // A user-pinned session ID conflicts with --resume and is removed.
-        assert_eq!(
-            Claude.resume_command(&format!("claude --session-id {OTHER} -v"), ID),
-            format!("claude -v --resume '{ID}'")
-        );
-        assert_eq!(
-            Claude.resume_command(&format!("claude --session-id={OTHER}"), ID),
+            Claude.resume_command(&format!("claude --resume '{OTHER}'"), ID),
             format!("claude --resume '{ID}'")
         );
-        // Unparseable commands are returned unchanged.
         assert_eq!(
-            Claude.resume_command("claude | tee log", ID),
-            "claude | tee log"
+            Claude.resume_command(&format!("claude --resume {OTHER}"), ID),
+            format!("claude --resume '{ID}'")
         );
         // Invalid IDs leave the command unchanged.
         assert_eq!(Claude.resume_command("claude", "evil'"), "claude");

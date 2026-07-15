@@ -2,7 +2,11 @@
 //! conversation. A harness detects supported commands, instruments execution
 //! to capture an ID, and emits a command that resumes that ID.
 //!
-//! Commands the tokenizer cannot fully account for remain uninstrumented.
+//! Detection accepts only the shapes `fleetcom` itself authors: the bare
+//! program word, or the canonical resume form (program word, fixed selector,
+//! one strict UUID, end of line). Everything else is opaque and runs and
+//! saves verbatim — if a user wants a command that specific we probably
+//! shouldn't rewrite it anyway.
 //!
 //! # Security invariant
 //!
@@ -49,8 +53,8 @@ pub trait Harness: Sync {
     /// resolves it from the launch context used for instrumentation or save.
     fn home_env_var(&self) -> &'static str;
 
-    /// Classify a command. Return `None` for another tool, an excluded
-    /// subcommand, or syntax this harness cannot parse safely.
+    /// Classify a command. Return `None` for another tool or any shape
+    /// `fleetcom` did not author.
     fn detect(&self, cmd: &str) -> Option<Invocation>;
 
     /// Build spawn-time command and environment additions.
@@ -78,7 +82,8 @@ pub trait Harness: Sync {
         home_override: Option<&Path>,
     ) -> Option<String>;
 
-    /// Rewrite `cmd` into the equivalent command that resumes `id`.
+    /// Rewrite an accepted `cmd` into the canonical command that resumes
+    /// `id`.
     fn resume_command(&self, cmd: &str, id: &str) -> String;
 }
 
@@ -92,19 +97,24 @@ pub fn detect(cmd: &str) -> Option<(&'static dyn Harness, Invocation)> {
         .find_map(|h| h.detect(cmd).map(|inv| (*h, inv)))
 }
 
-/// Parsed state for a recognized agent-CLI command.
+/// Classification of an accepted agent-CLI command.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Invocation {
-    /// Unquoted token texts, program first.
-    pub tokens: Vec<String>,
-    /// Session ID explicitly targeted by the command (`--resume <uuid>`,
-    /// `--session-id <uuid>`, or `codex resume <uuid>`). `None` means the
-    /// command does not contain a recognized UUID target.
-    pub known_id: Option<String>,
-    /// Whether `instrument` may pin a fresh session ID at launch. This is
-    /// false for `codex` and for `claude` or `grok` commands carrying
-    /// `--resume`, `--continue`, `--fork-session`, or `--session-id`.
-    pub can_inject_id: bool,
+pub enum Invocation {
+    /// The bare program word: `instrument` may pin a fresh session ID.
+    Bare,
+    /// The canonical resume form: the command already targets this ID, so
+    /// launch-time pinning is off.
+    Resume(String),
+}
+
+impl Invocation {
+    /// The session ID the command already targets.
+    pub fn known_id(self) -> Option<String> {
+        match self {
+            Invocation::Bare => None,
+            Invocation::Resume(id) => Some(id),
+        }
+    }
 }
 
 /// Capture paths allocated by [`assets::CaptureAssets::paths_for`].
@@ -128,6 +138,57 @@ pub struct SpawnPlan {
     pub env: Vec<(OsString, OsString)>,
     /// The session ID chosen at launch, when the harness can pin one.
     pub injected_id: Option<String>,
+}
+
+/// Characters that keep the program word from being one plain shell word:
+/// with any of these present, arguments this module appends could bind to a
+/// different command than the one the shell runs (`=` makes the word an
+/// env-prefix assignment; the rest separate, expand, quote, or comment).
+const PROGRAM_WORD_REFUSALS: &[char] = &[
+    '|', ';', '&', '<', '>', '$', '#', '`', '(', ')', '\\', '\'', '"', '=', '\n', '\r',
+];
+
+/// Match `cmd` against the two shapes `fleetcom` authors for `program`: the
+/// bare program word, or program + `selector` + one strict UUID ending the
+/// line. The program word matches by basename; the UUID may be bare
+/// (user-typed) or in one single-quote pair (`resume_command` output).
+/// Anything else — extra flags or arguments, prompts, alternate resume
+/// spellings, shell syntax — is opaque.
+pub(crate) fn detect_shape(cmd: &str, program: &str, selector: &str) -> Option<Invocation> {
+    let mut words = cmd.split([' ', '\t']).filter(|w| !w.is_empty());
+    let first = words.next()?;
+    if first.contains(PROGRAM_WORD_REFUSALS) || Path::new(first).file_name()?.to_str()? != program {
+        return None;
+    }
+    let Some(sel) = words.next() else {
+        return Some(Invocation::Bare);
+    };
+    let id = unquote(words.next()?);
+    (sel == selector && is_uuid(id) && words.next().is_none())
+        .then(|| Invocation::Resume(id.to_string()))
+}
+
+/// Strip one single-quote pair: `resume_command` quotes the ID it emits,
+/// while a user retyping a hint may not.
+fn unquote(token: &str) -> &str {
+    token
+        .strip_prefix('\'')
+        .and_then(|t| t.strip_suffix('\''))
+        .unwrap_or(token)
+}
+
+/// Rewrite an accepted `cmd` into `<program word as typed> <selector> '<id>'`.
+/// Unaccepted commands and invalid IDs pass through unchanged; the supervisor
+/// rewrites only detected tasks, so that branch is defensive.
+pub(crate) fn resume_shape(cmd: &str, program: &str, selector: &str, id: &str) -> String {
+    if !is_uuid(id) || detect_shape(cmd, program, selector).is_none() {
+        return cmd.to_string();
+    }
+    let first = cmd
+        .split([' ', '\t'])
+        .find(|w| !w.is_empty())
+        .expect("detect_shape accepted a program word");
+    format!("{first} {selector} {}", shell_quote(id))
 }
 
 /// Validate the shell-insertion boundary: exactly `8-4-4-4-12` lowercase hex.
@@ -185,247 +246,9 @@ pub(crate) fn within_window_ms(a: u128, b: u128) -> bool {
     a.abs_diff(b) <= CORRELATE_WINDOW.as_millis()
 }
 
-/// One shell word and its byte span in the source, including quotes. Spans
-/// let `resume_command` splice edits into the original string, preserving
-/// every untouched byte.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct Word {
-    pub(crate) text: String,
-    pub(crate) start: usize,
-    pub(crate) end: usize,
-}
-
-/// Split `cmd` into shell words: unquoted whitespace separates, and quoted
-/// spans are decoded without expansion by this tokenizer. Refuses (`None`) any
-/// command containing, outside quotes, a construct whose meaning this module
-/// cannot account for: `| ; & < > $ #` backtick `( ) \`, a newline or
-/// carriage return, an unterminated quote, or an `=` in the first word
-/// (env-prefix form). An unquoted `#` comments out the rest of the line, so
-/// appended flags would be recorded but never execute. A word that resolves
-/// to exactly `--` is refused even when quoted: the shell strips quotes
-/// before argv, the CLI reads `--` as the flag terminator either way, and
-/// appended flags would land in prompt text. Inside double quotes, `$`,
-/// backtick, and `\` also refuse: the shell expands or unescapes them, so the
-/// decoded token would diverge from the argv the CLI receives (`codex "$MODE"`
-/// can run `codex exec`), and a `\"` would split the word at the wrong quote.
-/// Single-quoted bytes are literal and stay accepted.
-pub(crate) fn tokenize(cmd: &str) -> Option<Vec<Word>> {
-    let mut words: Vec<Word> = Vec::new();
-    let mut cur: Option<Word> = None;
-    let mut iter = cmd.char_indices();
-    while let Some((i, c)) = iter.next() {
-        match c {
-            ' ' | '\t' => {
-                if let Some(mut w) = cur.take() {
-                    if w.text == "--" {
-                        return None;
-                    }
-                    w.end = i;
-                    words.push(w);
-                }
-            }
-            '\'' | '"' => {
-                let rest = &cmd[i + 1..];
-                let close = rest.find(c)?;
-                // The shell processes `$`, backticks, and backslashes inside
-                // double quotes; a backslash also invalidates this closing-
-                // quote scan (`\"` is not a terminator).
-                if c == '"' && rest[..close].contains(['$', '`', '\\']) {
-                    return None;
-                }
-                cur.get_or_insert_with(|| Word {
-                    text: String::new(),
-                    start: i,
-                    end: 0,
-                })
-                .text
-                .push_str(&rest[..close]);
-                // Consume through the closing quote (ASCII, so `i + 1 +
-                // close` is a char boundary).
-                let target = i + 1 + close;
-                for (j, _) in iter.by_ref() {
-                    if j == target {
-                        break;
-                    }
-                }
-            }
-            '|' | ';' | '&' | '<' | '>' | '$' | '#' | '`' | '(' | ')' | '\\' | '\n' | '\r' => {
-                return None;
-            }
-            '=' if words.is_empty() => return None,
-            _ => {
-                cur.get_or_insert_with(|| Word {
-                    text: String::new(),
-                    start: i,
-                    end: 0,
-                })
-                .text
-                .push(c);
-            }
-        }
-    }
-    if let Some(mut w) = cur.take() {
-        if w.text == "--" {
-            return None;
-        }
-        w.end = cmd.len();
-        words.push(w);
-    }
-    Some(words)
-}
-
-/// Include preceding whitespace when removing a token.
-pub(crate) fn erase_start(cmd: &str, mut start: usize) -> usize {
-    let b = cmd.as_bytes();
-    while start > 0 && matches!(b[start - 1], b' ' | b'\t') {
-        start -= 1;
-    }
-    start
-}
-
 /// Single-quote `s` for `$SHELL -c`, encoding embedded `'` as `'\''`.
 pub(crate) fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
-}
-
-/// Insert `insertion` into `cmd` at byte offset `at`.
-pub(crate) fn splice_insert(cmd: &str, at: usize, insertion: &str) -> String {
-    let mut out = String::with_capacity(cmd.len() + insertion.len());
-    out.push_str(&cmd[..at]);
-    out.push_str(insertion);
-    out.push_str(&cmd[at..]);
-    out
-}
-
-/// Outcome of a positional scan. Distinguishing `Exhausted` (only known flags
-/// remained) from `Opaque` (an unrecognized flag) lets callers refuse a
-/// command they cannot parse instead of guessing a subcommand.
-pub(crate) enum Scan {
-    /// First non-flag token, at this index.
-    Positional(usize),
-    /// End of the words with no positional; every flag was recognized.
-    Exhausted,
-    /// An unrecognized flag: the command is opaque and must not be rewritten.
-    Opaque,
-}
-
-/// How a `-`-prefixed token consumes what follows it.
-enum FlagKind {
-    /// Consumes the next token as a separate, required value.
-    SeparateValue,
-    /// Value is optional (`[value]`): the CLI binds the next token only when
-    /// it is not itself option-like (does not start with `-`).
-    OptionalValue,
-    /// Variadic (`<value...>`): consumes every following non-flag token.
-    Variadic,
-    /// A bool, or a value fused into the token (`--flag=value`, `-fvalue`).
-    SelfContained,
-    /// Unrecognized: its value could be mistaken for a subcommand or prompt.
-    Unknown,
-}
-
-/// A CLI's top-level flags, split by how each flag consumes a value. The
-/// table-driven scan returns `Opaque` for an unlisted flag so its possible
-/// value cannot be mistaken for a subcommand. Opaque commands run unchanged.
-pub(crate) struct FlagTable {
-    /// Flags taking a required separate value.
-    pub(crate) value: &'static [&'static str],
-    /// Flags whose value is optional (`[value]`).
-    pub(crate) optional: &'static [&'static str],
-    /// Variadic flags (`<value...>`).
-    pub(crate) variadic: &'static [&'static str],
-    /// Flags taking no value.
-    pub(crate) boolean: &'static [&'static str],
-}
-
-impl FlagTable {
-    /// Whether `flag` is a named entry in any of the four tables.
-    fn is_known(&self, flag: &str) -> bool {
-        self.value.contains(&flag)
-            || self.optional.contains(&flag)
-            || self.variadic.contains(&flag)
-            || self.boolean.contains(&flag)
-    }
-
-    /// Classify a `-`-prefixed token. The `--flag=value` and `-fvalue`
-    /// spellings are self-contained: a value fused into the token can never
-    /// desync the walk, so only the flag name needs to be known.
-    fn classify(&self, t: &str) -> FlagKind {
-        if self.value.contains(&t) {
-            return FlagKind::SeparateValue;
-        }
-        if self.optional.contains(&t) {
-            return FlagKind::OptionalValue;
-        }
-        if self.variadic.contains(&t) {
-            return FlagKind::Variadic;
-        }
-        if self.boolean.contains(&t) {
-            return FlagKind::SelfContained;
-        }
-        // Short flag with a directly attached value (`-mvalue`, `-m=value`).
-        // The value may itself contain `=`, so this precedes the split below.
-        // `get(..2)` safely rejects multibyte text immediately after `-`,
-        // where byte 2 is not a character boundary.
-        if t.starts_with('-')
-            && !t.starts_with("--")
-            && t.len() > 2
-            && t.get(..2).is_some_and(|p| {
-                self.value.contains(&p) || self.optional.contains(&p) || self.variadic.contains(&p)
-            })
-        {
-            return FlagKind::SelfContained;
-        }
-        // Long flag with an attached assignment: `--model=opus`.
-        if let Some((name, _)) = t.split_once('=')
-            && self.is_known(name)
-        {
-            return FlagKind::SelfContained;
-        }
-        FlagKind::Unknown
-    }
-
-    /// Index just past the flag at `from` and any value it consumes, or `None`
-    /// when the flag is unrecognized (opaque). `from` must index a `-`-token.
-    pub(crate) fn skip_flag(&self, words: &[Word], from: usize) -> Option<usize> {
-        match self.classify(words[from].text.as_str()) {
-            FlagKind::SeparateValue => Some(from + 2),
-            FlagKind::OptionalValue => Some(
-                if words
-                    .get(from + 1)
-                    .is_some_and(|w| !w.text.starts_with('-'))
-                {
-                    from + 2
-                } else {
-                    from + 1
-                },
-            ),
-            FlagKind::Variadic => {
-                let mut n = from + 1;
-                while words.get(n).is_some_and(|w| !w.text.starts_with('-')) {
-                    n += 1;
-                }
-                Some(n)
-            }
-            FlagKind::SelfContained => Some(from + 1),
-            FlagKind::Unknown => None,
-        }
-    }
-
-    /// First non-flag token at or after `from`, skipping each known flag and
-    /// the value it consumes. An unrecognized flag stops the scan `Opaque`.
-    pub(crate) fn first_positional(&self, words: &[Word], mut from: usize) -> Scan {
-        while from < words.len() {
-            if !words[from].text.starts_with('-') {
-                return Scan::Positional(from);
-            }
-            match self.skip_flag(words, from) {
-                Some(next) => from = next,
-                None => return Scan::Opaque,
-            }
-        }
-        Scan::Exhausted
-    }
 }
 
 #[cfg(test)]
@@ -476,95 +299,41 @@ mod tests {
         assert_ne!(a, b);
     }
 
+    /// The UUID token may be bare or in exactly one single-quote pair;
+    /// anything half-quoted or nested fails the strict check.
     #[test]
-    fn tokenize_splits_on_unquoted_whitespace() {
-        let words = tokenize("claude --resume abc").unwrap();
-        let texts: Vec<&str> = words.iter().map(|w| w.text.as_str()).collect();
-        assert_eq!(texts, ["claude", "--resume", "abc"]);
-        // Spans address the original bytes.
-        assert_eq!((words[1].start, words[1].end), (7, 15));
-        assert_eq!((words[2].start, words[2].end), (16, 19));
-    }
-
-    #[test]
-    fn tokenize_resolves_quotes_without_expansion() {
-        let words = tokenize(r#"claude 'a b' "c d" --x='q r'"#).unwrap();
-        let texts: Vec<&str> = words.iter().map(|w| w.text.as_str()).collect();
-        assert_eq!(texts, ["claude", "a b", "c d", "--x=q r"]);
-        // Quoted spans include their quotes.
-        assert_eq!((words[1].start, words[1].end), (7, 12));
-        // Single quotes are literal, so a `$` inside them is not a shell
-        // expansion and stays in the token.
-        let words = tokenize(r#"claude 'costs $5'"#).unwrap();
-        assert_eq!(words[1].text, "costs $5");
-    }
-
-    #[test]
-    fn tokenize_refuses_shell_constructs() {
-        for cmd in [
-            "claude | tee log",
-            "claude; ls",
-            "claude && ls",
-            "claude < in",
-            "claude > out",
-            "claude $ID",
-            "claude `id`",
-            "claude (x)",
-            "claude a\\ b",
-            "claude \nls",
-            "FOO=bar claude",
-            "claude 'unterminated",
-        ] {
-            assert_eq!(tokenize(cmd), None, "{cmd:?} must be refused");
-        }
-        // `=` outside the first word is ordinary flag syntax.
-        assert!(tokenize("claude --resume=abc").is_some());
-    }
-
-    /// An unquoted `#` hides appended flags behind a comment; a bare `--`
-    /// word turns them into prompt text. Both refuse; quoted prompt text
-    /// containing either stays fine.
-    #[test]
-    fn tokenize_refuses_comments_and_the_flag_terminator() {
-        for cmd in [
-            "claude # note",
-            "claude fix#3",
-            "claude -- foo",
-            "codex -- foo",
-            // Quote removal still hands the CLI a bare `--` in argv.
-            "claude '--' foo",
-        ] {
-            assert_eq!(tokenize(cmd), None, "{cmd:?} must be refused");
-        }
-        // Inside larger quoted words, both remain prompt text.
-        let words = tokenize("claude 'fix bug #3'").unwrap();
-        assert_eq!(words[1].text, "fix bug #3");
-        let words = tokenize("codex 'run -- now'").unwrap();
-        assert_eq!(words[1].text, "run -- now");
-    }
-
-    /// Inside double quotes the shell expands `$`/backtick and unescapes `\`,
-    /// so the decoded token would diverge from the CLI's argv. All three
-    /// refuse; single quotes, which the shell leaves literal, do not.
-    #[test]
-    fn tokenize_refuses_shell_processing_inside_double_quotes() {
-        for cmd in [
-            r#"codex "$MODE""#,
-            r#"grok "prefix-$VAR""#,
-            r#"claude "`id`""#,
-            // An escaped quote invalidates the closing-quote scan.
-            r#"claude "say \"hi\"""#,
-            r#"claude "a\\b""#,
-        ] {
-            assert_eq!(tokenize(cmd), None, "{cmd:?} must be refused");
-        }
-        // Single-quoted content is literal: no shell processing, no refusal.
+    fn detect_shape_strips_exactly_one_quote_pair() {
         assert_eq!(
-            tokenize(r#"claude 'costs $5'"#).unwrap()[1].text,
-            "costs $5"
+            detect_shape(&format!("claude --resume '{ID}'"), "claude", "--resume"),
+            Some(Invocation::Resume(ID.into()))
         );
-        assert_eq!(tokenize(r#"grok 'a\b'"#).unwrap()[1].text, r"a\b");
-        assert_eq!(tokenize("codex 'run `now`'").unwrap()[1].text, "run `now`");
+        for token in [format!("'{ID}"), format!("{ID}'"), format!("''{ID}''")] {
+            assert_eq!(
+                detect_shape(&format!("claude --resume {token}"), "claude", "--resume"),
+                None,
+                "{token:?}"
+            );
+        }
+    }
+
+    /// A path-form program word matches by basename only while it stays one
+    /// plain shell word.
+    #[test]
+    fn detect_shape_matches_basenames_and_refuses_shell_syntax_in_them() {
+        assert_eq!(
+            detect_shape("/usr/local/bin/claude", "claude", "--resume"),
+            Some(Invocation::Bare)
+        );
+        for cmd in [
+            "$HOME/bin/claude",
+            "a=b/claude",
+            "'/bin/claude'",
+            "/tmp/x;y/claude",
+            "/tmp/x`y`/claude",
+            "claude\nls",
+        ] {
+            assert_eq!(detect_shape(cmd, "claude", "--resume"), None, "{cmd:?}");
+        }
     }
 
     /// Shell quoting preserves spaces and embedded single quotes.
@@ -582,11 +351,6 @@ mod tests {
             .output()
             .expect("sh must run");
         assert_eq!(String::from_utf8(out.stdout).unwrap(), path);
-
-        // A space-only path also survives the module's own tokenizer.
-        let quoted = shell_quote("/tmp/App Support/x.json");
-        let words = tokenize(&format!("claude --settings {quoted}")).unwrap();
-        assert_eq!(words[2].text, "/tmp/App Support/x.json");
     }
 
     #[test]
@@ -610,13 +374,13 @@ mod tests {
     fn registry_detect_routes_to_the_matching_harness() {
         let (h, inv) = detect("claude").unwrap();
         assert_eq!(h.name(), "claude");
-        assert!(inv.can_inject_id);
-        let (h, inv) = detect("codex").unwrap();
+        assert_eq!(inv, Invocation::Bare);
+        let (h, inv) = detect(&format!("codex resume {ID}")).unwrap();
         assert_eq!(h.name(), "codex");
-        assert!(!inv.can_inject_id);
+        assert_eq!(inv, Invocation::Resume(ID.into()));
         let (h, inv) = detect("grok").unwrap();
         assert_eq!(h.name(), "grok");
-        assert!(inv.can_inject_id);
+        assert_eq!(inv, Invocation::Bare);
         assert!(detect("vim").is_none());
         assert!(detect("").is_none());
     }

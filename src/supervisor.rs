@@ -514,7 +514,7 @@ impl Supervisor {
                 )?;
                 task.harness = Some(h);
                 task.capture_file = Some(paths.capture_file);
-                task.resume_id = plan.injected_id.or(inv.known_id);
+                task.resume_id = plan.injected_id.or_else(|| inv.known_id());
                 return Ok(task);
             }
         }
