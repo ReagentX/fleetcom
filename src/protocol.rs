@@ -57,8 +57,9 @@ pub enum Command {
     Kill { id: u64 },
     /// Drop a task from the set entirely (used on already-finished tasks).
     Remove { id: u64 },
-    /// Re-run a finished task with the same id, command, cwd, tag, group, and
-    /// name. Running tasks reject this request.
+    /// Re-run a finished task with the same id, cwd, tag, group, and name.
+    /// Captured agent sessions may replace the command with its resume form.
+    /// Running tasks reject this request.
     Restart { id: u64 },
     /// Set the manual "in use" tag.
     Tag { id: u64, on: bool },

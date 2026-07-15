@@ -1,6 +1,6 @@
 # Sessions
 
-A session records commands, working directories, and each task's optional group assignment and display name for repeatable launches. Loading starts new processes; it does not restore the processes that existed when the file was saved. Live process continuity belongs to the [daemon](README.md#directory--environment-configuration), which keeps jobs running across client disconnects.
+A session is a launch recipe, not a process snapshot. It records commands, working directories, and each task's optional group assignment and display name. Loading always starts new processes. Live process continuity belongs to the [daemon](README.md#storage-paths), which keeps jobs running across client disconnects.
 
 ## Storage
 
@@ -14,7 +14,7 @@ A session records commands, working directories, and each task's optional group 
 
 The first save creates the directory. This matches the [configuration path resolution](README.md#config-directory-sessions) used by save, list, and load.
 
-The filename derives from the session name. `fleetcom` trims leading and trailing whitespace, replaces control characters and any of `* " / \ < > : | ? .` with `_`, and caps the result at 255 characters. As a result, `my/session` becomes `my_session.json`, while `a.b` becomes `a_b.json`. Replacing `.` prevents the session name from supplying another extension.
+The filename derives from the session name. `fleetcom` trims leading and trailing whitespace, replaces control characters and any of `* " / \ < > : | ? .` with `_`, and caps the result at 255 characters: `my/session` becomes `my_session.json`, and `a.b` becomes `a_b.json`. Replacing `.` prevents the session name from supplying another extension.
 
 ## Format
 

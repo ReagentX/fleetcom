@@ -1,15 +1,15 @@
 # fleetcom Documentation
 
-`fleetcom` keeps durable session recipes separate from ephemeral daemon state. This guide documents both storage paths, the build workflow, and a complete first run.
+`fleetcom` has two kinds of state with different lifetimes: the daemon owns live processes, while session files store repeatable launch recipes. Confusing those boundaries makes shutdown, reconnect, and session behavior difficult to reason about. This guide documents the paths, the lifecycle, and a complete first run.
 
 ## Index
 
 - [Commands](commands.md): every key and launch flag, including the routing mechanics
 - [Sessions](sessions.md): the task recipe format and where it lives
 - [Agent session resume](../src/harness/agent-resume.md): when `fleetcom` can save resumable `claude`, `codex`, and `grok` commands
-- [Directory & Environment Configuration](#directory--environment-configuration): the socket, the lock, and the session paths
-- [Sample Usage Session](#sample-usage-session): a first run, start to finish
-- [Notes & Caveats](#notes--caveats): process and protocol boundaries
+- [Storage paths](#storage-paths): the socket, the lock, and the session paths
+- [First-run walkthrough](#first-run-walkthrough): a first run, start to finish
+- [Operational constraints](#operational-constraints): process and protocol boundaries
 
 ## Installation from source
 
@@ -21,9 +21,9 @@ From a repository clone:
 - `cargo build --release`: compile to `target/release/fleetcom`
 - `cargo install --path .`: put `fleetcom` on `PATH`
 
-## Directory & Environment Configuration
+## Storage paths
 
-`fleetcom` separates runtime state from configuration. Runtime state contains the daemon socket and lock; configuration contains durable session recipes.
+Runtime state contains the daemon socket and lock. Configuration contains durable session recipes. The paths resolve independently.
 
 ### Runtime directory (socket + lock)
 
@@ -51,7 +51,7 @@ Holds saved sessions under a `sessions/` subdirectory: one `<name>.json` per ses
 
 The platform default is [`dirs::config_dir()`](https://docs.rs/dirs/latest/dirs/fn.config_dir.html) joined with `fleetcom`. The directory is created on the first save.
 
-## Sample Usage Session
+## First-run walkthrough
 
 The following walkthrough moves from an empty dashboard to a saved fleet. The frames show layout, not captured terminal output.
 
@@ -135,7 +135,7 @@ The attached status bar shows both: `[attached] api tests · cargo watch -x test
 
 `w`, a name, and `Enter` save the fleet as a [session](sessions.md). `q` then disconnects while the daemon and both jobs continue running. A subsequent `fleetcom` invocation reconstructs the dashboard from the daemon's current task state. `Q` or `fleetcom --kill` stops the jobs (`TERM`, then `KILL` after a two-second grace period) and exits the daemon.
 
-## Notes & Caveats
+## Operational constraints
 
 - The fleet dies with the daemon. Because the daemon holds each PTY master, daemon termination closes the terminals and the kernel sends `SIGHUP` to every task's process group. A clean shutdown sends `SIGTERM` before `SIGKILL`; a crash or direct `SIGKILL` provides no grace period. HUP-immune jobs (`nohup`, `trap '' HUP`) can survive, but the next daemon neither owns nor displays them. A panic while serving one client only drops that connection.
 - Commands run through the client's non-interactive shell (`$SHELL -c`, or `/bin/sh` when `SHELL` is unset), so functions and aliases from `~/.zshrc` are unavailable.

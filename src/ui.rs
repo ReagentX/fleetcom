@@ -709,7 +709,7 @@ mod tests {
     }
 
     /// The time column follows the debounced state: exit age once finished,
-    /// quiet age while parked, launch age otherwise -- even when the glyph's
+    /// quiet age while parked, launch age otherwise, even when the glyph's
     /// instantaneous `Idle` disagrees. A `None` edge (old-daemon frame) falls
     /// back to launch age.
     #[test]

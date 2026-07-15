@@ -235,10 +235,10 @@ fn step_down(sel: usize, len: usize) -> usize {
 /// Dashboard grouping bucket: 0 tagged, 1 live, 2 parked live, 3 completed.
 /// Tagged wins over everything; completed is classified by `lifecycle`, never
 /// by trusting `parked == false`, so a core that ever shipped both signals
-/// still lands finished tasks in Completed. Placement follows `parked` — the
-/// core's 10 s debounced quiet signal — not the instantaneous
-/// `Lifecycle::Idle`: `top`-cadence output flaps the 600 ms glyph edge, and
-/// the glyph may flicker but the row must not change sections.
+/// still lands finished tasks in Completed. Placement follows `parked`, the
+/// core's 10 s debounced quiet signal, not the instantaneous `Lifecycle::Idle`:
+/// `top`-cadence output flaps the 600 ms glyph edge, and the glyph may flicker
+/// but the row must not change sections.
 fn bucket(v: &TaskView) -> u8 {
     if v.tagged {
         0
@@ -1704,7 +1704,7 @@ mod tests {
     /// A parked live task gets its own "Idle" section between "Running" and
     /// "Completed". `parked` is flipped on the local snapshot here (and in the
     /// tests below): the core's 10 s quiet window is exactly what a test must
-    /// not wait out, and `sections` is pure over `views` — the flip must come
+    /// not wait out, and `sections` is pure over `views`: the flip must come
     /// after the last pump, or a fresh snapshot overwrites it.
     #[test]
     fn parked_task_lands_in_idle_between_running_and_completed() {
@@ -2062,7 +2062,7 @@ mod tests {
 
     /// Selection wraps at the list edges: up from the first task lands on the
     /// last and down from the last lands on the first, across the section
-    /// boundary — `display_order` is flat, so headers never trap the cursor.
+    /// boundary. `display_order` is flat, so headers never trap the cursor.
     #[test]
     fn selection_wraps_at_list_edges() {
         let mut app = App::new_local(30, 100);

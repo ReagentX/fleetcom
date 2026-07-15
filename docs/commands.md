@@ -1,6 +1,6 @@
 # Commands
 
-`fleetcom` has two control surfaces. Launch arguments select the operating mode; keys control the dashboard and its overlays.
+`fleetcom` has two control surfaces. Launch arguments select the operating mode; keys control the dashboard, pickers, and attached PTY. `q`, `Q`, and `Ctrl-C` mean different things on each surface.
 
 ## Invocation
 
@@ -47,7 +47,7 @@
 
 The `∙` glyph flips after ≈600 ms of quiet; the Idle *section* in the by-state sort uses a 10 s window. A task can therefore show `∙` while still filed under Running.
 
-### Mechanics
+### Input and lifecycle mechanics
 
 #### Peek vs. attach
 
@@ -55,7 +55,7 @@ The `∙` glyph flips after ≈600 ms of quiet; the Idle *section* in the by-sta
 
 #### Attach and background
 
-While attached, `Ctrl-\` returns to the dashboard. Every other key, including `Ctrl-C`, `Ctrl-Z`, and `Ctrl-D`, is forwarded to the child. `Ctrl-\` refers to the physical chord; the input handler accepts both `Ctrl-\` and the `Ctrl-4` representation produced by crossterm's legacy decoder.
+While attached, `Ctrl-\` returns to the dashboard. Every other key, including `Ctrl-C`, `Ctrl-Z`, and `Ctrl-D`, is forwarded to the child. `Ctrl-\` refers to the physical chord; the input handler accepts both `Ctrl-\` and crossterm's `Ctrl-4` representation of that chord.
 
 #### Shift+Enter, paste, and the wheel
 

@@ -1,10 +1,10 @@
 # fleetcom
 
-A supervisor for concurrent shell commands.
-
 Running several long-lived commands becomes cumbersome once they span terminal panes or need to survive a disconnect. `fleetcom` gives each command its own PTY and exposes every screen through one dashboard. A daemon owns the jobs, so closing the client does not stop them.
 
-## What it does
+The scope is intentionally narrower than a terminal multiplexer. Each task is one command rather than a persistent shell session, which gives the dashboard explicit state, output, directory, and lifecycle data for every process.
+
+## Operational model
 
 - Runs each command in its own PTY and groups tasks by state, by working directory, or by custom named groups.
 - Provides read-only previews and full interactive attachment.
@@ -38,18 +38,13 @@ From the project root:
 
 ## Usage
 
-`fleetcom` supports these invocations:
-
-- `fleetcom`
-  - Connects to the daemon (autostarting it if needed) and opens the dashboard
-- `fleetcom <session>`
-  - Loads a saved session at startup, then opens the dashboard
-- `fleetcom --foreground`
-  - Runs everything in-process, without a daemon (jobs die when you quit)
-- `fleetcom --kill`
-  - Kills the daemon and its running jobs
-- `fleetcom --help` / `--version`
-  - Print usage / the version and exit
+| Invocation | Behavior |
+| -- | -- |
+| `fleetcom` | Connect to the daemon, autostarting it when necessary, and open the dashboard |
+| `fleetcom <session>` | Load a saved session, then open the dashboard |
+| `fleetcom --foreground` | Run in-process without a daemon; jobs stop when the client quits |
+| `fleetcom --kill` | Stop the daemon and every job it owns |
+| `fleetcom --help` / `--version` | Print usage or version information and exit |
 
 The first ordinary invocation starts the daemon when necessary. `--daemon` is an internal mode.
 
@@ -82,11 +77,11 @@ The first ordinary invocation starts the daemon when necessary. `--daemon` is an
 | `Ctrl-\` | background the task and return to the dashboard |
 | anything else | forwarded to the task's PTY |
 
-## Features
+## How it works
 
 ### One PTY per command
 
-Every task runs in its own pseudo-terminal, emulated with `alacritty_terminal`. `fleetcom` answers cursor-position and device-attribute queries, renders `?2026` synchronized updates as whole frames, and reflows history after a resize. The dashboard preview, peek overlay, and attached view all read the same emulated screen grid. As a result, full-screen programs such as `vim` and `htop` retain one consistent terminal state across views. Backgrounding changes client focus without notifying the child.
+Every task runs in its own pseudo-terminal, emulated with `alacritty_terminal`. `fleetcom` answers cursor-position and device-attribute queries, renders `?2026` synchronized updates as whole frames, and reflows history after a resize. The dashboard preview, peek overlay, and attached view all read the same emulated screen grid, so full-screen programs such as `vim` and `htop` retain one consistent terminal state across views. Backgrounding changes client focus without notifying the child.
 
 ### Input fidelity
 
@@ -94,15 +89,17 @@ Attached input follows the terminal modes reported by the child. Modified Enter 
 
 ### Jobs outlive the UI
 
-A per-user daemon owns the processes and their terminals. `q` disconnects the client but leaves the daemon and its jobs running; the next `fleetcom` invocation reattaches. Each launch uses the environment and working directory of the client that requested it. This means a job launched from a virtual environment sees that environment even when another client originally started the daemon.
+A per-user daemon owns the processes and their terminals. `q` disconnects the client but leaves the daemon and its jobs running; the next `fleetcom` invocation reattaches. Each launch uses the environment and working directory of the client that requested it: a job launched from a virtual environment sees that environment even when another client originally started the daemon.
 
 `Q` and `fleetcom --kill` stop the daemon and send `SIGTERM` to each job's process group, followed by `SIGKILL` after a two-second grace period. Sending `SIGTERM`, `SIGINT`, or `SIGHUP` directly to the daemon uses the same shutdown path. `fleetcom --kill` reads the daemon PID from the lock file, so it also works while another client occupies the socket. If the connection drops, the client discards the task snapshot it can no longer verify and offers to reconnect.
 
 Signals target each task's process group. `fleetcom` leaves an exited leader unreaped until final cleanup, preserving the process-group ID so background children remain signalable. A process that creates a new session or double-forks out of the group is outside `fleetcom`'s control.
 
-### Grouping and launch targets
+### Grouping uses two activity windows
 
-The dashboard groups tasks by state (In use / Running / Idle / Completed), working directory, or names assigned with `g`. A running task moves to Idle after 10 s without output. That window is deliberately wider than the 600 ms that flips the row glyph between `✻` and `∙`: a tool like `top` that prints every 1–2 s flaps the glyph but never goes 10 s quiet, so it stays under Running. The glyph is the instantaneous signal; the section is the settled one. Custom groups sort by name, with Unassigned last. `@` opens a live directory picker with the current directory first, recently used directories next, and matching subdirectories after them. This provides an explicit launch directory without leaving the dashboard.
+The dashboard groups tasks by state (In use / Running / Idle / Completed), working directory, or names assigned with `g`. Activity uses two separate windows. The row glyph changes from `✻` to `∙` after 600 ms without output, while state grouping moves the task to Idle after 10 s. A tool such as `top`, which prints every 1–2 s, can therefore alternate glyphs without moving sections. The glyph reports the short edge; the section reports the debounced state.
+
+Custom groups sort by name, with Unassigned last. `@` opens a directory picker with the current directory first, recently used directories next, and matching subdirectories after them. This makes the launch directory explicit without leaving the dashboard.
 
 ### Task names
 
@@ -116,9 +113,9 @@ The dashboard groups tasks by state (In use / Running / Idle / Completed), worki
 
 Session recipes store commands, which is insufficient for agent CLIs: relaunching a bare `claude`, `codex`, or `grok` command starts another conversation. When `fleetcom` obtains a valid ID, save and rerun (`r`) use `claude --resume '<id>'`, `codex resume '<id>'`, or `grok --resume '<id>'`. Detection is deliberately narrow. Only the bare program word and `fleetcom`'s canonical resume form participate; flags, prompts, subcommands, and shell syntax run and save verbatim. [`agent-resume.md`](src/harness/agent-resume.md) documents the capture evidence, precedence, and failure behavior.
 
-## Notes
+## Scope and tradeoffs
 
-`fleetcom` targets concurrent build, test, watch, server, and interactive-agent processes. It is deliberately narrower than a terminal multiplexer: each task is one command, not a persistent shell session.
+`fleetcom` targets concurrent build, test, watch, server, and interactive-agent processes.
 
 ### When to use it
 
@@ -131,7 +128,7 @@ Session recipes store commands, which is insufficient for agent CLIs: relaunchin
 - For interactive multiplexing of persistent shells, use `tmux`; `fleetcom` runs one command per task.
 - It is not a full process manager: the fleet's lifetime is bounded by the daemon's (see the first limitation below).
 
-### Known limitations
+### Operational limits
 
 - The fleet dies with the daemon. The daemon holds every PTY master, so daemon termination closes the terminals and the kernel sends `SIGHUP` to each task's process group. A clean shutdown (`Q`, `--kill`, or `SIGTERM`) sends `SIGTERM` first and escalates to `SIGKILL` after two seconds. A crash or direct `SIGKILL` skips that grace period. HUP-immune jobs (`nohup`, `trap '' HUP`) can survive, but the next daemon does not own or display them. A panic while serving one client only drops that connection; the daemon process remains the fleet's single point of failure.
 - Commands run through the client's non-interactive shell (`$SHELL -c`, or `/bin/sh` when `SHELL` is unset), so functions and aliases defined in `~/.zshrc` are not available.

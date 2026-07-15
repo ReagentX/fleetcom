@@ -30,7 +30,7 @@ const IDLE_AFTER: Duration = Duration::from_millis(600);
 /// second window over the same `last_activity` signal as `IDLE_AFTER`: 600 ms
 /// flips the per-row glyph, 10 s moves the row. A cadence shorter than the
 /// window (`top` bursts every 1–2 s) resets the signal before it can
-/// expire and never produces a placement edge — the window is the debounce.
+/// expire and never produces a placement edge: the window is the debounce.
 const SORT_IDLE_AFTER: Duration = Duration::from_secs(10);
 
 /// Send-on-change fingerprint for the watched screen and scrollback offset.
