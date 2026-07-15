@@ -44,9 +44,6 @@ const CORRELATE_WINDOW: Duration = Duration::from_secs(30);
 
 /// Detection, capture, correlation, and resume behavior for one agent CLI.
 pub trait Harness: Sync {
-    #[allow(dead_code)] // test-only: registry routing assertions
-    fn name(&self) -> &'static str;
-
     /// Environment variable overriding the tool's home root. The supervisor
     /// resolves it from the launch context used for instrumentation or save.
     fn home_env_var(&self) -> &'static str;
@@ -389,13 +386,13 @@ mod tests {
     #[test]
     fn registry_detect_routes_to_the_matching_harness() {
         let (h, inv) = detect("claude").unwrap();
-        assert_eq!(h.name(), "claude");
+        assert_eq!(h.home_dot_dir(), ".claude");
         assert_eq!(inv, Invocation::Bare);
         let (h, inv) = detect(&format!("codex resume {ID}")).unwrap();
-        assert_eq!(h.name(), "codex");
+        assert_eq!(h.home_dot_dir(), ".codex");
         assert_eq!(inv, Invocation::Resume(ID.into()));
         let (h, inv) = detect("grok").unwrap();
-        assert_eq!(h.name(), "grok");
+        assert_eq!(h.home_dot_dir(), ".grok");
         assert_eq!(inv, Invocation::Bare);
         assert!(detect("vim").is_none());
         assert!(detect("").is_none());

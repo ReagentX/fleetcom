@@ -58,7 +58,7 @@ const PASTE_END: &[u8] = b"\x1b[201~";
 /// terminators stripped, content otherwise verbatim. Legacy: no markers, and
 /// line endings (`\r\n` and bare `\n`) become `\r` (the byte Enter sends),
 /// because a legacy line editor reads `\n` as ^J, not as end-of-line.
-pub fn paste_bytes(bracketed: bool, content: &[u8]) -> Vec<u8> {
+fn paste_bytes(bracketed: bool, content: &[u8]) -> Vec<u8> {
     if bracketed {
         let mut out = Vec::with_capacity(content.len() + 2 * PASTE_END.len() + 6);
         out.extend_from_slice(b"\x1b[200~");
@@ -94,7 +94,7 @@ pub fn paste_bytes(bracketed: bool, content: &[u8]) -> Vec<u8> {
 /// no mouse protocol, wheel actions become alternate-scroll arrows when the
 /// alternate screen and DECSET 1007 are both active. DECSET 1007 defaults on;
 /// see [`Emulator::alternate_scroll`]. Unsupported actions return `None`.
-pub fn mouse_bytes(emu: &Emulator, kind: MouseKind, col: u16, row: u16) -> Option<Vec<u8>> {
+fn mouse_bytes(emu: &Emulator, kind: MouseKind, col: u16, row: u16) -> Option<Vec<u8>> {
     use crate::emulator::{MouseProtocolEncoding, MouseProtocolMode};
     let mode = emu.mouse_protocol_mode();
     if mode != MouseProtocolMode::None {
@@ -214,7 +214,7 @@ pub struct Task {
     scraped: bool,
     /// Wall-clock spawn time used for filesystem correlation.
     pub spawned_at: SystemTime,
-    pub exit_code: Option<i32>,
+    exit_code: Option<i32>,
     pub started: Instant,
     pub finished: Option<Instant>,
     /// When SIGTERM was sent (`terminate`): the start of the grace window the

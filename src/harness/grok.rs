@@ -13,10 +13,6 @@ use super::{
 pub struct Grok;
 
 impl Harness for Grok {
-    fn name(&self) -> &'static str {
-        "grok"
-    }
-
     fn home_env_var(&self) -> &'static str {
         "GROK_HOME"
     }

@@ -20,10 +20,6 @@ use super::{
 pub struct Codex;
 
 impl Harness for Codex {
-    fn name(&self) -> &'static str {
-        "codex"
-    }
-
     fn home_env_var(&self) -> &'static str {
         "CODEX_HOME"
     }

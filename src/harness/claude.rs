@@ -14,10 +14,6 @@ use super::{
 pub struct Claude;
 
 impl Harness for Claude {
-    fn name(&self) -> &'static str {
-        "claude"
-    }
-
     fn home_env_var(&self) -> &'static str {
         "CLAUDE_CONFIG_DIR"
     }

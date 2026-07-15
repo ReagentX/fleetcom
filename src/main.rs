@@ -4,6 +4,7 @@
 //! a command in its own PTY; the dashboard groups them by status, and you can
 //! peek at, attach to, and background any of them.
 
+mod ansi;
 mod app;
 mod core;
 mod daemon;
@@ -17,7 +18,6 @@ mod golden;
 mod harness;
 mod path;
 mod protocol;
-mod serialize;
 mod session;
 mod supervisor;
 mod task;

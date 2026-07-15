@@ -276,6 +276,18 @@ pub fn decode_hello(kind: u8, payload: &[u8]) -> Option<(u32, LaunchContext)> {
     ))
 }
 
+/// Extract a claimed protocol version for mismatch reporting.
+/// Accepts hello-kind frames and control frames with a `hello` discriminant,
+/// even when the remaining fields do not satisfy [`decode_hello`].
+pub fn hello_version(kind: u8, payload: &[u8]) -> Option<u32> {
+    let v = jzon::parse(std::str::from_utf8(payload).ok()?).ok()?;
+    match kind {
+        KIND_HELLO => v["v"].as_u32(),
+        KIND_CONTROL if v["t"].as_str() == Some("hello") => v["v"].as_u32(),
+        _ => None,
+    }
+}
+
 /// Serialize a command to `(kind, payload)` for [`crate::frame::write_frame`].
 /// Every command is a jzon control frame tagged by a `"t"` discriminant.
 pub fn encode_command(cmd: &Command) -> (u8, Vec<u8>) {

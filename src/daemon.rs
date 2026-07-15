@@ -46,7 +46,7 @@ use crate::{
     frame::{MAX_FRAME, read_frame, write_frame},
     protocol::{
         Command, Event, LaunchContext, PROTOCOL_VERSION, decode_command, decode_event,
-        decode_hello, encode_command, encode_event, encode_hello,
+        decode_hello, encode_command, encode_event, encode_hello, hello_version,
     },
     supervisor::Supervisor,
 };
@@ -488,18 +488,6 @@ enum ServeOutcome {
     Disconnected,
     /// Client asked to kill everything and stop the daemon.
     Shutdown,
-}
-
-/// Extract a claimed protocol version for mismatch reporting.
-/// Accepts hello-kind frames and control frames with a `hello` discriminant,
-/// even when the remaining fields do not satisfy [`decode_hello`].
-fn hello_version(kind: u8, payload: &[u8]) -> Option<u32> {
-    let v = jzon::parse(std::str::from_utf8(payload).ok()?).ok()?;
-    match kind {
-        crate::frame::KIND_HELLO => v["v"].as_u32(),
-        crate::frame::KIND_CONTROL if v["t"].as_str() == Some("hello") => v["v"].as_u32(),
-        _ => None,
-    }
 }
 
 /// Read and validate the connection-opening hello frame.

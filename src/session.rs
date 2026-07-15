@@ -23,7 +23,7 @@ pub type SessionConfig = BTreeMap<String, Vec<SessionEntry>>;
 const DISALLOWED: &[char] = &['*', '"', '/', '\\', '<', '>', ':', '|', '?', '.'];
 
 /// Make `name` safe as a bare filename.
-pub fn sanitize(name: &str) -> String {
+fn sanitize(name: &str) -> String {
     name.trim()
         .chars()
         .map(|c| {

@@ -10,7 +10,7 @@ use crossterm::{
 };
 
 use crate::{
-    app::{App, DirKind, GroupMode, Mode, Row, scroll_window},
+    app::{App, DirKind, GroupMode, Mode, Row},
     format::{pad, rel_time, truncate},
     protocol::{Lifecycle, TaskView},
 };
@@ -652,9 +652,32 @@ fn render_attached(out: &mut impl Write, app: &App) -> io::Result<()> {
     Ok(())
 }
 
+/// Visible `(start, count)` window that includes the selected list item.
+pub fn scroll_window(sel: usize, total: usize, max: usize) -> (usize, usize) {
+    if total == 0 || max == 0 {
+        return (0, 0);
+    }
+    let count = total.min(max);
+    let start = if sel >= count { sel + 1 - count } else { 0 };
+    (start, count)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scroll_window_keeps_selection_visible() {
+        assert_eq!(scroll_window(0, 5, 8), (0, 5)); // fits, no scroll
+        assert_eq!(scroll_window(4, 5, 8), (0, 5));
+        assert_eq!(scroll_window(7, 20, 8), (0, 8)); // last row of first window
+        assert_eq!(scroll_window(8, 20, 8), (1, 8)); // scrolls one
+        assert_eq!(scroll_window(19, 20, 8), (12, 8)); // last item
+        for sel in 0..20 {
+            let (start, count) = scroll_window(sel, 20, 8);
+            assert!(sel >= start && sel < start + count, "sel {sel} off-window");
+        }
+    }
 
     /// Directory and group destinations appear only when present.
     #[test]
