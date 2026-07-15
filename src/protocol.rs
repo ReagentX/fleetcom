@@ -157,10 +157,10 @@ pub enum Lifecycle {
 }
 
 /// A read-only snapshot of one task: everything a dashboard row needs, with no
-/// handle into the live process. Time is pre-reduced to `started_ago` and
-/// `lifecycle` is pre-computed by the core (it owns the clock and the idle
-/// threshold), so nothing here depends on a process-local `Instant` that a
-/// socket peer could not interpret.
+/// handle into the live process. Time is pre-reduced to the `*_ago` durations
+/// and `lifecycle`/`parked` are pre-computed by the core (it owns the clock
+/// and both idle windows), so nothing here depends on a process-local
+/// `Instant` that a socket peer could not interpret.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TaskView {
     pub id: u64,
@@ -172,8 +172,15 @@ pub struct TaskView {
     /// Custom display name; `None` means unnamed.
     pub name: Option<String>,
     pub lifecycle: Lifecycle,
+    /// Quiet past the placement window, a much longer edge than `lifecycle`'s
+    /// idle threshold; `false` once finished.
+    pub parked: bool,
     pub preview: String,
     pub started_ago: Duration,
+    /// Time since the last PTY output; `Some` only while the task is live.
+    pub quiet_ago: Option<Duration>,
+    /// Time since the exit latched; `Some` only once the task is finished.
+    pub finished_ago: Option<Duration>,
 }
 
 /// The watched task's screen, in both forms the UI needs: `lines` for the peek
@@ -244,6 +251,24 @@ fn opt_str(v: &jzon::JsonValue) -> Option<Option<String>> {
 fn insert_opt_str(o: &mut jzon::JsonValue, key: &str, val: &Option<String>) {
     if let Some(s) = val {
         let _ = o.insert(key, s.as_str());
+    }
+}
+
+/// Decode an optional duration field carried as whole milliseconds: missing
+/// and null both mean unknown (`Some(None)`), a number is the value, and any
+/// other type rejects the message (`None`), mirroring [`opt_str`].
+fn opt_ms(v: &jzon::JsonValue) -> Option<Option<Duration>> {
+    if v.is_null() {
+        return Some(None);
+    }
+    Some(Some(Duration::from_millis(v.as_u64()?)))
+}
+
+/// Insert `key` only when the optional duration is set; absence encodes
+/// `None` on the wire (see [`opt_ms`]).
+fn insert_opt_ms(o: &mut jzon::JsonValue, key: &str, val: Option<Duration>) {
+    if let Some(d) = val {
+        let _ = o.insert(key, d.as_millis() as u64);
     }
 }
 
@@ -572,6 +597,11 @@ pub fn encode_event(ev: &Event) -> (u8, Vec<u8>) {
                 let _ = o.insert("life", lifecycle_str(tv.lifecycle));
                 let _ = o.insert("preview", tv.preview.as_str());
                 let _ = o.insert("started_ms", tv.started_ago.as_millis() as u64);
+                let _ = o.insert("parked", tv.parked);
+                // Each age exists in exactly one phase: `quiet_ms` while
+                // live, `finished_ms` once finished.
+                insert_opt_ms(&mut o, "quiet_ms", tv.quiet_ago);
+                insert_opt_ms(&mut o, "finished_ms", tv.finished_ago);
                 let _ = arr.push(o);
             }
             let mut root = jzon::JsonValue::new_object();
@@ -634,6 +664,15 @@ pub fn decode_event(kind: u8, payload: &[u8]) -> Option<Event> {
                 "tasks" => {
                     let mut views = Vec::new();
                     for tv in v["tasks"].members() {
+                        let lifecycle = lifecycle_from(tv["life"].as_str()?)?;
+                        // A frame from a daemon predating `parked` derives it
+                        // from the idle lifecycle: skew degrades to the
+                        // pre-`parked` signal, never to a dropped frame.
+                        let parked = if tv["parked"].is_null() {
+                            lifecycle == Lifecycle::Idle
+                        } else {
+                            tv["parked"].as_bool()?
+                        };
                         views.push(TaskView {
                             id: tv["id"].as_u64()?,
                             command: tv["command"].as_str()?.to_string(),
@@ -642,9 +681,13 @@ pub fn decode_event(kind: u8, payload: &[u8]) -> Option<Event> {
                             // Missing and null both mean unassigned/unnamed.
                             group: opt_str(&tv["group"])?,
                             name: opt_str(&tv["name"])?,
-                            lifecycle: lifecycle_from(tv["life"].as_str()?)?,
+                            lifecycle,
+                            parked,
                             preview: tv["preview"].as_str()?.to_string(),
                             started_ago: Duration::from_millis(tv["started_ms"].as_u64()?),
+                            // Absent from pre-`parked` daemons: unknown, not zero.
+                            quiet_ago: opt_ms(&tv["quiet_ms"])?,
+                            finished_ago: opt_ms(&tv["finished_ms"])?,
                         });
                     }
                     Some(Event::Tasks(views))
@@ -960,8 +1003,11 @@ mod tests {
                 group: Some("x".into()),
                 name: Some("editor".into()),
                 lifecycle: Lifecycle::Idle,
+                parked: false,
                 preview: "~ line".into(),
                 started_ago: Duration::from_millis(4200),
+                quiet_ago: Some(Duration::from_millis(700)),
+                finished_ago: None,
             },
             TaskView {
                 id: 2,
@@ -972,8 +1018,11 @@ mod tests {
                 group: None,
                 name: None,
                 lifecycle: Lifecycle::Active,
+                parked: false,
                 preview: String::new(),
                 started_ago: Duration::from_millis(10),
+                quiet_ago: None,
+                finished_ago: None,
             },
         ]);
         let (k, p) = encode_event(&tasks);
@@ -1044,7 +1093,7 @@ mod tests {
     #[test]
     fn tasks_frame_group_key_is_optional() {
         // "Lw==" is the base64 encoding of "/".
-        let ungrouped = r#"{"t":"tasks","tasks":[{"id":1,"command":"x","cwd":"Lw==","tagged":false,"life":"ok","preview":"","started_ms":0}]}"#;
+        let ungrouped = r#"{"t":"tasks","tasks":[{"id":1,"command":"x","cwd":"Lw==","tagged":false,"life":"ok","preview":"","started_ms":0,"parked":false}]}"#;
         match decode_event(KIND_CONTROL, ungrouped.as_bytes()) {
             Some(Event::Tasks(v)) => assert_eq!(v[0].group, None),
             other => panic!("expected tasks event, got {other:?}"),
@@ -1058,8 +1107,11 @@ mod tests {
             group: None,
             name: None,
             lifecycle: Lifecycle::Ok,
+            parked: false,
             preview: String::new(),
             started_ago: Duration::from_millis(0),
+            quiet_ago: None,
+            finished_ago: None,
         }]));
         assert_eq!(std::str::from_utf8(&p).unwrap(), ungrouped);
 
@@ -1075,7 +1127,7 @@ mod tests {
     #[test]
     fn tasks_frame_name_key_is_optional() {
         // "Lw==" is the base64 encoding of "/".
-        let unnamed = r#"{"t":"tasks","tasks":[{"id":1,"command":"x","cwd":"Lw==","tagged":false,"life":"ok","preview":"","started_ms":0}]}"#;
+        let unnamed = r#"{"t":"tasks","tasks":[{"id":1,"command":"x","cwd":"Lw==","tagged":false,"life":"ok","preview":"","started_ms":0,"parked":false}]}"#;
         match decode_event(KIND_CONTROL, unnamed.as_bytes()) {
             Some(Event::Tasks(v)) => assert_eq!(v[0].name, None),
             other => panic!("expected tasks event, got {other:?}"),
@@ -1089,14 +1141,77 @@ mod tests {
             group: None,
             name: None,
             lifecycle: Lifecycle::Ok,
+            parked: false,
             preview: String::new(),
             started_ago: Duration::from_millis(0),
+            quiet_ago: None,
+            finished_ago: None,
         }]));
         assert_eq!(std::str::from_utf8(&p).unwrap(), unnamed);
 
         let named = r#"{"t":"tasks","tasks":[{"id":1,"command":"x","cwd":"Lw==","tagged":false,"name":"build","life":"ok","preview":"","started_ms":0}]}"#;
         match decode_event(KIND_CONTROL, named.as_bytes()) {
             Some(Event::Tasks(v)) => assert_eq!(v[0].name.as_deref(), Some("build")),
+            other => panic!("expected tasks event, got {other:?}"),
+        }
+    }
+
+    /// The age keys ride the optional-key idiom: a live parked view carries
+    /// `quiet_ms` and no `finished_ms`, a finished view the reverse, and
+    /// both round-trip.
+    #[test]
+    fn parked_and_age_fields_round_trip() {
+        let tasks = Event::Tasks(vec![
+            TaskView {
+                id: 1,
+                command: "top".into(),
+                cwd: PathBuf::from("/"),
+                tagged: false,
+                group: None,
+                name: None,
+                lifecycle: Lifecycle::Idle,
+                parked: true,
+                preview: String::new(),
+                started_ago: Duration::from_millis(60_000),
+                quiet_ago: Some(Duration::from_millis(12_000)),
+                finished_ago: None,
+            },
+            TaskView {
+                id: 2,
+                command: "make".into(),
+                cwd: PathBuf::from("/"),
+                tagged: false,
+                group: None,
+                name: None,
+                lifecycle: Lifecycle::Ok,
+                parked: false,
+                preview: String::new(),
+                started_ago: Duration::from_millis(60_000),
+                quiet_ago: None,
+                finished_ago: Some(Duration::from_millis(3_000)),
+            },
+        ]);
+        let (k, p) = encode_event(&tasks);
+        let s = std::str::from_utf8(&p).unwrap();
+        assert_eq!(s.matches("\"quiet_ms\"").count(), 1, "frame was {s}");
+        assert_eq!(s.matches("\"finished_ms\"").count(), 1, "frame was {s}");
+        assert_eq!(decode_event(k, &p), Some(tasks));
+    }
+
+    /// A frame from a daemon predating `parked` still decodes: `parked`
+    /// falls back to the idle lifecycle and both ages read as unknown, so
+    /// skew degrades to the pre-`parked` signal instead of dropping the
+    /// frame.
+    #[test]
+    fn tasks_frame_without_parked_keys_decodes_with_defaults() {
+        let old = r#"{"t":"tasks","tasks":[{"id":1,"command":"x","cwd":"Lw==","tagged":false,"life":"idle","preview":"","started_ms":0},{"id":2,"command":"y","cwd":"Lw==","tagged":false,"life":"active","preview":"","started_ms":0}]}"#;
+        match decode_event(KIND_CONTROL, old.as_bytes()) {
+            Some(Event::Tasks(v)) => {
+                assert!(v[0].parked, "idle derives parked");
+                assert!(!v[1].parked, "active derives not-parked");
+                assert_eq!((v[0].quiet_ago, v[0].finished_ago), (None, None));
+                assert_eq!((v[1].quiet_ago, v[1].finished_ago), (None, None));
+            }
             other => panic!("expected tasks event, got {other:?}"),
         }
     }

@@ -665,8 +665,11 @@ mod tests {
             group: None,
             name: name.map(str::to_string),
             lifecycle: Lifecycle::Active,
+            parked: false,
             preview: String::new(),
             started_ago: std::time::Duration::from_secs(5),
+            quiet_ago: None,
+            finished_ago: None,
         }
     }
 
