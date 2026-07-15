@@ -113,7 +113,7 @@ The dashboard groups tasks by state (In use / Running / Completed), working dire
 
 ### Agent session resume
 
-Relaunching a bare `claude`, `codex`, or `grok` command starts another conversation. `fleetcom` captures the ID and stores a resuming command (`claude --resume '<id>'`, `codex resume '<id>'`, or `grok --resume '<id>'`) when saving or rerunning (`r`) a task. Only commands `fleetcom` itself authors participate: the bare program word or the canonical resume form. Anything more specific — flags, prompts, subcommands, shell syntax — runs and saves verbatim. [`agent-resume.md`](src/harness/agent-resume.md) documents the capture and rewrite mechanics.
+Relaunching a bare `claude`, `codex`, or `grok` command starts another conversation. `fleetcom` captures the ID and stores a resuming command (`claude --resume '<id>'`, `codex resume '<id>'`, or `grok --resume '<id>'`) when saving or rerunning (`r`) a task. Only the bare program word and `fleetcom`'s canonical resume form participate. Anything more specific (flags, prompts, subcommands, shell syntax) runs and saves verbatim. [`agent-resume.md`](src/harness/agent-resume.md) documents the capture and rewrite mechanics.
 
 ## Notes
 

@@ -75,8 +75,8 @@ fn normalize_group(name: Option<String>) -> Option<String> {
     normalize_label(name).filter(|g| g != "Unassigned")
 }
 
-/// Return the 64-bit FNV-1a hash used to separate capture roots. A fixed-width
-/// hex component keeps the generated directory name flat and path-safe.
+/// Return the 64-bit FNV-1a hash used to separate fallback capture roots. The
+/// fixed-width hexadecimal result is a single path-safe component.
 fn fnv1a_hex(bytes: &[u8]) -> String {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
     for &b in bytes {
@@ -104,12 +104,8 @@ pub(crate) fn current_resume_id(task: &Task) -> Option<String> {
     task.resume_id.clone()
 }
 
-/// Run one task's exit scrape now instead of at the next reap tick. Save and
-/// restart read session ids after this: one landing between process exit and
-/// the tick would otherwise read pre-exit state (spawn-time id, stale
-/// capture) and report success. Latches the exit first so the scrape's own
-/// gate can pass. A reader thread short of EOF still refuses the scrape: the
-/// window shrinks to reader-drain latency, it does not vanish.
+/// Poll for exit and scrape a fully drained terminal before save or rerun reads
+/// the session ID. A reader that has not reached EOF keeps the scrape deferred.
 fn scrape_now(t: &mut Task) {
     let _ = t.poll_exit();
     t.scrape_exit_hint();
@@ -652,10 +648,8 @@ impl Supervisor {
         let Some(h) = t.harness else {
             return t.command.clone();
         };
-        // Correlate against the store the task launched under, not the
-        // current connection's: the overrides can differ after a reconnect,
-        // and a unique in-window candidate in the wrong store correlates
-        // silently wrong.
+        // Correlate against the store selected when the task launched; a
+        // reconnect may supply a different home override.
         let id = current_resume_id(t)
             .or_else(|| h.correlate_fs(&t.cwd, t.spawned_at, t.harness_home.as_deref()));
         match id {
@@ -2368,7 +2362,7 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(dir.join("capenv")).unwrap(),
             cap.display().to_string(),
-            "the capture env must name task-<id>.json under the override root"
+            "the capture env must name task-<id>-<run>.json under the override root"
         );
         assert_eq!(
             t.command, "claude",
@@ -2494,8 +2488,8 @@ mod tests {
     }
 
     /// Restart retires the old run's capture file by construction: the
-    /// fresh run reads a per-run path, so a stale pre-drift payload — or a
-    /// lingering old process writing through its inherited env — cannot
+    /// fresh run reads a per-run path, so a stale pre-drift payload, or a
+    /// lingering old process writing through its inherited env, cannot
     /// reach the next save.
     #[test]
     fn restart_cannot_read_the_old_runs_stale_capture() {
@@ -2880,8 +2874,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A restart landing in the same window resumes the scraped session —
-    /// and the just-exited task is not refused as still running — because
+    /// A restart landing in the same window resumes the scraped session,
+    /// and the just-exited task is not refused as still running, because
     /// `restart` runs the ready-scrape itself.
     #[test]
     fn restart_scrapes_a_finished_task_without_reap() {
@@ -3046,10 +3040,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Save-time correlation reads the store the task launched under: a
-    /// reconnect with a different `CODEX_HOME` must not let a unique decoy
-    /// in the new store correlate — that match is silently wrong, worse
-    /// than no id at all.
+    /// Save-time correlation uses the task's spawn-time `CODEX_HOME`, even
+    /// after a reconnect supplies another home containing a matching rollout.
     #[test]
     fn save_correlates_against_the_spawn_time_home() {
         let dir = scratch("correlate_home");

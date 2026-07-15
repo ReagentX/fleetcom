@@ -198,10 +198,8 @@ pub struct Task {
     pub name: Option<String>,
     /// Harness selected by the supervisor for session capture.
     pub harness: Option<&'static dyn crate::harness::Harness>,
-    /// Harness home resolved from the spawn-time launch env. Later readers
-    /// (save-time correlation) must use this, never the current connection's
-    /// env: after a reconnect with a different override, a unique in-window
-    /// candidate in the wrong store correlates silently wrong.
+    /// Harness home override captured from the spawn-time environment.
+    /// Save-time correlation must not use a later connection's override.
     pub harness_home: Option<PathBuf>,
     /// Spawn generation, incremented by restart. Capture paths are keyed by
     /// task *and* run, so a fresh run never reads (or is overwritten through)

@@ -2,11 +2,9 @@
 //! conversation. A harness detects supported commands, instruments execution
 //! to capture an ID, and emits a command that resumes that ID.
 //!
-//! Detection accepts only the shapes `fleetcom` itself authors: the bare
-//! program word, or the canonical resume form (program word, fixed selector,
-//! one strict UUID, end of line). Everything else is opaque and runs and
-//! saves verbatim — if a user wants a command that specific we probably
-//! shouldn't rewrite it anyway.
+//! Detection accepts only the bare program word or the canonical resume form
+//! (program word, fixed selector, one strict UUID, end of line). Everything
+//! else is opaque and runs and saves verbatim.
 //!
 //! # Security invariant
 //!
@@ -53,8 +51,8 @@ pub trait Harness: Sync {
     /// resolves it from the launch context used for instrumentation or save.
     fn home_env_var(&self) -> &'static str;
 
-    /// Classify a command. Return `None` for another tool or any shape
-    /// `fleetcom` did not author.
+    /// Classify a command. Return `None` for another tool or an unsupported
+    /// command shape.
     fn detect(&self, cmd: &str) -> Option<Invocation>;
 
     /// Build spawn-time command and environment additions.
@@ -120,7 +118,7 @@ impl Invocation {
 /// Capture paths allocated by [`assets::CaptureAssets::paths_for`].
 #[derive(Debug, Clone)]
 pub struct CapturePaths {
-    /// File written by the injected hook or notifier.
+    /// Per-run path available to an injected hook or notifier.
     pub capture_file: PathBuf,
     /// Additive settings file passed to `claude --settings`.
     pub claude_settings: PathBuf,
@@ -148,12 +146,12 @@ const PROGRAM_WORD_REFUSALS: &[char] = &[
     '|', ';', '&', '<', '>', '$', '#', '`', '(', ')', '\\', '\'', '"', '=', '\n', '\r',
 ];
 
-/// Match `cmd` against the two shapes `fleetcom` authors for `program`: the
-/// bare program word, or program + `selector` + one strict UUID ending the
-/// line. The program word matches by basename; the UUID may be bare
+/// Match `cmd` against the two supported shapes for `program`: the bare
+/// program word, or program + `selector` + one strict UUID ending the line.
+/// The program word matches by basename; the UUID may be bare
 /// (user-typed) or in one single-quote pair (`resume_command` output).
-/// Anything else — extra flags or arguments, prompts, alternate resume
-/// spellings, shell syntax — is opaque.
+/// Anything else is opaque: extra flags or arguments, prompts, alternate
+/// resume spellings, shell syntax.
 pub(crate) fn detect_shape(cmd: &str, program: &str, selector: &str) -> Option<Invocation> {
     let mut words = cmd.split([' ', '\t']).filter(|w| !w.is_empty());
     let first = words.next()?;

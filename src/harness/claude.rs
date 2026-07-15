@@ -170,9 +170,8 @@ mod tests {
         }
     }
 
-    /// Shapes `fleetcom` did not author are opaque: no detection, no rewrite.
-    /// The pile includes shapes earlier revisions accepted — prompts, tabled
-    /// flags, `--continue`, `-r`, `--resume=` — now saved verbatim.
+    /// Prompts, flags, alternate resume forms, subcommands, and shell syntax
+    /// are opaque: they are neither detected nor rewritten.
     #[test]
     fn everything_else_is_opaque_and_never_rewritten() {
         let opaque: Vec<String> = [

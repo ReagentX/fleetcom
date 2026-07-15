@@ -1,14 +1,13 @@
 //! Hooks and notifiers need files outside the child process. This module
-//! installs those shared assets and allocates one capture path per task. The
+//! installs those shared assets and allocates one capture path per task run. The
 //! supervisor installs each root once per daemon lifetime and reuses it.
 //!
 //! Asset contracts:
 //! - `claude`: `--settings <claude-settings.json>` layers a `SessionStart` hook
-//!   (`cat > "$FLEETCOM_CAPTURE_FILE"`) over the user's settings. `claude`
-//!   sends the hook a JSON payload on stdin and runs it with the task's env,
-//!   where `fleetcom` sets [`CAPTURE_ENV`](super::CAPTURE_ENV). The hook fires
-//!   on startup, resume, clear, and compact, each time overwriting the
-//!   capture file with the current session payload.
+//!   (`cat > "$FLEETCOM_CAPTURE_FILE"`) over the user's settings. The hook
+//!   copies each JSON payload from stdin into the path named by
+//!   [`CAPTURE_ENV`](super::CAPTURE_ENV), which `fleetcom` sets in the task's
+//!   environment.
 //! - `codex`: `-c notify=["<codex-notify.sh>"]` names an executable that
 //!   `codex` invokes with notification JSON. The script writes its first
 //!   argument verbatim (no trailing newline) over `$FLEETCOM_CAPTURE_FILE`,
@@ -95,7 +94,7 @@ impl CaptureAssets {
     ///
     /// The supervisor calls this at most once per root per daemon lifetime,
     /// before allocating capture paths for that root. The initial cleanup
-    /// prevents reused task IDs from reading pre-existing payloads without
+    /// prevents a new daemon from reading pre-existing payloads without
     /// removing files allocated by this instance.
     pub fn install(root: &Path) -> io::Result<CaptureAssets> {
         fs::DirBuilder::new()
@@ -133,8 +132,7 @@ impl CaptureAssets {
     /// keyed by task *and* run: restart bumps the run, so the fresh run's
     /// reads cannot reach the old run's file, and a lingering old process
     /// (graveyard, TERM grace) writes only its own dead path through its
-    /// inherited env. Superseded files persist until the next `install`
-    /// sweep; litter per task per daemon lifetime equals its restart count.
+    /// inherited env. Superseded files persist until the next `install` sweep.
     pub fn paths_for(&self, task_id: u64, run: u32) -> CapturePaths {
         CapturePaths {
             capture_file: self.root.join(format!("task-{task_id}-{run}.json")),
@@ -218,7 +216,7 @@ mod tests {
         CaptureAssets::install(&root).unwrap();
         fs::write(root.join("task-1-0.json"), "{}").unwrap();
         fs::write(root.join("task-42-7.json"), "{}").unwrap();
-        // Pre-per-run litter from older daemons matches the same glob.
+        // The cleanup pattern also matches names without a run suffix.
         fs::write(root.join("task-9.json"), "{}").unwrap();
         fs::write(root.join("unrelated.txt"), "x").unwrap();
 
