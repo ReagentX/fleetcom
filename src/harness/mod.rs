@@ -29,6 +29,9 @@ use std::{
 
 pub use claude::Claude;
 pub use codex::Codex;
+// Test-only: `testutil::write_rollout` derives day directories from it.
+#[cfg(test)]
+pub(crate) use codex::civil_from_days;
 pub use grok::Grok;
 
 /// Environment variable naming the capture file used by injected assets.
@@ -312,11 +315,128 @@ pub(crate) fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
+/// Fixtures shared by the per-harness test modules and the supervisor's
+/// capture suite.
+#[cfg(test)]
+pub(crate) mod testutil {
+    use std::path::PathBuf;
+
+    use super::CapturePaths;
+
+    /// Strict v4 UUID used wherever a valid session ID is needed.
+    pub(crate) const ID: &str = "c8c4a5cc-0b32-4ba0-a6b4-6ed08c218e0d";
+    /// A second distinct ID for last-hint, requote, and ambiguity cases.
+    pub(crate) const OTHER: &str = "11111111-2222-4333-8444-555555555555";
+
+    /// Capture-path fixture. The spaced `claude_settings` and `codex_notify`
+    /// paths keep the shell- and TOML-quoting assertions honest.
+    pub(crate) fn paths() -> CapturePaths {
+        CapturePaths {
+            capture_file: PathBuf::from("/tmp/cap/session.json"),
+            claude_settings: PathBuf::from("/tmp/Application Support/fleetcom.json"),
+            codex_notify: PathBuf::from("/tmp/Application Support/notify.sh"),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use super::testutil::{ID, OTHER};
     use super::*;
 
-    const ID: &str = "c8c4a5cc-0b32-4ba0-a6b4-6ed08c218e0d";
+    /// Harness, program word, selector, and path prefix for the shape tests
+    /// shared by every harness. Codex's resume selector is a subcommand, not
+    /// a flag.
+    static SHAPES: [(&dyn Harness, &str, &str, &str); 3] = [
+        (&Claude, "claude", "--resume", "/usr/local/bin"),
+        (&Codex, "codex", "resume", "/opt/bin"),
+        (&Grok, "grok", "--resume", "/usr/local/bin"),
+    ];
+
+    /// Each harness accepts exactly its bare program word (plain or path
+    /// form) and its canonical resume form (bare or quoted ID).
+    #[test]
+    fn every_harness_detects_the_two_authored_shapes() {
+        for &(h, prog, sel, path) in &SHAPES {
+            assert_eq!(h.detect(prog), Some(Invocation::Bare), "{prog}");
+            assert_eq!(
+                h.detect(&format!("{path}/{prog}")),
+                Some(Invocation::Bare),
+                "{prog}"
+            );
+            for cmd in [
+                format!("{prog} {sel} {ID}"),
+                format!("{prog} {sel} '{ID}'"),
+                format!("{path}/{prog} {sel} '{ID}'"),
+            ] {
+                assert_eq!(h.detect(&cmd), Some(Invocation::Resume(ID.into())), "{cmd}");
+            }
+        }
+    }
+
+    /// Both accepted shapes regenerate the canonical resume form while
+    /// preserving the program word as typed; invalid IDs leave the command
+    /// unchanged.
+    #[test]
+    fn every_harness_regenerates_the_canonical_resume_form() {
+        for &(h, prog, sel, path) in &SHAPES {
+            let canonical = format!("{prog} {sel} '{ID}'");
+            assert_eq!(h.resume_command(prog, ID), canonical, "{prog}");
+            assert_eq!(
+                h.resume_command(&format!("{path}/{prog}"), ID),
+                format!("{path}/{prog} {sel} '{ID}'")
+            );
+            assert_eq!(
+                h.resume_command(&format!("{prog} {sel} '{OTHER}'"), ID),
+                canonical
+            );
+            assert_eq!(
+                h.resume_command(&format!("{prog} {sel} {OTHER}"), ID),
+                canonical
+            );
+            for bad in ["evil'", "not-an-id"] {
+                assert_eq!(h.resume_command(prog, bad), prog, "{prog} {bad:?}");
+            }
+        }
+    }
+
+    /// Shared shell-syntax shapes are opaque for every harness and are never
+    /// rewritten: prompts, a bare or malformed selector, `=`-joined IDs,
+    /// quoted-ID-plus-prompt, token-extending IDs, pipes, separators, env
+    /// prefixes, other tools, and the empty command. Harness-specific
+    /// opacity cases stay in each harness's own test module.
+    #[test]
+    fn every_harness_keeps_shared_shell_syntax_opaque() {
+        for &(h, prog, sel, _) in &SHAPES {
+            let opaque = [
+                format!("{prog} 'fix the tests'"),
+                format!("{prog} {sel}"),
+                format!("{prog} {sel} not-a-uuid"),
+                format!("{prog} {sel} $ID"),
+                format!("{prog} {sel}={ID}"),
+                format!("{prog} {sel} '{ID}' 'and do x'"),
+                format!("{prog} {sel} {ID}ff"),
+                format!("{prog} | tee log"),
+                format!("{prog}; ls"),
+                format!("FOO=bar {prog}"),
+                String::new(),
+            ];
+            for cmd in opaque {
+                assert_eq!(h.detect(&cmd), None, "{cmd:?} must be opaque");
+                assert_eq!(
+                    h.resume_command(&cmd, ID),
+                    cmd,
+                    "an opaque command must never be rewritten"
+                );
+            }
+            // Another tool's program word never matches.
+            for other in ["claude", "codex", "grok"] {
+                if other != prog {
+                    assert_eq!(h.detect(other), None, "{other:?} is not {prog}");
+                }
+            }
+        }
+    }
 
     #[test]
     fn is_uuid_accepts_only_the_strict_shape() {

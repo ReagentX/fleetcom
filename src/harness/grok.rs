@@ -83,73 +83,32 @@ fn encode_cwd(cwd: &Path) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, path::PathBuf};
+    use std::fs;
 
     use super::super::is_uuid;
+    use super::super::testutil::{ID, OTHER, paths};
     use super::*;
-    use crate::emulator::Emulator;
+    use crate::testutil::{corpus_emulator, temp};
 
-    const ID: &str = "c8c4a5cc-0b32-4ba0-a6b4-6ed08c218e0d";
-    const OTHER: &str = "11111111-2222-4333-8444-555555555555";
-
-    fn paths() -> CapturePaths {
-        CapturePaths {
-            capture_file: PathBuf::from("/tmp/cap/session.json"),
-            claude_settings: PathBuf::from("/tmp/cap/settings.json"),
-            codex_notify: PathBuf::from("/tmp/cap/notify.sh"),
-        }
-    }
-
-    fn temp(tag: &str) -> PathBuf {
-        let d = std::env::temp_dir().join(format!("fleetcom_grok_test_{tag}"));
-        let _ = fs::remove_dir_all(&d);
-        d
-    }
-
-    #[test]
-    fn detect_accepts_the_two_authored_shapes() {
-        assert_eq!(Grok.detect("grok"), Some(Invocation::Bare));
-        assert_eq!(Grok.detect("/usr/local/bin/grok"), Some(Invocation::Bare));
-        for cmd in [
-            format!("grok --resume {ID}"),
-            format!("grok --resume '{ID}'"),
-            format!("/usr/local/bin/grok --resume '{ID}'"),
-        ] {
-            assert_eq!(
-                Grok.detect(&cmd),
-                Some(Invocation::Resume(ID.into())),
-                "{cmd}"
-            );
-        }
-    }
-
-    /// Prompts, flags, alternate resume forms, subcommands, and shell syntax
-    /// stay opaque and are never rewritten.
+    /// Grok-specific opaque shapes: flags, the `-r`/`-s`/`=` spellings the
+    /// tool prints but detection refuses, and subcommands. The syntax shared
+    /// by every harness is covered by the table test in `harness::tests`.
     #[test]
     fn everything_else_is_opaque_and_never_rewritten() {
         let opaque: Vec<String> = [
-            "grok 'fix the tests'",
             "grok --model grok-4",
             "grok --continue",
             "grok -r",
-            "grok --resume",
-            "grok --resume not-a-uuid",
             "grok -r my-session",
             "grok sessions list",
-            "grok | tee log",
             "grokk",
-            "claude",
-            "",
         ]
         .iter()
         .map(|s| s.to_string())
         .chain([
             format!("grok -r {ID}"),
-            format!("grok --resume={ID}"),
             format!("grok -s {ID}"),
             format!("grok --resume {ID} --debug"),
-            format!("grok --resume '{ID}' 'and do x'"),
-            format!("grok --resume {ID}ff"),
         ])
         .collect();
         for cmd in opaque {
@@ -209,30 +168,6 @@ mod tests {
         assert_eq!(Grok.scrape_exit(&format!("grok -r {ID}ff")), None);
     }
 
-    /// Both accepted shapes produce the canonical resume form while preserving
-    /// the program word as typed.
-    #[test]
-    fn resume_command_regenerates_the_canonical_form() {
-        assert_eq!(
-            Grok.resume_command("grok", ID),
-            format!("grok --resume '{ID}'")
-        );
-        assert_eq!(
-            Grok.resume_command("/usr/local/bin/grok", ID),
-            format!("/usr/local/bin/grok --resume '{ID}'")
-        );
-        assert_eq!(
-            Grok.resume_command(&format!("grok --resume '{OTHER}'"), ID),
-            format!("grok --resume '{ID}'")
-        );
-        assert_eq!(
-            Grok.resume_command(&format!("grok --resume {OTHER}"), ID),
-            format!("grok --resume '{ID}'")
-        );
-        // Invalid IDs leave the command unchanged.
-        assert_eq!(Grok.resume_command("grok", "evil'"), "grok");
-    }
-
     /// Store keys encode slashes and percent signs while preserving dots.
     #[test]
     fn encode_cwd_matches_the_observed_store_names() {
@@ -251,7 +186,7 @@ mod tests {
 
     #[test]
     fn correlate_fs_requires_a_unique_in_window_session_dir() {
-        let home = temp("correlate");
+        let home = temp("grok_correlate");
         let cwd = Path::new("/work/proj.rs");
         let dir = home.join("sessions").join("%2Fwork%2Fproj.rs");
         fs::create_dir_all(dir.join(ID)).unwrap();
@@ -280,7 +215,7 @@ mod tests {
 
     #[test]
     fn correlate_fs_rejects_a_unique_non_uuid_dir() {
-        let home = temp("nonuuid");
+        let home = temp("grok_nonuuid");
         let cwd = Path::new("/w");
         let dir = home.join("sessions").join("%2Fw");
         fs::create_dir_all(dir.join("not-a-session")).unwrap();
@@ -291,7 +226,7 @@ mod tests {
     /// The scraper recovers the exit-hint ID from the corpus terminal bytes.
     #[test]
     fn corpus_scrape_recovers_the_exit_hint_id() {
-        let mut emu = Emulator::new(40, 120, 2000);
+        let mut emu = corpus_emulator();
         emu.process(include_bytes!("../../tests/corpus/grok_resume.bin"));
         assert_eq!(
             Grok.scrape_exit(&emu.text_with_history()).as_deref(),

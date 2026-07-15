@@ -4,14 +4,13 @@
 mod common;
 
 use std::{
-    io::Write,
     process::{Command, Stdio},
     time::Duration,
 };
 
-use nix::{sys::signal::kill, unistd::Pid};
+use nix::sys::signal::kill;
 
-use common::{b64, control_frame, start_daemon, wait_until};
+use common::{spawn_job, start_daemon, wait_until};
 
 #[test]
 fn kill_works_while_a_client_is_attached() {
@@ -20,26 +19,11 @@ fn kill_works_while_a_client_is_attached() {
 
     // A long-lived job that records its pid (== its pgid, via setsid).
     let pidfile = dir.join("job.pid");
-    let spawn = format!(
-        r#"{{"t":"spawn","command":"echo $$ > {pf} && sleep 300","cwd":"{cwd}"}}"#,
-        pf = pidfile.display(),
-        cwd = b64(dir.display().to_string().as_bytes())
-    );
-    stream.write_all(&control_frame(&spawn)).unwrap();
-    assert!(
-        wait_until(Duration::from_secs(5), || {
-            std::fs::read_to_string(&pidfile)
-                .map(|s| !s.trim().is_empty())
-                .unwrap_or(false)
-        }),
-        "the spawned job never wrote its pid"
-    );
-    let job = Pid::from_raw(
-        std::fs::read_to_string(&pidfile)
-            .unwrap()
-            .trim()
-            .parse::<i32>()
-            .unwrap(),
+    let job = spawn_job(
+        &mut stream,
+        &dir,
+        &pidfile,
+        &format!("echo $$ > {} && sleep 300", pidfile.display()),
     );
 
     // Keep `stream` open while `fleetcom --kill` runs.

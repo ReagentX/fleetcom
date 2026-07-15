@@ -1408,7 +1408,11 @@ fn list_dirs(base: &Path, partial: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{transport::LocalTransport, ui::scroll_window};
+    use crate::{
+        testutil::{temp, wait_until},
+        transport::LocalTransport,
+        ui::scroll_window,
+    };
 
     impl App {
         /// A synchronous App: the supervisor ticks inline on `poll`, so `send`
@@ -1639,8 +1643,7 @@ mod tests {
     #[test]
     fn custom_mode_clusters_by_dir_within_group() {
         let mut app = App::new_local(30, 100);
-        let base = std::env::temp_dir().join(format!("fleetcom_app_cg_{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&base);
+        let base = temp("app_cg");
         let (dir_a, dir_b) = (base.join("a"), base.join("b"));
         std::fs::create_dir_all(&dir_a).unwrap();
         std::fs::create_dir_all(&dir_b).unwrap();
@@ -1666,18 +1669,13 @@ mod tests {
         let mut app = App::new_local(30, 100);
         let inv = app.invocation_dir.clone();
         app.spawn_in("true", inv); // exits ~immediately
-        for _ in 0..100 {
+        wait_until(Duration::from_secs(5), || {
             app.pump();
-            let done = app
-                .views
+            app.views
                 .first()
                 .map(|v| matches!(v.lifecycle, Lifecycle::Ok | Lifecycle::Failed))
-                .unwrap_or(false);
-            if done {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(20));
-        }
+                .unwrap_or(false)
+        });
         assert!(matches!(
             app.views[0].lifecycle,
             Lifecycle::Ok | Lifecycle::Failed
@@ -1697,23 +1695,16 @@ mod tests {
     #[test]
     fn rerun_key_is_gated_to_finished_tasks() {
         let mut app = App::new_local(30, 100);
-        let dir = std::env::temp_dir().join(format!("fleetcom_app_rerun_{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = temp("app_rerun");
         let marker = dir.join("marker");
         app.spawn_in("sleep 30", dir.clone()); // id 1: stays running
         app.spawn_in(&format!("echo run >> {}", marker.display()), dir.clone()); // id 2
-        for _ in 0..200 {
+        wait_until(Duration::from_secs(5), || {
             app.pump();
-            let done = app
-                .views
+            app.views
                 .iter()
-                .any(|v| v.id == 2 && matches!(v.lifecycle, Lifecycle::Ok));
-            if done {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(20));
-        }
+                .any(|v| v.id == 2 && matches!(v.lifecycle, Lifecycle::Ok))
+        });
 
         // Running selection: `r` must send nothing (and thus kill nothing).
         app.selected_id = Some(1);
@@ -1730,16 +1721,12 @@ mod tests {
         // Finished selection: `r` reruns it under the same id.
         app.selected_id = Some(2);
         app.on_key_dashboard(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE));
-        for _ in 0..200 {
+        wait_until(Duration::from_secs(5), || {
             app.pump();
-            let reran = std::fs::read_to_string(&marker)
+            std::fs::read_to_string(&marker)
                 .map(|s| s.lines().count() == 2)
-                .unwrap_or(false);
-            if reran {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(20));
-        }
+                .unwrap_or(false)
+        });
         assert_eq!(
             std::fs::read_to_string(&marker).unwrap().lines().count(),
             2,
@@ -1754,8 +1741,7 @@ mod tests {
 
     /// Scratch config dir with the given pre-written (empty) session recipes.
     fn session_scratch(tag: &str, names: &[&str]) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("fleetcom_app_{tag}_{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir = temp(&format!("app_{tag}"));
         std::fs::create_dir_all(dir.join("sessions")).unwrap();
         for n in names {
             std::fs::write(dir.join("sessions").join(format!("{n}.json")), "{}").unwrap();
@@ -2109,10 +2095,7 @@ mod tests {
     /// Attached wheel input follows the child's DECSET 1007 state.
     #[test]
     fn attached_wheel_honors_the_childs_1007_veto() {
-        use std::time::Instant;
-        let dir = std::env::temp_dir().join(format!("fleetcom_app_1007_{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = temp("app_1007");
 
         let wheel_up = MouseEvent {
             kind: MouseEventKind::ScrollUp,
@@ -2141,21 +2124,16 @@ mod tests {
             let id = app.focused_id.expect("attached");
             app.set_watch(Some(id));
             // Wait for the child's terminal modes to reach the client.
-            let deadline = Instant::now() + Duration::from_secs(5);
-            loop {
-                app.pump();
-                if matches!(
-                    app.screen_for(id),
-                    Some(s) if s.alt_screen && s.alt_scroll != veto
-                ) {
-                    break;
-                }
-                assert!(
-                    Instant::now() < deadline,
-                    "gate state (veto: {veto}) never reached the client"
-                );
-                std::thread::sleep(Duration::from_millis(10));
-            }
+            assert!(
+                wait_until(Duration::from_secs(5), || {
+                    app.pump();
+                    matches!(
+                        app.screen_for(id),
+                        Some(s) if s.alt_screen && s.alt_scroll != veto
+                    )
+                }),
+                "gate state (veto: {veto}) never reached the client"
+            );
             // Disabled alternate scroll captures the wheel; enabled does not.
             assert_eq!(desired_mouse_capture(app.screen_for(id), false), veto);
             app.on_mouse(wheel_up);
@@ -2166,15 +2144,11 @@ mod tests {
                     bytes: b"zzz".to_vec(),
                 });
             }
-            let deadline = Instant::now() + Duration::from_secs(5);
             let mut got = Vec::new();
-            while Instant::now() < deadline {
+            wait_until(Duration::from_secs(5), || {
                 got = std::fs::read(&out).unwrap_or_default();
-                if got.len() >= take {
-                    break;
-                }
-                std::thread::sleep(Duration::from_millis(20));
-            }
+                got.len() >= take
+            });
             got
         };
 

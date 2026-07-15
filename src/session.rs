@@ -144,12 +144,7 @@ pub fn list_in(dir: &Path) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn temp(tag: &str) -> PathBuf {
-        let d = std::env::temp_dir().join(format!("fleetcom_session_test_{tag}"));
-        let _ = fs::remove_dir_all(&d);
-        d
-    }
+    use crate::testutil::temp;
 
     /// Unadorned entry: the plain-string member form.
     fn e(cmd: &str) -> SessionEntry {
@@ -189,7 +184,7 @@ mod tests {
 
     #[test]
     fn round_trips_dirs_and_commands() {
-        let dir = temp("roundtrip");
+        let dir = temp("session_roundtrip");
         let mut cfg = SessionConfig::new();
         cfg.insert("~/proj".into(), vec![e("cargo test"), e("vim")]);
         cfg.insert("/tmp".into(), vec![e("top")]);
@@ -203,7 +198,7 @@ mod tests {
     /// Mixed string and object entries survive one serialization round trip.
     #[test]
     fn round_trips_mixed_grouped_and_ungrouped_entries() {
-        let dir = temp("mixed");
+        let dir = temp("session_mixed");
         let mut cfg = SessionConfig::new();
         cfg.insert(
             "~/proj".into(),
@@ -218,7 +213,7 @@ mod tests {
     /// Every group/name combination survives serialization.
     #[test]
     fn round_trips_named_entries() {
-        let dir = temp("named");
+        let dir = temp("session_named");
         let mut cfg = SessionConfig::new();
         cfg.insert(
             "~/proj".into(),

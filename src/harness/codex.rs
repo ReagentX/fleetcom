@@ -350,7 +350,9 @@ fn line1_cwd_matches(path: &Path, cwd: &Path) -> bool {
 }
 
 /// Proleptic Gregorian date for a count of days since 1970-01-01.
-fn civil_from_days(days: i64) -> (i64, u32, u32) {
+/// `pub(crate)` for the shared rollout fixture in `testutil`; the module
+/// itself stays private, so the path runs through `harness`'s re-export.
+pub(crate) fn civil_from_days(days: i64) -> (i64, u32, u32) {
     let z = days + 719_468;
     let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
     let doe = z - era * 146_097; // [0, 146096]
@@ -366,82 +368,22 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
 mod tests {
     use std::path::PathBuf;
 
+    use super::super::testutil::{OTHER, paths};
     use super::*;
-    use crate::emulator::Emulator;
+    use crate::testutil::{corpus_emulator, temp, v7_at, write_rollout};
 
+    /// Codex's own launch and resume commands carry v7 IDs; the shared v4
+    /// fixture stays valid for detection, which is version-agnostic.
     const ID: &str = "019f5453-de22-7240-b2e5-0d32692aa6d9";
-    const OTHER: &str = "11111111-2222-4333-8444-555555555555";
 
-    fn paths() -> CapturePaths {
-        CapturePaths {
-            capture_file: PathBuf::from("/tmp/cap/session.json"),
-            claude_settings: PathBuf::from("/tmp/cap/settings.json"),
-            codex_notify: PathBuf::from("/tmp/Application Support/notify.sh"),
-        }
-    }
-
-    fn temp(tag: &str) -> PathBuf {
-        let d = std::env::temp_dir().join(format!("fleetcom_codex_test_{tag}"));
-        let _ = fs::remove_dir_all(&d);
-        d
-    }
-
-    /// A v7-shaped ID whose embedded instant is `ms`, with a fixed tail.
-    fn v7_at(ms: u64, tail: u32) -> String {
-        format!(
-            "{:08x}-{:04x}-7000-8000-0000000{:05x}",
-            ms >> 16,
-            ms & 0xffff,
-            tail
-        )
-    }
-
-    /// Write a rollout under the UTC day dir for `ms` with `cwd` in its
-    /// `session_meta` line; returns the ID.
-    fn write_rollout(home: &Path, ms: u64, tail: u32, cwd: &str) -> String {
-        let id = v7_at(ms, tail);
-        let (y, m, d) = civil_from_days((ms / 86_400_000) as i64);
-        let dir = home
-            .join("sessions")
-            .join(format!("{y:04}"))
-            .join(format!("{m:02}"))
-            .join(format!("{d:02}"));
-        fs::create_dir_all(&dir).unwrap();
-        let meta = format!(
-            r#"{{"timestamp":"x","type":"session_meta","payload":{{"id":"{id}","cwd":"{cwd}"}}}}"#
-        );
-        fs::write(
-            dir.join(format!("rollout-2026-07-13T09-00-00-{id}.jsonl")),
-            format!("{meta}\n{{}}\n"),
-        )
-        .unwrap();
-        id
-    }
-
-    #[test]
-    fn detect_accepts_the_two_authored_shapes() {
-        assert_eq!(Codex.detect("codex"), Some(Invocation::Bare));
-        assert_eq!(Codex.detect("/opt/bin/codex"), Some(Invocation::Bare));
-        for cmd in [
-            format!("codex resume {ID}"),
-            format!("codex resume '{ID}'"),
-            format!("/opt/bin/codex resume '{ID}'"),
-        ] {
-            assert_eq!(
-                Codex.detect(&cmd),
-                Some(Invocation::Resume(ID.into())),
-                "{cmd}"
-            );
-        }
-    }
-
-    /// Prompts, flags, noncanonical resume forms, subcommands, and shell syntax
-    /// stay opaque and are never rewritten.
+    /// Codex-specific opaque shapes: subcommands (including `exec` and
+    /// single-letter aliases), flags, `-c` overrides, `--resume` (the wrong
+    /// selector), and out-of-position or named resume forms. The syntax
+    /// shared by every harness is covered by the table test in
+    /// `harness::tests`.
     #[test]
     fn everything_else_is_opaque_and_never_rewritten() {
         let opaque: Vec<String> = [
-            "codex 'fix the tests'",
-            "codex resume",
             "codex resume my-thread",
             "codex resume --last",
             "codex -m gpt-5",
@@ -451,19 +393,14 @@ mod tests {
             "codex a",
             "codex -p team",
             r#"codex -c 'notify=["/my/hook"]'"#,
-            "codex; ls",
             "codex -\u{e9}x",
             "codexx",
-            "claude",
-            "",
         ]
         .iter()
         .map(|s| s.to_string())
         .chain([
             format!("codex resume {ID} -m gpt-5"),
-            format!("codex resume '{ID}' 'and do x'"),
             format!("codex -m gpt-5 resume {ID}"),
-            format!("codex resume {ID}ff"),
             format!("codex --resume {ID}"),
         ])
         .collect();
@@ -479,7 +416,7 @@ mod tests {
 
     /// Scratch home without a `config.toml`.
     fn no_config_home() -> PathBuf {
-        temp("no_config_home")
+        temp("codex_no_config_home")
     }
 
     /// Both accepted shapes receive the same notify override because Codex
@@ -514,7 +451,7 @@ mod tests {
     /// define a route, so capture runs alone.
     #[test]
     fn instrument_chains_a_config_toml_notify() {
-        let home = temp("cfg_notify");
+        let home = temp("codex_cfg_notify");
         let inv = Codex.detect("codex").unwrap();
         let chained = |plan: &SpawnPlan| {
             plan.env
@@ -523,13 +460,12 @@ mod tests {
                 .map(|(_, v)| v.clone())
         };
 
-        // Missing file (and missing home dir): plain injection, and the
-        // chain is present but empty.
+        // Missing config file: plain injection, and the chain is present but
+        // empty.
         let plan = Codex.instrument(&inv, &paths(), Some(&home));
         assert!(!plan.args_suffix.is_empty());
         assert_eq!(chained(&plan), Some("".into()));
 
-        fs::create_dir_all(&home).unwrap();
         let cfg = home.join("config.toml");
         for active in [
             "notify = [\"/my/thing\"]\n",
@@ -561,8 +497,7 @@ mod tests {
     /// The newline-joined chain preserves spaces within argv elements.
     #[test]
     fn instrument_chains_the_vendor_desktop_entry() {
-        let home = temp("vendor_notify");
-        fs::create_dir_all(&home).unwrap();
+        let home = temp("codex_vendor_notify");
         fs::write(
             home.join("config.toml"),
             "notify = [\"/Applications/Codex Computer Use.app/Contents/MacOS/SkyComputerUseClient\", \"turn-ended\"]\n",
@@ -585,8 +520,7 @@ mod tests {
     /// An unrepresentable route disables capture injection.
     #[test]
     fn instrument_skips_an_unrepresentable_config_notify() {
-        let home = temp("opaque_notify");
-        fs::create_dir_all(&home).unwrap();
+        let home = temp("codex_opaque_notify");
         let cfg = home.join("config.toml");
         let inv = Codex.detect("codex").unwrap();
         for opaque in [
@@ -747,34 +681,9 @@ mod tests {
         assert_eq!(Codex.scrape_exit(&both).as_deref(), Some(ID));
     }
 
-    /// Both accepted shapes produce the canonical resume form while preserving
-    /// the program word as typed.
-    #[test]
-    fn resume_command_regenerates_the_canonical_form() {
-        assert_eq!(
-            Codex.resume_command("codex", ID),
-            format!("codex resume '{ID}'")
-        );
-        assert_eq!(
-            Codex.resume_command("/opt/bin/codex", ID),
-            format!("/opt/bin/codex resume '{ID}'")
-        );
-        assert_eq!(
-            Codex.resume_command(&format!("codex resume '{OTHER}'"), ID),
-            format!("codex resume '{ID}'")
-        );
-        assert_eq!(
-            Codex.resume_command(&format!("codex resume {OTHER}"), ID),
-            format!("codex resume '{ID}'")
-        );
-        // Invalid IDs leave the command unchanged.
-        assert_eq!(Codex.resume_command("codex", "not-an-id"), "codex");
-    }
-
     #[test]
     fn config_notify_route_resolves_profiles() {
-        let home = temp("profile_notify");
-        fs::create_dir_all(&home).unwrap();
+        let home = temp("codex_profile_notify");
         let cfg = home.join("config.toml");
         let team = home.join("team.config.toml");
         let team_route = NotifyRoute::Chain(vec!["/team/hook".to_string()]);
@@ -821,11 +730,11 @@ mod tests {
 
     #[test]
     fn correlate_fs_requires_a_unique_cwd_matched_rollout() {
-        let home = temp("correlate");
+        let home = temp("codex_correlate");
         let spawn_ms: u64 = 1_785_000_000_000; // 2026-07-25T02:40Z
         let spawned = SystemTime::UNIX_EPOCH + std::time::Duration::from_millis(spawn_ms);
 
-        let id = write_rollout(&home, spawn_ms + 4_000, 1, "/work/proj");
+        let id = write_rollout(&home, spawn_ms + 4_000, 1, Path::new("/work/proj"));
         assert_eq!(
             Codex
                 .correlate_fs(Path::new("/work/proj"), spawned, Some(&home))
@@ -839,14 +748,14 @@ mod tests {
         );
 
         // Outside the ±30 s window: excluded.
-        write_rollout(&home, spawn_ms + 90_000, 2, "/late/proj");
+        write_rollout(&home, spawn_ms + 90_000, 2, Path::new("/late/proj"));
         assert_eq!(
             Codex.correlate_fs(Path::new("/late/proj"), spawned, Some(&home)),
             None
         );
 
         // Two in-window rollouts from the same directory are ambiguous.
-        write_rollout(&home, spawn_ms + 8_000, 3, "/work/proj");
+        write_rollout(&home, spawn_ms + 8_000, 3, Path::new("/work/proj"));
         assert_eq!(
             Codex.correlate_fs(Path::new("/work/proj"), spawned, Some(&home)),
             None
@@ -857,7 +766,7 @@ mod tests {
     /// The ±2-day probe includes a rollout in the adjacent day directory.
     #[test]
     fn correlate_fs_spans_adjacent_day_directories() {
-        let home = temp("dayspan");
+        let home = temp("codex_dayspan");
         let spawn_ms: u64 = 1_785_000_000_000;
         let spawned = SystemTime::UNIX_EPOCH + std::time::Duration::from_millis(spawn_ms);
 
@@ -899,7 +808,7 @@ mod tests {
     /// terminal emulation removes the styling.
     #[test]
     fn corpus_scrape_recovers_the_exit_hint_id() {
-        let mut emu = Emulator::new(40, 120, 2000);
+        let mut emu = corpus_emulator();
         emu.process(include_bytes!("../../tests/corpus/codex_resume.bin"));
         assert_eq!(
             Codex.scrape_exit(&emu.text_with_history()).as_deref(),

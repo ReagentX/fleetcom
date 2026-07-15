@@ -88,75 +88,28 @@ fn slug(cwd: &Path) -> Option<String> {
 mod tests {
     use std::{fs, path::PathBuf};
 
+    use super::super::testutil::{ID, OTHER, paths};
     use super::*;
-    use crate::emulator::Emulator;
+    use crate::testutil::{corpus_emulator, temp};
 
-    const ID: &str = "c8c4a5cc-0b32-4ba0-a6b4-6ed08c218e0d";
-    const OTHER: &str = "11111111-2222-4333-8444-555555555555";
-
-    fn paths() -> CapturePaths {
-        CapturePaths {
-            capture_file: PathBuf::from("/tmp/cap/session.json"),
-            claude_settings: PathBuf::from("/tmp/Application Support/fleetcom.json"),
-            codex_notify: PathBuf::from("/tmp/cap/notify.sh"),
-        }
-    }
-
-    fn temp(tag: &str) -> PathBuf {
-        let d = std::env::temp_dir().join(format!("fleetcom_claude_test_{tag}"));
-        let _ = fs::remove_dir_all(&d);
-        d
-    }
-
-    #[test]
-    fn detect_accepts_the_two_authored_shapes() {
-        assert_eq!(Claude.detect("claude"), Some(Invocation::Bare));
-        assert_eq!(
-            Claude.detect("/usr/local/bin/claude"),
-            Some(Invocation::Bare)
-        );
-        for cmd in [
-            format!("claude --resume {ID}"),
-            format!("claude --resume '{ID}'"),
-            format!("/usr/local/bin/claude --resume '{ID}'"),
-        ] {
-            assert_eq!(
-                Claude.detect(&cmd),
-                Some(Invocation::Resume(ID.into())),
-                "{cmd}"
-            );
-        }
-    }
-
-    /// Prompts, flags, alternate resume forms, subcommands, and shell syntax
-    /// stay opaque and are never rewritten.
+    /// Claude-specific opaque shapes: flags, `--continue`/`-c`, subcommands,
+    /// the short/`=` resume spellings, and `--session-id`. The syntax shared
+    /// by every harness is covered by the table test in `harness::tests`.
     #[test]
     fn everything_else_is_opaque_and_never_rewritten() {
         let opaque: Vec<String> = [
-            "claude 'fix the tests'",
             "claude --model opus",
             "claude --continue",
             "claude -c",
-            "claude --resume",
-            "claude --resume not-a-uuid",
-            "claude --resume $ID",
             "claude mcp list",
-            "claude | tee log",
-            "claude; ls",
-            "FOO=bar claude",
             "claudius",
-            "codex",
-            "",
         ]
         .iter()
         .map(|s| s.to_string())
         .chain([
             format!("claude -r {ID}"),
-            format!("claude --resume={ID}"),
             format!("claude --resume {ID} --model opus"),
-            format!("claude --resume '{ID}' 'and do x'"),
             format!("claude --session-id {ID}"),
-            format!("claude --resume {ID}ff"),
         ])
         .collect();
         for cmd in opaque {
@@ -233,33 +186,9 @@ mod tests {
         assert_eq!(Claude.scrape_exit(&format!("claude --resume {ID}ff")), None);
     }
 
-    /// Both accepted shapes produce the canonical resume form while preserving
-    /// the program word as typed.
-    #[test]
-    fn resume_command_regenerates_the_canonical_form() {
-        assert_eq!(
-            Claude.resume_command("claude", ID),
-            format!("claude --resume '{ID}'")
-        );
-        assert_eq!(
-            Claude.resume_command("/usr/local/bin/claude", ID),
-            format!("/usr/local/bin/claude --resume '{ID}'")
-        );
-        assert_eq!(
-            Claude.resume_command(&format!("claude --resume '{OTHER}'"), ID),
-            format!("claude --resume '{ID}'")
-        );
-        assert_eq!(
-            Claude.resume_command(&format!("claude --resume {OTHER}"), ID),
-            format!("claude --resume '{ID}'")
-        );
-        // Invalid IDs leave the command unchanged.
-        assert_eq!(Claude.resume_command("claude", "evil'"), "claude");
-    }
-
     #[test]
     fn correlate_fs_requires_a_unique_in_window_transcript() {
-        let home = temp("correlate");
+        let home = temp("claude_correlate");
         // Slug: `/` and `.` both become `-`.
         let cwd = Path::new("/a/b.c");
         let dir = home.join("projects").join("-a-b-c");
@@ -288,7 +217,7 @@ mod tests {
 
     #[test]
     fn correlate_fs_rejects_a_unique_non_uuid_stem() {
-        let home = temp("nonuuid");
+        let home = temp("claude_nonuuid");
         let cwd = Path::new("/w");
         let dir = home.join("projects").join("-w");
         fs::create_dir_all(&dir).unwrap();
@@ -303,7 +232,7 @@ mod tests {
     /// The scraper recovers the exit-hint ID from the corpus terminal bytes.
     #[test]
     fn corpus_scrape_recovers_the_exit_hint_id() {
-        let mut emu = Emulator::new(40, 120, 2000);
+        let mut emu = corpus_emulator();
         emu.process(include_bytes!("../../tests/corpus/claude_resume.bin"));
         assert_eq!(
             Claude.scrape_exit(&emu.text_with_history()).as_deref(),

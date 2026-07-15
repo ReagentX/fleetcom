@@ -21,6 +21,9 @@ mod protocol;
 mod session;
 mod supervisor;
 mod task;
+// Shared test scaffolds: scratch dirs, deadline polling, corpus fixtures.
+#[cfg(test)]
+mod testutil;
 mod transport;
 mod ui;
 

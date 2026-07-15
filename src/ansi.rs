@@ -405,11 +405,7 @@ mod tests {
     };
 
     use super::*;
-
-    /// Corpus fixtures were captured under a 40-row, 120-column PTY
-    /// (tests/corpus/README.md).
-    const CORPUS_LINES: usize = 40;
-    const CORPUS_COLS: usize = 120;
+    use crate::testutil::{CORPUS_COLS, CORPUS_LINES};
 
     /// Flags replay can never set: CUP-per-row emission performs no soft
     /// wraps, so wrap bookkeeping (soft-wrap marker and the spacer left when a

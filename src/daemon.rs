@@ -611,21 +611,14 @@ fn serve_client(sup: &mut Supervisor, stream: UnixStream, stop: &AtomicBool) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn temp(tag: &str) -> PathBuf {
-        let d =
-            std::env::temp_dir().join(format!("fleetcom_daemon_test_{tag}_{}", std::process::id()));
-        let _ = fs::remove_dir_all(&d);
-        fs::create_dir_all(&d).unwrap();
-        d
-    }
+    use crate::testutil::temp;
 
     /// A symlink at the runtime-dir path is the planted shared-`/tmp` attack:
     /// it must be rejected even when its target is a real directory, or the
     /// daemon (and the client's `daemon.log` create) would write through it.
     #[test]
     fn ensure_runtime_dir_rejects_symlink() {
-        let base = temp("symlink");
+        let base = temp("daemon_symlink");
         let target = base.join("target");
         fs::create_dir(&target).unwrap();
         let link = base.join("runtime");
@@ -636,7 +629,7 @@ mod tests {
 
     #[test]
     fn ensure_runtime_dir_rejects_plain_file() {
-        let base = temp("file");
+        let base = temp("daemon_file");
         let path = base.join("runtime");
         fs::write(&path, b"x").unwrap();
         assert!(ensure_runtime_dir(&path).is_err());
@@ -734,7 +727,7 @@ mod tests {
     /// steady-state daemon restart path).
     #[test]
     fn ensure_runtime_dir_creates_private_dir() {
-        let base = temp("create");
+        let base = temp("daemon_create");
         let path = base.join("runtime");
         ensure_runtime_dir(&path).unwrap();
         let mode = fs::symlink_metadata(&path).unwrap().permissions().mode();

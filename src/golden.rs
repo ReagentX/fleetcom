@@ -19,11 +19,10 @@ use alacritty_terminal::{
     vte::ansi::{Color, NamedColor, Processor, Rgb},
 };
 
-use crate::ansi;
-
-/// Corpus dimensions: 40 rows by 120 columns.
-const LINES: usize = 40;
-const COLS: usize = 120;
+use crate::{
+    ansi,
+    testutil::{CORPUS_COLS as COLS, CORPUS_LINES as LINES},
+};
 
 fn alacritty(bytes: &[u8]) -> Term<VoidListener> {
     let mut term = Term::new(Config::default(), &TermSize::new(COLS, LINES), VoidListener);

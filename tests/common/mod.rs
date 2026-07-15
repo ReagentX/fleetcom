@@ -9,8 +9,8 @@
 
 use std::{
     io::{Read, Write},
-    os::unix::net::UnixStream,
-    path::PathBuf,
+    os::unix::{ffi::OsStrExt, net::UnixStream},
+    path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     time::{Duration, Instant},
 };
@@ -120,6 +120,55 @@ pub fn wait_until(budget: Duration, mut ok: impl FnMut() -> bool) -> bool {
         std::thread::sleep(Duration::from_millis(25));
     }
     ok()
+}
+
+/// Build a spawn control frame. The command embeds as a JSON string (quotes
+/// and backslashes escaped); the working directory rides base64-encoded.
+pub fn spawn_frame(command: &str, cwd: &Path) -> Vec<u8> {
+    let cmd = command.replace('\\', "\\\\").replace('"', "\\\"");
+    control_frame(&format!(
+        r#"{{"t":"spawn","command":"{cmd}","cwd":"{}"}}"#,
+        b64(cwd.as_os_str().as_bytes())
+    ))
+}
+
+/// Spawn `command` (which must write its own `$$` to `pidfile`) and return the
+/// job's leader pid (== pgid: portable-pty `setsid`s it).
+pub fn spawn_job(
+    stream: &mut UnixStream,
+    cwd: &Path,
+    pidfile: &Path,
+    command: &str,
+) -> nix::unistd::Pid {
+    stream.write_all(&spawn_frame(command, cwd)).unwrap();
+    assert!(
+        wait_until(Duration::from_secs(5), || {
+            std::fs::read_to_string(pidfile)
+                .map(|s| !s.trim().is_empty())
+                .unwrap_or(false)
+        }),
+        "the job never wrote its pid"
+    );
+    nix::unistd::Pid::from_raw(
+        std::fs::read_to_string(pidfile)
+            .unwrap()
+            .trim()
+            .parse::<i32>()
+            .unwrap(),
+    )
+}
+
+/// Send SIGTERM and require the daemon to exit cleanly.
+pub fn stop_daemon(daemon: &mut KillOnDrop) {
+    nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(daemon.0.id() as i32),
+        nix::sys::signal::Signal::SIGTERM,
+    )
+    .unwrap();
+    let exited = wait_until(Duration::from_secs(10), || {
+        daemon.0.try_wait().map(|s| s.is_some()).unwrap_or(false)
+    });
+    assert!(exited, "daemon did not exit on SIGTERM");
 }
 
 /// Kill the daemon if the test fails before its clean shutdown, so an

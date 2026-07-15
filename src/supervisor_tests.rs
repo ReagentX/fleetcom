@@ -1,6 +1,8 @@
 use std::path::Path;
 
 use super::*;
+use crate::harness::testutil::{ID as CAP_ID, OTHER as CAP_OTHER};
+use crate::testutil::{now_ms, read_pid, wait_until, write_rollout};
 
 fn here() -> PathBuf {
     std::env::current_dir().unwrap()
@@ -153,29 +155,21 @@ fn decset_1007_flip_resends_watched_screen() {
     s.apply(Command::Watch { id: Some(id) });
 
     // Wait for the initial alternate-scroll state.
-    let deadline = Instant::now() + Duration::from_secs(5);
-    let mut open = false;
-    while Instant::now() < deadline && !open {
+    let open = wait_until(Duration::from_secs(5), || {
         s.tick();
-        open = s
-            .drain()
+        s.drain()
             .iter()
-            .any(|e| matches!(e, Event::Screen(sv) if sv.alt_screen && sv.alt_scroll));
-        std::thread::sleep(Duration::from_millis(20));
-    }
+            .any(|e| matches!(e, Event::Screen(sv) if sv.alt_screen && sv.alt_scroll))
+    });
     assert!(open, "the gate-open screen never arrived");
 
     std::fs::write(&flag, b"").unwrap();
-    let deadline = Instant::now() + Duration::from_secs(5);
-    let mut closed = false;
-    while Instant::now() < deadline && !closed {
+    let closed = wait_until(Duration::from_secs(5), || {
         s.tick();
-        closed = s
-            .drain()
+        s.drain()
             .iter()
-            .any(|e| matches!(e, Event::Screen(sv) if sv.alt_screen && !sv.alt_scroll));
-        std::thread::sleep(Duration::from_millis(20));
-    }
+            .any(|e| matches!(e, Event::Screen(sv) if sv.alt_screen && !sv.alt_scroll))
+    });
     assert!(closed, "the ?1007l flip never re-sent the screen");
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -190,9 +184,8 @@ fn tick_flushes_a_stalled_sync_update() {
         cwd: here(),
         group: None,
     });
-    let deadline = Instant::now() + Duration::from_secs(5);
     let mut preview = String::new();
-    while Instant::now() < deadline {
+    wait_until(Duration::from_secs(5), || {
         s.tick();
         for e in s.drain() {
             if let Event::Tasks(v) = e
@@ -201,11 +194,8 @@ fn tick_flushes_a_stalled_sync_update() {
                 preview = t.preview.clone();
             }
         }
-        if preview.contains("stalled") {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(25));
-    }
+        preview.contains("stalled")
+    });
     assert!(
         preview.contains("stalled"),
         "the stalled sync frame never flushed; preview: {preview:?}"
@@ -214,10 +204,7 @@ fn tick_flushes_a_stalled_sync_update() {
 
 /// Scratch dir for tests that sync through marker files.
 fn scratch(tag: &str) -> PathBuf {
-    let d = std::env::temp_dir().join(format!("fleetcom_sup_test_{tag}_{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&d);
-    std::fs::create_dir_all(&d).unwrap();
-    d
+    crate::testutil::temp(&format!("sup_{tag}"))
 }
 
 /// Spawn `command` and block until it has written `ready`: the sync that
@@ -229,13 +216,15 @@ fn spawn_ready(s: &mut Supervisor, command: String, cwd: PathBuf, ready: &Path) 
         cwd,
         group: None,
     });
-    for _ in 0..200 {
-        if ready.exists() {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(25));
-    }
-    assert!(ready.exists(), "task never signalled ready");
+    assert!(
+        wait_until(Duration::from_secs(5), || ready.exists()),
+        "task never signalled ready"
+    );
+    first_id(s)
+}
+
+/// Tick once and return the first snapshotted task's id.
+fn first_id(s: &mut Supervisor) -> u64 {
     s.tick();
     match s.drain().first() {
         Some(Event::Tasks(v)) => v[0].id,
@@ -249,19 +238,14 @@ fn wait_for_lifecycle(
     id: u64,
     pred: impl Fn(crate::protocol::Lifecycle) -> bool,
 ) {
-    for _ in 0..200 {
+    let ok = wait_until(Duration::from_secs(5), || {
         s.tick();
-        for e in s.drain() {
-            if let Event::Tasks(v) = e
-                && let Some(t) = v.iter().find(|t| t.id == id)
-                && pred(t.lifecycle)
-            {
-                return;
-            }
-        }
-        std::thread::sleep(Duration::from_millis(25));
-    }
-    panic!("task {id} never reached the expected lifecycle");
+        s.drain().iter().any(|e| {
+            matches!(e, Event::Tasks(v)
+                if v.iter().any(|t| t.id == id && pred(t.lifecycle)))
+        })
+    });
+    assert!(ok, "task {id} never reached the expected lifecycle");
 }
 
 /// `Kill` delivers SIGTERM first: a trap handler gets to run and exit
@@ -347,11 +331,7 @@ fn shutdown_survives_a_child_that_never_reads_stdin() {
         cwd: here(),
         group: None,
     });
-    s.tick();
-    let id = match s.drain().first() {
-        Some(Event::Tasks(v)) => v[0].id,
-        _ => panic!("expected a Tasks snapshot"),
-    };
+    let id = first_id(&mut s);
     // Newline-terminated input fills the canonical-mode PTY queue and
     // blocks the writer worker while the child is not reading.
     s.apply(Command::Paste {
@@ -383,11 +363,7 @@ fn overfull_writer_queue_refuses_message_with_notice() {
         cwd: here(),
         group: None,
     });
-    s.tick();
-    let id = match s.drain().first() {
-        Some(Event::Tasks(v)) => v[0].id,
-        _ => panic!("expected a Tasks snapshot"),
-    };
+    let id = first_id(&mut s);
     // Newline-terminated input keeps the worker blocked and its admitted
     // byte count pending while the child does not read.
     let big = b"x\n".repeat(4 << 20);
@@ -459,11 +435,7 @@ fn clear_watch_stops_screen_stream_and_resets_dedup() {
         cwd: here(),
         group: None,
     });
-    s.tick();
-    let id = match s.drain().first() {
-        Some(Event::Tasks(v)) => v[0].id,
-        _ => panic!("expected a Tasks snapshot"),
-    };
+    let id = first_id(&mut s);
 
     s.apply(Command::Watch { id: Some(id) });
     s.tick();
@@ -496,7 +468,7 @@ fn clear_watch_stops_screen_stream_and_resets_dedup() {
 #[test]
 fn rerun_replaces_finished_task_in_place() {
     use crate::protocol::Lifecycle;
-    let dir = scratch("restart");
+    let dir = scratch("rerun");
     let marker = dir.join("marker");
     let mut s = sup(24, 80);
     s.apply(Command::Spawn {
@@ -504,25 +476,21 @@ fn rerun_replaces_finished_task_in_place() {
         cwd: dir.clone(),
         group: None,
     });
-    s.tick();
-    let id = match s.drain().first() {
-        Some(Event::Tasks(v)) => v[0].id,
-        _ => panic!("expected a Tasks snapshot"),
-    };
+    let id = first_id(&mut s);
     s.apply(Command::Tag { id, on: true });
     wait_for_lifecycle(&mut s, id, |l| l == Lifecycle::Ok);
 
     s.apply(Command::Restart { id });
     wait_for_lifecycle(&mut s, id, |l| l == Lifecycle::Ok);
     let runs = std::fs::read_to_string(&marker).unwrap().lines().count();
-    assert_eq!(runs, 2, "restart must re-execute the command");
+    assert_eq!(runs, 2, "rerun must re-execute the command");
 
     s.tick();
     let tagged = s
         .drain()
         .iter()
         .any(|e| matches!(e, Event::Tasks(v) if v.iter().any(|t| t.id == id && t.tagged)));
-    assert!(tagged, "restart must carry the tag over");
+    assert!(tagged, "rerun must carry the tag over");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -581,11 +549,7 @@ fn set_group_round_trips_and_clears() {
         cwd: here(),
         group: None,
     });
-    s.tick();
-    let id = match s.drain().first() {
-        Some(Event::Tasks(v)) => v[0].id,
-        _ => panic!("expected a Tasks snapshot"),
-    };
+    let id = first_id(&mut s);
     let group_of = |s: &mut Supervisor| -> Option<String> {
         s.tick();
         for e in s.drain() {
@@ -626,11 +590,7 @@ fn set_name_round_trips_and_clears() {
         cwd: here(),
         group: None,
     });
-    s.tick();
-    let id = match s.drain().first() {
-        Some(Event::Tasks(v)) => v[0].id,
-        _ => panic!("expected a Tasks snapshot"),
-    };
+    let id = first_id(&mut s);
     let name_of = |s: &mut Supervisor| -> Option<String> {
         s.tick();
         for e in s.drain() {
@@ -684,7 +644,7 @@ fn spawn_carries_a_normalized_group_from_birth() {
     }
 }
 
-/// Restart preserves the task's group and tag.
+/// Rerun preserves the task's group and tag.
 #[test]
 fn rerun_carries_the_group_over() {
     use crate::protocol::Lifecycle;
@@ -694,11 +654,7 @@ fn rerun_carries_the_group_over() {
         cwd: here(),
         group: Some("infra".into()),
     });
-    s.tick();
-    let id = match s.drain().first() {
-        Some(Event::Tasks(v)) => v[0].id,
-        _ => panic!("expected a Tasks snapshot"),
-    };
+    let id = first_id(&mut s);
     wait_for_lifecycle(&mut s, id, |l| l == Lifecycle::Ok);
 
     s.apply(Command::Restart { id });
@@ -708,10 +664,10 @@ fn rerun_carries_the_group_over() {
         matches!(e, Event::Tasks(v)
                 if v.iter().any(|t| t.id == id && t.group.as_deref() == Some("infra")))
     });
-    assert!(carried, "restart must carry the group over");
+    assert!(carried, "rerun must carry the group over");
 }
 
-/// Restart preserves the task's name.
+/// Rerun preserves the task's name.
 #[test]
 fn rerun_carries_the_name_over() {
     use crate::protocol::Lifecycle;
@@ -721,11 +677,7 @@ fn rerun_carries_the_name_over() {
         cwd: here(),
         group: None,
     });
-    s.tick();
-    let id = match s.drain().first() {
-        Some(Event::Tasks(v)) => v[0].id,
-        _ => panic!("expected a Tasks snapshot"),
-    };
+    let id = first_id(&mut s);
     s.apply(Command::SetName {
         id,
         name: Some("smoke".into()),
@@ -739,7 +691,7 @@ fn rerun_carries_the_name_over() {
         matches!(e, Event::Tasks(v)
                 if v.iter().any(|t| t.id == id && t.name.as_deref() == Some("smoke")))
     });
-    assert!(carried, "restart must carry the name over");
+    assert!(carried, "rerun must carry the name over");
 }
 
 /// `Restart` never kills: a running task is refused with a status notice
@@ -753,11 +705,7 @@ fn rerun_refuses_running_task_and_unknown_id() {
         cwd: here(),
         group: None,
     });
-    s.tick();
-    let id = match s.drain().first() {
-        Some(Event::Tasks(v)) => v[0].id,
-        _ => panic!("expected a Tasks snapshot"),
-    };
+    let id = first_id(&mut s);
 
     s.apply(Command::Restart { id });
     assert!(
@@ -782,7 +730,7 @@ fn rerun_refuses_running_task_and_unknown_id() {
     );
 }
 
-/// Restarting the watched task must resend a full `Screen` on the next
+/// Rerunning the watched task must resend a full `Screen` on the next
 /// tick. Both runs of a silent command leave a byte-identical blank
 /// screen, so only the fingerprint reset makes this pass: without it the
 /// fresh screen would be skipped as "unchanged".
@@ -795,11 +743,7 @@ fn rerun_watched_task_resends_screen() {
         cwd: here(),
         group: None,
     });
-    s.tick();
-    let id = match s.drain().first() {
-        Some(Event::Tasks(v)) => v[0].id,
-        _ => panic!("expected a Tasks snapshot"),
-    };
+    let id = first_id(&mut s);
     wait_for_lifecycle(&mut s, id, |l| l == Lifecycle::Ok);
 
     s.apply(Command::Watch { id: Some(id) });
@@ -813,7 +757,7 @@ fn rerun_watched_task_resends_screen() {
     s.tick();
     assert!(
         s.drain().iter().any(|e| matches!(e, Event::Screen(_))),
-        "restart of the watched task must resend the screen"
+        "rerun of the watched task must resend the screen"
     );
 }
 
@@ -962,15 +906,10 @@ fn reap_until(
     budget: Duration,
     mut pred: impl FnMut(&mut Supervisor) -> bool,
 ) -> bool {
-    let deadline = Instant::now() + budget;
-    while Instant::now() < deadline {
+    wait_until(budget, || {
         s.reap();
-        if pred(s) {
-            return true;
-        }
-        std::thread::sleep(Duration::from_millis(20));
-    }
-    pred(s)
+        pred(s)
+    })
 }
 
 /// Use `/bin/sh` so background-process tests have consistent semantics.
@@ -979,21 +918,6 @@ fn hello_with_sh(s: &mut Supervisor, cwd: PathBuf) {
     env.retain(|(k, _)| k != "SHELL");
     env.push(("SHELL".into(), "/bin/sh".into()));
     s.set_launch_context(LaunchContext { env, cwd });
-}
-
-/// Read a pid a test job wrote, waiting for the write to land.
-fn read_pid(path: &Path) -> nix::unistd::Pid {
-    let deadline = Instant::now() + Duration::from_secs(5);
-    loop {
-        if let Some(pid) = std::fs::read_to_string(path)
-            .ok()
-            .and_then(|s| s.trim().parse::<i32>().ok())
-        {
-            return nix::unistd::Pid::from_raw(pid);
-        }
-        assert!(Instant::now() < deadline, "pid file never appeared");
-        std::thread::sleep(Duration::from_millis(10));
-    }
 }
 
 /// `Remove` must sweep group members the exited leader left behind (a
@@ -1044,7 +968,7 @@ fn remove_sweeps_stragglers_of_an_exited_leader() {
 #[test]
 fn rerun_sweeps_stragglers_of_the_old_run() {
     use nix::sys::signal::kill;
-    let dir = scratch("restart_sweep");
+    let dir = scratch("rerun_sweep");
     let (spid, ready) = (dir.join("spid"), dir.join("ready"));
     let mut s = sup(24, 80);
     hello_with_sh(&mut s, dir.clone());
@@ -1072,7 +996,7 @@ fn rerun_sweeps_stragglers_of_the_old_run() {
             None
         )
         .is_err()),
-        "restart never swept the old run's straggler"
+        "rerun never swept the old run's straggler"
     );
     // The fresh run exists under the same id; its own straggler dies with
     // the supervisor (Task::drop backstop).
@@ -1509,22 +1433,18 @@ fn launch_without_context_is_refused() {
 
 // --- session-capture wiring -------------------------------------------
 
-const CAP_ID: &str = "c8c4a5cc-0b32-4ba0-a6b4-6ed08c218e0d";
-const CAP_OTHER: &str = "11111111-2222-4333-8444-555555555555";
-
 /// Install an executable stub that records `FLEETCOM_CAPTURE_FILE` and
 /// its argv, one token per line, then exits.
 fn install_stub(bin: &Path, name: &str, out: &Path) {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::create_dir_all(bin).unwrap();
-    let script = format!(
-        "#!/bin/sh\nprintf '%s' \"$FLEETCOM_CAPTURE_FILE\" > '{out}/capenv'\n\
-             printf '%s\\n' \"$@\" > '{out}/argv'\n",
-        out = out.display()
+    install_script(
+        bin,
+        name,
+        &format!(
+            "printf '%s' \"$FLEETCOM_CAPTURE_FILE\" > '{out}/capenv'\n\
+             printf '%s\\n' \"$@\" > '{out}/argv'",
+            out = out.display()
+        ),
     );
-    let path = bin.join(name);
-    std::fs::write(&path, script).unwrap();
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
 }
 
 /// Launch context containing only the stub path, shell, and capture root.
@@ -1588,28 +1508,6 @@ fn save_and_read(s: &mut Supervisor, config: &Path, name: &str) -> String {
     s.apply(Command::SaveSession { name: name.into() });
     let _ = s.drain();
     std::fs::read_to_string(config.join("sessions").join(format!("{name}.json"))).unwrap()
-}
-
-/// Construct a v7 rollout ID for filesystem-correlation fixtures.
-fn v7_at(ms: u64, tail: u32) -> String {
-    format!(
-        "{:08x}-{:04x}-7000-8000-0000000{:05x}",
-        ms >> 16,
-        ms & 0xffff,
-        tail
-    )
-}
-
-fn civil_from_days(days: i64) -> (i64, u32, u32) {
-    let z = days + 719_468;
-    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
-    let doe = z - era * 146_097;
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
-    (yoe + era * 400 + i64::from(m <= 2), m, d)
 }
 
 /// The FNV-1a discriminator is stable and separates distinct config roots.
@@ -1761,7 +1659,7 @@ fn spawn_resuming_claude_injects_only_the_capture_channel() {
 #[test]
 fn rerun_resumes_the_captured_conversation() {
     use crate::protocol::Lifecycle;
-    let dir = scratch("cap_restart");
+    let dir = scratch("cap_rerun");
     let (bin, runtime) = (dir.join("bin"), dir.join("run"));
     install_stub(&bin, "claude", &dir);
     let mut s = Supervisor::new(24, 80);
@@ -1810,7 +1708,7 @@ fn rerun_resumes_the_captured_conversation() {
     // as bounded litter: install never deletes.
     assert!(
         cap.exists(),
-        "restart must not delete the old run's capture file"
+        "rerun must not delete the old run's capture file"
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -2192,11 +2090,10 @@ fn save_scrapes_a_finished_task_without_reap() {
 
     // Wait out only the residual reader-drain race: after EOF the sole
     // remaining gate is the exit latch, which save's own pass must flip.
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while !s.tasks[0].reader_done() && Instant::now() < deadline {
-        std::thread::sleep(Duration::from_millis(10));
-    }
-    assert!(s.tasks[0].reader_done(), "the stub never reached EOF");
+    assert!(
+        wait_until(Duration::from_secs(5), || s.tasks[0].reader_done()),
+        "the stub never reached EOF"
+    );
     assert!(s.tasks[0].finished.is_none(), "no reap may have run yet");
 
     let text = save_and_read(&mut s, &config, "syncsave");
@@ -2208,11 +2105,11 @@ fn save_scrapes_a_finished_task_without_reap() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Restarting between process exit and the next reap tick latches the exit,
+/// Rerunning between process exit and the next reap tick latches the exit,
 /// scrapes the hint, and resumes that session.
 #[test]
 fn rerun_scrapes_a_finished_task_without_reap() {
-    let dir = scratch("restart_sync_scrape");
+    let dir = scratch("rerun_sync_scrape");
     let (bin, runtime) = (dir.join("bin"), dir.join("run"));
     install_script(
         &bin,
@@ -2228,18 +2125,17 @@ fn rerun_scrapes_a_finished_task_without_reap() {
     });
     let id = s.tasks[0].id;
 
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while !s.tasks[0].reader_done() && Instant::now() < deadline {
-        std::thread::sleep(Duration::from_millis(10));
-    }
-    assert!(s.tasks[0].reader_done(), "the stub never reached EOF");
+    assert!(
+        wait_until(Duration::from_secs(5), || s.tasks[0].reader_done()),
+        "the stub never reached EOF"
+    );
     assert!(s.tasks[0].finished.is_none(), "no reap may have run yet");
 
     s.apply(Command::Restart { id });
     assert_eq!(
         s.tasks[0].command,
         format!("claude --resume '{CAP_ID}'"),
-        "restart must compute its resume command from the exit scrape"
+        "rerun must compute its resume command from the exit scrape"
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -2320,26 +2216,8 @@ fn save_falls_back_to_fs_correlation_for_a_silent_codex() {
     let codex_home = dir.join("codex_home");
     install_stub(&bin, "codex", &dir);
     // Create a rollout with a current v7 instant and the task's cwd.
-    let now_ms = std::time::SystemTime::now()
-        .duration_since(std::time::SystemTime::UNIX_EPOCH)
-        .unwrap()
-        .as_millis() as u64;
-    let id = v7_at(now_ms, 1);
-    let (y, m, d) = civil_from_days((now_ms / 86_400_000) as i64);
-    let day = codex_home
-        .join("sessions")
-        .join(format!("{y:04}"))
-        .join(format!("{m:02}"))
-        .join(format!("{d:02}"));
-    std::fs::create_dir_all(&day).unwrap();
-    std::fs::write(
-        day.join(format!("rollout-2026-07-14T09-00-00-{id}.jsonl")),
-        format!(
-            r#"{{"timestamp":"x","type":"session_meta","payload":{{"id":"{id}","cwd":"{}"}}}}"#,
-            dir.display()
-        ),
-    )
-    .unwrap();
+    let now_ms = now_ms();
+    let id = write_rollout(&codex_home, now_ms, 1, &dir);
 
     let mut s = Supervisor::new(24, 80);
     s.set_launch_context(agent_ctx_plus(
@@ -2381,31 +2259,10 @@ fn save_correlates_against_the_spawn_time_home() {
     let (bin, runtime, config) = (dir.join("bin"), dir.join("run"), dir.join("config"));
     let (home_a, home_b) = (dir.join("codex_a"), dir.join("codex_b"));
     install_stub(&bin, "codex", &dir);
-    let now_ms = std::time::SystemTime::now()
-        .duration_since(std::time::SystemTime::UNIX_EPOCH)
-        .unwrap()
-        .as_millis() as u64;
-    let (y, m, d) = civil_from_days((now_ms / 86_400_000) as i64);
+    let now_ms = now_ms();
     // One unique in-window rollout per store, both naming the task cwd.
-    let rollout = |home: &Path, id: &str| {
-        let day = home
-            .join("sessions")
-            .join(format!("{y:04}"))
-            .join(format!("{m:02}"))
-            .join(format!("{d:02}"));
-        std::fs::create_dir_all(&day).unwrap();
-        std::fs::write(
-            day.join(format!("rollout-2026-07-14T09-00-00-{id}.jsonl")),
-            format!(
-                r#"{{"timestamp":"x","type":"session_meta","payload":{{"id":"{id}","cwd":"{}"}}}}"#,
-                dir.display()
-            ),
-        )
-        .unwrap();
-    };
-    let (id_a, id_b) = (v7_at(now_ms, 1), v7_at(now_ms, 2));
-    rollout(&home_a, &id_a);
-    rollout(&home_b, &id_b);
+    let id_a = write_rollout(&home_a, now_ms, 1, &dir);
+    let id_b = write_rollout(&home_b, now_ms, 2, &dir);
 
     let mut s = Supervisor::new(24, 80);
     s.set_launch_context(agent_ctx_plus(
@@ -2491,26 +2348,8 @@ fn home_only_launch_env_targets_the_clients_dot_codex() {
     install_stub(&bin, "codex", &dir);
     // A unique in-window rollout in the same tree for save-time
     // correlation: with injection suppressed, no capture channel fires.
-    let now_ms = std::time::SystemTime::now()
-        .duration_since(std::time::SystemTime::UNIX_EPOCH)
-        .unwrap()
-        .as_millis() as u64;
-    let id = v7_at(now_ms, 1);
-    let (y, m, d) = civil_from_days((now_ms / 86_400_000) as i64);
-    let day = codex_home
-        .join("sessions")
-        .join(format!("{y:04}"))
-        .join(format!("{m:02}"))
-        .join(format!("{d:02}"));
-    std::fs::create_dir_all(&day).unwrap();
-    std::fs::write(
-        day.join(format!("rollout-2026-07-14T09-00-00-{id}.jsonl")),
-        format!(
-            r#"{{"timestamp":"x","type":"session_meta","payload":{{"id":"{id}","cwd":"{}"}}}}"#,
-            dir.display()
-        ),
-    )
-    .unwrap();
+    let now_ms = now_ms();
+    let id = write_rollout(&codex_home, now_ms, 1, &dir);
 
     let mut s = Supervisor::new(24, 80);
     s.set_launch_context(agent_ctx_plus(
