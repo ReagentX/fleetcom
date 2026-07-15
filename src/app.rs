@@ -504,6 +504,8 @@ impl App {
         }
     }
 
+    /// Move the selection one task up in display order; up from the first
+    /// task wraps to the last.
     fn select_up(&mut self) {
         let order = self.display_order();
         if order.is_empty() {
@@ -511,9 +513,11 @@ impl App {
             return;
         }
         let pos = self.selected_pos(&order).unwrap_or(0);
-        self.selected_id = Some(self.views[order[pos.saturating_sub(1)]].id);
+        self.selected_id = Some(self.views[order[(pos + order.len() - 1) % order.len()]].id);
     }
 
+    /// Move the selection one task down in display order; down from the last
+    /// task wraps to the first.
     fn select_down(&mut self) {
         let order = self.display_order();
         if order.is_empty() {
@@ -521,7 +525,7 @@ impl App {
             return;
         }
         let pos = self.selected_pos(&order).unwrap_or(0);
-        let next = (pos + 1).min(order.len() - 1);
+        let next = (pos + 1) % order.len();
         self.selected_id = Some(self.views[order[next]].id);
     }
 
@@ -2054,6 +2058,61 @@ mod tests {
                 "step {step}: row {sel} outside window ({start}, {count})"
             );
         }
+    }
+
+    /// Selection wraps at the list edges: up from the first task lands on the
+    /// last and down from the last lands on the first, across the section
+    /// boundary — `display_order` is flat, so headers never trap the cursor.
+    #[test]
+    fn selection_wraps_at_list_edges() {
+        let mut app = App::new_local(30, 100);
+        let inv = app.invocation_dir.clone();
+        app.spawn_in("sleep 5", inv.clone()); // id 1
+        app.spawn_in("sleep 5", inv.clone()); // id 2
+        app.spawn_in("sleep 5", inv); // id 3
+        app.pump();
+
+        // Tag id 2 -> it sorts into a leading "In use" section, so the wrap
+        // below crosses a section boundary.
+        app.transport.send(Command::Tag { id: 2, on: true });
+        app.pump();
+        app.resolve_selection();
+        assert_eq!(app.section_ids().len(), 2, "tag splits the list in two");
+
+        let order = app.display_order();
+        let first = app.views[order[0]].id;
+        let last = app.views[*order.last().unwrap()].id;
+        assert_eq!(first, 2, "tagged task sorts first");
+        assert_eq!(app.selected_id, Some(first));
+
+        app.select_up();
+        assert_eq!(
+            app.selected_id,
+            Some(last),
+            "up from the first wraps to the last"
+        );
+        app.select_down();
+        assert_eq!(
+            app.selected_id,
+            Some(first),
+            "down from the last wraps to the first"
+        );
+    }
+
+    /// With a single task, wrap degrades to a no-op in both directions.
+    #[test]
+    fn selection_wrap_is_noop_with_one_task() {
+        let mut app = App::new_local(30, 100);
+        let inv = app.invocation_dir.clone();
+        app.spawn_in("sleep 5", inv);
+        app.pump();
+        app.resolve_selection();
+        assert_eq!(app.selected_id, Some(1));
+
+        app.select_up();
+        assert_eq!(app.selected_id, Some(1));
+        app.select_down();
+        assert_eq!(app.selected_id, Some(1));
     }
 
     /// Modified Enter must stay distinguishable on the wire: `\x1b\r` (the
