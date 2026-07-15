@@ -104,6 +104,17 @@ pub(crate) fn current_resume_id(task: &Task) -> Option<String> {
     task.resume_id.clone()
 }
 
+/// Run one task's exit scrape now instead of at the next reap tick. Save and
+/// restart read session ids after this: one landing between process exit and
+/// the tick would otherwise read pre-exit state (spawn-time id, stale
+/// capture) and report success. Latches the exit first so the scrape's own
+/// gate can pass. A reader thread short of EOF still refuses the scrape: the
+/// window shrinks to reader-drain latency, it does not vanish.
+fn scrape_now(t: &mut Task) {
+    let _ = t.poll_exit();
+    t.scrape_exit_hint();
+}
+
 /// Resolve the harness home from the provided launch environment.
 fn home_override(env: &[(OsString, OsString)], h: &dyn harness::Harness) -> Option<PathBuf> {
     env.iter()
@@ -490,12 +501,13 @@ impl Supervisor {
     fn spawn_task(
         &mut self,
         id: u64,
+        run: u32,
         command: &str,
         cwd: &Path,
         env: &[(OsString, OsString)],
     ) -> io::Result<Task> {
         if let Some((h, inv)) = harness::detect(command) {
-            let paths = self.ensure_capture_assets().map(|a| a.paths_for(id));
+            let paths = self.ensure_capture_assets().map(|a| a.paths_for(id, run));
             if let Some(paths) = paths {
                 let home = home_override(env, h);
                 let plan = h.instrument(&inv, &paths, home.as_deref());
@@ -513,12 +525,15 @@ impl Supervisor {
                     Arc::clone(&self.waker),
                 )?;
                 task.harness = Some(h);
+                // The home this task launched under, for every later read.
+                task.harness_home = home;
                 task.capture_file = Some(paths.capture_file);
                 task.resume_id = plan.injected_id.or_else(|| inv.known_id());
+                task.run = run;
                 return Ok(task);
             }
         }
-        Task::spawn(
+        let mut task = Task::spawn(
             id,
             command,
             command,
@@ -527,7 +542,9 @@ impl Supervisor {
             self.cols,
             env,
             Arc::clone(&self.waker),
-        )
+        )?;
+        task.run = run;
+        Ok(task)
     }
 
     fn spawn(&mut self, command: &str, cwd: PathBuf, group: Option<String>) {
@@ -540,7 +557,7 @@ impl Supervisor {
         let Some(launch) = self.launch_or_refuse() else {
             return;
         };
-        match self.spawn_task(self.next_id, command, &cwd, &launch.env) {
+        match self.spawn_task(self.next_id, 0, command, &cwd, &launch.env) {
             Ok(mut task) => {
                 task.group = group;
                 self.next_id += 1;
@@ -560,6 +577,11 @@ impl Supervisor {
                 .push(Event::Status(format!("rerun: no task {id}")));
             return;
         };
+        // The resume command below reads the exit scrape; give the task its
+        // chance now rather than at the next reap tick. Also latches an exit
+        // reap hasn't seen, so a just-finished task reruns instead of being
+        // refused as still running.
+        scrape_now(&mut self.tasks[i]);
         if self.tasks[i].finished.is_none() {
             self.events
                 .push(Event::Status("rerun: task is still running".into()));
@@ -578,7 +600,11 @@ impl Supervisor {
             (command, old.cwd.clone())
         };
         // Preserve the finished task if its replacement cannot start.
-        match self.spawn_task(id, &command, &cwd, &launch.env) {
+        // The bumped run gives the replacement its own capture file: the old
+        // run's stale payload is unreachable, and the displaced process still
+        // winding down in the graveyard writes only its own dead file.
+        let run = self.tasks[i].run + 1;
+        match self.spawn_task(id, run, &command, &cwd, &launch.env) {
             Ok(mut fresh) => {
                 fresh.tagged = self.tasks[i].tagged;
                 fresh.group = self.tasks[i].group.clone();
@@ -626,13 +652,12 @@ impl Supervisor {
         let Some(h) = t.harness else {
             return t.command.clone();
         };
-        let id = current_resume_id(t).or_else(|| {
-            let home = self
-                .launch
-                .as_ref()
-                .and_then(|ctx| home_override(&ctx.env, h));
-            h.correlate_fs(&t.cwd, t.spawned_at, home.as_deref())
-        });
+        // Correlate against the store the task launched under, not the
+        // current connection's: the overrides can differ after a reconnect,
+        // and a unique in-window candidate in the wrong store correlates
+        // silently wrong.
+        let id = current_resume_id(t)
+            .or_else(|| h.correlate_fs(&t.cwd, t.spawned_at, t.harness_home.as_deref()));
         match id {
             Some(id) => h.resume_command(&t.command, &id),
             None => t.command.clone(),
@@ -657,6 +682,11 @@ impl Supervisor {
     }
 
     fn save_session(&mut self, name: &str) {
+        // `session_config` reads ids through `&self`; give finished tasks
+        // their exit scrape first (see `scrape_now`).
+        for t in &mut self.tasks {
+            scrape_now(t);
+        }
         let cfg = self.session_config();
         let count: usize = cfg.values().map(Vec::len).sum();
         let status = match self
@@ -711,7 +741,7 @@ impl Supervisor {
                     continue;
                 }
                 if let Ok(mut task) =
-                    self.spawn_task(self.next_id, &entry.cmd, &resolved, &launch.env)
+                    self.spawn_task(self.next_id, 0, &entry.cmd, &resolved, &launch.env)
                 {
                     // Normalize persisted labels before assigning them.
                     task.group = normalize_group(entry.group.clone());
@@ -2333,7 +2363,7 @@ mod tests {
         );
 
         let t = &s.tasks[0];
-        let cap = runtime.join(format!("task-{}.json", t.id));
+        let cap = runtime.join(format!("task-{}-0.json", t.id));
         // An explicit runtime directory is used without a discriminator.
         assert_eq!(
             std::fs::read_to_string(dir.join("capenv")).unwrap(),
@@ -2450,15 +2480,76 @@ mod tests {
             !argv.iter().any(|a| a == "--session-id"),
             "re-detection classifies the respawn as resuming: no second id"
         );
-        // Rerun retains the capture path while the displaced task is reaped.
         assert!(
             reap_until(&mut s, Duration::from_secs(5), |s| s.graveyard.is_empty()),
             "the displaced run was never collected"
         );
+        // The old run's file is unreachable from the fresh run and survives
+        // as bounded litter until the next install sweep.
         assert!(
             cap.exists(),
-            "restart must not delete the live capture file"
+            "restart must not delete the old run's capture file"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Restart retires the old run's capture file by construction: the
+    /// fresh run reads a per-run path, so a stale pre-drift payload — or a
+    /// lingering old process writing through its inherited env — cannot
+    /// reach the next save.
+    #[test]
+    fn restart_cannot_read_the_old_runs_stale_capture() {
+        let dir = scratch("cap_stale_run");
+        let (bin, runtime, config) = (dir.join("bin"), dir.join("run"), dir.join("config"));
+        // The session drifts to CAP_ID mid-run and the exit hint reports it.
+        install_script(
+            &bin,
+            "claude",
+            &format!("printf 'Resume this session with:\\nclaude --resume {CAP_ID}\\n'"),
+        );
+        let mut s = Supervisor::new(24, 80);
+        s.set_launch_context(agent_ctx_plus(
+            &bin,
+            &runtime,
+            dir.clone(),
+            &[("FLEETCOM_CONFIG_DIR", &config)],
+        ));
+        s.apply(Command::Spawn {
+            command: "claude".into(),
+            cwd: dir.clone(),
+            group: None,
+        });
+        let id = s.tasks[0].id;
+        // The capture file still holds the pre-drift session.
+        let stale = format!(
+            r#"{{"session_id":"{CAP_OTHER}","hook_event_name":"SessionStart","source":"startup"}}"#
+        );
+        let old_cap = s.tasks[0].capture_file.clone().expect("capture file set");
+        std::fs::write(&old_cap, &stale).unwrap();
+        assert!(reap_until(&mut s, Duration::from_secs(5), |s| s.tasks[0]
+            .scraped_id
+            .is_some()));
+        assert_eq!(s.tasks[0].scraped_id.as_deref(), Some(CAP_ID));
+
+        s.apply(Command::Restart { id });
+        let new_cap = s.tasks[0].capture_file.clone().expect("capture file set");
+        assert_ne!(new_cap, old_cap, "the fresh run needs its own capture file");
+        assert_eq!(s.tasks[0].command, format!("claude --resume '{CAP_ID}'"));
+
+        // A lingering old-run write lands only in the dead file: a save
+        // right after the restart must not resurrect the stale session.
+        std::fs::write(&old_cap, &stale).unwrap();
+        let text = save_and_read(&mut s, &config, "stalecap");
+        assert!(
+            text.contains(&format!("claude --resume '{CAP_ID}'")),
+            "the fresh run must save the drifted session; got {text}"
+        );
+        assert!(
+            !text.contains(CAP_OTHER),
+            "the old run's stale capture must be unreachable; got {text}"
+        );
+        // Bounded litter: the superseded file waits for the install sweep.
+        assert!(old_cap.exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2591,7 +2682,7 @@ mod tests {
             cwd: dir.clone(),
             group: None,
         });
-        let decoy = root_b.join(format!("task-{id}.json"));
+        let decoy = root_b.join(format!("task-{id}-0.json"));
         std::fs::write(&decoy, "{}").unwrap();
 
         s.apply(Command::Remove { id });
@@ -2745,6 +2836,87 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A save landing between process exit and the next reap tick still
+    /// carries the scraped id: `save_session` runs the ready-scrape itself.
+    /// No reap runs here, so only that pass can have latched the exit and
+    /// scraped the hint.
+    #[test]
+    fn save_scrapes_a_finished_task_without_reap() {
+        let dir = scratch("save_sync_scrape");
+        let (bin, runtime, config) = (dir.join("bin"), dir.join("run"), dir.join("config"));
+        install_script(
+            &bin,
+            "claude",
+            &format!("printf 'Resume this session with:\\nclaude --resume {CAP_ID}\\n'"),
+        );
+        let mut s = Supervisor::new(24, 80);
+        s.set_launch_context(agent_ctx_plus(
+            &bin,
+            &runtime,
+            dir.clone(),
+            &[("FLEETCOM_CONFIG_DIR", &config)],
+        ));
+        s.apply(Command::Spawn {
+            command: "claude".into(),
+            cwd: dir.clone(),
+            group: None,
+        });
+
+        // Wait out only the residual reader-drain race: after EOF the sole
+        // remaining gate is the exit latch, which save's own pass must flip.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !s.tasks[0].reader_done() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(s.tasks[0].reader_done(), "the stub never reached EOF");
+        assert!(s.tasks[0].finished.is_none(), "no reap may have run yet");
+
+        let text = save_and_read(&mut s, &config, "syncsave");
+        assert!(
+            text.contains(&format!("claude --resume '{CAP_ID}'")),
+            "save must scrape the finished task itself; got {text}"
+        );
+        assert_eq!(s.tasks[0].scraped_id.as_deref(), Some(CAP_ID));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A restart landing in the same window resumes the scraped session —
+    /// and the just-exited task is not refused as still running — because
+    /// `restart` runs the ready-scrape itself.
+    #[test]
+    fn restart_scrapes_a_finished_task_without_reap() {
+        let dir = scratch("restart_sync_scrape");
+        let (bin, runtime) = (dir.join("bin"), dir.join("run"));
+        install_script(
+            &bin,
+            "claude",
+            &format!("printf 'Resume this session with:\\nclaude --resume {CAP_ID}\\n'"),
+        );
+        let mut s = Supervisor::new(24, 80);
+        s.set_launch_context(agent_ctx(&bin, &runtime, dir.clone()));
+        s.apply(Command::Spawn {
+            command: "claude".into(),
+            cwd: dir.clone(),
+            group: None,
+        });
+        let id = s.tasks[0].id;
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !s.tasks[0].reader_done() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(s.tasks[0].reader_done(), "the stub never reached EOF");
+        assert!(s.tasks[0].finished.is_none(), "no reap may have run yet");
+
+        s.apply(Command::Restart { id });
+        assert_eq!(
+            s.tasks[0].command,
+            format!("claude --resume '{CAP_ID}'"),
+            "restart must compute its resume command from the exit scrape"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Session-ID precedence is exit scrape, capture file, then spawn-time ID.
     #[test]
     fn resume_id_precedence_scrape_over_capture_over_spawn() {
@@ -2870,6 +3042,77 @@ mod tests {
         assert!(
             text.contains(&format!("codex resume '{id}'")),
             "save must fall back to filesystem correlation; got {text}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Save-time correlation reads the store the task launched under: a
+    /// reconnect with a different `CODEX_HOME` must not let a unique decoy
+    /// in the new store correlate — that match is silently wrong, worse
+    /// than no id at all.
+    #[test]
+    fn save_correlates_against_the_spawn_time_home() {
+        let dir = scratch("correlate_home");
+        let (bin, runtime, config) = (dir.join("bin"), dir.join("run"), dir.join("config"));
+        let (home_a, home_b) = (dir.join("codex_a"), dir.join("codex_b"));
+        install_stub(&bin, "codex", &dir);
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let (y, m, d) = civil_from_days((now_ms / 86_400_000) as i64);
+        // One unique in-window rollout per store, both naming the task cwd.
+        let rollout = |home: &Path, id: &str| {
+            let day = home
+                .join("sessions")
+                .join(format!("{y:04}"))
+                .join(format!("{m:02}"))
+                .join(format!("{d:02}"));
+            std::fs::create_dir_all(&day).unwrap();
+            std::fs::write(
+                day.join(format!("rollout-2026-07-14T09-00-00-{id}.jsonl")),
+                format!(
+                    r#"{{"timestamp":"x","type":"session_meta","payload":{{"id":"{id}","cwd":"{}"}}}}"#,
+                    dir.display()
+                ),
+            )
+            .unwrap();
+        };
+        let (id_a, id_b) = (v7_at(now_ms, 1), v7_at(now_ms, 2));
+        rollout(&home_a, &id_a);
+        rollout(&home_b, &id_b);
+
+        let mut s = Supervisor::new(24, 80);
+        s.set_launch_context(agent_ctx_plus(
+            &bin,
+            &runtime,
+            dir.clone(),
+            &[("FLEETCOM_CONFIG_DIR", &config), ("CODEX_HOME", &home_a)],
+        ));
+        s.apply(Command::Spawn {
+            command: "codex".into(),
+            cwd: dir.clone(),
+            group: None,
+        });
+        assert!(reap_until(&mut s, Duration::from_secs(5), |s| s.tasks[0]
+            .finished
+            .is_some()));
+
+        // Reconnect under home B, then save.
+        s.set_launch_context(agent_ctx_plus(
+            &bin,
+            &runtime,
+            dir.clone(),
+            &[("FLEETCOM_CONFIG_DIR", &config), ("CODEX_HOME", &home_b)],
+        ));
+        let text = save_and_read(&mut s, &config, "homepin");
+        assert!(
+            text.contains(&format!("codex resume '{id_a}'")),
+            "the recipe must resolve from the launch-time store; got {text}"
+        );
+        assert!(
+            !text.contains(&id_b),
+            "the reconnect store's decoy must not correlate; got {text}"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -8,7 +8,7 @@ use std::{
     io::Write,
     os::unix::{ffi::OsStrExt, fs::PermissionsExt, net::UnixStream},
     path::{Path, PathBuf},
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use common::{
@@ -208,37 +208,36 @@ fn spawn_frame(command: &str, cwd: &Path) -> Vec<u8> {
     ))
 }
 
-/// Repeat `save` until the persisted recipe contains `needle`. Exit scraping
-/// can produce an ID only after process exit and reader EOF, so an earlier
-/// save can legitimately retain the original command.
-fn save_until(stream: &mut UnixStream, recipe: &Path, name: &str, needle: &str) -> String {
-    let deadline = Instant::now() + Duration::from_secs(10);
-    loop {
-        stream
-            .write_all(&control_frame(&format!(
-                r#"{{"t":"save","name":"{name}"}}"#
-            )))
-            .unwrap();
-        let mut text = String::new();
-        let found = wait_until(
-            Duration::from_millis(250),
-            || match std::fs::read_to_string(recipe) {
-                Ok(s) if s.contains(needle) => {
-                    text = s;
-                    true
-                }
-                _ => false,
-            },
-        );
-        if found {
-            return text;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "recipe never became resuming; wanted {needle:?}, recipe holds {:?}",
-            std::fs::read_to_string(recipe)
-        );
-    }
+/// Send one save and return the persisted recipe. One save, no poll loop:
+/// the daemon scrapes finished tasks before reading ids, and each caller
+/// waits for its id channel (the spawn-time pin or the capture file) before
+/// saving, so a single save must already persist the resuming form.
+fn save_once(stream: &mut UnixStream, recipe: &Path, name: &str) -> String {
+    stream
+        .write_all(&control_frame(&format!(
+            r#"{{"t":"save","name":"{name}"}}"#
+        )))
+        .unwrap();
+    let ok = wait_until(Duration::from_secs(10), || {
+        std::fs::read_to_string(recipe).is_ok_and(|s| !s.is_empty())
+    });
+    assert!(ok, "recipe {} never landed", recipe.display());
+    std::fs::read_to_string(recipe).unwrap()
+}
+
+/// Whether the runtime root holds a non-empty per-run capture file.
+fn has_capture(runtime: &Path) -> bool {
+    std::fs::read_dir(runtime).is_ok_and(|entries| {
+        entries.flatten().any(|e| {
+            let name = e.file_name();
+            let Some(n) = name.to_str() else {
+                return false;
+            };
+            n.starts_with("task-")
+                && n.ends_with(".json")
+                && e.metadata().is_ok_and(|m| m.len() > 0)
+        })
+    })
 }
 
 /// Send SIGTERM and require the daemon to exit cleanly.
@@ -282,8 +281,12 @@ fn claude_spawn_save_load_resumes_the_conversation() {
         "the runtime root must hold the installed settings overlay"
     );
 
-    let want = format!("claude --resume '{id}'");
-    let recipe = save_until(&mut stream, &s.recipe("story"), "story", &want);
+    // The pinned id rides `resume_id` from spawn: one save suffices.
+    let recipe = save_once(&mut stream, &s.recipe("story"), "story");
+    assert!(
+        recipe.contains(&format!("claude --resume '{id}'")),
+        "the recipe must resume the pinned id: {recipe}"
+    );
     assert!(
         !recipe.contains("--settings") && !recipe.contains("--session-id"),
         "instrumentation must never leak into the recipe: {recipe}"
@@ -334,10 +337,15 @@ fn codex_capture_file_drives_save_and_load_resumes() {
         "spawn must route notify at the installed script: {argv:?}"
     );
 
-    // The stub exits silently, so the capture file is the only id channel
-    // and it exists only after the child has run: save must be re-polled.
-    let want = format!("codex resume '{CODEX_ID}'");
-    save_until(&mut stream, &s.recipe("story"), "story", &want);
+    // The stub exits silently, so its capture write is the only id channel;
+    // wait for the file, then a single save must persist the resuming form.
+    let ok = wait_until(Duration::from_secs(10), || has_capture(&s.runtime()));
+    assert!(ok, "the codex stub never wrote its capture file");
+    let recipe = save_once(&mut stream, &s.recipe("story"), "story");
+    assert!(
+        recipe.contains(&format!("codex resume '{CODEX_ID}'")),
+        "the recipe must resume the captured thread: {recipe}"
+    );
 
     stream
         .write_all(&control_frame(r#"{"t":"load","name":"story"}"#))
@@ -375,11 +383,10 @@ fn saved_recipe_resumes_across_a_daemon_restart() {
         .unwrap();
     let argv = wait_run(&rec, 0, |a| a.iter().any(|t| t == "--session-id"));
     let id = value_after(&argv, "--session-id").to_string();
-    save_until(
-        &mut stream_a,
-        &s.recipe("overnight"),
-        "overnight",
-        &format!("claude --resume '{id}'"),
+    let recipe = save_once(&mut stream_a, &s.recipe("overnight"), "overnight");
+    assert!(
+        recipe.contains(&format!("claude --resume '{id}'")),
+        "the recipe must resume the pinned id: {recipe}"
     );
     stop_daemon(&mut daemon_a);
     drop(stream_a);

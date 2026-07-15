@@ -198,6 +198,15 @@ pub struct Task {
     pub name: Option<String>,
     /// Harness selected by the supervisor for session capture.
     pub harness: Option<&'static dyn crate::harness::Harness>,
+    /// Harness home resolved from the spawn-time launch env. Later readers
+    /// (save-time correlation) must use this, never the current connection's
+    /// env: after a reconnect with a different override, a unique in-window
+    /// candidate in the wrong store correlates silently wrong.
+    pub harness_home: Option<PathBuf>,
+    /// Spawn generation, incremented by restart. Capture paths are keyed by
+    /// task *and* run, so a fresh run never reads (or is overwritten through)
+    /// the old run's capture file.
+    pub run: u32,
     /// Session ID injected or recognized at spawn. Capture files and exit
     /// scrapes can supersede it.
     pub resume_id: Option<String>,
@@ -410,6 +419,8 @@ impl Task {
             group: None,
             name: None,
             harness: None,
+            harness_home: None,
+            run: 0,
             resume_id: None,
             capture_file: None,
             scraped_id: None,
@@ -463,6 +474,13 @@ impl Task {
         if let Some(id) = h.scrape_exit(&text) {
             self.scraped_id = Some(id);
         }
+    }
+
+    /// Whether the reader thread has drained to EOF: the second half of the
+    /// exit-scrape gate, exposed so tests can wait on it without driving reap.
+    #[cfg(test)]
+    pub(crate) fn reader_done(&self) -> bool {
+        self.handle.as_ref().is_none_or(|h| h.is_finished())
     }
 
     /// Reap the exited session leader without blocking.

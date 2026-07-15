@@ -129,10 +129,15 @@ impl CaptureAssets {
         })
     }
 
-    /// Return the per-task capture path and shared asset paths.
-    pub fn paths_for(&self, task_id: u64) -> CapturePaths {
+    /// Return the per-run capture path and shared asset paths. The file is
+    /// keyed by task *and* run: restart bumps the run, so the fresh run's
+    /// reads cannot reach the old run's file, and a lingering old process
+    /// (graveyard, TERM grace) writes only its own dead path through its
+    /// inherited env. Superseded files persist until the next `install`
+    /// sweep; litter per task per daemon lifetime equals its restart count.
+    pub fn paths_for(&self, task_id: u64, run: u32) -> CapturePaths {
         CapturePaths {
-            capture_file: self.root.join(format!("task-{task_id}.json")),
+            capture_file: self.root.join(format!("task-{task_id}-{run}.json")),
             claude_settings: self.claude_settings.clone(),
             codex_notify: self.codex_notify.clone(),
         }
@@ -211,13 +216,16 @@ mod tests {
     fn install_sweeps_capture_files_but_not_the_assets() {
         let root = temp("sweep");
         CaptureAssets::install(&root).unwrap();
-        fs::write(root.join("task-1.json"), "{}").unwrap();
-        fs::write(root.join("task-42.json"), "{}").unwrap();
+        fs::write(root.join("task-1-0.json"), "{}").unwrap();
+        fs::write(root.join("task-42-7.json"), "{}").unwrap();
+        // Pre-per-run litter from older daemons matches the same glob.
+        fs::write(root.join("task-9.json"), "{}").unwrap();
         fs::write(root.join("unrelated.txt"), "x").unwrap();
 
         let assets = CaptureAssets::install(&root).unwrap();
-        assert!(!root.join("task-1.json").exists());
-        assert!(!root.join("task-42.json").exists());
+        assert!(!root.join("task-1-0.json").exists());
+        assert!(!root.join("task-42-7.json").exists());
+        assert!(!root.join("task-9.json").exists());
         assert!(root.join("unrelated.txt").exists());
         assert!(assets.claude_settings.exists());
         assert!(assets.codex_notify.exists());
@@ -231,7 +239,7 @@ mod tests {
     fn notify_script_writes_the_argument_verbatim() {
         let root = temp("notify");
         let assets = CaptureAssets::install(&root).unwrap();
-        let cap = assets.paths_for(1).capture_file;
+        let cap = assets.paths_for(1, 0).capture_file;
         let payload = r#"{"type":"agent-turn-complete","turn-id":"t1"}"#;
 
         // Unset and empty env: exit 0, no output, no file.
@@ -294,7 +302,7 @@ mod tests {
     fn notify_script_chains_the_displaced_notifier() {
         let root = temp("chain");
         let assets = CaptureAssets::install(&root).unwrap();
-        let cap = assets.paths_for(3).capture_file;
+        let cap = assets.paths_for(3, 0).capture_file;
         let notifier = root.join("Fake App.app").join("Sky Client");
         let record = root.join("record");
         install_fake_notifier(&notifier, &record);
@@ -325,7 +333,7 @@ mod tests {
     fn notify_script_capture_survives_a_failing_chain() {
         let root = temp("chain_fail");
         let assets = CaptureAssets::install(&root).unwrap();
-        let cap = assets.paths_for(4).capture_file;
+        let cap = assets.paths_for(4, 0).capture_file;
         let notifier = root.join("failing");
         fs::write(&notifier, "#!/bin/sh\nexit 1\n").unwrap();
         fs::set_permissions(&notifier, fs::Permissions::from_mode(0o700)).unwrap();
@@ -368,7 +376,7 @@ mod tests {
     fn hook_command_from_settings_copies_stdin_to_the_capture_file() {
         let root = temp("hook");
         let assets = CaptureAssets::install(&root).unwrap();
-        let cap = assets.paths_for(2).capture_file;
+        let cap = assets.paths_for(2, 0).capture_file;
 
         let text = fs::read_to_string(&assets.claude_settings).unwrap();
         let parsed = jzon::parse(&text).unwrap();
@@ -402,8 +410,13 @@ mod tests {
     fn paths_for_names_the_task_file_under_the_root() {
         let root = temp("paths");
         let assets = CaptureAssets::install(&root).unwrap();
-        let paths = assets.paths_for(7);
-        assert_eq!(paths.capture_file, root.join("task-7.json"));
+        let paths = assets.paths_for(7, 0);
+        assert_eq!(paths.capture_file, root.join("task-7-0.json"));
+        // The run discriminates: a restarted task gets a different file.
+        assert_eq!(
+            assets.paths_for(7, 3).capture_file,
+            root.join("task-7-3.json")
+        );
         assert_eq!(paths.claude_settings, assets.claude_settings);
         assert_eq!(paths.codex_notify, assets.codex_notify);
         let _ = fs::remove_dir_all(&root);
