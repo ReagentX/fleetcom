@@ -1480,19 +1480,42 @@ mod tests {
         }
 
         fn spawn_in(&mut self, cmd: &str, cwd: PathBuf) {
-            self.transport.send(Command::Spawn {
-                command: cmd.to_string(),
-                cwd,
-                group: None,
-            });
+            self.spawn_checked(cmd, cwd, None);
         }
 
         fn spawn_grouped(&mut self, cmd: &str, cwd: PathBuf, group: &str) {
-            self.transport.send(Command::Spawn {
-                command: cmd.to_string(),
-                cwd,
-                group: Some(group.to_string()),
-            });
+            self.spawn_checked(cmd, cwd, Some(group));
+        }
+
+        /// Send a Spawn and confirm the task landed, retrying a transient
+        /// refusal. Under parallel-suite PTY churn, openpty itself can fail
+        /// (observed on macOS as ENXIO); the supervisor answers with a Status
+        /// notice and no task, and every assertion after that fails without
+        /// naming the cause. Ids stay stable across retries: the supervisor
+        /// advances `next_id` only on success.
+        fn spawn_checked(&mut self, cmd: &str, cwd: PathBuf, group: Option<&str>) {
+            self.pump();
+            let want = self.views.len() + 1;
+            for attempt in 0u64..5 {
+                if attempt > 0 {
+                    std::thread::sleep(std::time::Duration::from_millis(25 << attempt));
+                }
+                self.transport.send(Command::Spawn {
+                    command: cmd.to_string(),
+                    cwd: cwd.clone(),
+                    group: group.map(str::to_string),
+                });
+                self.pump();
+                if self.views.len() == want {
+                    // Drop the refusal notice a failed attempt left behind so
+                    // status assertions see only their own test's traffic.
+                    if attempt > 0 {
+                        self.status = None;
+                    }
+                    return;
+                }
+            }
+            panic!("spawn never landed: {:?}", self.status);
         }
 
         /// Return section labels with task ids instead of `views` indices.
