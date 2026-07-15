@@ -1,6 +1,6 @@
 # Commands
 
-Fleetcom has two control surfaces. Launch arguments select the operating mode; keys control the dashboard and its overlays.
+`fleetcom` has two control surfaces. Launch arguments select the operating mode; keys control the dashboard and its overlays.
 
 ## Invocation
 
@@ -28,7 +28,7 @@ Fleetcom has two control surfaces. Launch arguments select the operating mode; k
 | `m` | Tag the selected task "in use" (toggles) |
 | `g` | Assign the selected task to a group (opens the group picker) |
 | `R` | Rename the selected task: a display name shown in place of the command |
-| `r` | Rerun a finished task with the same command, directory, tag, group, and name |
+| `r` | Rerun a finished task; supported agent tasks use the captured resume command |
 | `X` | Kill a running task (`TERM`, then `KILL` after 2 s), or remove a finished one |
 | `w` | Save the current tasks as a session |
 | `o` | Load a saved session |
@@ -60,8 +60,8 @@ While attached, `Ctrl-\` returns to the dashboard. Every other key, including `C
 Modified Enter, paste, and mouse input require state-dependent encoding:
 
 - Shift+Enter and Alt+Enter are sent as `ESC CR`, which is distinct from plain Enter. Shift requires a terminal that reports modified keys; terminals that do not report it send plain `CR`.
-- Paste travels as one message. Bracketed-paste-aware children receive paste markers with embedded terminators removed; other children receive line endings as `CR`. Fleetcom text fields strip control characters.
-- Mouse-protocol children receive clicks, drags, releases, and wheel events in the negotiated encoding. Full-screen children without a mouse protocol use alternate scroll. For inline children without a mouse protocol, wheel-up enters Fleetcom's scrollback view. When Fleetcom captures the mouse (for mouse-protocol children, inline children, or scrollback), terminal selection requires the terminal's selection-override modifier. Otherwise, drag selects normally.
+- Paste travels as one message. Bracketed-paste-aware children receive paste markers with embedded terminators removed; other children receive line endings as `CR`. `fleetcom` text fields strip control characters.
+- Mouse-protocol children receive clicks, drags, releases, and wheel events in the negotiated encoding. Full-screen children without a mouse protocol use alternate scroll. For inline children without a mouse protocol, wheel-up enters `fleetcom`'s scrollback view. When `fleetcom` captures the mouse (for mouse-protocol children, inline children, or scrollback), terminal selection requires the terminal's selection-override modifier. Otherwise, drag selects normally.
 
 #### Scrollback
 
@@ -73,7 +73,7 @@ Tasks retain 2,000 lines of scrollback. While attached to an inline child, wheel
 
 #### Rerun
 
-`r` re-executes a *finished* task with the same command and directory, using the environment of the client that requested the rerun. The task retains its ID, `◆` tag, group, name, and spawn order; its clock and screen reset. Because lifecycle participates in sorting, the task can move to another section when it starts running again. On a running task, `r` is a no-op because rerunning would require a destructive kill first. The same key works inside peek, keeping the task visible while the next run starts.
+`r` re-executes a *finished* task in the same directory, using the environment of the client that requested the rerun. Most tasks reuse their stored command. A supported `claude`, `codex`, or `grok` task instead uses its captured resume command when a valid conversation ID is available. The task retains its ID, `◆` tag, group, name, and spawn order; its clock and screen reset. Because lifecycle participates in sorting, the task can move to another section when it starts running again. A running task is left untouched because rerunning it would require a destructive kill first. The same key works inside peek, keeping the task visible while the replacement starts.
 
 #### Detach vs. quit
 

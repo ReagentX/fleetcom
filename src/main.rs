@@ -13,6 +13,8 @@ mod frame;
 // Differential emulator tests over recorded PTY output.
 #[cfg(test)]
 mod golden;
+// Agent-CLI session capture: the supervisor instruments spawns through it.
+mod harness;
 mod path;
 mod protocol;
 mod serialize;

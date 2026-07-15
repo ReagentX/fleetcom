@@ -10,7 +10,7 @@ use std::{
         mpsc::{Sender, channel},
     },
     thread::{self, JoinHandle},
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime},
 };
 
 use alacritty_terminal::sync::FairMutex;
@@ -196,6 +196,24 @@ pub struct Task {
     pub group: Option<String>,
     /// Custom display name; `None` means unnamed.
     pub name: Option<String>,
+    /// Agent harness selected for session capture.
+    pub harness: Option<&'static dyn crate::harness::Harness>,
+    /// Harness home resolved from this run's launch environment.
+    pub harness_home: Option<PathBuf>,
+    /// Spawn generation used to give each rerun a distinct capture path.
+    pub run: u32,
+    /// Session ID injected or recognized at spawn. Later capture data or an
+    /// exit hint can supersede it.
+    pub resume_id: Option<String>,
+    /// Capture path allocated for this task run.
+    pub capture_file: Option<PathBuf>,
+    /// Session ID scraped once from final terminal text after exit and reader
+    /// EOF.
+    pub scraped_id: Option<String>,
+    /// Whether the one-shot full-history exit scrape has run.
+    scraped: bool,
+    /// Wall-clock spawn time used for filesystem correlation.
+    pub spawned_at: SystemTime,
     pub exit_code: Option<i32>,
     pub started: Instant,
     pub finished: Option<Instant>,
@@ -252,14 +270,15 @@ fn wait_code(status: &rustix::process::WaitIdStatus) -> i32 {
 }
 
 impl Task {
-    /// Spawn `command` under `$SHELL -c` in `cwd`, in a fresh PTY sized `rows`×`cols`,
-    /// with exactly `env` as the environment (the launching client's; the caller
-    /// owns any fallback policy). `waker` lets the reader thread nudge the core
-    /// loop when the PTY produces output, so an attached screen refreshes
-    /// without a polling delay.
+    /// Spawn `exec_command` under `$SHELL -c` in a fresh `rows`×`cols` PTY.
+    /// The task keeps `command` for the UI and recipes, while only
+    /// `exec_command` carries instrumentation. The child receives exactly
+    /// `env`; `waker` notifies the core when terminal output arrives.
+    #[allow(clippy::too_many_arguments)] // All arguments define task launch state.
     pub fn spawn(
         id: u64,
         command: &str,
+        exec_command: &str,
         cwd: &Path,
         rows: u16,
         cols: u16,
@@ -290,7 +309,7 @@ impl Task {
         // Use a non-interactive shell. Interactive startup files, aliases, and
         // shell functions are not loaded.
         cmd.arg("-c");
-        cmd.arg(command);
+        cmd.arg(exec_command);
         // The job runs under the *client's* environment, verbatim: clear the
         // builder's captured base (the daemon's own env, whatever the client
         // that first autostarted it happened to have) so nothing leaks through
@@ -393,6 +412,14 @@ impl Task {
             tagged: false,
             group: None,
             name: None,
+            harness: None,
+            harness_home: None,
+            run: 0,
+            resume_id: None,
+            capture_file: None,
+            scraped_id: None,
+            scraped: false,
+            spawned_at: SystemTime::now(),
             exit_code: None,
             started: Instant::now(),
             finished: None,
@@ -423,6 +450,30 @@ impl Task {
             self.finished = Some(Instant::now());
         }
         Ok(())
+    }
+
+    /// Scrape at most one exit hint after the process exits and the PTY reader
+    /// reaches EOF. A missing reader handle counts as complete.
+    pub(crate) fn scrape_exit_hint(&mut self) {
+        let Some(h) = self.harness else { return };
+        if self.scraped
+            || self.finished.is_none()
+            || self.handle.as_ref().is_some_and(|jh| !jh.is_finished())
+        {
+            return;
+        }
+        self.scraped = true;
+        let text = grid(&self.parser).text_with_history();
+        if let Some(id) = h.scrape_exit(&text) {
+            self.scraped_id = Some(id);
+        }
+    }
+
+    /// Report whether the reader reached EOF. Tests use this second scrape gate
+    /// without driving the reap loop.
+    #[cfg(test)]
+    pub(crate) fn reader_done(&self) -> bool {
+        self.handle.as_ref().is_none_or(|h| h.is_finished())
     }
 
     /// Reap the exited session leader without blocking.
@@ -709,7 +760,17 @@ mod tests {
     }
 
     fn spawn(id: u64, command: &str) -> Task {
-        Task::spawn(id, command, &here(), 24, 80, &env_here(), no_waker()).unwrap()
+        Task::spawn(
+            id,
+            command,
+            command,
+            &here(),
+            24,
+            80,
+            &env_here(),
+            no_waker(),
+        )
+        .unwrap()
     }
 
     fn wait_finished(t: &mut Task) {
@@ -756,7 +817,17 @@ mod tests {
 
     #[test]
     fn resize_is_reflected_in_the_grid() {
-        let mut t = Task::spawn(3, "sleep 5", &here(), 24, 80, &env_here(), no_waker()).unwrap();
+        let mut t = Task::spawn(
+            3,
+            "sleep 5",
+            "sleep 5",
+            &here(),
+            24,
+            80,
+            &env_here(),
+            no_waker(),
+        )
+        .unwrap();
         t.resize(30, 100).unwrap();
         assert_eq!(t.parser.lock().size(), (30, 100));
         t.terminate();
@@ -796,16 +867,8 @@ mod tests {
         // `trap '' HUP` first: the ignore is inherited by the `&` child, which
         // must survive its session leader's exit (leader death HUPs the
         // foreground group) to *be* a straggler.
-        let mut t = Task::spawn(
-            5,
-            &format!("trap '' HUP; sleep 300 & echo $! > {}", spid.display()),
-            &here(),
-            24,
-            80,
-            &sh_env(),
-            no_waker(),
-        )
-        .unwrap();
+        let cmd = format!("trap '' HUP; sleep 300 & echo $! > {}", spid.display());
+        let mut t = Task::spawn(5, &cmd, &cmd, &here(), 24, 80, &sh_env(), no_waker()).unwrap();
         wait_finished(&mut t); // leader exits as soon as the background job is up
         let deadline = Instant::now() + Duration::from_secs(5);
         let mut straggler = None;
@@ -1109,6 +1172,50 @@ mod tests {
         t.terminate();
     }
 
+    /// Holding the grid lock after process exit blocks reader EOF, which must
+    /// also block exit-hint scraping.
+    #[test]
+    fn scrape_exit_hint_waits_for_reader_eof() {
+        const ID: &str = "c8c4a5cc-0b32-4ba0-a6b4-6ed08c218e0d";
+        let dir = std::env::temp_dir().join(format!("fleetcom_task_scrape_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let flag = dir.join("flag");
+        let cmd = format!(
+            "until [ -e '{f}' ]; do sleep 0.05; done; \
+             printf 'Resume this session with:\\nclaude --resume {ID}\\n'",
+            f = flag.display()
+        );
+        let mut t = Task::spawn(20, &cmd, &cmd, &here(), 24, 80, &sh_env(), no_waker()).unwrap();
+        t.harness = Some(&crate::harness::Claude);
+
+        // Hold the grid before output so the reader cannot process bytes or
+        // observe EOF.
+        let parser = Arc::clone(&t.parser);
+        let guard = parser.lock();
+        std::fs::write(&flag, b"").unwrap();
+        // The process can exit while its hint remains blocked in the reader.
+        // The long deadline bounds failure without constraining loaded CI.
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while t.finished.is_none() && Instant::now() < deadline {
+            t.poll_exit().unwrap();
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(t.finished.is_some(), "child never exited");
+        t.scrape_exit_hint();
+        assert_eq!(t.scraped_id, None, "the scrape must wait for reader EOF");
+
+        // Release the reader so it can parse the hint and reach EOF.
+        drop(guard);
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while t.scraped_id.is_none() && Instant::now() < deadline {
+            t.scrape_exit_hint();
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(t.scraped_id.as_deref(), Some(ID));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// A child's cursor-position probe is answered on the wire: the reply
     /// crosses the reader thread → allowlist → writer worker → PTY, and only
     /// the advertised shape arrives. The child first sends secondary DA (a
@@ -1128,7 +1235,7 @@ mod tests {
              head -c 11 > {}",
             out.display()
         );
-        let mut t = Task::spawn(11, &cmd, &here(), 24, 80, &sh_env(), no_waker()).unwrap();
+        let mut t = Task::spawn(11, &cmd, &cmd, &here(), 24, 80, &sh_env(), no_waker()).unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
         let mut got = Vec::new();
         while Instant::now() < deadline {

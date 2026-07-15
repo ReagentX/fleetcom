@@ -5,13 +5,17 @@
 //! `Event`s).
 
 use std::{
-    path::PathBuf,
+    collections::BTreeMap,
+    ffi::OsString,
+    io,
+    path::{Path, PathBuf},
     sync::{Arc, Mutex, mpsc::Sender},
     time::{Duration, Instant},
 };
 
 use crate::{
     core::{Wake, Waker},
+    harness::{self, assets},
     path,
     protocol::{Command, Event, LaunchContext, ScreenView, ScrollAction, TaskView},
     session::{self, SessionConfig, SessionEntry},
@@ -71,6 +75,53 @@ fn normalize_group(name: Option<String>) -> Option<String> {
     normalize_label(name).filter(|g| g != "Unassigned")
 }
 
+/// Return the 64-bit FNV-1a hash used to separate fallback capture roots. The
+/// fixed-width hexadecimal result is a single path-safe component.
+fn fnv1a_hex(bytes: &[u8]) -> String {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for &b in bytes {
+        h ^= u64::from(b);
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("{h:016x}")
+}
+
+/// Resolve the best session ID in precedence order: exit scrape, capture file,
+/// then spawn-time ID. Exit and capture data outrank the launch value because
+/// either can reflect a conversation selected later.
+pub(crate) fn current_resume_id(task: &Task) -> Option<String> {
+    if let Some(id) = &task.scraped_id {
+        return Some(id.clone());
+    }
+    if let (Some(h), Some(path)) = (task.harness, &task.capture_file)
+        && let Ok(payload) = std::fs::read_to_string(path)
+        && let Some(id) = h.parse_capture(&payload)
+    {
+        return Some(id);
+    }
+    task.resume_id.clone()
+}
+
+/// Poll for exit before save or rerun reads the session ID. Scraping remains
+/// deferred until the PTY reader reaches EOF and the terminal contains every
+/// child byte.
+fn scrape_now(t: &mut Task) {
+    let _ = t.poll_exit();
+    t.scrape_exit_hint();
+}
+
+/// Resolve the harness home from the launch environment. The tool-specific
+/// override wins, followed by `$HOME/<tool dot directory>`; neither yields
+/// `None` so the harness can apply its platform-home fallback.
+fn harness_home(env: &[(OsString, OsString)], h: &dyn harness::Harness) -> Option<PathBuf> {
+    let val = |key: &str| {
+        env.iter()
+            .find(|(k, _)| k == key)
+            .map(|(_, v)| PathBuf::from(v))
+    };
+    val(h.home_env_var()).or_else(|| Some(val("HOME")?.join(h.home_dot_dir())))
+}
+
 pub struct Supervisor {
     tasks: Vec<Task>,
     /// Removed tasks whose process groups may still be winding down: TERMed at
@@ -105,6 +156,9 @@ pub struct Supervisor {
     /// TERM→KILL escalation window. `KILL_GRACE` in production; a field so tests
     /// shrink it instead of sleeping through real seconds.
     kill_grace: Duration,
+    /// Capture assets keyed by canonicalized root and reused for this
+    /// supervisor's lifetime.
+    capture: BTreeMap<PathBuf, assets::CaptureAssets>,
 }
 
 impl Supervisor {
@@ -121,6 +175,7 @@ impl Supervisor {
             events: Vec::new(),
             waker: Arc::new(Mutex::new(None)),
             kill_grace: KILL_GRACE,
+            capture: BTreeMap::new(),
         }
     }
 
@@ -180,6 +235,11 @@ impl Supervisor {
                 if let Some(i) = self.index_of(id) {
                     let mut t = self.tasks.remove(i);
                     t.terminate();
+                    // Remove the task's own capture file; the current client
+                    // may use a different capture root.
+                    if let Some(cap) = &t.capture_file {
+                        let _ = std::fs::remove_file(cap);
+                    }
                     self.graveyard.push(t);
                 }
             }
@@ -264,10 +324,20 @@ impl Supervisor {
     /// Latch exits, escalate overdue TERM requests, and collect removed tasks.
     pub fn reap(&mut self) {
         let now = Instant::now();
-        for t in self.tasks.iter_mut().chain(self.graveyard.iter_mut()) {
+        for t in &mut self.tasks {
             // Swallow a poll error rather than propagate: the task just isn't
             // latched this pass and is retried next. waitid failing is rare and
             // must not take down the loop.
+            let _ = t.poll_exit();
+            // Scrape after process exit and reader EOF, when every child byte
+            // is present in the grid (see `Task::scrape_exit_hint`).
+            t.scrape_exit_hint();
+            if t.overdue(now, self.kill_grace) {
+                t.force_kill();
+            }
+        }
+        // Removed tasks need exit handling and escalation, not hint scraping.
+        for t in &mut self.graveyard {
             let _ = t.poll_exit();
             if t.overdue(now, self.kill_grace) {
                 t.force_kill();
@@ -395,6 +465,87 @@ impl Supervisor {
         self.launch.clone()
     }
 
+    /// Resolve and install capture assets for the current launch context.
+    /// `FLEETCOM_RUNTIME_DIR` is used verbatim; otherwise the platform root is
+    /// partitioned by session directory. Assets are cached by canonical root,
+    /// and installation failure disables instrumentation for the spawn.
+    fn ensure_capture_assets(&mut self) -> Option<&assets::CaptureAssets> {
+        let root = if let Some(ctx) = &self.launch
+            && let Some((_, dir)) = ctx.env.iter().find(|(k, _)| k == "FLEETCOM_RUNTIME_DIR")
+        {
+            Some(PathBuf::from(dir))
+        } else {
+            assets::runtime_root(None).map(|base| {
+                let key = self
+                    .sessions_root()
+                    .map(PathBuf::into_os_string)
+                    .unwrap_or_default();
+                base.join(fnv1a_hex(key.as_encoded_bytes()))
+            })
+        };
+        let root = root?;
+        if let Ok(key) = std::fs::canonicalize(&root)
+            && self.capture.contains_key(&key)
+        {
+            return self.capture.get(&key);
+        }
+        let installed = assets::CaptureAssets::install(&root, std::process::id()).ok()?;
+        let key = std::fs::canonicalize(&root).unwrap_or(root);
+        Some(self.capture.entry(key).or_insert(installed))
+    }
+
+    /// Spawn a direct command, rerun, or session entry. Agent instrumentation
+    /// changes only the executed shell string; the task keeps the requested
+    /// command for display and persistence.
+    fn spawn_task(
+        &mut self,
+        id: u64,
+        run: u32,
+        command: &str,
+        cwd: &Path,
+        env: &[(OsString, OsString)],
+    ) -> io::Result<Task> {
+        if let Some((h, inv)) = harness::detect(command) {
+            let paths = self.ensure_capture_assets().map(|a| a.paths_for(id, run));
+            if let Some(paths) = paths {
+                let home = harness_home(env, h);
+                let plan = h.instrument(&inv, &paths, home.as_deref());
+                let exec = format!("{command}{}", plan.args_suffix);
+                let mut env = env.to_vec();
+                env.extend(plan.env);
+                let mut task = Task::spawn(
+                    id,
+                    command,
+                    &exec,
+                    cwd,
+                    self.rows,
+                    self.cols,
+                    &env,
+                    Arc::clone(&self.waker),
+                )?;
+                task.harness = Some(h);
+                // Preserve the launch-time store for later correlation.
+                task.harness_home = home;
+                task.capture_file = Some(paths.capture_file);
+                task.resume_id = plan.injected_id.or_else(|| inv.known_id());
+                task.run = run;
+                return Ok(task);
+            }
+        }
+        let mut task = Task::spawn(
+            id,
+            command,
+            command,
+            cwd,
+            self.rows,
+            self.cols,
+            env,
+            Arc::clone(&self.waker),
+        )?;
+        task.run = run;
+        Ok(task)
+    }
+
     fn spawn(&mut self, command: &str, cwd: PathBuf, group: Option<String>) {
         if self.tasks.len() >= MAX_TASKS {
             self.events.push(Event::Status(format!(
@@ -405,15 +556,7 @@ impl Supervisor {
         let Some(launch) = self.launch_or_refuse() else {
             return;
         };
-        match Task::spawn(
-            self.next_id,
-            command,
-            &cwd,
-            self.rows,
-            self.cols,
-            &launch.env,
-            Arc::clone(&self.waker),
-        ) {
+        match self.spawn_task(self.next_id, 0, command, &cwd, &launch.env) {
             Ok(mut task) => {
                 task.group = group;
                 self.next_id += 1;
@@ -425,14 +568,18 @@ impl Supervisor {
         }
     }
 
-    /// Re-run a finished task in place while preserving its ID, tag, group,
-    /// and name.
+    /// Rerun a finished task in place while preserving its ID, tag, group, and
+    /// name. If the task has a captured agent session, the replacement resumes
+    /// the best-known ID.
     fn restart(&mut self, id: u64) {
         let Some(i) = self.index_of(id) else {
             self.events
                 .push(Event::Status(format!("rerun: no task {id}")));
             return;
         };
+        // Latch a recent exit and scrape its drained terminal before choosing
+        // the rerun command.
+        scrape_now(&mut self.tasks[i]);
         if self.tasks[i].finished.is_none() {
             self.events
                 .push(Event::Status("rerun: task is still running".into()));
@@ -441,16 +588,20 @@ impl Supervisor {
         let Some(launch) = self.launch_or_refuse() else {
             return;
         };
-        // Preserve the finished task if its replacement cannot start.
-        match Task::spawn(
-            id,
-            &self.tasks[i].command,
-            &self.tasks[i].cwd,
-            self.rows,
-            self.cols,
-            &launch.env,
-            Arc::clone(&self.waker),
-        ) {
+        // Store the resuming form so detection treats the replacement as a
+        // targeted conversation.
+        let (command, cwd) = {
+            let old = &self.tasks[i];
+            let command = match (old.harness, current_resume_id(old)) {
+                (Some(h), Some(rid)) => h.resume_command(&old.command, &rid),
+                _ => old.command.clone(),
+            };
+            (command, old.cwd.clone())
+        };
+        // Preserve the finished task if its replacement cannot start. The run
+        // number gives the replacement a distinct capture file.
+        let run = self.tasks[i].run + 1;
+        match self.spawn_task(id, run, &command, &cwd, &launch.env) {
             Ok(mut fresh) => {
                 fresh.tagged = self.tasks[i].tagged;
                 fresh.group = self.tasks[i].group.clone();
@@ -472,8 +623,8 @@ impl Supervisor {
         }
     }
 
-    /// Snapshot tasks as `{dir: [entries]}`. Entries preserve spawn order,
-    /// group assignments, and display names.
+    /// Build `{dir: [entries]}` in spawn order. Groups and names remain intact;
+    /// agent entries use the command returned by `recipe_command`.
     fn session_config(&self) -> SessionConfig {
         let mut order: Vec<usize> = (0..self.tasks.len()).collect();
         order.sort_by_key(|&i| self.tasks[i].id);
@@ -483,12 +634,28 @@ impl Supervisor {
             cfg.entry(path::abbreviate(&t.cwd))
                 .or_default()
                 .push(SessionEntry {
-                    cmd: t.command.clone(),
+                    cmd: self.recipe_command(t),
                     group: t.group.clone(),
                     name: t.name.clone(),
                 });
         }
         cfg
+    }
+
+    /// Build the command stored for one task. Agent commands use the best live
+    /// ID, then filesystem correlation; without either, the requested command
+    /// remains unchanged.
+    fn recipe_command(&self, t: &Task) -> String {
+        let Some(h) = t.harness else {
+            return t.command.clone();
+        };
+        // Correlate against the store selected when this task launched.
+        let id = current_resume_id(t)
+            .or_else(|| h.correlate_fs(&t.cwd, t.spawned_at, t.harness_home.as_deref()));
+        match id {
+            Some(id) => h.resume_command(&t.command, &id),
+            None => t.command.clone(),
+        }
     }
 
     /// Session-recipe root for this connection: `FLEETCOM_CONFIG_DIR` from the
@@ -509,6 +676,11 @@ impl Supervisor {
     }
 
     fn save_session(&mut self, name: &str) {
+        // `session_config` reads ids through `&self`; give finished tasks
+        // their exit scrape first (see `scrape_now`).
+        for t in &mut self.tasks {
+            scrape_now(t);
+        }
         let cfg = self.session_config();
         let count: usize = cfg.values().map(Vec::len).sum();
         let status = match self
@@ -562,15 +734,9 @@ impl Supervisor {
                     skipped += 1;
                     continue;
                 }
-                if let Ok(mut task) = Task::spawn(
-                    self.next_id,
-                    &entry.cmd,
-                    &resolved,
-                    self.rows,
-                    self.cols,
-                    &launch.env,
-                    Arc::clone(&self.waker),
-                ) {
+                if let Ok(mut task) =
+                    self.spawn_task(self.next_id, 0, &entry.cmd, &resolved, &launch.env)
+                {
                     // Normalize persisted labels before assigning them.
                     task.group = normalize_group(entry.group.clone());
                     task.name = normalize_label(entry.name.clone());
@@ -2032,5 +2198,1314 @@ mod tests {
                 if m.contains("no launch context") || m.contains("not found"))),
             "context-less load must not spawn; got {evs:?}"
         );
+    }
+
+    // --- session-capture wiring -------------------------------------------
+
+    const CAP_ID: &str = "c8c4a5cc-0b32-4ba0-a6b4-6ed08c218e0d";
+    const CAP_OTHER: &str = "11111111-2222-4333-8444-555555555555";
+
+    /// Install an executable stub that records `FLEETCOM_CAPTURE_FILE` and
+    /// its argv, one token per line, then exits.
+    fn install_stub(bin: &Path, name: &str, out: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::create_dir_all(bin).unwrap();
+        let script = format!(
+            "#!/bin/sh\nprintf '%s' \"$FLEETCOM_CAPTURE_FILE\" > '{out}/capenv'\n\
+             printf '%s\\n' \"$@\" > '{out}/argv'\n",
+            out = out.display()
+        );
+        let path = bin.join(name);
+        std::fs::write(&path, script).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    /// Launch context containing only the stub path, shell, and capture root.
+    fn agent_ctx(bin: &Path, runtime: &Path, cwd: PathBuf) -> LaunchContext {
+        LaunchContext {
+            env: vec![
+                (
+                    "PATH".into(),
+                    format!("{}:/usr/bin:/bin", bin.display()).into(),
+                ),
+                ("SHELL".into(), "/bin/sh".into()),
+                (
+                    "FLEETCOM_RUNTIME_DIR".into(),
+                    runtime.as_os_str().to_os_string(),
+                ),
+            ],
+            cwd,
+        }
+    }
+
+    /// Poll until the stub's argv record contains data, then return its lines.
+    fn wait_argv(s: &mut Supervisor, path: &Path) -> Vec<String> {
+        assert!(
+            reap_until(s, Duration::from_secs(5), |_| std::fs::read_to_string(path)
+                .is_ok_and(|c| !c.is_empty())),
+            "the stub never recorded its argv"
+        );
+        std::fs::read_to_string(path)
+            .unwrap()
+            .lines()
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// `agent_ctx` plus explicit environment pairs for recipe and harness
+    /// storage tests.
+    fn agent_ctx_plus(
+        bin: &Path,
+        runtime: &Path,
+        cwd: PathBuf,
+        extra: &[(&str, &Path)],
+    ) -> LaunchContext {
+        let mut ctx = agent_ctx(bin, runtime, cwd);
+        for (k, v) in extra {
+            ctx.env.push(((*k).into(), v.as_os_str().to_os_string()));
+        }
+        ctx
+    }
+
+    /// Install an executable stub with caller-supplied shell behavior.
+    fn install_script(bin: &Path, name: &str, body: &str) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::create_dir_all(bin).unwrap();
+        let path = bin.join(name);
+        std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    /// Save a recipe and return its persisted JSON.
+    fn save_and_read(s: &mut Supervisor, config: &Path, name: &str) -> String {
+        s.apply(Command::SaveSession { name: name.into() });
+        let _ = s.drain();
+        std::fs::read_to_string(config.join("sessions").join(format!("{name}.json"))).unwrap()
+    }
+
+    /// Construct a v7 rollout ID for filesystem-correlation fixtures.
+    fn v7_at(ms: u64, tail: u32) -> String {
+        format!(
+            "{:08x}-{:04x}-7000-8000-0000000{:05x}",
+            ms >> 16,
+            ms & 0xffff,
+            tail
+        )
+    }
+
+    fn civil_from_days(days: i64) -> (i64, u32, u32) {
+        let z = days + 719_468;
+        let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+        let doe = z - era * 146_097;
+        let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
+        let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+        let mp = (5 * doy + 2) / 153;
+        let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+        let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+        (yoe + era * 400 + i64::from(m <= 2), m, d)
+    }
+
+    /// The FNV-1a discriminator is stable and separates distinct config roots.
+    #[test]
+    fn fnv_discriminator_is_stable_and_distinguishes_roots() {
+        // FNV-1a 64-bit vectors for the empty input and "a".
+        assert_eq!(fnv1a_hex(b""), "cbf29ce484222325");
+        assert_eq!(fnv1a_hex(b"a"), "af63dc4c8601ec8c");
+        assert_eq!(fnv1a_hex(b"/cfg/one"), fnv1a_hex(b"/cfg/one"));
+        assert_ne!(fnv1a_hex(b"/cfg/one"), fnv1a_hex(b"/cfg/two"));
+    }
+
+    /// A `claude` spawn receives a pinned ID, settings overlay, and capture
+    /// environment without changing the stored command.
+    #[test]
+    fn spawn_claude_pins_an_id_and_layers_settings() {
+        let dir = scratch("cap_claude");
+        let (bin, runtime) = (dir.join("bin"), dir.join("run"));
+        install_stub(&bin, "claude", &dir);
+        let mut s = Supervisor::new(24, 80);
+        s.set_launch_context(agent_ctx(&bin, &runtime, dir.clone()));
+        s.apply(Command::Spawn {
+            command: "claude".into(),
+            cwd: dir.clone(),
+            group: None,
+        });
+
+        let argv = wait_argv(&mut s, &dir.join("argv"));
+        let si = argv
+            .iter()
+            .position(|a| a == "--session-id")
+            .expect("the stub must receive --session-id");
+        let id = argv[si + 1].clone();
+        assert!(
+            crate::harness::is_uuid(&id),
+            "the pinned id must be a strict uuid: {id:?}"
+        );
+        let fi = argv
+            .iter()
+            .position(|a| a == "--settings")
+            .expect("the stub must receive --settings");
+        let settings = PathBuf::from(&argv[fi + 1]);
+        assert!(settings.is_file(), "the settings overlay must exist");
+        let parsed = jzon::parse(&std::fs::read_to_string(&settings).unwrap())
+            .expect("the settings overlay must be valid JSON");
+        let hook = parsed["hooks"]["SessionStart"][0]["hooks"][0]["command"]
+            .as_str()
+            .expect("the overlay must carry the hook command");
+        assert!(
+            hook.contains("FLEETCOM_CAPTURE_FILE"),
+            "the hook must write to the capture env: {hook:?}"
+        );
+
+        let t = &s.tasks[0];
+        let cap = t.capture_file.clone().expect("capture file set");
+        // An explicit runtime directory is used without a discriminator;
+        // capture files sit in this incarnation's `<pid>-<nonce>` namespace
+        // directly under it.
+        let ns = cap.parent().expect("capture file must sit in a namespace");
+        assert_eq!(ns.parent(), Some(runtime.as_path()));
+        assert!(
+            ns.file_name()
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .starts_with(&format!("{}-", std::process::id())),
+            "the namespace must carry this process's pid prefix: {ns:?}"
+        );
+        assert_eq!(
+            cap.file_name().unwrap().to_str().unwrap(),
+            format!("task-{}-0.json", t.id),
+            "the capture file must be keyed by task and run"
+        );
+        assert_eq!(
+            settings.parent(),
+            Some(ns),
+            "assets and captures must share the namespace"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("capenv")).unwrap(),
+            cap.display().to_string(),
+            "the capture env must name task-<id>-<run>.json under the incarnation namespace"
+        );
+        assert_eq!(
+            t.command, "claude",
+            "instrumentation must never leak into the stored command"
+        );
+        assert_eq!(t.resume_id.as_deref(), Some(id.as_str()));
+        assert!(t.harness.is_some());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An unrecognized command spawns without capture state or assets.
+    #[test]
+    fn spawn_non_agent_command_is_not_instrumented() {
+        let dir = scratch("cap_plain");
+        let runtime = dir.join("run");
+        let mut s = Supervisor::new(24, 80);
+        s.set_launch_context(agent_ctx(&dir.join("bin"), &runtime, dir.clone()));
+        s.apply(Command::Spawn {
+            command: "printf ok".into(),
+            cwd: dir.clone(),
+            group: None,
+        });
+        let t = &s.tasks[0];
+        assert!(t.harness.is_none());
+        assert!(t.capture_file.is_none());
+        assert!(t.resume_id.is_none());
+        assert!(
+            s.capture.is_empty(),
+            "a non-agent spawn must not install capture assets"
+        );
+        assert!(!runtime.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A resuming `claude` launch retains its target ID and adds only the
+    /// capture overlay.
+    #[test]
+    fn spawn_resuming_claude_injects_only_the_capture_channel() {
+        let dir = scratch("cap_resume");
+        let (bin, runtime) = (dir.join("bin"), dir.join("run"));
+        install_stub(&bin, "claude", &dir);
+        let mut s = Supervisor::new(24, 80);
+        s.set_launch_context(agent_ctx(&bin, &runtime, dir.clone()));
+        s.apply(Command::Spawn {
+            command: format!("claude --resume {CAP_ID}"),
+            cwd: dir.clone(),
+            group: None,
+        });
+
+        let argv = wait_argv(&mut s, &dir.join("argv"));
+        assert!(
+            !argv.iter().any(|a| a == "--session-id"),
+            "a resuming launch must never pin a second id; argv: {argv:?}"
+        );
+        assert!(
+            argv.iter().any(|a| a == "--settings"),
+            "the settings overlay must still ride along; argv: {argv:?}"
+        );
+        let t = &s.tasks[0];
+        assert_eq!(t.command, format!("claude --resume {CAP_ID}"));
+        assert_eq!(t.resume_id.as_deref(), Some(CAP_ID));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Rerun prefers the capture-file ID, stores the resulting resume command,
+    /// and retains the displaced run's capture file while that run is reaped.
+    #[test]
+    fn restart_resumes_the_captured_conversation() {
+        use crate::protocol::Lifecycle;
+        let dir = scratch("cap_restart");
+        let (bin, runtime) = (dir.join("bin"), dir.join("run"));
+        install_stub(&bin, "claude", &dir);
+        let mut s = Supervisor::new(24, 80);
+        s.set_launch_context(agent_ctx(&bin, &runtime, dir.clone()));
+        s.apply(Command::Spawn {
+            command: "claude".into(),
+            cwd: dir.clone(),
+            group: None,
+        });
+        let _ = wait_argv(&mut s, &dir.join("argv"));
+        let id = s.tasks[0].id;
+        wait_for_lifecycle(&mut s, id, |l| l == Lifecycle::Ok);
+
+        // The capture payload reports a different ID from the pinned one.
+        let cap = s.tasks[0].capture_file.clone().expect("capture file set");
+        std::fs::write(
+            &cap,
+            format!(
+                r#"{{"session_id":"{CAP_OTHER}","hook_event_name":"SessionStart","source":"clear"}}"#
+            ),
+        )
+        .unwrap();
+        std::fs::remove_file(dir.join("argv")).unwrap();
+
+        s.apply(Command::Restart { id });
+        let argv = wait_argv(&mut s, &dir.join("argv"));
+        assert_eq!(
+            s.tasks[0].command,
+            format!("claude --resume '{CAP_OTHER}'"),
+            "the stored command must become the resuming one"
+        );
+        let ri = argv
+            .iter()
+            .position(|a| a == "--resume")
+            .expect("the respawn must resume");
+        assert_eq!(argv[ri + 1], CAP_OTHER);
+        assert!(
+            !argv.iter().any(|a| a == "--session-id"),
+            "re-detection classifies the respawn as resuming: no second id"
+        );
+        assert!(
+            reap_until(&mut s, Duration::from_secs(5), |s| s.graveyard.is_empty()),
+            "the displaced run was never collected"
+        );
+        // The old run's file is unreachable from the fresh run and survives
+        // as bounded litter: install never deletes.
+        assert!(
+            cap.exists(),
+            "restart must not delete the old run's capture file"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A rerun uses a new capture path, so the displaced run's payload and
+    /// later writes cannot affect the replacement.
+    #[test]
+    fn restart_cannot_read_the_old_runs_stale_capture() {
+        let dir = scratch("cap_stale_run");
+        let (bin, runtime, config) = (dir.join("bin"), dir.join("run"), dir.join("config"));
+        // The session drifts to CAP_ID mid-run and the exit hint reports it.
+        install_script(
+            &bin,
+            "claude",
+            &format!("printf 'Resume this session with:\\nclaude --resume {CAP_ID}\\n'"),
+        );
+        let mut s = Supervisor::new(24, 80);
+        s.set_launch_context(agent_ctx_plus(
+            &bin,
+            &runtime,
+            dir.clone(),
+            &[("FLEETCOM_CONFIG_DIR", &config)],
+        ));
+        s.apply(Command::Spawn {
+            command: "claude".into(),
+            cwd: dir.clone(),
+            group: None,
+        });
+        let id = s.tasks[0].id;
+        // The capture file still holds the pre-drift session.
+        let stale = format!(
+            r#"{{"session_id":"{CAP_OTHER}","hook_event_name":"SessionStart","source":"startup"}}"#
+        );
+        let old_cap = s.tasks[0].capture_file.clone().expect("capture file set");
+        std::fs::write(&old_cap, &stale).unwrap();
+        assert!(reap_until(&mut s, Duration::from_secs(5), |s| s.tasks[0]
+            .scraped_id
+            .is_some()));
+        assert_eq!(s.tasks[0].scraped_id.as_deref(), Some(CAP_ID));
+
+        s.apply(Command::Restart { id });
+        let new_cap = s.tasks[0].capture_file.clone().expect("capture file set");
+        assert_ne!(new_cap, old_cap, "the fresh run needs its own capture file");
+        assert_eq!(s.tasks[0].command, format!("claude --resume '{CAP_ID}'"));
+
+        // A later write from the displaced run remains in its capture file.
+        std::fs::write(&old_cap, &stale).unwrap();
+        let text = save_and_read(&mut s, &config, "stalecap");
+        assert!(
+            text.contains(&format!("claude --resume '{CAP_ID}'")),
+            "the fresh run must save the drifted session; got {text}"
+        );
+        assert!(
+            !text.contains(CAP_OTHER),
+            "the old run's stale capture must be unreachable; got {text}"
+        );
+        // Bounded litter: install never deletes the superseded file.
+        assert!(old_cap.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Removing a task also removes its capture file.
+    #[test]
+    fn remove_deletes_the_capture_file() {
+        use crate::protocol::Lifecycle;
+        let dir = scratch("cap_remove");
+        let (bin, runtime) = (dir.join("bin"), dir.join("run"));
+        install_stub(&bin, "claude", &dir);
+        let mut s = Supervisor::new(24, 80);
+        s.set_launch_context(agent_ctx(&bin, &runtime, dir.clone()));
+        s.apply(Command::Spawn {
+            command: "claude".into(),
+            cwd: dir.clone(),
+            group: None,
+        });
+        let _ = wait_argv(&mut s, &dir.join("argv"));
+        let id = s.tasks[0].id;
+        wait_for_lifecycle(&mut s, id, |l| l == Lifecycle::Ok);
+        let cap = s.tasks[0].capture_file.clone().unwrap();
+        std::fs::write(&cap, "{}").unwrap();
+
+        s.apply(Command::Remove { id });
+        assert!(!cap.exists(), "Remove must delete the task's capture file");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Reconnecting with the active root reuses installed assets and preserves
+    /// live capture files.
+    #[test]
+    fn reconnect_with_unchanged_root_preserves_capture_files() {
+        let dir = scratch("cap_reconnect");
+        let (bin, runtime) = (dir.join("bin"), dir.join("run"));
+        install_stub(&bin, "claude", &dir);
+        let mut s = Supervisor::new(24, 80);
+        s.set_launch_context(agent_ctx(&bin, &runtime, dir.clone()));
+        s.apply(Command::Spawn {
+            command: "claude".into(),
+            cwd: dir.clone(),
+            group: None,
+        });
+        let cap = s.tasks[0].capture_file.clone().expect("capture file set");
+        std::fs::write(&cap, "{}").unwrap();
+
+        // The client reconnects with an identical env and spawns again.
+        s.set_launch_context(agent_ctx(&bin, &runtime, dir.clone()));
+        s.apply(Command::Spawn {
+            command: "claude".into(),
+            cwd: dir.clone(),
+            group: None,
+        });
+        assert_eq!(s.tasks.len(), 2);
+        assert!(
+            cap.exists(),
+            "an unchanged root must not disturb live capture files"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Returning to an installed root preserves its live capture files.
+    #[test]
+    fn returning_to_a_prior_root_preserves_its_live_captures() {
+        let dir = scratch("cap_aba");
+        let (bin, root_a, root_b) = (dir.join("bin"), dir.join("run-a"), dir.join("run-b"));
+        install_stub(&bin, "claude", &dir);
+        let mut s = Supervisor::new(24, 80);
+        s.set_launch_context(agent_ctx(&bin, &root_a, dir.clone()));
+        s.apply(Command::Spawn {
+            command: "claude".into(),
+            cwd: dir.clone(),
+            group: None,
+        });
+        let cap_a = s.tasks[0].capture_file.clone().expect("capture file set");
+        std::fs::write(&cap_a, "{}").unwrap();
+
+        // The client reconnects under root B, spawns, then returns to A and
+        // spawns again.
+        s.set_launch_context(agent_ctx(&bin, &root_b, dir.clone()));
+        s.apply(Command::Spawn {
+            command: "claude".into(),
+            cwd: dir.clone(),
+            group: None,
+        });
+        s.set_launch_context(agent_ctx(&bin, &root_a, dir.clone()));
+        s.apply(Command::Spawn {
+            command: "claude".into(),
+            cwd: dir.clone(),
+            group: None,
+        });
+
+        assert_eq!(s.tasks.len(), 3);
+        assert!(
+            cap_a.exists(),
+            "returning to a known root must not disturb its live captures"
+        );
+        let ns_b = s.tasks[1]
+            .capture_file
+            .as_deref()
+            .and_then(|c| c.parent())
+            .expect("the root-B spawn must have a namespaced capture file");
+        assert!(ns_b.starts_with(&root_b), "root B owns its namespace");
+        assert!(
+            ns_b.join("claude-settings.json").is_file(),
+            "the interleaved root must keep its own namespaced assets"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Remove deletes the capture file under the root the task spawned in,
+    /// not under whichever root the current client presents.
+    #[test]
+    fn remove_deletes_the_capture_file_under_the_spawn_root() {
+        use crate::protocol::Lifecycle;
+        let dir = scratch("cap_remove_cross");
+        let (bin, root_a, root_b) = (dir.join("bin"), dir.join("run-a"), dir.join("run-b"));
+        install_stub(&bin, "claude", &dir);
+        let mut s = Supervisor::new(24, 80);
+        s.set_launch_context(agent_ctx(&bin, &root_a, dir.clone()));
+        s.apply(Command::Spawn {
+            command: "claude".into(),
+            cwd: dir.clone(),
+            group: None,
+        });
+        let _ = wait_argv(&mut s, &dir.join("argv"));
+        let id = s.tasks[0].id;
+        wait_for_lifecycle(&mut s, id, |l| l == Lifecycle::Ok);
+        let cap = s.tasks[0].capture_file.clone().unwrap();
+        std::fs::write(&cap, "{}").unwrap();
+
+        // Root B is installed by a newer spawn; a same-id file under it must
+        // survive the A task's removal.
+        s.set_launch_context(agent_ctx(&bin, &root_b, dir.clone()));
+        s.apply(Command::Spawn {
+            command: "claude".into(),
+            cwd: dir.clone(),
+            group: None,
+        });
+        let decoy = s.tasks[1]
+            .capture_file
+            .as_deref()
+            .and_then(|c| c.parent())
+            .expect("the root-B spawn must have a namespaced capture file")
+            .join(format!("task-{id}-0.json"));
+        std::fs::write(&decoy, "{}").unwrap();
+
+        s.apply(Command::Remove { id });
+        assert!(
+            !cap.exists(),
+            "Remove must delete the task's own capture file"
+        );
+        assert!(
+            decoy.exists(),
+            "Remove must not touch the same id under another root"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A `codex` spawn receives a `notify=[...]` override naming an executable
+    /// capture script.
+    #[test]
+    fn spawn_codex_installs_the_notify_override() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = scratch("cap_codex");
+        let (bin, runtime) = (dir.join("bin"), dir.join("run"));
+        install_stub(&bin, "codex", &dir);
+        let mut s = Supervisor::new(24, 80);
+        // Keep config lookup within this test's scratch directory.
+        s.set_launch_context(agent_ctx_plus(
+            &bin,
+            &runtime,
+            dir.clone(),
+            &[("CODEX_HOME", &dir.join("codex_home"))],
+        ));
+        s.apply(Command::Spawn {
+            command: "codex".into(),
+            cwd: dir.clone(),
+            group: None,
+        });
+
+        let argv = wait_argv(&mut s, &dir.join("argv"));
+        let ci = argv
+            .iter()
+            .position(|a| a == "-c")
+            .expect("the stub must receive -c");
+        let script = argv[ci + 1]
+            .strip_prefix("notify=[\"")
+            .and_then(|t| t.strip_suffix("\"]"))
+            .unwrap_or_else(|| panic!("malformed notify override: {:?}", argv[ci + 1]));
+        let meta = std::fs::metadata(script).expect("the notify program must exist");
+        assert!(
+            meta.permissions().mode() & 0o111 != 0,
+            "codex execs the notify program directly; it must be executable"
+        );
+        let t = &s.tasks[0];
+        assert_eq!(t.command, "codex");
+        assert!(t.resume_id.is_none(), "codex cannot pin an id at launch");
+        assert!(t.capture_file.is_some());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A `grok` spawn receives exactly the pinned ID: no settings overlay,
+    /// no config override, and no capture environment (grok has no
+    /// injectable live channel). The saved recipe resumes the pinned ID.
+    #[test]
+    fn spawn_grok_pins_an_id_and_injects_nothing_else() {
+        let dir = scratch("cap_grok");
+        let (bin, runtime, config) = (dir.join("bin"), dir.join("run"), dir.join("config"));
+        install_stub(&bin, "grok", &dir);
+        let mut s = Supervisor::new(24, 80);
+        // Keep save-time correlation inside the scratch tree.
+        s.set_launch_context(agent_ctx_plus(
+            &bin,
+            &runtime,
+            dir.clone(),
+            &[
+                ("FLEETCOM_CONFIG_DIR", &config),
+                ("GROK_HOME", &dir.join("grok_home")),
+            ],
+        ));
+        s.apply(Command::Spawn {
+            command: "grok".into(),
+            cwd: dir.clone(),
+            group: None,
+        });
+
+        let argv = wait_argv(&mut s, &dir.join("argv"));
+        assert_eq!(
+            argv.len(),
+            2,
+            "only the pinned id may be injected: {argv:?}"
+        );
+        assert_eq!(argv[0], "--session-id");
+        let id = argv[1].clone();
+        assert!(
+            crate::harness::is_uuid(&id),
+            "the pinned id must be a strict uuid: {id:?}"
+        );
+        // The stub recorded an empty FLEETCOM_CAPTURE_FILE: no capture env.
+        assert_eq!(
+            std::fs::read_to_string(dir.join("capenv")).unwrap(),
+            "",
+            "grok has no capture channel, so the env must not name one"
+        );
+        let t = &s.tasks[0];
+        assert_eq!(
+            t.command, "grok",
+            "instrumentation must never leak into the stored command"
+        );
+        assert_eq!(t.resume_id.as_deref(), Some(id.as_str()));
+
+        let text = save_and_read(&mut s, &config, "grokpin");
+        assert!(
+            text.contains(&format!("grok --resume '{id}'")),
+            "the recipe must resume the pinned session; got {text}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A `claude` exit hint becomes the session ID used by the saved recipe.
+    #[test]
+    fn exit_hint_is_scraped_and_saved_as_a_resume() {
+        let dir = scratch("scrape_exit");
+        let (bin, runtime, config) = (dir.join("bin"), dir.join("run"), dir.join("config"));
+        install_script(
+            &bin,
+            "claude",
+            &format!("printf 'Resume this session with:\\nclaude --resume {CAP_ID}\\n'"),
+        );
+        let mut s = Supervisor::new(24, 80);
+        s.set_launch_context(agent_ctx_plus(
+            &bin,
+            &runtime,
+            dir.clone(),
+            &[("FLEETCOM_CONFIG_DIR", &config)],
+        ));
+        s.apply(Command::Spawn {
+            command: "claude".into(),
+            cwd: dir.clone(),
+            group: None,
+        });
+        // No pre-exit synchronization: the scrape's reader-EOF gate means
+        // reap can run against the exiting stub at any point and the hint
+        // still lands.
+        assert!(reap_until(&mut s, Duration::from_secs(5), |s| s.tasks[0]
+            .scraped_id
+            .is_some()));
+        assert_eq!(s.tasks[0].scraped_id.as_deref(), Some(CAP_ID));
+
+        let text = save_and_read(&mut s, &config, "hint");
+        assert!(
+            text.contains(&format!("claude --resume '{CAP_ID}'")),
+            "the recipe must resume the scraped session; got {text}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Saving between process exit and the next reap tick still captures the
+    /// exit hint because `save_session` performs its own ready scrape.
+    #[test]
+    fn save_scrapes_a_finished_task_without_reap() {
+        let dir = scratch("save_sync_scrape");
+        let (bin, runtime, config) = (dir.join("bin"), dir.join("run"), dir.join("config"));
+        install_script(
+            &bin,
+            "claude",
+            &format!("printf 'Resume this session with:\\nclaude --resume {CAP_ID}\\n'"),
+        );
+        let mut s = Supervisor::new(24, 80);
+        s.set_launch_context(agent_ctx_plus(
+            &bin,
+            &runtime,
+            dir.clone(),
+            &[("FLEETCOM_CONFIG_DIR", &config)],
+        ));
+        s.apply(Command::Spawn {
+            command: "claude".into(),
+            cwd: dir.clone(),
+            group: None,
+        });
+
+        // Wait out only the residual reader-drain race: after EOF the sole
+        // remaining gate is the exit latch, which save's own pass must flip.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !s.tasks[0].reader_done() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(s.tasks[0].reader_done(), "the stub never reached EOF");
+        assert!(s.tasks[0].finished.is_none(), "no reap may have run yet");
+
+        let text = save_and_read(&mut s, &config, "syncsave");
+        assert!(
+            text.contains(&format!("claude --resume '{CAP_ID}'")),
+            "save must scrape the finished task itself; got {text}"
+        );
+        assert_eq!(s.tasks[0].scraped_id.as_deref(), Some(CAP_ID));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Restarting between process exit and the next reap tick latches the exit,
+    /// scrapes the hint, and resumes that session.
+    #[test]
+    fn restart_scrapes_a_finished_task_without_reap() {
+        let dir = scratch("restart_sync_scrape");
+        let (bin, runtime) = (dir.join("bin"), dir.join("run"));
+        install_script(
+            &bin,
+            "claude",
+            &format!("printf 'Resume this session with:\\nclaude --resume {CAP_ID}\\n'"),
+        );
+        let mut s = Supervisor::new(24, 80);
+        s.set_launch_context(agent_ctx(&bin, &runtime, dir.clone()));
+        s.apply(Command::Spawn {
+            command: "claude".into(),
+            cwd: dir.clone(),
+            group: None,
+        });
+        let id = s.tasks[0].id;
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !s.tasks[0].reader_done() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(s.tasks[0].reader_done(), "the stub never reached EOF");
+        assert!(s.tasks[0].finished.is_none(), "no reap may have run yet");
+
+        s.apply(Command::Restart { id });
+        assert_eq!(
+            s.tasks[0].command,
+            format!("claude --resume '{CAP_ID}'"),
+            "restart must compute its resume command from the exit scrape"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Session-ID precedence is exit scrape, capture file, then spawn-time ID.
+    #[test]
+    fn resume_id_precedence_scrape_over_capture_over_spawn() {
+        let dir = scratch("precedence");
+        let (bin, runtime, config) = (dir.join("bin"), dir.join("run"), dir.join("config"));
+        let (hinted, done) = (dir.join("hinted"), dir.join("done"));
+        install_script(
+            &bin,
+            "claude",
+            &format!(
+                "until [ -e '{h}' ]; do sleep 0.05; done\n\
+                 printf 'Resume this session with:\\nclaude --resume {CAP_ID}\\n'\n\
+                 until [ -e '{d}' ]; do sleep 0.05; done",
+                h = hinted.display(),
+                d = done.display()
+            ),
+        );
+        let mut s = Supervisor::new(24, 80);
+        s.set_launch_context(agent_ctx_plus(
+            &bin,
+            &runtime,
+            dir.clone(),
+            &[("FLEETCOM_CONFIG_DIR", &config)],
+        ));
+        s.apply(Command::Spawn {
+            command: "claude".into(),
+            cwd: dir.clone(),
+            group: None,
+        });
+        let injected = s.tasks[0]
+            .resume_id
+            .clone()
+            .expect("a fresh claude launch pins an id");
+        assert_ne!(injected.as_str(), CAP_OTHER);
+
+        // The hook moved the session mid-run: pre-exit, the capture file
+        // must beat the injected id.
+        let cap = s.tasks[0].capture_file.clone().expect("capture file set");
+        std::fs::write(
+            &cap,
+            format!(
+                r#"{{"session_id":"{CAP_OTHER}","hook_event_name":"SessionStart","source":"clear"}}"#
+            ),
+        )
+        .unwrap();
+        let text = save_and_read(&mut s, &config, "mid");
+        assert!(
+            text.contains(&format!("claude --resume '{CAP_OTHER}'")),
+            "pre-exit the capture file must beat the injected id; got {text}"
+        );
+
+        // Print the hint and let the task exit: post-exit, the scrape must
+        // beat the capture file.
+        std::fs::write(&hinted, b"").unwrap();
+        std::fs::write(&done, b"").unwrap();
+        assert!(reap_until(&mut s, Duration::from_secs(5), |s| s.tasks[0]
+            .scraped_id
+            .is_some()));
+        assert_eq!(s.tasks[0].scraped_id.as_deref(), Some(CAP_ID));
+        let text = save_and_read(&mut s, &config, "post");
+        assert!(
+            text.contains(&format!("claude --resume '{CAP_ID}'")),
+            "post-exit the scraped hint must beat the capture file; got {text}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A silent Codex task falls back to one matching rollout under
+    /// `CODEX_HOME` when live channels produce no ID.
+    #[test]
+    fn save_falls_back_to_fs_correlation_for_a_silent_codex() {
+        let dir = scratch("correlate_save");
+        let (bin, runtime, config) = (dir.join("bin"), dir.join("run"), dir.join("config"));
+        let codex_home = dir.join("codex_home");
+        install_stub(&bin, "codex", &dir);
+        // Create a rollout with a current v7 instant and the task's cwd.
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let id = v7_at(now_ms, 1);
+        let (y, m, d) = civil_from_days((now_ms / 86_400_000) as i64);
+        let day = codex_home
+            .join("sessions")
+            .join(format!("{y:04}"))
+            .join(format!("{m:02}"))
+            .join(format!("{d:02}"));
+        std::fs::create_dir_all(&day).unwrap();
+        std::fs::write(
+            day.join(format!("rollout-2026-07-14T09-00-00-{id}.jsonl")),
+            format!(
+                r#"{{"timestamp":"x","type":"session_meta","payload":{{"id":"{id}","cwd":"{}"}}}}"#,
+                dir.display()
+            ),
+        )
+        .unwrap();
+
+        let mut s = Supervisor::new(24, 80);
+        s.set_launch_context(agent_ctx_plus(
+            &bin,
+            &runtime,
+            dir.clone(),
+            &[
+                ("FLEETCOM_CONFIG_DIR", &config),
+                ("CODEX_HOME", &codex_home),
+            ],
+        ));
+        s.apply(Command::Spawn {
+            command: "codex".into(),
+            cwd: dir.clone(),
+            group: None,
+        });
+        assert!(reap_until(&mut s, Duration::from_secs(5), |s| s.tasks[0]
+            .finished
+            .is_some()));
+        assert!(s.tasks[0].scraped_id.is_none(), "a silent exit has no hint");
+        assert!(
+            current_resume_id(&s.tasks[0]).is_none(),
+            "no capture channel fired"
+        );
+
+        let text = save_and_read(&mut s, &config, "corr");
+        assert!(
+            text.contains(&format!("codex resume '{id}'")),
+            "save must fall back to filesystem correlation; got {text}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Save-time correlation uses the task's spawn-time `CODEX_HOME`, even
+    /// after a reconnect supplies another home containing a matching rollout.
+    #[test]
+    fn save_correlates_against_the_spawn_time_home() {
+        let dir = scratch("correlate_home");
+        let (bin, runtime, config) = (dir.join("bin"), dir.join("run"), dir.join("config"));
+        let (home_a, home_b) = (dir.join("codex_a"), dir.join("codex_b"));
+        install_stub(&bin, "codex", &dir);
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let (y, m, d) = civil_from_days((now_ms / 86_400_000) as i64);
+        // One unique in-window rollout per store, both naming the task cwd.
+        let rollout = |home: &Path, id: &str| {
+            let day = home
+                .join("sessions")
+                .join(format!("{y:04}"))
+                .join(format!("{m:02}"))
+                .join(format!("{d:02}"));
+            std::fs::create_dir_all(&day).unwrap();
+            std::fs::write(
+                day.join(format!("rollout-2026-07-14T09-00-00-{id}.jsonl")),
+                format!(
+                    r#"{{"timestamp":"x","type":"session_meta","payload":{{"id":"{id}","cwd":"{}"}}}}"#,
+                    dir.display()
+                ),
+            )
+            .unwrap();
+        };
+        let (id_a, id_b) = (v7_at(now_ms, 1), v7_at(now_ms, 2));
+        rollout(&home_a, &id_a);
+        rollout(&home_b, &id_b);
+
+        let mut s = Supervisor::new(24, 80);
+        s.set_launch_context(agent_ctx_plus(
+            &bin,
+            &runtime,
+            dir.clone(),
+            &[("FLEETCOM_CONFIG_DIR", &config), ("CODEX_HOME", &home_a)],
+        ));
+        s.apply(Command::Spawn {
+            command: "codex".into(),
+            cwd: dir.clone(),
+            group: None,
+        });
+        assert!(reap_until(&mut s, Duration::from_secs(5), |s| s.tasks[0]
+            .finished
+            .is_some()));
+
+        // Reconnect under home B, then save.
+        s.set_launch_context(agent_ctx_plus(
+            &bin,
+            &runtime,
+            dir.clone(),
+            &[("FLEETCOM_CONFIG_DIR", &config), ("CODEX_HOME", &home_b)],
+        ));
+        let text = save_and_read(&mut s, &config, "homepin");
+        assert!(
+            text.contains(&format!("codex resume '{id_a}'")),
+            "the recipe must resolve from the launch-time store; got {text}"
+        );
+        assert!(
+            !text.contains(&id_b),
+            "the reconnect store's decoy must not correlate; got {text}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Home resolution order: the tool's own var, then the launch env's HOME
+    /// joined with the tool's dot directory, then nothing.
+    #[test]
+    fn harness_home_prefers_the_tool_var_then_home() {
+        use crate::harness::{Claude, Codex, Grok};
+        let env: Vec<(OsString, OsString)> = vec![
+            ("HOME".into(), "/h".into()),
+            ("CODEX_HOME".into(), "/x".into()),
+        ];
+        assert_eq!(harness_home(&env, &Codex).as_deref(), Some(Path::new("/x")));
+        let env: Vec<(OsString, OsString)> = vec![("HOME".into(), "/h".into())];
+        assert_eq!(
+            harness_home(&env, &Codex).as_deref(),
+            Some(Path::new("/h/.codex"))
+        );
+        assert_eq!(
+            harness_home(&env, &Claude).as_deref(),
+            Some(Path::new("/h/.claude"))
+        );
+        assert_eq!(
+            harness_home(&env, &Grok).as_deref(),
+            Some(Path::new("/h/.grok"))
+        );
+        assert_eq!(harness_home(&[], &Codex), None);
+    }
+
+    /// With only `HOME` in the launch environment, both notify routing and
+    /// save-time correlation resolve through `<home>/.codex`.
+    #[test]
+    fn home_only_launch_env_targets_the_clients_dot_codex() {
+        let dir = scratch("home_resolve");
+        let (bin, runtime, config, home) = (
+            dir.join("bin"),
+            dir.join("run"),
+            dir.join("config"),
+            dir.join("home"),
+        );
+        let codex_home = home.join(".codex");
+        std::fs::create_dir_all(&codex_home).unwrap();
+        // A multi-line notify is Opaque: injection is suppressed only when
+        // the guard reads the client's config.toml through HOME.
+        std::fs::write(
+            codex_home.join("config.toml"),
+            "notify = [\n  \"/my/thing\",\n]\n",
+        )
+        .unwrap();
+        install_stub(&bin, "codex", &dir);
+        // A unique in-window rollout in the same tree for save-time
+        // correlation: with injection suppressed, no capture channel fires.
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let id = v7_at(now_ms, 1);
+        let (y, m, d) = civil_from_days((now_ms / 86_400_000) as i64);
+        let day = codex_home
+            .join("sessions")
+            .join(format!("{y:04}"))
+            .join(format!("{m:02}"))
+            .join(format!("{d:02}"));
+        std::fs::create_dir_all(&day).unwrap();
+        std::fs::write(
+            day.join(format!("rollout-2026-07-14T09-00-00-{id}.jsonl")),
+            format!(
+                r#"{{"timestamp":"x","type":"session_meta","payload":{{"id":"{id}","cwd":"{}"}}}}"#,
+                dir.display()
+            ),
+        )
+        .unwrap();
+
+        let mut s = Supervisor::new(24, 80);
+        s.set_launch_context(agent_ctx_plus(
+            &bin,
+            &runtime,
+            dir.clone(),
+            &[("FLEETCOM_CONFIG_DIR", &config), ("HOME", &home)],
+        ));
+        s.apply(Command::Spawn {
+            command: "codex".into(),
+            cwd: dir.clone(),
+            group: None,
+        });
+        assert_eq!(
+            s.tasks[0].harness_home.as_deref(),
+            Some(codex_home.as_path()),
+            "HOME alone must resolve the harness home"
+        );
+        let argv = wait_argv(&mut s, &dir.join("argv"));
+        assert!(
+            !argv.iter().any(|a| a.contains("notify=")),
+            "the guard must read <home>/.codex/config.toml; argv: {argv:?}"
+        );
+        assert!(reap_until(&mut s, Duration::from_secs(5), |s| s.tasks[0]
+            .finished
+            .is_some()));
+
+        let text = save_and_read(&mut s, &config, "homeonly");
+        assert!(
+            text.contains(&format!("codex resume '{id}'")),
+            "correlation must read <home>/.codex; got {text}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// With no configured notifier, instrumentation clears an inherited
+    /// `FLEETCOM_NOTIFY_CHAIN` so the capture script cannot execute it.
+    #[test]
+    fn stale_inherited_notify_chain_is_never_executed() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = scratch("stale_chain");
+        let (bin, runtime) = (dir.join("bin"), dir.join("run"));
+        // No config.toml exists: nothing routed, so nothing may be chained.
+        let codex_home = dir.join("codex_home");
+        let stale = dir.join("stale");
+        let record = dir.join("stale-record");
+        std::fs::write(&stale, format!("#!/bin/sh\ntouch '{}'\n", record.display())).unwrap();
+        std::fs::set_permissions(&stale, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        // The stub invokes the injected notify script the way codex would.
+        let payload = format!(r#"{{"type":"agent-turn-complete","thread-id":"{CAP_ID}"}}"#);
+        // The notify script sits beside the capture file, in a namespace
+        // whose nonce is unknowable before spawn: derive it from the env.
+        install_script(
+            &bin,
+            "codex",
+            &format!("\"${{FLEETCOM_CAPTURE_FILE%/*}}/codex-notify.sh\" '{payload}'"),
+        );
+        let mut s = Supervisor::new(24, 80);
+        let mut ctx = agent_ctx_plus(&bin, &runtime, dir.clone(), &[("CODEX_HOME", &codex_home)]);
+        ctx.env.push((
+            crate::harness::NOTIFY_CHAIN_ENV.into(),
+            stale.as_os_str().to_os_string(),
+        ));
+        s.set_launch_context(ctx);
+        s.apply(Command::Spawn {
+            command: "codex".into(),
+            cwd: dir.clone(),
+            group: None,
+        });
+        assert!(reap_until(&mut s, Duration::from_secs(5), |s| s.tasks[0]
+            .finished
+            .is_some()));
+        let cap = s.tasks[0].capture_file.clone().expect("capture file set");
+        assert_eq!(
+            std::fs::read_to_string(&cap).unwrap(),
+            payload,
+            "the capture write must land before the script exits"
+        );
+        assert!(
+            !record.exists(),
+            "the stale inherited chain must not execute"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Without a live or filesystem ID, an agent recipe retains the original
+    /// command.
+    #[test]
+    fn agent_save_without_any_id_keeps_the_plain_command() {
+        let dir = scratch("no_id");
+        let (bin, runtime, config) = (dir.join("bin"), dir.join("run"), dir.join("config"));
+        // CODEX_HOME names a store that never exists: correlation has
+        // nothing to find, and the notify routing nothing to read.
+        let codex_home = dir.join("codex_home");
+        install_stub(&bin, "codex", &dir);
+        let mut s = Supervisor::new(24, 80);
+        s.set_launch_context(agent_ctx_plus(
+            &bin,
+            &runtime,
+            dir.clone(),
+            &[
+                ("FLEETCOM_CONFIG_DIR", &config),
+                ("CODEX_HOME", &codex_home),
+            ],
+        ));
+        s.apply(Command::Spawn {
+            command: "codex".into(),
+            cwd: dir.clone(),
+            group: None,
+        });
+        assert!(reap_until(&mut s, Duration::from_secs(5), |s| s.tasks[0]
+            .finished
+            .is_some()));
+
+        let text = save_and_read(&mut s, &config, "plainagent");
+        assert!(
+            text.contains("\"codex\""),
+            "the plain command must survive; got {text}"
+        );
+        assert!(
+            !text.contains("resume"),
+            "no id exists, so nothing may be rewritten; got {text}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A representable `notify` assignment runs through the injected notifier
+    /// after the capture write.
+    #[test]
+    fn config_toml_notify_chains_through_the_injected_script() {
+        use crate::harness::NOTIFY_CHAIN_ENV;
+        use std::os::unix::fs::PermissionsExt;
+        let dir = scratch("cfg_chain");
+        let (bin, runtime) = (dir.join("bin"), dir.join("run"));
+        let codex_home = dir.join("codex_home");
+        std::fs::create_dir_all(&codex_home).unwrap();
+        // The notifier path contains spaces and carries a fixed argument.
+        let notifier = dir.join("Fake App.app").join("Sky Client");
+        let record = dir.join("notifier-record");
+        std::fs::create_dir_all(notifier.parent().unwrap()).unwrap();
+        std::fs::write(
+            &notifier,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\n",
+                record.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&notifier, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::write(
+            codex_home.join("config.toml"),
+            format!("notify = [\"{}\", \"turn-ended\"]\n", notifier.display()),
+        )
+        .unwrap();
+
+        // The stub records argv and the chain env, then invokes the notify
+        // script with notification JSON as the final argument.
+        let payload = format!(r#"{{"type":"agent-turn-complete","thread-id":"{CAP_ID}"}}"#);
+        install_script(
+            &bin,
+            "codex",
+            &format!(
+                "printf '%s\\n' \"$@\" > '{out}/argv'\n\
+                 printf '%s' \"${chain}\" > '{out}/chainenv'\n\
+                 \"${{FLEETCOM_CAPTURE_FILE%/*}}/codex-notify.sh\" '{payload}'",
+                out = dir.display(),
+                chain = NOTIFY_CHAIN_ENV,
+            ),
+        );
+        let mut s = Supervisor::new(24, 80);
+        s.set_launch_context(agent_ctx_plus(
+            &bin,
+            &runtime,
+            dir.clone(),
+            &[("CODEX_HOME", &codex_home)],
+        ));
+        s.apply(Command::Spawn {
+            command: "codex".into(),
+            cwd: dir.clone(),
+            group: None,
+        });
+        let argv = wait_argv(&mut s, &dir.join("argv"));
+        assert!(
+            argv.iter().any(|a| a.starts_with("notify=[")),
+            "a chained spawn must still inject the override; argv: {argv:?}"
+        );
+        assert!(
+            reap_until(&mut s, Duration::from_secs(5), |_| record.exists()),
+            "the chained notifier never ran"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("chainenv")).unwrap(),
+            format!("{}\nturn-ended", notifier.display()),
+            "the child env must carry the displaced argv, newline-joined"
+        );
+        let cap = s.tasks[0].capture_file.clone().unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&cap).unwrap(),
+            payload,
+            "the capture write must precede the chain handoff"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&record).unwrap(),
+            format!("turn-ended\n{payload}\n"),
+            "the notifier must receive its original args plus the payload"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An unrepresentable `notify` value disables injection, while a commented
+    /// assignment defines no route and leaves injection enabled.
+    #[test]
+    fn unrepresentable_config_notify_suppresses_injection() {
+        let dir = scratch("cfg_guard");
+        let (bin, runtime) = (dir.join("bin"), dir.join("run"));
+        let codex_home = dir.join("codex_home");
+        std::fs::create_dir_all(&codex_home).unwrap();
+        // A multi-line array is out of the line-based parser's reach.
+        std::fs::write(
+            codex_home.join("config.toml"),
+            "notify = [\n  \"/my/thing\",\n]\n",
+        )
+        .unwrap();
+        install_stub(&bin, "codex", &dir);
+        let mut s = Supervisor::new(24, 80);
+        s.set_launch_context(agent_ctx_plus(
+            &bin,
+            &runtime,
+            dir.clone(),
+            &[("CODEX_HOME", &codex_home)],
+        ));
+        s.apply(Command::Spawn {
+            command: "codex".into(),
+            cwd: dir.clone(),
+            group: None,
+        });
+        let argv = wait_argv(&mut s, &dir.join("argv"));
+        assert!(
+            !argv.iter().any(|a| a.contains("notify=")),
+            "fleetcom must not guess at an unparseable notify; argv: {argv:?}"
+        );
+
+        // The same route commented out is inert: the injection returns.
+        std::fs::write(
+            codex_home.join("config.toml"),
+            "# notify = [\"/my/thing\"]\n",
+        )
+        .unwrap();
+        std::fs::remove_file(dir.join("argv")).unwrap();
+        s.apply(Command::Spawn {
+            command: "codex".into(),
+            cwd: dir.clone(),
+            group: None,
+        });
+        let argv = wait_argv(&mut s, &dir.join("argv"));
+        assert!(
+            argv.iter().any(|a| a.starts_with("notify=[")),
+            "a commented notify must not suppress the injection; argv: {argv:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Non-agent commands remain plain string entries in persisted JSON.
+    #[test]
+    fn non_agent_entries_survive_save_as_plain_strings() {
+        let dir = scratch("plain_save");
+        let config = dir.join("config");
+        let mut s = Supervisor::new(24, 80);
+        s.set_launch_context(LaunchContext {
+            env: vec![
+                ("SHELL".into(), "/bin/sh".into()),
+                (
+                    "FLEETCOM_CONFIG_DIR".into(),
+                    config.clone().into_os_string(),
+                ),
+            ],
+            cwd: dir.clone(),
+        });
+        s.apply(Command::Spawn {
+            command: "sleep 30".into(),
+            cwd: dir.clone(),
+            group: None,
+        });
+        let text = save_and_read(&mut s, &config, "plain");
+        assert!(
+            text.contains("\"sleep 30\""),
+            "string-form member expected; got {text}"
+        );
+        assert!(
+            !text.contains("\"cmd\""),
+            "no object form for an unadorned entry; got {text}"
+        );
+        let cfg = session::load_in(&config.join("sessions"), "plain").unwrap();
+        assert_eq!(
+            cfg[&path::abbreviate(&dir)],
+            vec![SessionEntry {
+                cmd: "sleep 30".into(),
+                group: None,
+                name: None,
+            }]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

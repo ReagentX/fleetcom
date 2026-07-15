@@ -10,6 +10,7 @@ Running several long-lived commands becomes cumbersome once they span terminal p
 - Provides read-only previews and full interactive attachment.
 - Keeps jobs running after the client disconnects.
 - Saves and reloads task recipes with directories, commands, group assignments, and display names.
+- Saves resumable `claude`, `codex`, and `grok` commands when it can identify their conversations.
 - Launches commands in other directories through the `@` picker.
 
 ## Documentation
@@ -37,7 +38,7 @@ From the project root:
 
 ## Usage
 
-`fleetcom` exposes four operating modes:
+`fleetcom` supports these invocations:
 
 - `fleetcom`
   - Connects to the daemon (autostarting it if needed) and opens the dashboard
@@ -67,6 +68,7 @@ The first ordinary invocation starts the daemon when necessary. `--daemon` is an
 | `m` | tag the task "in use" (prioritizes it within the active grouping) |
 | `g` | assign the selected task to a named group (picker: pick, create, or clear) |
 | `R` | rename the selected task: a display name shown in place of the command (an empty prompt clears it) |
+| `r` | rerun a finished task; supported agent tasks resume the captured conversation |
 | `X` | kill a running task (`TERM`, then `KILL` after 2 s), or remove a finished one (Shift-gated); removal sweeps any background processes the job left in its group, with the same `TERM`-then-`KILL` grace |
 | `w` | save the current tasks as a session |
 | `o` | load a saved session |
@@ -84,11 +86,11 @@ The first ordinary invocation starts the daemon when necessary. `--daemon` is an
 
 ### One PTY per command
 
-Every task runs in its own pseudo-terminal, emulated with `alacritty_terminal`. Fleetcom answers cursor-position and device-attribute queries, renders `?2026` synchronized updates as whole frames, and reflows history after a resize. The dashboard preview, peek overlay, and attached view all read the same emulated screen grid. As a result, full-screen programs such as `vim` and `htop` retain one consistent terminal state across views. Backgrounding changes client focus without notifying the child.
+Every task runs in its own pseudo-terminal, emulated with `alacritty_terminal`. `fleetcom` answers cursor-position and device-attribute queries, renders `?2026` synchronized updates as whole frames, and reflows history after a resize. The dashboard preview, peek overlay, and attached view all read the same emulated screen grid. As a result, full-screen programs such as `vim` and `htop` retain one consistent terminal state across views. Backgrounding changes client focus without notifying the child.
 
 ### Input fidelity
 
-Attached input follows the terminal modes reported by the child. Modified Enter becomes `ESC CR` when the terminal reports the modifier. Paste receives bracketed-paste markers only when the child enables them. Mouse events go to children that request a mouse protocol. Full-screen children receive alternate-scroll input only while DECSET 1007 is enabled; otherwise Fleetcom suppresses wheel events. Each task retains 2,000 lines of scrollback. For inline children, wheel-up or `Shift+PageUp` enters history; paging keys navigate it, while `Esc` or ordinary input returns to live output. [`docs/commands.md`](docs/commands.md) documents the exact routing rules.
+Attached input follows the terminal modes reported by the child. Modified Enter becomes `ESC CR` when the terminal reports the modifier. Paste receives bracketed-paste markers only when the child enables them. Mouse events go to children that request a mouse protocol. Full-screen children receive alternate-scroll input only while DECSET 1007 is enabled; otherwise `fleetcom` suppresses wheel events. Each task retains 2,000 lines of scrollback. For inline children, wheel-up or `Shift+PageUp` enters history; paging keys navigate it, while `Esc` or ordinary input returns to live output. [`docs/commands.md`](docs/commands.md) documents the exact routing rules.
 
 ### Jobs outlive the UI
 
@@ -96,7 +98,7 @@ A per-user daemon owns the processes and their terminals. `q` disconnects the cl
 
 `Q` and `fleetcom --kill` stop the daemon and send `SIGTERM` to each job's process group, followed by `SIGKILL` after a two-second grace period. Sending `SIGTERM`, `SIGINT`, or `SIGHUP` directly to the daemon uses the same shutdown path. `fleetcom --kill` reads the daemon PID from the lock file, so it also works while another client occupies the socket. If the connection drops, the client discards the task snapshot it can no longer verify and offers to reconnect.
 
-Signals target each task's process group. Fleetcom leaves an exited leader unreaped until final cleanup, preserving the process-group ID so background children remain signalable. A process that creates a new session or double-forks out of the group is outside Fleetcom's control.
+Signals target each task's process group. `fleetcom` leaves an exited leader unreaped until final cleanup, preserving the process-group ID so background children remain signalable. A process that creates a new session or double-forks out of the group is outside `fleetcom`'s control.
 
 ### Grouping and launch targets
 
@@ -104,11 +106,15 @@ The dashboard groups tasks by state (In use / Running / Completed), working dire
 
 ### Task names
 
-`R` gives the selected task a display name. The dashboard row and peek title show the name in place of the command; the attached status bar shows `name · command`. An empty prompt clears the name, and rerun preserves it. Fleetcom removes control characters, trims surrounding whitespace, and limits names to 64 characters.
+`R` gives the selected task a display name. The dashboard row and peek title show the name in place of the command; the attached status bar shows `name · command`. An empty prompt clears the name, and rerun preserves it. `fleetcom` removes control characters, trims surrounding whitespace, and limits names to 64 characters.
 
 ### Sessions
 
-`w`, `o`, and `fleetcom <name>` save or load named recipes. A recipe retains each task's directory, command, group assignment, and display name. Loading starts new processes; it does not recover the processes that existed when the recipe was saved. Process continuity comes from the daemon, while sessions provide repeatable launches.
+`w`, `o`, and `fleetcom <name>` save or load named recipes. A recipe retains each task's directory, saved launch command, group assignment, and display name. Loading starts new processes; it does not recover the processes that existed when the recipe was saved. Process continuity comes from the daemon, while sessions provide repeatable launches.
+
+### Agent session resume
+
+Session recipes store commands, which is insufficient for agent CLIs: relaunching a bare `claude`, `codex`, or `grok` command starts another conversation. When `fleetcom` obtains a valid ID, save and rerun (`r`) use `claude --resume '<id>'`, `codex resume '<id>'`, or `grok --resume '<id>'`. Detection is deliberately narrow. Only the bare program word and `fleetcom`'s canonical resume form participate; flags, prompts, subcommands, and shell syntax run and save verbatim. [`agent-resume.md`](src/harness/agent-resume.md) documents the capture evidence, precedence, and failure behavior.
 
 ## Notes
 
@@ -122,7 +128,7 @@ The dashboard groups tasks by state (In use / Running / Completed), working dire
 
 ### When to avoid it
 
-- For interactive multiplexing of persistent shells, use `tmux`; Fleetcom runs one command per task.
+- For interactive multiplexing of persistent shells, use `tmux`; `fleetcom` runs one command per task.
 - It is not a full process manager: the fleet's lifetime is bounded by the daemon's (see the first limitation below).
 
 ### Known limitations
