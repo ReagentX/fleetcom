@@ -14,6 +14,7 @@
 pub mod assets;
 mod claude;
 mod codex;
+mod grok;
 
 use std::{
     ffi::OsString,
@@ -25,6 +26,7 @@ use std::{
 
 pub use claude::Claude;
 pub use codex::Codex;
+pub use grok::Grok;
 
 /// Environment variable naming the capture file used by injected assets.
 pub const CAPTURE_ENV: &str = "FLEETCOM_CAPTURE_FILE";
@@ -81,7 +83,7 @@ pub trait Harness: Sync {
 }
 
 /// Harness registry in detection order.
-pub static HARNESSES: &[&dyn Harness] = &[&Claude, &Codex];
+pub static HARNESSES: &[&dyn Harness] = &[&Claude, &Codex, &Grok];
 
 /// Return the first harness that recognizes `cmd`.
 pub fn detect(cmd: &str) -> Option<(&'static dyn Harness, Invocation)> {
@@ -100,8 +102,8 @@ pub struct Invocation {
     /// command does not contain a recognized UUID target.
     pub known_id: Option<String>,
     /// Whether `instrument` may pin a fresh session ID at launch. This is
-    /// false for `codex` and for `claude` commands carrying `--resume`,
-    /// `--continue`, `--fork-session`, or `--session-id`.
+    /// false for `codex` and for `claude` or `grok` commands carrying
+    /// `--resume`, `--continue`, `--fork-session`, or `--session-id`.
     pub can_inject_id: bool,
 }
 
@@ -262,6 +264,15 @@ pub(crate) fn tokenize(cmd: &str) -> Option<Vec<Word>> {
         words.push(w);
     }
     Some(words)
+}
+
+/// Include preceding whitespace when removing a token.
+pub(crate) fn erase_start(cmd: &str, mut start: usize) -> usize {
+    let b = cmd.as_bytes();
+    while start > 0 && matches!(b[start - 1], b' ' | b'\t') {
+        start -= 1;
+    }
+    start
 }
 
 /// Single-quote `s` for `$SHELL -c`, encoding embedded `'` as `'\''`.
@@ -428,6 +439,7 @@ mod tests {
     fn home_env_vars_name_each_tools_override() {
         assert_eq!(Claude.home_env_var(), "CLAUDE_CONFIG_DIR");
         assert_eq!(Codex.home_env_var(), "CODEX_HOME");
+        assert_eq!(Grok.home_env_var(), "GROK_HOME");
     }
 
     #[test]
@@ -438,6 +450,9 @@ mod tests {
         let (h, inv) = detect("codex").unwrap();
         assert_eq!(h.name(), "codex");
         assert!(!inv.can_inject_id);
+        let (h, inv) = detect("grok").unwrap();
+        assert_eq!(h.name(), "grok");
+        assert!(inv.can_inject_id);
         assert!(detect("vim").is_none());
         assert!(detect("").is_none());
     }

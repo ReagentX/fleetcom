@@ -2655,6 +2655,65 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A `grok` spawn receives exactly the pinned ID: no settings overlay,
+    /// no config override, and no capture environment (grok has no
+    /// injectable live channel). The saved recipe resumes the pinned ID.
+    #[test]
+    fn spawn_grok_pins_an_id_and_injects_nothing_else() {
+        let dir = scratch("cap_grok");
+        let (bin, runtime, config) = (dir.join("bin"), dir.join("run"), dir.join("config"));
+        install_stub(&bin, "grok", &dir);
+        let mut s = Supervisor::new(24, 80);
+        // GROK_HOME stays inside the scratch tree so save-time correlation
+        // can never read a real store.
+        s.set_launch_context(agent_ctx_plus(
+            &bin,
+            &runtime,
+            dir.clone(),
+            &[
+                ("FLEETCOM_CONFIG_DIR", &config),
+                ("GROK_HOME", &dir.join("grok_home")),
+            ],
+        ));
+        s.apply(Command::Spawn {
+            command: "grok".into(),
+            cwd: dir.clone(),
+            group: None,
+        });
+
+        let argv = wait_argv(&mut s, &dir.join("argv"));
+        assert_eq!(
+            argv.len(),
+            2,
+            "only the pinned id may be injected: {argv:?}"
+        );
+        assert_eq!(argv[0], "--session-id");
+        let id = argv[1].clone();
+        assert!(
+            crate::harness::is_uuid(&id),
+            "the pinned id must be a strict uuid: {id:?}"
+        );
+        // The stub recorded an empty FLEETCOM_CAPTURE_FILE: no capture env.
+        assert_eq!(
+            std::fs::read_to_string(dir.join("capenv")).unwrap(),
+            "",
+            "grok has no capture channel, so the env must not name one"
+        );
+        let t = &s.tasks[0];
+        assert_eq!(
+            t.command, "grok",
+            "instrumentation must never leak into the stored command"
+        );
+        assert_eq!(t.resume_id.as_deref(), Some(id.as_str()));
+
+        let text = save_and_read(&mut s, &config, "grokpin");
+        assert!(
+            text.contains(&format!("grok --resume '{id}'")),
+            "the recipe must resume the pinned session; got {text}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// A `claude` exit hint becomes the session ID used by the saved recipe.
     #[test]
     fn exit_hint_is_scraped_and_saved_as_a_resume() {

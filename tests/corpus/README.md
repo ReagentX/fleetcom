@@ -18,6 +18,7 @@ binary capture.
 | --- | --- | --- |
 | `claude_resume.bin` | recorded `claude --session-id` session: one prompt, reply, `/exit` | alternate-screen exit followed by the primary-screen resume hint (`claude --resume <uuid>`); the scrape target for harness exit capture |
 | `codex_resume.bin` | real `codex resume` session replay | top-anchored DECSTBM scroll regions (`CSI 1;N r`), reverse index, inline-TUI history insertion |
+| `grok_resume.bin` | recorded `grok --session-id` session under `script -q` inside a fleetcom task PTY: one prompt, reply, `/exit` | primary-screen exit followed by the resume hint (`grok --resume <uuid>`); the scrape target for harness exit capture |
 | `tmux_split.bin` | `tmux` session with two splits and one command per pane | scroll regions, pane borders, full redraws |
 | `vim_session.bin` | `vim -u NONE`: insert, navigate, `:set number`, `:q!` | alternate screen, cursor addressing, line editing |
 | `less_altscreen.bin` | `less` over `/usr/share/dict/words`: page, `G`, `g`, `q` | alternate-screen entry and exit, full-screen paging |
@@ -38,8 +39,9 @@ The fixtures cover three classes of behavior:
 - `codex_resume`, `wide_emoji`, `dec_scrollregion`, and `topregion_scroll` pin
   parser semantics: scrollback retention, intensity stacking, charset
   translation, and VS16 width.
-- `claude_resume` verifies that retained terminal text preserves the exit hint
-  consumed by the Claude harness.
+- `claude_resume` and `grok_resume` verify that retained terminal text
+  preserves the exit hint consumed by the Claude and Grok harnesses.
 
 `src/golden.rs` contains the absolute display and parser expectations.
-`src/harness/claude.rs` contains the Claude scrape expectation.
+`src/harness/claude.rs` and `src/harness/grok.rs` contain the Claude and Grok
+scrape expectations.

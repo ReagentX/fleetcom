@@ -9,8 +9,8 @@
 use std::{fs, path::Path, time::SystemTime};
 
 use super::{
-    CAPTURE_ENV, CapturePaths, Harness, Invocation, SpawnPlan, is_uuid, leading_uuid, shell_quote,
-    tokenize, uuid_v4, within_window,
+    CAPTURE_ENV, CapturePaths, Harness, Invocation, SpawnPlan, erase_start, is_uuid, leading_uuid,
+    shell_quote, tokenize, uuid_v4, within_window,
 };
 
 /// Subcommands excluded from session capture.
@@ -277,15 +277,6 @@ fn slug(cwd: &Path) -> Option<String> {
             .map(|c| if c == '/' || c == '.' { '-' } else { c })
             .collect(),
     )
-}
-
-/// Include preceding whitespace when removing a token.
-fn erase_start(cmd: &str, mut start: usize) -> usize {
-    let b = cmd.as_bytes();
-    while start > 0 && matches!(b[start - 1], b' ' | b'\t') {
-        start -= 1;
-    }
-    start
 }
 
 #[cfg(test)]

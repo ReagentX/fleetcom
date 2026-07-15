@@ -10,7 +10,7 @@ Running several long-lived commands becomes cumbersome once they span terminal p
 - Provides read-only previews and full interactive attachment.
 - Keeps jobs running after the client disconnects.
 - Saves and reloads task recipes with directories, commands, group assignments, and display names.
-- Captures `claude` and `codex` conversation IDs and saves commands that resume them.
+- Captures `claude`, `codex`, and `grok` conversation IDs and saves commands that resume them.
 - Launches commands in other directories through the `@` picker.
 
 ## Documentation
@@ -113,7 +113,7 @@ The dashboard groups tasks by state (In use / Running / Completed), working dire
 
 ### Agent session resume
 
-Relaunching a bare `claude` or `codex` command starts another conversation. `fleetcom` captures the ID and stores `claude --resume '<id>'` or `codex resume '<id>'` when saving or rerunning (`r`) a task. If capture is unavailable—for example, for a piped command or excluded subcommand—`fleetcom` keeps the original command. [`agent-resume.md`](src/harness/agent-resume.md) documents the capture and rewrite mechanics.
+Relaunching a bare `claude`, `codex`, or `grok` command starts another conversation. `fleetcom` captures the ID and stores a resuming command — `claude --resume '<id>'`, `codex resume '<id>'`, or `grok --resume '<id>'` — when saving or rerunning (`r`) a task. If capture is unavailable—for example, for a piped command or excluded subcommand—`fleetcom` keeps the original command. [`agent-resume.md`](src/harness/agent-resume.md) documents the capture and rewrite mechanics.
 
 ## Notes
 
