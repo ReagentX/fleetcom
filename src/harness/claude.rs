@@ -10,22 +10,113 @@
 use std::{fs, path::Path, time::SystemTime};
 
 use super::{
-    CAPTURE_ENV, CapturePaths, Harness, Invocation, SpawnPlan, erase_start, is_uuid, leading_uuid,
-    shell_quote, tokenize, uuid_v4, within_window,
+    CAPTURE_ENV, CapturePaths, FlagTable, Harness, Invocation, SpawnPlan, erase_start, is_uuid,
+    leading_uuid, shell_quote, tokenize, uuid_v4, within_window,
 };
 
-/// Subcommands excluded from session capture.
+/// Subcommands excluded from session capture, from `claude --help`'s
+/// Commands section (audited 2026-07-15). Entries the CLI has since dropped
+/// stay listed: refusing a one-word prompt that collides with a dead
+/// subcommand costs one capture, while missing a live one breaks the spawn.
 const BLOCKLIST: &[&str] = &[
     "agents",
-    "mcp",
-    "doctor",
-    "update",
-    "install",
-    "plugin",
+    "auth",
+    "auto-mode",
     "config",
-    "setup-token",
+    "doctor",
+    "gateway",
+    "install",
+    "mcp",
     "migrate-installer",
+    "plugin",
+    "plugins", // alias of plugin
+    "project",
+    "setup-token",
+    "ultrareview",
+    "update",
+    "upgrade", // alias of update
 ];
+
+/// Top-level `claude` flag grammar, enumerated from `claude --help`. The id
+/// flags (`--resume`/`-r`, `--session-id`, `--continue`/`-c`, `--fork-session`)
+/// are listed for completeness but intercepted in `detect` before this table
+/// is consulted. An unmodeled flag makes the command opaque.
+const FLAGS: FlagTable = FlagTable {
+    value: &[
+        "--agent",
+        "--agents",
+        "--append-system-prompt",
+        "--debug-file",
+        "--effort",
+        "--fallback-model",
+        "--input-format",
+        "--json-schema",
+        "--max-budget-usd",
+        "--model",
+        "-n",
+        "--name",
+        "--output-format",
+        "--permission-mode",
+        "--remote-control-session-name-prefix",
+        "--session-id",
+        "--setting-sources",
+        "--settings",
+        "--system-prompt",
+    ],
+    optional: &[
+        "-d",
+        "--debug",
+        "--from-pr",
+        "--prompt-suggestions",
+        "--remote-control",
+        "-r",
+        "--resume",
+        "-w",
+        "--worktree",
+    ],
+    variadic: &[
+        "--add-dir",
+        "--allowedTools",
+        "--allowed-tools",
+        "--betas",
+        "--disallowedTools",
+        "--disallowed-tools",
+        "--file",
+        "--mcp-config",
+        "--tools",
+    ],
+    boolean: &[
+        "--allow-dangerously-skip-permissions",
+        "--ax-screen-reader",
+        "--background",
+        "--bare",
+        "--bg",
+        "--brief",
+        "--chrome",
+        "-c",
+        "--continue",
+        "--dangerously-skip-permissions",
+        "--disable-slash-commands",
+        "--exclude-dynamic-system-prompt-sections",
+        "--fork-session",
+        "-h",
+        "--help",
+        "--ide",
+        "--include-hook-events",
+        "--include-partial-messages",
+        "--no-chrome",
+        "--no-session-persistence",
+        "-p",
+        "--print",
+        "--replay-user-messages",
+        "--safe-mode",
+        "--strict-mcp-config",
+        "--tmux",
+        "--verbose",
+        "-v",
+        "--version",
+    ],
+};
 
 pub struct Claude;
 
@@ -53,9 +144,19 @@ impl Harness for Claude {
         let mut i = 1;
         while i < words.len() {
             let t = words[i].text.as_str();
-            // Consume values for flags this parser interprets so they cannot
-            // be mistaken for a subcommand. Values of other flags are not
-            // modeled; a blocklisted value makes the command opaque.
+            if !t.starts_with('-') {
+                // First positional: a subcommand or a prompt string.
+                if !saw_positional {
+                    if BLOCKLIST.contains(&t) {
+                        return None;
+                    }
+                    saw_positional = true;
+                }
+                i += 1;
+                continue;
+            }
+            // Id-relevant flags first: they disable launch pinning and may
+            // carry a target uuid.
             if t == "--resume" || t == "-r" {
                 can_inject_id = false;
                 if let Some(next) = words.get(i + 1).map(|w| w.text.as_str())
@@ -94,17 +195,11 @@ impl Harness for Claude {
                 if is_uuid(v) && known_id.is_none() {
                     known_id = Some(v.to_string());
                 }
-            } else if t == "--settings" {
-                if words.get(i + 1).is_some_and(|w| !w.text.starts_with('-')) {
-                    i += 2;
-                    continue;
-                }
-            } else if !t.starts_with('-') && !saw_positional {
-                // First positional: a subcommand or a prompt string.
-                if BLOCKLIST.contains(&t) {
-                    return None;
-                }
-                saw_positional = true;
+            } else {
+                // Any other flag: skip the value it consumes so it cannot
+                // shadow the subcommand. An unmodeled flag refuses.
+                i = FLAGS.skip_flag(&words, i)?;
+                continue;
             }
             i += 1;
         }
@@ -358,6 +453,39 @@ mod tests {
             assert_eq!(inv.known_id, None, "{cmd}");
             assert!(!inv.can_inject_id, "{cmd}");
         }
+    }
+
+    /// An unmodeled flag's value must not shadow a subcommand: the strict
+    /// table skips each known flag's value and refuses an unknown flag.
+    #[test]
+    fn detect_refuses_unknown_flags_and_skips_value_flags() {
+        // Finding B: `--model`'s value must not become the first positional,
+        // leaving `plugin` unchecked against the blocklist.
+        assert!(Claude.detect("claude --model opus plugin list").is_none());
+        assert!(Claude.detect("claude --model=opus plugin").is_none());
+        assert!(Claude.detect("claude -n myname plugin").is_none());
+        // A value flag before an ordinary prompt: still detected.
+        assert!(Claude.detect("claude --model opus 'do x'").is_some());
+        // A variadic flag consumes its list, then the prompt stands.
+        assert!(Claude.detect("claude --add-dir /a /b 'do x'").is_some());
+        // An optional-value flag binds a following non-flag token, so it is
+        // the debug filter, not a subcommand.
+        assert!(Claude.detect("claude -d plugin").is_some());
+        // But an optional flag before another flag does not bind it; `--model`
+        // then eats `opus` and `plugin` is the subcommand: refuse.
+        assert!(
+            Claude
+                .detect("claude --debug --model opus plugin")
+                .is_none()
+        );
+        // An unmodeled flag makes the whole command opaque.
+        assert!(Claude.detect("claude --made-up-flag x").is_none());
+        // A value flag still yields the resume target that follows it.
+        let inv = Claude
+            .detect(&format!("claude --model opus --resume {ID}"))
+            .unwrap();
+        assert_eq!(inv.known_id.as_deref(), Some(ID));
+        assert!(!inv.can_inject_id);
     }
 
     #[test]

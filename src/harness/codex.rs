@@ -12,13 +12,14 @@ use std::{
 };
 
 use super::{
-    CAPTURE_ENV, CapturePaths, Harness, Invocation, NOTIFY_CHAIN_ENV, SpawnPlan, Word, is_uuid,
-    leading_uuid, shell_quote, splice_insert, tokenize, within_window_ms,
+    CAPTURE_ENV, CapturePaths, FlagTable, Harness, Invocation, NOTIFY_CHAIN_ENV, Scan, SpawnPlan,
+    is_uuid, leading_uuid, shell_quote, splice_insert, tokenize, within_window_ms,
 };
 
 /// Subcommands excluded from session capture.
 const BLOCKLIST: &[&str] = &[
     "exec",
+    "e", // alias of exec
     "review",
     "login",
     "logout",
@@ -34,6 +35,7 @@ const BLOCKLIST: &[&str] = &[
     "sandbox",
     "debug",
     "apply",
+    "a", // alias of apply
     "archive",
     "delete",
     "unarchive",
@@ -87,12 +89,14 @@ const BOOL_FLAGS: &[&str] = &[
     "--version",
 ];
 
-/// Whether `flag` is a known `codex` top-level flag. A flag in neither table
-/// makes the command opaque because its value could be mistaken for a
-/// subcommand or prompt.
-fn is_known_flag(flag: &str) -> bool {
-    VALUE_FLAGS.contains(&flag) || BOOL_FLAGS.contains(&flag)
-}
+/// Codex has no optional-value or variadic top-level flags, so those tables
+/// are empty. A flag in neither table makes the command opaque.
+const TABLE: FlagTable = FlagTable {
+    value: VALUE_FLAGS,
+    optional: &[],
+    variadic: &[],
+    boolean: BOOL_FLAGS,
+};
 
 pub struct Codex;
 
@@ -115,7 +119,7 @@ impl Harness for Codex {
             return None;
         }
         let mut known_id: Option<String> = None;
-        match first_positional(&words, 1) {
+        match TABLE.first_positional(&words, 1) {
             // An unrecognized flag makes the command opaque: refuse rather
             // than risk misreading its value as the subcommand.
             Scan::Opaque => return None,
@@ -129,7 +133,7 @@ impl Harness for Codex {
                 // <name>` and bare `resume` leave the user's target
                 // untouched. Any other positional is a prompt.
                 if sub == "resume" {
-                    match first_positional(&words, si + 1) {
+                    match TABLE.first_positional(&words, si + 1) {
                         Scan::Opaque => return None,
                         Scan::Positional(ti) if is_uuid(&words[ti].text) => {
                             known_id = Some(words[ti].text.clone());
@@ -291,7 +295,7 @@ impl Harness for Codex {
         if words.is_empty() {
             return cmd.to_string();
         }
-        let si = match first_positional(&words, 1) {
+        let si = match TABLE.first_positional(&words, 1) {
             // Opaque: an unknown flag. detect already refused it, so this is
             // defensive; leave the command untouched.
             Scan::Opaque => return cmd.to_string(),
@@ -309,7 +313,7 @@ impl Harness for Codex {
             // Prompt positional: `resume <id>` precedes it; the prompt stays.
             return splice_insert(cmd, words[0].end, &format!(" resume {}", shell_quote(id)));
         }
-        match first_positional(&words, si + 1) {
+        match TABLE.first_positional(&words, si + 1) {
             Scan::Opaque => cmd.to_string(),
             Scan::Positional(ti) if is_uuid(&words[ti].text) => {
                 let mut out = cmd.to_string();
@@ -325,79 +329,6 @@ impl Harness for Codex {
             Scan::Exhausted => cmd.to_string(),
         }
     }
-}
-
-/// Outcome of a positional scan. Distinguishing `Exhausted` (only known
-/// flags remained) from `Opaque` (an unrecognized flag) lets callers refuse
-/// a command they cannot parse instead of guessing a subcommand.
-enum Scan {
-    /// First non-flag token, at this index.
-    Positional(usize),
-    /// End of the words with no positional; every flag was recognized.
-    Exhausted,
-    /// An unrecognized flag: the command is opaque and must not be rewritten.
-    Opaque,
-}
-
-/// Whether `flag` consumes the following token as a separate value, is
-/// self-contained (bool, or an attached `--flag=value` / `-fvalue`), or is
-/// unrecognized.
-enum FlagKind {
-    SeparateValue,
-    SelfContained,
-    Unknown,
-}
-
-/// Classify a `-`-prefixed token against the strict flag tables. The
-/// `--flag=value`, `-fvalue`, and `-f=value` spellings are self-contained: a
-/// value fused into the token can never desync the positional walk, so only
-/// the flag name needs to be known.
-fn classify_flag(t: &str) -> FlagKind {
-    if VALUE_FLAGS.contains(&t) {
-        return FlagKind::SeparateValue;
-    }
-    if BOOL_FLAGS.contains(&t) {
-        return FlagKind::SelfContained;
-    }
-    // Short flag with a directly attached value (`-cvalue`, `-c=value`). The
-    // value may itself contain `=`, so this must precede the `--flag=value`
-    // split below.
-    // `get` rather than indexing: a multibyte char straight after the dash
-    // (`-éx`) has no byte-2 boundary, and a recipe command must never be
-    // able to panic the supervisor. No boundary there also means no ASCII
-    // short flag, so falling through to Unknown is the correct reading.
-    if t.starts_with('-')
-        && !t.starts_with("--")
-        && t.len() > 2
-        && t.get(..2).is_some_and(|p| VALUE_FLAGS.contains(&p))
-    {
-        return FlagKind::SelfContained;
-    }
-    // Long flag with an attached assignment: `--config=notify=…`.
-    if let Some((name, _)) = t.split_once('=')
-        && is_known_flag(name)
-    {
-        return FlagKind::SelfContained;
-    }
-    FlagKind::Unknown
-}
-
-/// Scan for the first non-flag token at or after `from`, skipping each known
-/// flag (and the separate value of a [`VALUE_FLAGS`] entry). An unrecognized
-/// flag stops the scan with [`Scan::Opaque`].
-fn first_positional(words: &[Word], mut from: usize) -> Scan {
-    while from < words.len() {
-        let t = words[from].text.as_str();
-        if !t.starts_with('-') {
-            return Scan::Positional(from);
-        }
-        match classify_flag(t) {
-            FlagKind::SeparateValue => from += 2,
-            FlagKind::SelfContained => from += 1,
-            FlagKind::Unknown => return Scan::Opaque,
-        }
-    }
-    Scan::Exhausted
 }
 
 /// Whether the command already routes notifications through `-c notify=…`,
@@ -1070,6 +1001,10 @@ mod tests {
         );
         // Blocklisted and unparseable commands pass through unchanged.
         assert_eq!(Codex.resume_command("codex exec 'x'", ID), "codex exec 'x'");
+        // A subcommand alias (`e` for exec, `a` for apply) is blocklisted too,
+        // so it is never rewritten into `codex resume '<id>' e …`.
+        assert_eq!(Codex.resume_command("codex e 'x'", ID), "codex e 'x'");
+        assert_eq!(Codex.resume_command("codex a", ID), "codex a");
         assert_eq!(Codex.resume_command("codex; ls", ID), "codex; ls");
         assert_eq!(Codex.resume_command("codex", "not-an-id"), "codex");
     }

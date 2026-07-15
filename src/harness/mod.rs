@@ -204,9 +204,11 @@ pub(crate) struct Word {
 /// appended flags would be recorded but never execute. A word that resolves
 /// to exactly `--` is refused even when quoted: the shell strips quotes
 /// before argv, the CLI reads `--` as the flag terminator either way, and
-/// appended flags would land in prompt text. A `$` inside double quotes is
-/// accepted because the tokenizer preserves the original bytes and leaves
-/// expansion to the shell.
+/// appended flags would land in prompt text. Inside double quotes, `$`,
+/// backtick, and `\` also refuse: the shell expands or unescapes them, so the
+/// decoded token would diverge from the argv the CLI receives (`codex "$MODE"`
+/// can run `codex exec`), and a `\"` would split the word at the wrong quote.
+/// Single-quoted bytes are literal and stay accepted.
 pub(crate) fn tokenize(cmd: &str) -> Option<Vec<Word>> {
     let mut words: Vec<Word> = Vec::new();
     let mut cur: Option<Word> = None;
@@ -225,6 +227,12 @@ pub(crate) fn tokenize(cmd: &str) -> Option<Vec<Word>> {
             '\'' | '"' => {
                 let rest = &cmd[i + 1..];
                 let close = rest.find(c)?;
+                // The shell still processes `$`, backticks, and backslashes
+                // inside double quotes; a backslash also breaks this naive
+                // close-quote scan (`\"` is not a terminator).
+                if c == '"' && rest[..close].contains(['$', '`', '\\']) {
+                    return None;
+                }
                 cur.get_or_insert_with(|| Word {
                     text: String::new(),
                     start: i,
@@ -287,6 +295,140 @@ pub(crate) fn splice_insert(cmd: &str, at: usize, insertion: &str) -> String {
     out.push_str(insertion);
     out.push_str(&cmd[at..]);
     out
+}
+
+/// Outcome of a positional scan. Distinguishing `Exhausted` (only known flags
+/// remained) from `Opaque` (an unrecognized flag) lets callers refuse a
+/// command they cannot parse instead of guessing a subcommand.
+pub(crate) enum Scan {
+    /// First non-flag token, at this index.
+    Positional(usize),
+    /// End of the words with no positional; every flag was recognized.
+    Exhausted,
+    /// An unrecognized flag: the command is opaque and must not be rewritten.
+    Opaque,
+}
+
+/// How a `-`-prefixed token consumes what follows it.
+enum FlagKind {
+    /// Consumes the next token as a separate, required value.
+    SeparateValue,
+    /// Value is optional (`[value]`): the CLI binds the next token only when
+    /// it is not itself option-like (does not start with `-`).
+    OptionalValue,
+    /// Variadic (`<value...>`): consumes every following non-flag token.
+    Variadic,
+    /// A bool, or a value fused into the token (`--flag=value`, `-fvalue`).
+    SelfContained,
+    /// Unrecognized: its value could be mistaken for a subcommand or prompt.
+    Unknown,
+}
+
+/// A CLI's top-level flag grammar, split by how each flag consumes a value.
+/// The walk is table-driven so an unmodeled flag refuses (`Opaque`) rather
+/// than let its value shadow a subcommand. A flag added upstream costs capture
+/// until the table learns it — never a broken command.
+pub(crate) struct FlagTable {
+    /// Flags taking a required separate value.
+    pub(crate) value: &'static [&'static str],
+    /// Flags whose value is optional (`[value]`).
+    pub(crate) optional: &'static [&'static str],
+    /// Variadic flags (`<value...>`).
+    pub(crate) variadic: &'static [&'static str],
+    /// Flags taking no value.
+    pub(crate) boolean: &'static [&'static str],
+}
+
+impl FlagTable {
+    /// Whether `flag` is a named entry in any of the four tables.
+    fn is_known(&self, flag: &str) -> bool {
+        self.value.contains(&flag)
+            || self.optional.contains(&flag)
+            || self.variadic.contains(&flag)
+            || self.boolean.contains(&flag)
+    }
+
+    /// Classify a `-`-prefixed token. The `--flag=value` and `-fvalue`
+    /// spellings are self-contained: a value fused into the token can never
+    /// desync the walk, so only the flag name needs to be known.
+    fn classify(&self, t: &str) -> FlagKind {
+        if self.value.contains(&t) {
+            return FlagKind::SeparateValue;
+        }
+        if self.optional.contains(&t) {
+            return FlagKind::OptionalValue;
+        }
+        if self.variadic.contains(&t) {
+            return FlagKind::Variadic;
+        }
+        if self.boolean.contains(&t) {
+            return FlagKind::SelfContained;
+        }
+        // Short flag with a directly attached value (`-mvalue`, `-m=value`).
+        // The value may itself contain `=`, so this precedes the split below.
+        // `get(..2)` rather than indexing: a multibyte char straight after the
+        // dash (`-éx`) has no byte-2 boundary, and a recipe command must never
+        // panic the supervisor. No boundary there also means no ASCII short
+        // flag, so falling through to Unknown is the correct reading.
+        if t.starts_with('-')
+            && !t.starts_with("--")
+            && t.len() > 2
+            && t.get(..2).is_some_and(|p| {
+                self.value.contains(&p) || self.optional.contains(&p) || self.variadic.contains(&p)
+            })
+        {
+            return FlagKind::SelfContained;
+        }
+        // Long flag with an attached assignment: `--model=opus`.
+        if let Some((name, _)) = t.split_once('=')
+            && self.is_known(name)
+        {
+            return FlagKind::SelfContained;
+        }
+        FlagKind::Unknown
+    }
+
+    /// Index just past the flag at `from` and any value it consumes, or `None`
+    /// when the flag is unrecognized (opaque). `from` must index a `-`-token.
+    pub(crate) fn skip_flag(&self, words: &[Word], from: usize) -> Option<usize> {
+        match self.classify(words[from].text.as_str()) {
+            FlagKind::SeparateValue => Some(from + 2),
+            FlagKind::OptionalValue => Some(
+                if words
+                    .get(from + 1)
+                    .is_some_and(|w| !w.text.starts_with('-'))
+                {
+                    from + 2
+                } else {
+                    from + 1
+                },
+            ),
+            FlagKind::Variadic => {
+                let mut n = from + 1;
+                while words.get(n).is_some_and(|w| !w.text.starts_with('-')) {
+                    n += 1;
+                }
+                Some(n)
+            }
+            FlagKind::SelfContained => Some(from + 1),
+            FlagKind::Unknown => None,
+        }
+    }
+
+    /// First non-flag token at or after `from`, skipping each known flag and
+    /// the value it consumes. An unrecognized flag stops the scan `Opaque`.
+    pub(crate) fn first_positional(&self, words: &[Word], mut from: usize) -> Scan {
+        while from < words.len() {
+            if !words[from].text.starts_with('-') {
+                return Scan::Positional(from);
+            }
+            match self.skip_flag(words, from) {
+                Some(next) => from = next,
+                None => return Scan::Opaque,
+            }
+        }
+        Scan::Exhausted
+    }
 }
 
 #[cfg(test)]
@@ -354,9 +496,10 @@ mod tests {
         assert_eq!(texts, ["claude", "a b", "c d", "--x=q r"]);
         // Quoted spans include their quotes.
         assert_eq!((words[1].start, words[1].end), (7, 12));
-        // `$` inside quotes remains in the parsed token.
-        let words = tokenize(r#"claude "$HOME""#).unwrap();
-        assert_eq!(words[1].text, "$HOME");
+        // Single quotes are literal, so a `$` inside them is not a shell
+        // expansion and stays in the token.
+        let words = tokenize(r#"claude 'costs $5'"#).unwrap();
+        assert_eq!(words[1].text, "costs $5");
     }
 
     #[test]
@@ -401,6 +544,31 @@ mod tests {
         assert_eq!(words[1].text, "fix bug #3");
         let words = tokenize("codex 'run -- now'").unwrap();
         assert_eq!(words[1].text, "run -- now");
+    }
+
+    /// Inside double quotes the shell expands `$`/backtick and unescapes `\`,
+    /// so the decoded token would diverge from the CLI's argv. All three
+    /// refuse; single quotes, which the shell leaves literal, do not.
+    #[test]
+    fn tokenize_refuses_shell_processing_inside_double_quotes() {
+        for cmd in [
+            r#"codex "$MODE""#,
+            r#"grok "prefix-$VAR""#,
+            r#"claude "`id`""#,
+            // A backslashed quote: the naive close-quote scan would split the
+            // word at the escaped `"` and mis-tokenize the tail. Refuse.
+            r#"claude "say \"hi\"""#,
+            r#"claude "a\\b""#,
+        ] {
+            assert_eq!(tokenize(cmd), None, "{cmd:?} must be refused");
+        }
+        // Single-quoted content is literal: no shell processing, no refusal.
+        assert_eq!(
+            tokenize(r#"claude 'costs $5'"#).unwrap()[1].text,
+            "costs $5"
+        );
+        assert_eq!(tokenize(r#"grok 'a\b'"#).unwrap()[1].text, r"a\b");
+        assert_eq!(tokenize("codex 'run `now`'").unwrap()[1].text, "run `now`");
     }
 
     /// Shell quoting preserves spaces and embedded single quotes.

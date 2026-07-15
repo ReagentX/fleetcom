@@ -68,7 +68,7 @@ The harness rewrites only the command passed to `resume_command`; the [recipe fo
 - The stored entry is a plain runnable string: `claude --resume '<id>'` can run directly in a shell.
 - `claude`: an existing UUID passed through `--resume` or `-r` is replaced in place; otherwise `--resume '<id>'` is appended. Any `--session-id` flag is removed.
 - `codex`: an existing UUID target is replaced. Fresh commands insert `resume '<id>'` after the program, and bare `codex resume` gains the ID. Named targets (`codex resume my-thread`) and self-targeting forms (`codex resume --last`) remain unchanged.
-- `grok`: same as `claude`. A UUID passed through `--resume` or `-r` is replaced in place; otherwise `--resume '<id>'` is appended. Any `--session-id` or `-s` flag is removed, because `grok` rejects it alongside `--resume` without `--fork-session`.
+- `grok`: like `claude`, but `grok` rejects a second `--resume` (`the argument '--resume [<SESSION_ID>]' cannot be used multiple times`). A UUID passed through `--resume`/`-r` is replaced in place. A bare `--resume`/`-r` (picker/most-recent form) receives the captured id on the existing flag rather than a duplicate; a bare flag already followed by a non-flag target `grok` would bind is left unchanged. Otherwise `--resume '<id>'` is appended. Any `--session-id` or `-s` flag is removed, because `grok` rejects it alongside `--resume` without `--fork-session`.
 - Rerun (`r`) applies the same rewrite and stores the resuming command. Re-detection then treats the task as a resume and does not inject another ID.
 - A stale ID fails inside the task's PTY, where the error remains visible. Since the recipe is ordinary JSON, the ID or resume flag can be edited by hand.
 
@@ -79,8 +79,9 @@ The harness rewrites only the command passed to `resume_command`; the [recipe fo
 | Situation | Behavior |
 | -- | -- |
 | Outside quotes: <code>\| ; & < > $ # ` ( ) \\</code> or a newline; an unquoted `=` in the first word; unterminated quotes | Not detected. Spawns and saves as the plain command. |
+| Inside double quotes: `$`, backtick, or `\` | Not detected. The shell expands or unescapes them, so the classified tokens would diverge from the CLI's argv (`codex "$MODE"` can run `codex exec`). Single-quoted content stays literal and is unaffected. |
 | A word that resolves to a standalone `--` | Not detected because appended flags would become prompt text. |
-| `codex`: a top-level flag outside the known flag table | Not detected because its value cannot be distinguished safely from a subcommand or prompt. |
+| A top-level flag outside the tool's known flag table (`claude`, `codex`, `grok`) | Not detected because its value cannot be distinguished safely from a subcommand or prompt. A flag added upstream costs capture until the table learns it, never a broken command. |
 | Non-conversation subcommands (`claude`: `mcp`, `doctor`, `config`, …; `codex`: `exec`, `login`, `apply`, …; `grok`: `sessions`, `login`, `mcp`, …) | Not detected. |
 | Capture assets cannot be installed for the selected root | Spawns untouched. |
 | `codex`: `-c notify=` in the command, or a config `notify` value the chain cannot carry | No injection; exit scrape and store correlation remain. A parseable config `notify` chains instead: capture plus the user's notifier. |
