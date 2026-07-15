@@ -29,6 +29,12 @@ pub use codex::Codex;
 /// Environment variable naming the capture file used by injected assets.
 pub const CAPTURE_ENV: &str = "FLEETCOM_CAPTURE_FILE";
 
+/// Environment variable carrying a displaced `codex` notify program's argv,
+/// newline-joined. Set only when the user's config already routed `notify`;
+/// the injected notify script execs this argv, payload appended, after the
+/// capture write.
+pub const NOTIFY_CHAIN_ENV: &str = "FLEETCOM_NOTIFY_CHAIN";
+
 /// Maximum difference between a task spawn and a correlated session timestamp.
 const CORRELATE_WINDOW: Duration = Duration::from_secs(30);
 

@@ -2829,7 +2829,7 @@ mod tests {
         let dir = scratch("no_id");
         let (bin, runtime, config) = (dir.join("bin"), dir.join("run"), dir.join("config"));
         // CODEX_HOME names a store that never exists: correlation has
-        // nothing to find, and the notify guard nothing to read.
+        // nothing to find, and the notify routing nothing to read.
         let codex_home = dir.join("codex_home");
         install_stub(&bin, "codex", &dir);
         let mut s = Supervisor::new(24, 80);
@@ -2863,15 +2863,107 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// An active `notify` assignment suppresses `fleetcom`'s override; a
-    /// commented assignment does not.
+    /// A parseable `notify` assignment no longer suppresses instrumentation:
+    /// the spawn injects the override, carries the displaced argv in the
+    /// chain variable, and the notify script hands off to the user's program
+    /// after the capture write.
     #[test]
-    fn config_toml_notify_guard_suppresses_injection() {
+    fn config_toml_notify_chains_through_the_injected_script() {
+        use crate::harness::NOTIFY_CHAIN_ENV;
+        use std::os::unix::fs::PermissionsExt;
+        let dir = scratch("cfg_chain");
+        let (bin, runtime) = (dir.join("bin"), dir.join("run"));
+        let codex_home = dir.join("codex_home");
+        std::fs::create_dir_all(&codex_home).unwrap();
+        // The vendor desktop shape: an app-bundle path with spaces plus a
+        // fixed argument.
+        let notifier = dir.join("Fake App.app").join("Sky Client");
+        let record = dir.join("notifier-record");
+        std::fs::create_dir_all(notifier.parent().unwrap()).unwrap();
+        std::fs::write(
+            &notifier,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\n",
+                record.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&notifier, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::write(
+            codex_home.join("config.toml"),
+            format!("notify = [\"{}\", \"turn-ended\"]\n", notifier.display()),
+        )
+        .unwrap();
+
+        // The stub records argv and the chain env, then invokes the notify
+        // script the way codex would: notification JSON as the final arg.
+        let payload = format!(r#"{{"type":"agent-turn-complete","thread-id":"{CAP_ID}"}}"#);
+        install_script(
+            &bin,
+            "codex",
+            &format!(
+                "printf '%s\\n' \"$@\" > '{out}/argv'\n\
+                 printf '%s' \"${chain}\" > '{out}/chainenv'\n\
+                 '{script}' '{payload}'",
+                out = dir.display(),
+                chain = NOTIFY_CHAIN_ENV,
+                script = runtime.join("codex-notify.sh").display(),
+            ),
+        );
+        let mut s = Supervisor::new(24, 80);
+        s.set_launch_context(agent_ctx_plus(
+            &bin,
+            &runtime,
+            dir.clone(),
+            &[("CODEX_HOME", &codex_home)],
+        ));
+        s.apply(Command::Spawn {
+            command: "codex".into(),
+            cwd: dir.clone(),
+            group: None,
+        });
+        let argv = wait_argv(&mut s, &dir.join("argv"));
+        assert!(
+            argv.iter().any(|a| a.starts_with("notify=[")),
+            "a chained spawn must still inject the override; argv: {argv:?}"
+        );
+        assert!(
+            reap_until(&mut s, Duration::from_secs(5), |_| record.exists()),
+            "the chained notifier never ran"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("chainenv")).unwrap(),
+            format!("{}\nturn-ended", notifier.display()),
+            "the child env must carry the displaced argv, newline-joined"
+        );
+        let cap = s.tasks[0].capture_file.clone().unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&cap).unwrap(),
+            payload,
+            "the capture write must precede the chain handoff"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&record).unwrap(),
+            format!("turn-ended\n{payload}\n"),
+            "the notifier must receive its original args plus the payload"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A `notify` value the chain cannot carry suppresses the injection; a
+    /// commented assignment never counts as configured.
+    #[test]
+    fn unrepresentable_config_notify_suppresses_injection() {
         let dir = scratch("cfg_guard");
         let (bin, runtime) = (dir.join("bin"), dir.join("run"));
         let codex_home = dir.join("codex_home");
         std::fs::create_dir_all(&codex_home).unwrap();
-        std::fs::write(codex_home.join("config.toml"), "notify = [\"/my/thing\"]\n").unwrap();
+        // A multi-line array is out of the line-based parser's reach.
+        std::fs::write(
+            codex_home.join("config.toml"),
+            "notify = [\n  \"/my/thing\",\n]\n",
+        )
+        .unwrap();
         install_stub(&bin, "codex", &dir);
         let mut s = Supervisor::new(24, 80);
         s.set_launch_context(agent_ctx_plus(
@@ -2888,10 +2980,10 @@ mod tests {
         let argv = wait_argv(&mut s, &dir.join("argv"));
         assert!(
             !argv.iter().any(|a| a.contains("notify=")),
-            "fleetcom must not override a user-configured notify; argv: {argv:?}"
+            "fleetcom must not guess at an unparseable notify; argv: {argv:?}"
         );
 
-        // The same line commented out is inert: the injection returns.
+        // The same route commented out is inert: the injection returns.
         std::fs::write(
             codex_home.join("config.toml"),
             "# notify = [\"/my/thing\"]\n",

@@ -36,11 +36,13 @@ Two fallback channels require no injection. After exit, `fleetcom` scans the fin
 -c 'notify=["<root>/codex-notify.sh"]'
 ```
 
-After each turn, `codex` invokes the program with notification JSON as its final argument. The script writes that argument to `$FLEETCOM_CAPTURE_FILE`, replacing the previous payload. If the variable is unset, the script exits successfully without writing. `fleetcom` accepts only `"type":"agent-turn-complete"` payloads and reads the ID from `thread-id`.
+After each turn, `codex` invokes the program with notification JSON as its final argument. The script writes that argument to `$FLEETCOM_CAPTURE_FILE`, replacing the previous payload; if the variable is unset, it skips the write. `fleetcom` accepts only `"type":"agent-turn-complete"` payloads and reads the ID from `thread-id`.
 
-`fleetcom` does not replace an existing notification route. It skips the override and capture environment when the command contains `-c notify=` or `--config notify=`, when `<codex-home>/config.toml` contains an uncommented `notify` assignment, or when the effective profile's `<codex-home>/<profile>.config.toml` does. The last command-line `-p`/`--profile` value selects the profile; without one, `fleetcom` uses the first line-based `profile = "name"` assignment in `config.toml`.
+A configured `notify` is the common case, not the exception: the Codex desktop app writes its own `notify = [".../Codex Computer Use.app/.../SkyComputerUseClient", "turn-ended"]` into `config.toml` without the user asking. `fleetcom` therefore chains instead of yielding. When `<codex-home>/config.toml` or the effective profile's `<codex-home>/<profile>.config.toml` assigns `notify` a one-line TOML array of basic strings, `fleetcom` still injects its script and hands it the displaced argv through `FLEETCOM_NOTIFY_CHAIN`, newline-joined. After the capture write, the script execs that argv with the notification JSON appended — the user's program receives exactly what `codex` would have passed it. The write precedes the exec, so a hanging or crashing notifier cannot cost the capture. The profile file's assignment overrides the base file's; the last command-line `-p`/`--profile` value selects the profile, otherwise the first line-based `profile = "name"` assignment in `config.toml`.
 
-These checks are intentionally line-based, not TOML-aware. A `notify` or `profile` key inside a table therefore counts as configured. This suppresses injection, but exit scraping and store correlation remain available.
+Two cases still skip the override and capture environment entirely. A `-c notify=` or `--config notify=` in the command itself is per-invocation intent and is never overridden. And an assignment the chain cannot carry faithfully — a value that is not a one-line array of basic strings, an empty array, or an element that is empty or contains a newline (the chain delimiter) — leaves the command untouched. Refusal stays the fallback; guessing never is.
+
+These checks are intentionally line-based, not TOML-aware. A `notify` or `profile` key inside a table therefore counts, and two `notify` assignment lines in one file read as ambiguous and skip injection. Wherever injection is skipped, exit scraping and store correlation remain available.
 
 The exit scraper recognizes both `codex resume <uuid>` and `codex resume, then select <name> (<uuid>)`. It takes the last valid UUID, never the display name. Filesystem correlation searches `<codex-home>/sessions/YYYY/MM/DD/rollout-<local-ts>-<uuid>.jsonl`. Those directories use local dates, so `fleetcom` probes the UTC date ±2 days. A candidate survives only when the v7 UUID's embedded millisecond timestamp falls inside the correlation window and the rollout's first record contains the task's working directory.
 
@@ -74,7 +76,7 @@ The harness rewrites only the command passed to `resume_command`; the [recipe fo
 | `codex`: a top-level flag outside the known flag table | Not detected because its value cannot be distinguished safely from a subcommand or prompt. |
 | Non-conversation subcommands (`claude`: `mcp`, `doctor`, `config`, …; `codex`: `exec`, `login`, `apply`, …) | Not detected. |
 | Capture assets cannot be installed for the selected root | Spawns untouched. |
-| `codex`: the user routes `notify` (command line or `config.toml`) | No injection; exit scrape and store correlation remain. |
+| `codex`: `-c notify=` in the command, or a config `notify` value the chain cannot carry | No injection; exit scrape and store correlation remain. A parseable config `notify` chains instead: capture plus the user's notifier. |
 | `claude`: the user passes `--settings` | No overlay hook; the pinned ID, exit scrape, and store correlation remain. |
 | No ID captured by save time | Store correlation is tried; on failure the original command is stored. |
 | Store correlation is ambiguous, or a `claude` transcript lacks a creation time | The original command is stored. |
@@ -92,7 +94,7 @@ Each supported tool implements the `Harness` trait ([`src/harness/mod.rs`](../sr
 - `name`: registry identity (test routing assertions).
 - `home_env_var`: the env var overriding the tool's home root (`CLAUDE_CONFIG_DIR`, `CODEX_HOME`); resolved from the connection's launch context during instrumentation and save-time correlation.
 - `detect`: classify the command, any targeted ID, and whether launch-time pinning is allowed. Blocklisted subcommands and unsupported shell syntax return `None`.
-- `instrument`: return the argument suffix, environment pairs, and optional pinned ID. This is also where configuration guards, such as the codex notifier check, apply.
+- `instrument`: return the argument suffix, environment pairs, and optional pinned ID. This is also where configuration routing, such as the codex notify chain-or-skip classification, applies.
 - `parse_capture`: extract an ID from a capture-file payload.
 - `scrape_exit`: extract the last valid ID from final terminal text.
 - `correlate_fs`: find a unique ID in the on-disk store. Ambiguity returns `None`.
@@ -118,5 +120,6 @@ The implementation has three test boundaries:
 | -- | -- | -- |
 | `FLEETCOM_RUNTIME_DIR` | client env (hello) | Capture-asset root, used verbatim. When unset, `fleetcom` uses the platform runtime directory (or `<cache>/fleetcom/run`) plus a discriminator derived from the sessions root. |
 | `FLEETCOM_CAPTURE_FILE` | internal child env | Task capture file used by the injected hook or notifier. |
+| `FLEETCOM_NOTIFY_CHAIN` | internal child env | Displaced `codex` notify argv, newline-joined. The injected notify script execs it, payload appended, after the capture write. |
 | `CLAUDE_CONFIG_DIR` | client env (hello) | `claude` home override used for transcript correlation. Defaults to `~/.claude`. |
-| `CODEX_HOME` | client env (hello) | `codex` home override used for the notifier guard and rollout correlation. Defaults to `~/.codex`. |
+| `CODEX_HOME` | client env (hello) | `codex` home override used for notify routing and rollout correlation. Defaults to `~/.codex`. |

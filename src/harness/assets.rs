@@ -11,8 +11,11 @@
 //!   capture file with the current session payload.
 //! - `codex`: `-c notify=["<codex-notify.sh>"]` names an executable that
 //!   `codex` invokes with notification JSON. The script writes its first
-//!   argument verbatim (no trailing newline) over `$FLEETCOM_CAPTURE_FILE`
-//!   and exits 0 without writing when the variable is unset or empty.
+//!   argument verbatim (no trailing newline) over `$FLEETCOM_CAPTURE_FILE`,
+//!   skipping the write when the variable is unset or empty. When
+//!   `$FLEETCOM_NOTIFY_CHAIN` is non-empty the script then execs that
+//!   newline-joined argv with the payload appended, handing the displaced
+//!   notifier exactly what `codex` would have passed it; otherwise exit 0.
 
 use std::{
     fs, io,
@@ -23,11 +26,26 @@ use std::{
 use super::CapturePaths;
 
 /// Notify program injected into `codex`. Without a capture path it writes
-/// nothing.
+/// nothing; with a chain it execs the displaced notifier afterward.
 const CODEX_NOTIFY_SCRIPT: &str = r#"#!/bin/sh
-# Write the notification JSON without a trailing newline.
-[ -n "$FLEETCOM_CAPTURE_FILE" ] || exit 0
-printf '%s' "$1" > "$FLEETCOM_CAPTURE_FILE"
+# Capture before the chain handoff: exec never returns, so a hanging or
+# crashing notifier must not be able to cost the capture write.
+if [ -n "$FLEETCOM_CAPTURE_FILE" ]; then
+  # Write the notification JSON without a trailing newline.
+  printf '%s' "$1" > "$FLEETCOM_CAPTURE_FILE"
+fi
+[ -n "$FLEETCOM_NOTIFY_CHAIN" ] || exit 0
+# The chain variable holds the displaced notifier's argv, newline-joined.
+# Field splitting is the decoder: with IFS holding only a newline, the
+# unquoted expansion splits at element boundaries and nowhere else, so
+# spaces inside elements survive, and set -f keeps the fields out of glob
+# expansion. The quoted "$1" is still the payload: expansions happen before
+# set replaces the positional parameters.
+IFS='
+'
+set -f
+set -- $FLEETCOM_NOTIFY_CHAIN "$1"
+exec "$@"
 "#;
 
 /// Build the `claude` settings overlay containing the `SessionStart` hook.
@@ -129,7 +147,7 @@ mod tests {
         process::{Command, Stdio},
     };
 
-    use super::super::CAPTURE_ENV;
+    use super::super::{CAPTURE_ENV, NOTIFY_CHAIN_ENV};
     use super::*;
 
     const ID: &str = "c8c4a5cc-0b32-4ba0-a6b4-6ed08c218e0d";
@@ -221,6 +239,7 @@ mod tests {
         for setup in [None, Some("")] {
             let mut cmd = Command::new("sh");
             cmd.arg(&assets.codex_notify).arg(payload);
+            cmd.env_remove(NOTIFY_CHAIN_ENV);
             match setup {
                 Some(v) => cmd.env(CAPTURE_ENV, v),
                 None => cmd.env_remove(CAPTURE_ENV),
@@ -235,6 +254,7 @@ mod tests {
             .arg(&assets.codex_notify)
             .arg(payload)
             .env(CAPTURE_ENV, &cap)
+            .env_remove(NOTIFY_CHAIN_ENV)
             .output()
             .unwrap();
         assert!(out.status.success());
@@ -245,10 +265,103 @@ mod tests {
         let out = Command::new(&assets.codex_notify)
             .arg(second)
             .env(CAPTURE_ENV, &cap)
+            .env_remove(NOTIFY_CHAIN_ENV)
             .output()
             .unwrap();
         assert!(out.status.success());
         assert_eq!(fs::read(&cap).unwrap(), second.as_bytes());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Install a fake notifier at `path` that records its argv, one token
+    /// per line, into `record`.
+    fn install_fake_notifier(path: &Path, record: &Path) {
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(
+            path,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\n",
+                record.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    /// With a chain configured, the script writes the capture file and then
+    /// execs the displaced notifier with its original argv plus the payload
+    /// last — including a notifier path containing spaces (the vendor
+    /// desktop shape).
+    #[test]
+    fn notify_script_chains_the_displaced_notifier() {
+        let root = temp("chain");
+        let assets = CaptureAssets::install(&root).unwrap();
+        let cap = assets.paths_for(3).capture_file;
+        let notifier = root.join("Fake App.app").join("Sky Client");
+        let record = root.join("record");
+        install_fake_notifier(&notifier, &record);
+
+        let payload = r#"{"type":"agent-turn-complete","turn-id":"t3"}"#;
+        let out = Command::new(&assets.codex_notify)
+            .arg(payload)
+            .env(CAPTURE_ENV, &cap)
+            .env(
+                NOTIFY_CHAIN_ENV,
+                format!("{}\nturn-ended", notifier.display()),
+            )
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        assert_eq!(fs::read(&cap).unwrap(), payload.as_bytes());
+        assert_eq!(
+            fs::read_to_string(&record).unwrap(),
+            format!("turn-ended\n{payload}\n"),
+            "the notifier must receive its original args, payload last"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A failing chained notifier cannot cost the capture: the write
+    /// precedes the exec, and the notifier's exit status passes through.
+    #[test]
+    fn notify_script_capture_survives_a_failing_chain() {
+        let root = temp("chain_fail");
+        let assets = CaptureAssets::install(&root).unwrap();
+        let cap = assets.paths_for(4).capture_file;
+        let notifier = root.join("failing");
+        fs::write(&notifier, "#!/bin/sh\nexit 1\n").unwrap();
+        fs::set_permissions(&notifier, fs::Permissions::from_mode(0o700)).unwrap();
+
+        let payload = r#"{"type":"agent-turn-complete","turn-id":"t4"}"#;
+        let out = Command::new(&assets.codex_notify)
+            .arg(payload)
+            .env(CAPTURE_ENV, &cap)
+            .env(NOTIFY_CHAIN_ENV, &notifier)
+            .output()
+            .unwrap();
+        assert!(!out.status.success(), "exec forwards the notifier's status");
+        assert_eq!(fs::read(&cap).unwrap(), payload.as_bytes());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// The chain fires even without a capture path: the displaced notifier
+    /// must never be lost to a missing fleetcom variable.
+    #[test]
+    fn notify_script_chains_without_a_capture_path() {
+        let root = temp("chain_nocap");
+        let assets = CaptureAssets::install(&root).unwrap();
+        let notifier = root.join("bare");
+        let record = root.join("record");
+        install_fake_notifier(&notifier, &record);
+
+        let out = Command::new(&assets.codex_notify)
+            .arg("payload")
+            .env_remove(CAPTURE_ENV)
+            .env(NOTIFY_CHAIN_ENV, &notifier)
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        assert_eq!(fs::read_to_string(&record).unwrap(), "payload\n");
         let _ = fs::remove_dir_all(&root);
     }
 

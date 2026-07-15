@@ -1,6 +1,7 @@
 //! `codex` does not expose launch-time ID pinning. This harness therefore
-//! injects a `notify` override, scans both final resume-hint forms, and
-//! correlates rollout files under
+//! injects a `notify` override (chaining any notifier the user's config
+//! already routes), scans both final resume-hint forms, and correlates
+//! rollout files under
 //! `<codex-home>/sessions/YYYY/MM/DD/rollout-<local-ts>-<uuid>.jsonl`.
 
 use std::{
@@ -12,8 +13,8 @@ use std::{
 };
 
 use super::{
-    CAPTURE_ENV, CapturePaths, Harness, Invocation, SpawnPlan, Word, is_uuid, leading_uuid,
-    shell_quote, splice_insert, tokenize, within_window_ms,
+    CAPTURE_ENV, CapturePaths, Harness, Invocation, NOTIFY_CHAIN_ENV, SpawnPlan, Word, is_uuid,
+    leading_uuid, shell_quote, splice_insert, tokenize, within_window_ms,
 };
 
 /// Subcommands excluded from session capture.
@@ -152,21 +153,35 @@ impl Harness for Codex {
         capture: &CapturePaths,
         home_override: Option<&Path>,
     ) -> SpawnPlan {
-        // Preserve an existing notify route. Exit scraping and filesystem
-        // correlation remain available without an injected notifier.
-        if has_notify_override(&inv.tokens) || config_has_notify(home_override, &inv.tokens) {
+        // A notify override in the command tokens is per-invocation intent;
+        // never chain over it. Exit scraping and filesystem correlation
+        // remain available without an injected notifier.
+        if has_notify_override(&inv.tokens) {
             return SpawnPlan::default();
         }
+        let chain = match config_notify_route(home_override, &inv.tokens) {
+            NotifyRoute::Vacant => None,
+            // A routed notifier rides along: the injected script execs this
+            // argv, payload appended, after the capture write.
+            NotifyRoute::Chain(argv) => Some(argv.join("\n")),
+            // A route the chain cannot carry faithfully: leave the command
+            // untouched rather than guess.
+            NotifyRoute::Opaque => return SpawnPlan::default(),
+        };
         let toml = format!(
             "notify=[\"{}\"]",
             toml_escape(&capture.codex_notify.to_string_lossy())
         );
+        let mut env = vec![(
+            CAPTURE_ENV.into(),
+            capture.capture_file.clone().into_os_string(),
+        )];
+        if let Some(chain) = chain {
+            env.push((NOTIFY_CHAIN_ENV.into(), chain.into()));
+        }
         SpawnPlan {
             args_suffix: format!(" -c {}", shell_quote(&toml)),
-            env: vec![(
-                CAPTURE_ENV.into(),
-                capture.capture_file.clone().into_os_string(),
-            )],
+            env,
             injected_id: None,
         }
     }
@@ -401,30 +416,62 @@ fn has_notify_override(tokens: &[String]) -> bool {
     })
 }
 
-/// Whether `config.toml` or the selected profile config contains a `notify`
-/// assignment. The last command-line profile wins; otherwise the first
-/// line-based `profile` assignment in `config.toml` is used. Line-based checks
-/// also match assignments inside TOML tables.
-fn config_has_notify(home: Option<&Path>, tokens: &[String]) -> bool {
+/// How `instrument` must treat the user's configured notify route.
+#[derive(Debug, PartialEq, Eq)]
+enum NotifyRoute {
+    /// No active `notify` assignment: inject the capture notifier alone.
+    Vacant,
+    /// One assignment the chain transport can carry: inject the capture
+    /// notifier and hand it this argv to exec afterward.
+    Chain(Vec<String>),
+    /// An assignment the transport cannot carry faithfully: skip injection
+    /// so the user's route keeps working untouched.
+    Opaque,
+}
+
+/// Classify the `notify` route in `config.toml` and the effective profile
+/// config. The profile file's assignment overrides the base file's. The last
+/// command-line `-p`/`--profile` wins; otherwise the first line-based
+/// `profile` assignment in `config.toml` selects the profile. Line-based
+/// checks also match assignments inside TOML tables, so two `notify` lines
+/// in one file are ambiguous and read as [`NotifyRoute::Opaque`].
+fn config_notify_route(home: Option<&Path>, tokens: &[String]) -> NotifyRoute {
     let root = match home {
         Some(p) => p.to_path_buf(),
         None => match dirs::home_dir() {
             Some(h) => h.join(".codex"),
-            None => return false,
+            None => return NotifyRoute::Vacant,
         },
     };
     let config_text = fs::read_to_string(root.join("config.toml")).unwrap_or_default();
-    if config_text.lines().any(is_notify_assignment) {
-        return true;
+    let profile_text = cli_profile(tokens)
+        .or_else(|| config_profile(&config_text))
+        .and_then(|p| fs::read_to_string(root.join(format!("{p}.config.toml"))).ok())
+        .unwrap_or_default();
+    for text in [&profile_text, &config_text] {
+        let mut values = text.lines().filter_map(notify_value);
+        let Some(value) = values.next() else { continue };
+        if values.next().is_some() {
+            return NotifyRoute::Opaque;
+        }
+        return route_for(value);
     }
-    // Command line `-p`/`--profile` overrides `config.toml`'s own `profile`.
-    let Some(profile) = cli_profile(tokens).or_else(|| config_profile(&config_text)) else {
-        return false;
-    };
-    let Ok(text) = fs::read_to_string(root.join(format!("{profile}.config.toml"))) else {
-        return false;
-    };
-    text.lines().any(is_notify_assignment)
+    NotifyRoute::Vacant
+}
+
+/// Classify one assignment's value. Newlines are the chain encoding's
+/// delimiter, and empty elements vanish in the script's field split (newline
+/// is IFS whitespace, which collapses), so neither can travel; an empty
+/// array routes no program at all.
+fn route_for(value: &str) -> NotifyRoute {
+    match parse_notify_array(value) {
+        Some(argv)
+            if !argv.is_empty() && argv.iter().all(|a| !a.is_empty() && !a.contains('\n')) =>
+        {
+            NotifyRoute::Chain(argv)
+        }
+        _ => NotifyRoute::Opaque,
+    }
 }
 
 /// Effective profile named on the command line, or `None`. Accepts `-p x`,
@@ -481,12 +528,70 @@ fn unquote_toml(s: &str) -> String {
     s.split([' ', '\t', '#']).next().unwrap_or("").to_string()
 }
 
-/// Whether `line` begins with an uncommented bare `notify` assignment.
-fn is_notify_assignment(line: &str) -> bool {
-    let Some(rest) = line.trim_start().strip_prefix("notify") else {
-        return false;
-    };
-    rest.trim_start_matches([' ', '\t']).starts_with('=')
+/// Value after `=` of an uncommented bare `notify` assignment, or `None`.
+fn notify_value(line: &str) -> Option<&str> {
+    let rest = line.trim_start().strip_prefix("notify")?;
+    rest.trim_start_matches([' ', '\t']).strip_prefix('=')
+}
+
+/// Parse a one-line TOML array of basic strings into its elements. Anything
+/// else returns `None`: literal strings, non-string elements, a multi-line
+/// array (the line ends before `]`), or junk after the array. A trailing
+/// comma and a trailing `#` comment are tolerated.
+fn parse_notify_array(value: &str) -> Option<Vec<String>> {
+    let mut rest = value.trim_start_matches([' ', '\t']).strip_prefix('[')?;
+    let mut out = Vec::new();
+    loop {
+        rest = rest.trim_start_matches([' ', '\t']);
+        if let Some(tail) = rest.strip_prefix(']') {
+            let tail = tail.trim_start_matches([' ', '\t']);
+            return (tail.is_empty() || tail.starts_with('#')).then_some(out);
+        }
+        let (elem, tail) = parse_basic_string(rest.strip_prefix('"')?)?;
+        out.push(elem);
+        rest = tail.trim_start_matches([' ', '\t']);
+        if let Some(t) = rest.strip_prefix(',') {
+            rest = t;
+        } else if !rest.starts_with(']') {
+            return None;
+        }
+    }
+}
+
+/// Decode a TOML basic string after its opening quote; return the text and
+/// the remainder past the closing quote. The escapes are TOML's fixed set,
+/// a superset of what [`toml_escape`] emits. An unknown escape, a malformed
+/// `\u`/`\U`, or a missing closing quote returns `None`.
+fn parse_basic_string(s: &str) -> Option<(String, &str)> {
+    let mut out = String::new();
+    let mut rest = s;
+    loop {
+        let i = rest.find(['"', '\\'])?;
+        out.push_str(&rest[..i]);
+        if rest.as_bytes()[i] == b'"' {
+            return Some((out, &rest[i + 1..]));
+        }
+        let esc = rest[i + 1..].chars().next()?;
+        rest = &rest[i + 1 + esc.len_utf8()..];
+        match esc {
+            'b' => out.push('\u{8}'),
+            't' => out.push('\t'),
+            'n' => out.push('\n'),
+            'f' => out.push('\u{c}'),
+            'r' => out.push('\r'),
+            '"' => out.push('"'),
+            '\\' => out.push('\\'),
+            'u' | 'U' => {
+                let n = if esc == 'u' { 4 } else { 8 };
+                let hex = rest
+                    .get(..n)
+                    .filter(|h| h.bytes().all(|b| b.is_ascii_hexdigit()))?;
+                out.push(char::from_u32(u32::from_str_radix(hex, 16).ok()?)?);
+                rest = &rest[n..];
+            }
+            _ => return None,
+        }
+    }
 }
 
 /// Escape a path for a TOML basic string.
@@ -693,21 +798,25 @@ mod tests {
         );
     }
 
-    /// An active `notify` assignment suppresses injection; comments, longer
-    /// keys, and missing files do not.
+    /// An active `notify` assignment no longer suppresses injection: the
+    /// override still lands and the displaced argv rides
+    /// [`NOTIFY_CHAIN_ENV`]. Comments, longer keys, and missing files leave
+    /// plain injection alone.
     #[test]
-    fn instrument_defers_to_a_config_toml_notify() {
+    fn instrument_chains_a_config_toml_notify() {
         let home = temp("cfg_notify");
         let inv = Codex.detect("codex").unwrap();
+        let chained = |plan: &SpawnPlan| {
+            plan.env
+                .iter()
+                .find(|(k, _)| k == NOTIFY_CHAIN_ENV)
+                .map(|(_, v)| v.clone())
+        };
 
-        // Missing file (and missing home dir): injection proceeds.
-        assert!(!config_has_notify(Some(&home), &inv.tokens));
-        assert!(
-            !Codex
-                .instrument(&inv, &paths(), Some(&home))
-                .args_suffix
-                .is_empty()
-        );
+        // Missing file (and missing home dir): plain injection, no chain.
+        let plan = Codex.instrument(&inv, &paths(), Some(&home));
+        assert!(!plan.args_suffix.is_empty());
+        assert_eq!(chained(&plan), None);
 
         fs::create_dir_all(&home).unwrap();
         let cfg = home.join("config.toml");
@@ -718,12 +827,11 @@ mod tests {
             "model = \"gpt-5\"\nnotify = [\"/my/thing\"]\n",
         ] {
             fs::write(&cfg, active).unwrap();
-            assert!(config_has_notify(Some(&home), &inv.tokens), "{active:?}");
-            assert_eq!(
-                Codex.instrument(&inv, &paths(), Some(&home)),
-                SpawnPlan::default(),
-                "{active:?}"
-            );
+            let plan = Codex.instrument(&inv, &paths(), Some(&home));
+            assert!(!plan.args_suffix.is_empty(), "{active:?}");
+            assert_eq!(chained(&plan), Some("/my/thing".into()), "{active:?}");
+            // The capture env still rides the chain case.
+            assert!(plan.env.iter().any(|(k, _)| k == CAPTURE_ENV), "{active:?}");
         }
         for inert in [
             "# notify = [\"/my/thing\"]\n",
@@ -732,13 +840,66 @@ mod tests {
             "notify\n",
         ] {
             fs::write(&cfg, inert).unwrap();
-            assert!(!config_has_notify(Some(&home), &inv.tokens), "{inert:?}");
-            assert!(
-                !Codex
-                    .instrument(&inv, &paths(), Some(&home))
-                    .args_suffix
-                    .is_empty(),
-                "{inert:?}"
+            let plan = Codex.instrument(&inv, &paths(), Some(&home));
+            assert!(!plan.args_suffix.is_empty(), "{inert:?}");
+            assert_eq!(chained(&plan), None, "{inert:?}");
+        }
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    /// The desktop app's vendor-written entry — a path with spaces plus an
+    /// argument — chains verbatim, newline-joined.
+    #[test]
+    fn instrument_chains_the_vendor_desktop_entry() {
+        let home = temp("vendor_notify");
+        fs::create_dir_all(&home).unwrap();
+        fs::write(
+            home.join("config.toml"),
+            "notify = [\"/Applications/Codex Computer Use.app/Contents/MacOS/SkyComputerUseClient\", \"turn-ended\"]\n",
+        )
+        .unwrap();
+        let inv = Codex.detect("codex").unwrap();
+        let plan = Codex.instrument(&inv, &paths(), Some(&home));
+        assert_eq!(
+            plan.args_suffix,
+            r#" -c 'notify=["/tmp/Application Support/notify.sh"]'"#
+        );
+        assert!(plan.env.contains(&(
+            NOTIFY_CHAIN_ENV.into(),
+            "/Applications/Codex Computer Use.app/Contents/MacOS/SkyComputerUseClient\nturn-ended"
+                .into()
+        )));
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    /// An assignment the chain cannot carry skips injection entirely.
+    #[test]
+    fn instrument_skips_an_unrepresentable_config_notify() {
+        let home = temp("opaque_notify");
+        fs::create_dir_all(&home).unwrap();
+        let cfg = home.join("config.toml");
+        let inv = Codex.detect("codex").unwrap();
+        for opaque in [
+            // Multi-line array: the value ends mid-structure.
+            "notify = [\n  \"/my/thing\",\n]\n",
+            // Literal strings are outside the parser's deliberate scope.
+            "notify = ['/my/thing']\n",
+            // Empty array: notify is routed, yet no program to chain.
+            "notify = []\n",
+            // Empty element: the script's field split would drop it.
+            "notify = [\"\"]\n",
+            // Embedded newline: the chain encoding's delimiter.
+            "notify = [\"a\\nb\"]\n",
+            // Not an array.
+            "notify = \"/my/thing\"\n",
+            // Two assignment lines (e.g. one inside a table): ambiguous.
+            "notify = [\"/a\"]\nnotify = [\"/b\"]\n",
+        ] {
+            fs::write(&cfg, opaque).unwrap();
+            assert_eq!(
+                Codex.instrument(&inv, &paths(), Some(&home)),
+                SpawnPlan::default(),
+                "{opaque:?}"
             );
         }
         let _ = fs::remove_dir_all(&home);
@@ -769,6 +930,76 @@ mod tests {
             String::from_utf8(out.stdout).unwrap(),
             format!("-c\n{}\n", r#"notify=["/Odd Path/it's \"here\"\\now"]"#)
         );
+    }
+
+    #[test]
+    fn parse_notify_array_decodes_escapes_and_structure() {
+        assert_eq!(
+            parse_notify_array(" [\"/bin/notify\"]").unwrap(),
+            vec!["/bin/notify"]
+        );
+        // The vendor entry verbatim: spaces in the path, a second element.
+        assert_eq!(
+            parse_notify_array(
+                r#" ["/Applications/Codex Computer Use.app/Contents/MacOS/SkyComputerUseClient", "turn-ended"]"#
+            )
+            .unwrap(),
+            vec![
+                "/Applications/Codex Computer Use.app/Contents/MacOS/SkyComputerUseClient",
+                "turn-ended"
+            ]
+        );
+        // Escapes: TOML's fixed set, mirroring what `toml_escape` emits.
+        assert_eq!(
+            parse_notify_array(r#"["a\"b\\c", "d\u0041\te"]"#).unwrap(),
+            vec!["a\"b\\c", "d\u{41}\te"]
+        );
+        // Trailing comma and a trailing comment are tolerated.
+        assert_eq!(
+            parse_notify_array("[\"a\", \"b\",] # mine").unwrap(),
+            vec!["a", "b"]
+        );
+        assert_eq!(parse_notify_array("[]").unwrap(), Vec::<String>::new());
+        assert_eq!(parse_notify_array("[ ]").unwrap(), Vec::<String>::new());
+    }
+
+    #[test]
+    fn parse_notify_array_rejects_unsupported_shapes() {
+        for bad in [
+            // A multi-line array leaves the line mid-structure.
+            "[",
+            "[\"/my/thing\",",
+            // Unterminated element.
+            r#"["a"#,
+            // Literal strings and non-string elements.
+            "['a']",
+            "[1]",
+            // Missing comma, trailing junk, unknown escape, malformed \u.
+            r#"["a" "b"]"#,
+            r#"["a"] x"#,
+            r#"["a\qb"]"#,
+            r#"["a\u00gg"]"#,
+            // Not an array at all.
+            r#""a""#,
+        ] {
+            assert_eq!(parse_notify_array(bad), None, "{bad:?}");
+        }
+    }
+
+    /// `route_for` refuses values the transport would corrupt even when the
+    /// array itself parses.
+    #[test]
+    fn route_for_refuses_untransportable_argv() {
+        assert_eq!(
+            route_for(r#" ["/x", "y"]"#),
+            NotifyRoute::Chain(vec!["/x".into(), "y".into()])
+        );
+        // Newline elements collide with the join delimiter; empty elements
+        // are dropped by sh field splitting; an empty array has no program.
+        assert_eq!(route_for(r#"["a\nb"]"#), NotifyRoute::Opaque);
+        assert_eq!(route_for(r#"[""]"#), NotifyRoute::Opaque);
+        assert_eq!(route_for("[]"), NotifyRoute::Opaque);
+        assert_eq!(route_for("garbage"), NotifyRoute::Opaque);
     }
 
     #[test]
@@ -902,38 +1133,52 @@ mod tests {
     }
 
     #[test]
-    fn config_has_notify_resolves_profiles() {
+    fn config_notify_route_resolves_profiles() {
         let home = temp("profile_notify");
         fs::create_dir_all(&home).unwrap();
         let cfg = home.join("config.toml");
         let team = home.join("team.config.toml");
+        let team_route = NotifyRoute::Chain(vec!["/team/hook".to_string()]);
 
         // notify lives in the profile file; `-p team` on the CLI selects it.
         fs::write(&cfg, "model = \"gpt-5\"\n").unwrap();
         fs::write(&team, "notify = [\"/team/hook\"]\n").unwrap();
         let inv = Codex.detect("codex -p team").unwrap();
-        assert!(config_has_notify(Some(&home), &inv.tokens));
-        assert_eq!(
-            Codex.instrument(&inv, &paths(), Some(&home)),
-            SpawnPlan::default()
+        assert_eq!(config_notify_route(Some(&home), &inv.tokens), team_route);
+        let plan = Codex.instrument(&inv, &paths(), Some(&home));
+        assert!(
+            plan.env
+                .contains(&(NOTIFY_CHAIN_ENV.into(), "/team/hook".into())),
+            "{:?}",
+            plan.env
         );
 
         // Profile selected by config.toml's own `profile` key, no `-p`.
         let bare = vec!["codex".to_string()];
         fs::write(&cfg, "profile = \"team\"\n").unwrap();
-        assert!(config_has_notify(Some(&home), &bare));
+        assert_eq!(config_notify_route(Some(&home), &bare), team_route);
         // Bare (unquoted) value with a trailing comment resolves too.
         fs::write(&cfg, "profile = team # mine\n").unwrap();
-        assert!(config_has_notify(Some(&home), &bare));
+        assert_eq!(config_notify_route(Some(&home), &bare), team_route);
 
-        // Commented-out notify in the profile file still injects.
-        fs::write(&cfg, "profile = \"team\"\n").unwrap();
+        // The profile file's assignment overrides the base file's.
+        fs::write(&cfg, "profile = \"team\"\nnotify = [\"/base/hook\"]\n").unwrap();
+        assert_eq!(config_notify_route(Some(&home), &bare), team_route);
+
+        // Commented out in the profile file: the base assignment stands.
         fs::write(&team, "# notify = [\"/team/hook\"]\n").unwrap();
-        assert!(!config_has_notify(Some(&home), &bare));
+        assert_eq!(
+            config_notify_route(Some(&home), &bare),
+            NotifyRoute::Chain(vec!["/base/hook".to_string()])
+        );
 
-        // A missing profile file still injects.
+        // No assignment anywhere: vacant, plain injection.
+        fs::write(&cfg, "profile = \"team\"\n").unwrap();
+        assert_eq!(config_notify_route(Some(&home), &bare), NotifyRoute::Vacant);
+
+        // A missing profile file leaves only the base config.
         fs::write(&cfg, "profile = \"ghost\"\n").unwrap();
-        assert!(!config_has_notify(Some(&home), &bare));
+        assert_eq!(config_notify_route(Some(&home), &bare), NotifyRoute::Vacant);
 
         let _ = fs::remove_dir_all(&home);
     }
