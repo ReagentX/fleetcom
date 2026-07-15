@@ -1,7 +1,8 @@
-//! No single `claude` channel guarantees the current conversation ID. This
-//! harness pins a v4 UUID with `--session-id`, adds a `SessionStart` hook,
-//! scans final terminal text for `claude --resume <uuid>`, and correlates
-//! transcripts under `<claude-home>/projects/<cwd-slug>/<uuid>.jsonl`.
+//! For eligible `claude` launches, this harness pins a v4 UUID with
+//! `--session-id`, adds a `SessionStart` hook when the command has no
+//! `--settings`, scans final terminal text for `claude --resume <uuid>`, and
+//! correlates transcripts under
+//! `<claude-home>/projects/<cwd-slug>/<uuid>.jsonl`.
 //!
 //! `fleetcom` does not pin launches that contain `--resume`, `--continue`,
 //! `--fork-session`, or `--session-id`.
@@ -208,8 +209,7 @@ impl Harness for Claude {
         if !is_uuid(id) {
             return cmd.to_string();
         }
-        // Refused commands were never detected; leave them untouched rather
-        // than append flags into syntax this module cannot parse.
+        // Preserve commands whose shell syntax this module cannot parse.
         let Some(words) = tokenize(cmd) else {
             return cmd.to_string();
         };

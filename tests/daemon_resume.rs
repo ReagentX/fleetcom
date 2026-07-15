@@ -146,8 +146,8 @@ printf 'Resume this session with:\nclaude --resume %s\n' "$id""#,
     install_stub(s, "claude", &body);
 }
 
-/// `codex` stub that records argv and reports `CODEX_ID` only through the
-/// notify capture file.
+/// `codex` stub that records argv and writes `CODEX_ID` only to the capture
+/// file.
 fn install_codex_stub(s: &Scratch) {
     let body = format!(
         r#"printf '%s\n' '{marker}' "$@" >> '{rec}'
@@ -311,8 +311,8 @@ fn claude_spawn_save_load_resumes_the_conversation() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// `codex` notification capture persists a resume command and re-instruments
-/// the loaded task.
+/// A `codex` capture-file payload persists a resume command, and loading it
+/// applies instrumentation again.
 #[test]
 fn codex_capture_file_drives_save_and_load_resumes() {
     let s = Scratch::new("codex");

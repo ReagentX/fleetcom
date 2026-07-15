@@ -87,9 +87,10 @@ fn fnv1a_hex(bytes: &[u8]) -> String {
 }
 
 /// Return the best session ID available for a task: exit scrape, capture file,
-/// then spawn-time ID. Exit scraping waits for process exit and reader EOF.
-/// Capture files outrank the spawn-time ID because resume, clear, and compact
-/// events can replace their contents.
+/// then spawn-time ID. Scraped IDs are populated after process exit and reader
+/// EOF.
+/// Capture files outrank the spawn-time ID because they can report a newer
+/// conversation after launch.
 pub(crate) fn current_resume_id(task: &Task) -> Option<String> {
     if let Some(id) = &task.scraped_id {
         return Some(id.clone());
@@ -317,18 +318,14 @@ impl Supervisor {
             // latched this pass and is retried next. waitid failing is rare and
             // must not take down the loop.
             let _ = t.poll_exit();
-            // Scrape the tool's exit hint once per task, after both of its
-            // gates close: the exit latch and reader-thread EOF. The EOF
-            // gate closes the latch/drain race by construction: every byte
-            // the child wrote is in the grid before the render (see
-            // `Task::scrape_exit_hint`).
+            // Scrape after process exit and reader EOF, when every child byte
+            // is present in the grid (see `Task::scrape_exit_hint`).
             t.scrape_exit_hint();
             if t.overdue(now, self.kill_grace) {
                 t.force_kill();
             }
         }
-        // Graveyard tasks are gone from every recipe, so their hints are
-        // dead state: only the exit latch and the escalation run here.
+        // Removed tasks need exit handling and escalation, not hint scraping.
         for t in &mut self.graveyard {
             let _ = t.poll_exit();
             if t.overdue(now, self.kill_grace) {
@@ -571,7 +568,7 @@ impl Supervisor {
         let Some(launch) = self.launch_or_refuse() else {
             return;
         };
-        // Store the resuming form so re-detection does not inject another id.
+        // Store the resuming form so re-detection does not inject another ID.
         let (command, cwd) = {
             let old = &self.tasks[i];
             let command = match (old.harness, current_resume_id(old)) {
@@ -2426,8 +2423,7 @@ mod tests {
         let id = s.tasks[0].id;
         wait_for_lifecycle(&mut s, id, |l| l == Lifecycle::Ok);
 
-        // The hook's payload names a different session than the pinned one:
-        // the conversation moved (clear/compact) while the task ran.
+        // The capture payload reports a different ID from the pinned one.
         let cap = s.tasks[0].capture_file.clone().expect("capture file set");
         std::fs::write(
             &cap,
@@ -2523,9 +2519,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Returning to a previously installed root reuses its assets: no
-    /// re-install, so no sweep of the capture files its live tasks wrote
-    /// during the root's first tenure.
+    /// Returning to an installed root preserves its live capture files.
     #[test]
     fn returning_to_a_prior_root_preserves_its_live_captures() {
         let dir = scratch("cap_aba");
@@ -2664,8 +2658,7 @@ mod tests {
         let (bin, runtime, config) = (dir.join("bin"), dir.join("run"), dir.join("config"));
         install_stub(&bin, "grok", &dir);
         let mut s = Supervisor::new(24, 80);
-        // GROK_HOME stays inside the scratch tree so save-time correlation
-        // can never read a real store.
+        // Keep save-time correlation inside the scratch tree.
         s.set_launch_context(agent_ctx_plus(
             &bin,
             &runtime,
@@ -2922,10 +2915,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A parseable `notify` assignment no longer suppresses instrumentation:
-    /// the spawn injects the override, carries the displaced argv in the
-    /// chain variable, and the notify script hands off to the user's program
-    /// after the capture write.
+    /// A parseable `notify` assignment is chained through the injected
+    /// notifier after the capture write.
     #[test]
     fn config_toml_notify_chains_through_the_injected_script() {
         use crate::harness::NOTIFY_CHAIN_ENV;
@@ -2934,8 +2925,7 @@ mod tests {
         let (bin, runtime) = (dir.join("bin"), dir.join("run"));
         let codex_home = dir.join("codex_home");
         std::fs::create_dir_all(&codex_home).unwrap();
-        // The vendor desktop shape: an app-bundle path with spaces plus a
-        // fixed argument.
+        // The notifier path contains spaces and carries a fixed argument.
         let notifier = dir.join("Fake App.app").join("Sky Client");
         let record = dir.join("notifier-record");
         std::fs::create_dir_all(notifier.parent().unwrap()).unwrap();
@@ -2955,7 +2945,7 @@ mod tests {
         .unwrap();
 
         // The stub records argv and the chain env, then invokes the notify
-        // script the way codex would: notification JSON as the final arg.
+        // script with notification JSON as the final argument.
         let payload = format!(r#"{{"type":"agent-turn-complete","thread-id":"{CAP_ID}"}}"#);
         install_script(
             &bin,

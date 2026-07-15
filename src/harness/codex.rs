@@ -1,7 +1,6 @@
-//! `codex` does not expose launch-time ID pinning. This harness therefore
-//! injects a `notify` override (chaining any notifier the user's config
-//! already routes), scans both final resume-hint forms, and correlates
-//! rollout files under
+//! For eligible `codex` commands, this harness captures IDs through an injected
+//! `notify` override and chains compatible configured notifiers. It also scans
+//! both final resume-hint forms and correlates rollout files under
 //! `<codex-home>/sessions/YYYY/MM/DD/rollout-<local-ts>-<uuid>.jsonl`.
 
 use std::{
@@ -798,10 +797,9 @@ mod tests {
         );
     }
 
-    /// An active `notify` assignment no longer suppresses injection: the
-    /// override still lands and the displaced argv rides
+    /// A parseable `notify` assignment is chained through
     /// [`NOTIFY_CHAIN_ENV`]. Comments, longer keys, and missing files leave
-    /// plain injection alone.
+    /// plain injection unchanged.
     #[test]
     fn instrument_chains_a_config_toml_notify() {
         let home = temp("cfg_notify");
@@ -847,8 +845,8 @@ mod tests {
         let _ = fs::remove_dir_all(&home);
     }
 
-    /// The desktop app's vendor-written entry — a path with spaces plus an
-    /// argument — chains verbatim, newline-joined.
+    /// A notifier path containing spaces and a fixed argument is preserved in
+    /// the newline-joined chain.
     #[test]
     fn instrument_chains_the_vendor_desktop_entry() {
         let home = temp("vendor_notify");
@@ -882,7 +880,7 @@ mod tests {
         for opaque in [
             // Multi-line array: the value ends mid-structure.
             "notify = [\n  \"/my/thing\",\n]\n",
-            // Literal strings are outside the parser's deliberate scope.
+            // Literal strings are unsupported.
             "notify = ['/my/thing']\n",
             // Empty array: notify is routed, yet no program to chain.
             "notify = []\n",
@@ -938,7 +936,7 @@ mod tests {
             parse_notify_array(" [\"/bin/notify\"]").unwrap(),
             vec!["/bin/notify"]
         );
-        // The vendor entry verbatim: spaces in the path, a second element.
+        // Spaces in the path and the second element are preserved.
         assert_eq!(
             parse_notify_array(
                 r#" ["/Applications/Codex Computer Use.app/Contents/MacOS/SkyComputerUseClient", "turn-ended"]"#

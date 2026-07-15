@@ -205,8 +205,8 @@ pub(crate) struct Word {
 /// to exactly `--` is refused even when quoted: the shell strips quotes
 /// before argv, the CLI reads `--` as the flag terminator either way, and
 /// appended flags would land in prompt text. A `$` inside double quotes is
-/// accepted as literal text: the original bytes pass through untouched, so
-/// the shell still owns it.
+/// accepted because the tokenizer preserves the original bytes and leaves
+/// expansion to the shell.
 pub(crate) fn tokenize(cmd: &str) -> Option<Vec<Word>> {
     let mut words: Vec<Word> = Vec::new();
     let mut cur: Option<Word> = None;
@@ -354,7 +354,7 @@ mod tests {
         assert_eq!(texts, ["claude", "a b", "c d", "--x=q r"]);
         // Quoted spans include their quotes.
         assert_eq!((words[1].start, words[1].end), (7, 12));
-        // `$` inside quotes is literal text, not a refusal.
+        // `$` inside quotes remains in the parsed token.
         let words = tokenize(r#"claude "$HOME""#).unwrap();
         assert_eq!(words[1].text, "$HOME");
     }

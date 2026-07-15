@@ -7,17 +7,16 @@ byte.
 
 ## Capture method
 
-Each fixture comes from a scripted `pty.fork` session under a 40×120 PTY with
-`TERM=xterm-256color`. Tests feed the captured bytes to the emulator verbatim.
-If a fixture needs to change, record a new session rather than patching the
-binary capture.
+Fixtures are recorded under a 40×120 PTY with `TERM=xterm-256color`. Tests feed
+the captured bytes to the emulator verbatim. If a fixture needs to change,
+record a new session rather than patching the binary capture.
 
 ## Fixtures
 
 | Fixture | Source | Coverage |
 | --- | --- | --- |
 | `claude_resume.bin` | recorded `claude --session-id` session: one prompt, reply, `/exit` | alternate-screen exit followed by the primary-screen resume hint (`claude --resume <uuid>`); the scrape target for harness exit capture |
-| `codex_resume.bin` | real `codex resume` session replay | top-anchored DECSTBM scroll regions (`CSI 1;N r`), reverse index, inline-TUI history insertion |
+| `codex_resume.bin` | recorded `codex resume` session | top-anchored DECSTBM scroll regions (`CSI 1;N r`), reverse index, inline-TUI history insertion |
 | `grok_resume.bin` | recorded `grok --session-id` session under `script -q` inside a fleetcom task PTY: one prompt, reply, `/exit` | primary-screen exit followed by the resume hint (`grok --resume <uuid>`); the scrape target for harness exit capture |
 | `tmux_split.bin` | `tmux` session with two splits and one command per pane | scroll regions, pane borders, full redraws |
 | `vim_session.bin` | `vim -u NONE`: insert, navigate, `:set number`, `:q!` | alternate screen, cursor addressing, line editing |

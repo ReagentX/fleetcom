@@ -1,24 +1,24 @@
 # Agent session resume
 
-Saving a `fleetcom` session preserves commands, not the application state behind them. This is problematic for agent CLIs: relaunching a bare `claude`, `codex`, or `grok` command starts another conversation. `fleetcom` associates an ID with the task, then uses it when saving a [session recipe](sessions.md) or rerunning a finished task with `r`.
+Saving a `fleetcom` session preserves commands, not the application state behind them. For agent CLIs, that means relaunching a bare `claude`, `codex`, or `grok` command starts another conversation. `fleetcom` associates an ID with the task, then uses it when saving a [session recipe](../../docs/sessions.md) or rerunning a finished task with `r`.
 
-The dashboard continues to show the command the user entered because instrumentation exists only in the string passed to `$SHELL -c`. When capture succeeds, the recipe contains a resuming command such as `claude --resume '<id>'`, `codex resume '<id>'`, or `grok --resume '<id>'`. When capture fails or produces an ambiguous result, `fleetcom` keeps the original command.
+For direct spawns and session loads, capture flags affect only the string passed to `$SHELL -c`; the task retains the requested command for display and later saves. A rerun stores and displays the generated resume command. When capture succeeds, saved and rerun commands use forms such as `claude --resume '<id>'`, `codex resume '<id>'`, or `grok --resume '<id>'`. When capture fails or produces an ambiguous result, `fleetcom` keeps the task's command unchanged.
 
 ## How capture works
 
-Each instrumented task gets `task-<id>.json` under the capture root (see [environment variables](#environment-variables)). `fleetcom` exposes the path through `FLEETCOM_CAPTURE_FILE`; the injected hook or notifier then overwrites the file with JSON containing the conversation ID.
+Each instrumented task gets `task-<id>.json` under the capture root (see [environment variables](#environment-variables)). For Claude and Codex capture, `fleetcom` exposes the path through `FLEETCOM_CAPTURE_FILE`; the injected hook or notifier overwrites the file with JSON containing the conversation ID.
 
-The first supported task installs two shared assets: `claude-settings.json` with mode `0600` and `codex-notify.sh` with mode `0700`. The capture root uses mode `0700`. Installation also removes existing `task-.json` files; otherwise, a reused numeric task ID could consume a payload left by a stopped daemon.
+The first supported task for a capture root installs `claude-settings.json` with mode `0600` and `codex-notify.sh` with mode `0700`. The root uses mode `0700`. Installation also removes existing `task-*.json` files so reused numeric task IDs cannot consume payloads left by a stopped daemon.
 
 ### `claude`
 
-A fresh launch without session-selection flags normally receives both arguments below. A resuming launch normally receives only the `--settings` addition. `fleetcom` preserves an existing `--settings` argument instead of adding its overlay.
+A fresh launch without session-selection flags receives both arguments below when UUID generation succeeds. A resuming launch receives the `--settings` addition but no new session ID. `fleetcom` does not add the generated settings file when the command already has `--settings`.
 
 ```
 --session-id '<new v4 UUID>' --settings '<root>/claude-settings.json'
 ```
 
-`--session-id` pins the ID before the child produces output. `fleetcom` does not add it when the command already contains `--resume`, `--continue`, `--fork-session`, or `--session-id`. The `--settings` overlay is additive: existing hooks remain active, and `fleetcom` adds one `SessionStart` hook:
+`--session-id` pins the ID before the child produces output. `fleetcom` does not add it when the command already contains `--resume`, `--continue`, `--fork-session`, or `--session-id`. The generated settings file defines one `SessionStart` hook:
 
 ```json
 {"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"cat > \"$FLEETCOM_CAPTURE_FILE\""}]}]}}
@@ -38,19 +38,19 @@ Two fallback channels require no injection. After exit, `fleetcom` scans the fin
 
 After each turn, `codex` invokes the program with notification JSON as its final argument. The script writes that argument to `$FLEETCOM_CAPTURE_FILE`, replacing the previous payload; if the variable is unset, it skips the write. `fleetcom` accepts only `"type":"agent-turn-complete"` payloads and reads the ID from `thread-id`.
 
-A configured `notify` is the common case, not the exception: the Codex desktop app writes its own `notify = [".../Codex Computer Use.app/.../SkyComputerUseClient", "turn-ended"]` into `config.toml` without the user asking. `fleetcom` therefore chains instead of yielding. When `<codex-home>/config.toml` or the effective profile's `<codex-home>/<profile>.config.toml` assigns `notify` a one-line TOML array of basic strings, `fleetcom` still injects its script and hands it the displaced argv through `FLEETCOM_NOTIFY_CHAIN`, newline-joined. After the capture write, the script execs that argv with the notification JSON appended — the user's program receives exactly what `codex` would have passed it. The write precedes the exec, so a hanging or crashing notifier cannot cost the capture. The profile file's assignment overrides the base file's; the last command-line `-p`/`--profile` value selects the profile, otherwise the first line-based `profile = "name"` assignment in `config.toml`.
+When `<codex-home>/config.toml` or the effective profile's `<codex-home>/<profile>.config.toml` assigns `notify` a one-line TOML array of basic strings, `fleetcom` injects its script and passes the displaced argv through `FLEETCOM_NOTIFY_CHAIN`, newline-joined. After writing the capture file, the script execs that argv with the notification JSON appended. The profile file overrides the base file; the last command-line `-p`/`--profile` value selects the profile, or the first line-based `profile = "name"` assignment in `config.toml` applies when the command has no profile flag.
 
-Two cases still skip the override and capture environment entirely. A `-c notify=` or `--config notify=` in the command itself is per-invocation intent and is never overridden. And an assignment the chain cannot carry faithfully — a value that is not a one-line array of basic strings, an empty array, or an element that is empty or contains a newline (the chain delimiter) — leaves the command untouched. Refusal stays the fallback; guessing never is.
+Two cases skip the override and capture environment. A `-c notify=` or `--config notify=` in the command is not overridden. Configuration also remains untouched when `notify` is not a one-line array of basic strings, is empty, or contains an empty or newline-bearing element that cannot be represented by the chain encoding.
 
-These checks are intentionally line-based, not TOML-aware. A `notify` or `profile` key inside a table therefore counts, and two `notify` assignment lines in one file read as ambiguous and skip injection. Wherever injection is skipped, exit scraping and store correlation remain available.
+These checks are line-based, not TOML-aware. A `notify` or `profile` key inside a table therefore counts, and two `notify` assignment lines in one file read as ambiguous and skip injection. Wherever injection is skipped, exit scraping and store correlation remain available.
 
 The exit scraper recognizes both `codex resume <uuid>` and `codex resume, then select <name> (<uuid>)`. It takes the last valid UUID, never the display name. Filesystem correlation searches `<codex-home>/sessions/YYYY/MM/DD/rollout-<local-ts>-<uuid>.jsonl`. Those directories use local dates, so `fleetcom` probes the UTC date ±2 days. A candidate survives only when the v7 UUID's embedded millisecond timestamp falls inside the correlation window and the rollout's first record contains the task's working directory.
 
 ### `grok`
 
-`grok` mirrors `claude`'s launch semantics: a fresh launch is pinned with `--session-id '<new v4 UUID>'`, which `fleetcom` skips when the command already contains `--resume`, `--continue`, `--fork-session`, or `--session-id`. There the symmetry ends: `grok` gets no live capture channel, by decision rather than omission. Its hooks load only from `~/.grok/hooks/*.json`, and `fleetcom` does not write persistent configuration outside its own directories — that invariant was chosen over drift tracking. `parse_capture` therefore always returns `None`, and an in-TUI `/resume` to another session is visible only to the exit scrape.
+`grok` mirrors `claude`'s launch semantics: a fresh launch is pinned with `--session-id '<new v4 UUID>'`, which `fleetcom` skips when the command already contains `--resume`, `--continue`, `--fork-session`, or `--session-id`. The Grok harness has no live capture channel, so an in-TUI `/resume` to another session is available only from the exit scrape.
 
-The two no-injection channels carry the rest. After exit, `fleetcom` scans the final viewport and scrollback for the last `grok -r <uuid>` or `grok --resume <uuid>` hint. At save time, it can also inspect `<grok-home>/sessions/<encoded-cwd>/`, where `<encoded-cwd>` is the absolute working directory percent-encoded (`/` and `%` encode; `.` stays literal) and each session is a directory named by its UUID.
+After exit, `fleetcom` scans the final viewport and scrollback for the last `grok -r <uuid>` or `grok --resume <uuid>` hint. At save time, it can also inspect `<grok-home>/sessions/<encoded-cwd>/`, where `<encoded-cwd>` is the absolute working directory percent-encoded (`/` and `%` encode; `.` stays literal) and each session is a directory named by its UUID.
 
 ## Choosing an ID
 
@@ -63,12 +63,12 @@ Several channels can report different IDs during one task. `fleetcom` resolves t
 
 ## Saved commands
 
-The harness rewrites only the command passed to `resume_command`; the [recipe format](sessions.md#format) does not change:
+The harness rewrites only the command passed to `resume_command`; the [recipe format](../../docs/sessions.md#format) does not change:
 
 - The stored entry is a plain runnable string: `claude --resume '<id>'` can run directly in a shell.
 - `claude`: an existing UUID passed through `--resume` or `-r` is replaced in place; otherwise `--resume '<id>'` is appended. Any `--session-id` flag is removed.
 - `codex`: an existing UUID target is replaced. Fresh commands insert `resume '<id>'` after the program, and bare `codex resume` gains the ID. Named targets (`codex resume my-thread`) and self-targeting forms (`codex resume --last`) remain unchanged.
-- `grok`: as `claude` — a UUID passed through `--resume` or `-r` is replaced in place; otherwise `--resume '<id>'` is appended. Any `--session-id` or `-s` flag is removed, because `grok` rejects it alongside `--resume` without `--fork-session`.
+- `grok`: same as `claude`. A UUID passed through `--resume` or `-r` is replaced in place; otherwise `--resume '<id>'` is appended. Any `--session-id` or `-s` flag is removed, because `grok` rejects it alongside `--resume` without `--fork-session`.
 - Rerun (`r`) applies the same rewrite and stores the resuming command. Re-detection then treats the task as a resume and does not inject another ID.
 - A stale ID fails inside the task's PTY, where the error remains visible. Since the recipe is ordinary JSON, the ID or resume flag can be edited by hand.
 
@@ -85,7 +85,7 @@ The harness rewrites only the command passed to `resume_command`; the [recipe fo
 | Capture assets cannot be installed for the selected root | Spawns untouched. |
 | `codex`: `-c notify=` in the command, or a config `notify` value the chain cannot carry | No injection; exit scrape and store correlation remain. A parseable config `notify` chains instead: capture plus the user's notifier. |
 | `claude`: the user passes `--settings` | No overlay hook; the pinned ID, exit scrape, and store correlation remain. |
-| `grok`: every command | No live capture channel exists to inject (file-based hooks only); the pinned ID, exit scrape, and store correlation remain. |
+| `grok`: every command | No live capture channel is injected; the pinned ID, exit scrape, and store correlation remain. |
 | No ID captured by save time | Store correlation is tried; on failure the original command is stored. |
 | Store correlation is ambiguous, or a `claude` transcript lacks a creation time | The original command is stored. |
 
@@ -97,10 +97,10 @@ Terminal output is untrusted because the child can print a forged resume hint. S
 
 ## Adding another harness
 
-Each supported tool implements the `Harness` trait ([`src/harness/mod.rs`](../src/harness/mod.rs)) and registers in `HARNESSES`. Its eight methods separate detection, capture, correlation, and rewriting:
+Each supported tool implements the `Harness` trait ([`mod.rs`](mod.rs)) and registers in `HARNESSES`. Its eight methods separate detection, capture, correlation, and rewriting:
 
-- `name`: registry identity (test routing assertions).
-- `home_env_var`: the env var overriding the tool's home root (`CLAUDE_CONFIG_DIR`, `CODEX_HOME`); resolved from the connection's launch context during instrumentation and save-time correlation.
+- `name`: registry identity.
+- `home_env_var`: the env var overriding the tool's home root (`CLAUDE_CONFIG_DIR`, `CODEX_HOME`, or `GROK_HOME`); resolved from the connection's launch context during instrumentation and save-time correlation.
 - `detect`: classify the command, any targeted ID, and whether launch-time pinning is allowed. Blocklisted subcommands and unsupported shell syntax return `None`.
 - `instrument`: return the argument suffix, environment pairs, and optional pinned ID. This is also where configuration routing, such as the codex notify chain-or-skip classification, applies.
 - `parse_capture`: extract an ID from a capture-file payload.
@@ -111,16 +111,16 @@ Each supported tool implements the `Harness` trait ([`src/harness/mod.rs`](../sr
 Each harness must define these tool-specific behaviors:
 
 - ID stability under resume. Whether resume preserves or replaces an ID determines when the capture file must be rewritten and where the ID ranks in the precedence chain.
-- A live capture channel. A hook, notify program, or equivalent that `fleetcom` can inject without replacing the user's configuration.
+- Live capture support. Whether a hook, notify program, or equivalent can be injected without replacing the user's configuration.
 - Exit-hint shape. The plain-text pattern recognized after terminal emulation.
 - On-disk store layout. The path scheme, timestamp semantics, and working-directory metadata used for correlation.
 - Launch-time pinning. Whether an ID can be fixed at spawn, and which flag combinations reject it.
 
 The implementation has three test boundaries:
 
-- Corpus fixture: replay a recorded PTY session ending in the tool's exit hint ([`tests/corpus/README.md`](../tests/corpus/README.md)) and assert that the scraper recovers the ID from retained terminal text.
-- Unit: the supervisor tests drive spawn/save/rerun against stub scripts and scratch home dirs ([`src/supervisor.rs`](../src/supervisor.rs), test module).
-- Daemon: [`tests/daemon_resume.rs`](../tests/daemon_resume.rs) covers spawn, save, and load through the daemon protocol, including a daemon restart.
+- Corpus fixture: replay a recorded PTY session ending in the tool's exit hint ([`tests/corpus/README.md`](../../tests/corpus/README.md)) and assert that the scraper recovers the ID from retained terminal text.
+- Unit: the supervisor tests drive spawn/save/rerun against stub scripts and scratch home dirs ([`src/supervisor.rs`](../supervisor.rs), test module).
+- Daemon: [`tests/daemon_resume.rs`](../../tests/daemon_resume.rs) covers spawn, save, and load through the daemon protocol, including a daemon restart.
 
 ## Environment variables
 

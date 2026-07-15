@@ -1,11 +1,6 @@
-//! `grok` mirrors `claude`'s session semantics: `--session-id` pins a fresh
-//! launch, plain `--resume` reuses the ID, and `--fork-session` is the
-//! explicit fork. What it lacks is an injectable live capture channel — its
-//! hooks load only from `~/.grok/hooks/*.json`, and `fleetcom` does not write
-//! persistent configuration outside its own directories. This harness
-//! therefore pins a v4 UUID, scans final terminal text for `grok -r <uuid>`
-//! or `grok --resume <uuid>`, and correlates session directories under
-//! `<grok-home>/sessions/<encoded-cwd>/<uuid>/`.
+//! This harness pins eligible fresh `grok` launches with a v4 UUID, scans final
+//! terminal text for `grok -r <uuid>` or `grok --resume <uuid>`, and correlates
+//! session directories under `<grok-home>/sessions/<encoded-cwd>/<uuid>/`.
 //!
 //! `fleetcom` does not pin launches that contain `--resume`, `--continue`,
 //! `--fork-session`, or `--session-id`.
@@ -51,8 +46,6 @@ impl Harness for Grok {
     }
 
     fn home_env_var(&self) -> &'static str {
-        // Documented by grok itself: "Override config directory (default:
-        // ~/.grok)", and the sessions store follows it.
         "GROK_HOME"
     }
 
@@ -151,20 +144,13 @@ impl Harness for Grok {
         plan
     }
 
-    /// Always `None`, by decision rather than omission: grok's hooks are
-    /// file-based (`~/.grok/hooks/*.json`), and installing one would mean
-    /// writing persistent configuration outside `fleetcom`'s own
-    /// directories. The cost is drift tracking — an in-TUI `/resume` to
-    /// another session is visible only to the exit scrape.
+    /// Grok has no injected live capture channel.
     fn parse_capture(&self, _payload: &str) -> Option<String> {
         None
     }
 
     fn scrape_exit(&self, text: &str) -> Option<String> {
-        // The last valid hint by byte position names the conversation at
-        // exit. The recorded interactive session prints the long spelling
-        // (`grok --resume <uuid>`, the corpus fixture); the binary also
-        // carries a `grok -r ` hint string, so both are scanned.
+        // The last valid short or long resume hint names the conversation.
         let mut last: Option<(usize, String)> = None;
         for hint in ["grok -r ", "grok --resume "] {
             for (i, _) in text.match_indices(hint) {
@@ -219,10 +205,7 @@ impl Harness for Grok {
         if !is_uuid(id) {
             return cmd.to_string();
         }
-        // Refused commands were never detected; leave them untouched rather
-        // than append flags into syntax this module cannot parse. Flags are
-        // order-insensitive, so a misread positional degrades to a harmless
-        // appended `--resume`.
+        // Preserve commands whose shell syntax this module cannot parse.
         let Some(words) = tokenize(cmd) else {
             return cmd.to_string();
         };
@@ -282,10 +265,9 @@ impl Harness for Grok {
     }
 }
 
-/// Grok's store key: the absolute cwd percent-encoded. Only `/` and `%` are
-/// encoded — the observed store leaves `.` and other bytes literal, and the
-/// key must reproduce grok's own encoding, not a guessed RFC set. `%` must
-/// encode for the mapping to stay injective. Non-UTF-8 paths have no key.
+/// Encode an absolute cwd as a Grok session-store key. Only `/` and `%` are
+/// encoded; `%` must encode to keep the mapping injective. Non-UTF-8 paths
+/// have no key.
 fn encode_cwd(cwd: &Path) -> Option<String> {
     let s = cwd.to_str()?;
     let mut out = String::with_capacity(s.len() + 16);
@@ -486,8 +468,7 @@ mod tests {
         assert_eq!(Grok.resume_command("grok", "evil'"), "grok");
     }
 
-    /// The store key reproduces grok's own encoding, pinned by two observed
-    /// directory names.
+    /// Store keys encode slashes and percent signs while leaving dots literal.
     #[test]
     fn encode_cwd_matches_the_observed_store_names() {
         assert_eq!(

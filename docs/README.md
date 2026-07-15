@@ -6,7 +6,7 @@
 
 - [Commands](commands.md): every key and launch flag, including the routing mechanics
 - [Sessions](sessions.md): the task recipe format and where it lives
-- [Agent session resume](src/harness/agent-resume.md): how `fleetcom` captures `claude` and `codex` conversation IDs and rewrites saved commands
+- [Agent session resume](../src/harness/agent-resume.md): how `fleetcom` captures `claude`, `codex`, and `grok` conversation IDs and rewrites saved commands
 - [Directory & Environment Configuration](#directory--environment-configuration): the socket, the lock, and the session paths
 - [Sample Usage Session](#sample-usage-session): a first run, start to finish
 - [Notes & Caveats](#notes--caveats): process and protocol boundaries

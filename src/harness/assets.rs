@@ -28,8 +28,7 @@ use super::CapturePaths;
 /// Notify program injected into `codex`. Without a capture path it writes
 /// nothing; with a chain it execs the displaced notifier afterward.
 const CODEX_NOTIFY_SCRIPT: &str = r#"#!/bin/sh
-# Capture before the chain handoff: exec never returns, so a hanging or
-# crashing notifier must not be able to cost the capture write.
+# Write the capture before replacing this process with the chained notifier.
 if [ -n "$FLEETCOM_CAPTURE_FILE" ]; then
   # Write the notification JSON without a trailing newline.
   printf '%s' "$1" > "$FLEETCOM_CAPTURE_FILE"
@@ -290,8 +289,7 @@ mod tests {
 
     /// With a chain configured, the script writes the capture file and then
     /// execs the displaced notifier with its original argv plus the payload
-    /// last — including a notifier path containing spaces (the vendor
-    /// desktop shape).
+    /// last, including a notifier path containing spaces.
     #[test]
     fn notify_script_chains_the_displaced_notifier() {
         let root = temp("chain");
@@ -321,8 +319,8 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
-    /// A failing chained notifier cannot cost the capture: the write
-    /// precedes the exec, and the notifier's exit status passes through.
+    /// The capture write precedes the chained notifier, whose exit status
+    /// passes through.
     #[test]
     fn notify_script_capture_survives_a_failing_chain() {
         let root = temp("chain_fail");
@@ -344,8 +342,7 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
-    /// The chain fires even without a capture path: the displaced notifier
-    /// must never be lost to a missing fleetcom variable.
+    /// Without a capture path, the script still execs the configured chain.
     #[test]
     fn notify_script_chains_without_a_capture_path() {
         let root = temp("chain_nocap");
