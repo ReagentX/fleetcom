@@ -2,8 +2,8 @@
 
 use std::time::Duration;
 
-/// Coarse relative age for the dashboard: `3s` / `4m` / `2h` / `5d`.
-/// The result uses one unit with no decimals.
+/// Coarse relative age, matching the fleet-view idiom: `3s` / `4m` / `2h` / `5d`.
+/// One unit, no decimals. This is a glanceable column, not a stopwatch.
 pub fn rel_time(d: Duration) -> String {
     let s = d.as_secs();
     if s < 60 {

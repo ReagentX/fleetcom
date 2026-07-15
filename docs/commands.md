@@ -1,6 +1,6 @@
 # Commands
 
-`fleetcom` separates process-level actions from UI actions. Launch arguments select the operating mode; keys control the dashboard, pickers, and attached PTY. This distinction matters because `q`, `Q`, and `Ctrl-C` have different effects depending on the active surface.
+`fleetcom` has two control surfaces. Launch arguments select the operating mode; keys control the dashboard, pickers, and attached PTY. `q`, `Q`, and `Ctrl-C` mean different things on each surface.
 
 ## Invocation
 
@@ -69,7 +69,7 @@ Modified Enter, paste, and mouse input require state-dependent encoding:
 
 Tasks retain 2,000 lines of scrollback. While attached to an inline child, wheel-up over its output enters scrollback; `Shift+PageUp` also enters it (`Ctrl+PageUp` and `Alt+PageUp` work when Shift is intercepted). The status bar shows `[scroll ↑N]`. The wheel scrolls, `PageUp`/`PageDown` move by pages, `↑`/`↓` by lines, and `Home` jumps to the oldest row. `Esc`, `Enter`, `q`, `End`, or reaching the bottom returns to live output. Typing also returns to live and forwards the key. Detaching or switching tasks resets the view.
 
-#### Destructive actions are Shift-gated
+#### Destroy is Shift-gated
 
 `X` kills a running task or removes a finished one. Removal also terminates remaining processes in the task's process group, escalating from `TERM` to `KILL` after two seconds. Lowercase `x` and Ctrl-X do nothing.
 

@@ -81,7 +81,7 @@ The first ordinary invocation starts the daemon when necessary. `--daemon` is an
 
 ### One PTY per command
 
-Every task runs in its own pseudo-terminal, emulated with `alacritty_terminal`. `fleetcom` answers cursor-position and device-attribute queries, renders `?2026` synchronized updates as whole frames, and reflows history after a resize. The dashboard preview, peek overlay, and attached view all read the same emulated screen grid. As a result, full-screen programs such as `vim` and `htop` retain one consistent terminal state across views. Backgrounding changes client focus without notifying the child.
+Every task runs in its own pseudo-terminal, emulated with `alacritty_terminal`. `fleetcom` answers cursor-position and device-attribute queries, renders `?2026` synchronized updates as whole frames, and reflows history after a resize. The dashboard preview, peek overlay, and attached view all read the same emulated screen grid, so full-screen programs such as `vim` and `htop` retain one consistent terminal state across views. Backgrounding changes client focus without notifying the child.
 
 ### Input fidelity
 
@@ -89,7 +89,7 @@ Attached input follows the terminal modes reported by the child. Modified Enter 
 
 ### Jobs outlive the UI
 
-A per-user daemon owns the processes and their terminals. `q` disconnects the client but leaves the daemon and its jobs running; the next `fleetcom` invocation reattaches. Each launch uses the environment and working directory of the client that requested it. This means a job launched from a virtual environment sees that environment even when another client originally started the daemon.
+A per-user daemon owns the processes and their terminals. `q` disconnects the client but leaves the daemon and its jobs running; the next `fleetcom` invocation reattaches. Each launch uses the environment and working directory of the client that requested it: a job launched from a virtual environment sees that environment even when another client originally started the daemon.
 
 `Q` and `fleetcom --kill` stop the daemon and send `SIGTERM` to each job's process group, followed by `SIGKILL` after a two-second grace period. Sending `SIGTERM`, `SIGINT`, or `SIGHUP` directly to the daemon uses the same shutdown path. `fleetcom --kill` reads the daemon PID from the lock file, so it also works while another client occupies the socket. If the connection drops, the client discards the task snapshot it can no longer verify and offers to reconnect.
 

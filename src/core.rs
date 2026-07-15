@@ -7,14 +7,14 @@
 //! It is fully event-driven. The loop waits on a single `Wake` channel that both
 //! the command source *and* every task's reader thread feed, so there is no fixed
 //! polling cadence: an idle core sleeps, and an attached keystroke's echo ships
-//! within a frame of the child emitting it. Two timers
+//! within a frame of the child emitting it. No round-trip stall. Two timers
 //! bound the extremes, neither on the interactive path:
 //!
-//! - `FRAME_MIN` caps screen emission under sustained output (a watched `yes`):
-//!   a burst coalesces into at most one screen per interval.
+//! - `FRAME_MIN` caps screen emission under a firehose (a watched `yes`): a burst
+//!   of output coalesces into at most one screen per interval.
 //! - `FALLBACK` is the idle backstop for the *time-based* dashboard state
 //!   (`started_ago`, the Active→Idle edge) that no wake announces, and the ceiling
-//!   on how long a missed wake could stall a repaint.
+//!   on how long a missed wake could stall a repaint. A self-heal, not the norm.
 
 use std::{
     sync::{
@@ -47,7 +47,7 @@ pub enum Wake {
 
 /// The slot the `Supervisor` hands to each `Task` so its reader thread can wake
 /// the core loop on output. `None` between connections (no loop is listening),
-/// so an unattached daemon's task output accumulates without channel traffic.
+/// so an unattached daemon's task output just accumulates in the parser, free.
 pub type Waker = Arc<Mutex<Option<Sender<Wake>>>>;
 
 /// Why the loop returned.
@@ -59,15 +59,16 @@ pub enum LoopExit {
     ClientGone,
 }
 
-/// Screen-emission ceiling: coalesce sustained output to at most one screen per
-/// interval. 8 ms limits emission to 125 frames per second and bounds the work
-/// a watched `yes` can induce.
+/// Screen-emission ceiling: coalesce a firehose to at most one screen per
+/// interval. 8 ms ⇒ ≤125 fps: under perception, yet a hard cap on the work a
+/// watched `yes` can induce. Interactive echo is sparse, so it never waits the
+/// full interval.
 const FRAME_MIN: Duration = Duration::from_millis(8);
 
 /// Idle backstop: with nothing queued, tick this often anyway so time-based
 /// dashboard state advances (`started_ago`, and the 600 ms Active→Idle edge) even
-/// though no wake marks the passage of time. Also bounds how long a missed wake
-/// could stall a repaint.
+/// though no wake marks the passage of time. Also the ceiling on how long a
+/// missed wake could stall a repaint.
 const FALLBACK: Duration = Duration::from_millis(200);
 
 /// How long to block before the next tick is due: honor the frame floor while
@@ -193,9 +194,9 @@ mod tests {
     }
 
     /// A keystroke to a watched task echoes back as a `Screen` event within a
-    /// frame, not on the idle backstop. Exercises a live PTY, its
+    /// frame, not on the idle backstop. Exercises the real path (a live PTY, its
     /// reader thread signalling the waker, `run_loop` waking and ticking), so it
-    /// fails if the waker wiring breaks because echo would then surface on
+    /// fails loudly if the waker wiring breaks (echo would then only surface on
     /// the 200 ms backstop).
     #[test]
     fn watched_input_echoes_without_polling_delay() {

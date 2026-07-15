@@ -14,7 +14,7 @@ A session is a launch recipe, not a process snapshot. It records commands, worki
 
 The first save creates the directory. This matches the [configuration path resolution](README.md#config-directory-sessions) used by save, list, and load.
 
-The filename derives from the session name. `fleetcom` trims leading and trailing whitespace, replaces control characters and any of `* " / \ < > : | ? .` with `_`, and caps the result at 255 characters. As a result, `my/session` becomes `my_session.json`, while `a.b` becomes `a_b.json`. Replacing `.` prevents the session name from supplying another extension.
+The filename derives from the session name. `fleetcom` trims leading and trailing whitespace, replaces control characters and any of `* " / \ < > : | ? .` with `_`, and caps the result at 255 characters: `my/session` becomes `my_session.json`, and `a.b` becomes `a_b.json`. Replacing `.` prevents the session name from supplying another extension.
 
 ## Format
 
@@ -36,7 +36,7 @@ A session is a JSON object that maps each working directory to an ordered list o
 - Values are ordered lists. A string member is a bare shell command; the object form adds the optional group and display name assigned on load. Order is preserved, and each command runs in its own PTY under that directory.
 - Directories serialize alphabetically. Command order remains stable within each directory.
 
-The schema is a flat map with no version field or metadata, which keeps manual edits practical. On load, the daemon removes control characters, trims surrounding whitespace, and limits group and display names to 64 characters. `Unassigned` maps to no group but remains a legal display name. Invalid JSON fails the entire load. Within valid JSON, `fleetcom` drops any member that matches neither entry form, including a non-string scalar, an object without a string `cmd`, or an object with a non-string `group` or `name`.
+The schema is a flat map with no version field or metadata, so it remains practical to edit by hand. On load, the daemon removes control characters, trims surrounding whitespace, and limits group and display names to 64 characters. `Unassigned` maps to no group but remains a legal display name. Invalid JSON fails the entire load. Within valid JSON, `fleetcom` drops any member that matches neither entry form, including a non-string scalar, an object without a string `cmd`, or an object with a non-string `group` or `name`.
 
 Commands with neither a group nor a name use the string form. String and object entries can appear in the same directory array.
 

@@ -30,7 +30,7 @@ const IDLE_AFTER: Duration = Duration::from_millis(600);
 /// second window over the same `last_activity` signal as `IDLE_AFTER`: 600 ms
 /// flips the per-row glyph, 10 s moves the row. A cadence shorter than the
 /// window (`top` bursts every 1–2 s) resets the signal before it can
-/// expire and never produces a placement edge — the window is the debounce.
+/// expire and never produces a placement edge: the window is the debounce.
 const SORT_IDLE_AFTER: Duration = Duration::from_secs(10);
 
 /// Send-on-change fingerprint for the watched screen and scrollback offset.
@@ -47,11 +47,16 @@ const MAX_CELLS: u32 = 500_000;
 // Keep `MAX_CELLS / rows` nonzero for every clamped row count.
 const _: () = assert!(MAX_CELLS >= MAX_DIM as u32);
 
-/// Ceiling on live tasks. Each task owns a PTY, child, reader thread, and
-/// terminal grid, so this bounds resource use from direct spawns and sessions.
+/// Ceiling on live tasks. Each is a PTY (fds) + child + reader thread + a
+/// terminal grid, so an unbounded `Spawn` loop or a huge session recipe could
+/// exhaust file descriptors and memory. Far above any real fleet: a
+/// guardrail, not a working limit.
 const MAX_TASKS: usize = 256;
 
-/// Grace period between SIGTERM and SIGKILL; bounds shutdown latency.
+/// How long a SIGTERMed job gets to exit before SIGKILL. TERM-respecting
+/// processes exit in milliseconds, so this is the *ceiling* on quit latency,
+/// not the norm; 2 s is enough for any real flush handler while keeping a
+/// wedged job from making `Q` feel broken.
 const KILL_GRACE: Duration = Duration::from_secs(2);
 
 /// Maximum stored label length in Unicode scalar values after normalization,
@@ -152,9 +157,10 @@ pub struct Supervisor {
     /// Handed to every `Task` so its reader thread can wake the core loop when the
     /// PTY produces output. The serving loop installs its sender on connect
     /// (`set_waker`) and drops it on disconnect (`clear_waker`); between clients
-    /// it is `None`, so task output accumulates without wake-channel traffic.
+    /// it is `None`, so an unattached daemon's task output accumulates cost-free.
     waker: Waker,
-    /// TERM→KILL escalation window. Tests replace the production duration.
+    /// TERM→KILL escalation window. `KILL_GRACE` in production; a field so tests
+    /// shrink it instead of sleeping through real seconds.
     kill_grace: Duration,
     /// Capture assets keyed by canonicalized root and reused for this
     /// supervisor's lifetime.
@@ -348,9 +354,11 @@ impl Supervisor {
 
     /// Kill every task for the quit path: TERM all groups at once, wait out
     /// one shared grace, then SIGKILL the stragglers. The wait exits early
-    /// once `swept` proves there is nothing left to wait for. Leader exit
-    /// alone is insufficient because `cmd & exit 0` can leave group members
-    /// running through the TERM grace.
+    /// once `swept` proves there is nothing left to wait for; a task's
+    /// `finished` alone cannot gate it, because leader exit says nothing
+    /// about the rest of the group (`cmd & exit 0` leaves members behind),
+    /// and a leader-only predicate KILLed those members the instant the last
+    /// leader happened to be done, skipping the TERM grace entirely.
     /// Blocking is bounded by the grace. Anything the final KILLs don't
     /// collect (a leader in uninterruptible sleep) reparents to init when
     /// the daemon exits moments later, as do TERM-refusing members of a
@@ -632,8 +640,9 @@ impl Supervisor {
                 fresh.tagged = self.tasks[i].tagged;
                 fresh.group = self.tasks[i].group.clone();
                 fresh.name = self.tasks[i].name.clone();
-                // Terminate the displaced job through the graveyard so its
-                // process group receives the normal TERM-to-KILL grace.
+                // The displaced job exits like a Remove: TERM now, the
+                // graveyard's grace-then-KILL behind it. Dropping it here
+                // would straight-SIGKILL stragglers of the old run.
                 let mut old = std::mem::replace(&mut self.tasks[i], fresh);
                 old.terminate();
                 self.graveyard.push(old);
@@ -723,8 +732,8 @@ impl Supervisor {
     }
 
     /// Spawn every command in the named session, each in its (existing) dir.
-    /// Missing directories are skipped because the task cannot change into
-    /// them before spawning.
+    /// Missing dirs are skipped rather than spawning tasks doomed to fail on
+    /// chdir.
     fn load_session(&mut self, name: &str) {
         let cfg = match self
             .sessions_root()
@@ -777,7 +786,7 @@ impl Supervisor {
     }
 }
 
-// Unit tests are kept in a separate source file.
+// Tests live in supervisor_tests.rs: at ≈2,800 lines they dwarf the module itself.
 #[cfg(test)]
 #[path = "supervisor_tests.rs"]
 mod tests;

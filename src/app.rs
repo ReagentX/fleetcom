@@ -132,7 +132,7 @@ pub struct App {
     pub views: Vec<TaskView>,
     /// The watched task's screen (attach/peek), from `Event::Screen`.
     focused_screen: Option<ScreenView>,
-    /// Last `Watch` target sent to the core, avoiding a resend every tick.
+    /// Last `Watch` target sent to the core, so we don't resend it every tick.
     watched: Option<u64>,
     /// Whether this client talks to a daemon (vs. an in-process `--foreground`
     /// core). Only a daemon client can meaningfully reconnect after a drop.
@@ -189,15 +189,16 @@ pub struct App {
     input_tx: Option<Sender<CtEvent>>,
     /// Wake notifications from the input and transport reader threads.
     wait_rx: Receiver<()>,
-    /// Wake sender shared with the stdin thread and replacement transports.
+    /// Kept so `run` can hand the stdin thread a poker, and `reconnect` a fresh
+    /// transport one.
     wait_tx: Sender<()>,
     /// Set by an external SIGTERM/SIGHUP/SIGINT; the loop treats it as quit so
     /// teardown runs and the terminal is restored.
     term_signal: Arc<AtomicBool>,
     should_quit: bool,
     /// How to leave when `should_quit` fires: `q`/Ctrl-C/signals disconnect
-    /// while `Q` kills the jobs. The default is `Disconnect`, which preserves
-    /// daemon-owned jobs on an unexpected client exit.
+    /// (daemon + jobs survive), `Q` quits and kills. Defaults to the safe
+    /// `Disconnect` so an unexpected exit never reaps the daemon.
     exit_intent: ExitIntent,
     /// Whether the client currently captures terminal mouse events.
     mouse_captured: bool,
@@ -232,10 +233,12 @@ fn step_down(sel: usize, len: usize) -> usize {
 }
 
 /// Dashboard grouping bucket: 0 tagged, 1 live, 2 parked live, 3 completed.
-/// Tagged tasks always use bucket 0, and finished lifecycle states use bucket
-/// 3. Live tasks use `parked`, the core's 10 s quiet signal, to select bucket 1
-/// or 2. `Lifecycle::Idle` uses a 600 ms edge, so a `top`-cadence task may
-/// change glyphs without changing sections.
+/// Tagged wins over everything; completed is classified by `lifecycle`, never
+/// by trusting `parked == false`, so a core that ever shipped both signals
+/// still lands finished tasks in Completed. Placement follows `parked`, the
+/// core's 10 s debounced quiet signal, not the instantaneous `Lifecycle::Idle`:
+/// `top`-cadence output flaps the 600 ms glyph edge, and the glyph may flicker
+/// but the row must not change sections.
 fn bucket(v: &TaskView) -> u8 {
     if v.tagged {
         0
@@ -292,8 +295,8 @@ impl App {
         }
     }
 
-    /// `--foreground`: run the core in-process on a thread. This mode has no
-    /// daemon and gives UI tests a deterministic transport.
+    /// `--foreground`: run the core in-process on a thread (no daemon). A
+    /// non-daemon escape hatch, and the deterministic target the UI harnesses use.
     pub fn new_foreground(rows: u16, cols: u16) -> App {
         App::assemble(rows, cols, |pr, c, wait_tx| {
             Box::new(ThreadTransport::spawn(Supervisor::new(pr, c), wait_tx))
@@ -395,8 +398,8 @@ impl App {
     }
 
     /// The watched task's screen, but only if it's the one `id` expects. Guards
-    /// against painting a stale screen for the wrong task while a socket-backed
-    /// watch switches targets.
+    /// against painting a stale screen for the wrong task on the frame a watch
+    /// switches (a real race once the core is across a socket).
     pub fn screen_for(&self, id: u64) -> Option<&ScreenView> {
         self.focused_screen.as_ref().filter(|s| s.id == id)
     }
@@ -526,7 +529,7 @@ impl App {
         self.selected_id = Some(self.views[order[next]].id);
     }
 
-    /// Tell the core which task's screen is needed (attach/peek), sending `Watch`
+    /// Tell the core which task's screen we need (attach/peek), sending `Watch`
     /// only when the target actually changes.
     fn set_watch(&mut self, want: Option<u64>) {
         if want != self.watched {
@@ -1327,7 +1330,7 @@ impl App {
     }
 }
 
-/// Translate supported key events to PTY input byte sequences.
+/// Translate supported key events to legacy PTY byte sequences.
 fn key_to_bytes(code: KeyCode, mods: KeyModifiers) -> Option<Vec<u8>> {
     let ctrl = mods.contains(KeyModifiers::CONTROL);
     let alt = mods.contains(KeyModifiers::ALT);
@@ -1383,7 +1386,7 @@ fn key_to_bytes(code: KeyCode, mods: KeyModifiers) -> Option<Vec<u8>> {
 }
 
 /// Split a typed path into (directory-so-far, trailing fragment). The fragment
-/// is prefix-matched against candidates; the directory is listed.
+/// is prefix-matched against candidates; the directory is what we list.
 fn split_input(input: &str) -> (&str, &str) {
     match input.rfind('/') {
         Some(pos) => (&input[..=pos], &input[pos + 1..]),
@@ -1701,7 +1704,7 @@ mod tests {
     /// A parked live task gets its own "Idle" section between "Running" and
     /// "Completed". `parked` is flipped on the local snapshot here (and in the
     /// tests below): the core's 10 s quiet window is exactly what a test must
-    /// not wait out, and `sections` is pure over `views` — the flip must come
+    /// not wait out, and `sections` is pure over `views`: the flip must come
     /// after the last pump, or a fresh snapshot overwrites it.
     #[test]
     fn parked_task_lands_in_idle_between_running_and_completed() {
@@ -1882,7 +1885,7 @@ mod tests {
     }
 
     /// An App whose core's session root is pinned to `dir` via the launch
-    /// context, so these tests never read the host process's config directory.
+    /// context, so these tests never read this process's real config dir.
     fn app_with_config_dir(dir: &Path) -> App {
         App::new_local_with_ctx(
             30,
@@ -2059,7 +2062,7 @@ mod tests {
 
     /// Selection wraps at the list edges: up from the first task lands on the
     /// last and down from the last lands on the first, across the section
-    /// boundary — `display_order` is flat, so headers never trap the cursor.
+    /// boundary. `display_order` is flat, so headers never trap the cursor.
     #[test]
     fn selection_wraps_at_list_edges() {
         let mut app = App::new_local(30, 100);
@@ -2128,7 +2131,7 @@ mod tests {
             key_to_bytes(KeyCode::Enter, KeyModifiers::ALT),
             Some(b"\x1b\r".to_vec())
         );
-        // Ctrl+Enter has no distinct encoding here: send plain CR.
+        // Ctrl+Enter has no distinct legacy encoding: plain CR.
         assert_eq!(
             key_to_bytes(KeyCode::Enter, KeyModifiers::CONTROL),
             Some(vec![b'\r'])

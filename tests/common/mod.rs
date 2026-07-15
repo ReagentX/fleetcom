@@ -15,8 +15,8 @@ use std::{
     time::{Duration, Instant},
 };
 
-/// Protocol version spoken by the integration-test client. It must match
-/// `protocol::PROTOCOL_VERSION` for the handshake to succeed.
+/// The protocol version this test suite speaks; must track
+/// `protocol::PROTOCOL_VERSION` (drift fails the handshake, loudly).
 pub const PROTOCOL_VERSION: u32 = 8;
 
 /// One frame of the given kind: `[u32 len][kind][payload]`.
@@ -212,8 +212,8 @@ pub fn start_daemon_raw(
     (dir, daemon, stream)
 }
 
-/// `start_daemon_raw` plus the standard handshake, leaving a connection ready
-/// for commands from the integration-test client.
+/// `start_daemon_raw` plus the standard handshake: the connection is ready for
+/// commands, exactly like a real client's.
 pub fn start_daemon(
     tag: &str,
     configure: impl FnOnce(&mut Command),

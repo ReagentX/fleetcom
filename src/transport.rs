@@ -28,8 +28,8 @@ pub enum ExitIntent {
     Quit,
 }
 
-/// The client↔core boundary. Commands travel toward the core and results return
-/// as events, matching the socket transport's one-way channels.
+/// The client↔core seam. Deliberately one-way-each: commands never return a
+/// value (results arrive as events), which is exactly what a socket enforces.
 pub trait Transport {
     /// Dispatch a command to the core.
     fn send(&mut self, cmd: Command);
