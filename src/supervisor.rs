@@ -111,11 +111,20 @@ fn scrape_now(t: &mut Task) {
     t.scrape_exit_hint();
 }
 
-/// Resolve the harness home from the provided launch environment.
-fn home_override(env: &[(OsString, OsString)], h: &dyn harness::Harness) -> Option<PathBuf> {
-    env.iter()
-        .find(|(k, _)| k == h.home_env_var())
-        .map(|(_, v)| PathBuf::from(v))
+/// Resolve the harness home from the provided launch environment: the tool's
+/// own override wins; without it, the launch env's HOME names the client's
+/// tree through the tool's dot directory. The child resolves `~/.codex` and
+/// friends from the env it inherits, so anything else would aim the notify
+/// guard and store correlation at the wrong tree. `None` (neither present)
+/// leaves each harness's `dirs` fallback — this process's home — as the last
+/// resort.
+fn harness_home(env: &[(OsString, OsString)], h: &dyn harness::Harness) -> Option<PathBuf> {
+    let val = |key: &str| {
+        env.iter()
+            .find(|(k, _)| k == key)
+            .map(|(_, v)| PathBuf::from(v))
+    };
+    val(h.home_env_var()).or_else(|| Some(val("HOME")?.join(h.home_dot_dir())))
 }
 
 pub struct Supervisor {
@@ -465,6 +474,9 @@ impl Supervisor {
     /// `FLEETCOM_RUNTIME_DIR` is used verbatim; the fallback root includes a
     /// session-root discriminator. Canonical roots are installed and swept
     /// once per daemon lifetime, preserving live capture files on reuse.
+    /// Capture files land in this process's pid namespace under the root, so
+    /// concurrent supervisors sharing a root (a daemon plus `--foreground`
+    /// runs) cannot cross-wire each other's captures.
     /// Installation failure disables instrumentation for the spawn.
     fn ensure_capture_assets(&mut self) -> Option<&assets::CaptureAssets> {
         let root = if let Some(ctx) = &self.launch
@@ -486,7 +498,7 @@ impl Supervisor {
         {
             return self.capture.get(&key);
         }
-        let installed = assets::CaptureAssets::install(&root).ok()?;
+        let installed = assets::CaptureAssets::install(&root, std::process::id()).ok()?;
         let key = std::fs::canonicalize(&root).unwrap_or(root);
         Some(self.capture.entry(key).or_insert(installed))
     }
@@ -505,7 +517,7 @@ impl Supervisor {
         if let Some((h, inv)) = harness::detect(command) {
             let paths = self.ensure_capture_assets().map(|a| a.paths_for(id, run));
             if let Some(paths) = paths {
-                let home = home_override(env, h);
+                let home = harness_home(env, h);
                 let plan = h.instrument(&inv, &paths, home.as_deref());
                 let exec = format!("{command}{}", plan.args_suffix);
                 let mut env = env.to_vec();
@@ -2357,12 +2369,15 @@ mod tests {
         );
 
         let t = &s.tasks[0];
-        let cap = runtime.join(format!("task-{}-0.json", t.id));
-        // An explicit runtime directory is used without a discriminator.
+        let cap = runtime
+            .join(std::process::id().to_string())
+            .join(format!("task-{}-0.json", t.id));
+        // An explicit runtime directory is used without a discriminator;
+        // capture files sit in this process's pid namespace under it.
         assert_eq!(
             std::fs::read_to_string(dir.join("capenv")).unwrap(),
             cap.display().to_string(),
-            "the capture env must name task-<id>-<run>.json under the override root"
+            "the capture env must name task-<id>-<run>.json under the root's pid namespace"
         );
         assert_eq!(
             t.command, "claude",
@@ -2676,7 +2691,9 @@ mod tests {
             cwd: dir.clone(),
             group: None,
         });
-        let decoy = root_b.join(format!("task-{id}-0.json"));
+        let decoy = root_b
+            .join(std::process::id().to_string())
+            .join(format!("task-{id}-0.json"));
         std::fs::write(&decoy, "{}").unwrap();
 
         s.apply(Command::Remove { id });
@@ -3105,6 +3122,165 @@ mod tests {
         assert!(
             !text.contains(&id_b),
             "the reconnect store's decoy must not correlate; got {text}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Home resolution order: the tool's own var, then the launch env's HOME
+    /// joined with the tool's dot directory, then nothing.
+    #[test]
+    fn harness_home_prefers_the_tool_var_then_home() {
+        use crate::harness::{Claude, Codex, Grok};
+        let env: Vec<(OsString, OsString)> = vec![
+            ("HOME".into(), "/h".into()),
+            ("CODEX_HOME".into(), "/x".into()),
+        ];
+        assert_eq!(harness_home(&env, &Codex).as_deref(), Some(Path::new("/x")));
+        let env: Vec<(OsString, OsString)> = vec![("HOME".into(), "/h".into())];
+        assert_eq!(
+            harness_home(&env, &Codex).as_deref(),
+            Some(Path::new("/h/.codex"))
+        );
+        assert_eq!(
+            harness_home(&env, &Claude).as_deref(),
+            Some(Path::new("/h/.claude"))
+        );
+        assert_eq!(
+            harness_home(&env, &Grok).as_deref(),
+            Some(Path::new("/h/.grok"))
+        );
+        assert_eq!(harness_home(&[], &Codex), None);
+    }
+
+    /// With only HOME in the launch env, the harness home resolves to
+    /// `<home>/.codex`: the notify guard reads that tree's config.toml and
+    /// save-time correlation reads that tree's store — the client's tree,
+    /// not the daemon's.
+    #[test]
+    fn home_only_launch_env_targets_the_clients_dot_codex() {
+        let dir = scratch("home_resolve");
+        let (bin, runtime, config, home) = (
+            dir.join("bin"),
+            dir.join("run"),
+            dir.join("config"),
+            dir.join("home"),
+        );
+        let codex_home = home.join(".codex");
+        std::fs::create_dir_all(&codex_home).unwrap();
+        // A multi-line notify is Opaque: injection is suppressed only when
+        // the guard reads the client's config.toml through HOME.
+        std::fs::write(
+            codex_home.join("config.toml"),
+            "notify = [\n  \"/my/thing\",\n]\n",
+        )
+        .unwrap();
+        install_stub(&bin, "codex", &dir);
+        // A unique in-window rollout in the same tree for save-time
+        // correlation: with injection suppressed, no capture channel fires.
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let id = v7_at(now_ms, 1);
+        let (y, m, d) = civil_from_days((now_ms / 86_400_000) as i64);
+        let day = codex_home
+            .join("sessions")
+            .join(format!("{y:04}"))
+            .join(format!("{m:02}"))
+            .join(format!("{d:02}"));
+        std::fs::create_dir_all(&day).unwrap();
+        std::fs::write(
+            day.join(format!("rollout-2026-07-14T09-00-00-{id}.jsonl")),
+            format!(
+                r#"{{"timestamp":"x","type":"session_meta","payload":{{"id":"{id}","cwd":"{}"}}}}"#,
+                dir.display()
+            ),
+        )
+        .unwrap();
+
+        let mut s = Supervisor::new(24, 80);
+        s.set_launch_context(agent_ctx_plus(
+            &bin,
+            &runtime,
+            dir.clone(),
+            &[("FLEETCOM_CONFIG_DIR", &config), ("HOME", &home)],
+        ));
+        s.apply(Command::Spawn {
+            command: "codex".into(),
+            cwd: dir.clone(),
+            group: None,
+        });
+        assert_eq!(
+            s.tasks[0].harness_home.as_deref(),
+            Some(codex_home.as_path()),
+            "HOME alone must resolve the harness home"
+        );
+        let argv = wait_argv(&mut s, &dir.join("argv"));
+        assert!(
+            !argv.iter().any(|a| a.contains("notify=")),
+            "the guard must read <home>/.codex/config.toml; argv: {argv:?}"
+        );
+        assert!(reap_until(&mut s, Duration::from_secs(5), |s| s.tasks[0]
+            .finished
+            .is_some()));
+
+        let text = save_and_read(&mut s, &config, "homeonly");
+        assert!(
+            text.contains(&format!("codex resume '{id}'")),
+            "correlation must read <home>/.codex; got {text}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A stale `FLEETCOM_NOTIFY_CHAIN` inherited through the launch env (a
+    /// nested fleetcom's export) must never execute: with nothing routed,
+    /// instrument pins the chain to empty, which the script reads as absent.
+    #[test]
+    fn stale_inherited_notify_chain_is_never_executed() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = scratch("stale_chain");
+        let (bin, runtime) = (dir.join("bin"), dir.join("run"));
+        // No config.toml exists: nothing routed, so nothing may be chained.
+        let codex_home = dir.join("codex_home");
+        let stale = dir.join("stale");
+        let record = dir.join("stale-record");
+        std::fs::write(&stale, format!("#!/bin/sh\ntouch '{}'\n", record.display())).unwrap();
+        std::fs::set_permissions(&stale, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        // The stub invokes the injected notify script the way codex would.
+        let payload = format!(r#"{{"type":"agent-turn-complete","thread-id":"{CAP_ID}"}}"#);
+        install_script(
+            &bin,
+            "codex",
+            &format!(
+                "'{script}' '{payload}'",
+                script = runtime.join("codex-notify.sh").display(),
+            ),
+        );
+        let mut s = Supervisor::new(24, 80);
+        let mut ctx = agent_ctx_plus(&bin, &runtime, dir.clone(), &[("CODEX_HOME", &codex_home)]);
+        ctx.env.push((
+            crate::harness::NOTIFY_CHAIN_ENV.into(),
+            stale.as_os_str().to_os_string(),
+        ));
+        s.set_launch_context(ctx);
+        s.apply(Command::Spawn {
+            command: "codex".into(),
+            cwd: dir.clone(),
+            group: None,
+        });
+        assert!(reap_until(&mut s, Duration::from_secs(5), |s| s.tasks[0]
+            .finished
+            .is_some()));
+        let cap = s.tasks[0].capture_file.clone().expect("capture file set");
+        assert_eq!(
+            std::fs::read_to_string(&cap).unwrap(),
+            payload,
+            "the capture write must land before the script exits"
+        );
+        assert!(
+            !record.exists(),
+            "the stale inherited chain must not execute"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

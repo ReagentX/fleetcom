@@ -27,6 +27,10 @@ impl Harness for Codex {
         "CODEX_HOME"
     }
 
+    fn home_dot_dir(&self) -> &'static str {
+        ".codex"
+    }
+
     fn detect(&self, cmd: &str) -> Option<Invocation> {
         detect_shape(cmd, "codex", "resume")
     }
@@ -37,13 +41,17 @@ impl Harness for Codex {
         // ID at launch either way.
         _inv: &Invocation,
         capture: &CapturePaths,
-        home_override: Option<&Path>,
+        home: Option<&Path>,
     ) -> SpawnPlan {
-        let chain = match config_notify_route(home_override) {
-            NotifyRoute::Vacant => None,
+        let chain = match config_notify_route(home) {
+            // Nothing routed still sets the chain, empty: children inherit
+            // the client env verbatim, so a stale exported value (a nested
+            // fleetcom) would otherwise reach the injected script, which
+            // execs it per notification. The script reads empty as absent.
+            NotifyRoute::Vacant => String::new(),
             // A routed notifier rides along: the injected script execs this
             // argv, payload appended, after the capture write.
-            NotifyRoute::Chain(argv) => Some(argv.join("\n")),
+            NotifyRoute::Chain(argv) => argv.join("\n"),
             // A route the chain cannot carry faithfully: leave the command
             // untouched rather than guess.
             NotifyRoute::Opaque => return SpawnPlan::default(),
@@ -52,16 +60,15 @@ impl Harness for Codex {
             "notify=[\"{}\"]",
             toml_escape(&capture.codex_notify.to_string_lossy())
         );
-        let mut env = vec![(
-            CAPTURE_ENV.into(),
-            capture.capture_file.clone().into_os_string(),
-        )];
-        if let Some(chain) = chain {
-            env.push((NOTIFY_CHAIN_ENV.into(), chain.into()));
-        }
         SpawnPlan {
             args_suffix: format!(" -c {}", shell_quote(&toml)),
-            env,
+            env: vec![
+                (
+                    CAPTURE_ENV.into(),
+                    capture.capture_file.clone().into_os_string(),
+                ),
+                (NOTIFY_CHAIN_ENV.into(), chain.into()),
+            ],
             injected_id: None,
         }
     }
@@ -100,13 +107,10 @@ impl Harness for Codex {
         last
     }
 
-    fn correlate_fs(
-        &self,
-        cwd: &Path,
-        spawned: SystemTime,
-        home_override: Option<&Path>,
-    ) -> Option<String> {
-        let root = match home_override {
+    fn correlate_fs(&self, cwd: &Path, spawned: SystemTime, home: Option<&Path>) -> Option<String> {
+        // The `dirs` default is the last resort: the supervisor resolves
+        // `home` from the launch env whenever it names any home at all.
+        let root = match home {
             Some(p) => p.to_path_buf(),
             None => dirs::home_dir()?.join(".codex"),
         };
@@ -513,10 +517,14 @@ mod tests {
             assert_eq!(plan.injected_id, None, "{cmd}");
             assert_eq!(
                 plan.env,
-                vec![(
-                    CAPTURE_ENV.into(),
-                    PathBuf::from("/tmp/cap/session.json").into_os_string()
-                )],
+                vec![
+                    (
+                        CAPTURE_ENV.into(),
+                        PathBuf::from("/tmp/cap/session.json").into_os_string()
+                    ),
+                    // The empty chain overrides a stale inherited value.
+                    (NOTIFY_CHAIN_ENV.into(), "".into()),
+                ],
                 "{cmd}"
             );
         }
@@ -536,10 +544,11 @@ mod tests {
                 .map(|(_, v)| v.clone())
         };
 
-        // Missing file (and missing home dir): plain injection, no chain.
+        // Missing file (and missing home dir): plain injection, and the
+        // chain is present but empty.
         let plan = Codex.instrument(&inv, &paths(), Some(&home));
         assert!(!plan.args_suffix.is_empty());
-        assert_eq!(chained(&plan), None);
+        assert_eq!(chained(&plan), Some("".into()));
 
         fs::create_dir_all(&home).unwrap();
         let cfg = home.join("config.toml");
@@ -565,7 +574,7 @@ mod tests {
             fs::write(&cfg, inert).unwrap();
             let plan = Codex.instrument(&inv, &paths(), Some(&home));
             assert!(!plan.args_suffix.is_empty(), "{inert:?}");
-            assert_eq!(chained(&plan), None, "{inert:?}");
+            assert_eq!(chained(&plan), Some("".into()), "{inert:?}");
         }
         let _ = fs::remove_dir_all(&home);
     }

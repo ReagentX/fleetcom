@@ -34,9 +34,11 @@ pub use grok::Grok;
 pub const CAPTURE_ENV: &str = "FLEETCOM_CAPTURE_FILE";
 
 /// Environment variable carrying a displaced `codex` notify program's argv,
-/// newline-joined. Set only when the user's config already routed `notify`;
-/// the injected notify script execs this argv, payload appended, after the
-/// capture write.
+/// newline-joined. `codex` instrumentation always sets it: the chain argv
+/// when the user's config routed `notify`, empty otherwise — children inherit
+/// the client env verbatim, so a stale exported value (a nested fleetcom)
+/// would otherwise reach the injected script, which execs it per
+/// notification. The script's `[ -n ]` guard reads empty as absent.
 pub const NOTIFY_CHAIN_ENV: &str = "FLEETCOM_NOTIFY_CHAIN";
 
 /// Maximum difference between a task spawn and a correlated session timestamp.
@@ -51,18 +53,26 @@ pub trait Harness: Sync {
     /// resolves it from the launch context used for instrumentation or save.
     fn home_env_var(&self) -> &'static str;
 
+    /// The tool's directory name under `$HOME` (`.claude`, `.codex`,
+    /// `.grok`). With no [`Harness::home_env_var`] in the launch env, the
+    /// supervisor resolves the harness home as the launch env's HOME joined
+    /// with this — the tree the child itself will use, not the daemon's.
+    fn home_dot_dir(&self) -> &'static str;
+
     /// Classify a command. Return `None` for another tool or an unsupported
     /// command shape.
     fn detect(&self, cmd: &str) -> Option<Invocation>;
 
     /// Build spawn-time command and environment additions.
-    /// `home_override` is the launch env's [`Harness::home_env_var`] value;
-    /// `codex` reads the user's config through it before injecting `notify`.
+    /// `home` is the harness home resolved from the launch env; `codex`
+    /// reads the user's config through it before injecting `notify`. `None`
+    /// (the launch env named neither the tool var nor HOME) falls back to
+    /// this process's own home, the only tree left to guess.
     fn instrument(
         &self,
         inv: &Invocation,
         capture: &CapturePaths,
-        home_override: Option<&Path>,
+        home: Option<&Path>,
     ) -> SpawnPlan;
 
     /// Extract a session ID from hook or notify JSON.
@@ -72,13 +82,8 @@ pub trait Harness: Sync {
     fn scrape_exit(&self, text: &str) -> Option<String>;
 
     /// Find one session ID in the tool's on-disk store. Missing or ambiguous
-    /// matches return `None`.
-    fn correlate_fs(
-        &self,
-        cwd: &Path,
-        spawned: SystemTime,
-        home_override: Option<&Path>,
-    ) -> Option<String>;
+    /// matches return `None`. `home` follows the `instrument` contract.
+    fn correlate_fs(&self, cwd: &Path, spawned: SystemTime, home: Option<&Path>) -> Option<String>;
 
     /// Rewrite an accepted `cmd` into the canonical command that resumes
     /// `id`.
@@ -141,9 +146,14 @@ pub struct SpawnPlan {
 /// Characters that keep the program word from being one plain shell word:
 /// with any of these present, arguments this module appends could bind to a
 /// different command than the one the shell runs (`=` makes the word an
-/// env-prefix assignment; the rest separate, expand, quote, or comment).
+/// env-prefix assignment; `*?[]` glob-expand and `{}` brace-expand the word
+/// into several words or a different path; the rest separate, expand, quote,
+/// or comment). Tilde is accepted deliberately: it expands to a single word
+/// with the same basename, so appended flags still bind to the detected
+/// program.
 const PROGRAM_WORD_REFUSALS: &[char] = &[
-    '|', ';', '&', '<', '>', '$', '#', '`', '(', ')', '\\', '\'', '"', '=', '\n', '\r',
+    '|', ';', '&', '<', '>', '$', '#', '`', '(', ')', '\\', '\'', '"', '=', '\n', '\r', '*', '?',
+    '[', ']', '{', '}',
 ];
 
 /// Match `cmd` against the two supported shapes for `program`: the bare
@@ -334,6 +344,25 @@ mod tests {
         }
     }
 
+    /// Glob and brace metacharacters can expand the program word into
+    /// several words or a different path, losing flag binding; tilde expands
+    /// to one word with the same basename, so it stays accepted.
+    #[test]
+    fn detect_shape_refuses_expanding_metacharacters_but_accepts_tilde() {
+        assert_eq!(
+            detect_shape("~/bin/claude", "claude", "--resume"),
+            Some(Invocation::Bare)
+        );
+        for (cmd, prog, sel) in [
+            ("tools/*/claude", "claude", "--resume"),
+            ("/opt/{stable,beta}/codex", "codex", "resume"),
+            ("a?b/claude", "claude", "--resume"),
+            ("[a]/grok", "grok", "--resume"),
+        ] {
+            assert_eq!(detect_shape(cmd, prog, sel), None, "{cmd:?}");
+        }
+    }
+
     /// Shell quoting preserves spaces and embedded single quotes.
     #[test]
     fn shell_quote_survives_spaces_and_single_quotes() {
@@ -366,6 +395,9 @@ mod tests {
         assert_eq!(Claude.home_env_var(), "CLAUDE_CONFIG_DIR");
         assert_eq!(Codex.home_env_var(), "CODEX_HOME");
         assert_eq!(Grok.home_env_var(), "GROK_HOME");
+        assert_eq!(Claude.home_dot_dir(), ".claude");
+        assert_eq!(Codex.home_dot_dir(), ".codex");
+        assert_eq!(Grok.home_dot_dir(), ".grok");
     }
 
     #[test]

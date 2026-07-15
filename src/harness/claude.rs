@@ -22,6 +22,10 @@ impl Harness for Claude {
         "CLAUDE_CONFIG_DIR"
     }
 
+    fn home_dot_dir(&self) -> &'static str {
+        ".claude"
+    }
+
     fn detect(&self, cmd: &str) -> Option<Invocation> {
         detect_shape(cmd, "claude", "--resume")
     }
@@ -31,7 +35,7 @@ impl Harness for Claude {
         inv: &Invocation,
         capture: &CapturePaths,
         // The settings overlay does not depend on the Claude home path.
-        _home_override: Option<&Path>,
+        _home: Option<&Path>,
     ) -> SpawnPlan {
         let mut suffix = String::new();
         let mut injected_id = None;
@@ -74,13 +78,10 @@ impl Harness for Claude {
         last
     }
 
-    fn correlate_fs(
-        &self,
-        cwd: &Path,
-        spawned: SystemTime,
-        home_override: Option<&Path>,
-    ) -> Option<String> {
-        let root = match home_override {
+    fn correlate_fs(&self, cwd: &Path, spawned: SystemTime, home: Option<&Path>) -> Option<String> {
+        // The `dirs` default is the last resort: the supervisor resolves
+        // `home` from the launch env whenever it names any home at all.
+        let root = match home {
             Some(p) => p.to_path_buf(),
             None => dirs::home_dir()?.join(".claude"),
         };

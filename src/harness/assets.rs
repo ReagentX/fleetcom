@@ -2,6 +2,11 @@
 //! installs those shared assets and allocates one capture path per task run. The
 //! supervisor installs each root once per daemon lifetime and reuses it.
 //!
+//! Shared assets sit at the root; capture files live under `<root>/<pid>`.
+//! `--foreground` lets several fleetcom processes share one root, and each
+//! allocates task ids from 1, so an unshared namespace per process is the
+//! only thing keeping their `task-<id>-<run>.json` paths apart.
+//!
 //! Asset contracts:
 //! - `claude`: `--settings <claude-settings.json>` layers a `SessionStart` hook
 //!   (`cat > "$FLEETCOM_CAPTURE_FILE"`) over the user's settings. The hook
@@ -22,6 +27,8 @@ use std::{
     os::unix::fs::{DirBuilderExt, PermissionsExt},
     path::{Path, PathBuf},
 };
+
+use nix::{errno::Errno, sys::signal::kill, unistd::Pid};
 
 use super::CapturePaths;
 
@@ -77,26 +84,54 @@ pub fn runtime_root(override_dir: Option<&Path>) -> Option<PathBuf> {
     dirs::cache_dir().map(|c| c.join("fleetcom").join("run"))
 }
 
+/// Whether `pid` names a live process: signal 0 probes existence without
+/// delivering anything. Only ESRCH proves death; EPERM (another user's
+/// process) and an unprobeable id read as alive, so the sweep can only
+/// under-collect, never remove a live namespace.
+fn pid_alive(pid: u32) -> bool {
+    let Ok(pid) = i32::try_from(pid) else {
+        return true;
+    };
+    kill(Pid::from_raw(pid), None) != Err(Errno::ESRCH)
+}
+
 /// Shared paths in an installed capture-asset tree.
 #[derive(Debug)]
 pub struct CaptureAssets {
-    root: PathBuf,
+    /// This process's capture namespace: `<root>/<pid>`.
+    dir: PathBuf,
     claude_settings: PathBuf,
     codex_notify: PathBuf,
 }
 
 impl CaptureAssets {
-    /// Create `root` with mode `0700`, write both shared assets, and remove
-    /// existing `task-*.json` capture files.
+    /// Create `root` with mode `0700`, write both shared assets, sweep dead
+    /// capture namespaces, and claim `<root>/<pid>` for this process.
     ///
-    /// Shared assets are overwritten with the current contents. The settings
-    /// file uses mode `0600`; the directly executed notify script uses `0700`.
+    /// Shared assets stay at the root: their content is static per fleetcom
+    /// version, so concurrent installs write identical bytes. They are
+    /// overwritten with the current contents; the settings file uses mode
+    /// `0600`, the directly executed notify script `0700`.
     ///
     /// The supervisor calls this at most once per root per daemon lifetime,
-    /// before allocating capture paths for that root. The initial cleanup
-    /// prevents a new daemon from reading pre-existing payloads without
-    /// removing files allocated by this instance.
-    pub fn install(root: &Path) -> io::Result<CaptureAssets> {
+    /// before allocating capture paths for that root.
+    pub fn install(root: &Path, pid: u32) -> io::Result<CaptureAssets> {
+        CaptureAssets::install_probed(root, pid, pid_alive)
+    }
+
+    /// `install` with an injectable liveness probe, so tests can prove both
+    /// keep-alive and sweep-dead without depending on real pid lifecycles.
+    ///
+    /// The sweep removes only namespaces whose owning process is dead, plus
+    /// loose legacy `task-*.json` files pre-namespace daemons left at the
+    /// root. A recycled pid makes a stale namespace look alive and defers
+    /// its sweep: bounded litter, never a correctness hazard, because each
+    /// process writes only inside its own namespace.
+    fn install_probed(
+        root: &Path,
+        pid: u32,
+        alive: impl Fn(u32) -> bool,
+    ) -> io::Result<CaptureAssets> {
         fs::DirBuilder::new()
             .recursive(true)
             .mode(0o700)
@@ -108,10 +143,21 @@ impl CaptureAssets {
             let entry = entry?;
             let name = entry.file_name();
             let Some(name) = name.to_str() else { continue };
-            if name.starts_with("task-") && name.ends_with(".json") {
+            if entry.file_type()?.is_dir() {
+                // A directory named like our own pid is a dead predecessor's
+                // (pid reuse): this process has not written here yet.
+                if let Ok(owner) = name.parse::<u32>()
+                    && (owner == pid || !alive(owner))
+                {
+                    fs::remove_dir_all(entry.path())?;
+                }
+            } else if name.starts_with("task-") && name.ends_with(".json") {
                 fs::remove_file(entry.path())?;
             }
         }
+
+        let dir = root.join(pid.to_string());
+        fs::DirBuilder::new().mode(0o700).create(&dir)?;
 
         let claude_settings = root.join("claude-settings.json");
         fs::write(&claude_settings, claude_settings_json())?;
@@ -122,7 +168,7 @@ impl CaptureAssets {
         fs::set_permissions(&codex_notify, fs::Permissions::from_mode(0o700))?;
 
         Ok(CaptureAssets {
-            root: root.to_path_buf(),
+            dir,
             claude_settings,
             codex_notify,
         })
@@ -132,10 +178,11 @@ impl CaptureAssets {
     /// keyed by task *and* run: restart bumps the run, so the fresh run's
     /// reads cannot reach the old run's file, and a lingering old process
     /// (graveyard, TERM grace) writes only its own dead path through its
-    /// inherited env. Superseded files persist until the next `install` sweep.
+    /// inherited env. Superseded files persist as bounded litter until an
+    /// `install` finds this namespace's owner dead.
     pub fn paths_for(&self, task_id: u64, run: u32) -> CapturePaths {
         CapturePaths {
-            capture_file: self.root.join(format!("task-{task_id}-{run}.json")),
+            capture_file: self.dir.join(format!("task-{task_id}-{run}.json")),
             claude_settings: self.claude_settings.clone(),
             codex_notify: self.codex_notify.clone(),
         }
@@ -178,9 +225,10 @@ mod tests {
         // A nested root proves the recursive create.
         let base = temp("modes");
         let root = base.join("nested");
-        let assets = CaptureAssets::install(&root).unwrap();
+        let assets = CaptureAssets::install(&root, std::process::id()).unwrap();
 
         assert_eq!(mode(&root), 0o700);
+        assert_eq!(mode(&root.join(std::process::id().to_string())), 0o700);
         assert_eq!(mode(&assets.claude_settings), 0o600);
         assert_eq!(mode(&assets.codex_notify), 0o700);
         let _ = fs::remove_dir_all(&base);
@@ -189,7 +237,7 @@ mod tests {
     #[test]
     fn install_is_idempotent_and_heals_corrupted_assets() {
         let root = temp("heal");
-        let first = CaptureAssets::install(&root).unwrap();
+        let first = CaptureAssets::install(&root, std::process::id()).unwrap();
         let settings = fs::read_to_string(&first.claude_settings).unwrap();
         let script = fs::read_to_string(&first.codex_notify).unwrap();
 
@@ -198,7 +246,7 @@ mod tests {
         fs::set_permissions(&first.codex_notify, fs::Permissions::from_mode(0o644)).unwrap();
         fs::set_permissions(&root, fs::Permissions::from_mode(0o755)).unwrap();
 
-        let second = CaptureAssets::install(&root).unwrap();
+        let second = CaptureAssets::install(&root, std::process::id()).unwrap();
         assert_eq!(
             fs::read_to_string(&second.claude_settings).unwrap(),
             settings
@@ -210,23 +258,56 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
+    /// The sweep is liveness-honest: dead namespaces and loose legacy root
+    /// files go, a live process's namespace and the shared assets stay, and
+    /// a pre-existing directory named like our own pid reads as a dead
+    /// predecessor's (pid reuse).
     #[test]
-    fn install_sweeps_capture_files_but_not_the_assets() {
+    fn install_sweeps_dead_namespaces_and_legacy_files_only() {
         let root = temp("sweep");
-        CaptureAssets::install(&root).unwrap();
-        fs::write(root.join("task-1-0.json"), "{}").unwrap();
+        let (live, dead, reused) = (root.join("1000"), root.join("2000"), root.join("3000"));
+        for ns in [&live, &dead, &reused] {
+            fs::create_dir_all(ns).unwrap();
+            fs::write(ns.join("task-1-0.json"), "{}").unwrap();
+        }
         fs::write(root.join("task-42-7.json"), "{}").unwrap();
-        // The cleanup pattern also matches names without a run suffix.
+        // The legacy pattern also matches names without a run suffix.
         fs::write(root.join("task-9.json"), "{}").unwrap();
         fs::write(root.join("unrelated.txt"), "x").unwrap();
 
-        let assets = CaptureAssets::install(&root).unwrap();
-        assert!(!root.join("task-1-0.json").exists());
+        let assets =
+            CaptureAssets::install_probed(&root, 3000, |pid| pid == 1000 || pid == 3000).unwrap();
+        assert!(
+            live.join("task-1-0.json").exists(),
+            "a live namespace must never be touched"
+        );
+        assert!(!dead.exists(), "a dead namespace must be removed");
+        assert!(
+            reused.is_dir() && !reused.join("task-1-0.json").exists(),
+            "our own pre-existing namespace holds a dead predecessor's files"
+        );
         assert!(!root.join("task-42-7.json").exists());
         assert!(!root.join("task-9.json").exists());
         assert!(root.join("unrelated.txt").exists());
         assert!(assets.claude_settings.exists());
         assert!(assets.codex_notify.exists());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// The production probe: this process and pid 1 (init/launchd) are
+    /// alive, so `install` keeps their namespaces.
+    #[test]
+    fn install_production_probe_keeps_live_pids() {
+        assert!(pid_alive(std::process::id()));
+        let root = temp("probe");
+        let init = root.join("1");
+        fs::create_dir_all(&init).unwrap();
+        fs::write(init.join("task-1-0.json"), "{}").unwrap();
+        CaptureAssets::install(&root, std::process::id()).unwrap();
+        assert!(
+            init.join("task-1-0.json").exists(),
+            "pid 1 is always alive; its namespace must survive"
+        );
         let _ = fs::remove_dir_all(&root);
     }
 
@@ -236,7 +317,7 @@ mod tests {
     #[test]
     fn notify_script_writes_the_argument_verbatim() {
         let root = temp("notify");
-        let assets = CaptureAssets::install(&root).unwrap();
+        let assets = CaptureAssets::install(&root, std::process::id()).unwrap();
         let cap = assets.paths_for(1, 0).capture_file;
         let payload = r#"{"type":"agent-turn-complete","turn-id":"t1"}"#;
 
@@ -265,12 +346,13 @@ mod tests {
         assert!(out.status.success());
         assert_eq!(fs::read(&cap).unwrap(), payload.as_bytes());
 
-        // Direct execution overwrites rather than appends.
+        // Direct execution overwrites rather than appends. An empty chain
+        // reads as absent: write, then exit 0 without exec.
         let second = r#"{"type":"agent-turn-complete","turn-id":"t2"}"#;
         let out = Command::new(&assets.codex_notify)
             .arg(second)
             .env(CAPTURE_ENV, &cap)
-            .env_remove(NOTIFY_CHAIN_ENV)
+            .env(NOTIFY_CHAIN_ENV, "")
             .output()
             .unwrap();
         assert!(out.status.success());
@@ -299,7 +381,7 @@ mod tests {
     #[test]
     fn notify_script_chains_the_displaced_notifier() {
         let root = temp("chain");
-        let assets = CaptureAssets::install(&root).unwrap();
+        let assets = CaptureAssets::install(&root, std::process::id()).unwrap();
         let cap = assets.paths_for(3, 0).capture_file;
         let notifier = root.join("Fake App.app").join("Sky Client");
         let record = root.join("record");
@@ -330,7 +412,7 @@ mod tests {
     #[test]
     fn notify_script_capture_survives_a_failing_chain() {
         let root = temp("chain_fail");
-        let assets = CaptureAssets::install(&root).unwrap();
+        let assets = CaptureAssets::install(&root, std::process::id()).unwrap();
         let cap = assets.paths_for(4, 0).capture_file;
         let notifier = root.join("failing");
         fs::write(&notifier, "#!/bin/sh\nexit 1\n").unwrap();
@@ -352,7 +434,7 @@ mod tests {
     #[test]
     fn notify_script_chains_without_a_capture_path() {
         let root = temp("chain_nocap");
-        let assets = CaptureAssets::install(&root).unwrap();
+        let assets = CaptureAssets::install(&root, std::process::id()).unwrap();
         let notifier = root.join("bare");
         let record = root.join("record");
         install_fake_notifier(&notifier, &record);
@@ -373,7 +455,7 @@ mod tests {
     #[test]
     fn hook_command_from_settings_copies_stdin_to_the_capture_file() {
         let root = temp("hook");
-        let assets = CaptureAssets::install(&root).unwrap();
+        let assets = CaptureAssets::install(&root, std::process::id()).unwrap();
         let cap = assets.paths_for(2, 0).capture_file;
 
         let text = fs::read_to_string(&assets.claude_settings).unwrap();
@@ -405,15 +487,16 @@ mod tests {
     }
 
     #[test]
-    fn paths_for_names_the_task_file_under_the_root() {
+    fn paths_for_names_the_task_file_under_the_pid_namespace() {
         let root = temp("paths");
-        let assets = CaptureAssets::install(&root).unwrap();
+        let assets = CaptureAssets::install(&root, std::process::id()).unwrap();
+        let ns = root.join(std::process::id().to_string());
         let paths = assets.paths_for(7, 0);
-        assert_eq!(paths.capture_file, root.join("task-7-0.json"));
+        assert_eq!(paths.capture_file, ns.join("task-7-0.json"));
         // The run discriminates: a restarted task gets a different file.
         assert_eq!(
             assets.paths_for(7, 3).capture_file,
-            root.join("task-7-3.json")
+            ns.join("task-7-3.json")
         );
         assert_eq!(paths.claude_settings, assets.claude_settings);
         assert_eq!(paths.codex_notify, assets.codex_notify);

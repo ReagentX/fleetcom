@@ -225,18 +225,31 @@ fn save_once(stream: &mut UnixStream, recipe: &Path, name: &str) -> String {
     std::fs::read_to_string(recipe).unwrap()
 }
 
-/// Whether the runtime root holds a non-empty per-run capture file.
+/// Whether the daemon's capture namespace holds a non-empty per-run capture
+/// file. Capture files live under `<runtime>/<pid>/`; only the shared assets
+/// sit at the root, so any numeric namespace here is the daemon's.
 fn has_capture(runtime: &Path) -> bool {
-    std::fs::read_dir(runtime).is_ok_and(|entries| {
-        entries.flatten().any(|e| {
-            let name = e.file_name();
-            let Some(n) = name.to_str() else {
-                return false;
-            };
-            n.starts_with("task-")
-                && n.ends_with(".json")
-                && e.metadata().is_ok_and(|m| m.len() > 0)
-        })
+    std::fs::read_dir(runtime).is_ok_and(|namespaces| {
+        namespaces
+            .flatten()
+            .filter(|ns| {
+                ns.file_name()
+                    .to_str()
+                    .is_some_and(|n| n.parse::<u32>().is_ok())
+            })
+            .any(|ns| {
+                std::fs::read_dir(ns.path()).is_ok_and(|files| {
+                    files.flatten().any(|e| {
+                        let name = e.file_name();
+                        let Some(n) = name.to_str() else {
+                            return false;
+                        };
+                        n.starts_with("task-")
+                            && n.ends_with(".json")
+                            && e.metadata().is_ok_and(|m| m.len() > 0)
+                    })
+                })
+            })
     })
 }
 

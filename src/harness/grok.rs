@@ -21,6 +21,10 @@ impl Harness for Grok {
         "GROK_HOME"
     }
 
+    fn home_dot_dir(&self) -> &'static str {
+        ".grok"
+    }
+
     fn detect(&self, cmd: &str) -> Option<Invocation> {
         detect_shape(cmd, "grok", "--resume")
     }
@@ -30,7 +34,7 @@ impl Harness for Grok {
         inv: &Invocation,
         // Grok instrumentation does not use capture paths or home config.
         _capture: &CapturePaths,
-        _home_override: Option<&Path>,
+        _home: Option<&Path>,
     ) -> SpawnPlan {
         let mut plan = SpawnPlan::default();
         // The resume form already targets its conversation; only a bare
@@ -64,13 +68,10 @@ impl Harness for Grok {
         last.map(|(_, id)| id)
     }
 
-    fn correlate_fs(
-        &self,
-        cwd: &Path,
-        spawned: SystemTime,
-        home_override: Option<&Path>,
-    ) -> Option<String> {
-        let root = match home_override {
+    fn correlate_fs(&self, cwd: &Path, spawned: SystemTime, home: Option<&Path>) -> Option<String> {
+        // The `dirs` default is the last resort: the supervisor resolves
+        // `home` from the launch env whenever it names any home at all.
+        let root = match home {
             Some(p) => p.to_path_buf(),
             None => dirs::home_dir()?.join(".grok"),
         };
