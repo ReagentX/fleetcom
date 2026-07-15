@@ -1,6 +1,7 @@
-//! For accepted `codex` commands, this harness captures IDs through an injected
-//! `notify` override, chains compatible configured notifiers, scans both
-//! resume-hint forms, and correlates rollout files under
+//! Codex does not let the caller select an ID at launch. This harness instead
+//! injects a `notify` override, chains compatible configured notifiers, and
+//! scans both exit-hint forms. When neither channel yields an ID, it correlates
+//! rollout files under
 //! `<codex-home>/sessions/YYYY/MM/DD/rollout-<local-ts>-<uuid>.jsonl`.
 
 use std::{
@@ -44,16 +45,13 @@ impl Harness for Codex {
         home: Option<&Path>,
     ) -> SpawnPlan {
         let chain = match config_notify_route(home) {
-            // Nothing routed still sets the chain, empty: children inherit
-            // the client env verbatim, so a stale exported value (a nested
-            // fleetcom) would otherwise reach the injected script, which
-            // execs it per notification. The script reads empty as absent.
+            // An explicit empty value prevents an inherited chain from
+            // reaching the injected script.
             NotifyRoute::Vacant => String::new(),
             // A routed notifier rides along: the injected script execs this
             // argv, payload appended, after the capture write.
             NotifyRoute::Chain(argv) => argv.join("\n"),
-            // A route the chain cannot carry faithfully: leave the command
-            // untouched rather than guess.
+            // Skip injection when the configured route cannot be encoded.
             NotifyRoute::Opaque => return SpawnPlan::default(),
         };
         let toml = format!(
@@ -108,8 +106,8 @@ impl Harness for Codex {
     }
 
     fn correlate_fs(&self, cwd: &Path, spawned: SystemTime, home: Option<&Path>) -> Option<String> {
-        // The `dirs` default is the last resort: the supervisor resolves
-        // `home` from the launch env whenever it names any home at all.
+        // Fall back to this process's home only when the launch environment
+        // supplied neither the tool-specific override nor HOME.
         let root = match home {
             Some(p) => p.to_path_buf(),
             None => dirs::home_dir()?.join(".codex"),
@@ -171,25 +169,23 @@ impl Harness for Codex {
     }
 }
 
-/// How `instrument` must treat the user's configured notify route.
+/// Whether Codex notification capture can preserve the configured route.
 #[derive(Debug, PartialEq, Eq)]
 enum NotifyRoute {
-    /// No active `notify` assignment: inject the capture notifier alone.
+    /// No active route, so the capture notifier can run alone.
     Vacant,
-    /// One assignment the chain transport can carry: inject the capture
-    /// notifier and hand it this argv to exec afterward.
+    /// One representable route, executed after the capture write.
     Chain(Vec<String>),
-    /// An assignment the transport cannot carry faithfully: skip injection
-    /// so the user's route keeps working untouched.
+    /// A route that cannot be represented without changing its argv. Capture
+    /// injection is disabled so the route remains untouched.
     Opaque,
 }
 
-/// Classify the `notify` route in `config.toml` and the effective profile
-/// config. The profile file's assignment overrides the base file's; the first
-/// line-based `profile` assignment in `config.toml` selects the profile.
-/// Line-based checks also match assignments inside TOML tables, so two
-/// `notify` lines in one file are ambiguous and read as
-/// [`NotifyRoute::Opaque`].
+/// Classify the effective `notify` route from `config.toml` and its selected
+/// profile. The first line-based `profile` assignment selects the profile, and
+/// its notify assignment takes precedence over the base file. Because this is
+/// deliberately line-based rather than TOML-aware, two `notify` lines in one
+/// file are ambiguous and produce [`NotifyRoute::Opaque`].
 fn config_notify_route(home: Option<&Path>) -> NotifyRoute {
     let root = match home {
         Some(p) => p.to_path_buf(),
@@ -213,10 +209,9 @@ fn config_notify_route(home: Option<&Path>) -> NotifyRoute {
     NotifyRoute::Vacant
 }
 
-/// Classify one assignment's value. Newlines are the chain encoding's
-/// delimiter, and empty elements vanish in the script's field split (newline
-/// is IFS whitespace, which collapses), so neither can travel; an empty
-/// array routes no program at all.
+/// Classify one notify assignment for the newline-delimited chain transport.
+/// Newlines collide with the delimiter, empty elements disappear during shell
+/// field splitting, and an empty array names no program. Each case is opaque.
 fn route_for(value: &str) -> NotifyRoute {
     match parse_notify_array(value) {
         Some(argv)
@@ -228,8 +223,8 @@ fn route_for(value: &str) -> NotifyRoute {
     }
 }
 
-/// First line-based `profile = name` assignment in `config.toml`. Bare and
-/// quoted values are accepted, and trailing comments are ignored.
+/// Return the first line-based `profile = name` assignment. Bare and quoted
+/// values are valid; trailing comments are ignored.
 fn config_profile(text: &str) -> Option<String> {
     for line in text.lines() {
         let Some(rest) = line.trim_start().strip_prefix("profile") else {
@@ -264,10 +259,9 @@ fn notify_value(line: &str) -> Option<&str> {
     rest.trim_start_matches([' ', '\t']).strip_prefix('=')
 }
 
-/// Parse a one-line TOML array of basic strings into its elements. Anything
-/// else returns `None`: literal strings, non-string elements, a multi-line
-/// array (the line ends before `]`), or junk after the array. A trailing
-/// comma and a trailing `#` comment are tolerated.
+/// Parse a one-line TOML array of basic strings. Literal strings, non-string
+/// elements, multiline arrays, and trailing junk return `None`. A trailing
+/// comma or `#` comment remains valid.
 fn parse_notify_array(value: &str) -> Option<Vec<String>> {
     let mut rest = value.trim_start_matches([' ', '\t']).strip_prefix('[')?;
     let mut out = Vec::new();
@@ -288,10 +282,10 @@ fn parse_notify_array(value: &str) -> Option<Vec<String>> {
     }
 }
 
-/// Decode a TOML basic string after its opening quote; return the text and
-/// the remainder past the closing quote. The escapes are TOML's fixed set,
-/// a superset of what [`toml_escape`] emits. An unknown escape, a malformed
-/// `\u`/`\U`, or a missing closing quote returns `None`.
+/// Decode a TOML basic string after its opening quote and return the remaining
+/// input after the closing quote. The parser accepts TOML's fixed escape set,
+/// which is a superset of [`toml_escape`]'s output. Unknown escapes, malformed
+/// Unicode escapes, and unterminated strings return `None`.
 fn parse_basic_string(s: &str) -> Option<(String, &str)> {
     let mut out = String::new();
     let mut rest = s;
@@ -340,7 +334,7 @@ fn toml_escape(s: &str) -> String {
     out
 }
 
-/// Return the millisecond instant in a validated v7 UUID. Other UUID versions
+/// Extract the millisecond timestamp from a validated v7 UUID. Other versions
 /// return `None`.
 fn v7_millis(id: &str) -> Option<u64> {
     if id.as_bytes()[14] != b'7' {
@@ -349,8 +343,8 @@ fn v7_millis(id: &str) -> Option<u64> {
     u64::from_str_radix(&format!("{}{}", &id[..8], &id[9..13]), 16).ok()
 }
 
-/// Whether the rollout's first record names `cwd`. The read is capped at
-/// 64 KiB because later content is ignored.
+/// Check whether the rollout's first record names `cwd`. Reads stop at 64 KiB
+/// because later records do not participate in correlation.
 fn line1_cwd_matches(path: &Path, cwd: &Path) -> bool {
     let Ok(file) = fs::File::open(path) else {
         return false;
@@ -456,8 +450,8 @@ mod tests {
         }
     }
 
-    /// Prompts, flags, noncanonical resume forms, subcommands, and shell
-    /// syntax are opaque: they are neither detected nor rewritten.
+    /// Prompts, flags, noncanonical resume forms, subcommands, and shell syntax
+    /// stay opaque and are never rewritten.
     #[test]
     fn everything_else_is_opaque_and_never_rewritten() {
         let opaque: Vec<String> = [
@@ -503,8 +497,8 @@ mod tests {
         temp("no_config_home")
     }
 
-    /// Both accepted shapes receive the same injection: codex cannot pin an
-    /// ID at launch, so the notify override is the only channel.
+    /// Both accepted shapes receive the same notify override because Codex
+    /// cannot pin an ID at launch.
     #[test]
     fn instrument_installs_the_notify_override() {
         for cmd in ["codex".to_string(), format!("codex resume {ID}")] {
@@ -522,7 +516,7 @@ mod tests {
                         CAPTURE_ENV.into(),
                         PathBuf::from("/tmp/cap/session.json").into_os_string()
                     ),
-                    // The empty chain overrides a stale inherited value.
+                    // The explicit empty value overrides any inherited chain.
                     (NOTIFY_CHAIN_ENV.into(), "".into()),
                 ],
                 "{cmd}"
@@ -530,9 +524,9 @@ mod tests {
         }
     }
 
-    /// A parseable `notify` assignment is chained through
-    /// [`NOTIFY_CHAIN_ENV`]. Comments, longer keys, and missing files leave
-    /// plain injection unchanged.
+    /// A representable `notify` assignment passes through
+    /// [`NOTIFY_CHAIN_ENV`]. Comments, longer keys, and missing files do not
+    /// define a route, so capture runs alone.
     #[test]
     fn instrument_chains_a_config_toml_notify() {
         let home = temp("cfg_notify");
@@ -579,8 +573,7 @@ mod tests {
         let _ = fs::remove_dir_all(&home);
     }
 
-    /// A notifier path containing spaces and a fixed argument is preserved in
-    /// the newline-joined chain.
+    /// The newline-joined chain preserves spaces within argv elements.
     #[test]
     fn instrument_chains_the_vendor_desktop_entry() {
         let home = temp("vendor_notify");
@@ -604,7 +597,7 @@ mod tests {
         let _ = fs::remove_dir_all(&home);
     }
 
-    /// An assignment the chain cannot carry skips injection entirely.
+    /// An unrepresentable route disables capture injection.
     #[test]
     fn instrument_skips_an_unrepresentable_config_notify() {
         let home = temp("opaque_notify");
@@ -718,8 +711,7 @@ mod tests {
         }
     }
 
-    /// `route_for` refuses values the transport would corrupt even when the
-    /// array itself parses.
+    /// `route_for` rejects parsed arrays that the chain transport would alter.
     #[test]
     fn route_for_refuses_untransportable_argv() {
         assert_eq!(
@@ -770,8 +762,8 @@ mod tests {
         assert_eq!(Codex.scrape_exit(&both).as_deref(), Some(ID));
     }
 
-    /// Both authored shapes rewrite to the same canonical resume form; the
-    /// program word survives as typed.
+    /// Both accepted shapes produce the canonical resume form while preserving
+    /// the program word as typed.
     #[test]
     fn resume_command_regenerates_the_canonical_form() {
         assert_eq!(
@@ -918,8 +910,8 @@ mod tests {
         assert_eq!(civil_from_days(-1), (1969, 12, 31));
     }
 
-    /// The scraper recovers an SGR-split exit hint from a recorded terminal
-    /// stream after the emulator removes styling.
+    /// The scraper recovers an SGR-split exit hint from the corpus bytes after
+    /// terminal emulation removes the styling.
     #[test]
     fn corpus_scrape_recovers_the_exit_hint_id() {
         let mut emu = Emulator::new(40, 120, 2000);

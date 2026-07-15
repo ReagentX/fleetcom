@@ -1,6 +1,7 @@
-//! End-to-end agent-resume tests across the daemon protocol. Stub `claude` and
-//! `codex` executables expose argv, and an explicit handshake confines every
-//! store to scratch space.
+//! Agent resume crosses command parsing, daemon framing, child instrumentation,
+//! session persistence, and reload. These tests exercise that complete path
+//! with stub `claude` and `codex` executables. An explicit handshake keeps every
+//! path inside the test's scratch tree.
 
 mod common;
 
@@ -21,8 +22,8 @@ const RUN_MARKER: &str = "-- run --";
 /// Fixed v7-shaped thread ID reported by the `codex` stub.
 const CODEX_ID: &str = "019f5453-de22-7240-b2e5-0d32692aa6d9";
 
-/// Scratch tree containing the stub bin, runtime root, config, tool homes,
-/// working directory, and argv records for one test.
+/// Scratch tree containing every executable, store, working directory, and argv
+/// record used by one test.
 struct Scratch {
     root: PathBuf,
 }
@@ -111,8 +112,9 @@ fn hello(stream: &mut UnixStream, s: &Scratch) {
     shake_hands_env(stream, &s.work().display().to_string(), &env);
 }
 
-/// Drain daemon events so snapshot traffic cannot fill the socket while a
-/// test polls files. The thread exits when the daemon closes the connection.
+/// Drain daemon events while a test polls files. Without this reader, snapshot
+/// traffic can fill the socket and block the daemon. The thread exits with the
+/// connection.
 fn drain_events(stream: &UnixStream) {
     let mut rx = stream.try_clone().unwrap();
     std::thread::spawn(move || while read_frame(&mut rx).is_ok() {});
@@ -208,10 +210,9 @@ fn spawn_frame(command: &str, cwd: &Path) -> Vec<u8> {
     ))
 }
 
-/// Send one save and return the persisted recipe. One save, no poll loop:
-/// the daemon scrapes finished tasks before reading ids, and each caller
-/// waits for its id channel (the spawn-time pin or the capture file) before
-/// saving, so a single save must already persist the resuming form.
+/// Save once and return the persisted recipe. Each caller first waits for its
+/// ID channel, and the daemon scrapes finished tasks before reading IDs. As a
+/// result, one save must already contain the resume form.
 fn save_once(stream: &mut UnixStream, recipe: &Path, name: &str) -> String {
     stream
         .write_all(&control_frame(&format!(
@@ -225,10 +226,9 @@ fn save_once(stream: &mut UnixStream, recipe: &Path, name: &str) -> String {
     std::fs::read_to_string(recipe).unwrap()
 }
 
-/// Whether the daemon's capture namespace holds a non-empty per-run capture
-/// file. Capture files and assets live under `<runtime>/<pid>-<nonce>/`;
-/// nothing sits at the root, so any subdirectory here is a daemon
-/// incarnation's namespace.
+/// Check whether a daemon namespace contains a non-empty task capture file.
+/// Assets live under `<runtime>/<pid>-<nonce>/`, so the runtime root itself
+/// contains no task files.
 fn has_capture(runtime: &Path) -> bool {
     std::fs::read_dir(runtime).is_ok_and(|namespaces| {
         namespaces
@@ -263,8 +263,8 @@ fn stop_daemon(daemon: &mut KillOnDrop) {
     assert!(exited, "daemon did not exit on SIGTERM");
 }
 
-/// `claude` instrumentation captures an ID, persists a clean resume command,
-/// and loads the same conversation.
+/// Claude instrumentation captures an ID without leaking its injected flags
+/// into the recipe, then reloads the same conversation.
 #[test]
 fn claude_spawn_save_load_resumes_the_conversation() {
     let s = Scratch::new("claude");
@@ -339,8 +339,8 @@ fn claude_spawn_save_load_resumes_the_conversation() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// A `codex` capture-file payload persists a resume command, and loading it
-/// applies instrumentation again.
+/// A Codex capture payload persists the resume command, and loading that command
+/// reapplies the notifier instrumentation.
 #[test]
 fn codex_capture_file_drives_save_and_load_resumes() {
     let s = Scratch::new("codex");
@@ -412,7 +412,8 @@ fn codex_capture_file_drives_save_and_load_resumes() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// A recipe saved before a daemon restart resumes the same ID afterward.
+/// A persisted resume command survives daemon replacement and targets the same
+/// ID afterward.
 #[test]
 fn saved_recipe_resumes_across_a_daemon_restart() {
     let s = Scratch::new("restart");

@@ -1,7 +1,7 @@
-//! This harness pins bare `grok` launches with a v4 UUID, scans final
-//! terminal text for `grok -r <uuid>` or `grok --resume <uuid>`, and
-//! correlates session directories under
-//! `<grok-home>/sessions/<encoded-cwd>/<uuid>/`.
+//! Grok has no injectable live-capture channel. Bare launches instead pin a v4
+//! UUID, and completed tasks expose either `grok -r <uuid>` or
+//! `grok --resume <uuid>` in terminal output. The filesystem fallback
+//! correlates `<grok-home>/sessions/<encoded-cwd>/<uuid>/` directories.
 
 use std::{fs, path::Path, time::SystemTime};
 
@@ -69,8 +69,8 @@ impl Harness for Grok {
     }
 
     fn correlate_fs(&self, cwd: &Path, spawned: SystemTime, home: Option<&Path>) -> Option<String> {
-        // The `dirs` default is the last resort: the supervisor resolves
-        // `home` from the launch env whenever it names any home at all.
+        // Fall back to this process's home only when the launch environment
+        // supplied neither the tool-specific override nor HOME.
         let root = match home {
             Some(p) => p.to_path_buf(),
             None => dirs::home_dir()?.join(".grok"),
@@ -107,9 +107,9 @@ impl Harness for Grok {
     }
 }
 
-/// Encode an absolute cwd as a Grok session-store key. Only `/` and `%` are
-/// encoded; `%` must encode to keep the mapping injective. Non-UTF-8 paths
-/// have no key.
+/// Encode an absolute working directory as a Grok session-store key. `/`
+/// becomes `%2F`, and `%` becomes `%25` to keep the mapping injective.
+/// Non-UTF-8 paths have no representable key.
 fn encode_cwd(cwd: &Path) -> Option<String> {
     let s = cwd.to_str()?;
     let mut out = String::with_capacity(s.len() + 16);
@@ -165,7 +165,7 @@ mod tests {
     }
 
     /// Prompts, flags, alternate resume forms, subcommands, and shell syntax
-    /// are opaque: they are neither detected nor rewritten.
+    /// stay opaque and are never rewritten.
     #[test]
     fn everything_else_is_opaque_and_never_rewritten() {
         let opaque: Vec<String> = [
@@ -203,9 +203,8 @@ mod tests {
         }
     }
 
-    /// A bare launch gains exactly the pinned ID: no settings overlay, no
-    /// config override, and no capture environment (there is no channel to
-    /// point it at).
+    /// A bare launch gains only the pinned ID because Grok exposes no live
+    /// capture channel.
     #[test]
     fn instrument_pins_an_id_and_nothing_else() {
         let inv = Grok.detect("grok").unwrap();
@@ -216,7 +215,7 @@ mod tests {
         assert!(plan.env.is_empty(), "no capture channel, no capture env");
     }
 
-    /// The resume form receives nothing: no pin, no overlay, no env.
+    /// A resume command needs no pin, overlay, or environment change.
     #[test]
     fn instrument_leaves_the_resume_form_untouched() {
         let inv = Grok.detect(&format!("grok --resume {ID}")).unwrap();
@@ -251,8 +250,8 @@ mod tests {
         assert_eq!(Grok.scrape_exit(&format!("grok -r {ID}ff")), None);
     }
 
-    /// Both authored shapes rewrite to the same canonical resume form; the
-    /// program word survives as typed.
+    /// Both accepted shapes produce the canonical resume form while preserving
+    /// the program word as typed.
     #[test]
     fn resume_command_regenerates_the_canonical_form() {
         assert_eq!(
@@ -275,7 +274,7 @@ mod tests {
         assert_eq!(Grok.resume_command("grok", "evil'"), "grok");
     }
 
-    /// Store keys encode slashes and percent signs while leaving dots literal.
+    /// Store keys encode slashes and percent signs while preserving dots.
     #[test]
     fn encode_cwd_matches_the_observed_store_names() {
         assert_eq!(
@@ -330,7 +329,7 @@ mod tests {
         let _ = fs::remove_dir_all(&home);
     }
 
-    /// The scraper recovers the exit-hint ID from a recorded terminal stream.
+    /// The scraper recovers the exit-hint ID from the corpus terminal bytes.
     #[test]
     fn corpus_scrape_recovers_the_exit_hint_id() {
         let mut emu = Emulator::new(40, 120, 2000);

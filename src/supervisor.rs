@@ -86,11 +86,9 @@ fn fnv1a_hex(bytes: &[u8]) -> String {
     format!("{h:016x}")
 }
 
-/// Return the best session ID available for a task: exit scrape, capture file,
-/// then spawn-time ID. Scraped IDs are populated after process exit and reader
-/// EOF.
-/// Capture files outrank the spawn-time ID because they can report a newer
-/// conversation after launch.
+/// Resolve the best session ID in precedence order: exit scrape, capture file,
+/// then spawn-time ID. Exit and capture data outrank the launch value because
+/// either can reflect a conversation selected later.
 pub(crate) fn current_resume_id(task: &Task) -> Option<String> {
     if let Some(id) = &task.scraped_id {
         return Some(id.clone());
@@ -104,20 +102,17 @@ pub(crate) fn current_resume_id(task: &Task) -> Option<String> {
     task.resume_id.clone()
 }
 
-/// Poll for exit and scrape a fully drained terminal before save or rerun reads
-/// the session ID. A reader that has not reached EOF keeps the scrape deferred.
+/// Poll for exit before save or rerun reads the session ID. Scraping remains
+/// deferred until the PTY reader reaches EOF and the terminal contains every
+/// child byte.
 fn scrape_now(t: &mut Task) {
     let _ = t.poll_exit();
     t.scrape_exit_hint();
 }
 
-/// Resolve the harness home from the provided launch environment: the tool's
-/// own override wins; without it, the launch env's HOME names the client's
-/// tree through the tool's dot directory. The child resolves `~/.codex` and
-/// friends from the env it inherits, so anything else would aim the notify
-/// guard and store correlation at the wrong tree. `None` (neither present)
-/// leaves each harness's `dirs` fallback — this process's home — as the last
-/// resort.
+/// Resolve the harness home from the launch environment. The tool-specific
+/// override wins, followed by `$HOME/<tool dot directory>`; neither yields
+/// `None` so the harness can apply its platform-home fallback.
 fn harness_home(env: &[(OsString, OsString)], h: &dyn harness::Harness) -> Option<PathBuf> {
     let val = |key: &str| {
         env.iter()
@@ -161,8 +156,8 @@ pub struct Supervisor {
     /// TERM→KILL escalation window. `KILL_GRACE` in production; a field so tests
     /// shrink it instead of sleeping through real seconds.
     kill_grace: Duration,
-    /// Capture assets keyed by canonicalized root. Each root is installed
-    /// once per daemon lifetime; installation deletes nothing.
+    /// Capture assets keyed by canonicalized root and reused for this
+    /// supervisor's lifetime.
     capture: BTreeMap<PathBuf, assets::CaptureAssets>,
 }
 
@@ -470,16 +465,10 @@ impl Supervisor {
         self.launch.clone()
     }
 
-    /// Resolve and install this connection's capture assets. An explicit
-    /// `FLEETCOM_RUNTIME_DIR` is used verbatim; the fallback root includes a
-    /// session-root discriminator. Canonical roots are installed once per
-    /// daemon lifetime.
-    /// Capture files and assets land in this incarnation's `<pid>-<nonce>`
-    /// namespace under the root, so concurrent supervisors sharing a root (a
-    /// daemon plus `--foreground` runs) — and a later process reusing a dead
-    /// supervisor's pid — cannot cross-wire each other's captures or rewrite
-    /// each other's assets.
-    /// Installation failure disables instrumentation for the spawn.
+    /// Resolve and install capture assets for the current launch context.
+    /// `FLEETCOM_RUNTIME_DIR` is used verbatim; otherwise the platform root is
+    /// partitioned by session directory. Assets are cached by canonical root,
+    /// and installation failure disables instrumentation for the spawn.
     fn ensure_capture_assets(&mut self) -> Option<&assets::CaptureAssets> {
         let root = if let Some(ctx) = &self.launch
             && let Some((_, dir)) = ctx.env.iter().find(|(k, _)| k == "FLEETCOM_RUNTIME_DIR")
@@ -506,8 +495,8 @@ impl Supervisor {
     }
 
     /// Spawn a direct command, rerun, or session entry. Agent instrumentation
-    /// modifies only the executed string; the task retains the caller's
-    /// command verbatim.
+    /// changes only the executed shell string; the task keeps the requested
+    /// command for display and persistence.
     fn spawn_task(
         &mut self,
         id: u64,
@@ -535,7 +524,7 @@ impl Supervisor {
                     Arc::clone(&self.waker),
                 )?;
                 task.harness = Some(h);
-                // The home this task launched under, for every later read.
+                // Preserve the launch-time store for later correlation.
                 task.harness_home = home;
                 task.capture_file = Some(paths.capture_file);
                 task.resume_id = plan.injected_id.or_else(|| inv.known_id());
@@ -579,18 +568,17 @@ impl Supervisor {
         }
     }
 
-    /// Rerun a finished task in place, preserving its ID, tag, group, and
-    /// name. Captured agent tasks use the best-known session ID.
+    /// Rerun a finished task in place while preserving its ID, tag, group, and
+    /// name. If the task has a captured agent session, the replacement resumes
+    /// the best-known ID.
     fn restart(&mut self, id: u64) {
         let Some(i) = self.index_of(id) else {
             self.events
                 .push(Event::Status(format!("rerun: no task {id}")));
             return;
         };
-        // The resume command below reads the exit scrape; give the task its
-        // chance now rather than at the next reap tick. Also latches an exit
-        // reap hasn't seen, so a just-finished task reruns instead of being
-        // refused as still running.
+        // Latch a recent exit and scrape its drained terminal before choosing
+        // the rerun command.
         scrape_now(&mut self.tasks[i]);
         if self.tasks[i].finished.is_none() {
             self.events
@@ -600,7 +588,8 @@ impl Supervisor {
         let Some(launch) = self.launch_or_refuse() else {
             return;
         };
-        // Store the resuming form so re-detection does not inject another ID.
+        // Store the resuming form so detection treats the replacement as a
+        // targeted conversation.
         let (command, cwd) = {
             let old = &self.tasks[i];
             let command = match (old.harness, current_resume_id(old)) {
@@ -609,10 +598,8 @@ impl Supervisor {
             };
             (command, old.cwd.clone())
         };
-        // Preserve the finished task if its replacement cannot start.
-        // The bumped run gives the replacement its own capture file: the old
-        // run's stale payload is unreachable, and the displaced process still
-        // winding down in the graveyard writes only its own dead file.
+        // Preserve the finished task if its replacement cannot start. The run
+        // number gives the replacement a distinct capture file.
         let run = self.tasks[i].run + 1;
         match self.spawn_task(id, run, &command, &cwd, &launch.env) {
             Ok(mut fresh) => {
@@ -655,15 +642,14 @@ impl Supervisor {
         cfg
     }
 
-    /// Return the command stored for one task. Agent commands use the best
-    /// live ID, then filesystem correlation. If neither yields an ID, the
-    /// original command is retained.
+    /// Build the command stored for one task. Agent commands use the best live
+    /// ID, then filesystem correlation; without either, the requested command
+    /// remains unchanged.
     fn recipe_command(&self, t: &Task) -> String {
         let Some(h) = t.harness else {
             return t.command.clone();
         };
-        // Correlate against the store selected when the task launched; a
-        // reconnect may supply a different home override.
+        // Correlate against the store selected when this task launched.
         let id = current_resume_id(t)
             .or_else(|| h.correlate_fs(&t.cwd, t.spawned_at, t.harness_home.as_deref()));
         match id {
@@ -2463,8 +2449,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Rerun uses the capture-file ID, stores the resuming command, and keeps
-    /// the capture file while the displaced task is reaped.
+    /// Rerun prefers the capture-file ID, stores the resulting resume command,
+    /// and retains the displaced run's capture file while that run is reaped.
     #[test]
     fn restart_resumes_the_captured_conversation() {
         use crate::protocol::Lifecycle;
@@ -2522,10 +2508,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Restart retires the old run's capture file by construction: the
-    /// fresh run reads a per-run path, so a stale pre-drift payload, or a
-    /// lingering old process writing through its inherited env, cannot
-    /// reach the next save.
+    /// A rerun uses a new capture path, so the displaced run's payload and
+    /// later writes cannot affect the replacement.
     #[test]
     fn restart_cannot_read_the_old_runs_stale_capture() {
         let dir = scratch("cap_stale_run");
@@ -2565,8 +2549,7 @@ mod tests {
         assert_ne!(new_cap, old_cap, "the fresh run needs its own capture file");
         assert_eq!(s.tasks[0].command, format!("claude --resume '{CAP_ID}'"));
 
-        // A lingering old-run write lands only in the dead file: a save
-        // right after the restart must not resurrect the stale session.
+        // A later write from the displaced run remains in its capture file.
         std::fs::write(&old_cap, &stale).unwrap();
         let text = save_and_read(&mut s, &config, "stalecap");
         assert!(
@@ -2876,10 +2859,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A save landing between process exit and the next reap tick still
-    /// carries the scraped id: `save_session` runs the ready-scrape itself.
-    /// No reap runs here, so only that pass can have latched the exit and
-    /// scraped the hint.
+    /// Saving between process exit and the next reap tick still captures the
+    /// exit hint because `save_session` performs its own ready scrape.
     #[test]
     fn save_scrapes_a_finished_task_without_reap() {
         let dir = scratch("save_sync_scrape");
@@ -2920,9 +2901,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A restart landing in the same window resumes the scraped session,
-    /// and the just-exited task is not refused as still running, because
-    /// `restart` runs the ready-scrape itself.
+    /// Restarting between process exit and the next reap tick latches the exit,
+    /// scrapes the hint, and resumes that session.
     #[test]
     fn restart_scrapes_a_finished_task_without_reap() {
         let dir = scratch("restart_sync_scrape");
@@ -3024,8 +3004,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A silent `codex` task can use a unique rollout under `CODEX_HOME` when
-    /// live capture channels produce no ID.
+    /// A silent Codex task falls back to one matching rollout under
+    /// `CODEX_HOME` when live channels produce no ID.
     #[test]
     fn save_falls_back_to_fs_correlation_for_a_silent_codex() {
         let dir = scratch("correlate_save");
@@ -3181,10 +3161,8 @@ mod tests {
         assert_eq!(harness_home(&[], &Codex), None);
     }
 
-    /// With only HOME in the launch env, the harness home resolves to
-    /// `<home>/.codex`: the notify guard reads that tree's config.toml and
-    /// save-time correlation reads that tree's store — the client's tree,
-    /// not the daemon's.
+    /// With only `HOME` in the launch environment, both notify routing and
+    /// save-time correlation resolve through `<home>/.codex`.
     #[test]
     fn home_only_launch_env_targets_the_clients_dot_codex() {
         let dir = scratch("home_resolve");
@@ -3261,9 +3239,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A stale `FLEETCOM_NOTIFY_CHAIN` inherited through the launch env (a
-    /// nested fleetcom's export) must never execute: with nothing routed,
-    /// instrument pins the chain to empty, which the script reads as absent.
+    /// With no configured notifier, instrumentation clears an inherited
+    /// `FLEETCOM_NOTIFY_CHAIN` so the capture script cannot execute it.
     #[test]
     fn stale_inherited_notify_chain_is_never_executed() {
         use std::os::unix::fs::PermissionsExt;
@@ -3354,8 +3331,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A parseable `notify` assignment is chained through the injected
-    /// notifier after the capture write.
+    /// A representable `notify` assignment runs through the injected notifier
+    /// after the capture write.
     #[test]
     fn config_toml_notify_chains_through_the_injected_script() {
         use crate::harness::NOTIFY_CHAIN_ENV;
@@ -3437,8 +3414,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A `notify` value the chain cannot carry suppresses the injection; a
-    /// commented assignment never counts as configured.
+    /// An unrepresentable `notify` value disables injection, while a commented
+    /// assignment defines no route and leaves injection enabled.
     #[test]
     fn unrepresentable_config_notify_suppresses_injection() {
         let dir = scratch("cfg_guard");

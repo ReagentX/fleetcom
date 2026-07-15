@@ -28,7 +28,7 @@
 | `m` | Tag the selected task "in use" (toggles) |
 | `g` | Assign the selected task to a group (opens the group picker) |
 | `R` | Rename the selected task: a display name shown in place of the command |
-| `r` | Rerun a finished task with the same command, directory, tag, group, and name |
+| `r` | Rerun a finished task; supported agent tasks use the captured resume command |
 | `X` | Kill a running task (`TERM`, then `KILL` after 2 s), or remove a finished one |
 | `w` | Save the current tasks as a session |
 | `o` | Load a saved session |
@@ -73,7 +73,7 @@ Tasks retain 2,000 lines of scrollback. While attached to an inline child, wheel
 
 #### Rerun
 
-`r` re-executes a *finished* task with the same command and directory, using the environment of the client that requested the rerun. The task retains its ID, `◆` tag, group, name, and spawn order; its clock and screen reset. Because lifecycle participates in sorting, the task can move to another section when it starts running again. On a running task, `r` is a no-op because rerunning would require a destructive kill first. The same key works inside peek, keeping the task visible while the next run starts.
+`r` re-executes a *finished* task in the same directory, using the environment of the client that requested the rerun. Most tasks reuse their stored command. A supported `claude`, `codex`, or `grok` task instead uses its captured resume command when a valid conversation ID is available. The task retains its ID, `◆` tag, group, name, and spawn order; its clock and screen reset. Because lifecycle participates in sorting, the task can move to another section when it starts running again. A running task is left untouched because rerunning it would require a destructive kill first. The same key works inside peek, keeping the task visible while the replacement starts.
 
 #### Detach vs. quit
 

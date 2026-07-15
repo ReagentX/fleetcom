@@ -245,9 +245,9 @@ impl Emulator {
         crate::serialize::contents(&self.term)
     }
 
-    /// Return retained plain text from the oldest scrollback row through the
-    /// viewport. Soft-wrapped rows join without a separator; trailing padding
-    /// is trimmed from other rows. The current scroll offset has no effect.
+    /// Reconstruct retained terminal text from the oldest history row through
+    /// the live viewport. Soft wraps join into logical lines, hard lines lose
+    /// trailing padding, and the current scroll offset does not affect output.
     pub fn text_with_history(&self) -> String {
         let grid = self.term.grid();
         let top = -(grid.history_size() as i32);
@@ -259,8 +259,7 @@ impl Emulator {
             let line = &grid[Line(row)];
             for col in 0..grid.columns() {
                 let cell = &line[Column(col)];
-                // Skip wide-character spacers and preserve displayed tabs as
-                // spaces.
+                // Spacers have no glyph; terminal tabs occupy visible spaces.
                 if cell
                     .flags
                     .intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER)
@@ -272,7 +271,7 @@ impl Emulator {
                     out.extend(zerowidth.iter());
                 }
             }
-            // A soft-wrapped row continues without trimming or a newline.
+            // A soft wrap continues on the next grid row.
             if line[Column(last_col)].flags.contains(Flags::WRAPLINE) {
                 continue;
             }
@@ -583,10 +582,8 @@ mod tests {
         assert_eq!(emu.text_with_history(), full);
     }
 
-    /// The exit-hint scrape depends on this: a line the child printed past
-    /// the grid width soft-wraps, and the wrapped rows must join back into
-    /// the one line the child wrote (no synthetic newline through the UUID),
-    /// while explicit newlines still separate logical lines.
+    /// Soft wraps reconstruct one logical line without erasing explicit line
+    /// breaks.
     #[test]
     fn text_with_history_joins_soft_wrapped_rows() {
         let mut emu = Emulator::new(6, 20, 100);

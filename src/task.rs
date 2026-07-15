@@ -196,21 +196,16 @@ pub struct Task {
     pub group: Option<String>,
     /// Custom display name; `None` means unnamed.
     pub name: Option<String>,
-    /// Harness selected by the supervisor for session capture.
+    /// Agent harness selected for session capture.
     pub harness: Option<&'static dyn crate::harness::Harness>,
-    /// Harness home resolved from the spawn-time environment (the tool's
-    /// var, else HOME + the tool's dot directory). Save-time correlation
-    /// must not use a later connection's env.
+    /// Harness home resolved from this run's launch environment.
     pub harness_home: Option<PathBuf>,
-    /// Spawn generation, incremented by restart. Capture paths are keyed by
-    /// task *and* run, so a fresh run never reads (or is overwritten through)
-    /// the old run's capture file.
+    /// Spawn generation used to give each rerun a distinct capture path.
     pub run: u32,
-    /// Session ID injected or recognized at spawn. Capture files and exit
-    /// scrapes can supersede it.
+    /// Session ID injected or recognized at spawn. Later capture data or an
+    /// exit hint can supersede it.
     pub resume_id: Option<String>,
-    /// Capture path allocated for this task. It remains unwritten when no live
-    /// capture channel is injected.
+    /// Capture path allocated for this task run.
     pub capture_file: Option<PathBuf>,
     /// Session ID scraped once from final terminal text after exit and reader
     /// EOF.
@@ -276,9 +271,9 @@ fn wait_code(status: &rustix::process::WaitIdStatus) -> i32 {
 
 impl Task {
     /// Spawn `exec_command` under `$SHELL -c` in a fresh `rows`×`cols` PTY.
-    /// The task stores `command` for the UI and recipes, while only
+    /// The task keeps `command` for the UI and recipes, while only
     /// `exec_command` carries instrumentation. The child receives exactly
-    /// `env`, and `waker` notifies the core when terminal output arrives.
+    /// `env`; `waker` notifies the core when terminal output arrives.
     #[allow(clippy::too_many_arguments)] // All arguments define task launch state.
     pub fn spawn(
         id: u64,
@@ -457,9 +452,8 @@ impl Task {
         Ok(())
     }
 
-    /// Scrape one exit hint after process exit and reader completion. A missing
-    /// reader handle also satisfies the completion gate. The `scraped` latch
-    /// limits full-history rendering to one pass per task.
+    /// Scrape at most one exit hint after the process exits and the PTY reader
+    /// reaches EOF. A missing reader handle counts as complete.
     pub(crate) fn scrape_exit_hint(&mut self) {
         let Some(h) = self.harness else { return };
         if self.scraped
@@ -475,8 +469,8 @@ impl Task {
         }
     }
 
-    /// Whether the reader thread has drained to EOF: the second half of the
-    /// exit-scrape gate, exposed so tests can wait on it without driving reap.
+    /// Report whether the reader reached EOF. Tests use this second scrape gate
+    /// without driving the reap loop.
     #[cfg(test)]
     pub(crate) fn reader_done(&self) -> bool {
         self.handle.as_ref().is_none_or(|h| h.is_finished())
@@ -1178,8 +1172,8 @@ mod tests {
         t.terminate();
     }
 
-    /// Holding the grid lock keeps the reader from reaching EOF after process
-    /// exit; scraping waits until the lock is released and the reader exits.
+    /// Holding the grid lock after process exit blocks reader EOF, which must
+    /// also block exit-hint scraping.
     #[test]
     fn scrape_exit_hint_waits_for_reader_eof() {
         const ID: &str = "c8c4a5cc-0b32-4ba0-a6b4-6ed08c218e0d";
@@ -1195,16 +1189,13 @@ mod tests {
         let mut t = Task::spawn(20, &cmd, &cmd, &here(), 24, 80, &sh_env(), no_waker()).unwrap();
         t.harness = Some(&crate::harness::Claude);
 
-        // Park the reader before any output exists: it cannot process bytes,
-        // let alone observe EOF, while the test holds the grid lock.
+        // Hold the grid before output so the reader cannot process bytes or
+        // observe EOF.
         let parser = Arc::clone(&t.parser);
         let guard = parser.lock();
         std::fs::write(&flag, b"").unwrap();
-        // The child prints the hint and exits; the latch flips while the
-        // hint bytes are still on the reader's side of the held lock.
-        // 60 s ceilings: shell spawn plus the flag poll are milliseconds
-        // unloaded, but a parallel full-suite run on a busy machine has
-        // blown a 5 s budget; the ceiling only costs time on failure.
+        // The process can exit while its hint remains blocked in the reader.
+        // The long deadline bounds failure without constraining loaded CI.
         let deadline = Instant::now() + Duration::from_secs(60);
         while t.finished.is_none() && Instant::now() < deadline {
             t.poll_exit().unwrap();

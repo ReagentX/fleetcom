@@ -1,19 +1,8 @@
-//! Hooks and notifiers need files outside the child process. This module
-//! installs those assets and allocates one capture path per task run. The
-//! supervisor installs each root once per daemon lifetime and reuses it.
-//!
-//! Assets and capture files both live under `<root>/<pid>-<nonce>`, one
-//! namespace per fleetcom incarnation. `--foreground` lets several fleetcom
-//! processes share one root, and each allocates task ids from 1, so an
-//! unshared namespace per process is the only thing keeping their
-//! `task-<id>-<run>.json` paths apart — and pid alone cannot key it: a
-//! reused pid would land the new process in a dead predecessor's retained
-//! namespace, where the predecessor's `task-1-0.json` is exactly the new
-//! first task's path. Assets get the same isolation: a root-level copy
-//! would be rewritten by every process's install, so a concurrent install
-//! could expose a truncated script to another process's in-flight turn,
-//! and two fleetcom versions sharing a root would overwrite each other's
-//! implementation.
+//! Claude hooks and Codex notifiers run outside the supervisor, so capture needs
+//! stable files with explicit ownership. Each supervisor process therefore owns
+//! a `<root>/<pid>-<nonce>` namespace containing its assets and one
+//! `task-<id>-<run>.json` path per task run. The nonce isolates concurrent
+//! processes and prevents PID reuse from selecting an existing namespace.
 //!
 //! Asset contracts:
 //! - `claude`: `--settings <claude-settings.json>` layers a `SessionStart` hook
@@ -38,8 +27,8 @@ use std::{
 
 use super::CapturePaths;
 
-/// Notify program injected into `codex`. Without a capture path it writes
-/// nothing; with a chain it execs the displaced notifier afterward.
+/// Notify program injected into `codex`. It writes the capture payload when a
+/// path exists, then replaces itself with the configured notifier when present.
 const CODEX_NOTIFY_SCRIPT: &str = r#"#!/bin/sh
 # Write the capture before replacing this process with the chained notifier.
 if [ -n "$FLEETCOM_CAPTURE_FILE" ]; then
@@ -90,7 +79,7 @@ pub fn runtime_root(override_dir: Option<&Path>) -> Option<PathBuf> {
     dirs::cache_dir().map(|c| c.join("fleetcom").join("run"))
 }
 
-/// One process's paths in an installed capture-asset tree.
+/// Capture assets owned by one supervisor process.
 #[derive(Debug)]
 pub struct CaptureAssets {
     /// This incarnation's capture namespace: `<root>/<pid>-<nonce>`.
@@ -100,33 +89,10 @@ pub struct CaptureAssets {
 }
 
 impl CaptureAssets {
-    /// Create `root` and a fresh `<root>/<pid>-<nonce>` namespace with mode
-    /// `0700` and write both assets inside it: the settings file with mode
-    /// `0600`, the directly executed notify script `0700`.
-    ///
-    /// The nonce (12 hex chars of a fresh v4 UUID) keys the namespace to
-    /// this incarnation, so a collision is statistically negligible —
-    /// including a dead predecessor's namespace after pid reuse, whose
-    /// retained `task-1-0.json` would otherwise be exactly this process's
-    /// first task's path. The pid prefix survives purely for debuggability;
-    /// nothing parses these names.
-    ///
-    /// Nothing under `root` is ever deleted here. Per-incarnation namespaces
-    /// isolate every process by construction, so a startup sweep would
-    /// protect nothing and can only break live captures: a foreign namespace
-    /// with a dead-looking owner may serve agents that survived a fleetcom
-    /// crash (a SIGKILLed daemon never signals its children, and their notify
-    /// script lives at that path), legacy root-level assets are exec'd every
-    /// turn by an older fleetcom sharing the root, and root-level
-    /// `task-*.json` files are that version's live capture files. Stale data
-    /// is bytes; a wrong deletion is a broken live capture. The litter bound
-    /// is one few-KB namespace per fleetcom incarnation per root. If
-    /// collection is ever wanted it belongs in a clean-shutdown path, where
-    /// "my tasks are dead" is knowledge rather than a startup guess about
-    /// other processes.
-    ///
-    /// The supervisor calls this at most once per root per daemon lifetime,
-    /// before allocating capture paths for that root.
+    /// Create `root` and a private `<root>/<pid>-<nonce>` namespace. The
+    /// namespace uses mode `0700`; its Claude settings use `0600`, and its
+    /// executable Codex notifier uses `0700`. Existing root entries remain
+    /// unchanged.
     pub fn install(root: &Path, pid: u32) -> io::Result<CaptureAssets> {
         fs::DirBuilder::new()
             .recursive(true)
@@ -135,22 +101,15 @@ impl CaptureAssets {
         // Recursive creation retains a pre-existing directory's permissions.
         fs::set_permissions(root, fs::Permissions::from_mode(0o700))?;
 
-        // 12 hex chars of a v4 UUID, dashes stripped: the first 6 bytes,
-        // all random (the version and variant nibbles land at stripped
-        // indices 12 and 16). 48 bits against a collision set of "retained
-        // namespaces for this pid in this root" — a handful — while keeping
-        // the directory name short enough to eyeball. No urandom means no
-        // unique namespace: fail the install (which disables capture for
-        // the spawn) rather than risk sharing a predecessor's directory.
+        // The first 12 dash-free UUID characters contain 48 random bits; the
+        // UUID version and variant occur later in the string.
         let nonce: String = super::uuid_v4()
             .ok_or_else(|| io::Error::other("no /dev/urandom for the namespace nonce"))?
             .chars()
             .filter(|c| *c != '-')
             .take(12)
             .collect();
-        // The name is 48 fresh random bits, so the non-recursive create
-        // fails loudly on the negligible residual collision instead of writing into
-        // a foreign namespace.
+        // Non-recursive creation refuses a namespace collision.
         let dir = root.join(format!("{pid}-{nonce}"));
         fs::DirBuilder::new().mode(0o700).create(&dir)?;
         fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))?;
@@ -170,12 +129,8 @@ impl CaptureAssets {
         })
     }
 
-    /// Return the per-run capture path and this namespace's asset paths. The
-    /// file is keyed by task *and* run: restart bumps the run, so the fresh
-    /// run's reads cannot reach the old run's file, and a lingering old
-    /// process (graveyard, TERM grace) writes only its own dead path through
-    /// its inherited env. Superseded files persist as bounded litter:
-    /// `install` never deletes (see its doc).
+    /// Return the installed asset paths plus the capture path for one task run.
+    /// Including the run number prevents reruns from sharing payloads.
     pub fn paths_for(&self, task_id: u64, run: u32) -> CapturePaths {
         CapturePaths {
             capture_file: self.dir.join(format!("task-{task_id}-{run}.json")),
@@ -207,8 +162,8 @@ mod tests {
         fs::metadata(p).unwrap().permissions().mode() & 0o777
     }
 
-    /// The namespace the assets landed in, shape-checked: a direct child of
-    /// `root` named `<pid>-<12 lowercase hex>`.
+    /// Recover the installed namespace and verify its
+    /// `<pid>-<12 lowercase hex>` name.
     fn namespace(assets: &CaptureAssets, root: &Path) -> PathBuf {
         let ns = assets.claude_settings.parent().unwrap();
         assert_eq!(ns.parent(), Some(root), "namespace must sit under root");
@@ -252,9 +207,8 @@ mod tests {
         let _ = fs::remove_dir_all(&base);
     }
 
-    /// Every install mints a fresh namespace with pristine assets and
-    /// reasserts the root mode; an earlier namespace — corrupted or not —
-    /// survives untouched.
+    /// Installation creates a distinct namespace, reapplies the root mode, and
+    /// leaves existing namespaces unchanged.
     #[test]
     fn install_mints_a_fresh_namespace_per_call() {
         let root = temp("fresh");
@@ -287,10 +241,7 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
-    /// `install` deletes nothing: a foreign namespace's capture file, a
-    /// root-level legacy capture file, and root-level legacy assets — all
-    /// possibly live property of another process or an older fleetcom
-    /// sharing the root — survive intact.
+    /// Installation leaves every pre-existing root entry unchanged.
     #[test]
     fn install_never_deletes_foreign_or_legacy_files() {
         let root = temp("retain");
@@ -324,12 +275,7 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
-    /// Pid reuse: a dead predecessor's namespace bearing our pid is neither
-    /// entered nor touched. The nonce lands the new incarnation in a fresh
-    /// directory, so the predecessor's `task-1-0.json` — the exact path our
-    /// first task would have used under pid-only keying — stays its own,
-    /// and its assets stay byte-identical for any agent that survived the
-    /// predecessor's crash.
+    /// A matching PID prefix does not cause an existing namespace to be reused.
     #[test]
     fn install_after_pid_reuse_leaves_the_predecessor_namespace_alone() {
         let root = temp("reuse");
@@ -368,9 +314,8 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
-    /// The notify script writes its first argument byte-for-byte, overwrites
-    /// earlier payloads, supports direct execution, and does nothing without
-    /// a configured capture path.
+    /// The notifier overwrites the capture file with its first argument. With
+    /// no capture path or chain, it exits without producing output.
     #[test]
     fn notify_script_writes_the_argument_verbatim() {
         let root = temp("notify");
@@ -432,9 +377,8 @@ mod tests {
         fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
     }
 
-    /// With a chain configured, the script writes the capture file and then
-    /// execs the displaced notifier with its original argv plus the payload
-    /// last, including a notifier path containing spaces.
+    /// A configured chain runs after capture and receives its original argv
+    /// followed by the payload. Spaces within an argument remain intact.
     #[test]
     fn notify_script_chains_the_displaced_notifier() {
         let root = temp("chain");

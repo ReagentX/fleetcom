@@ -10,7 +10,7 @@ Running several long-lived commands becomes cumbersome once they span terminal p
 - Provides read-only previews and full interactive attachment.
 - Keeps jobs running after the client disconnects.
 - Saves and reloads task recipes with directories, commands, group assignments, and display names.
-- Captures `claude`, `codex`, and `grok` conversation IDs and saves commands that resume them.
+- Saves resumable `claude`, `codex`, and `grok` commands when it can identify their conversations.
 - Launches commands in other directories through the `@` picker.
 
 ## Documentation
@@ -38,7 +38,7 @@ From the project root:
 
 ## Usage
 
-`fleetcom` exposes four operating modes:
+`fleetcom` supports these invocations:
 
 - `fleetcom`
   - Connects to the daemon (autostarting it if needed) and opens the dashboard
@@ -68,6 +68,7 @@ The first ordinary invocation starts the daemon when necessary. `--daemon` is an
 | `m` | tag the task "in use" (prioritizes it within the active grouping) |
 | `g` | assign the selected task to a named group (picker: pick, create, or clear) |
 | `R` | rename the selected task: a display name shown in place of the command (an empty prompt clears it) |
+| `r` | rerun a finished task; supported agent tasks resume the captured conversation |
 | `X` | kill a running task (`TERM`, then `KILL` after 2 s), or remove a finished one (Shift-gated); removal sweeps any background processes the job left in its group, with the same `TERM`-then-`KILL` grace |
 | `w` | save the current tasks as a session |
 | `o` | load a saved session |
@@ -109,11 +110,11 @@ The dashboard groups tasks by state (In use / Running / Completed), working dire
 
 ### Sessions
 
-`w`, `o`, and `fleetcom <name>` save or load named recipes. A recipe retains each task's directory, command, group assignment, and display name. Loading starts new processes; it does not recover the processes that existed when the recipe was saved. Process continuity comes from the daemon, while sessions provide repeatable launches.
+`w`, `o`, and `fleetcom <name>` save or load named recipes. A recipe retains each task's directory, saved launch command, group assignment, and display name. Loading starts new processes; it does not recover the processes that existed when the recipe was saved. Process continuity comes from the daemon, while sessions provide repeatable launches.
 
 ### Agent session resume
 
-Relaunching a bare `claude`, `codex`, or `grok` command starts another conversation. `fleetcom` captures the ID and stores a resuming command (`claude --resume '<id>'`, `codex resume '<id>'`, or `grok --resume '<id>'`) when saving or rerunning (`r`) a task. Only the bare program word and `fleetcom`'s canonical resume form participate. Anything more specific (flags, prompts, subcommands, shell syntax) runs and saves verbatim. [`agent-resume.md`](src/harness/agent-resume.md) documents the capture and rewrite mechanics.
+Session recipes store commands, which is insufficient for agent CLIs: relaunching a bare `claude`, `codex`, or `grok` command starts another conversation. When `fleetcom` obtains a valid ID, save and rerun (`r`) use `claude --resume '<id>'`, `codex resume '<id>'`, or `grok --resume '<id>'`. Detection is deliberately narrow. Only the bare program word and `fleetcom`'s canonical resume form participate; flags, prompts, subcommands, and shell syntax run and save verbatim. [`agent-resume.md`](src/harness/agent-resume.md) documents the capture evidence, precedence, and failure behavior.
 
 ## Notes
 

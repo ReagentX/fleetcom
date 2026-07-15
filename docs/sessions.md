@@ -40,7 +40,7 @@ The schema is a flat map with no version field or metadata, so it remains practi
 
 Commands with neither a group nor a name use the string form. String and object entries can appear in the same directory array.
 
-A bare agent command does not identify its conversation. When `fleetcom` captures an ID for `claude`, `codex`, or `grok`, it saves the resuming form instead. The result remains an ordinary command string that can run directly in a shell:
+A bare agent command does not identify its conversation, so saving it verbatim would start another one on load. When `fleetcom` captures an ID for `claude`, `codex`, or `grok`, it stores the resume form instead. The result remains an ordinary command string that can run directly in a shell:
 
 ```json
 {
@@ -57,4 +57,4 @@ A bare agent command does not identify its conversation. When `fleetcom` capture
 - Load in-app: `o`, pick from the list, `Enter`.
 - Load at launch: `fleetcom <name>`.
 
-Loading always spawns new processes from the stored commands. Existing jobs remain daemon state and never enter the session file. [Agent session resume](../src/harness/agent-resume.md) documents how supported agent commands preserve their conversations across that relaunch.
+Loading always spawns new processes from the stored commands. Existing jobs remain daemon state and never enter the session file. [Agent session resume](../src/harness/agent-resume.md) documents when supported agent commands can preserve their conversations across that relaunch.

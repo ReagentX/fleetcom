@@ -1,16 +1,17 @@
-//! Saving an agent command is not enough: relaunching it can start another
-//! conversation. A harness detects supported commands, instruments execution
-//! to capture an ID, and emits a command that resumes that ID.
+//! A saved agent command is incomplete without its conversation ID. Relaunching
+//! the command can otherwise start a new conversation. Each harness detects a
+//! narrow set of commands, captures a validated ID, and builds the corresponding
+//! resume command.
 //!
-//! Detection accepts only the bare program word or the canonical resume form
-//! (program word, fixed selector, one strict UUID, end of line). Everything
-//! else is opaque and runs and saves verbatim.
+//! Detection accepts only a bare program word or its canonical resume form:
+//! program word, fixed selector, one strict UUID, and end of line. Everything
+//! else remains opaque and runs and saves verbatim.
 //!
 //! # Security invariant
 //!
 //! Every ID returned by `parse_capture`, `scrape_exit`, or `correlate_fs`
-//! eventually enters a shell command, so these methods may return only strings
-//! accepted by [`is_uuid`]. Free-text names, paths, and malformed IDs must
+//! eventually enters a shell command. These methods must therefore return only
+//! strings accepted by [`is_uuid`]. Free-text names, paths, and malformed IDs
 //! yield `None`.
 
 pub mod assets;
@@ -33,12 +34,9 @@ pub use grok::Grok;
 /// Environment variable naming the capture file used by injected assets.
 pub const CAPTURE_ENV: &str = "FLEETCOM_CAPTURE_FILE";
 
-/// Environment variable carrying a displaced `codex` notify program's argv,
-/// newline-joined. `codex` instrumentation always sets it: the chain argv
-/// when the user's config routed `notify`, empty otherwise — children inherit
-/// the client env verbatim, so a stale exported value (a nested fleetcom)
-/// would otherwise reach the injected script, which execs it per
-/// notification. The script's `[ -n ]` guard reads empty as absent.
+/// Environment variable carrying the configured `codex` notifier argv joined
+/// by newlines. Instrumentation sets an empty value when no notifier is
+/// configured so inherited values cannot reach the capture script.
 pub const NOTIFY_CHAIN_ENV: &str = "FLEETCOM_NOTIFY_CHAIN";
 
 /// Maximum difference between a task spawn and a correlated session timestamp.
@@ -53,21 +51,16 @@ pub trait Harness: Sync {
     /// resolves it from the launch context used for instrumentation or save.
     fn home_env_var(&self) -> &'static str;
 
-    /// The tool's directory name under `$HOME` (`.claude`, `.codex`,
-    /// `.grok`). With no [`Harness::home_env_var`] in the launch env, the
-    /// supervisor resolves the harness home as the launch env's HOME joined
-    /// with this — the tree the child itself will use, not the daemon's.
+    /// The tool's directory name under the launched process's `$HOME`.
     fn home_dot_dir(&self) -> &'static str;
 
     /// Classify a command. Return `None` for another tool or an unsupported
     /// command shape.
     fn detect(&self, cmd: &str) -> Option<Invocation>;
 
-    /// Build spawn-time command and environment additions.
-    /// `home` is the harness home resolved from the launch env; `codex`
-    /// reads the user's config through it before injecting `notify`. `None`
-    /// (the launch env named neither the tool var nor HOME) falls back to
-    /// this process's own home, the only tree left to guess.
+    /// Build spawn-time command and environment additions. `home` is resolved
+    /// from the launch environment; `None` uses the harness's platform-home
+    /// fallback.
     fn instrument(
         &self,
         inv: &Invocation,
@@ -143,25 +136,20 @@ pub struct SpawnPlan {
     pub injected_id: Option<String>,
 }
 
-/// Characters that keep the program word from being one plain shell word:
-/// with any of these present, arguments this module appends could bind to a
-/// different command than the one the shell runs (`=` makes the word an
-/// env-prefix assignment; `*?[]` glob-expand and `{}` brace-expand the word
-/// into several words or a different path; the rest separate, expand, quote,
-/// or comment). Tilde is accepted deliberately: it expands to a single word
-/// with the same basename, so appended flags still bind to the detected
-/// program.
+/// Shell metacharacters that make the program token unsafe to instrument.
+/// `=` can turn it into an environment assignment, `*?[]` and `{}` can expand
+/// it into different words, and the remaining characters can separate, quote,
+/// expand, or comment out shell input. Tilde remains valid because it expands
+/// to one word with the same basename.
 const PROGRAM_WORD_REFUSALS: &[char] = &[
     '|', ';', '&', '<', '>', '$', '#', '`', '(', ')', '\\', '\'', '"', '=', '\n', '\r', '*', '?',
     '[', ']', '{', '}',
 ];
 
-/// Match `cmd` against the two supported shapes for `program`: the bare
-/// program word, or program + `selector` + one strict UUID ending the line.
-/// The program word matches by basename; the UUID may be bare
-/// (user-typed) or in one single-quote pair (`resume_command` output).
-/// Anything else is opaque: extra flags or arguments, prompts, alternate
-/// resume spellings, shell syntax.
+/// Match `cmd` against a bare `program` or its canonical resume form. The
+/// program matches by basename, and the strict UUID may be bare or wrapped in
+/// the single quote pair emitted by `resume_command`. Extra arguments, prompts,
+/// alternate selectors, and shell syntax do not match.
 pub(crate) fn detect_shape(cmd: &str, program: &str, selector: &str) -> Option<Invocation> {
     let mut words = cmd.split([' ', '\t']).filter(|w| !w.is_empty());
     let first = words.next()?;
@@ -176,8 +164,7 @@ pub(crate) fn detect_shape(cmd: &str, program: &str, selector: &str) -> Option<I
         .then(|| Invocation::Resume(id.to_string()))
 }
 
-/// Strip one single-quote pair: `resume_command` quotes the ID it emits,
-/// while a user retyping a hint may not.
+/// Strip the optional single quote pair emitted by `resume_command`.
 fn unquote(token: &str) -> &str {
     token
         .strip_prefix('\'')
@@ -185,9 +172,9 @@ fn unquote(token: &str) -> &str {
         .unwrap_or(token)
 }
 
-/// Rewrite an accepted `cmd` into `<program word as typed> <selector> '<id>'`.
-/// Unaccepted commands and invalid IDs pass through unchanged; the supervisor
-/// rewrites only detected tasks, so that branch is defensive.
+/// Rewrite an accepted command as
+/// `<program word as typed> <selector> '<id>'`. Invalid IDs and unsupported
+/// command shapes pass through unchanged.
 pub(crate) fn resume_shape(cmd: &str, program: &str, selector: &str, id: &str) -> String {
     if !is_uuid(id) || detect_shape(cmd, program, selector).is_none() {
         return cmd.to_string();
@@ -209,9 +196,8 @@ pub fn is_uuid(s: &str) -> bool {
         })
 }
 
-/// Return the strict UUID at the start of `s`. A token boundary must follow:
-/// a trailing alphanumeric, `-`, or `_` means the token continues past 36
-/// bytes and is not an ID.
+/// Return the strict UUID at the start of `s`. The next byte must end the token;
+/// an alphanumeric character, `-`, or `_` extends the token and rejects it.
 pub(crate) fn leading_uuid(s: &str) -> Option<&str> {
     let head = s.get(..36).filter(|h| is_uuid(h))?;
     match s.as_bytes().get(36) {
@@ -220,8 +206,8 @@ pub(crate) fn leading_uuid(s: &str) -> Option<&str> {
     }
 }
 
-/// Generate a v4 UUID from `/dev/urandom`. Return `None` when the device
-/// cannot be read so callers can continue without launch-time pinning.
+/// Generate a v4 UUID from `/dev/urandom`. A read failure returns `None`, which
+/// lets the caller launch without pinning an ID.
 pub(crate) fn uuid_v4() -> Option<String> {
     use std::fmt::Write;
     let mut bytes = [0u8; 16];

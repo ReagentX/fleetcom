@@ -97,7 +97,7 @@ pub fn shake_hands(stream: &mut UnixStream, cwd: &str) {
     shake_hands_env(stream, cwd, &env);
 }
 
-/// [`shake_hands`] with a caller-supplied hello environment.
+/// Complete [`shake_hands`] with a caller-supplied hello environment.
 pub fn shake_hands_env(stream: &mut UnixStream, cwd: &str, env: &[(&[u8], &[u8])]) {
     stream
         .write_all(&hello_frame(PROTOCOL_VERSION, env, cwd))

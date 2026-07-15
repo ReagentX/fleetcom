@@ -1,8 +1,8 @@
-//! For accepted `claude` launches, this harness pins a v4 UUID with
-//! `--session-id` (bare launches only), layers a `SessionStart` hook through
-//! `--settings`, scans final terminal text for `claude --resume <uuid>`, and
-//! correlates transcripts under
-//! `<claude-home>/projects/<cwd-slug>/<uuid>.jsonl`.
+//! Claude exposes three useful session signals: a launch-time `--session-id`, a
+//! `SessionStart` hook, and an exit-time resume hint. Bare launches pin a v4
+//! UUID; every accepted launch receives the hook through `--settings`. The
+//! filesystem fallback correlates
+//! `<claude-home>/projects/<cwd-slug>/<uuid>.jsonl` transcripts.
 
 use std::{fs, path::Path, time::SystemTime};
 
@@ -79,8 +79,8 @@ impl Harness for Claude {
     }
 
     fn correlate_fs(&self, cwd: &Path, spawned: SystemTime, home: Option<&Path>) -> Option<String> {
-        // The `dirs` default is the last resort: the supervisor resolves
-        // `home` from the launch env whenever it names any home at all.
+        // Fall back to this process's home only when the launch environment
+        // supplied neither the tool-specific override nor HOME.
         let root = match home {
             Some(p) => p.to_path_buf(),
             None => dirs::home_dir()?.join(".claude"),
@@ -116,8 +116,9 @@ impl Harness for Claude {
     }
 }
 
-/// Claude's project slug: the absolute cwd with both `/` and `.` replaced by
-/// `-` (`/a/b.c` → `-a-b-c`). Non-UTF-8 paths have no slug.
+/// Convert an absolute working directory to Claude's project slug by replacing
+/// `/` and `.` with `-` (`/a/b.c` becomes `-a-b-c`). Non-UTF-8 paths have no
+/// representable slug.
 fn slug(cwd: &Path) -> Option<String> {
     Some(
         cwd.to_str()?
@@ -172,7 +173,7 @@ mod tests {
     }
 
     /// Prompts, flags, alternate resume forms, subcommands, and shell syntax
-    /// are opaque: they are neither detected nor rewritten.
+    /// stay opaque and are never rewritten.
     #[test]
     fn everything_else_is_opaque_and_never_rewritten() {
         let opaque: Vec<String> = [
@@ -231,8 +232,8 @@ mod tests {
         );
     }
 
-    /// The resume form already targets its conversation: the settings overlay
-    /// rides along, and no second ID is pinned.
+    /// A resume command already targets a conversation, so instrumentation adds
+    /// the settings overlay without pinning another ID.
     #[test]
     fn instrument_adds_only_settings_to_the_resume_form() {
         let inv = Claude.detect(&format!("claude --resume {ID}")).unwrap();
@@ -276,8 +277,8 @@ mod tests {
         assert_eq!(Claude.scrape_exit(&format!("claude --resume {ID}ff")), None);
     }
 
-    /// Both authored shapes rewrite to the same canonical resume form; the
-    /// program word survives as typed.
+    /// Both accepted shapes produce the canonical resume form while preserving
+    /// the program word as typed.
     #[test]
     fn resume_command_regenerates_the_canonical_form() {
         assert_eq!(
@@ -343,7 +344,7 @@ mod tests {
         let _ = fs::remove_dir_all(&home);
     }
 
-    /// The scraper recovers the exit-hint ID from a recorded terminal stream.
+    /// The scraper recovers the exit-hint ID from the corpus terminal bytes.
     #[test]
     fn corpus_scrape_recovers_the_exit_hint_id() {
         let mut emu = Emulator::new(40, 120, 2000);

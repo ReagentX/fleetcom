@@ -7,17 +7,16 @@ byte.
 
 ## Capture method
 
-Fixtures are recorded under a 40×120 PTY with `TERM=xterm-256color`. Tests feed
-the captured bytes to the emulator verbatim. If a fixture needs to change,
-record a new session rather than patching the binary capture.
+Each fixture is raw output from a 40×120 PTY with `TERM=xterm-256color`. Tests
+feed the bytes to the emulator verbatim.
 
 ## Fixtures
 
-| Fixture | Source | Coverage |
+| Fixture | Scenario | Coverage |
 | --- | --- | --- |
-| `claude_resume.bin` | recorded `claude --session-id` session: one prompt, reply, `/exit` | alternate-screen exit followed by the primary-screen resume hint (`claude --resume <uuid>`); the scrape target for harness exit capture |
-| `codex_resume.bin` | recorded `codex resume` session | top-anchored DECSTBM scroll regions (`CSI 1;N r`), reverse index, inline-TUI history insertion, and an SGR-split resume hint for harness exit capture |
-| `grok_resume.bin` | recorded `grok --session-id` session: one prompt, reply, `/exit` | primary-screen exit followed by the resume hint (`grok --resume <uuid>`); the scrape target for harness exit capture |
+| `claude_resume.bin` | `claude --session-id`: one prompt, reply, `/exit` | alternate-screen exit followed by the primary-screen resume hint (`claude --resume <uuid>`); the scrape target for harness exit capture |
+| `codex_resume.bin` | `codex resume` | top-anchored DECSTBM scroll regions (`CSI 1;N r`), reverse index, inline-TUI history insertion, and an SGR-split resume hint for harness exit capture |
+| `grok_resume.bin` | `grok --session-id`: one prompt, reply, `/exit` | primary-screen exit followed by the resume hint (`grok --resume <uuid>`); the scrape target for harness exit capture |
 | `tmux_split.bin` | `tmux` session with two splits and one command per pane | scroll regions, pane borders, full redraws |
 | `vim_session.bin` | `vim -u NONE`: insert, navigate, `:set number`, `:q!` | alternate screen, cursor addressing, line editing |
 | `less_altscreen.bin` | `less` over `/usr/share/dict/words`: page, `G`, `g`, `q` | alternate-screen entry and exit, full-screen paging |
@@ -30,7 +29,7 @@ record a new session rather than patching the binary capture.
 
 ## Test classification
 
-The fixtures cover display, parser, and harness-scrape behavior:
+The fixtures provide evidence for three distinct boundaries:
 
 - `tmux_split`, `vim_session`, `less_altscreen`, `top_live`, `shell_colors`,
   and `build_log` pin displayed state: every plain-text row, the cursor, and
