@@ -1202,7 +1202,10 @@ mod tests {
         std::fs::write(&flag, b"").unwrap();
         // The child prints the hint and exits; the latch flips while the
         // hint bytes are still on the reader's side of the held lock.
-        let deadline = Instant::now() + Duration::from_secs(5);
+        // 60 s ceilings: shell spawn plus the flag poll are milliseconds
+        // unloaded, but a parallel full-suite run on a busy machine has
+        // blown a 5 s budget; the ceiling only costs time on failure.
+        let deadline = Instant::now() + Duration::from_secs(60);
         while t.finished.is_none() && Instant::now() < deadline {
             t.poll_exit().unwrap();
             thread::sleep(Duration::from_millis(10));
@@ -1213,7 +1216,7 @@ mod tests {
 
         // Release the reader so it can parse the hint and reach EOF.
         drop(guard);
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + Duration::from_secs(60);
         while t.scraped_id.is_none() && Instant::now() < deadline {
             t.scrape_exit_hint();
             thread::sleep(Duration::from_millis(10));

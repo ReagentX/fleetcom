@@ -472,8 +472,8 @@ impl Supervisor {
 
     /// Resolve and install this connection's capture assets. An explicit
     /// `FLEETCOM_RUNTIME_DIR` is used verbatim; the fallback root includes a
-    /// session-root discriminator. Canonical roots are installed and swept
-    /// once per daemon lifetime, preserving live capture files on reuse.
+    /// session-root discriminator. Canonical roots are installed once per
+    /// daemon lifetime.
     /// Capture files and assets land in this process's pid namespace under
     /// the root, so concurrent supervisors sharing a root (a daemon plus
     /// `--foreground` runs) cannot cross-wire each other's captures or
@@ -2495,7 +2495,7 @@ mod tests {
             "the displaced run was never collected"
         );
         // The old run's file is unreachable from the fresh run and survives
-        // as bounded litter until the next install sweep.
+        // as bounded litter: install never deletes.
         assert!(
             cap.exists(),
             "restart must not delete the old run's capture file"
@@ -2558,7 +2558,7 @@ mod tests {
             !text.contains(CAP_OTHER),
             "the old run's stale capture must be unreachable; got {text}"
         );
-        // Bounded litter: the superseded file waits for the install sweep.
+        // Bounded litter: install never deletes the superseded file.
         assert!(old_cap.exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2615,7 +2615,7 @@ mod tests {
         assert_eq!(s.tasks.len(), 2);
         assert!(
             cap.exists(),
-            "an unchanged root must not re-sweep live capture files"
+            "an unchanged root must not disturb live capture files"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2654,7 +2654,7 @@ mod tests {
         assert_eq!(s.tasks.len(), 3);
         assert!(
             cap_a.exists(),
-            "returning to a known root must not re-sweep its live captures"
+            "returning to a known root must not disturb its live captures"
         );
         assert!(
             root_b

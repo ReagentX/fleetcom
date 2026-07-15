@@ -32,8 +32,6 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use nix::{errno::Errno, sys::signal::kill, unistd::Pid};
-
 use super::CapturePaths;
 
 /// Notify program injected into `codex`. Without a capture path it writes
@@ -88,17 +86,6 @@ pub fn runtime_root(override_dir: Option<&Path>) -> Option<PathBuf> {
     dirs::cache_dir().map(|c| c.join("fleetcom").join("run"))
 }
 
-/// Whether `pid` names a live process: signal 0 probes existence without
-/// delivering anything. Only ESRCH proves death; EPERM (another user's
-/// process) and an unprobeable id read as alive, so the sweep can only
-/// under-collect, never remove a live namespace.
-fn pid_alive(pid: u32) -> bool {
-    let Ok(pid) = i32::try_from(pid) else {
-        return true;
-    };
-    kill(Pid::from_raw(pid), None) != Err(Errno::ESRCH)
-}
-
 /// One process's paths in an installed capture-asset tree.
 #[derive(Debug)]
 pub struct CaptureAssets {
@@ -109,31 +96,27 @@ pub struct CaptureAssets {
 }
 
 impl CaptureAssets {
-    /// Create `root` with mode `0700`, sweep dead capture namespaces, claim
-    /// `<root>/<pid>` for this process, and write both assets inside it: the
-    /// settings file with mode `0600`, the directly executed notify script
-    /// `0700`.
+    /// Create `root` and `<root>/<pid>` with mode `0700` and write both
+    /// assets inside the namespace: the settings file with mode `0600`, the
+    /// directly executed notify script `0700`.
+    ///
+    /// Nothing under `root` is ever deleted here. Per-pid namespaces already
+    /// isolate every process by construction, so a startup sweep would
+    /// protect nothing and can only break live captures: a foreign namespace
+    /// with a dead-looking owner may serve agents that survived a fleetcom
+    /// crash (a SIGKILLed daemon never signals its children, and their notify
+    /// script lives at that path), legacy root-level assets are exec'd every
+    /// turn by an older fleetcom sharing the root, and root-level
+    /// `task-*.json` files are that version's live capture files. Stale data
+    /// is bytes; a wrong deletion is a broken live capture. The litter bound
+    /// is one few-KB namespace per fleetcom process lifetime per root. If
+    /// collection is ever wanted it belongs in a clean-shutdown path, where
+    /// "my tasks are dead" is knowledge rather than a startup guess about
+    /// other processes.
     ///
     /// The supervisor calls this at most once per root per daemon lifetime,
     /// before allocating capture paths for that root.
     pub fn install(root: &Path, pid: u32) -> io::Result<CaptureAssets> {
-        CaptureAssets::install_probed(root, pid, pid_alive)
-    }
-
-    /// `install` with an injectable liveness probe, so tests can prove both
-    /// keep-alive and sweep-dead without depending on real pid lifecycles.
-    ///
-    /// The sweep removes only namespaces whose owning process is dead, plus
-    /// litter pre-namespace daemons left at the root: loose `task-*.json`
-    /// files and the root-level asset copies, both regenerated per pid and
-    /// referenced by nothing current. A recycled pid makes a stale namespace
-    /// look alive and defers its sweep: bounded litter, never a correctness
-    /// hazard, because each process writes only inside its own namespace.
-    fn install_probed(
-        root: &Path,
-        pid: u32,
-        alive: impl Fn(u32) -> bool,
-    ) -> io::Result<CaptureAssets> {
         fs::DirBuilder::new()
             .recursive(true)
             .mode(0o700)
@@ -141,33 +124,21 @@ impl CaptureAssets {
         // Recursive creation retains a pre-existing directory's permissions.
         fs::set_permissions(root, fs::Permissions::from_mode(0o700))?;
 
-        for entry in fs::read_dir(root)? {
-            let entry = entry?;
-            let name = entry.file_name();
-            let Some(name) = name.to_str() else { continue };
-            if entry.file_type()?.is_dir() {
-                // A directory named like our own pid is a dead predecessor's
-                // (pid reuse): this process has not written here yet.
-                if let Ok(owner) = name.parse::<u32>()
-                    && (owner == pid || !alive(owner))
-                {
-                    fs::remove_dir_all(entry.path())?;
-                }
-            } else if (name.starts_with("task-") && name.ends_with(".json"))
-                || name == "claude-settings.json"
-                || name == "codex-notify.sh"
-            {
-                fs::remove_file(entry.path())?;
-            }
-        }
-
+        // A pre-existing directory bearing our pid is a dead predecessor's
+        // (pid reuse). Write into it rather than rebuild it: a surviving
+        // agent of that process may still exec paths inside, and the writes
+        // below overwrite the assets with identical-per-version content —
+        // the least-destructive reconciliation. Its stale task files are
+        // unreachable from this process anyway: `current_resume_id` reads
+        // only capture paths stored on live `Task` structs, never a
+        // directory scan, and our run keys differ at worst.
         let dir = root.join(pid.to_string());
-        fs::DirBuilder::new().mode(0o700).create(&dir)?;
+        fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(&dir)?;
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))?;
 
-        // The assets live inside the namespace: nothing outside it ever
-        // references these paths, and the namespace outlives every task of
-        // its process by construction — a namespace is swept only when its
-        // owner is dead, and a dead fleetcom's tasks died with it.
         let claude_settings = dir.join("claude-settings.json");
         fs::write(&claude_settings, claude_settings_json())?;
         fs::set_permissions(&claude_settings, fs::Permissions::from_mode(0o600))?;
@@ -187,8 +158,8 @@ impl CaptureAssets {
     /// file is keyed by task *and* run: restart bumps the run, so the fresh
     /// run's reads cannot reach the old run's file, and a lingering old
     /// process (graveyard, TERM grace) writes only its own dead path through
-    /// its inherited env. Superseded files persist as bounded litter until
-    /// an `install` finds this namespace's owner dead.
+    /// its inherited env. Superseded files persist as bounded litter:
+    /// `install` never deletes (see its doc).
     pub fn paths_for(&self, task_id: u64, run: u32) -> CapturePaths {
         CapturePaths {
             capture_file: self.dir.join(format!("task-{task_id}-{run}.json")),
@@ -246,11 +217,9 @@ mod tests {
         let _ = fs::remove_dir_all(&base);
     }
 
-    /// Reinstalling with the same pid rebuilds the namespace wholesale: the
-    /// sweep reads a same-pid directory as a dead predecessor's, so the
-    /// second install starts clean and heals corrupted assets and modes.
-    /// The supervisor's once-per-root map keeps live capture files out of
-    /// reach of this path.
+    /// Reinstalling with the same pid overwrites the assets in place and
+    /// reasserts every mode, healing corruption without touching anything
+    /// else in the namespace.
     #[test]
     fn install_is_idempotent_and_heals_corrupted_assets() {
         let root = temp("heal");
@@ -275,63 +244,73 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
-    /// The sweep is liveness-honest: dead namespaces and legacy root litter
-    /// (loose task files, root-level assets) go, a live process's namespace
-    /// stays, and a pre-existing directory named like our own pid reads as
-    /// a dead predecessor's (pid reuse).
+    /// `install` deletes nothing: a foreign namespace's capture file, a
+    /// root-level legacy capture file, and root-level legacy assets — all
+    /// possibly live property of another process or an older fleetcom
+    /// sharing the root — survive intact.
     #[test]
-    fn install_sweeps_dead_namespaces_and_legacy_files_only() {
-        let root = temp("sweep");
-        let (live, dead, reused) = (root.join("1000"), root.join("2000"), root.join("3000"));
-        for ns in [&live, &dead, &reused] {
-            fs::create_dir_all(ns).unwrap();
-            fs::write(ns.join("task-1-0.json"), "{}").unwrap();
-        }
-        fs::write(root.join("task-42-7.json"), "{}").unwrap();
-        // The legacy pattern also matches names without a run suffix.
-        fs::write(root.join("task-9.json"), "{}").unwrap();
-        // Root-level assets are pre-namespace litter; nothing references them.
+    fn install_never_deletes_foreign_or_legacy_files() {
+        let root = temp("retain");
+        let foreign = root.join("99999");
+        fs::create_dir_all(&foreign).unwrap();
+        fs::write(foreign.join("task-1-0.json"), "{}").unwrap();
+        fs::write(root.join("task-1-0.json"), "{}").unwrap();
         fs::write(root.join("claude-settings.json"), "old").unwrap();
         fs::write(root.join("codex-notify.sh"), "old").unwrap();
-        fs::write(root.join("unrelated.txt"), "x").unwrap();
 
-        let assets =
-            CaptureAssets::install_probed(&root, 3000, |pid| pid == 1000 || pid == 3000).unwrap();
+        let assets = CaptureAssets::install(&root, std::process::id()).unwrap();
         assert!(
-            live.join("task-1-0.json").exists(),
-            "a live namespace must never be touched"
+            foreign.join("task-1-0.json").exists(),
+            "another process's capture file must survive"
         );
-        assert!(!dead.exists(), "a dead namespace must be removed");
         assert!(
-            reused.is_dir() && !reused.join("task-1-0.json").exists(),
-            "our own pre-existing namespace holds a dead predecessor's files"
+            root.join("task-1-0.json").exists(),
+            "an older fleetcom's root-level capture file must survive"
         );
-        assert!(!root.join("task-42-7.json").exists());
-        assert!(!root.join("task-9.json").exists());
-        assert!(
-            !root.join("claude-settings.json").exists() && !root.join("codex-notify.sh").exists(),
-            "legacy root-level assets are litter; nothing current reads them"
+        assert_eq!(
+            fs::read_to_string(root.join("claude-settings.json")).unwrap(),
+            "old",
+            "an older fleetcom's root-level assets must survive verbatim"
         );
-        assert!(root.join("unrelated.txt").exists());
+        assert_eq!(
+            fs::read_to_string(root.join("codex-notify.sh")).unwrap(),
+            "old"
+        );
         assert!(assets.claude_settings.exists());
         assert!(assets.codex_notify.exists());
         let _ = fs::remove_dir_all(&root);
     }
 
-    /// The production probe: this process and pid 1 (init/launchd) are
-    /// alive, so `install` keeps their namespaces.
+    /// Pid reuse: a dead predecessor's directory bearing our pid is written
+    /// into, not rebuilt. Its stale task file survives (a surviving agent of
+    /// the dead process may still reference the namespace) while the assets
+    /// heal to current content and modes.
     #[test]
-    fn install_production_probe_keeps_live_pids() {
-        assert!(pid_alive(std::process::id()));
-        let root = temp("probe");
-        let init = root.join("1");
-        fs::create_dir_all(&init).unwrap();
-        fs::write(init.join("task-1-0.json"), "{}").unwrap();
-        CaptureAssets::install(&root, std::process::id()).unwrap();
+    fn install_into_a_reused_pid_namespace_keeps_stale_task_files() {
+        let root = temp("reuse");
+        let ns = root.join(std::process::id().to_string());
+        fs::create_dir_all(&ns).unwrap();
+        fs::write(ns.join("task-1-0.json"), "{}").unwrap();
+        fs::write(ns.join("claude-settings.json"), "garbage").unwrap();
+        fs::write(ns.join("codex-notify.sh"), "garbage").unwrap();
+        fs::set_permissions(&ns, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let assets = CaptureAssets::install(&root, std::process::id()).unwrap();
         assert!(
-            init.join("task-1-0.json").exists(),
-            "pid 1 is always alive; its namespace must survive"
+            ns.join("task-1-0.json").exists(),
+            "a predecessor's task file must survive pid reuse"
         );
+        assert_eq!(
+            fs::read_to_string(&assets.claude_settings).unwrap(),
+            claude_settings_json()
+        );
+        assert_eq!(
+            fs::read_to_string(&assets.codex_notify).unwrap(),
+            CODEX_NOTIFY_SCRIPT
+        );
+        assert_eq!(mode(&ns), 0o700);
+        assert_eq!(mode(&assets.claude_settings), 0o600);
+        assert_eq!(mode(&assets.codex_notify), 0o700);
         let _ = fs::remove_dir_all(&root);
     }
 

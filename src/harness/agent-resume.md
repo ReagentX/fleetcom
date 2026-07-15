@@ -19,7 +19,7 @@ Each `fleetcom` process owns one namespace under the capture root: `<root>/<pid>
 
 Each instrumented task run gets `<root>/<pid>/task-<id>-<run>.json`. For Claude and Codex capture, `fleetcom` exposes the path through `FLEETCOM_CAPTURE_FILE`; the injected hook or notifier overwrites the file with JSON containing the conversation ID. The file is keyed by task and run: a restart bumps the run, so the fresh run cannot read the old run's file, and a lingering old process writes only its own superseded path.
 
-Installation also sweeps the root. A namespace whose owning process is dead is removed; liveness is probed with signal 0, and only `ESRCH` reads as dead, so the sweep can only under-collect. A recycled pid makes a stale namespace look alive and defers its removal: bounded litter, never a correctness hazard, because each process writes only inside its own namespace. Loose `task-*.json` files and root-level `claude-settings.json`/`codex-notify.sh` are pre-namespace litter and are removed.
+Installation deletes nothing under the root. Per-pid namespaces isolate every process by construction, so a garbage sweep would protect nothing — and every deletion it could make risks a live capture: a namespace with a dead-looking owner may serve agents that survived a `fleetcom` crash (a SIGKILLed daemon never signals its children, and their notify script lives at that path), root-level `claude-settings.json`/`codex-notify.sh` are exec'd every turn by an older `fleetcom` sharing the root, and root-level `task-*.json` files are that version's live capture files. Stale data is bytes; a wrong deletion is a broken live capture. The litter bound is one few-KB namespace per `fleetcom` process lifetime per root.
 
 ### `claude`
 
