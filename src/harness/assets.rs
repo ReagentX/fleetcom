@@ -105,7 +105,7 @@ impl CaptureAssets {
     /// `0600`, the directly executed notify script `0700`.
     ///
     /// The nonce (12 hex chars of a fresh v4 UUID) keys the namespace to
-    /// this incarnation, so it collides with nothing by construction —
+    /// this incarnation, so a collision is statistically negligible —
     /// including a dead predecessor's namespace after pid reuse, whose
     /// retained `task-1-0.json` would otherwise be exactly this process's
     /// first task's path. The pid prefix survives purely for debuggability;
@@ -148,8 +148,8 @@ impl CaptureAssets {
             .filter(|c| *c != '-')
             .take(12)
             .collect();
-        // The name is fresh by construction, so the non-recursive create
-        // fails loudly on the impossible collision instead of writing into
+        // The name is 48 fresh random bits, so the non-recursive create
+        // fails loudly on the negligible residual collision instead of writing into
         // a foreign namespace.
         let dir = root.join(format!("{pid}-{nonce}"));
         fs::DirBuilder::new().mode(0o700).create(&dir)?;

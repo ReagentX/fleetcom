@@ -161,8 +161,8 @@ pub struct Supervisor {
     /// TERM→KILL escalation window. `KILL_GRACE` in production; a field so tests
     /// shrink it instead of sleeping through real seconds.
     kill_grace: Duration,
-    /// Capture assets keyed by canonicalized root. Each root is installed and
-    /// swept once per daemon lifetime.
+    /// Capture assets keyed by canonicalized root. Each root is installed
+    /// once per daemon lifetime; installation deletes nothing.
     capture: BTreeMap<PathBuf, assets::CaptureAssets>,
 }
 
