@@ -232,11 +232,19 @@ fn step_down(sel: usize, len: usize) -> usize {
     (sel + 1).min(len.saturating_sub(1))
 }
 
-/// Dashboard grouping bucket: tagged tasks first, then live, then completed.
+/// Dashboard grouping bucket: 0 tagged, 1 live, 2 parked live, 3 completed.
+/// Tagged wins over everything; completed is classified by `lifecycle`, never
+/// by trusting `parked == false`, so a core that ever shipped both signals
+/// still lands finished tasks in Completed. Placement follows `parked` — the
+/// core's 10 s debounced quiet signal — not the instantaneous
+/// `Lifecycle::Idle`: `top`-cadence output flaps the 600 ms glyph edge, and
+/// the glyph may flicker but the row must not change sections.
 fn bucket(v: &TaskView) -> u8 {
     if v.tagged {
         0
     } else if matches!(v.lifecycle, Lifecycle::Ok | Lifecycle::Failed) {
+        3
+    } else if v.parked {
         2
     } else {
         1
@@ -419,6 +427,7 @@ impl App {
                         let l = match b {
                             0 => "In use",
                             1 => "Running",
+                            2 => "Idle",
                             _ => "Completed",
                         };
                         (b, l.to_string())
@@ -1686,6 +1695,128 @@ mod tests {
         app.transport.send(Command::Tag { id, on: true });
         app.pump();
         assert_eq!(app.sections()[0].0, "In use");
+    }
+
+    /// A parked live task gets its own "Idle" section between "Running" and
+    /// "Completed". `parked` is flipped on the local snapshot here (and in the
+    /// tests below): the core's 10 s quiet window is exactly what a test must
+    /// not wait out, and `sections` is pure over `views` — the flip must come
+    /// after the last pump, or a fresh snapshot overwrites it.
+    #[test]
+    fn parked_task_lands_in_idle_between_running_and_completed() {
+        let mut app = App::new_local(30, 100);
+        let inv = app.invocation_dir.clone();
+        app.spawn_in("sleep 5", inv.clone()); // id 1: running
+        app.spawn_in("sleep 5", inv.clone()); // id 2: parked below
+        app.spawn_in("sleep 5", inv.clone()); // id 3: tagged below
+        app.spawn_in("true", inv); // id 4: exits ~immediately
+        wait_until(Duration::from_secs(5), || {
+            app.pump();
+            app.views
+                .iter()
+                .any(|v| v.id == 4 && matches!(v.lifecycle, Lifecycle::Ok | Lifecycle::Failed))
+        });
+        app.transport.send(Command::Tag { id: 3, on: true });
+        app.pump();
+
+        let i = app.views.iter().position(|v| v.id == 2).unwrap();
+        app.views[i].parked = true;
+
+        assert_eq!(
+            app.section_ids(),
+            vec![
+                ("In use".to_string(), vec![3]),
+                ("Running".to_string(), vec![1]),
+                ("Idle".to_string(), vec![2]),
+                ("Completed".to_string(), vec![4]),
+            ]
+        );
+    }
+
+    /// Tagged beats parked: a tagged task stays in "In use" even while parked.
+    #[test]
+    fn tagged_parked_task_stays_in_use() {
+        let mut app = App::new_local(30, 100);
+        let inv = app.invocation_dir.clone();
+        app.spawn_in("sleep 5", inv.clone()); // id 1: tagged + parked
+        app.spawn_in("sleep 5", inv); // id 2: running
+        app.pump();
+        app.transport.send(Command::Tag { id: 1, on: true });
+        app.pump();
+
+        let i = app.views.iter().position(|v| v.id == 1).unwrap();
+        app.views[i].parked = true;
+
+        assert_eq!(
+            app.section_ids(),
+            vec![
+                ("In use".to_string(), vec![1]),
+                ("Running".to_string(), vec![2]),
+            ]
+        );
+    }
+
+    /// A glyph-idle but not-parked task stays in "Running": `lifecycle` flaps
+    /// at the 600 ms edge for tools like `top` whose output arrives in 1-2 s
+    /// bursts, so placement keys off the debounced `parked`, never the glyph.
+    #[test]
+    fn glyph_idle_without_parked_stays_in_running() {
+        let mut app = App::new_local(30, 100);
+        let inv = app.invocation_dir.clone();
+        app.spawn_in("sleep 5", inv); // id 1
+        app.pump();
+
+        let i = app.views.iter().position(|v| v.id == 1).unwrap();
+        app.views[i].lifecycle = Lifecycle::Idle;
+        app.views[i].parked = false;
+
+        assert_eq!(app.section_ids(), vec![("Running".to_string(), vec![1])]);
+    }
+
+    /// Selection is bound to a task id, so a `parked` flip (re-bucketing the
+    /// row from "Running" into "Idle") must not move the highlight to a
+    /// different task.
+    #[test]
+    fn selection_follows_task_across_parked_rebucket() {
+        let mut app = App::new_local(30, 100);
+        let dir = app.invocation_dir.clone();
+        app.spawn_in("sleep 5", dir.clone()); // id 1
+        app.spawn_in("sleep 5", dir); // id 2
+        app.pump();
+        app.resolve_selection();
+        assert_eq!(app.selected_id, Some(1));
+
+        // Park id 1 -> it sinks into "Idle", below id 2's "Running".
+        let i = app.views.iter().position(|v| v.id == 1).unwrap();
+        app.views[i].parked = true;
+
+        let order = app.display_order();
+        assert_eq!(app.views[order[0]].id, 2, "running task should sort first");
+
+        // Still on id 1, even though it is now the second row.
+        assert_eq!(app.selected_id, Some(1));
+        assert_eq!(app.views[app.selected_task().unwrap()].id, 1);
+    }
+
+    /// `bucket` doubles as the within-group tiebreak, so a parked task sinks
+    /// below a running one inside a Custom group too, not only in State mode.
+    #[test]
+    fn custom_mode_parked_sinks_within_group() {
+        let mut app = App::new_local(30, 100);
+        let inv = app.invocation_dir.clone();
+        app.spawn_grouped("sleep 5", inv.clone(), "alpha"); // id 1
+        app.spawn_grouped("sleep 5", inv, "alpha"); // id 2
+        app.pump();
+        app.group_mode = GroupMode::Custom;
+        assert_eq!(app.section_ids(), vec![("alpha".to_string(), vec![1, 2])]);
+
+        let i = app.views.iter().position(|v| v.id == 1).unwrap();
+        app.views[i].parked = true;
+        assert_eq!(
+            app.section_ids(),
+            vec![("alpha".to_string(), vec![2, 1])],
+            "parked id 1 sinks below running id 2 within alpha"
+        );
     }
 
     /// `r` sends `Restart` only for a finished selection. On a running task

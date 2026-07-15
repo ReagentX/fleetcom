@@ -45,6 +45,8 @@
 | `✗` | Completed, non-zero exit |
 | `◆` | Tagged "in use" |
 
+The `∙` glyph flips after ≈600 ms of quiet; the Idle *section* in the by-state sort uses a 10 s window. A task can therefore show `∙` while still filed under Running.
+
 ### Mechanics
 
 #### Peek vs. attach
@@ -83,13 +85,13 @@ Tasks retain 2,000 lines of scrollback. While attached to an inline child, wheel
 
 `s` cycles three grouping modes: state, dir, custom. The header shows the strip `by state · dir · custom` with the active mode bold and the rest dim.
 
-- By state: In use / Running / Completed.
+- By state: In use / Running / Idle / Completed. A running task files under Idle after 10 s without output; Completed stays one section (`✓`/`✗` show exit status).
 - By dir: one section per working directory; the invocation directory first, the rest alphabetical.
 - By custom group: one section per group name, sorted by name, with Unassigned last. Fresh spawns remain unassigned unless they inherit a group, and the Unassigned section exists only while it has a member.
 
 Groups belong to task state: an assignment survives client detach and rerun (`r`), and switching grouping modes does not modify it. `g` reassigns the selected task through the [group picker](#the-g-group-picker).
 
-`m` toggles the "in use" tag and marks the task with `◆`. In state mode, tagged tasks form the In use section at the top. In custom mode, a tag moves the task to the top of its existing group rather than creating a global section. Within each group, the order is tagged, running, completed; each bucket then sorts by directory and spawn order.
+`m` toggles the "in use" tag and marks the task with `◆`. In state mode, tagged tasks form the In use section at the top. In custom mode, a tag moves the task to the top of its existing group rather than creating a global section. Within each group, the order is tagged, running, idle, completed; each bucket then sorts by directory and spawn order.
 
 In custom mode only, a new command inherits the selected task's group, through both `n` and the `@` picker. The spawn prompt shows the destination as `❯ dir ▸ group ▸ command`, each segment present only when it applies: the dir segment for a non-default directory, the group segment when a group will be inherited. State- and dir-mode spawns start unassigned.
 

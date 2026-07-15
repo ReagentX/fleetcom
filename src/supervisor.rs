@@ -26,6 +26,13 @@ use crate::{
 /// the client, computes lifecycle. It holds the clock and the live parser.
 const IDLE_AFTER: Duration = Duration::from_millis(600);
 
+/// No output for this long ⇒ parked: idle for status-sort *placement*. A
+/// second window over the same `last_activity` signal as `IDLE_AFTER`: 600 ms
+/// flips the per-row glyph, 10 s moves the row. A cadence shorter than the
+/// window (`top` bursts every 1–2 s) resets the signal before it can
+/// expire and never produces a placement edge — the window is the debounce.
+const SORT_IDLE_AFTER: Duration = Duration::from_secs(10);
+
 /// Send-on-change fingerprint for the watched screen and scrollback offset.
 type LastScreen = (u64, Vec<u8>, (u16, u16), bool, (bool, bool, bool), usize);
 
@@ -407,8 +414,11 @@ impl Supervisor {
                 group: t.group.clone(),
                 name: t.name.clone(),
                 lifecycle: t.lifecycle(now, IDLE_AFTER),
+                parked: t.parked(now, SORT_IDLE_AFTER),
                 preview: t.preview(),
                 started_ago: now.duration_since(t.started),
+                quiet_ago: t.finished.is_none().then(|| t.quiet_for(now)),
+                finished_ago: t.finished.map(|f| now.duration_since(f)),
             })
             .collect();
         self.events.push(Event::Tasks(views));

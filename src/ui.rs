@@ -2,6 +2,7 @@
 //! buffered and written only when they differ from the previous frame.
 
 use std::io::{self, Stdout, Write};
+use std::time::Duration;
 
 use crossterm::{
     cursor::{Hide, MoveTo, Show},
@@ -287,6 +288,22 @@ fn attached_title(v: &TaskView) -> String {
     }
 }
 
+/// The time column's age: the task's last meaningful edge, not always launch.
+/// Finished rows count from exit, parked rows from their last output, running
+/// rows from launch. Quiet age keys off `parked` (the 10 s placement window),
+/// not `Lifecycle::Idle` (the 600 ms glyph edge): a `top`-cadence task flaps
+/// the glyph on every refresh and would flap the column with it. A `None` edge
+/// means the frame came from a daemon that predates the field; it falls back
+/// to launch age, exactly the old column.
+fn row_age(v: &TaskView) -> Duration {
+    let edge = match (v.lifecycle, v.parked) {
+        (Lifecycle::Ok | Lifecycle::Failed, _) => v.finished_ago,
+        (_, true) => v.quiet_ago,
+        (_, false) => None,
+    };
+    edge.unwrap_or(v.started_ago)
+}
+
 fn task_row(v: &TaskView, cols: usize) -> String {
     let glyph = match v.lifecycle {
         Lifecycle::Active => "✻",
@@ -295,7 +312,7 @@ fn task_row(v: &TaskView, cols: usize) -> String {
         Lifecycle::Failed => "✗",
     };
     let tag = if v.tagged { "◆" } else { " " };
-    let time = rel_time(v.started_ago);
+    let time = rel_time(row_age(v));
     let title_w = 26.min(cols / 3);
     let title = truncate(display_label(v), title_w);
 
@@ -665,8 +682,55 @@ mod tests {
             group: None,
             name: name.map(str::to_string),
             lifecycle: Lifecycle::Active,
+            parked: false,
             preview: String::new(),
             started_ago: std::time::Duration::from_secs(5),
+            quiet_ago: None,
+            finished_ago: None,
+        }
+    }
+
+    /// `view()` with the time-column inputs set; launched 2 h ago so the
+    /// launch-age fallback ("2h") cannot collide with an edge age.
+    fn timed_view(
+        lifecycle: Lifecycle,
+        parked: bool,
+        quiet_ago: Option<Duration>,
+        finished_ago: Option<Duration>,
+    ) -> TaskView {
+        TaskView {
+            lifecycle,
+            parked,
+            quiet_ago,
+            finished_ago,
+            started_ago: Duration::from_secs(2 * 60 * 60),
+            ..view(None)
+        }
+    }
+
+    /// The time column follows the debounced state: exit age once finished,
+    /// quiet age while parked, launch age otherwise -- even when the glyph's
+    /// instantaneous `Idle` disagrees. A `None` edge (old-daemon frame) falls
+    /// back to launch age.
+    #[test]
+    fn task_row_time_column_follows_the_debounced_state() {
+        let quiet = Some(Duration::from_secs(4 * 60)); // renders "4m"
+        let exited = Some(Duration::from_secs(3)); // renders "3s"
+        let cases = [
+            (Lifecycle::Ok, false, None, exited, "3s"),
+            (Lifecycle::Failed, false, None, exited, "3s"),
+            (Lifecycle::Idle, true, quiet, None, "4m"),
+            (Lifecycle::Idle, true, None, None, "2h"), // old daemon: no quiet edge
+            (Lifecycle::Idle, false, quiet, None, "2h"), // glyph idles; placement has not
+            (Lifecycle::Active, false, None, None, "2h"),
+            (Lifecycle::Ok, false, None, None, "2h"), // old daemon: no exit edge
+        ];
+        for (lifecycle, parked, quiet_ago, finished_ago, want) in cases {
+            let row = task_row(&timed_view(lifecycle, parked, quiet_ago, finished_ago), 80);
+            assert!(
+                row.ends_with(want),
+                "{lifecycle:?} parked={parked} wanted {want:?}: {row:?}"
+            );
         }
     }
 

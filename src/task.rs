@@ -541,16 +541,28 @@ impl Task {
                 Lifecycle::Failed
             };
         }
-        let idle = self
-            .last_activity
-            .lock()
-            .map(|t| now.duration_since(*t) > idle_after)
-            .unwrap_or(false);
-        if idle {
+        if self.quiet_for(now) > idle_after {
             Lifecycle::Idle
         } else {
             Lifecycle::Active
         }
+    }
+
+    /// Time since the reader thread last saw PTY output. Zero when the
+    /// activity lock is poisoned, so a task whose reader died mid-update
+    /// reads as just-active, never as stuck-idle.
+    pub fn quiet_for(&self, now: Instant) -> Duration {
+        self.last_activity
+            .lock()
+            .map(|t| now.duration_since(*t))
+            .unwrap_or(Duration::ZERO)
+    }
+
+    /// Idle for *placement*: live and quiet past `window`. The same signal
+    /// `lifecycle` reads, under the caller's (much longer) window; a finished
+    /// task is never parked because its exit state already places it.
+    pub fn parked(&self, now: Instant, window: Duration) -> bool {
+        self.finished.is_none() && self.quiet_for(now) > window
     }
 
     /// Flush an expired `?2026` synchronized update so a stalled child's
@@ -867,6 +879,38 @@ mod tests {
             t.lifecycle(Instant::now(), Duration::from_millis(600)),
             Lifecycle::Failed
         );
+        t.terminate();
+    }
+
+    /// Parked reads the same quiet signal as `lifecycle` under its own
+    /// window: 1 s of quiet is past a 600 ms glyph edge but inside a 10 s
+    /// placement window; 11 s crosses both.
+    #[test]
+    fn parked_uses_its_own_window_over_the_idle_signal() {
+        let mut t = spawn(5, "sleep 5");
+        // `sleep` writes nothing, so `last_activity` keeps its spawn value
+        // and the injected `now`s measure against a fixed instant.
+        let quiet_since = *t.last_activity.lock().unwrap();
+        let now = quiet_since + Duration::from_secs(1);
+        assert_eq!(
+            t.lifecycle(now, Duration::from_millis(600)),
+            Lifecycle::Idle
+        );
+        assert!(!t.parked(now, Duration::from_secs(10)));
+        assert!(t.parked(
+            quiet_since + Duration::from_secs(11),
+            Duration::from_secs(10)
+        ));
+        t.terminate();
+    }
+
+    /// A finished task is never parked, no matter how long it has been quiet.
+    #[test]
+    fn finished_tasks_are_never_parked() {
+        let mut t = spawn(6, "exit 0");
+        wait_finished(&mut t);
+        let now = *t.last_activity.lock().unwrap() + Duration::from_secs(11);
+        assert!(!t.parked(now, Duration::from_secs(10)));
         t.terminate();
     }
 
