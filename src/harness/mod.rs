@@ -21,7 +21,7 @@ mod grok;
 
 use std::{
     ffi::OsString,
-    fs::File,
+    fs::{self, File},
     io::Read,
     path::{Path, PathBuf},
     time::{Duration, SystemTime},
@@ -50,6 +50,16 @@ pub trait Harness: Sync {
 
     /// The tool's directory name under the launched process's `$HOME`.
     fn home_dot_dir(&self) -> &'static str;
+
+    /// Resolve the tool's home root. `home` follows the `instrument` contract:
+    /// falling back to this process's home happens only when the launch
+    /// environment supplied neither the tool-specific override nor `HOME`.
+    fn home_root(&self, home: Option<&Path>) -> Option<PathBuf> {
+        match home {
+            Some(p) => Some(p.to_path_buf()),
+            None => Some(dirs::home_dir()?.join(self.home_dot_dir())),
+        }
+    }
 
     /// Classify a command. Return `None` for another tool or an unsupported
     /// command shape.
@@ -203,6 +213,23 @@ pub(crate) fn leading_uuid(s: &str) -> Option<&str> {
     }
 }
 
+/// Extract the ID after the last valid resume hint in `text`. Every
+/// occurrence of every `hints` prefix competes when a strict UUID follows it,
+/// and the largest byte offset wins across prefixes.
+pub(crate) fn last_hint(text: &str, hints: &[&str]) -> Option<String> {
+    let mut last: Option<(usize, String)> = None;
+    for hint in hints {
+        for (i, _) in text.match_indices(hint) {
+            if let Some(id) = leading_uuid(&text[i + hint.len()..])
+                && last.as_ref().is_none_or(|(j, _)| i > *j)
+            {
+                last = Some((i, id.to_string()));
+            }
+        }
+    }
+    last.map(|(_, id)| id)
+}
+
 /// Generate a v4 UUID from `/dev/urandom`. A read failure returns `None`, which
 /// lets the caller launch without pinning an ID.
 pub(crate) fn uuid_v4() -> Option<String> {
@@ -224,6 +251,20 @@ pub(crate) fn uuid_v4() -> Option<String> {
     Some(out)
 }
 
+/// Spawn plan for the launch-time ID pin: a bare launch pins a fresh v4 UUID
+/// through `--session-id`, the resume form already targets its conversation,
+/// and a `uuid_v4` failure launches without pinning.
+pub(crate) fn pin_plan(inv: &Invocation) -> SpawnPlan {
+    let mut plan = SpawnPlan::default();
+    if *inv == Invocation::Bare
+        && let Some(id) = uuid_v4()
+    {
+        plan.args_suffix = format!(" --session-id {}", shell_quote(&id));
+        plan.injected_id = Some(id);
+    }
+    plan
+}
+
 /// Whether `a` and `b` differ by at most [`CORRELATE_WINDOW`].
 pub(crate) fn within_window(a: SystemTime, b: SystemTime) -> bool {
     match a.duration_since(b) {
@@ -235,6 +276,35 @@ pub(crate) fn within_window(a: SystemTime, b: SystemTime) -> bool {
 /// Millisecond form of [`within_window`] for UUID-embedded timestamps.
 pub(crate) fn within_window_ms(a: u128, b: u128) -> bool {
     a.abs_diff(b) <= CORRELATE_WINDOW.as_millis()
+}
+
+/// Return the sole `candidate` in `dir` created within [`CORRELATE_WINDOW`]
+/// of `spawned`. `candidate` names an entry or skips it; entries without
+/// creation times cannot be correlated by window and are skipped too. Several
+/// in-window candidates cannot be told apart, and a stray non-uuid candidate
+/// still counts against uniqueness: both return `None`.
+pub(crate) fn unique_in_window(
+    dir: PathBuf,
+    spawned: SystemTime,
+    candidate: impl Fn(&fs::DirEntry) -> Option<String>,
+) -> Option<String> {
+    let mut candidates: Vec<String> = Vec::new();
+    for entry in fs::read_dir(dir).ok()?.flatten() {
+        let Some(name) = candidate(&entry) else {
+            continue;
+        };
+        let Ok(created) = entry.metadata().and_then(|m| m.created()) else {
+            continue;
+        };
+        if !within_window(created, spawned) {
+            continue;
+        }
+        candidates.push(name);
+    }
+    match candidates.as_slice() {
+        [only] if is_uuid(only) => Some(only.clone()),
+        _ => None,
+    }
 }
 
 /// Single-quote `s` for `$SHELL -c`, encoding embedded `'` as `'\''`.

@@ -4,11 +4,11 @@
 //! filesystem fallback correlates
 //! `<claude-home>/projects/<cwd-slug>/<uuid>.jsonl` transcripts.
 
-use std::{fs, path::Path, time::SystemTime};
+use std::{path::Path, time::SystemTime};
 
 use super::{
-    CAPTURE_ENV, CapturePaths, Harness, Invocation, SpawnPlan, detect_shape, is_uuid, leading_uuid,
-    resume_shape, shell_quote, uuid_v4, within_window,
+    CAPTURE_ENV, CapturePaths, Harness, Invocation, SpawnPlan, detect_shape, is_uuid, last_hint,
+    pin_plan, resume_shape, shell_quote, unique_in_window,
 };
 
 pub struct Claude;
@@ -33,27 +33,15 @@ impl Harness for Claude {
         // The settings overlay does not depend on the Claude home path.
         _home: Option<&Path>,
     ) -> SpawnPlan {
-        let mut suffix = String::new();
-        let mut injected_id = None;
-        // The resume form already targets its conversation; only a bare
-        // launch pins a fresh ID.
-        if *inv == Invocation::Bare
-            && let Some(id) = uuid_v4()
-        {
-            suffix.push_str(" --session-id ");
-            suffix.push_str(&shell_quote(&id));
-            injected_id = Some(id);
-        }
-        suffix.push_str(" --settings ");
-        suffix.push_str(&shell_quote(&capture.claude_settings.to_string_lossy()));
-        SpawnPlan {
-            args_suffix: suffix,
-            env: vec![(
-                CAPTURE_ENV.into(),
-                capture.capture_file.clone().into_os_string(),
-            )],
-            injected_id,
-        }
+        let mut plan = pin_plan(inv);
+        plan.args_suffix.push_str(" --settings ");
+        plan.args_suffix
+            .push_str(&shell_quote(&capture.claude_settings.to_string_lossy()));
+        plan.env = vec![(
+            CAPTURE_ENV.into(),
+            capture.capture_file.clone().into_os_string(),
+        )];
+        plan
     }
 
     fn parse_capture(&self, payload: &str) -> Option<String> {
@@ -64,47 +52,19 @@ impl Harness for Claude {
 
     fn scrape_exit(&self, text: &str) -> Option<String> {
         // The last valid hint names the conversation at exit.
-        const HINT: &str = "claude --resume ";
-        let mut last = None;
-        for (i, _) in text.match_indices(HINT) {
-            if let Some(id) = leading_uuid(&text[i + HINT.len()..]) {
-                last = Some(id.to_string());
-            }
-        }
-        last
+        last_hint(text, &["claude --resume "])
     }
 
     fn correlate_fs(&self, cwd: &Path, spawned: SystemTime, home: Option<&Path>) -> Option<String> {
-        // Fall back to this process's home only when the launch environment
-        // supplied neither the tool-specific override nor HOME.
-        let root = match home {
-            Some(p) => p.to_path_buf(),
-            None => dirs::home_dir()?.join(".claude"),
-        };
-        let dir = root.join("projects").join(slug(cwd)?);
-        let mut candidates: Vec<String> = Vec::new();
-        for entry in fs::read_dir(dir).ok()?.flatten() {
+        let dir = self.home_root(home)?.join("projects").join(slug(cwd)?);
+        unique_in_window(dir, spawned, |entry| {
+            // A transcript's stem is its session ID.
             let path = entry.path();
             if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
-                continue;
+                return None;
             }
-            // Entries without creation times cannot be correlated by window.
-            let Ok(created) = entry.metadata().and_then(|m| m.created()) else {
-                continue;
-            };
-            if !within_window(created, spawned) {
-                continue;
-            }
-            if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
-                candidates.push(stem.to_string());
-            }
-        }
-        // Several in-window transcripts cannot be told apart; a stray
-        // non-uuid stem still counts against uniqueness.
-        match candidates.as_slice() {
-            [only] if is_uuid(only) => Some(only.clone()),
-            _ => None,
-        }
+            Some(path.file_stem()?.to_str()?.to_string())
+        })
     }
 
     fn resume_command(&self, cmd: &str, id: &str) -> String {
@@ -126,7 +86,7 @@ fn slug(cwd: &Path) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
+    use std::{fs, path::PathBuf};
 
     use super::*;
     use crate::emulator::Emulator;

@@ -14,7 +14,7 @@ use std::{
 
 use super::{
     CAPTURE_ENV, CapturePaths, Harness, Invocation, NOTIFY_CHAIN_ENV, SpawnPlan, detect_shape,
-    is_uuid, leading_uuid, resume_shape, shell_quote, within_window_ms,
+    is_uuid, last_hint, leading_uuid, resume_shape, shell_quote, within_window_ms,
 };
 
 pub struct Codex;
@@ -80,10 +80,8 @@ impl Harness for Codex {
         let mut last = None;
         for line in text.lines() {
             // Plain hint: `... run codex resume <uuid>`.
-            for (i, _) in line.match_indices("codex resume ") {
-                if let Some(id) = leading_uuid(&line[i + "codex resume ".len()..]) {
-                    last = Some(id.to_string());
-                }
+            if let Some(id) = last_hint(line, &["codex resume "]) {
+                last = Some(id);
             }
             // Named-thread hint: `codex resume, then select <name> (<uuid>)`.
             // Only the parenthesized ID is trusted, never the name.
@@ -102,12 +100,7 @@ impl Harness for Codex {
     }
 
     fn correlate_fs(&self, cwd: &Path, spawned: SystemTime, home: Option<&Path>) -> Option<String> {
-        // Fall back to this process's home only when the launch environment
-        // supplied neither the tool-specific override nor HOME.
-        let root = match home {
-            Some(p) => p.to_path_buf(),
-            None => dirs::home_dir()?.join(".codex"),
-        };
+        let root = self.home_root(home)?;
         let spawn_ms = spawned
             .duration_since(SystemTime::UNIX_EPOCH)
             .ok()?
@@ -183,12 +176,8 @@ enum NotifyRoute {
 /// deliberately line-based rather than TOML-aware, two `notify` lines in one
 /// file are ambiguous and produce [`NotifyRoute::Opaque`].
 fn config_notify_route(home: Option<&Path>) -> NotifyRoute {
-    let root = match home {
-        Some(p) => p.to_path_buf(),
-        None => match dirs::home_dir() {
-            Some(h) => h.join(".codex"),
-            None => return NotifyRoute::Vacant,
-        },
+    let Some(root) = Codex.home_root(home) else {
+        return NotifyRoute::Vacant;
     };
     let config_text = fs::read_to_string(root.join("config.toml")).unwrap_or_default();
     let profile_text = config_profile(&config_text)

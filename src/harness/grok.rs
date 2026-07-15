@@ -3,11 +3,11 @@
 //! `grok --resume <uuid>` in terminal output. The filesystem fallback
 //! correlates `<grok-home>/sessions/<encoded-cwd>/<uuid>/` directories.
 
-use std::{fs, path::Path, time::SystemTime};
+use std::{path::Path, time::SystemTime};
 
 use super::{
-    CapturePaths, Harness, Invocation, SpawnPlan, detect_shape, is_uuid, leading_uuid,
-    resume_shape, shell_quote, uuid_v4, within_window,
+    CapturePaths, Harness, Invocation, SpawnPlan, detect_shape, last_hint, pin_plan, resume_shape,
+    unique_in_window,
 };
 
 pub struct Grok;
@@ -32,16 +32,7 @@ impl Harness for Grok {
         _capture: &CapturePaths,
         _home: Option<&Path>,
     ) -> SpawnPlan {
-        let mut plan = SpawnPlan::default();
-        // The resume form already targets its conversation; only a bare
-        // launch pins a fresh ID.
-        if *inv == Invocation::Bare
-            && let Some(id) = uuid_v4()
-        {
-            plan.args_suffix = format!(" --session-id {}", shell_quote(&id));
-            plan.injected_id = Some(id);
-        }
-        plan
+        pin_plan(inv)
     }
 
     /// Grok has no injected live capture channel.
@@ -51,51 +42,22 @@ impl Harness for Grok {
 
     fn scrape_exit(&self, text: &str) -> Option<String> {
         // The last valid short or long resume hint names the conversation.
-        let mut last: Option<(usize, String)> = None;
-        for hint in ["grok -r ", "grok --resume "] {
-            for (i, _) in text.match_indices(hint) {
-                if let Some(id) = leading_uuid(&text[i + hint.len()..])
-                    && last.as_ref().is_none_or(|(j, _)| i > *j)
-                {
-                    last = Some((i, id.to_string()));
-                }
-            }
-        }
-        last.map(|(_, id)| id)
+        last_hint(text, &["grok -r ", "grok --resume "])
     }
 
     fn correlate_fs(&self, cwd: &Path, spawned: SystemTime, home: Option<&Path>) -> Option<String> {
-        // Fall back to this process's home only when the launch environment
-        // supplied neither the tool-specific override nor HOME.
-        let root = match home {
-            Some(p) => p.to_path_buf(),
-            None => dirs::home_dir()?.join(".grok"),
-        };
-        let dir = root.join("sessions").join(encode_cwd(cwd)?);
-        let mut candidates: Vec<String> = Vec::new();
-        for entry in fs::read_dir(dir).ok()?.flatten() {
+        let dir = self
+            .home_root(home)?
+            .join("sessions")
+            .join(encode_cwd(cwd)?);
+        unique_in_window(dir, spawned, |entry| {
             // One directory per session, named by its uuid. Files such as
             // the `prompt_history.jsonl` sibling are not sessions.
             if !entry.file_type().is_ok_and(|t| t.is_dir()) {
-                continue;
+                return None;
             }
-            // Entries without creation times cannot be correlated by window.
-            let Ok(created) = entry.metadata().and_then(|m| m.created()) else {
-                continue;
-            };
-            if !within_window(created, spawned) {
-                continue;
-            }
-            if let Some(name) = entry.file_name().to_str() {
-                candidates.push(name.to_string());
-            }
-        }
-        // Several in-window sessions cannot be told apart; a stray non-uuid
-        // directory still counts against uniqueness.
-        match candidates.as_slice() {
-            [only] if is_uuid(only) => Some(only.clone()),
-            _ => None,
-        }
+            Some(entry.file_name().to_str()?.to_string())
+        })
     }
 
     fn resume_command(&self, cmd: &str, id: &str) -> String {
@@ -121,8 +83,9 @@ fn encode_cwd(cwd: &Path) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
+    use std::{fs, path::PathBuf};
 
+    use super::super::is_uuid;
     use super::*;
     use crate::emulator::Emulator;
 
