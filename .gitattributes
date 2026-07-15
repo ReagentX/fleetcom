@@ -1,0 +1,2 @@
+# Raw PTY captures: exact bytes, never text-diffed or whitespace-checked.
+tests/corpus/*.bin binary
