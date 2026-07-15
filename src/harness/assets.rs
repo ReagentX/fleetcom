@@ -14,8 +14,9 @@
 //!   argument verbatim (no trailing newline) over `$FLEETCOM_CAPTURE_FILE`,
 //!   skipping the write when the variable is unset or empty. When
 //!   `$FLEETCOM_NOTIFY_CHAIN` is non-empty the script then execs that
-//!   newline-joined argv with the payload appended, handing the displaced
-//!   notifier exactly what `codex` would have passed it; otherwise exit 0.
+//!   newline-joined argv with the payload appended, so the displaced notifier
+//!   receives the same final argument `codex` would have passed; otherwise
+//!   exit 0.
 
 use std::{
     fs, io,
@@ -93,10 +94,9 @@ impl CaptureAssets {
     /// file uses mode `0600`; the directly executed notify script uses `0700`.
     ///
     /// The supervisor calls this at most once per root per daemon lifetime,
-    /// before allocating capture paths for it. Removing existing capture
-    /// files prevents reused task IDs from reading payloads left by another
-    /// daemon process. The cleanup is valid only on the first install, when
-    /// existing capture files belong to a stopped daemon.
+    /// before allocating capture paths for that root. The initial cleanup
+    /// prevents reused task IDs from reading pre-existing payloads without
+    /// removing files allocated by this instance.
     pub fn install(root: &Path) -> io::Result<CaptureAssets> {
         fs::DirBuilder::new()
             .recursive(true)

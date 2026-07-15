@@ -38,10 +38,9 @@ const BLOCKLIST: &[&str] = &[
     "worktree",
 ];
 
-/// Top-level `grok` flag grammar, enumerated from `grok --help`. The id flags
-/// (`--resume`/`-r`, `--session-id`/`-s`, `--continue`/`-c`, `--fork-session`)
-/// are listed for completeness but intercepted in `detect` before this table
-/// is consulted. An unmodeled flag makes the command opaque.
+/// Top-level `grok` flags grouped by value consumption. `detect` handles
+/// session-selection flags before consulting this table. Any unlisted flag
+/// makes the command opaque.
 const FLAGS: FlagTable = FlagTable {
     value: &[
         "--agent",
@@ -138,8 +137,8 @@ impl Harness for Grok {
                 i += 1;
                 continue;
             }
-            // Id-relevant flags first: they disable launch pinning and may
-            // carry a target uuid.
+            // Session-selection flags disable launch pinning and may carry a
+            // target UUID.
             if t == "--resume" || t == "-r" {
                 // The value is optional: bare `-r` resumes the most recent
                 // session, so the target is known only to grok.
@@ -164,7 +163,7 @@ impl Harness for Grok {
             } else if t == "--continue" || t == "-c" || t == "--fork-session" {
                 can_inject_id = false;
             } else if t == "--session-id" || t == "-s" {
-                // A user-pinned id seeds the known id like a resume does.
+                // A user-pinned ID is also the known resume target.
                 can_inject_id = false;
                 if let Some(next) = words.get(i + 1).map(|w| w.text.as_str())
                     && !next.starts_with('-')
@@ -201,8 +200,7 @@ impl Harness for Grok {
     fn instrument(
         &self,
         inv: &Invocation,
-        // Pinning is the only injection (see `parse_capture`), so neither
-        // the capture paths nor the home root matter at spawn time.
+        // Grok instrumentation does not use capture paths or home config.
         _capture: &CapturePaths,
         _home_override: Option<&Path>,
     ) -> SpawnPlan {
@@ -296,14 +294,12 @@ impl Harness for Grok {
                         continue;
                     }
                     // A non-flag token grok would bind as the target (session
-                    // name or id): the user chose it, so leave the whole
-                    // command unchanged rather than fight it.
+                    // name or id): leave the command unchanged.
                     Some(next) if !next.text.starts_with('-') => {
                         return cmd.to_string();
                     }
-                    // Bare flag (at the end, or before another flag). grok
-                    // rejects a second `--resume`, so hand the value to THIS
-                    // flag instead of appending a duplicate.
+                    // A bare flag receives the ID in place so the rewritten
+                    // command contains one resume option.
                     _ => {
                         edits.push((words[i].end, words[i].end, format!(" {}", shell_quote(id))));
                         replaced = true;
@@ -318,8 +314,7 @@ impl Harness for Grok {
                     replaced = true;
                 }
             } else if t == "--session-id" || t == "-s" {
-                // Without `--fork-session`, grok rejects a pinned session ID
-                // alongside `--resume`: dropped.
+                // Remove the pinned session ID before adding a resume target.
                 let start = words[i].start;
                 let end = match words.get(i + 1) {
                     Some(next) if !next.text.starts_with('-') => {
@@ -458,14 +453,13 @@ mod tests {
     /// table skips each known flag's value and refuses an unknown flag.
     #[test]
     fn detect_refuses_unknown_flags_and_skips_value_flags() {
-        // Finding B: `--model`'s value must not become the first positional,
-        // leaving `sessions` unchecked against the blocklist.
+        // `--model` consumes `grok-4`, leaving `sessions` as the subcommand.
         assert!(Grok.detect("grok --model grok-4 sessions list").is_none());
         assert!(Grok.detect("grok --model=grok-4 sessions").is_none());
         // `-p`/`--single` takes a value; its prompt must not shadow anything.
         assert!(Grok.detect("grok -p 'do x'").is_some());
         assert!(Grok.detect("grok --single 'do x'").is_some());
-        // A value flag before an ordinary prompt: still detected.
+        // A value flag before an ordinary prompt remains eligible.
         assert!(Grok.detect("grok --model grok-4 'do x'").is_some());
         // An optional-value flag before another flag does not bind it; the
         // real subcommand then surfaces and is refused.
@@ -533,15 +527,15 @@ mod tests {
         assert_eq!(Grok.scrape_exit(&both).as_deref(), Some(ID));
 
         assert_eq!(Grok.scrape_exit("no hint here"), None);
-        // A hint whose id fails the validator returns nothing.
+        // A hint whose ID fails validation returns nothing.
         assert_eq!(Grok.scrape_exit("grok -r NOT-A-UUID"), None);
-        // A longer hex run is not an id.
+        // A longer hexadecimal run is not an ID.
         assert_eq!(Grok.scrape_exit(&format!("grok -r {ID}ff")), None);
     }
 
     #[test]
     fn resume_command_appends_replaces_and_strips_session_id() {
-        // Fresh command: append, quoting the id.
+        // Fresh command: append a quoted ID.
         assert_eq!(
             Grok.resume_command("grok", ID),
             format!("grok --resume '{ID}'")
@@ -564,7 +558,7 @@ mod tests {
             Grok.resume_command(&format!("grok --resume={OTHER}"), ID),
             format!("grok --resume={ID}")
         );
-        // A user-pinned session id conflicts with --resume: dropped.
+        // A user-pinned session ID conflicts with --resume and is removed.
         assert_eq!(
             Grok.resume_command(&format!("grok --session-id {OTHER} --debug"), ID),
             format!("grok --debug --resume '{ID}'")
@@ -583,9 +577,8 @@ mod tests {
         assert_eq!(Grok.resume_command("grok", "evil'"), "grok");
     }
 
-    /// A bare `-r`/`--resume` (picker/most-recent form) must gain a value on
-    /// the existing flag: appending a second `--resume` makes grok hard-error
-    /// `the argument '--resume [<SESSION_ID>]' cannot be used multiple times`.
+    /// A bare `-r`/`--resume` receives the ID on the existing flag, keeping
+    /// exactly one resume option in the rewritten command.
     #[test]
     fn resume_command_fills_a_bare_resume_flag_rather_than_duplicating() {
         // Bare flag at the end of the command.
@@ -602,14 +595,13 @@ mod tests {
             Grok.resume_command("grok -r --debug", ID),
             format!("grok -r '{ID}' --debug")
         );
-        // A user-pinned session id conflicts with resume and is dropped; the
-        // bare flag still gets the captured id, no duplicate appended.
+        // The pinned session ID is removed, and the bare resume flag receives
+        // the captured ID.
         assert_eq!(
             Grok.resume_command(&format!("grok -s {OTHER} -r"), ID),
             format!("grok -r '{ID}'")
         );
-        // A non-flag token after bare `-r` is a target grok binds (verified:
-        // `grok -r not-a-uuid` restores session `not-a-uuid`). Leave it.
+        // A non-flag token after `-r` is already its resume target.
         assert_eq!(
             Grok.resume_command("grok -r my-session", ID),
             "grok -r my-session"

@@ -196,7 +196,7 @@ pub struct Task {
     pub group: Option<String>,
     /// Custom display name; `None` means unnamed.
     pub name: Option<String>,
-    /// Harness selected by the supervisor; `None` means no instrumentation.
+    /// Harness selected by the supervisor for session capture.
     pub harness: Option<&'static dyn crate::harness::Harness>,
     /// Session ID injected or recognized at spawn. Capture files and exit
     /// scrapes can supersede it.

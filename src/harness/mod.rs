@@ -1,15 +1,15 @@
-//! Saving an agent command is insufficient because relaunching it can start
-//! another conversation. A harness detects supported commands, instruments
-//! execution to capture an ID, and emits a command that resumes that ID.
+//! Saving an agent command is not enough: relaunching it can start another
+//! conversation. A harness detects supported commands, instruments execution
+//! to capture an ID, and emits a command that resumes that ID.
 //!
 //! Commands the tokenizer cannot fully account for remain uninstrumented.
 //!
 //! # Security invariant
 //!
 //! Every ID returned by `parse_capture`, `scrape_exit`, or `correlate_fs`
-//! eventually enters a shell command. These methods may therefore return only
-//! strings accepted by [`is_uuid`]. Free-text names, paths, and malformed IDs
-//! must yield `None`.
+//! eventually enters a shell command, so these methods may return only strings
+//! accepted by [`is_uuid`]. Free-text names, paths, and malformed IDs must
+//! yield `None`.
 
 pub mod assets;
 mod claude;
@@ -227,9 +227,9 @@ pub(crate) fn tokenize(cmd: &str) -> Option<Vec<Word>> {
             '\'' | '"' => {
                 let rest = &cmd[i + 1..];
                 let close = rest.find(c)?;
-                // The shell still processes `$`, backticks, and backslashes
-                // inside double quotes; a backslash also breaks this naive
-                // close-quote scan (`\"` is not a terminator).
+                // The shell processes `$`, backticks, and backslashes inside
+                // double quotes; a backslash also invalidates this closing-
+                // quote scan (`\"` is not a terminator).
                 if c == '"' && rest[..close].contains(['$', '`', '\\']) {
                     return None;
                 }
@@ -324,10 +324,9 @@ enum FlagKind {
     Unknown,
 }
 
-/// A CLI's top-level flag grammar, split by how each flag consumes a value.
-/// The walk is table-driven so an unmodeled flag refuses (`Opaque`) rather
-/// than let its value shadow a subcommand. A flag added upstream costs capture
-/// until the table learns it — never a broken command.
+/// A CLI's top-level flags, split by how each flag consumes a value. The
+/// table-driven scan returns `Opaque` for an unlisted flag so its possible
+/// value cannot be mistaken for a subcommand. Opaque commands run unchanged.
 pub(crate) struct FlagTable {
     /// Flags taking a required separate value.
     pub(crate) value: &'static [&'static str],
@@ -366,10 +365,8 @@ impl FlagTable {
         }
         // Short flag with a directly attached value (`-mvalue`, `-m=value`).
         // The value may itself contain `=`, so this precedes the split below.
-        // `get(..2)` rather than indexing: a multibyte char straight after the
-        // dash (`-éx`) has no byte-2 boundary, and a recipe command must never
-        // panic the supervisor. No boundary there also means no ASCII short
-        // flag, so falling through to Unknown is the correct reading.
+        // `get(..2)` safely rejects multibyte text immediately after `-`,
+        // where byte 2 is not a character boundary.
         if t.starts_with('-')
             && !t.starts_with("--")
             && t.len() > 2
@@ -555,8 +552,7 @@ mod tests {
             r#"codex "$MODE""#,
             r#"grok "prefix-$VAR""#,
             r#"claude "`id`""#,
-            // A backslashed quote: the naive close-quote scan would split the
-            // word at the escaped `"` and mis-tokenize the tail. Refuse.
+            // An escaped quote invalidates the closing-quote scan.
             r#"claude "say \"hi\"""#,
             r#"claude "a\\b""#,
         ] {

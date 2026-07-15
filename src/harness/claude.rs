@@ -14,10 +14,7 @@ use super::{
     leading_uuid, shell_quote, tokenize, uuid_v4, within_window,
 };
 
-/// Subcommands excluded from session capture, from `claude --help`'s
-/// Commands section (audited 2026-07-15). Entries the CLI has since dropped
-/// stay listed: refusing a one-word prompt that collides with a dead
-/// subcommand costs one capture, while missing a live one breaks the spawn.
+/// Subcommands that do not start or resume an interactive conversation.
 const BLOCKLIST: &[&str] = &[
     "agents",
     "auth",
@@ -37,10 +34,9 @@ const BLOCKLIST: &[&str] = &[
     "upgrade", // alias of update
 ];
 
-/// Top-level `claude` flag grammar, enumerated from `claude --help`. The id
-/// flags (`--resume`/`-r`, `--session-id`, `--continue`/`-c`, `--fork-session`)
-/// are listed for completeness but intercepted in `detect` before this table
-/// is consulted. An unmodeled flag makes the command opaque.
+/// Top-level `claude` flags grouped by value consumption. `detect` handles
+/// session-selection flags before consulting this table. Any unlisted flag
+/// makes the command opaque.
 const FLAGS: FlagTable = FlagTable {
     value: &[
         "--agent",
@@ -155,8 +151,8 @@ impl Harness for Claude {
                 i += 1;
                 continue;
             }
-            // Id-relevant flags first: they disable launch pinning and may
-            // carry a target uuid.
+            // Session-selection flags disable launch pinning and may carry a
+            // target UUID.
             if t == "--resume" || t == "-r" {
                 can_inject_id = false;
                 if let Some(next) = words.get(i + 1).map(|w| w.text.as_str())
@@ -179,7 +175,7 @@ impl Harness for Claude {
             } else if t == "--continue" || t == "-c" || t == "--fork-session" {
                 can_inject_id = false;
             } else if t == "--session-id" {
-                // A user-pinned id seeds the known id like a resume does.
+                // A user-pinned ID is also the known resume target.
                 can_inject_id = false;
                 if let Some(next) = words.get(i + 1).map(|w| w.text.as_str())
                     && !next.starts_with('-')
@@ -214,8 +210,7 @@ impl Harness for Claude {
         &self,
         inv: &Invocation,
         capture: &CapturePaths,
-        // The settings overlay layers additively onto the user's own config,
-        // wherever it lives: no home inspection needed.
+        // The settings overlay does not depend on the Claude home path.
         _home_override: Option<&Path>,
     ) -> SpawnPlan {
         let mut suffix = String::new();
@@ -227,8 +222,8 @@ impl Harness for Claude {
             suffix.push_str(&shell_quote(&id));
             injected_id = Some(id);
         }
-        // Preserve a user-supplied settings source. Launch-time ids, exit
-        // scraping, and filesystem correlation remain available.
+        // A user-supplied settings source disables only the overlay hook.
+        // Launch-time IDs, exit scraping, and filesystem correlation remain.
         let has_settings = inv.tokens[1..]
             .iter()
             .any(|t| t == "--settings" || t.starts_with("--settings="));
@@ -459,12 +454,11 @@ mod tests {
     /// table skips each known flag's value and refuses an unknown flag.
     #[test]
     fn detect_refuses_unknown_flags_and_skips_value_flags() {
-        // Finding B: `--model`'s value must not become the first positional,
-        // leaving `plugin` unchecked against the blocklist.
+        // `--model` consumes `opus`, leaving `plugin` as the subcommand.
         assert!(Claude.detect("claude --model opus plugin list").is_none());
         assert!(Claude.detect("claude --model=opus plugin").is_none());
         assert!(Claude.detect("claude -n myname plugin").is_none());
-        // A value flag before an ordinary prompt: still detected.
+        // A value flag before an ordinary prompt remains eligible.
         assert!(Claude.detect("claude --model opus 'do x'").is_some());
         // A variadic flag consumes its list, then the prompt stands.
         assert!(Claude.detect("claude --add-dir /a /b 'do x'").is_some());
@@ -565,15 +559,15 @@ mod tests {
         assert_eq!(Claude.scrape_exit(&text).as_deref(), Some(ID));
 
         assert_eq!(Claude.scrape_exit("no hint here"), None);
-        // A hint whose id fails the validator returns nothing.
+        // A hint whose ID fails validation returns nothing.
         assert_eq!(Claude.scrape_exit("claude --resume NOT-A-UUID"), None);
-        // A longer hex run is not an id.
+        // A longer hexadecimal run is not an ID.
         assert_eq!(Claude.scrape_exit(&format!("claude --resume {ID}ff")), None);
     }
 
     #[test]
     fn resume_command_appends_replaces_and_strips_session_id() {
-        // Fresh command: append, quoting the id.
+        // Fresh command: append a quoted ID.
         assert_eq!(
             Claude.resume_command("claude", ID),
             format!("claude --resume '{ID}'")
@@ -592,7 +586,7 @@ mod tests {
             Claude.resume_command(&format!("claude --resume={OTHER}"), ID),
             format!("claude --resume={ID}")
         );
-        // A user-pinned session id conflicts with --resume: dropped.
+        // A user-pinned session ID conflicts with --resume and is removed.
         assert_eq!(
             Claude.resume_command(&format!("claude --session-id {OTHER} -v"), ID),
             format!("claude -v --resume '{ID}'")

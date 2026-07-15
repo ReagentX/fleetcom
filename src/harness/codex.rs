@@ -1,6 +1,6 @@
 //! For eligible `codex` commands, this harness captures IDs through an injected
-//! `notify` override and chains compatible configured notifiers. It also scans
-//! both final resume-hint forms and correlates rollout files under
+//! `notify` override, chains compatible configured notifiers, scans both
+//! resume-hint forms, and correlates rollout files under
 //! `<codex-home>/sessions/YYYY/MM/DD/rollout-<local-ts>-<uuid>.jsonl`.
 
 use std::{
@@ -158,7 +158,7 @@ impl Harness for Codex {
     ) -> SpawnPlan {
         // A notify override in the command tokens is per-invocation intent;
         // never chain over it. Exit scraping and filesystem correlation
-        // remain available without an injected notifier.
+        // still apply without an injected notifier.
         if has_notify_override(&inv.tokens) {
             return SpawnPlan::default();
         }
@@ -208,7 +208,7 @@ impl Harness for Codex {
                 }
             }
             // Named-thread hint: `codex resume, then select <name> (<uuid>)`.
-            // Only the parenthesized id is trusted, never the name.
+            // Only the parenthesized ID is trusted, never the name.
             if line.contains("codex resume") && line.contains("then select") {
                 for (i, _) in line.match_indices('(') {
                     let inner = &line[i + 1..];
@@ -267,7 +267,7 @@ impl Harness for Codex {
                 if !is_uuid(id) {
                     continue;
                 }
-                // Correlate with the v7 id's embedded UTC instant; the
+                // Correlate with the v7 ID's embedded UTC instant; the
                 // filename timestamp is local wall-clock time.
                 let Some(ms) = v7_millis(id) else { continue };
                 if !within_window_ms(u128::from(ms), spawn_ms) {
@@ -296,8 +296,7 @@ impl Harness for Codex {
             return cmd.to_string();
         }
         let si = match TABLE.first_positional(&words, 1) {
-            // Opaque: an unknown flag. detect already refused it, so this is
-            // defensive; leave the command untouched.
+            // An unknown flag leaves the command unchanged.
             Scan::Opaque => return cmd.to_string(),
             // Flags only: the resume subcommand slots in after the program.
             Scan::Exhausted => {
@@ -320,12 +319,12 @@ impl Harness for Codex {
                 out.replace_range(words[ti].start..words[ti].end, id);
                 out
             }
-            // A session name still resolves; the user's target stands.
+            // A named target remains unchanged.
             Scan::Positional(_) => cmd.to_string(),
             // Bare `resume` at the end of the command gains the target.
             Scan::Exhausted if si + 1 == words.len() => format!("{cmd} {}", shell_quote(id)),
-            // Flags after `resume` (e.g. --last) pick their own target;
-            // adding an id would fight them.
+            // Flags after `resume` (for example, `--last`) select their own
+            // target, so no ID is added.
             Scan::Exhausted => cmd.to_string(),
         }
     }
@@ -955,7 +954,7 @@ mod tests {
         let named = format!("To continue this session, run codex resume, then select docs ({ID})");
         assert_eq!(Codex.scrape_exit(&named).as_deref(), Some(ID));
 
-        // Named form without an id yields nothing: a name is not spliceable.
+        // A named form without an ID yields nothing.
         assert_eq!(
             Codex.scrape_exit("run codex resume, then select my-thread"),
             None
@@ -984,7 +983,7 @@ mod tests {
             Codex.resume_command(&format!("codex resume {OTHER} -m gpt-5"), ID),
             format!("codex resume {ID} -m gpt-5")
         );
-        // A named target stands: the user chose it and it still resolves.
+        // Named targets remain unchanged.
         assert_eq!(
             Codex.resume_command("codex resume my-thread", ID),
             "codex resume my-thread"

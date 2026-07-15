@@ -1,6 +1,6 @@
-//! Agent resume crosses the daemon protocol, so supervisor unit tests are not
-//! sufficient. These tests use stub `claude` and `codex` executables to expose
-//! argv while an explicit handshake confines every store to scratch space.
+//! End-to-end agent-resume tests across the daemon protocol. Stub `claude` and
+//! `codex` executables expose argv, and an explicit handshake confines every
+//! store to scratch space.
 
 mod common;
 
