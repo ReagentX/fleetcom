@@ -53,6 +53,8 @@ Configuration remains untouched when `notify` is not a one-line array of basic s
 
 These checks are line-based, not TOML-aware: a `notify` or `profile` key inside a table counts, and two `notify` assignment lines in one file read as ambiguous and skip injection. Exit scraping and store correlation remain available without injection.
 
+Per-turn notification is also the earliest possible signal after an in-TUI `/resume`: at the moment of the switch itself, `codex` records nothing observable outside the process. Verified against live state (2026-07-15, codex 0.144.3): the resumed thread's rollout file keeps its old mtime (the append-open is lazy), `threads.updated_at` in the state database (`state_5.sqlite`) keeps its old value, hooks are trust-gated, and no query interface exists. A save between the switch and the next completed turn therefore stores the plain command by construction — do not re-chase these channels.
+
 The exit scraper recognizes both `codex resume <uuid>` and `codex resume, then select <name> (<uuid>)`. It takes the last valid UUID, never the display name. Filesystem correlation searches `<codex-home>/sessions/YYYY/MM/DD/rollout-<local-ts>-<uuid>.jsonl`. Those directories use local dates, so `fleetcom` probes the UTC date ±2 days. A candidate survives only when the v7 UUID's embedded millisecond timestamp falls inside the correlation window and the rollout's first record contains the task's working directory.
 
 ### `grok`
