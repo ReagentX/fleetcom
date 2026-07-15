@@ -57,8 +57,9 @@ pub enum Command {
     Kill { id: u64 },
     /// Drop a task from the set entirely (used on already-finished tasks).
     Remove { id: u64 },
-    /// Re-run a finished task with the same id, command, cwd, tag, group, and
-    /// name. Running tasks reject this request.
+    /// Re-run a finished task with the same id, cwd, tag, group, and name.
+    /// Captured agent sessions may replace the command with its resume form.
+    /// Running tasks reject this request.
     Restart { id: u64 },
     /// Set the manual "in use" tag.
     Tag { id: u64, on: bool },
@@ -185,7 +186,7 @@ pub struct TaskView {
 
 /// The watched task's screen, in both forms the UI needs: `lines` for the peek
 /// overlay's plain-text box, `formatted` (+cursor) for full attached rendering.
-/// Only ever produced for the single watched task, so carrying both is cheap.
+/// Only the watched task produces this snapshot, bounding the duplicated data.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ScreenView {
     pub id: u64,
@@ -665,9 +666,8 @@ pub fn decode_event(kind: u8, payload: &[u8]) -> Option<Event> {
                     let mut views = Vec::new();
                     for tv in v["tasks"].members() {
                         let lifecycle = lifecycle_from(tv["life"].as_str()?)?;
-                        // A frame from a daemon predating `parked` derives it
-                        // from the idle lifecycle: skew degrades to the
-                        // pre-`parked` signal, never to a dropped frame.
+                        // A missing `parked` field derives placement from the
+                        // lifecycle instead of rejecting the task snapshot.
                         let parked = if tv["parked"].is_null() {
                             lifecycle == Lifecycle::Idle
                         } else {
@@ -685,7 +685,7 @@ pub fn decode_event(kind: u8, payload: &[u8]) -> Option<Event> {
                             parked,
                             preview: tv["preview"].as_str()?.to_string(),
                             started_ago: Duration::from_millis(tv["started_ms"].as_u64()?),
-                            // Absent from pre-`parked` daemons: unknown, not zero.
+                            // Missing age fields mean the edge time is unknown.
                             quiet_ago: opt_ms(&tv["quiet_ms"])?,
                             finished_ago: opt_ms(&tv["finished_ms"])?,
                         });
@@ -1198,10 +1198,8 @@ mod tests {
         assert_eq!(decode_event(k, &p), Some(tasks));
     }
 
-    /// A frame from a daemon predating `parked` still decodes: `parked`
-    /// falls back to the idle lifecycle and both ages read as unknown, so
-    /// skew degrades to the pre-`parked` signal instead of dropping the
-    /// frame.
+    /// Missing placement and age fields decode with lifecycle-derived
+    /// placement and unknown ages.
     #[test]
     fn tasks_frame_without_parked_keys_decodes_with_defaults() {
         let old = r#"{"t":"tasks","tasks":[{"id":1,"command":"x","cwd":"Lw==","tagged":false,"life":"idle","preview":"","started_ms":0},{"id":2,"command":"y","cwd":"Lw==","tagged":false,"life":"active","preview":"","started_ms":0}]}"#;
@@ -1233,7 +1231,7 @@ mod tests {
     }
 
     /// The `Screen` event keeps its formatted bytes intact through the raw tail,
-    /// including non-UTF-8 bytes (0xFF) an ANSI stream really contains.
+    /// including non-UTF-8 bytes (0xFF) that an ANSI stream may contain.
     #[test]
     fn screen_round_trips_raw_bytes() {
         let screen = Event::Screen(ScreenView {

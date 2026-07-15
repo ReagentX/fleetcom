@@ -55,7 +55,7 @@ The `∙` glyph flips after ≈600 ms of quiet; the Idle *section* in the by-sta
 
 #### Attach and background
 
-While attached, `Ctrl-\` returns to the dashboard. Every other key, including `Ctrl-C`, `Ctrl-Z`, and `Ctrl-D`, is forwarded to the child. `Ctrl-\` refers to the physical chord; the input handler accepts both `Ctrl-\` and the `Ctrl-4` representation produced by crossterm's legacy decoder.
+While attached, `Ctrl-\` returns to the dashboard. Every other key, including `Ctrl-C`, `Ctrl-Z`, and `Ctrl-D`, is forwarded to the child. `Ctrl-\` refers to the physical chord; the input handler accepts both `Ctrl-\` and crossterm's `Ctrl-4` representation of that chord.
 
 #### Shift+Enter, paste, and the wheel
 

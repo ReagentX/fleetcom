@@ -42,8 +42,7 @@ pub struct WriteRefused {
     pub len: usize,
 }
 
-/// Map a dependency error (portable-pty returns `anyhow`) into `io::Error` so
-/// the whole crate speaks stdlib `io::Result` and never grows an `anyhow` dep.
+/// Convert portable-pty's error into the crate's `io::Error` result type.
 fn io_err(e: impl std::fmt::Display) -> io::Error {
     io::Error::other(e.to_string())
 }
@@ -54,10 +53,9 @@ fn io_err(e: impl std::fmt::Display) -> io::Error {
 const PASTE_END: &[u8] = b"\x1b[201~";
 
 /// Encode a clipboard paste for a child whose DECSET 2004 state is
-/// `bracketed`. Opted in: wrap in `200~`/`201~` markers with embedded
-/// terminators stripped, content otherwise verbatim. Legacy: no markers, and
-/// line endings (`\r\n` and bare `\n`) become `\r` (the byte Enter sends),
-/// because a legacy line editor reads `\n` as ^J, not as end-of-line.
+/// `bracketed`. Bracketed mode wraps content in `200~`/`201~` markers after
+/// stripping embedded terminators. Unbracketed mode emits no markers and
+/// converts `\r\n` and bare `\n` to `\r`, the byte sent by Enter.
 fn paste_bytes(bracketed: bool, content: &[u8]) -> Vec<u8> {
     if bracketed {
         let mut out = Vec::with_capacity(content.len() + 2 * PASTE_END.len() + 6);
@@ -313,12 +311,8 @@ impl Task {
             })
             .map_err(io_err)?;
 
-        // The launch context's shell, not the daemon's: a zsh client attached
-        // to a bash-started daemon still gets zsh word-splitting. No fallback
-        // through this process's own SHELL: for an autostarted daemon that is
-        // the *first* client's env, the exact coupling per-connection context
-        // exists to remove. A client env without SHELL gets the portable
-        // default.
+        // Use the launch context's shell without inheriting the daemon's
+        // `SHELL`. A context without `SHELL` uses the portable default.
         let shell = env_get(env, "SHELL")
             .map(OsString::from)
             .unwrap_or_else(|| "/bin/sh".into());
@@ -327,18 +321,16 @@ impl Task {
         // shell functions are not loaded.
         cmd.arg("-c");
         cmd.arg(exec_command);
-        // The job runs under the *client's* environment, verbatim: clear the
-        // builder's captured base (the daemon's own env, whatever the client
-        // that first autostarted it happened to have) so nothing leaks through
-        // where the client's env lacks a key.
+        // Clear the builder's inherited environment before installing the
+        // launch context so daemon-only variables cannot reach the job.
         cmd.env_clear();
         for (k, v) in env {
             cmd.env(k, v);
         }
         // Force a TERM the emulator understands, so color/interactivity are on.
         cmd.env("TERM", "xterm-256color");
-        // Override the inherited (stale) PWD so the shell's logical cwd matches
-        // where we actually put it. Otherwise prompts and `pwd` lie.
+        // Set `PWD` to the requested cwd so the shell's logical and physical
+        // working directories agree.
         cmd.env("PWD", cwd.as_os_str());
         cmd.cwd(cwd);
 
@@ -590,8 +582,8 @@ impl Task {
             .to_string()
     }
 
-    /// Full screen as ANSI bytes for attached mode, plus cursor state so we can
-    /// place the real cursor where the child put it.
+    /// Full screen as ANSI bytes for attached mode, plus the child's cursor
+    /// state.
     pub fn formatted(&self) -> (Vec<u8>, (u16, u16), bool) {
         grid(&self.parser).formatted()
     }
@@ -1081,7 +1073,7 @@ mod tests {
         );
     }
 
-    /// Legacy paste converts both `\r\n` and bare `\n` to the `\r` Enter sends,
+    /// Unbracketed paste converts `\r\n` and bare `\n` to the `\r` Enter sends,
     /// without doubling a CRLF into two returns.
     #[test]
     fn legacy_paste_converts_line_endings() {

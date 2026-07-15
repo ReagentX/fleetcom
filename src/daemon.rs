@@ -147,9 +147,7 @@ fn is_timeout(e: &io::Error) -> bool {
 }
 
 /// Map a failed hello-reply read to an actionable error. EOF means the daemon
-/// went away mid-handshake (a racing `--kill` or shutdown): rerunning
-/// autostarts a fresh one, so say that, not "kill and retry", which would be
-/// advice to destroy a fleet the next paragraph says no longer exists.
+/// exited during the handshake, so rerunning can autostart its replacement.
 fn hello_read_error(e: io::Error) -> io::Error {
     if e.kind() == ErrorKind::UnexpectedEof {
         io::Error::new(
@@ -411,11 +409,10 @@ pub fn run_daemon() -> io::Result<()> {
     // Each connection supplies its launch context in the hello frame.
     let mut sup = Supervisor::new(24, 80);
 
-    // A signalled daemon shuts down *cleanly*: TERM each job's group with a
-    // KILL after the grace, remove the socket. Dying without that cleanup
-    // would still kill the fleet (closing the PTY masters hangs up every
-    // job's terminal; see the module docs), but rudely: no TERM, no grace,
-    // and HUP-immune jobs would leak unowned. The flag is checked in the idle
+    // A signalled daemon performs the normal shutdown: TERM each job group,
+    // KILL after the grace, then remove the socket. Exiting without this path
+    // closes the PTYs without a TERM grace and can leave HUP-immune jobs
+    // unowned. The flag is checked in the idle
     // branch below and inside `run_loop` while a client is being served; both
     // observe it within ~200 ms.
     let term = Arc::new(AtomicBool::new(false));
@@ -453,9 +450,8 @@ pub fn run_daemon() -> io::Result<()> {
                 thread::sleep(IDLE_REAP);
             }
             Err(e) => {
-                // Anything else is a fd-level failure worth dying loudly for;
-                // this lands in daemon.log. The fleet dies with the daemon
-                // (drop → group-kill), which beats leaking it silently.
+                // Other fd-level failures terminate the daemon and are logged.
+                // Dropping the supervisor group-kills the fleet.
                 eprintln!("fleetcom: accept failed, shutting down: {e}");
                 break;
             }
@@ -711,7 +707,7 @@ mod tests {
             resolve_runtime_dir(None, Some("/run/user/501".into()), tmp.clone(), 501),
             PathBuf::from("/run/user/501/fleetcom")
         );
-        // An *empty* XDG value is unset in spirit: fall through.
+        // An empty XDG value falls through to the tmp fallback.
         assert_eq!(
             resolve_runtime_dir(None, Some(String::new()), tmp.clone(), 501),
             PathBuf::from("/tmpdir/fleetcom-501")

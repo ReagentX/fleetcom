@@ -1,7 +1,7 @@
 //! The fleet's lifetime is bounded by the daemon's: SIGKILLing the daemon
 //! closes every PTY master, and the resulting hangup SIGHUPs each job's
 //! foreground group. Ordinary jobs die; only HUP-immune jobs survive, unowned.
-//! These tests pin both halves so the docs stay honest.
+//! These tests cover both ordinary and HUP-immune jobs.
 
 mod common;
 

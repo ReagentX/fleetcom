@@ -15,8 +15,8 @@ use std::{
     time::{Duration, Instant},
 };
 
-/// The protocol version this test suite speaks; must track
-/// `protocol::PROTOCOL_VERSION` (drift fails the handshake, loudly).
+/// Protocol version spoken by the integration-test client. It must match
+/// `protocol::PROTOCOL_VERSION` for the handshake to succeed.
 pub const PROTOCOL_VERSION: u32 = 8;
 
 /// One frame of the given kind: `[u32 len][kind][payload]`.

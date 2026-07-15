@@ -7,14 +7,14 @@
 //! It is fully event-driven. The loop waits on a single `Wake` channel that both
 //! the command source *and* every task's reader thread feed, so there is no fixed
 //! polling cadence: an idle core sleeps, and an attached keystroke's echo ships
-//! within a frame of the child emitting it. No round-trip stall. Two timers
+//! within a frame of the child emitting it. Two timers
 //! bound the extremes, neither on the interactive path:
 //!
 //! - `FRAME_MIN` caps screen emission under a firehose (a watched `yes`): a burst
 //!   of output coalesces into at most one screen per interval.
 //! - `FALLBACK` is the idle backstop for the *time-based* dashboard state
 //!   (`started_ago`, the Active→Idle edge) that no wake announces, and the ceiling
-//!   on how long a missed wake could stall a repaint. A self-heal, not the norm.
+//!   on how long a missed wake could stall a repaint.
 
 use std::{
     sync::{
@@ -47,7 +47,7 @@ pub enum Wake {
 
 /// The slot the `Supervisor` hands to each `Task` so its reader thread can wake
 /// the core loop on output. `None` between connections (no loop is listening),
-/// so an unattached daemon's task output just accumulates in the parser, free.
+/// so an unattached daemon's task output accumulates without channel traffic.
 pub type Waker = Arc<Mutex<Option<Sender<Wake>>>>;
 
 /// Why the loop returned.
@@ -60,9 +60,8 @@ pub enum LoopExit {
 }
 
 /// Screen-emission ceiling: coalesce a firehose to at most one screen per
-/// interval. 8 ms ⇒ ≤125 fps: under perception, yet a hard cap on the work a
-/// watched `yes` can induce. Interactive echo is sparse, so it never waits the
-/// full interval.
+/// interval. 8 ms limits emission to 125 frames per second and bounds the work
+/// a watched `yes` can induce.
 const FRAME_MIN: Duration = Duration::from_millis(8);
 
 /// Idle backstop: with nothing queued, tick this often anyway so time-based

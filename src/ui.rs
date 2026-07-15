@@ -292,9 +292,8 @@ fn attached_title(v: &TaskView) -> String {
 /// Finished rows count from exit, parked rows from their last output, running
 /// rows from launch. Quiet age keys off `parked` (the 10 s placement window),
 /// not `Lifecycle::Idle` (the 600 ms glyph edge): a `top`-cadence task flaps
-/// the glyph on every refresh and would flap the column with it. A `None` edge
-/// means the frame came from a daemon that predates the field; it falls back
-/// to launch age, exactly the old column.
+/// the glyph on every refresh and would flap the column with it. If the
+/// relevant edge age is absent, the column falls back to launch age.
 fn row_age(v: &TaskView) -> Duration {
     let edge = match (v.lifecycle, v.parked) {
         (Lifecycle::Ok | Lifecycle::Failed, _) => v.finished_ago,
@@ -710,8 +709,8 @@ mod tests {
 
     /// The time column follows the debounced state: exit age once finished,
     /// quiet age while parked, launch age otherwise -- even when the glyph's
-    /// instantaneous `Idle` disagrees. A `None` edge (old-daemon frame) falls
-    /// back to launch age.
+    /// instantaneous `Idle` disagrees. A missing edge age falls back to launch
+    /// age.
     #[test]
     fn task_row_time_column_follows_the_debounced_state() {
         let quiet = Some(Duration::from_secs(4 * 60)); // renders "4m"
@@ -720,10 +719,10 @@ mod tests {
             (Lifecycle::Ok, false, None, exited, "3s"),
             (Lifecycle::Failed, false, None, exited, "3s"),
             (Lifecycle::Idle, true, quiet, None, "4m"),
-            (Lifecycle::Idle, true, None, None, "2h"), // old daemon: no quiet edge
+            (Lifecycle::Idle, true, None, None, "2h"), // missing quiet edge
             (Lifecycle::Idle, false, quiet, None, "2h"), // glyph idles; placement has not
             (Lifecycle::Active, false, None, None, "2h"),
-            (Lifecycle::Ok, false, None, None, "2h"), // old daemon: no exit edge
+            (Lifecycle::Ok, false, None, None, "2h"), // missing exit edge
         ];
         for (lifecycle, parked, quiet_ago, finished_ago, want) in cases {
             let row = task_row(&timed_view(lifecycle, parked, quiet_ago, finished_ago), 80);

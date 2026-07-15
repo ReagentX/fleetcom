@@ -132,7 +132,7 @@ pub struct App {
     pub views: Vec<TaskView>,
     /// The watched task's screen (attach/peek), from `Event::Screen`.
     focused_screen: Option<ScreenView>,
-    /// Last `Watch` target sent to the core, so we don't resend it every tick.
+    /// Last `Watch` target sent to the core, avoiding a resend every tick.
     watched: Option<u64>,
     /// Whether this client talks to a daemon (vs. an in-process `--foreground`
     /// core). Only a daemon client can meaningfully reconnect after a drop.
@@ -529,7 +529,7 @@ impl App {
         self.selected_id = Some(self.views[order[next]].id);
     }
 
-    /// Tell the core which task's screen we need (attach/peek), sending `Watch`
+    /// Tell the core which task's screen is needed (attach/peek), sending `Watch`
     /// only when the target actually changes.
     fn set_watch(&mut self, want: Option<u64>) {
         if want != self.watched {
@@ -1330,7 +1330,7 @@ impl App {
     }
 }
 
-/// Translate supported key events to legacy PTY byte sequences.
+/// Translate supported key events to PTY input byte sequences.
 fn key_to_bytes(code: KeyCode, mods: KeyModifiers) -> Option<Vec<u8>> {
     let ctrl = mods.contains(KeyModifiers::CONTROL);
     let alt = mods.contains(KeyModifiers::ALT);
@@ -1386,7 +1386,7 @@ fn key_to_bytes(code: KeyCode, mods: KeyModifiers) -> Option<Vec<u8>> {
 }
 
 /// Split a typed path into (directory-so-far, trailing fragment). The fragment
-/// is prefix-matched against candidates; the directory is what we list.
+/// is prefix-matched against candidates; the directory is listed.
 fn split_input(input: &str) -> (&str, &str) {
     match input.rfind('/') {
         Some(pos) => (&input[..=pos], &input[pos + 1..]),
@@ -2131,7 +2131,7 @@ mod tests {
             key_to_bytes(KeyCode::Enter, KeyModifiers::ALT),
             Some(b"\x1b\r".to_vec())
         );
-        // Ctrl+Enter has no distinct legacy encoding: plain CR.
+        // Ctrl+Enter has no distinct encoding here: send plain CR.
         assert_eq!(
             key_to_bytes(KeyCode::Enter, KeyModifiers::CONTROL),
             Some(vec![b'\r'])

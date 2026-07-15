@@ -1,8 +1,8 @@
 #![forbid(unsafe_code)]
 
 //! `fleetcom`: a fleet-view supervisor for arbitrary shell commands. Each task is
-//! a command in its own PTY; the dashboard groups them by status, and you can
-//! peek at, attach to, and background any of them.
+//! a command in its own PTY; the dashboard groups tasks by state, directory, or
+//! custom group and supports previewing, attaching to, and backgrounding them.
 
 mod ansi;
 mod app;

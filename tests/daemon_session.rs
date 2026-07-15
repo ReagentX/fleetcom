@@ -1,6 +1,5 @@
 //! Session-recipe dirs resolve against the *loading client's* cwd (from its
-//! hello), not the daemon's own working directory: the daemon's cwd is
-//! whatever the first client's happened to be, frozen for its lifetime.
+//! hello), not the daemon process's fixed working directory.
 
 mod common;
 

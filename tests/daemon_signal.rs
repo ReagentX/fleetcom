@@ -30,7 +30,7 @@ fn sigterm_kills_daemon_and_its_jobs() {
         "job should be alive before SIGTERM"
     );
 
-    // SIGTERM the daemon *while our client is attached*: the flag must
+    // SIGTERM the daemon while the client is attached: the flag must
     // interrupt `run_loop` mid-serve, not just the idle accept loop.
     stop_daemon(&mut daemon);
 

@@ -961,10 +961,9 @@ fn remove_sweeps_stragglers_of_an_exited_leader() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Rerun must give the displaced job the same graceful exit as Remove:
-/// TERM through the graveyard, not the straight SIGKILL a `Drop` delivers.
-/// The old run's HUP-immune straggler dies of the TERM while the fresh run
-/// (same id) is already up.
+/// Rerun gives the displaced job the same graceful exit as Remove. Its
+/// HUP-immune straggler receives TERM through the graveyard while the
+/// replacement with the same ID is already running.
 #[test]
 fn rerun_sweeps_stragglers_of_the_old_run() {
     use nix::sys::signal::kill;
@@ -1086,12 +1085,9 @@ fn shutdown_waits_for_graveyard_grace() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// The defect the group probe fixes: every leader exits at birth after
-/// backgrounding a TERM-refusing child, so the old leader-only predicate
-/// saw nothing to wait for and Drop KILLed the child instantly. Shutdown
-/// must instead hold the full grace while the group probes non-empty;
-/// the child, unreachable by KILL once the probe reaped its leader,
-/// survives to reparent.
+/// Shutdown holds the full grace while an exited leader's process group still
+/// contains a TERM-refusing child. Once the emptiness probe reaps the leader,
+/// the child cannot be KILL-escalated and survives to reparent.
 #[test]
 fn shutdown_holds_the_grace_for_members_of_an_exited_leader() {
     use nix::sys::signal::{Signal, kill};
@@ -1704,8 +1700,8 @@ fn rerun_resumes_the_captured_conversation() {
         reap_until(&mut s, Duration::from_secs(5), |s| s.graveyard.is_empty()),
         "the displaced run was never collected"
     );
-    // The old run's file is unreachable from the fresh run and survives
-    // as bounded litter: install never deletes.
+    // The replacement cannot read the displaced run's capture file. Asset
+    // installation leaves the superseded file in place.
     assert!(
         cap.exists(),
         "rerun must not delete the old run's capture file"
@@ -1738,7 +1734,7 @@ fn rerun_cannot_read_the_old_runs_stale_capture() {
         group: None,
     });
     let id = s.tasks[0].id;
-    // The capture file still holds the pre-drift session.
+    // The capture file still holds the launch-time session ID.
     let stale = format!(
         r#"{{"session_id":"{CAP_OTHER}","hook_event_name":"SessionStart","source":"startup"}}"#
     );

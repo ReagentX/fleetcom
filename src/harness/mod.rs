@@ -329,7 +329,7 @@ pub(crate) mod testutil {
     pub(crate) const OTHER: &str = "11111111-2222-4333-8444-555555555555";
 
     /// Capture-path fixture. The spaced `claude_settings` and `codex_notify`
-    /// paths keep the shell- and TOML-quoting assertions honest.
+    /// paths exercise the shell- and TOML-quoting boundaries.
     pub(crate) fn paths() -> CapturePaths {
         CapturePaths {
             capture_file: PathBuf::from("/tmp/cap/session.json"),
