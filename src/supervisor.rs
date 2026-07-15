@@ -474,9 +474,10 @@ impl Supervisor {
     /// `FLEETCOM_RUNTIME_DIR` is used verbatim; the fallback root includes a
     /// session-root discriminator. Canonical roots are installed and swept
     /// once per daemon lifetime, preserving live capture files on reuse.
-    /// Capture files land in this process's pid namespace under the root, so
-    /// concurrent supervisors sharing a root (a daemon plus `--foreground`
-    /// runs) cannot cross-wire each other's captures.
+    /// Capture files and assets land in this process's pid namespace under
+    /// the root, so concurrent supervisors sharing a root (a daemon plus
+    /// `--foreground` runs) cannot cross-wire each other's captures or
+    /// rewrite each other's assets.
     /// Installation failure disables instrumentation for the spawn.
     fn ensure_capture_assets(&mut self) -> Option<&assets::CaptureAssets> {
         let root = if let Some(ctx) = &self.launch
@@ -2656,8 +2657,11 @@ mod tests {
             "returning to a known root must not re-sweep its live captures"
         );
         assert!(
-            root_b.join("claude-settings.json").is_file(),
-            "the interleaved root must keep its own assets"
+            root_b
+                .join(std::process::id().to_string())
+                .join("claude-settings.json")
+                .is_file(),
+            "the interleaved root must keep its own namespaced assets"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -3254,7 +3258,10 @@ mod tests {
             "codex",
             &format!(
                 "'{script}' '{payload}'",
-                script = runtime.join("codex-notify.sh").display(),
+                script = runtime
+                    .join(std::process::id().to_string())
+                    .join("codex-notify.sh")
+                    .display(),
             ),
         );
         let mut s = Supervisor::new(24, 80);
@@ -3367,7 +3374,10 @@ mod tests {
                  '{script}' '{payload}'",
                 out = dir.display(),
                 chain = NOTIFY_CHAIN_ENV,
-                script = runtime.join("codex-notify.sh").display(),
+                script = runtime
+                    .join(std::process::id().to_string())
+                    .join("codex-notify.sh")
+                    .display(),
             ),
         );
         let mut s = Supervisor::new(24, 80);

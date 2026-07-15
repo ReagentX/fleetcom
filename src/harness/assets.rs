@@ -1,11 +1,15 @@
 //! Hooks and notifiers need files outside the child process. This module
-//! installs those shared assets and allocates one capture path per task run. The
+//! installs those assets and allocates one capture path per task run. The
 //! supervisor installs each root once per daemon lifetime and reuses it.
 //!
-//! Shared assets sit at the root; capture files live under `<root>/<pid>`.
-//! `--foreground` lets several fleetcom processes share one root, and each
-//! allocates task ids from 1, so an unshared namespace per process is the
-//! only thing keeping their `task-<id>-<run>.json` paths apart.
+//! Assets and capture files both live under `<root>/<pid>`. `--foreground`
+//! lets several fleetcom processes share one root, and each allocates task
+//! ids from 1, so an unshared namespace per process is the only thing
+//! keeping their `task-<id>-<run>.json` paths apart. Assets get the same
+//! isolation: a root-level copy would be rewritten by every process's
+//! install, so a concurrent install could expose a truncated script to
+//! another process's in-flight turn, and two fleetcom versions sharing a
+//! root would overwrite each other's implementation.
 //!
 //! Asset contracts:
 //! - `claude`: `--settings <claude-settings.json>` layers a `SessionStart` hook
@@ -95,7 +99,7 @@ fn pid_alive(pid: u32) -> bool {
     kill(Pid::from_raw(pid), None) != Err(Errno::ESRCH)
 }
 
-/// Shared paths in an installed capture-asset tree.
+/// One process's paths in an installed capture-asset tree.
 #[derive(Debug)]
 pub struct CaptureAssets {
     /// This process's capture namespace: `<root>/<pid>`.
@@ -105,13 +109,10 @@ pub struct CaptureAssets {
 }
 
 impl CaptureAssets {
-    /// Create `root` with mode `0700`, write both shared assets, sweep dead
-    /// capture namespaces, and claim `<root>/<pid>` for this process.
-    ///
-    /// Shared assets stay at the root: their content is static per fleetcom
-    /// version, so concurrent installs write identical bytes. They are
-    /// overwritten with the current contents; the settings file uses mode
-    /// `0600`, the directly executed notify script `0700`.
+    /// Create `root` with mode `0700`, sweep dead capture namespaces, claim
+    /// `<root>/<pid>` for this process, and write both assets inside it: the
+    /// settings file with mode `0600`, the directly executed notify script
+    /// `0700`.
     ///
     /// The supervisor calls this at most once per root per daemon lifetime,
     /// before allocating capture paths for that root.
@@ -123,10 +124,11 @@ impl CaptureAssets {
     /// keep-alive and sweep-dead without depending on real pid lifecycles.
     ///
     /// The sweep removes only namespaces whose owning process is dead, plus
-    /// loose legacy `task-*.json` files pre-namespace daemons left at the
-    /// root. A recycled pid makes a stale namespace look alive and defers
-    /// its sweep: bounded litter, never a correctness hazard, because each
-    /// process writes only inside its own namespace.
+    /// litter pre-namespace daemons left at the root: loose `task-*.json`
+    /// files and the root-level asset copies, both regenerated per pid and
+    /// referenced by nothing current. A recycled pid makes a stale namespace
+    /// look alive and defers its sweep: bounded litter, never a correctness
+    /// hazard, because each process writes only inside its own namespace.
     fn install_probed(
         root: &Path,
         pid: u32,
@@ -151,7 +153,10 @@ impl CaptureAssets {
                 {
                     fs::remove_dir_all(entry.path())?;
                 }
-            } else if name.starts_with("task-") && name.ends_with(".json") {
+            } else if (name.starts_with("task-") && name.ends_with(".json"))
+                || name == "claude-settings.json"
+                || name == "codex-notify.sh"
+            {
                 fs::remove_file(entry.path())?;
             }
         }
@@ -159,11 +164,15 @@ impl CaptureAssets {
         let dir = root.join(pid.to_string());
         fs::DirBuilder::new().mode(0o700).create(&dir)?;
 
-        let claude_settings = root.join("claude-settings.json");
+        // The assets live inside the namespace: nothing outside it ever
+        // references these paths, and the namespace outlives every task of
+        // its process by construction — a namespace is swept only when its
+        // owner is dead, and a dead fleetcom's tasks died with it.
+        let claude_settings = dir.join("claude-settings.json");
         fs::write(&claude_settings, claude_settings_json())?;
         fs::set_permissions(&claude_settings, fs::Permissions::from_mode(0o600))?;
 
-        let codex_notify = root.join("codex-notify.sh");
+        let codex_notify = dir.join("codex-notify.sh");
         fs::write(&codex_notify, CODEX_NOTIFY_SCRIPT)?;
         fs::set_permissions(&codex_notify, fs::Permissions::from_mode(0o700))?;
 
@@ -174,12 +183,12 @@ impl CaptureAssets {
         })
     }
 
-    /// Return the per-run capture path and shared asset paths. The file is
-    /// keyed by task *and* run: restart bumps the run, so the fresh run's
-    /// reads cannot reach the old run's file, and a lingering old process
-    /// (graveyard, TERM grace) writes only its own dead path through its
-    /// inherited env. Superseded files persist as bounded litter until an
-    /// `install` finds this namespace's owner dead.
+    /// Return the per-run capture path and this namespace's asset paths. The
+    /// file is keyed by task *and* run: restart bumps the run, so the fresh
+    /// run's reads cannot reach the old run's file, and a lingering old
+    /// process (graveyard, TERM grace) writes only its own dead path through
+    /// its inherited env. Superseded files persist as bounded litter until
+    /// an `install` finds this namespace's owner dead.
     pub fn paths_for(&self, task_id: u64, run: u32) -> CapturePaths {
         CapturePaths {
             capture_file: self.dir.join(format!("task-{task_id}-{run}.json")),
@@ -227,13 +236,21 @@ mod tests {
         let root = base.join("nested");
         let assets = CaptureAssets::install(&root, std::process::id()).unwrap();
 
+        let ns = root.join(std::process::id().to_string());
         assert_eq!(mode(&root), 0o700);
-        assert_eq!(mode(&root.join(std::process::id().to_string())), 0o700);
+        assert_eq!(mode(&ns), 0o700);
+        assert_eq!(assets.claude_settings, ns.join("claude-settings.json"));
+        assert_eq!(assets.codex_notify, ns.join("codex-notify.sh"));
         assert_eq!(mode(&assets.claude_settings), 0o600);
         assert_eq!(mode(&assets.codex_notify), 0o700);
         let _ = fs::remove_dir_all(&base);
     }
 
+    /// Reinstalling with the same pid rebuilds the namespace wholesale: the
+    /// sweep reads a same-pid directory as a dead predecessor's, so the
+    /// second install starts clean and heals corrupted assets and modes.
+    /// The supervisor's once-per-root map keeps live capture files out of
+    /// reach of this path.
     #[test]
     fn install_is_idempotent_and_heals_corrupted_assets() {
         let root = temp("heal");
@@ -258,10 +275,10 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
-    /// The sweep is liveness-honest: dead namespaces and loose legacy root
-    /// files go, a live process's namespace and the shared assets stay, and
-    /// a pre-existing directory named like our own pid reads as a dead
-    /// predecessor's (pid reuse).
+    /// The sweep is liveness-honest: dead namespaces and legacy root litter
+    /// (loose task files, root-level assets) go, a live process's namespace
+    /// stays, and a pre-existing directory named like our own pid reads as
+    /// a dead predecessor's (pid reuse).
     #[test]
     fn install_sweeps_dead_namespaces_and_legacy_files_only() {
         let root = temp("sweep");
@@ -273,6 +290,9 @@ mod tests {
         fs::write(root.join("task-42-7.json"), "{}").unwrap();
         // The legacy pattern also matches names without a run suffix.
         fs::write(root.join("task-9.json"), "{}").unwrap();
+        // Root-level assets are pre-namespace litter; nothing references them.
+        fs::write(root.join("claude-settings.json"), "old").unwrap();
+        fs::write(root.join("codex-notify.sh"), "old").unwrap();
         fs::write(root.join("unrelated.txt"), "x").unwrap();
 
         let assets =
@@ -288,6 +308,10 @@ mod tests {
         );
         assert!(!root.join("task-42-7.json").exists());
         assert!(!root.join("task-9.json").exists());
+        assert!(
+            !root.join("claude-settings.json").exists() && !root.join("codex-notify.sh").exists(),
+            "legacy root-level assets are litter; nothing current reads them"
+        );
         assert!(root.join("unrelated.txt").exists());
         assert!(assets.claude_settings.exists());
         assert!(assets.codex_notify.exists());
@@ -498,8 +522,8 @@ mod tests {
             assets.paths_for(7, 3).capture_file,
             ns.join("task-7-3.json")
         );
-        assert_eq!(paths.claude_settings, assets.claude_settings);
-        assert_eq!(paths.codex_notify, assets.codex_notify);
+        assert_eq!(paths.claude_settings, ns.join("claude-settings.json"));
+        assert_eq!(paths.codex_notify, ns.join("codex-notify.sh"));
         let _ = fs::remove_dir_all(&root);
     }
 }

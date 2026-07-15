@@ -226,8 +226,8 @@ fn save_once(stream: &mut UnixStream, recipe: &Path, name: &str) -> String {
 }
 
 /// Whether the daemon's capture namespace holds a non-empty per-run capture
-/// file. Capture files live under `<runtime>/<pid>/`; only the shared assets
-/// sit at the root, so any numeric namespace here is the daemon's.
+/// file. Capture files and assets live under `<runtime>/<pid>/`; nothing
+/// sits at the root, so any numeric namespace here is the daemon's.
 fn has_capture(runtime: &Path) -> bool {
     std::fs::read_dir(runtime).is_ok_and(|namespaces| {
         namespaces
@@ -283,15 +283,18 @@ fn claude_spawn_save_load_resumes_the_conversation() {
     });
     let id = value_after(&argv, "--session-id").to_string();
     assert_eq!(id.len(), 36, "pinned id must be uuid-shaped: {argv:?}");
-    let settings = s.runtime().join("claude-settings.json");
+    let settings = s
+        .runtime()
+        .join(daemon.0.id().to_string())
+        .join("claude-settings.json");
     assert_eq!(
         value_after(&argv, "--settings"),
         settings.display().to_string(),
-        "the overlay must be the shared asset under the hello's runtime root: {argv:?}"
+        "the overlay must sit in the daemon's pid namespace under the hello's runtime root: {argv:?}"
     );
     assert!(
         settings.is_file(),
-        "the runtime root must hold the installed settings overlay"
+        "the daemon's namespace must hold the installed settings overlay"
     );
 
     // The pinned id rides `resume_id` from spawn: one save suffices.
@@ -342,7 +345,10 @@ fn codex_capture_file_drives_save_and_load_resumes() {
     let argv = wait_run(&rec, 0, |a| a.iter().any(|t| t.starts_with("notify=[")));
     let notify = format!(
         r#"notify=["{}"]"#,
-        s.runtime().join("codex-notify.sh").display()
+        s.runtime()
+            .join(daemon.0.id().to_string())
+            .join("codex-notify.sh")
+            .display()
     );
     assert_eq!(
         value_after(&argv, "-c"),
