@@ -268,8 +268,8 @@ fn connect_or_autostart_in(dir: &Path) -> io::Result<UnixStream> {
     // dir someone else owns (a pre-created `$TMPDIR/fleetcom-$uid` on a shared
     // `/tmp`) harvests every API key without speaking a byte of the protocol.
     // The checks in `spawn_daemon` and `run_daemon` never run on this path: a
-    // successful connect skips both. An attacker-owned dir must fail loudly
-    // here, never fall through to the spawn below.
+    // successful connect skips both. An attacker-owned dir must fail here,
+    // never fall through to the spawn below.
     ensure_runtime_dir(dir)?;
     let path = socket_in(dir);
     if let Ok(s) = UnixStream::connect(&path) {

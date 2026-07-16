@@ -183,10 +183,10 @@ fn main() -> io::Result<()> {
     // Signal routing is pinned between two hard bounds; moving it either way
     // breaks an exit path. Not before `App::connect`: the handshake can queue
     // behind another client, and `connect_ready` documents Ctrl-C as the abort
-    // for that wait — that abort *is* SIGINT's default disposition, so arming
+    // for that wait. That abort *is* SIGINT's default disposition, so arming
     // earlier turns it into a store to a flag nothing polls yet. Not after
     // `enable_raw_mode`: a fatal signal's default disposition terminates
-    // without unwinding, so neither `TerminalGuard` nor the panic hook runs —
+    // without unwinding, so neither `TerminalGuard` nor the panic hook runs.
     // SIGTERM/SIGHUP landing between raw mode and registration would strand
     // the shell in raw mode. The window below is wide: the kitty probe blocks
     // on a tty round-trip before the alternate screen is even entered.

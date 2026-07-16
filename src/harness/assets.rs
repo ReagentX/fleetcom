@@ -140,12 +140,11 @@ impl CaptureAssets {
     }
 }
 
-/// Retire this incarnation's namespace when the owning supervisor releases it.
+/// Remove this incarnation's namespace when the owning supervisor drops it.
 impl Drop for CaptureAssets {
     fn drop(&mut self) {
-        // Best-effort by design: drop runs on shutdown paths, and a cleanup
-        // error must never outrank the shutdown itself, so the result is
-        // discarded. Removing only `self.dir` is deliberate — namespaces
+        // Best-effort: drop runs on shutdown paths, and a cleanup error must
+        // not fail the shutdown itself. Only `self.dir` is removed: namespaces
         // stranded by crashed daemons are an accepted leak, because sweeping
         // the shared root could delete a live sibling daemon's namespace.
         let _ = fs::remove_dir_all(&self.dir);

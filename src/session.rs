@@ -54,7 +54,7 @@ pub fn sessions_dir(root: Option<PathBuf>) -> Option<PathBuf> {
 }
 
 /// Serialize the current schema: `{"name": <original>, "dirs": {...}}`. The
-/// stored name is the collision tiebreaker in `save_in` — sanitize maps
+/// stored name is the collision tiebreaker in `save_in`: sanitize maps
 /// distinct names ("a/b", "a.b") onto one filename, and only the original
 /// distinguishes an overwrite from a clobber.
 fn to_json(name: &str, cfg: &SessionConfig) -> String {
@@ -139,7 +139,7 @@ pub fn save_in(dir: &Path, name: &str, cfg: &SessionConfig) -> io::Result<PathBu
     // Contents are 0600, so filenames are the residual surface: a umask
     // directory on a multi-user host with traversable parents lets anyone
     // enumerate session names and sizes. Create private, and re-tighten a
-    // pre-fix directory on its next save — the same on-touch correction the
+    // pre-fix directory on its next save: the same on-touch correction the
     // rename below applies to 0644 files. Only `dir` itself is corrected:
     // freshly created parents get 0700 from the builder, but an existing
     // config root (`~/.config`) is shared state this crate never `chmod`s.
@@ -158,7 +158,7 @@ pub fn save_in(dir: &Path, name: &str, cfg: &SessionConfig) -> io::Result<PathBu
     // land at a_b.json), so overwriting on stored-name mismatch would destroy
     // one session while reporting success under the other's name. Refuse
     // before any write: a refusal leaves zero side effects. Files without a
-    // stored original — pre-schema saves and torn pre-atomic writes — read as
+    // stored original (pre-schema saves and torn pre-atomic writes) read as
     // the same session; refusing those would lock users out of re-saving
     // under their own stem.
     match fs::read_to_string(&file) {
@@ -179,14 +179,14 @@ pub fn save_in(dir: &Path, name: &str, cfg: &SessionConfig) -> io::Result<PathBu
         Err(e) => return Err(e),
     }
 
-    // Write-temp-then-rename keeps a good copy on disk at every instant:
+    // Write-temp-then-rename keeps a good copy on disk throughout the save:
     // `fs::write` truncates before writing, so a crash mid-save left torn
     // JSON with the prior contents already gone. The temp lives in `dir`
     // itself (rename must not cross filesystems) and ends in `.tmp`, which
     // `list_in`'s `.json` filter never surfaces. Recipes persist full command
     // lines (secrets included), so the temp opens 0600 via `create_new`; the
     // rename carries that mode onto the target, correcting pre-existing 0644
-    // files on their next save — intended.
+    // files on their next save.
     let pid = std::process::id();
     let (mut tmp_file, tmp) = loop {
         let n = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
@@ -205,8 +205,7 @@ pub fn save_in(dir: &Path, name: &str, cfg: &SessionConfig) -> io::Result<PathBu
     let written = (|| {
         tmp_file.write_all(to_json(trimmed, cfg).as_bytes())?;
         // Without the sync, the rename can become durable before the data
-        // blocks do — resurrecting exactly the torn-file window this path
-        // exists to close.
+        // blocks do: exactly the torn-file window this path exists to close.
         tmp_file.sync_all()?;
         fs::rename(&tmp, &file)
     })();
@@ -224,7 +223,7 @@ pub fn load_in(dir: &Path, name: &str) -> io::Result<SessionConfig> {
 
 /// Recipe names under `dir`, sorted. The stored original wins over the file
 /// stem so callers see the name the user typed; legacy files fall back to
-/// their stem, which is already a sanitize fixpoint — either way the returned
+/// their stem, which is already a sanitize fixpoint. Either way the returned
 /// name loads back to the same file.
 pub fn list_in(dir: &Path) -> Vec<String> {
     let mut names = Vec::new();

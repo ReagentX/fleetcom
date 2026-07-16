@@ -1692,7 +1692,7 @@ fn spawn_resuming_claude_injects_only_the_capture_channel() {
 }
 
 /// Rerun prefers the capture-file ID, stores the resulting resume command,
-/// and deletes the displaced run's capture file at graveyard push — after
+/// and deletes the displaced run's capture file at graveyard push, after
 /// the resume command has consumed it.
 #[test]
 fn rerun_resumes_the_captured_conversation() {

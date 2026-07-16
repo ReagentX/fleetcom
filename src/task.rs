@@ -285,8 +285,8 @@ fn forward_probe_replies(tx: &Sender<Vec<u8>>, pending: &AtomicUsize, replies: V
 /// from `pending` whether or not the write succeeded. A write error means
 /// the slave side closed (child gone): writing stops, receiving must not.
 /// `admit_write` caps admission against `pending`, so a byte admitted and
-/// never subtracted inflates the counter for the task's whole life —
-/// breaking out of the loop would strand every message still queued, and a
+/// never subtracted inflates the counter for the task's whole life.
+/// Breaking out of the loop would strand every message still queued, and a
 /// drain-then-break would still leak any message sent between the drain and
 /// the receiver drop. The loop therefore runs until the channel closes
 /// (every sender dropped: the reader thread's clone on EOF, the task's own
