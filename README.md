@@ -14,7 +14,7 @@ See every task’s state and latest output from one dashboard.
 
 ### Quick peek
 
-Press `Space` to quick peek a task's live screen without attaching to it.
+Press `Space` for a quick peek at a task’s live screen without attaching to it.
 
 ![`fleetcom` quick peek](docs/img/quickpeek.png)
 
