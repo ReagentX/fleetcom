@@ -7,7 +7,7 @@ use std::{
     sync::{
         Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
-        mpsc::{Sender, channel},
+        mpsc::{Receiver, Sender, channel},
     },
     thread::{self, JoinHandle},
     time::{Duration, Instant, SystemTime},
@@ -181,7 +181,8 @@ pub struct Task {
     /// admitters: the core thread (`queue_write`, client input) and the reader
     /// thread (`forward_probe_replies`, probe replies of a few bytes each).
     /// A race can exceed the 16 MiB cap by at most one small probe reply. The
-    /// worker subtracts after each completed write.
+    /// worker subtracts every received message, written or not; see
+    /// [`drain_writes`].
     pending_write: Arc<AtomicUsize>,
     /// Session-leader PID, also used as the process-group ID.
     pid: Option<u32>,
@@ -277,6 +278,30 @@ fn forward_probe_replies(tx: &Sender<Vec<u8>>, pending: &AtomicUsize, replies: V
     for reply in replies {
         // Drop-when-full: a refused probe reply is not worth a notice.
         let _ = admit_write(tx, pending, reply.into_bytes());
+    }
+}
+
+/// Deliver queued messages to `writer`, subtracting each message's bytes
+/// from `pending` whether or not the write succeeded. A write error means
+/// the slave side closed (child gone): writing stops, receiving must not.
+/// `admit_write` caps admission against `pending`, so a byte admitted and
+/// never subtracted inflates the counter for the task's whole life —
+/// breaking out of the loop would strand every message still queued, and a
+/// drain-then-break would still leak any message sent between the drain and
+/// the receiver drop. The loop therefore runs until the channel closes
+/// (every sender dropped: the reader thread's clone on EOF, the task's own
+/// on teardown or `force_kill`), leaving the thread as a cheap
+/// counter-drainer for the dead task's remaining lifetime.
+fn drain_writes(input_rx: Receiver<Vec<u8>>, mut writer: impl Write, pending: &AtomicUsize) {
+    let mut dead = false;
+    while let Ok(msg) = input_rx.recv() {
+        if !dead {
+            dead = writer
+                .write_all(&msg)
+                .and_then(|()| writer.flush())
+                .is_err();
+        }
+        pending.fetch_sub(msg.len(), Ordering::Release);
     }
 }
 
@@ -395,21 +420,11 @@ impl Task {
         };
 
         // Drain whole queued messages on a detached worker. The worker is not
-        // joined because a PTY write can block until the slave side closes.
+        // joined because a PTY write can block until the slave side closes;
+        // see `drain_writes` for why it outlives a dead PTY.
         {
             let pending = Arc::clone(&pending_write);
-            let mut writer = writer;
-            thread::spawn(move || {
-                while let Ok(msg) = input_rx.recv() {
-                    let res = writer.write_all(&msg).and_then(|()| writer.flush());
-                    pending.fetch_sub(msg.len(), Ordering::Release);
-                    if res.is_err() {
-                        // The slave side closed (child gone): nothing more can
-                        // be delivered. Queued messages drop with the receiver.
-                        break;
-                    }
-                }
-            });
+            thread::spawn(move || drain_writes(input_rx, writer, &pending));
         }
 
         // Process-group signalling and `waitid` use the leader PID directly.
@@ -1295,6 +1310,62 @@ mod tests {
             .expect("second message never echoed");
         assert!(first < second, "queued writes reordered: {contents:?}");
         t.terminate();
+    }
+
+    /// Accepts `limit` bytes, then fails every write. `written` records what
+    /// got through, pinning that post-error messages were discarded rather
+    /// than written.
+    struct FailingWriter {
+        limit: usize,
+        written: usize,
+    }
+
+    impl Write for FailingWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            if self.written + buf.len() > self.limit {
+                return Err(io::Error::other("slave side closed"));
+            }
+            self.written += buf.len();
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A write error stops delivery, not accounting: `pending` returns to
+    /// zero once the channel closes, including messages queued behind the
+    /// failure that never touch the writer.
+    #[test]
+    fn write_error_keeps_draining_the_pending_counter() {
+        let (tx, rx) = channel::<Vec<u8>>();
+        let pending = AtomicUsize::new(0);
+        // The first message fits, the second hits the write error, the third
+        // is already queued behind the failure.
+        let msgs: [&[u8]; 3] = [b"fits", b"fails", b"queued-behind"];
+        for msg in msgs {
+            admit_write(&tx, &pending, msg.to_vec()).unwrap();
+        }
+        let total: usize = msgs.iter().map(|m| m.len()).sum();
+        assert_eq!(pending.load(Ordering::Acquire), total);
+        // Every sender dropped: the worker loop must run to completion.
+        drop(tx);
+        let mut w = FailingWriter {
+            limit: msgs[0].len(),
+            written: 0,
+        };
+        drain_writes(rx, &mut w, &pending);
+        assert_eq!(
+            pending.load(Ordering::Acquire),
+            0,
+            "accounting must survive a dead writer"
+        );
+        assert_eq!(
+            w.written,
+            msgs[0].len(),
+            "post-error messages must be discarded, not written"
+        );
     }
 
     /// Input hints track mouse, alternate-screen, and DECSET 1007 modes.
