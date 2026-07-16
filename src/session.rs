@@ -3,8 +3,11 @@
 
 use std::{
     collections::BTreeMap,
-    fs, io,
+    fs,
+    io::{self, Write},
+    os::unix::fs::OpenOptionsExt,
     path::{Path, PathBuf},
+    sync::atomic::{AtomicU64, Ordering},
 };
 
 /// One recipe entry. Entries without a group or name serialize as strings;
@@ -50,8 +53,12 @@ pub fn sessions_dir(root: Option<PathBuf>) -> Option<PathBuf> {
         .map(|base| base.join("sessions"))
 }
 
-fn to_json(cfg: &SessionConfig) -> String {
-    let mut obj = jzon::JsonValue::new_object();
+/// Serialize the current schema: `{"name": <original>, "dirs": {...}}`. The
+/// stored name is the collision tiebreaker in `save_in` — sanitize maps
+/// distinct names ("a/b", "a.b") onto one filename, and only the original
+/// distinguishes an overwrite from a clobber.
+fn to_json(name: &str, cfg: &SessionConfig) -> String {
+    let mut dirs = jzon::JsonValue::new_object();
     for (dir, entries) in cfg {
         let mut arr = jzon::JsonValue::new_array();
         for e in entries {
@@ -71,15 +78,27 @@ fn to_json(cfg: &SessionConfig) -> String {
             };
             let _ = arr.push(member);
         }
-        let _ = obj.insert(dir, arr);
+        let _ = dirs.insert(dir, arr);
     }
+    let mut obj = jzon::JsonValue::new_object();
+    let _ = obj.insert("name", name);
+    let _ = obj.insert("dirs", dirs);
     obj.pretty(2)
 }
 
-fn from_json(text: &str) -> io::Result<SessionConfig> {
+/// Parse either schema, returning the stored original name when present.
+/// Detection keys off `dirs` being an *object*: legacy files are flat maps
+/// whose top-level values are entry arrays, so even a legacy directory
+/// literally named "dirs" cannot masquerade as the wrapper.
+fn from_json(text: &str) -> io::Result<(Option<String>, SessionConfig)> {
     let parsed = jzon::parse(text).map_err(|e| io::Error::other(e.to_string()))?;
+    let (name, dirs) = if parsed["dirs"].is_object() {
+        (parsed["name"].as_str().map(str::to_string), &parsed["dirs"])
+    } else {
+        (None, &parsed)
+    };
     let mut cfg = SessionConfig::new();
-    for (dir, val) in parsed.entries() {
+    for (dir, val) in dirs.entries() {
         // Ignore members that match neither supported entry form.
         let entries = val
             .members()
@@ -106,25 +125,94 @@ fn from_json(text: &str) -> io::Result<SessionConfig> {
             .collect();
         cfg.insert(dir.to_string(), entries);
     }
-    Ok(cfg)
+    Ok((name, cfg))
 }
 
 // --- fs surface: callers supply the root. The supervisor resolves it from the
 // connection's launch context; `sessions_dir` above is only its process-env
 // fallback. Tests point it at scratch dirs the same way. -----------------------
 
+/// Distinguishes concurrent savers' temp files within one process.
+static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
+
 pub fn save_in(dir: &Path, name: &str, cfg: &SessionConfig) -> io::Result<PathBuf> {
     fs::create_dir_all(dir)?;
-    let file = dir.join(format!("{}.json", sanitize(name)));
-    fs::write(&file, to_json(cfg))?;
+    let trimmed = name.trim();
+    let file_name = format!("{}.json", sanitize(name));
+    let file = dir.join(&file_name);
+
+    // Sanitize maps distinct names onto one filename ("a/b" and "a.b" both
+    // land at a_b.json), so overwriting on stored-name mismatch would destroy
+    // one session while reporting success under the other's name. Refuse
+    // before any write: a refusal leaves zero side effects. Files without a
+    // stored original — pre-schema saves and torn pre-atomic writes — read as
+    // the same session; refusing those would lock users out of re-saving
+    // under their own stem.
+    match fs::read_to_string(&file) {
+        Ok(text) => {
+            if let Ok((Some(stored), _)) = from_json(&text)
+                && stored != trimmed
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    format!(
+                        "session \"{trimmed}\" collides with existing \"{stored}\" \
+                         (both map to {file_name})"
+                    ),
+                ));
+            }
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+
+    // Write-temp-then-rename keeps a good copy on disk at every instant:
+    // `fs::write` truncates before writing, so a crash mid-save left torn
+    // JSON with the prior contents already gone. The temp lives in `dir`
+    // itself (rename must not cross filesystems) and ends in `.tmp`, which
+    // `list_in`'s `.json` filter never surfaces. Recipes persist full command
+    // lines (secrets included), so the temp opens 0600 via `create_new`; the
+    // rename carries that mode onto the target, correcting pre-existing 0644
+    // files on their next save — intended.
+    let pid = std::process::id();
+    let (mut tmp_file, tmp) = loop {
+        let n = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+        let candidate = dir.join(format!(".{file_name}.{pid}.{n}.tmp"));
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&candidate)
+        {
+            Ok(f) => break (f, candidate),
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
+    };
+    let written = (|| {
+        tmp_file.write_all(to_json(trimmed, cfg).as_bytes())?;
+        // Without the sync, the rename can become durable before the data
+        // blocks do — resurrecting exactly the torn-file window this path
+        // exists to close.
+        tmp_file.sync_all()?;
+        fs::rename(&tmp, &file)
+    })();
+    if written.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    written?;
     Ok(file)
 }
 
 pub fn load_in(dir: &Path, name: &str) -> io::Result<SessionConfig> {
     let file = dir.join(format!("{}.json", sanitize(name)));
-    from_json(&fs::read_to_string(file)?)
+    from_json(&fs::read_to_string(file)?).map(|(_, cfg)| cfg)
 }
 
+/// Recipe names under `dir`, sorted. The stored original wins over the file
+/// stem so callers see the name the user typed; legacy files fall back to
+/// their stem, which is already a sanitize fixpoint — either way the returned
+/// name loads back to the same file.
 pub fn list_in(dir: &Path) -> Vec<String> {
     let mut names = Vec::new();
     if let Ok(entries) = fs::read_dir(dir) {
@@ -133,7 +221,11 @@ pub fn list_in(dir: &Path) -> Vec<String> {
             if p.extension().and_then(|s| s.to_str()) == Some("json")
                 && let Some(stem) = p.file_stem().and_then(|s| s.to_str())
             {
-                names.push(stem.to_string());
+                let stored = fs::read_to_string(&p)
+                    .ok()
+                    .and_then(|t| from_json(&t).ok())
+                    .and_then(|(name, _)| name);
+                names.push(stored.unwrap_or_else(|| stem.to_string()));
             }
         }
     }
@@ -230,35 +322,39 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
-    /// String members parse as unadorned entries.
+    /// String members parse as unadorned entries; flat files carry no name.
     #[test]
     fn parses_the_pre_group_string_only_format() {
-        let cfg = from_json(r#"{"~/proj": ["cargo test", "vim"]}"#).unwrap();
+        let (name, cfg) = from_json(r#"{"~/proj": ["cargo test", "vim"]}"#).unwrap();
+        assert_eq!(name, None);
         assert_eq!(cfg["~/proj"], vec![e("cargo test"), e("vim")]);
     }
 
     /// Object members may omit the optional `name` field.
     #[test]
     fn parses_the_pre_name_object_format() {
-        let cfg = from_json(r#"{"~/proj": [{"cmd": "cargo test", "group": "ci"}]}"#).unwrap();
+        let (name, cfg) =
+            from_json(r#"{"~/proj": [{"cmd": "cargo test", "group": "ci"}]}"#).unwrap();
+        assert_eq!(name, None);
         assert_eq!(cfg["~/proj"], vec![ge("cargo test", "ci")]);
     }
 
-    /// Entries without a group or name serialize as strings.
+    /// Entries without a group or name serialize as strings, inside the
+    /// `{"name", "dirs"}` wrapper every save now writes.
     #[test]
-    fn group_free_config_writes_the_pre_group_bytes() {
+    fn group_free_config_writes_string_members_in_the_wrapper() {
         let mut cfg = SessionConfig::new();
         cfg.insert("~/proj".into(), vec![e("cargo test"), e("vim")]);
         cfg.insert("/tmp".into(), vec![e("top")]);
 
-        let expected = "{\n  \"/tmp\": [\n    \"top\"\n  ],\n  \"~/proj\": [\n    \"cargo test\",\n    \"vim\"\n  ]\n}";
-        assert_eq!(to_json(&cfg), expected);
+        let expected = "{\n  \"name\": \"work\",\n  \"dirs\": {\n    \"/tmp\": [\n      \"top\"\n    ],\n    \"~/proj\": [\n      \"cargo test\",\n      \"vim\"\n    ]\n  }\n}";
+        assert_eq!(to_json("work", &cfg), expected);
     }
 
     /// Malformed members are omitted rather than decoded into partial entries.
     #[test]
     fn malformed_object_members_drop_without_error() {
-        let cfg = from_json(
+        let (_, cfg) = from_json(
             r#"{"d": [
                 {"group": "g"},
                 {"cmd": 3},
@@ -291,5 +387,107 @@ mod tests {
     fn sanitizes_names() {
         assert_eq!(sanitize("my/session"), "my_session");
         assert_eq!(sanitize("  a.b  "), "a_b");
+    }
+
+    /// Recipes persist full command lines (secrets included): the file must
+    /// open owner-only, and a save over a pre-schema 0644 file must carry
+    /// 0600 onto it via the rename.
+    #[test]
+    fn saves_owner_only_and_fixes_legacy_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = temp("session_mode");
+        let mut cfg = SessionConfig::new();
+        cfg.insert("~/p".into(), vec![e("run --api-key hunter2")]);
+
+        let file = save_in(&dir, "keys", &cfg).unwrap();
+        let mode = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&file), 0o600);
+
+        fs::set_permissions(&file, fs::Permissions::from_mode(0o644)).unwrap();
+        save_in(&dir, "keys", &cfg).unwrap();
+        assert_eq!(mode(&file), 0o600);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The temp is renamed away on success; only the recipe remains.
+    #[test]
+    fn save_leaves_no_temp_file() {
+        let dir = temp("session_notemp");
+        let mut cfg = SessionConfig::new();
+        cfg.insert("~/p".into(), vec![e("vim")]);
+
+        save_in(&dir, "clean", &cfg).unwrap();
+        let names: Vec<String> = fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        assert_eq!(names, vec!["clean.json".to_string()]);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// "a/b" and "a.b" sanitize to the same filename; the second save must
+    /// refuse rather than clobber, naming both sessions, and the first recipe
+    /// must survive intact.
+    #[test]
+    fn refuses_saves_that_collide_after_sanitize() {
+        let dir = temp("session_collide");
+        let mut first = SessionConfig::new();
+        first.insert("~/one".into(), vec![e("cargo test")]);
+        save_in(&dir, "a/b", &first).unwrap();
+
+        let mut second = SessionConfig::new();
+        second.insert("~/two".into(), vec![e("vim")]);
+        let err = save_in(&dir, "a.b", &second).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
+        assert!(err.to_string().contains("\"a.b\""), "{err}");
+        assert!(err.to_string().contains("\"a/b\""), "{err}");
+        assert_eq!(load_in(&dir, "a/b").unwrap(), first);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Pre-schema flat files still load, and list falls back to their stem.
+    #[test]
+    fn loads_and_lists_legacy_flat_schema_files() {
+        let dir = temp("session_legacy");
+        fs::write(dir.join("old.json"), r#"{"~/proj": ["cargo test"]}"#).unwrap();
+
+        assert_eq!(
+            load_in(&dir, "old").unwrap()["~/proj"],
+            vec![e("cargo test")]
+        );
+        assert_eq!(list_in(&dir), vec!["old".to_string()]);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A legacy file carries no stored name, so re-saving under its own stem
+    /// is an overwrite of the same session, not a collision.
+    #[test]
+    fn legacy_file_resaves_under_its_own_stem() {
+        let dir = temp("session_legacy_resave");
+        fs::write(dir.join("mine.json"), r#"{"~/old": ["vim"]}"#).unwrap();
+
+        let mut cfg = SessionConfig::new();
+        cfg.insert("~/new".into(), vec![e("top")]);
+        save_in(&dir, "mine", &cfg).unwrap();
+        assert_eq!(load_in(&dir, "mine").unwrap(), cfg);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// New-schema files list under the user's original name, not the
+    /// sanitized stem they store under; legacy files list by stem. Every
+    /// listed name must load back.
+    #[test]
+    fn lists_stored_names_for_new_schema_files() {
+        let dir = temp("session_list_names");
+        let mut cfg = SessionConfig::new();
+        cfg.insert("~/p".into(), vec![e("vim")]);
+        save_in(&dir, "a/b", &cfg).unwrap();
+        fs::write(dir.join("legacy.json"), r#"{"~/x": ["top"]}"#).unwrap();
+
+        assert_eq!(list_in(&dir), vec!["a/b".to_string(), "legacy".to_string()]);
+        for n in list_in(&dir) {
+            load_in(&dir, &n).unwrap();
+        }
+        let _ = fs::remove_dir_all(&dir);
     }
 }
