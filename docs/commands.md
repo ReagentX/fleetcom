@@ -55,7 +55,7 @@ The `∙` glyph flips after ≈600 ms of quiet; the Idle *section* in the by-sta
 
 #### Attach and background
 
-While attached, `Ctrl-\` returns to the dashboard. Every other key, including `Ctrl-C`, `Ctrl-Z`, and `Ctrl-D`, is forwarded to the child. `Ctrl-\` refers to the physical chord; the input handler accepts both `Ctrl-\` and crossterm's `Ctrl-4` representation of that chord.
+While attached, `Ctrl-\` returns to the dashboard. Other supported keys, including `Ctrl-C`, `Ctrl-Z`, and `Ctrl-D`, are forwarded to the child. The daemon encodes cursor keys against the child's live cursor-key mode: unmodified cursor keys use `SS3` in application-cursor mode (`ESC O A` for Up), while modified cursor keys use `CSI`. Function keys, modified navigation (e.g. `Alt+Left`), and standard `Ctrl` combinations are included. `Ctrl-\` refers to the physical chord; the input handler accepts both `Ctrl-\` and crossterm's `Ctrl-4` representation of that chord.
 
 #### Shift+Enter, paste, and the wheel
 
@@ -64,6 +64,7 @@ Modified Enter, paste, and mouse input require state-dependent encoding:
 - Shift+Enter and Alt+Enter are sent as `ESC CR`, which is distinct from plain Enter. Shift requires a terminal that reports modified keys; terminals that do not report it send plain `CR`.
 - Paste travels as one message. Bracketed-paste-aware children receive paste markers with embedded terminators removed; other children receive line endings as `CR`. `fleetcom` text fields strip control characters.
 - Mouse-protocol children receive clicks, drags, releases, and wheel events in the negotiated encoding. Full-screen children without a mouse protocol use alternate scroll. For inline children without a mouse protocol, wheel-up enters `fleetcom`'s scrollback view. When `fleetcom` captures the mouse (for mouse-protocol children, inline children, or scrollback), terminal selection requires the terminal's selection-override modifier. Otherwise, drag selects normally.
+- Attached children do not receive kitty keyboard-protocol or application-keypad sequences. Keypad digits send their normal characters.
 
 #### Scrollback
 

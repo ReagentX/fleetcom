@@ -2,6 +2,7 @@ use std::path::Path;
 
 use super::*;
 use crate::harness::testutil::{ID as CAP_ID, OTHER as CAP_OTHER};
+use crate::protocol::{Key, Mods};
 use crate::testutil::{now_ms, read_pid, wait_until, write_rollout};
 
 fn here() -> PathBuf {
@@ -2686,5 +2687,75 @@ fn non_agent_entries_survive_save_as_plain_strings() {
             name: None,
         }]
     );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A `Command::Key` is encoded against the child's live cursor-key mode.
+#[test]
+fn key_command_encodes_against_live_cursor_mode() {
+    let dir = scratch("key_live_mode");
+    let (ready, out) = (dir.join("ready"), dir.join("out"));
+    let mut s = sup(24, 80);
+    hello_with_sh(&mut s, dir.clone());
+
+    // Raw mode lets `cat` receive ESC-prefixed keys without a newline. The
+    // child enables DECCKM before alternate-screen mode, so observing the
+    // alternate screen also confirms that DECCKM has been processed.
+    let id = spawn_ready(
+        &mut s,
+        format!(
+            "stty raw 2>/dev/null; printf '\\033[?1h\\033[?1049h'; echo r > {r}; cat > {o}",
+            r = ready.display(),
+            o = out.display()
+        ),
+        dir.clone(),
+        &ready,
+    );
+
+    let app_cursor_on = |s: &Supervisor| {
+        s.tasks
+            .iter()
+            .find(|t| t.id == id)
+            .is_some_and(|t| t.input_hints().1)
+    };
+    assert!(
+        wait_until(Duration::from_secs(5), || app_cursor_on(&s)),
+        "child never entered application-cursor mode"
+    );
+
+    // An unmodified Up uses SS3 while application-cursor mode is active.
+    s.apply(Command::Key {
+        id,
+        code: Key::Up,
+        mods: Mods::default(),
+    });
+    let up: &[u8] = b"\x1bOA";
+    assert!(
+        wait_until(Duration::from_secs(5), || {
+            std::fs::read(&out).is_ok_and(|b| b == up)
+        }),
+        "Up under app-cursor must arrive as SS3 ESC O A; got {:?}",
+        std::fs::read(&out)
+    );
+
+    // A modified cursor key uses CSI even in application-cursor mode.
+    s.apply(Command::Key {
+        id,
+        code: Key::Left,
+        mods: Mods {
+            alt: true,
+            ..Mods::default()
+        },
+    });
+    let total: &[u8] = b"\x1bOA\x1b[1;3D";
+    assert!(
+        wait_until(Duration::from_secs(5), || {
+            std::fs::read(&out).is_ok_and(|b| b == total)
+        }),
+        "Alt+Left must force CSI 1;3D under app-cursor; got {:?}",
+        std::fs::read(&out)
+    );
+
+    s.apply(Command::Kill { id });
     let _ = std::fs::remove_dir_all(&dir);
 }

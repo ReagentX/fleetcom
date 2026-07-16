@@ -318,6 +318,15 @@ impl Supervisor {
                     self.notice_refused(id, "mouse input", r.len);
                 }
             }
+            // Encode keys here because the child's cursor-key mode is core-side.
+            Command::Key { id, code, mods } => {
+                let refused = self
+                    .by_id_mut(id)
+                    .and_then(|t| t.send_key(code, mods).err());
+                if let Some(r) = refused {
+                    self.notice_refused(id, "key input", r.len);
+                }
+            }
             Command::Scrollback { id, action } => {
                 if let Some(t) = self.by_id_mut(id) {
                     t.scroll_view(action);

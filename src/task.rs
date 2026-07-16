@@ -24,7 +24,7 @@ use rustix::process::{WaitId, WaitIdOptions, waitid};
 use crate::{
     core::{Wake, Waker},
     emulator::Emulator,
-    protocol::{Lifecycle, MouseKind, ScrollAction, env_get},
+    protocol::{Key, Lifecycle, Mods, MouseKind, ScrollAction, env_get},
 };
 
 /// Number of history rows retained by each task's terminal grid.
@@ -164,6 +164,143 @@ fn mouse_bytes(emu: &Emulator, kind: MouseKind, col: u16, row: u16) -> Option<Ve
         return Some(arrow.repeat(3));
     }
     None
+}
+
+/// Return the control byte for a supported `Ctrl`+key combination. ASCII
+/// letters and the standard symbol/digit aliases map to C0 control bytes.
+fn ctrl_byte(c: char) -> Option<u8> {
+    if c.is_ascii_alphabetic() {
+        return Some((c.to_ascii_uppercase() as u8) & 0x1f);
+    }
+    Some(match c {
+        ' ' | '@' | '2' => 0x00,
+        '[' | '3' => 0x1b,
+        '\\' | '4' => 0x1c,
+        ']' | '5' => 0x1d,
+        '^' | '6' => 0x1e,
+        '_' | '7' | '/' => 0x1f,
+        '?' | '8' => 0x7f,
+        _ => return None,
+    })
+}
+
+/// Encode a printable key. Shift is already folded into `c` by the client, so
+/// it is ignored here; only `ctrl` (control byte) and `alt` (ESC prefix, the
+/// meta convention) change the bytes.
+fn char_bytes(c: char, mods: Mods) -> Option<Vec<u8>> {
+    let mut out = if mods.ctrl {
+        vec![ctrl_byte(c)?]
+    } else {
+        let mut buf = [0u8; 4];
+        c.encode_utf8(&mut buf).as_bytes().to_vec()
+    };
+    if mods.alt {
+        out.insert(0, 0x1b);
+    }
+    Some(out)
+}
+
+/// Encode F1–F4 as SS3 when unmodified and CSI when modified. F5–F12 use their
+/// CSI numeric forms. Numbers outside `1..=12` encode to nothing.
+fn f_bytes(n: u8, m: Option<u8>) -> Option<Vec<u8>> {
+    if let Some(letter) = match n {
+        1 => Some('P'),
+        2 => Some('Q'),
+        3 => Some('R'),
+        4 => Some('S'),
+        _ => None,
+    } {
+        return Some(match m {
+            None => format!("\x1bO{letter}").into_bytes(),
+            Some(m) => format!("\x1b[1;{m}{letter}").into_bytes(),
+        });
+    }
+    let code = match n {
+        5 => 15,
+        6 => 17,
+        7 => 18,
+        8 => 19,
+        9 => 20,
+        10 => 21,
+        11 => 23,
+        12 => 24,
+        _ => return None,
+    };
+    Some(match m {
+        None => format!("\x1b[{code}~").into_bytes(),
+        Some(m) => format!("\x1b[{code};{m}~").into_bytes(),
+    })
+}
+
+/// Encode a key for the child. Application-cursor mode selects SS3 for
+/// unmodified cursor and Home/End keys; their modified forms use CSI.
+/// Unsupported key combinations return `None`.
+fn key_bytes(app_cursor: bool, code: Key, mods: Mods) -> Option<Vec<u8>> {
+    let m = mods.param();
+    match code {
+        Key::Char(c) => char_bytes(c, mods),
+        Key::F(n) => f_bytes(n, m),
+        Key::Up | Key::Down | Key::Left | Key::Right | Key::Home | Key::End => {
+            let letter = match code {
+                Key::Up => 'A',
+                Key::Down => 'B',
+                Key::Right => 'C',
+                Key::Left => 'D',
+                Key::Home => 'H',
+                Key::End => 'F',
+                _ => unreachable!(),
+            };
+            Some(match m {
+                None if app_cursor => format!("\x1bO{letter}").into_bytes(),
+                None => format!("\x1b[{letter}").into_bytes(),
+                Some(m) => format!("\x1b[1;{m}{letter}").into_bytes(),
+            })
+        }
+        Key::Insert | Key::Delete | Key::PageUp | Key::PageDown => {
+            // Navigation-cluster keys always use CSI `<n>~`.
+            let n = match code {
+                Key::Insert => 2,
+                Key::Delete => 3,
+                Key::PageUp => 5,
+                Key::PageDown => 6,
+                _ => unreachable!(),
+            };
+            Some(match m {
+                None => format!("\x1b[{n}~").into_bytes(),
+                Some(m) => format!("\x1b[{n};{m}~").into_bytes(),
+            })
+        }
+        // Enter uses ESC CR for Shift or Alt; Control does not change plain CR.
+        Key::Enter => Some(if mods.shift || mods.alt {
+            vec![0x1b, 0x0d]
+        } else {
+            vec![0x0d]
+        }),
+        // Alt prefixes Tab with ESC; Control and Shift do not change HT.
+        Key::Tab => Some(if mods.alt {
+            vec![0x1b, 0x09]
+        } else {
+            vec![0x09]
+        }),
+        // Alt prefixes BackTab's CSI Z sequence; Control and Shift are ignored.
+        Key::BackTab => Some(if mods.alt {
+            b"\x1b\x1b[Z".to_vec()
+        } else {
+            b"\x1b[Z".to_vec()
+        }),
+        // Backspace is DEL; Alt prefixes ESC, and Control/Shift leave it unchanged.
+        Key::Backspace => Some(if mods.alt {
+            vec![0x1b, 0x7f]
+        } else {
+            vec![0x7f]
+        }),
+        // Alt+Esc is the ESC-ESC meta form; Ctrl/Shift fold into a plain ESC.
+        Key::Esc => Some(if mods.alt {
+            vec![0x1b, 0x1b]
+        } else {
+            vec![0x1b]
+        }),
+    }
 }
 
 pub struct Task {
@@ -683,6 +820,21 @@ impl Task {
         let bytes = {
             let p = grid(&self.parser);
             mouse_bytes(&p, kind, col, row)
+        };
+        match bytes {
+            Some(b) => self.send_input(&b),
+            None => Ok(()),
+        }
+    }
+
+    /// Forward one key press, encoded under the child's cursor-key mode; see
+    /// [`key_bytes`]. The DECCKM read stays on this thread under the grid lock,
+    /// like [`Task::send_paste`]/[`Task::send_mouse`]. A key that encodes to
+    /// nothing sends nothing.
+    pub fn send_key(&mut self, code: Key, mods: Mods) -> Result<(), WriteRefused> {
+        let bytes = {
+            let p = grid(&self.parser);
+            key_bytes(p.application_cursor(), code, mods)
         };
         match bytes {
             Some(b) => self.send_input(&b),
@@ -1249,6 +1401,281 @@ mod tests {
                 "mode {mode}: sgr drag"
             );
         }
+    }
+
+    fn mods(shift: bool, alt: bool, ctrl: bool) -> Mods {
+        Mods { shift, alt, ctrl }
+    }
+
+    /// Cursor and Home/End keys: application-cursor mode picks SS3 vs CSI for
+    /// the unmodified sequence, and any modifier forces the CSI `1;m` form even
+    /// in application mode.
+    #[test]
+    fn cursor_keys_encode_by_mode_and_modifier() {
+        let none = Mods::default();
+        for (code, l) in [
+            (Key::Up, 'A'),
+            (Key::Down, 'B'),
+            (Key::Right, 'C'),
+            (Key::Left, 'D'),
+            (Key::Home, 'H'),
+            (Key::End, 'F'),
+        ] {
+            assert_eq!(
+                key_bytes(false, code, none),
+                Some(format!("\x1b[{l}").into_bytes()),
+                "{code:?} normal",
+            );
+            assert_eq!(
+                key_bytes(true, code, none),
+                Some(format!("\x1bO{l}").into_bytes()),
+                "{code:?} app-cursor",
+            );
+            assert_eq!(
+                key_bytes(true, code, mods(false, true, false)),
+                Some(format!("\x1b[1;3{l}").into_bytes()),
+                "{code:?} alt forces CSI even in app mode",
+            );
+        }
+    }
+
+    /// The modifier parameter is `1 + shift + 2·alt + 4·ctrl`: shift=2, alt=3,
+    /// ctrl=5, ctrl+alt=7, all-three=8.
+    #[test]
+    fn modifier_param_formula() {
+        for (m, digit) in [
+            (mods(true, false, false), '2'),
+            (mods(false, true, false), '3'),
+            (mods(false, false, true), '5'),
+            (mods(false, true, true), '7'),
+            (mods(true, true, true), '8'),
+        ] {
+            assert_eq!(
+                key_bytes(false, Key::Up, m),
+                Some(format!("\x1b[1;{digit}A").into_bytes()),
+                "param for {m:?}",
+            );
+        }
+    }
+
+    /// Application-cursor mode uses SS3 only for unmodified cursor keys.
+    #[test]
+    fn app_cursor_drives_unmodified_only() {
+        assert_eq!(
+            key_bytes(true, Key::Left, mods(false, true, false)),
+            Some(b"\x1b[1;3D".to_vec()),
+        );
+        assert_eq!(
+            key_bytes(true, Key::Up, Mods::default()),
+            Some(b"\x1bOA".to_vec()),
+        );
+    }
+
+    /// The full F1–F12 table, including the terminfo gaps (no 16 between
+    /// F5=15 and F6=17; no 22 before F11=23) and the modified forms.
+    #[test]
+    fn function_keys_cover_the_terminfo_gaps() {
+        let none = Mods::default();
+        for (n, seq) in [
+            (1u8, b"\x1bOP".to_vec()),
+            (2, b"\x1bOQ".to_vec()),
+            (3, b"\x1bOR".to_vec()),
+            (4, b"\x1bOS".to_vec()),
+            (5, b"\x1b[15~".to_vec()),
+            (6, b"\x1b[17~".to_vec()),
+            (7, b"\x1b[18~".to_vec()),
+            (8, b"\x1b[19~".to_vec()),
+            (9, b"\x1b[20~".to_vec()),
+            (10, b"\x1b[21~".to_vec()),
+            (11, b"\x1b[23~".to_vec()),
+            (12, b"\x1b[24~".to_vec()),
+        ] {
+            assert_eq!(key_bytes(false, Key::F(n), none), Some(seq), "F{n}");
+        }
+        // F1–F4 collapse to CSI `1;m`; F5–F12 splice m before the tilde.
+        assert_eq!(
+            key_bytes(false, Key::F(1), mods(true, false, false)),
+            Some(b"\x1b[1;2P".to_vec()),
+        );
+        assert_eq!(
+            key_bytes(false, Key::F(5), mods(false, false, true)),
+            Some(b"\x1b[15;5~".to_vec()),
+        );
+        assert_eq!(
+            key_bytes(false, Key::F(12), mods(false, true, false)),
+            Some(b"\x1b[24;3~".to_vec()),
+        );
+        assert_eq!(key_bytes(false, Key::F(0), none), None);
+        assert_eq!(key_bytes(false, Key::F(13), none), None);
+    }
+
+    /// The Insert/Delete/PageUp/PageDown cluster is CSI `<n>~` regardless of
+    /// application-cursor mode.
+    #[test]
+    fn nav_cluster_is_mode_independent() {
+        for (code, n) in [
+            (Key::Insert, 2),
+            (Key::Delete, 3),
+            (Key::PageUp, 5),
+            (Key::PageDown, 6),
+        ] {
+            assert_eq!(
+                key_bytes(false, code, Mods::default()),
+                Some(format!("\x1b[{n}~").into_bytes()),
+                "{code:?} normal",
+            );
+            assert_eq!(
+                key_bytes(true, code, Mods::default()),
+                Some(format!("\x1b[{n}~").into_bytes()),
+                "{code:?} app-cursor unchanged",
+            );
+            assert_eq!(
+                key_bytes(false, code, mods(false, false, true)),
+                Some(format!("\x1b[{n};5~").into_bytes()),
+                "{code:?} modified",
+            );
+        }
+    }
+
+    /// Supported Ctrl symbol/digit aliases produce their C0 control bytes.
+    #[test]
+    fn ctrl_symbol_and_digit_table() {
+        let ctrl = mods(false, false, true);
+        for (c, byte) in [
+            (' ', 0x00),
+            ('@', 0x00),
+            ('2', 0x00),
+            ('[', 0x1b),
+            ('3', 0x1b),
+            ('\\', 0x1c),
+            ('4', 0x1c),
+            (']', 0x1d),
+            ('5', 0x1d),
+            ('^', 0x1e),
+            ('6', 0x1e),
+            ('_', 0x1f),
+            ('7', 0x1f),
+            ('/', 0x1f),
+            ('?', 0x7f),
+            ('8', 0x7f),
+        ] {
+            assert_eq!(
+                key_bytes(false, Key::Char(c), ctrl),
+                Some(vec![byte]),
+                "Ctrl+{c:?}",
+            );
+        }
+        assert_eq!(key_bytes(false, Key::Char('1'), ctrl), None);
+        assert_eq!(key_bytes(false, Key::Char('9'), ctrl), None);
+    }
+
+    /// Char encodings: plain UTF-8 (multibyte preserved), shift folded into the
+    /// char, Alt as an ESC prefix, and Ctrl+letter folding to its C0 control.
+    #[test]
+    fn char_alt_and_ctrl_letters() {
+        let none = Mods::default();
+        assert_eq!(key_bytes(false, Key::Char('a'), none), Some(b"a".to_vec()));
+        assert_eq!(
+            key_bytes(false, Key::Char('é'), none),
+            Some("é".as_bytes().to_vec()),
+        );
+        // Shift is already in the char; on its own it changes nothing.
+        assert_eq!(
+            key_bytes(false, Key::Char('A'), mods(true, false, false)),
+            Some(b"A".to_vec()),
+        );
+        assert_eq!(
+            key_bytes(false, Key::Char('x'), mods(false, true, false)),
+            Some(b"\x1bx".to_vec()),
+        );
+        assert_eq!(
+            key_bytes(false, Key::Char('a'), mods(false, false, true)),
+            Some(vec![0x01]),
+        );
+        assert_eq!(
+            key_bytes(false, Key::Char('C'), mods(false, false, true)),
+            Some(vec![0x03]),
+        );
+        assert_eq!(
+            key_bytes(false, Key::Char('z'), mods(false, false, true)),
+            Some(vec![0x1a]),
+        );
+        assert_eq!(
+            key_bytes(false, Key::Char('c'), mods(false, true, true)),
+            Some(vec![0x1b, 0x03]),
+        );
+    }
+
+    /// Named keys and their modifier forms: keys with no distinct modified
+    /// encoding ignore an unsupported Ctrl/Shift (base sequence, never dropped)
+    /// and take the ESC-prefix meta form under Alt.
+    #[test]
+    fn named_keys_and_meta_prefixes() {
+        let none = Mods::default();
+        assert_eq!(key_bytes(false, Key::Enter, none), Some(vec![0x0d]));
+        assert_eq!(key_bytes(false, Key::Tab, none), Some(vec![0x09]));
+        assert_eq!(
+            key_bytes(false, Key::BackTab, none),
+            Some(b"\x1b[Z".to_vec())
+        );
+        assert_eq!(key_bytes(false, Key::Backspace, none), Some(vec![0x7f]));
+        assert_eq!(key_bytes(false, Key::Esc, none), Some(vec![0x1b]));
+        // Shift or Alt Enter -> ESC CR; Alt+Backspace -> ESC DEL.
+        assert_eq!(
+            key_bytes(false, Key::Enter, mods(true, false, false)),
+            Some(b"\x1b\r".to_vec()),
+        );
+        assert_eq!(
+            key_bytes(false, Key::Enter, mods(false, true, false)),
+            Some(b"\x1b\r".to_vec()),
+        );
+        assert_eq!(
+            key_bytes(false, Key::Backspace, mods(false, true, false)),
+            Some(b"\x1b\x7f".to_vec()),
+        );
+        // BackTab already is Shift+Tab: its inherent Shift is ignored; Alt
+        // meta-prefixes the CSI Z sequence.
+        assert_eq!(
+            key_bytes(false, Key::BackTab, mods(true, false, false)),
+            Some(b"\x1b[Z".to_vec()),
+        );
+        assert_eq!(
+            key_bytes(false, Key::BackTab, mods(false, true, false)),
+            Some(b"\x1b\x1b[Z".to_vec()),
+        );
+        // These keys have no distinct modified form: an unsupported Ctrl/Shift
+        // is ignored (base sequence, never dropped), and Alt is the ESC-prefix
+        // meta form.
+        assert_eq!(
+            key_bytes(false, Key::Enter, mods(false, false, true)),
+            Some(vec![0x0d]),
+            "Ctrl+Enter folds to CR",
+        );
+        assert_eq!(
+            key_bytes(false, Key::Backspace, mods(false, false, true)),
+            Some(vec![0x7f]),
+            "Ctrl+Backspace folds to DEL",
+        );
+        assert_eq!(
+            key_bytes(false, Key::Tab, mods(false, false, true)),
+            Some(vec![0x09]),
+            "Ctrl+Tab folds to HT",
+        );
+        assert_eq!(
+            key_bytes(false, Key::Tab, mods(false, true, false)),
+            Some(vec![0x1b, 0x09]),
+            "Alt+Tab is ESC TAB",
+        );
+        assert_eq!(
+            key_bytes(false, Key::Esc, mods(false, true, false)),
+            Some(vec![0x1b, 0x1b]),
+            "Alt+Esc is ESC ESC",
+        );
+        assert_eq!(
+            key_bytes(false, Key::Esc, mods(false, false, true)),
+            Some(vec![0x1b]),
+            "Ctrl+Esc folds to ESC",
+        );
     }
 
     /// Scrollback clamps at both ends and input returns to live output.
