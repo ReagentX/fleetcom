@@ -38,11 +38,11 @@ Resolved in this order:
 | 2 | `$XDG_RUNTIME_DIR` is set and non-empty | `$XDG_RUNTIME_DIR/fleetcom` |
 | 3 | otherwise | `$TMPDIR/fleetcom-$uid` |
 
-The `$XDG_RUNTIME_DIR` branch tests the variable, not the platform: systemd sets it on Linux by convention, but any OS that exports it resolves the same path. On macOS, `$TMPDIR` is already per-user. The `$uid` suffix also separates users when the fallback resolves beneath a shared `/tmp`.
+`$XDG_RUNTIME_DIR` is honored on every supported platform. On macOS, `$TMPDIR` is already per-user. The `$uid` suffix also separates users when the fallback resolves beneath a shared `/tmp`.
 
 ### Config directory (sessions)
 
-Holds saved sessions under a `sessions/` subdirectory: one `<name>.json` per session. See [Sessions](sessions.md) for the format.
+Holds saved sessions under a `sessions/` subdirectory: one sanitized-name `.json` file per session. See [Sessions](sessions.md) for the format.
 
 | Order | Condition | Path |
 | -- | -- | -- |
@@ -50,7 +50,7 @@ Holds saved sessions under a `sessions/` subdirectory: one `<name>.json` per ses
 | 2 | Linux | `${XDG_CONFIG_HOME:-~/.config}/fleetcom/sessions` |
 | 2 | macOS | `~/Library/Application Support/fleetcom/sessions` |
 
-The platform default is [`dirs::config_dir()`](https://docs.rs/dirs/latest/dirs/fn.config_dir.html) joined with `fleetcom`. The directory is created on the first save.
+The platform default is [`dirs::config_dir()`](https://docs.rs/dirs/latest/dirs/fn.config_dir.html) joined with `fleetcom`. The first save creates missing session directories with mode `0700`; recipe files use mode `0600`.
 
 ## First-run walkthrough
 
