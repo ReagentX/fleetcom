@@ -281,17 +281,8 @@ fn forward_probe_replies(tx: &Sender<Vec<u8>>, pending: &AtomicUsize, replies: V
     }
 }
 
-/// Deliver queued messages to `writer`, subtracting each message's bytes
-/// from `pending` whether or not the write succeeded. A write error means
-/// the slave side closed (child gone): writing stops, receiving must not.
-/// `admit_write` caps admission against `pending`, so a byte admitted and
-/// never subtracted inflates the counter for the task's whole life.
-/// Breaking out of the loop would strand every message still queued, and a
-/// drain-then-break would still leak any message sent between the drain and
-/// the receiver drop. The loop therefore runs until the channel closes
-/// (every sender dropped: the reader thread's clone on EOF, the task's own
-/// on teardown or `force_kill`), leaving the thread as a cheap
-/// counter-drainer for the dead task's remaining lifetime.
+/// Write queued messages until the first write error, then discard messages
+/// until all senders close. Every received message is removed from `pending`.
 fn drain_writes(input_rx: Receiver<Vec<u8>>, mut writer: impl Write, pending: &AtomicUsize) {
     let mut dead = false;
     while let Ok(msg) = input_rx.recv() {
@@ -420,8 +411,8 @@ impl Task {
         };
 
         // Drain whole queued messages on a detached worker. The worker is not
-        // joined because a PTY write can block until the slave side closes;
-        // see `drain_writes` for why it outlives a dead PTY.
+        // joined because a PTY write can block until the slave side closes.
+        // After a write error it keeps draining pending-byte accounting.
         {
             let pending = Arc::clone(&pending_write);
             thread::spawn(move || drain_writes(input_rx, writer, &pending));
@@ -1312,9 +1303,7 @@ mod tests {
         t.terminate();
     }
 
-    /// Accepts `limit` bytes, then fails every write. `written` records what
-    /// got through, pinning that post-error messages were discarded rather
-    /// than written.
+    /// Test writer that accepts writes within `limit` bytes, then fails.
     struct FailingWriter {
         limit: usize,
         written: usize,
@@ -1341,15 +1330,14 @@ mod tests {
     fn write_error_keeps_draining_the_pending_counter() {
         let (tx, rx) = channel::<Vec<u8>>();
         let pending = AtomicUsize::new(0);
-        // The first message fits, the second hits the write error, the third
-        // is already queued behind the failure.
+        // Queue one successful write, one failure, and one discarded message.
         let msgs: [&[u8]; 3] = [b"fits", b"fails", b"queued-behind"];
         for msg in msgs {
             admit_write(&tx, &pending, msg.to_vec()).unwrap();
         }
         let total: usize = msgs.iter().map(|m| m.len()).sum();
         assert_eq!(pending.load(Ordering::Acquire), total);
-        // Every sender dropped: the worker loop must run to completion.
+        // Closing the channel lets the worker finish draining.
         drop(tx);
         let mut w = FailingWriter {
             limit: msgs[0].len(),

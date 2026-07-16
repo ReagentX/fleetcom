@@ -53,10 +53,8 @@ pub fn sessions_dir(root: Option<PathBuf>) -> Option<PathBuf> {
         .map(|base| base.join("sessions"))
 }
 
-/// Serialize the current schema: `{"name": <original>, "dirs": {...}}`. The
-/// stored name is the collision tiebreaker in `save_in`: sanitize maps
-/// distinct names ("a/b", "a.b") onto one filename, and only the original
-/// distinguishes an overwrite from a clobber.
+/// Serialize `{"name": <original>, "dirs": {...}}`. The stored name lets
+/// `save_in` distinguish names that sanitize to the same filename.
 fn to_json(name: &str, cfg: &SessionConfig) -> String {
     let mut dirs = jzon::JsonValue::new_object();
     for (dir, entries) in cfg {
@@ -86,10 +84,9 @@ fn to_json(name: &str, cfg: &SessionConfig) -> String {
     obj.pretty(2)
 }
 
-/// Parse either schema, returning the stored original name when present.
-/// Detection keys off `dirs` being an *object*: legacy files are flat maps
-/// whose top-level values are entry arrays, so even a legacy directory
-/// literally named "dirs" cannot masquerade as the wrapper.
+/// Parse wrapped and flat schemas, returning the stored name when present.
+/// A wrapped file has an object-valued `dirs`; flat files have entry arrays at
+/// the top level, including when a directory is literally named `dirs`.
 fn from_json(text: &str) -> io::Result<(Option<String>, SessionConfig)> {
     let parsed = jzon::parse(text).map_err(|e| io::Error::other(e.to_string()))?;
     let (name, dirs) = if parsed["dirs"].is_object() {
@@ -136,13 +133,8 @@ fn from_json(text: &str) -> io::Result<(Option<String>, SessionConfig)> {
 static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
 pub fn save_in(dir: &Path, name: &str, cfg: &SessionConfig) -> io::Result<PathBuf> {
-    // Contents are 0600, so filenames are the residual surface: a umask
-    // directory on a multi-user host with traversable parents lets anyone
-    // enumerate session names and sizes. Create private, and re-tighten a
-    // pre-fix directory on its next save: the same on-touch correction the
-    // rename below applies to 0644 files. Only `dir` itself is corrected:
-    // freshly created parents get 0700 from the builder, but an existing
-    // config root (`~/.config`) is shared state this crate never `chmod`s.
+    // Create missing directories with 0700 and restrict the session directory
+    // itself to 0700. Existing parent directories remain unchanged.
     fs::DirBuilder::new()
         .recursive(true)
         .mode(0o700)
@@ -154,13 +146,8 @@ pub fn save_in(dir: &Path, name: &str, cfg: &SessionConfig) -> io::Result<PathBu
     let file_name = format!("{}.json", sanitize(name));
     let file = dir.join(&file_name);
 
-    // Sanitize maps distinct names onto one filename ("a/b" and "a.b" both
-    // land at a_b.json), so overwriting on stored-name mismatch would destroy
-    // one session while reporting success under the other's name. Refuse
-    // before any write: a refusal leaves zero side effects. Files without a
-    // stored original (pre-schema saves and torn pre-atomic writes) read as
-    // the same session; refusing those would lock users out of re-saving
-    // under their own stem.
+    // Refuse a stored-name mismatch because distinct names can sanitize to the
+    // same filename. Files without a parseable stored name remain overwritable.
     match fs::read_to_string(&file) {
         Ok(text) => {
             if let Ok((Some(stored), _)) = from_json(&text)
@@ -179,14 +166,9 @@ pub fn save_in(dir: &Path, name: &str, cfg: &SessionConfig) -> io::Result<PathBu
         Err(e) => return Err(e),
     }
 
-    // Write-temp-then-rename keeps a good copy on disk throughout the save:
-    // `fs::write` truncates before writing, so a crash mid-save left torn
-    // JSON with the prior contents already gone. The temp lives in `dir`
-    // itself (rename must not cross filesystems) and ends in `.tmp`, which
-    // `list_in`'s `.json` filter never surfaces. Recipes persist full command
-    // lines (secrets included), so the temp opens 0600 via `create_new`; the
-    // rename carries that mode onto the target, correcting pre-existing 0644
-    // files on their next save.
+    // Write a private temp file in the session directory, sync its contents,
+    // then atomically rename it over the recipe. The `.tmp` suffix keeps it
+    // out of `list_in`, and the rename gives the target mode 0600.
     let pid = std::process::id();
     let (mut tmp_file, tmp) = loop {
         let n = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
@@ -204,8 +186,7 @@ pub fn save_in(dir: &Path, name: &str, cfg: &SessionConfig) -> io::Result<PathBu
     };
     let written = (|| {
         tmp_file.write_all(to_json(trimmed, cfg).as_bytes())?;
-        // Without the sync, the rename can become durable before the data
-        // blocks do: exactly the torn-file window this path exists to close.
+        // Persist the contents before publishing the temp file as the recipe.
         tmp_file.sync_all()?;
         fs::rename(&tmp, &file)
     })();
@@ -221,10 +202,8 @@ pub fn load_in(dir: &Path, name: &str) -> io::Result<SessionConfig> {
     from_json(&fs::read_to_string(file)?).map(|(_, cfg)| cfg)
 }
 
-/// Recipe names under `dir`, sorted. The stored original wins over the file
-/// stem so callers see the name the user typed; legacy files fall back to
-/// their stem, which is already a sanitize fixpoint. Either way the returned
-/// name loads back to the same file.
+/// Return sorted recipe names under `dir`. Wrapped files use their stored name;
+/// flat files use the filename stem.
 pub fn list_in(dir: &Path) -> Vec<String> {
     let mut names = Vec::new();
     if let Ok(entries) = fs::read_dir(dir) {
@@ -334,7 +313,7 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
-    /// String members parse as unadorned entries; flat files carry no name.
+    /// String members parse as unadorned entries; flat files have no stored name.
     #[test]
     fn parses_the_pre_group_string_only_format() {
         let (name, cfg) = from_json(r#"{"~/proj": ["cargo test", "vim"]}"#).unwrap();
@@ -351,8 +330,7 @@ mod tests {
         assert_eq!(cfg["~/proj"], vec![ge("cargo test", "ci")]);
     }
 
-    /// Entries without a group or name serialize as strings, inside the
-    /// `{"name", "dirs"}` wrapper every save now writes.
+    /// Entries without a group or display name use strings in the wrapper.
     #[test]
     fn group_free_config_writes_string_members_in_the_wrapper() {
         let mut cfg = SessionConfig::new();
@@ -401,9 +379,7 @@ mod tests {
         assert_eq!(sanitize("  a.b  "), "a_b");
     }
 
-    /// Recipes persist full command lines (secrets included): the file must
-    /// open owner-only, and a save over a pre-schema 0644 file must carry
-    /// 0600 onto it via the rename.
+    /// Recipe files are owner-only, including after replacing a 0644 file.
     #[test]
     fn saves_owner_only_and_fixes_legacy_permissions() {
         let dir = temp("session_mode");
@@ -420,9 +396,8 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
-    /// Filenames are the residual surface once contents are 0600: a fresh
-    /// sessions dir is created private (its created parents too), and a
-    /// pre-fix umask directory is re-tightened on its next save.
+    /// Session directories are created private and existing permissive session
+    /// directories are restricted on save.
     #[test]
     fn sessions_dir_is_created_private_and_retightened() {
         let base = temp("session_dir_mode");
@@ -459,9 +434,7 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
-    /// "a/b" and "a.b" sanitize to the same filename; the second save must
-    /// refuse rather than clobber, naming both sessions, and the first recipe
-    /// must survive intact.
+    /// Saves reject a different name that sanitizes to an occupied filename.
     #[test]
     fn refuses_saves_that_collide_after_sanitize() {
         let dir = temp("session_collide");
@@ -479,7 +452,7 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
-    /// Pre-schema flat files still load, and list falls back to their stem.
+    /// Flat-schema files load and list by filename stem.
     #[test]
     fn loads_and_lists_legacy_flat_schema_files() {
         let dir = temp("session_legacy");
@@ -493,8 +466,7 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
-    /// A legacy file carries no stored name, so re-saving under its own stem
-    /// is an overwrite of the same session, not a collision.
+    /// A flat-schema file can be replaced under its filename stem.
     #[test]
     fn legacy_file_resaves_under_its_own_stem() {
         let dir = temp("session_legacy_resave");
@@ -507,9 +479,7 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
-    /// New-schema files list under the user's original name, not the
-    /// sanitized stem they store under; legacy files list by stem. Every
-    /// listed name must load back.
+    /// Wrapped files list by stored name; flat files list by filename stem.
     #[test]
     fn lists_stored_names_for_new_schema_files() {
         let dir = temp("session_list_names");

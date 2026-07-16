@@ -4,9 +4,7 @@
 //! a command in its own PTY; the dashboard groups them by status, and you can
 //! peek at, attach to, and background any of them.
 
-// Everything below assumes Unix (PTYs, unix-domain sockets, process groups,
-// `nix`/`rustix`): fail a non-unix `cargo install` here, with one line naming
-// the reason, instead of hundreds of errors deep in dependency compilation.
+// fleetcom requires Unix PTYs, domain sockets, and process-group signaling.
 #[cfg(not(unix))]
 compile_error!("fleetcom supports Unix platforms only.");
 
@@ -180,16 +178,8 @@ fn main() -> io::Result<()> {
         }
     };
 
-    // Signal routing is pinned between two hard bounds; moving it either way
-    // breaks an exit path. Not before `App::connect`: the handshake can queue
-    // behind another client, and `connect_ready` documents Ctrl-C as the abort
-    // for that wait. That abort *is* SIGINT's default disposition, so arming
-    // earlier turns it into a store to a flag nothing polls yet. Not after
-    // `enable_raw_mode`: a fatal signal's default disposition terminates
-    // without unwinding, so neither `TerminalGuard` nor the panic hook runs.
-    // SIGTERM/SIGHUP landing between raw mode and registration would strand
-    // the shell in raw mode. The window below is wide: the kitty probe blocks
-    // on a tty round-trip before the alternate screen is even entered.
+    // Keep SIGINT's default behavior while a connection is waiting, then route
+    // signals through the app before raw mode requires terminal restoration.
     install_signal_handlers(app.signal_flag())?;
 
     let mut out = io::stdout();

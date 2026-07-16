@@ -140,13 +140,11 @@ impl CaptureAssets {
     }
 }
 
-/// Remove this incarnation's namespace when the owning supervisor drops it.
+/// Remove this supervisor's capture namespace on drop.
 impl Drop for CaptureAssets {
     fn drop(&mut self) {
-        // Best-effort: drop runs on shutdown paths, and a cleanup error must
-        // not fail the shutdown itself. Only `self.dir` is removed: namespaces
-        // stranded by crashed daemons are an accepted leak, because sweeping
-        // the shared root could delete a live sibling daemon's namespace.
+        // Ignore shutdown cleanup errors and preserve sibling namespaces under
+        // the shared capture root.
         let _ = fs::remove_dir_all(&self.dir);
     }
 }
@@ -492,8 +490,7 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
-    /// Drop removes the incarnation namespace and its contents, and nothing
-    /// else: the shared root and sibling namespaces survive.
+    /// Drop removes only the owned namespace and its contents.
     #[test]
     fn drop_removes_only_the_incarnation_namespace() {
         let root = temp("assets_drop");
@@ -503,7 +500,7 @@ mod tests {
 
         let assets = CaptureAssets::install(&root, std::process::id()).unwrap();
         let ns = namespace(&assets, &root);
-        // A capture file left inside goes with the namespace.
+        // Namespace cleanup includes task capture files.
         fs::write(assets.paths_for(1, 0).capture_file, "{}").unwrap();
         drop(assets);
 

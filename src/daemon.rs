@@ -100,8 +100,7 @@ fn socket_path() -> PathBuf {
     socket_in(&runtime_dir())
 }
 
-/// Socket path inside an explicit runtime dir: the one place the file name
-/// lives, shared by the env-reading wrapper and the dir-explicit connect path.
+/// Return the daemon socket path under `dir`.
 fn socket_in(dir: &Path) -> PathBuf {
     dir.join("default.sock")
 }
@@ -259,17 +258,10 @@ fn connect_or_autostart() -> io::Result<UnixStream> {
     connect_or_autostart_in(&runtime_dir())
 }
 
-/// The dir-explicit body of [`connect_or_autostart`]: tests drive the refusal
-/// branch directly instead of racing other tests on `FLEETCOM_RUNTIME_DIR`.
+/// Validate `dir` before the first daemon connection attempt.
 fn connect_or_autostart_in(dir: &Path) -> io::Result<UnixStream> {
-    // Validate before the *first* connect, not just before spawning: both
-    // callers follow a successful connect with a hello carrying this process's
-    // entire env (`LaunchContext::here()`), so a listener on a socket inside a
-    // dir someone else owns (a pre-created `$TMPDIR/fleetcom-$uid` on a shared
-    // `/tmp`) harvests every API key without speaking a byte of the protocol.
-    // The checks in `spawn_daemon` and `run_daemon` never run on this path: a
-    // successful connect skips both. An attacker-owned dir must fail here,
-    // never fall through to the spawn below.
+    // Validate before connecting because the hello sends the client's
+    // environment and a successful connection skips daemon-side validation.
     ensure_runtime_dir(dir)?;
     let path = socket_in(dir);
     if let Ok(s) = UnixStream::connect(&path) {
@@ -321,10 +313,8 @@ fn spawn_daemon() -> io::Result<()> {
 /// A no-op (with a message) if no daemon is running.
 pub fn run_kill() -> io::Result<()> {
     let dir = runtime_dir();
-    // Everything below trusts this dir's contents: the lock file's pid becomes
-    // a SIGTERM target, and the no-pid fallback connects to the socket and
-    // sends the env-bearing hello. A planted dir could steer either at an
-    // attacker-chosen victim, so validate before reading anything from it.
+    // The lock PID is a signal target, and the socket receives the client's
+    // environment, so validate the directory before reading either file.
     ensure_runtime_dir(&dir)?;
     let lock_path = dir.join("daemon.lock");
     let Ok(file) = fs::OpenOptions::new()
@@ -468,9 +458,8 @@ pub fn run_daemon() -> io::Result<()> {
             Ok((stream, _)) => {
                 // serve_client does blocking reads; force the accepted stream
                 // blocking regardless of the listener's mode (BSD would inherit).
-                // A failed fcntl is one connection's dead socket, not a listener
-                // fault: propagating it would exit past the Shutdown teardown
-                // below and reap the whole fleet over a client we can drop.
+                // A stream setup failure affects only this client; keep the
+                // daemon and its tasks available to later connections.
                 if let Err(e) = stream.set_nonblocking(false) {
                     eprintln!("fleetcom: dropping client, cannot set stream blocking: {e}");
                     continue;
@@ -669,10 +658,7 @@ mod tests {
         let _ = fs::remove_dir_all(&base);
     }
 
-    /// The client's fast path must refuse before its first connect: a hello
-    /// over a socket in an untrusted dir hands the listener this process's
-    /// whole env. A symlinked or plain-file runtime path errors out; it never
-    /// falls through to a connect or a daemon spawn.
+    /// Connection setup rejects symlinked and non-directory runtime paths.
     #[test]
     fn connect_refuses_untrusted_runtime_dir() {
         let base = temp("daemon_connect_untrusted");
