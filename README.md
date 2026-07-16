@@ -1,24 +1,26 @@
 # `fleetcom`
 
+`fleetcom` supervises your local development fleet: multiplexers, application servers, REPLs, builds, tests, and AI agent sessions.
+
 Running several long-lived commands is pesky once they span terminal panes or need to survive a disconnect. `fleetcom` gives each command its own PTY and exposes every screen through one dashboard. A daemon owns the jobs, so closing the client does not stop them.
 
 ## Key Features
 
 ### Fleet view
 
-`fleetcom` supervises your local development fleet: multiplexers, application servers, REPLs, builds, tests, and AI agent sessions.
+See every task’s state and latest output from one dashboard.
 
 ![`fleetcom` fleet view](docs/img/home.png)
 
 ### Quick peek
 
-Press `Space` to quick peek at a task without attaching to it.
+Press `Space` to quick peek a task's live screen without attaching to it.
 
 ![`fleetcom` quick peek](docs/img/quickpeek.png)
 
 ### Attach and interact
 
-Press enter to attach and interact with a task.
+Press `Enter` to take control of a task, then `^\` to return to the fleet without interrupting it.
 
 ![`fleetcom` attach](docs/img/attach.png)
 
@@ -27,7 +29,7 @@ Press enter to attach and interact with a task.
 - Runs each command in its own PTY and groups tasks by state, by working directory, or by custom named groups.
 - Keeps jobs running after the client disconnects.
 - Saves and reloads task recipes with directories, commands, group assignments, and display names.
-- Saves resumable `claude`, `codex`, and `grok` commands when it can identify their conversations.
+- Preserves supported `claude`, `codex`, and `grok` conversations so saved or rerun tasks can resume them.
 - Launches commands in other directories through the `@` picker.
 
 ## Documentation
@@ -105,7 +107,8 @@ Every task runs in its own pseudo-terminal, emulated with `alacritty_terminal`. 
 
 ### When to avoid `fleetcom`
 
-- It is not a full process manager: the fleet's lifetime is bounded by the daemon's (see the first limitation below).
+- You primarily need persistent interactive shell workspaces; use `tmux` or `zellij` directly. `fleetcom` can supervise a multiplexer, but it does not replace one.
+- You need a full process manager: the fleet’s lifetime is bounded by the daemon’s.
 
 ### Operational limits
 
