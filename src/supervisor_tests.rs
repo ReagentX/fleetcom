@@ -2690,11 +2690,7 @@ fn non_agent_entries_survive_save_as_plain_strings() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// End-to-end proof of the client→daemon key path on a real PTY: a
-/// `Command::Key` is encoded against the child's *live* cursor-key mode, the
-/// whole reason encoding moved to the daemon. The child turns on
-/// application-cursor mode (DECCKM), so an unmodified Up must arrive as SS3
-/// `ESC O A` — not the CSI `ESC [ A` a stateless client would have sent.
+/// A `Command::Key` is encoded against the child's live cursor-key mode.
 #[test]
 fn key_command_encodes_against_live_cursor_mode() {
     let dir = scratch("key_live_mode");
@@ -2702,12 +2698,9 @@ fn key_command_encodes_against_live_cursor_mode() {
     let mut s = sup(24, 80);
     hello_with_sh(&mut s, dir.clone());
 
-    // `stty raw` defeats canonical line-buffering so `cat` sees ESC-prefixed
-    // keys that carry no newline. The child turns on DECCKM (app-cursor) first,
-    // then the alternate screen: one reader thread advances the emulator in
-    // byte order, so observing alt-screen ON proves DECCKM is already ON — the
-    // gate we need before sending, since `ready` only proves the bytes reached
-    // the pty, not that the emulator consumed them.
+    // Raw mode lets `cat` receive ESC-prefixed keys without a newline. The
+    // child enables DECCKM before alternate-screen mode, so observing the
+    // alternate screen also confirms that DECCKM has been processed.
     let id = spawn_ready(
         &mut s,
         format!(
@@ -2719,7 +2712,6 @@ fn key_command_encodes_against_live_cursor_mode() {
         &ready,
     );
 
-    // alt-screen ON (input_hints().1) ⟹ DECCKM already applied.
     let app_cursor_on = |s: &Supervisor| {
         s.tasks
             .iter()
@@ -2731,7 +2723,7 @@ fn key_command_encodes_against_live_cursor_mode() {
         "child never entered application-cursor mode"
     );
 
-    // App-cursor case: unmodified Up ⇒ SS3, proof the encoding saw live state.
+    // An unmodified Up uses SS3 while application-cursor mode is active.
     s.apply(Command::Key {
         id,
         code: Key::Up,
@@ -2746,8 +2738,7 @@ fn key_command_encodes_against_live_cursor_mode() {
         std::fs::read(&out)
     );
 
-    // Zellij case: Alt+Left is modified, so it forces CSI 1;3D even while
-    // app-cursor is on — any modifier selects CSI over SS3.
+    // A modified cursor key uses CSI even in application-cursor mode.
     s.apply(Command::Key {
         id,
         code: Key::Left,

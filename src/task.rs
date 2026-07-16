@@ -166,11 +166,8 @@ fn mouse_bytes(emu: &Emulator, kind: MouseKind, col: u16, row: u16) -> Option<Ve
     None
 }
 
-/// The control byte a `Ctrl`+key produces, or `None` for a combination the
-/// terminfo table does not define (silently dropped rather than guessed). ASCII
-/// letters fold to `upper & 0x1f`; the symbol/digit rows are the C0 aliases
-/// xterm emits (both `Ctrl+2` and `Ctrl+@` are NUL, both `Ctrl+/` and `Ctrl+_`
-/// are US, etc.), which the byte-encoding client got wrong.
+/// Return the control byte for a supported `Ctrl`+key combination. ASCII
+/// letters and the standard symbol/digit aliases map to C0 control bytes.
 fn ctrl_byte(c: char) -> Option<u8> {
     if c.is_ascii_alphabetic() {
         return Some((c.to_ascii_uppercase() as u8) & 0x1f);
@@ -188,8 +185,8 @@ fn ctrl_byte(c: char) -> Option<u8> {
 }
 
 /// Encode a printable key. Shift is already folded into `c` by the client, so
-/// it plays no part here; only `ctrl` (control byte) and `alt` (ESC prefix,
-/// the meta convention) change the bytes.
+/// it is ignored here; only `ctrl` (control byte) and `alt` (ESC prefix, the
+/// meta convention) change the bytes.
 fn char_bytes(c: char, mods: Mods) -> Option<Vec<u8>> {
     let mut out = if mods.ctrl {
         vec![ctrl_byte(c)?]
@@ -203,10 +200,8 @@ fn char_bytes(c: char, mods: Mods) -> Option<Vec<u8>> {
     Some(out)
 }
 
-/// Encode a function key. F1–F4 are SS3 `P`–`S` unmodified and collapse to the
-/// CSI `1;m` form under any modifier; F5–F12 are CSI `<n>~` with a modifier
-/// parameter spliced in. `n` is not contiguous (no 16, no 22) — the gaps are
-/// terminfo's, not a mistake. Numbers outside `1..=12` encode to nothing.
+/// Encode F1–F4 as SS3 when unmodified and CSI when modified. F5–F12 use their
+/// CSI numeric forms. Numbers outside `1..=12` encode to nothing.
 fn f_bytes(n: u8, m: Option<u8>) -> Option<Vec<u8>> {
     if let Some(letter) = match n {
         1 => Some('P'),
@@ -237,14 +232,9 @@ fn f_bytes(n: u8, m: Option<u8>) -> Option<Vec<u8>> {
     })
 }
 
-/// Encode a semantic key press to the bytes the child expects, or `None` for a
-/// key that encodes to nothing. `app_cursor` is the child's DECCKM state
-/// ([`Emulator::application_cursor`]): it selects SS3-vs-CSI for *unmodified*
-/// cursor and Home/End keys only — any modifier forces the CSI `1;m` form even
-/// in application-cursor mode (the Alt+arrow bug some multiplexers ship). All
-/// sequences are terminfo-derived (`xterm-256color`); an uncovered `(code,
-/// mods)` returns `None` rather than a guessed sequence, because a wrong byte
-/// silently corrupts the child's input while silence merely drops a rare key.
+/// Encode a key for the child. Application-cursor mode selects SS3 for
+/// unmodified cursor and Home/End keys; their modified forms use CSI.
+/// Unsupported key combinations return `None`.
 fn key_bytes(app_cursor: bool, code: Key, mods: Mods) -> Option<Vec<u8>> {
     let m = mods.param();
     match code {
@@ -267,7 +257,7 @@ fn key_bytes(app_cursor: bool, code: Key, mods: Mods) -> Option<Vec<u8>> {
             })
         }
         Key::Insert | Key::Delete | Key::PageUp | Key::PageDown => {
-            // Mode-independent: always CSI `<n>~`, unaffected by app_cursor.
+            // Navigation-cluster keys always use CSI `<n>~`.
             let n = match code {
                 Key::Insert => 2,
                 Key::Delete => 3,
@@ -280,35 +270,25 @@ fn key_bytes(app_cursor: bool, code: Key, mods: Mods) -> Option<Vec<u8>> {
                 Some(m) => format!("\x1b[{n};{m}~").into_bytes(),
             })
         }
-        // The keys below have no distinct xterm modified encoding, so an
-        // unsupported Ctrl/Shift is *ignored* rather than dropped: the base
-        // sequence is never wrong, only less specific, and dropping a named key
-        // is strictly worse (the "I pressed a key and nothing happened" bug
-        // this routing exists to kill). Alt applies the ESC-prefix meta form
-        // (xterm metaSendsEscape).
-        //
-        // Enter also has the documented Shift/Alt ESC-CR form; Ctrl folds into
-        // the plain CR.
+        // Enter uses ESC CR for Shift or Alt; Control does not change plain CR.
         Key::Enter => Some(if mods.shift || mods.alt {
             vec![0x1b, 0x0d]
         } else {
             vec![0x0d]
         }),
-        // Alt+Tab is readline's `\e<Tab>`; Ctrl/Shift fold into a plain HT.
+        // Alt prefixes Tab with ESC; Control and Shift do not change HT.
         Key::Tab => Some(if mods.alt {
             vec![0x1b, 0x09]
         } else {
             vec![0x09]
         }),
-        // BackTab already *is* Shift+Tab, so its inherent Shift is ignored, as
-        // is an unsupported Ctrl; Alt meta-prefixes the CSI Z sequence.
+        // Alt prefixes BackTab's CSI Z sequence; Control and Shift are ignored.
         Key::BackTab => Some(if mods.alt {
             b"\x1b\x1b[Z".to_vec()
         } else {
             b"\x1b[Z".to_vec()
         }),
-        // xterm's default Backspace is DEL (0x7f), not terminfo's ^H — a
-        // deliberate choice. Alt meta-prefixes ESC; Ctrl/Shift fold into DEL.
+        // Backspace is DEL; Alt prefixes ESC, and Control/Shift leave it unchanged.
         Key::Backspace => Some(if mods.alt {
             vec![0x1b, 0x7f]
         } else {
@@ -1423,7 +1403,6 @@ mod tests {
         }
     }
 
-    /// Terse `Mods` builder for the key-encoding tests.
     fn mods(shift: bool, alt: bool, ctrl: bool) -> Mods {
         Mods { shift, alt, ctrl }
     }
@@ -1479,9 +1458,7 @@ mod tests {
         }
     }
 
-    /// The multiplexer Alt+arrow regression: application-cursor mode selects
-    /// SS3 only for the unmodified arrow; a held modifier must still take the
-    /// CSI `1;m` form, never SS3 and never a bare arrow.
+    /// Application-cursor mode uses SS3 only for unmodified cursor keys.
     #[test]
     fn app_cursor_drives_unmodified_only() {
         assert_eq!(
@@ -1560,8 +1537,7 @@ mod tests {
         }
     }
 
-    /// The Ctrl symbol/digit aliases xterm emits (the combinations the
-    /// byte-encoding client got wrong); an uncovered pair drops.
+    /// Supported Ctrl symbol/digit aliases produce their C0 control bytes.
     #[test]
     fn ctrl_symbol_and_digit_table() {
         let ctrl = mods(false, false, true);

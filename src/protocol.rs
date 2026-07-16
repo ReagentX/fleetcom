@@ -90,12 +90,8 @@ pub enum Command {
         col: u16,
         row: u16,
     },
-    /// One key press over an attached task, carried semantically rather than
-    /// pre-encoded. Routing is core-side for the same reason as `Paste` and
-    /// `Mouse`: the bytes a key produces depend on the child's cursor-key mode
-    /// (DECCKM / DECSET 1), which lives in its emulator. The client cannot see
-    /// it, so a client that byte-encoded arrows would pick the wrong SS3-vs-CSI
-    /// form and drop the modifier combinations the child's mode dictates.
+    /// One key press over an attached task. The core encodes it using the
+    /// child's cursor-key mode.
     Key { id: u64, code: Key, mods: Mods },
     /// Move a task's scrollback viewport.
     Scrollback { id: u64, action: ScrollAction },
@@ -138,9 +134,7 @@ pub enum MouseKind {
     Release(MouseBtn),
 }
 
-/// A semantic key press in a [`Command::Key`], mirroring the keys the client
-/// can produce. Unmappable keys are never carried: the client only sends what
-/// encodes to bytes, so there is no `Null`/unmappable variant.
+/// A key code carried by [`Command::Key`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Key {
     Char(char),
@@ -163,9 +157,8 @@ pub enum Key {
     Esc,
 }
 
-/// The modifier state a [`Command::Key`] carries: exactly the three bits xterm's
-/// modifier parameter is built from. Shift on a printable key is already folded
-/// into the `char`; it matters here only for the nav/cursor/function encodings.
+/// The Shift, Alt, and Control state carried by [`Command::Key`]. For
+/// [`Key::Char`], the client folds Shift into the character itself.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Mods {
     pub shift: bool,
@@ -174,10 +167,8 @@ pub struct Mods {
 }
 
 impl Mods {
-    /// xterm's modifier parameter `1 + shift + 2·alt + 4·ctrl`, or `None` when
-    /// unmodified. `None` is load-bearing twice: the unmodified sequence omits
-    /// the `;m` field, and it is also what selects the SS3-vs-CSI cursor-key
-    /// form (any modifier forces CSI even in application-cursor mode).
+    /// Return xterm's modifier parameter `1 + shift + 2·alt + 4·ctrl`, or
+    /// `None` when no modifier is held.
     pub fn param(self) -> Option<u8> {
         let bits = self.shift as u8 + 2 * self.alt as u8 + 4 * self.ctrl as u8;
         (bits != 0).then_some(1 + bits)
@@ -290,9 +281,8 @@ fn u16_from(v: &jzon::JsonValue) -> Option<u16> {
     u16::try_from(v.as_u64()?).ok()
 }
 
-/// Decode an optional boolean flag: missing and null both mean `false` (a mod
-/// key not held), a bool is itself, any other type rejects the message. Lets
-/// the encoder omit unheld modifiers instead of writing `false` three times.
+/// Decode an optional boolean flag. Missing and null values mean `false`; any
+/// non-boolean value rejects the message.
 fn bool_flag(v: &jzon::JsonValue) -> Option<bool> {
     if v.is_null() {
         return Some(false);
@@ -534,7 +524,7 @@ pub fn encode_command(cmd: &Command) -> (u8, Vec<u8>) {
                 Key::Esc => "esc",
             };
             let _ = o.insert("k", tag);
-            // Absent mod keys encode a held-nothing bit; see `bool_flag`.
+            // Omit unheld modifiers; `bool_flag` decodes missing fields as false.
             if mods.shift {
                 let _ = o.insert("sh", true);
             }

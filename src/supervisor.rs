@@ -318,9 +318,7 @@ impl Supervisor {
                     self.notice_refused(id, "mouse input", r.len);
                 }
             }
-            // Keys land here (not as pre-encoded `Input`) for the same reason
-            // as `Paste`/`Mouse`: the byte sequence depends on the child's
-            // cursor-key mode, which only this side of the socket can see.
+            // Encode keys here because the child's cursor-key mode is core-side.
             Command::Key { id, code, mods } => {
                 let refused = self
                     .by_id_mut(id)

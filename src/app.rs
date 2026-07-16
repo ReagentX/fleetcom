@@ -1150,12 +1150,9 @@ impl App {
         Ok(())
     }
 
-    /// Clipboard paste, routed by mode. Attached: shipped whole to the core,
-    /// which encodes it against the child's negotiated paste state. Splitting
-    /// it into per-key events would strip the bracketed-paste framing and turn
-    /// every embedded newline into a submit. Text-entry modes: inserted as one
-    /// string with control characters stripped, so a multi-line clipboard can't
-    /// fake an Enter press.
+    /// Route a clipboard paste by mode. Attached pastes go intact to the core,
+    /// which applies the child's paste mode. Text-entry modes strip control
+    /// characters before inserting the text.
     fn on_paste(&mut self, s: &str) {
         self.status = None;
         match self.mode {
@@ -1332,20 +1329,17 @@ impl App {
     }
 }
 
-/// Translate a crossterm key event into the daemon's semantic `(Key, Mods)`.
-/// Pure translation: the client makes no encoding decision — only the daemon
-/// sees the child's cursor-key mode, so it owns the bytes ([`Task::send_key`]).
-/// Unmappable keys (lock keys, media, keypad-begin, `Null`, …) return `None`
-/// and send nothing, the same silence the byte encoder gave them.
+/// Map a crossterm key event to the semantic key representation sent to the
+/// daemon. Unsupported key codes return `None`.
 fn key_event_to_key(ev: KeyEvent) -> Option<(Key, Mods)> {
-    // SUPER/HYPER/META fall outside xterm's three-bit modifier param; drop them.
+    // The wire format carries only Shift, Alt, and Control modifiers.
     let mods = Mods {
         shift: ev.modifiers.contains(KeyModifiers::SHIFT),
         alt: ev.modifiers.contains(KeyModifiers::ALT),
         ctrl: ev.modifiers.contains(KeyModifiers::CONTROL),
     };
-    // Crossterm already folds Shift into a printable char (Shift+a ⇒ 'A'); the
-    // daemon ignores `mods.shift` for `Char`, so forwarding it is harmless.
+    // Crossterm folds Shift into printable characters; the daemon ignores the
+    // Shift flag when encoding `Key::Char`.
     let code = match ev.code {
         KeyCode::Char(c) => Key::Char(c),
         KeyCode::F(n) => Key::F(n),
@@ -2099,22 +2093,17 @@ mod tests {
         assert_eq!(app.selected_id, Some(1));
     }
 
-    /// The client is a pure translator: a crossterm event becomes a semantic
-    /// `(Key, Mods)`. Bytes are the daemon's job (see `task::key_bytes`); these
-    /// assert only the mapping.
+    /// Supported crossterm keys and modifiers map to their wire representation.
     #[test]
     fn key_event_maps_to_semantic_key() {
-        // Plain char, no modifiers.
         assert_eq!(
             key_event_to_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE)),
             Some((Key::Char('a'), Mods::default()))
         );
-        // Function key passes its number through.
         assert_eq!(
             key_event_to_key(KeyEvent::new(KeyCode::F(5), KeyModifiers::NONE)),
             Some((Key::F(5), Mods::default()))
         );
-        // Each modifier bit lands in its matching Mods field.
         assert_eq!(
             key_event_to_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::SHIFT)),
             Some((
@@ -2145,7 +2134,6 @@ mod tests {
                 }
             ))
         );
-        // Zellij's Alt+Left: the pair the daemon encodes to CSI 1;3D.
         assert_eq!(
             key_event_to_key(KeyEvent::new(KeyCode::Left, KeyModifiers::ALT)),
             Some((
@@ -2158,16 +2146,13 @@ mod tests {
         );
     }
 
-    /// SUPER (and HYPER/META) lie outside xterm's three-bit modifier param, so
-    /// they are dropped; unencodable keys map to `None` and send nothing.
+    /// Unsupported modifier bits are ignored; unsupported key codes are dropped.
     #[test]
     fn unencodable_modifiers_and_keys_are_dropped() {
-        // SUPER is ignored: the pair still maps, just without a super bit.
         assert_eq!(
             key_event_to_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::SUPER)),
             Some((Key::Char('a'), Mods::default()))
         );
-        // A key with no byte encoding is silently dropped.
         assert_eq!(
             key_event_to_key(KeyEvent::new(KeyCode::CapsLock, KeyModifiers::NONE)),
             None
