@@ -3,6 +3,7 @@ authors = ["Christopher Sardegna <fleetcom@reagentx.net>"]
 categories = ["command-line-interface", "command-line-utilities"]
 description = "A fleet-view supervisor for arbitrary shell commands."
 edition = "2024"
+exclude = ["docs/img/*.png", ".github", "docs"]
 keywords = ["cli", "tui", "pty", "supervisor", "process"]
 license = "GPL-3.0-or-later"
 name = "fleetcom"
