@@ -97,7 +97,13 @@ fn resolve_runtime_dir(
 }
 
 fn socket_path() -> PathBuf {
-    runtime_dir().join("default.sock")
+    socket_in(&runtime_dir())
+}
+
+/// Socket path inside an explicit runtime dir: the one place the file name
+/// lives, shared by the env-reading wrapper and the dir-explicit connect path.
+fn socket_in(dir: &Path) -> PathBuf {
+    dir.join("default.sock")
 }
 
 /// Create or validate a user-owned runtime directory with `0700` permissions.
@@ -250,7 +256,22 @@ pub fn connect_ready_bounded() -> io::Result<UnixStream> {
 
 /// Connect to the daemon or start one, then wait up to one second for its socket.
 fn connect_or_autostart() -> io::Result<UnixStream> {
-    let path = socket_path();
+    connect_or_autostart_in(&runtime_dir())
+}
+
+/// The dir-explicit body of [`connect_or_autostart`]: tests drive the refusal
+/// branch directly instead of racing other tests on `FLEETCOM_RUNTIME_DIR`.
+fn connect_or_autostart_in(dir: &Path) -> io::Result<UnixStream> {
+    // Validate before the *first* connect, not just before spawning: both
+    // callers follow a successful connect with a hello carrying this process's
+    // entire env (`LaunchContext::here()`), so a listener on a socket inside a
+    // dir someone else owns (a pre-created `$TMPDIR/fleetcom-$uid` on a shared
+    // `/tmp`) harvests every API key without speaking a byte of the protocol.
+    // The checks in `spawn_daemon` and `run_daemon` never run on this path: a
+    // successful connect skips both. An attacker-owned dir must fail loudly
+    // here, never fall through to the spawn below.
+    ensure_runtime_dir(dir)?;
+    let path = socket_in(dir);
     if let Ok(s) = UnixStream::connect(&path) {
         return Ok(s);
     }
@@ -299,7 +320,13 @@ fn spawn_daemon() -> io::Result<()> {
 /// daemon exit releases the flock, so acquiring it is the completion signal.
 /// A no-op (with a message) if no daemon is running.
 pub fn run_kill() -> io::Result<()> {
-    let lock_path = runtime_dir().join("daemon.lock");
+    let dir = runtime_dir();
+    // Everything below trusts this dir's contents: the lock file's pid becomes
+    // a SIGTERM target, and the no-pid fallback connects to the socket and
+    // sends the env-bearing hello. A planted dir could steer either at an
+    // attacker-chosen victim, so validate before reading anything from it.
+    ensure_runtime_dir(&dir)?;
+    let lock_path = dir.join("daemon.lock");
     let Ok(file) = fs::OpenOptions::new()
         .read(true)
         .write(true)
@@ -441,7 +468,13 @@ pub fn run_daemon() -> io::Result<()> {
             Ok((stream, _)) => {
                 // serve_client does blocking reads; force the accepted stream
                 // blocking regardless of the listener's mode (BSD would inherit).
-                stream.set_nonblocking(false)?;
+                // A failed fcntl is one connection's dead socket, not a listener
+                // fault: propagating it would exit past the Shutdown teardown
+                // below and reap the whole fleet over a client we can drop.
+                if let Err(e) = stream.set_nonblocking(false) {
+                    eprintln!("fleetcom: dropping client, cannot set stream blocking: {e}");
+                    continue;
+                }
                 if serve_client(&mut sup, stream, &term) == ServeOutcome::Shutdown {
                     break;
                 }
@@ -633,6 +666,25 @@ mod tests {
         let path = base.join("runtime");
         fs::write(&path, b"x").unwrap();
         assert!(ensure_runtime_dir(&path).is_err());
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    /// The client's fast path must refuse before its first connect: a hello
+    /// over a socket in an untrusted dir hands the listener this process's
+    /// whole env. A symlinked or plain-file runtime path errors out; it never
+    /// falls through to a connect or a daemon spawn.
+    #[test]
+    fn connect_refuses_untrusted_runtime_dir() {
+        let base = temp("daemon_connect_untrusted");
+        let target = base.join("target");
+        fs::create_dir(&target).unwrap();
+        let link = base.join("link");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        assert!(connect_or_autostart_in(&link).is_err());
+
+        let file = base.join("file");
+        fs::write(&file, b"x").unwrap();
+        assert!(connect_or_autostart_in(&file).is_err());
         let _ = fs::remove_dir_all(&base);
     }
 
