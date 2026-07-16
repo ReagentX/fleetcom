@@ -35,10 +35,10 @@ Resolved in this order:
 | Order | Condition | Path |
 | -- | -- | -- |
 | 1 | `FLEETCOM_RUNTIME_DIR` is set | `$FLEETCOM_RUNTIME_DIR` (verbatim) |
-| 2 | `$XDG_RUNTIME_DIR` is set and non-empty (Linux) | `$XDG_RUNTIME_DIR/fleetcom` |
+| 2 | `$XDG_RUNTIME_DIR` is set and non-empty | `$XDG_RUNTIME_DIR/fleetcom` |
 | 3 | otherwise | `$TMPDIR/fleetcom-$uid` |
 
-On macOS, `$TMPDIR` is already per-user. The `$uid` suffix also separates users when the fallback resolves beneath a shared `/tmp`.
+The `$XDG_RUNTIME_DIR` branch tests the variable, not the platform: systemd sets it on Linux by convention, but any OS that exports it resolves the same path. On macOS, `$TMPDIR` is already per-user. The `$uid` suffix also separates users when the fallback resolves beneath a shared `/tmp`.
 
 ### Config directory (sessions)
 
