@@ -1,16 +1,35 @@
-# fleetcom
+# `fleetcom`
 
-Running several long-lived commands becomes cumbersome once they span terminal panes or need to survive a disconnect. `fleetcom` gives each command its own PTY and exposes every screen through one dashboard. A daemon owns the jobs, so closing the client does not stop them.
+`fleetcom` supervises your local development fleet: multiplexers, application servers, REPLs, builds, tests, and AI agent sessions.
 
-The scope is intentionally narrower than a terminal multiplexer. Each task is one command rather than a persistent shell session, which gives the dashboard explicit state, output, directory, and lifecycle data for every process.
+Running several long-lived commands is pesky once they span terminal panes or need to survive a disconnect. `fleetcom` gives each command its own PTY and exposes every screen through one dashboard. A daemon owns the jobs, so closing the client does not stop them.
+
+## Key Features
+
+### Fleet view
+
+See every task’s state and latest output from one dashboard.
+
+![`fleetcom` fleet view](docs/img/home.png)
+
+### Quick peek
+
+Press `Space` for a quick peek at a task’s live screen without attaching to it.
+
+![`fleetcom` quick peek](docs/img/quickpeek.png)
+
+### Attach and interact
+
+Press `Enter` to take control of a task, then `^\` to return to the fleet without interrupting it.
+
+![`fleetcom` attach](docs/img/attach.png)
 
 ## Operational model
 
 - Runs each command in its own PTY and groups tasks by state, by working directory, or by custom named groups.
-- Provides read-only previews and full interactive attachment.
 - Keeps jobs running after the client disconnects.
 - Saves and reloads task recipes with directories, commands, group assignments, and display names.
-- Saves resumable `claude`, `codex`, and `grok` commands when it can identify their conversations.
+- Preserves supported `claude`, `codex`, and `grok` conversations so saved or rerun tasks can resume them.
 - Launches commands in other directories through the `@` picker.
 
 ## Documentation
@@ -59,14 +78,6 @@ The first ordinary invocation starts the daemon when necessary. `--daemon` is an
 | `Space` | peek at the selected task |
 | `n` | new command in the current directory |
 | `@` | new command in a directory you pick (with completion) |
-| `s` | cycle grouping: by state / by directory / by custom group |
-| `m` | tag the task "in use" (prioritizes it within the active grouping) |
-| `g` | assign the selected task to a named group (picker: pick, create, or clear) |
-| `R` | rename the selected task: a display name shown in place of the command (an empty prompt clears it) |
-| `r` | rerun a finished task; supported agent tasks resume the captured conversation |
-| `X` | kill a running task (`TERM`, then `KILL` after 2 s), or remove a finished one (Shift-gated); removal sweeps any background processes the job left in its group, with the same `TERM`-then-`KILL` grace |
-| `w` | save the current tasks as a session |
-| `o` | load a saved session |
 | `q` | disconnect; leave the daemon and jobs running |
 | `Q` | quit; kill the jobs and stop the daemon |
 
@@ -77,59 +88,32 @@ The first ordinary invocation starts the daemon when necessary. `--daemon` is an
 | `Ctrl-\` | background the task and return to the dashboard |
 | anything else | forwarded to the task's PTY |
 
+[`docs/commands.md`](docs/commands.md) covers every key and launch flag, including the routing mechanics.
+
 ## How it works
 
-### One PTY per command
-
-Every task runs in its own pseudo-terminal, emulated with `alacritty_terminal`. `fleetcom` answers cursor-position and device-attribute queries, renders `?2026` synchronized updates as whole frames, and reflows history after a resize. The dashboard preview, peek overlay, and attached view all read the same emulated screen grid, so full-screen programs such as `vim` and `htop` retain one consistent terminal state across views. Backgrounding changes client focus without notifying the child.
-
-### Input fidelity
-
-Attached input follows the terminal modes reported by the child. Modified Enter becomes `ESC CR` when the terminal reports the modifier. Paste receives bracketed-paste markers only when the child enables them. Mouse events go to children that request a mouse protocol. Full-screen children receive alternate-scroll input only while DECSET 1007 is enabled; otherwise `fleetcom` suppresses wheel events. Each task retains 2,000 lines of scrollback. For inline children, wheel-up or `Shift+PageUp` enters history; paging keys navigate it, while `Esc` or ordinary input returns to live output. [`docs/commands.md`](docs/commands.md) documents the exact routing rules.
-
-### Jobs outlive the UI
-
-A per-user daemon owns the processes and their terminals. `q` disconnects the client but leaves the daemon and its jobs running; the next `fleetcom` invocation reattaches. Each launch uses the environment and working directory of the client that requested it: a job launched from a virtual environment sees that environment even when another client originally started the daemon.
-
-`Q` and `fleetcom --kill` stop the daemon and send `SIGTERM` to each job's process group, followed by `SIGKILL` after a two-second grace period. Sending `SIGTERM`, `SIGINT`, or `SIGHUP` directly to the daemon uses the same shutdown path. `fleetcom --kill` reads the daemon PID from the lock file, so it also works while another client occupies the socket. If the connection drops, the client discards the task snapshot it can no longer verify and offers to reconnect.
-
-Signals target each task's process group. `fleetcom` leaves an exited leader unreaped until final cleanup, preserving the process-group ID so background children remain signalable. A process that creates a new session or double-forks out of the group is outside `fleetcom`'s control.
-
-### Grouping uses two activity windows
-
-The dashboard groups tasks by state (In use / Running / Idle / Completed), working directory, or names assigned with `g`. Activity uses two separate windows. The row glyph changes from `✻` to `∙` after 600 ms without output, while state grouping moves the task to Idle after 10 s. A tool such as `top`, which prints every 1–2 s, can therefore alternate glyphs without moving sections. The glyph reports the short edge; the section reports the debounced state.
-
-Custom groups sort by name, with Unassigned last. `@` opens a directory picker with the current directory first, recently used directories next, and matching subdirectories after them. This makes the launch directory explicit without leaving the dashboard.
-
-### Task names
-
-`R` gives the selected task a display name. The dashboard row and peek title show the name in place of the command; the attached status bar shows `name · command`. An empty prompt clears the name, and rerun preserves it. `fleetcom` removes control characters, trims surrounding whitespace, and limits names to 64 characters.
-
-### Sessions
-
-`w`, `o`, and `fleetcom <name>` save or load named recipes. A recipe retains each task's directory, saved launch command, group assignment, and display name. Loading starts new processes; it does not recover the processes that existed when the recipe was saved. Process continuity comes from the daemon, while sessions provide repeatable launches.
-
-### Agent session resume
-
-Session recipes store commands, which is insufficient for agent CLIs: relaunching a bare `claude`, `codex`, or `grok` command starts another conversation. When `fleetcom` obtains a valid ID, save and rerun (`r`) use `claude --resume '<id>'`, `codex resume '<id>'`, or `grok --resume '<id>'`. Detection is deliberately narrow. Only the bare program word and `fleetcom`'s canonical resume form participate; flags, prompts, subcommands, and shell syntax run and save verbatim. [`agent-resume.md`](src/harness/agent-resume.md) documents the capture evidence, precedence, and failure behavior.
+Every task runs in its own pseudo-terminal, emulated with `alacritty_terminal`. The dashboard preview, peek overlay, and attached view all read the same emulated screen grid, so full-screen programs such as `vim` and `htop` retain one consistent terminal state across views. [`docs/how-it-works.md`](docs/how-it-works.md) documents the terminal emulation, input routing, and activity windows.
 
 ## Scope and tradeoffs
 
-`fleetcom` targets concurrent build, test, watch, server, and interactive-agent processes.
+`fleetcom` targets concurrent build, test, watch, server, and interactive-agent processes. Each task is one command rather than a persistent shell session.
 
-### When to use it
+### When to use `fleetcom`
 
 - Several long-lived commands need one place for observation, tagging, and attachment.
 - Jobs must survive a terminal closing and remain available for reattachment.
 - The same command set is launched often enough to justify a saved session.
+- Agent sessions (`claude`, `codex`, `grok`) must resume their conversations on rerun rather than start new ones.
 
-### When to avoid it
+### When to avoid `fleetcom`
 
-- For interactive multiplexing of persistent shells, use `tmux`; `fleetcom` runs one command per task.
-- It is not a full process manager: the fleet's lifetime is bounded by the daemon's (see the first limitation below).
+- You primarily need persistent interactive shell workspaces; use `tmux` or `zellij` directly. `fleetcom` can supervise a multiplexer, but it does not replace one.
+- You need a full process manager: the fleet’s lifetime is bounded by the daemon’s.
 
 ### Operational limits
 
-- The fleet dies with the daemon. The daemon holds every PTY master, so daemon termination closes the terminals and the kernel sends `SIGHUP` to each task's process group. A clean shutdown (`Q`, `--kill`, or `SIGTERM`) sends `SIGTERM` first and escalates to `SIGKILL` after two seconds. A crash or direct `SIGKILL` skips that grace period. HUP-immune jobs (`nohup`, `trap '' HUP`) can survive, but the next daemon does not own or display them. A panic while serving one client only drops that connection; the daemon process remains the fleet's single point of failure.
+- The fleet dies with the daemon: the daemon process is the fleet's single point of failure.
 - Commands run through the client's non-interactive shell (`$SHELL -c`, or `/bin/sh` when `SHELL` is unset), so functions and aliases defined in `~/.zshrc` are not available.
-- The daemon serves one client at a time. A second `fleetcom` prints a waiting notice, then attaches when the active client disconnects (`q`).
+- The daemon serves one client at a time.
+
+[Operational constraints](docs/README.md#operational-constraints) documents the shutdown and signal mechanics.

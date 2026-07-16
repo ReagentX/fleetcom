@@ -9,3 +9,6 @@
 
 # tooling
 .claude/
+
+# macOS
+*.DS_Store
