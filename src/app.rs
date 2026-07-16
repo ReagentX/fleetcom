@@ -26,7 +26,8 @@ use crossterm::{
 use crate::{
     path,
     protocol::{
-        Command, Event, Lifecycle, MouseBtn, MouseKind, ScreenView, ScrollAction, TaskView,
+        Command, Event, Key, Lifecycle, Mods, MouseBtn, MouseKind, ScreenView, ScrollAction,
+        TaskView,
     },
     supervisor::Supervisor,
     transport::{ExitIntent, SocketTransport, ThreadTransport, Transport},
@@ -1124,9 +1125,9 @@ impl App {
                 _ => {
                     self.view_scroll = false;
                     if let Some(id) = self.focused_id
-                        && let Some(bytes) = key_to_bytes(k.code, k.modifiers)
+                        && let Some((code, mods)) = key_event_to_key(k)
                     {
-                        self.transport.send(Command::Input { id, bytes });
+                        self.transport.send(Command::Key { id, code, mods });
                     }
                 }
             }
@@ -1142,18 +1143,19 @@ impl App {
             return Ok(());
         }
         if let Some(id) = self.focused_id
-            && let Some(bytes) = key_to_bytes(k.code, k.modifiers)
+            && let Some((code, mods)) = key_event_to_key(k)
         {
-            self.transport.send(Command::Input { id, bytes });
+            self.transport.send(Command::Key { id, code, mods });
         }
         Ok(())
     }
 
     /// Clipboard paste, routed by mode. Attached: shipped whole to the core,
-    /// which encodes it against the child's negotiated paste state. Pushing
-    /// it through `key_to_bytes` would turn every newline into a submit.
-    /// Text-entry modes: inserted as one string with control characters
-    /// stripped, so a multi-line clipboard can't fake an Enter press.
+    /// which encodes it against the child's negotiated paste state. Splitting
+    /// it into per-key events would strip the bracketed-paste framing and turn
+    /// every embedded newline into a submit. Text-entry modes: inserted as one
+    /// string with control characters stripped, so a multi-line clipboard can't
+    /// fake an Enter press.
     fn on_paste(&mut self, s: &str) {
         self.status = None;
         match self.mode {
@@ -1330,59 +1332,41 @@ impl App {
     }
 }
 
-/// Translate supported key events to legacy PTY byte sequences.
-fn key_to_bytes(code: KeyCode, mods: KeyModifiers) -> Option<Vec<u8>> {
-    let ctrl = mods.contains(KeyModifiers::CONTROL);
-    let alt = mods.contains(KeyModifiers::ALT);
-    // Alt prefixes the encoded key with ESC.
-    let meta = |alt: bool, mut bytes: Vec<u8>| {
-        if alt {
-            bytes.insert(0, 0x1b);
-        }
-        bytes
+/// Translate a crossterm key event into the daemon's semantic `(Key, Mods)`.
+/// Pure translation: the client makes no encoding decision — only the daemon
+/// sees the child's cursor-key mode, so it owns the bytes ([`Task::send_key`]).
+/// Unmappable keys (lock keys, media, keypad-begin, `Null`, …) return `None`
+/// and send nothing, the same silence the byte encoder gave them.
+fn key_event_to_key(ev: KeyEvent) -> Option<(Key, Mods)> {
+    // SUPER/HYPER/META fall outside xterm's three-bit modifier param; drop them.
+    let mods = Mods {
+        shift: ev.modifiers.contains(KeyModifiers::SHIFT),
+        alt: ev.modifiers.contains(KeyModifiers::ALT),
+        ctrl: ev.modifiers.contains(KeyModifiers::CONTROL),
     };
-    match code {
-        KeyCode::Char(c) => {
-            let base = if ctrl {
-                let b = c.to_ascii_uppercase() as u8;
-                if c == '?' {
-                    vec![0x7f]
-                } else if (b'@'..=b'_').contains(&b) {
-                    vec![b - b'@']
-                } else {
-                    vec![(c as u8) & 0x1f]
-                }
-            } else {
-                let mut buf = [0u8; 4];
-                c.encode_utf8(&mut buf).as_bytes().to_vec()
-            };
-            Some(meta(alt, base))
-        }
-        KeyCode::Enter => {
-            // Modified Enter uses the meta-prefix sequence, ESC CR.
-            if mods.intersects(KeyModifiers::SHIFT | KeyModifiers::ALT) {
-                Some(b"\x1b\r".to_vec())
-            } else {
-                Some(vec![b'\r'])
-            }
-        }
-        // Preserve Alt on Backspace.
-        KeyCode::Backspace => Some(meta(alt, vec![0x7f])),
-        KeyCode::Tab => Some(vec![b'\t']),
-        KeyCode::BackTab => Some(b"\x1b[Z".to_vec()),
-        KeyCode::Esc => Some(vec![0x1b]),
-        KeyCode::Left => Some(b"\x1b[D".to_vec()),
-        KeyCode::Right => Some(b"\x1b[C".to_vec()),
-        KeyCode::Up => Some(b"\x1b[A".to_vec()),
-        KeyCode::Down => Some(b"\x1b[B".to_vec()),
-        KeyCode::Home => Some(b"\x1b[H".to_vec()),
-        KeyCode::End => Some(b"\x1b[F".to_vec()),
-        KeyCode::PageUp => Some(b"\x1b[5~".to_vec()),
-        KeyCode::PageDown => Some(b"\x1b[6~".to_vec()),
-        KeyCode::Delete => Some(b"\x1b[3~".to_vec()),
-        KeyCode::Insert => Some(b"\x1b[2~".to_vec()),
-        _ => None,
-    }
+    // Crossterm already folds Shift into a printable char (Shift+a ⇒ 'A'); the
+    // daemon ignores `mods.shift` for `Char`, so forwarding it is harmless.
+    let code = match ev.code {
+        KeyCode::Char(c) => Key::Char(c),
+        KeyCode::F(n) => Key::F(n),
+        KeyCode::Up => Key::Up,
+        KeyCode::Down => Key::Down,
+        KeyCode::Left => Key::Left,
+        KeyCode::Right => Key::Right,
+        KeyCode::Home => Key::Home,
+        KeyCode::End => Key::End,
+        KeyCode::PageUp => Key::PageUp,
+        KeyCode::PageDown => Key::PageDown,
+        KeyCode::Insert => Key::Insert,
+        KeyCode::Delete => Key::Delete,
+        KeyCode::Enter => Key::Enter,
+        KeyCode::Tab => Key::Tab,
+        KeyCode::BackTab => Key::BackTab,
+        KeyCode::Backspace => Key::Backspace,
+        KeyCode::Esc => Key::Esc,
+        _ => return None,
+    };
+    Some((code, mods))
 }
 
 /// Split a typed path into (directory-so-far, trailing fragment). The fragment
@@ -2115,55 +2099,82 @@ mod tests {
         assert_eq!(app.selected_id, Some(1));
     }
 
-    /// Modified Enter must stay distinguishable on the wire: `\x1b\r` (the
-    /// meta-prefix encoding), never flattened to the bare `\r` that submits.
+    /// The client is a pure translator: a crossterm event becomes a semantic
+    /// `(Key, Mods)`. Bytes are the daemon's job (see `task::key_bytes`); these
+    /// assert only the mapping.
     #[test]
-    fn modified_enter_keeps_its_modifier() {
+    fn key_event_maps_to_semantic_key() {
+        // Plain char, no modifiers.
         assert_eq!(
-            key_to_bytes(KeyCode::Enter, KeyModifiers::NONE),
-            Some(vec![b'\r'])
+            key_event_to_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE)),
+            Some((Key::Char('a'), Mods::default()))
+        );
+        // Function key passes its number through.
+        assert_eq!(
+            key_event_to_key(KeyEvent::new(KeyCode::F(5), KeyModifiers::NONE)),
+            Some((Key::F(5), Mods::default()))
+        );
+        // Each modifier bit lands in its matching Mods field.
+        assert_eq!(
+            key_event_to_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::SHIFT)),
+            Some((
+                Key::Char('a'),
+                Mods {
+                    shift: true,
+                    ..Mods::default()
+                }
+            ))
         );
         assert_eq!(
-            key_to_bytes(KeyCode::Enter, KeyModifiers::SHIFT),
-            Some(b"\x1b\r".to_vec())
+            key_event_to_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL)),
+            Some((
+                Key::Char('a'),
+                Mods {
+                    ctrl: true,
+                    ..Mods::default()
+                }
+            ))
         );
         assert_eq!(
-            key_to_bytes(KeyCode::Enter, KeyModifiers::ALT),
-            Some(b"\x1b\r".to_vec())
+            key_event_to_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::ALT)),
+            Some((
+                Key::Char('a'),
+                Mods {
+                    alt: true,
+                    ..Mods::default()
+                }
+            ))
         );
-        // Ctrl+Enter has no distinct legacy encoding: plain CR.
+        // Zellij's Alt+Left: the pair the daemon encodes to CSI 1;3D.
         assert_eq!(
-            key_to_bytes(KeyCode::Enter, KeyModifiers::CONTROL),
-            Some(vec![b'\r'])
+            key_event_to_key(KeyEvent::new(KeyCode::Left, KeyModifiers::ALT)),
+            Some((
+                Key::Left,
+                Mods {
+                    alt: true,
+                    ..Mods::default()
+                }
+            ))
         );
     }
 
-    /// Alt prefixes supported character and Backspace encodings with ESC.
+    /// SUPER (and HYPER/META) lie outside xterm's three-bit modifier param, so
+    /// they are dropped; unencodable keys map to `None` and send nothing.
     #[test]
-    fn alt_chords_get_the_meta_prefix() {
+    fn unencodable_modifiers_and_keys_are_dropped() {
+        // SUPER is ignored: the pair still maps, just without a super bit.
         assert_eq!(
-            key_to_bytes(KeyCode::Char('f'), KeyModifiers::ALT),
-            Some(b"\x1bf".to_vec())
+            key_event_to_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::SUPER)),
+            Some((Key::Char('a'), Mods::default()))
+        );
+        // A key with no byte encoding is silently dropped.
+        assert_eq!(
+            key_event_to_key(KeyEvent::new(KeyCode::CapsLock, KeyModifiers::NONE)),
+            None
         );
         assert_eq!(
-            key_to_bytes(
-                KeyCode::Char('f'),
-                KeyModifiers::ALT | KeyModifiers::CONTROL
-            ),
-            Some(vec![0x1b, 0x06])
-        );
-        // Alt prefixes Backspace too.
-        assert_eq!(
-            key_to_bytes(KeyCode::Backspace, KeyModifiers::ALT),
-            Some(vec![0x1b, 0x7f])
-        );
-        assert_eq!(
-            key_to_bytes(KeyCode::Char('f'), KeyModifiers::NONE),
-            Some(b"f".to_vec())
-        );
-        assert_eq!(
-            key_to_bytes(KeyCode::Char('f'), KeyModifiers::CONTROL),
-            Some(vec![0x06])
+            key_event_to_key(KeyEvent::new(KeyCode::Null, KeyModifiers::NONE)),
+            None
         );
     }
 

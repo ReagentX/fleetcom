@@ -2,6 +2,7 @@ use std::path::Path;
 
 use super::*;
 use crate::harness::testutil::{ID as CAP_ID, OTHER as CAP_OTHER};
+use crate::protocol::{Key, Mods};
 use crate::testutil::{now_ms, read_pid, wait_until, write_rollout};
 
 fn here() -> PathBuf {
@@ -2686,5 +2687,84 @@ fn non_agent_entries_survive_save_as_plain_strings() {
             name: None,
         }]
     );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// End-to-end proof of the client→daemon key path on a real PTY: a
+/// `Command::Key` is encoded against the child's *live* cursor-key mode, the
+/// whole reason encoding moved to the daemon. The child turns on
+/// application-cursor mode (DECCKM), so an unmodified Up must arrive as SS3
+/// `ESC O A` — not the CSI `ESC [ A` a stateless client would have sent.
+#[test]
+fn key_command_encodes_against_live_cursor_mode() {
+    let dir = scratch("key_live_mode");
+    let (ready, out) = (dir.join("ready"), dir.join("out"));
+    let mut s = sup(24, 80);
+    hello_with_sh(&mut s, dir.clone());
+
+    // `stty raw` defeats canonical line-buffering so `cat` sees ESC-prefixed
+    // keys that carry no newline. The child turns on DECCKM (app-cursor) first,
+    // then the alternate screen: one reader thread advances the emulator in
+    // byte order, so observing alt-screen ON proves DECCKM is already ON — the
+    // gate we need before sending, since `ready` only proves the bytes reached
+    // the pty, not that the emulator consumed them.
+    let id = spawn_ready(
+        &mut s,
+        format!(
+            "stty raw 2>/dev/null; printf '\\033[?1h\\033[?1049h'; echo r > {r}; cat > {o}",
+            r = ready.display(),
+            o = out.display()
+        ),
+        dir.clone(),
+        &ready,
+    );
+
+    // alt-screen ON (input_hints().1) ⟹ DECCKM already applied.
+    let app_cursor_on = |s: &Supervisor| {
+        s.tasks
+            .iter()
+            .find(|t| t.id == id)
+            .is_some_and(|t| t.input_hints().1)
+    };
+    assert!(
+        wait_until(Duration::from_secs(5), || app_cursor_on(&s)),
+        "child never entered application-cursor mode"
+    );
+
+    // App-cursor case: unmodified Up ⇒ SS3, proof the encoding saw live state.
+    s.apply(Command::Key {
+        id,
+        code: Key::Up,
+        mods: Mods::default(),
+    });
+    let up: &[u8] = b"\x1bOA";
+    assert!(
+        wait_until(Duration::from_secs(5), || {
+            std::fs::read(&out).is_ok_and(|b| b == up)
+        }),
+        "Up under app-cursor must arrive as SS3 ESC O A; got {:?}",
+        std::fs::read(&out)
+    );
+
+    // Zellij case: Alt+Left is modified, so it forces CSI 1;3D even while
+    // app-cursor is on — any modifier selects CSI over SS3.
+    s.apply(Command::Key {
+        id,
+        code: Key::Left,
+        mods: Mods {
+            alt: true,
+            ..Mods::default()
+        },
+    });
+    let total: &[u8] = b"\x1bOA\x1b[1;3D";
+    assert!(
+        wait_until(Duration::from_secs(5), || {
+            std::fs::read(&out).is_ok_and(|b| b == total)
+        }),
+        "Alt+Left must force CSI 1;3D under app-cursor; got {:?}",
+        std::fs::read(&out)
+    );
+
+    s.apply(Command::Kill { id });
     let _ = std::fs::remove_dir_all(&dir);
 }
