@@ -32,12 +32,10 @@ pub fn bytes(n: usize) -> String {
 
 /// Truncate to at most `max` display columns, appending `…` when cut.
 ///
-/// Control chars are flattened to spaces so a stray escape/newline from a
-/// child's output can't corrupt a dashboard row. Width is UAX #11 display
-/// columns (CJK/emoji count 2, combining marks 0), never chars; a wide glyph
-/// that would straddle the cut is dropped whole, so the result can under-fill
-/// by a column but never overflows. Graphemes are not segmented: a ZWJ emoji
-/// sequence can cut mid-sequence and render as a partial glyph.
+/// Control characters become spaces. Width is measured in terminal columns;
+/// characters that cross the cutoff are omitted, so the result may under-fill
+/// but never overflow. Truncation operates on scalar values, so it can split a
+/// multi-character grapheme.
 pub fn truncate(s: &str, max: usize) -> String {
     if max == 0 {
         return String::new();
@@ -54,8 +52,7 @@ pub fn truncate(s: &str, max: usize) -> String {
     let mut used = 0;
     let mut out = String::new();
     for c in clean.chars() {
-        // Post-flatten every char has Some(width); zero-width marks ride along
-        // with their base char for free.
+        // Zero-width characters do not consume the budget.
         let w = c.width().unwrap_or(0);
         if used + w > budget {
             break;
@@ -70,8 +67,7 @@ pub fn truncate(s: &str, max: usize) -> String {
 /// Truncate then right-pad with spaces to exactly `width` display columns.
 pub fn pad(s: &str, width: usize) -> String {
     let mut t = truncate(s, width);
-    // Measure the real width: a dropped straddling glyph leaves truncate
-    // short of `width`, and wide glyphs make char count meaningless.
+    // A dropped wide character can leave the truncated value short.
     let w = t.width();
     if w < width {
         t.extend(std::iter::repeat_n(' ', width - w));
@@ -107,7 +103,7 @@ mod tests {
 
     #[test]
     fn truncate_drops_a_straddling_wide_glyph() {
-        // budget 3: "ab" uses 2, 日 needs 2 with 1 left — dropped whole.
+        // budget 3: "ab" uses 2; 日 needs 2 with 1 left, so dropped whole.
         let t = truncate("ab日本", 4);
         assert_eq!(t, "ab…");
         assert_eq!(t.width(), 3); // under-fills rather than overflowing

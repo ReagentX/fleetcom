@@ -1402,8 +1402,7 @@ fn load_session_renormalizes_hand_edited_groups() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Launch context whose env carries only `FLEETCOM_CONFIG_DIR` (plus any
-/// `extra` pairs), for load-reporting tests that plant recipe files by hand.
+/// Launch context with a session directory and optional environment entries.
 fn config_ctx(config: &Path, cwd: PathBuf, extra: &[(&str, &str)]) -> LaunchContext {
     let mut env: Vec<(std::ffi::OsString, std::ffi::OsString)> = vec![(
         "FLEETCOM_CONFIG_DIR".into(),
@@ -1415,10 +1414,7 @@ fn config_ctx(config: &Path, cwd: PathBuf, extra: &[(&str, &str)]) -> LaunchCont
     LaunchContext { env, cwd }
 }
 
-/// A recipe file with broken JSON must surface the parse error, not claim
-/// the file doesn't exist: `load_in` already produced the precise message,
-/// and reporting absence would send the user hunting for a file that is
-/// right there.
+/// Broken JSON reports a load error rather than a missing session.
 #[test]
 fn load_surfaces_parse_errors_instead_of_absence() {
     let dir = scratch("sess_parse_err");
@@ -1445,7 +1441,7 @@ fn load_surfaces_parse_errors_instead_of_absence() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// A recipe that genuinely doesn't exist still reads as "not found".
+/// Missing recipes report "not found".
 #[test]
 fn load_missing_session_reads_as_not_found() {
     let dir = scratch("sess_missing");
@@ -1464,10 +1460,8 @@ fn load_missing_session_reads_as_not_found() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Entries whose spawn fails must land in a visible bucket: the old
-/// `.is_ok()` gate counted them in neither `spawned` nor `skipped`, so the
-/// status line read as clean success while tasks silently never started.
-/// `SHELL` pointing at a nonexistent binary makes every `admit` fail.
+/// Spawn failures have their own status bucket. An invalid `SHELL` makes both
+/// recipe entries fail to spawn.
 #[test]
 fn load_reports_admit_failures_not_clean_success() {
     let dir = scratch("sess_admit_fail");
@@ -1503,10 +1497,7 @@ fn load_reports_admit_failures_not_clean_success() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// A `Spawn` whose command exceeds `MAX_COMMAND_LEN` is refused with a
-/// notice and no task: execve would fail it with E2BIG anyway, and a task
-/// set of such commands would push `Tasks` snapshots past `MAX_FRAME`,
-/// silently freezing the UI (see `daemon::send_event`).
+/// Direct spawns reject commands above `MAX_COMMAND_LEN` without creating a task.
 #[test]
 fn spawn_refuses_over_length_command() {
     let mut s = sup(24, 80);
@@ -1530,8 +1521,7 @@ fn spawn_refuses_over_length_command() {
     );
 }
 
-/// An over-length recipe entry counts as skipped in the load status; the
-/// in-bounds entry beside it still spawns.
+/// Session loads skip over-length commands and admit valid entries.
 #[test]
 fn load_skips_over_length_commands() {
     let dir = scratch("sess_cmd_len");

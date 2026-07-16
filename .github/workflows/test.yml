@@ -29,7 +29,6 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      # Keep the toolchain here in lockstep with `rust-version` in Cargo.toml:
-      # this job exists to fail when a dependency bump silently raises the floor.
+      # Verify the package with its declared minimum Rust version.
       - run: rustup update 1.88 && rustup default 1.88
       - run: cargo check --all-targets
