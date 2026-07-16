@@ -4,6 +4,10 @@
 //! a command in its own PTY; the dashboard groups them by status, and you can
 //! peek at, attach to, and background any of them.
 
+// fleetcom requires Unix PTYs, domain sockets, and process-group signaling.
+#[cfg(not(unix))]
+compile_error!("fleetcom supports Unix platforms only.");
+
 mod ansi;
 mod app;
 mod core;
@@ -174,6 +178,10 @@ fn main() -> io::Result<()> {
         }
     };
 
+    // Keep SIGINT's default behavior while a connection is waiting, then route
+    // signals through the app before raw mode requires terminal restoration.
+    install_signal_handlers(app.signal_flag())?;
+
     let mut out = io::stdout();
     enable_raw_mode()?;
     // Armed the moment raw mode is on: every exit past this point (the `?`s
@@ -207,7 +215,6 @@ fn main() -> io::Result<()> {
     if let Some(name) = &session {
         app.load_session(name);
     }
-    install_signal_handlers(app.signal_flag())?;
     let result = app.run(&mut out);
 
     // Consuming the guard restores here, at the same point the happy path

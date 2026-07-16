@@ -18,6 +18,7 @@
 use std::{
     fs,
     io::{self, ErrorKind, Read, Write},
+    net::Shutdown,
     os::unix::{
         fs::{DirBuilderExt, MetadataExt, PermissionsExt},
         net::{UnixListener, UnixStream},
@@ -97,36 +98,59 @@ fn resolve_runtime_dir(
 }
 
 fn socket_path() -> PathBuf {
-    runtime_dir().join("default.sock")
+    socket_in(&runtime_dir())
+}
+
+/// Return the daemon socket path under `dir`.
+fn socket_in(dir: &Path) -> PathBuf {
+    dir.join("default.sock")
 }
 
 /// Create or validate a user-owned runtime directory with `0700` permissions.
 fn ensure_runtime_dir(dir: &Path) -> io::Result<()> {
     match fs::symlink_metadata(dir) {
-        Ok(md) => {
-            if !md.file_type().is_dir() {
-                return Err(io::Error::new(
-                    ErrorKind::AlreadyExists,
-                    "runtime path exists but is not a directory",
-                ));
-            }
-            if md.uid() != nix::unistd::getuid().as_raw() {
-                return Err(io::Error::new(
-                    ErrorKind::PermissionDenied,
-                    "runtime dir is not owned by this user",
-                ));
-            }
-            if md.permissions().mode() & 0o077 != 0 {
-                fs::set_permissions(dir, fs::Permissions::from_mode(0o700))?;
-            }
-            Ok(())
+        Ok(md) => validate_runtime_dir(dir, &md),
+        Err(e) if e.kind() == ErrorKind::NotFound => {
+            fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(dir)?;
+            // `create` also succeeds if a directory appeared after the initial
+            // lookup, so validate the current path metadata.
+            let md = fs::symlink_metadata(dir)?;
+            validate_runtime_dir(dir, &md)
         }
-        Err(e) if e.kind() == ErrorKind::NotFound => fs::DirBuilder::new()
-            .recursive(true)
-            .mode(0o700)
-            .create(dir),
         Err(e) => Err(e),
     }
+}
+
+/// Require a real, user-owned directory without group or other write access.
+fn validate_runtime_dir(dir: &Path, md: &fs::Metadata) -> io::Result<()> {
+    if !md.file_type().is_dir() {
+        return Err(io::Error::new(
+            ErrorKind::AlreadyExists,
+            "runtime path exists but is not a directory",
+        ));
+    }
+    if md.uid() != nix::unistd::getuid().as_raw() {
+        return Err(io::Error::new(
+            ErrorKind::PermissionDenied,
+            "runtime dir is not owned by this user",
+        ));
+    }
+    let mode = md.permissions().mode() & 0o777;
+    // Reject write access because untrusted directory entries may already
+    // exist. Other group or other permissions can be removed safely.
+    if mode & 0o022 != 0 {
+        return Err(io::Error::new(
+            ErrorKind::PermissionDenied,
+            "runtime dir is writable by other users; refusing to trust its contents",
+        ));
+    }
+    if mode & 0o077 != 0 {
+        fs::set_permissions(dir, fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
 }
 
 /// Read one frame under a deadline, restoring the unbounded default after.
@@ -250,7 +274,15 @@ pub fn connect_ready_bounded() -> io::Result<UnixStream> {
 
 /// Connect to the daemon or start one, then wait up to one second for its socket.
 fn connect_or_autostart() -> io::Result<UnixStream> {
-    let path = socket_path();
+    connect_or_autostart_in(&runtime_dir())
+}
+
+/// Validate `dir` before the first daemon connection attempt.
+fn connect_or_autostart_in(dir: &Path) -> io::Result<UnixStream> {
+    // Validate before connecting because the hello sends the client's
+    // environment and a successful connection skips daemon-side validation.
+    ensure_runtime_dir(dir)?;
+    let path = socket_in(dir);
     if let Ok(s) = UnixStream::connect(&path) {
         return Ok(s);
     }
@@ -299,7 +331,11 @@ fn spawn_daemon() -> io::Result<()> {
 /// daemon exit releases the flock, so acquiring it is the completion signal.
 /// A no-op (with a message) if no daemon is running.
 pub fn run_kill() -> io::Result<()> {
-    let lock_path = runtime_dir().join("daemon.lock");
+    let dir = runtime_dir();
+    // The lock PID is a signal target, and the socket receives the client's
+    // environment, so validate the directory before reading either file.
+    ensure_runtime_dir(&dir)?;
+    let lock_path = dir.join("daemon.lock");
     let Ok(file) = fs::OpenOptions::new()
         .read(true)
         .write(true)
@@ -441,7 +477,12 @@ pub fn run_daemon() -> io::Result<()> {
             Ok((stream, _)) => {
                 // serve_client does blocking reads; force the accepted stream
                 // blocking regardless of the listener's mode (BSD would inherit).
-                stream.set_nonblocking(false)?;
+                // A stream setup failure affects only this client; keep the
+                // daemon and its tasks available to later connections.
+                if let Err(e) = stream.set_nonblocking(false) {
+                    eprintln!("fleetcom: dropping client, cannot set stream blocking: {e}");
+                    continue;
+                }
                 if serve_client(&mut sup, stream, &term) == ServeOutcome::Shutdown {
                     break;
                 }
@@ -564,11 +605,10 @@ fn serve_client(sup: &mut Supervisor, stream: UnixStream, stop: &AtomicBool) -> 
     // Install the waker so task reader threads wake this loop on output; cleared
     // when we return, so their signals stop reaching a defunct receiver.
     sup.set_waker(wake_tx.clone());
-    // Reader thread: block on frames, decode, forward as `Wake::Cmd`. Ends on EOF
-    // (client gone) or when the channel closes (this loop returned). Detached,
-    // never joined, so a half-closing client can't wedge the daemon. A final
-    // `Hangup` lets the loop notice the client left at once, not on a later write.
-    thread::spawn(move || {
+    // Block on frames and forward decoded commands. EOF or a read error sends
+    // `Hangup`, waking the serve loop immediately. Cleanup below shuts down the
+    // socket to interrupt this thread on other exit paths.
+    let reader = thread::spawn(move || {
         let mut read = read;
         while let Ok((kind, payload)) = read_frame(&mut read) {
             if let Some(cmd) = decode_command(kind, &payload)
@@ -596,6 +636,11 @@ fn serve_client(sup: &mut Supervisor, stream: UnixStream, stop: &AtomicBool) -> 
     // asked for.
     sup.clear_waker();
     sup.clear_watch();
+    // Shut down the socket before joining the reader. Dropping `write` alone
+    // would not interrupt a blocking read through the cloned descriptor, so an
+    // idle client could otherwise retain the reader thread indefinitely.
+    let _ = write.shutdown(Shutdown::Both);
+    let _ = reader.join();
     match outcome {
         Ok(LoopExit::Shutdown) => ServeOutcome::Shutdown,
         Ok(LoopExit::ClientGone) => ServeOutcome::Disconnected,
@@ -633,6 +678,22 @@ mod tests {
         let path = base.join("runtime");
         fs::write(&path, b"x").unwrap();
         assert!(ensure_runtime_dir(&path).is_err());
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    /// Connection setup rejects symlinked and non-directory runtime paths.
+    #[test]
+    fn connect_refuses_untrusted_runtime_dir() {
+        let base = temp("daemon_connect_untrusted");
+        let target = base.join("target");
+        fs::create_dir(&target).unwrap();
+        let link = base.join("link");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        assert!(connect_or_autostart_in(&link).is_err());
+
+        let file = base.join("file");
+        fs::write(&file, b"x").unwrap();
+        assert!(connect_or_autostart_in(&file).is_err());
         let _ = fs::remove_dir_all(&base);
     }
 
@@ -733,6 +794,41 @@ mod tests {
         let mode = fs::symlink_metadata(&path).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o700, "dir must be private");
         ensure_runtime_dir(&path).unwrap();
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    /// Reject group- or other-writable directories because they may already
+    /// contain untrusted entries.
+    #[test]
+    fn ensure_runtime_dir_rejects_a_writable_dir() {
+        let base = temp("daemon_writable");
+        for bits in [0o020, 0o002, 0o022] {
+            let path = base.join(format!("dir_{bits:o}"));
+            fs::create_dir_all(&path).unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o700 | bits)).unwrap();
+            assert!(
+                ensure_runtime_dir(&path).is_err(),
+                "mode 0o{:o} must be refused",
+                0o700 | bits
+            );
+        }
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    /// Remove group and other read/execute permissions from a valid directory.
+    #[test]
+    fn ensure_runtime_dir_tightens_harmless_bits() {
+        let base = temp("daemon_tighten");
+        let path = base.join("runtime");
+        fs::create_dir_all(&path).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        ensure_runtime_dir(&path).unwrap();
+        let mode = fs::symlink_metadata(&path).unwrap().permissions().mode();
+        assert_eq!(
+            mode & 0o777,
+            0o700,
+            "harmless bits must be tightened to 0700"
+        );
         let _ = fs::remove_dir_all(&base);
     }
 }

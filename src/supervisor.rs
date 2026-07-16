@@ -212,12 +212,15 @@ impl Supervisor {
         }
     }
 
-    /// Forget the watch target on disconnect. The watch belongs to the
-    /// connection, not the task set: without this, the next client would be
-    /// streamed full `Screen` frames for a task it never asked about. Its own
-    /// watch state starts `None`, so it never sends the `Watch{None}` that
-    /// would stop them.
+    /// Clear connection-owned watch state and restore the watched task's live
+    /// viewport before another client connects.
     pub fn clear_watch(&mut self) {
+        // Restore the previous target to live output.
+        if let Some(old) = self.watched
+            && let Some(t) = self.by_id_mut(old)
+        {
+            t.scroll_view(ScrollAction::Live);
+        }
         self.watched = None;
         self.last_screen = None;
     }
@@ -645,6 +648,11 @@ impl Supervisor {
                 // would straight-SIGKILL stragglers of the old run.
                 let mut old = std::mem::replace(&mut self.tasks[i], fresh);
                 old.terminate();
+                // Delete the displaced run's capture after deriving its resume
+                // command. Use the task's path because capture roots can vary.
+                if let Some(cap) = &old.capture_file {
+                    let _ = std::fs::remove_file(cap);
+                }
                 self.graveyard.push(old);
                 // Reset the fingerprint for the replacement task's screen.
                 if self.watched == Some(id) {

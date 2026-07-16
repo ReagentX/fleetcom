@@ -35,14 +35,14 @@ Resolved in this order:
 | Order | Condition | Path |
 | -- | -- | -- |
 | 1 | `FLEETCOM_RUNTIME_DIR` is set | `$FLEETCOM_RUNTIME_DIR` (verbatim) |
-| 2 | `$XDG_RUNTIME_DIR` is set and non-empty (Linux) | `$XDG_RUNTIME_DIR/fleetcom` |
+| 2 | `$XDG_RUNTIME_DIR` is set and non-empty | `$XDG_RUNTIME_DIR/fleetcom` |
 | 3 | otherwise | `$TMPDIR/fleetcom-$uid` |
 
-On macOS, `$TMPDIR` is already per-user. The `$uid` suffix also separates users when the fallback resolves beneath a shared `/tmp`.
+`$XDG_RUNTIME_DIR` is honored on every supported platform. On macOS, `$TMPDIR` is already per-user. The `$uid` suffix also separates users when the fallback resolves beneath a shared `/tmp`.
 
 ### Config directory (sessions)
 
-Holds saved sessions under a `sessions/` subdirectory: one `<name>.json` per session. See [Sessions](sessions.md) for the format.
+Holds saved sessions under a `sessions/` subdirectory: one sanitized-name `.json` file per session. See [Sessions](sessions.md) for the format.
 
 | Order | Condition | Path |
 | -- | -- | -- |
@@ -50,7 +50,7 @@ Holds saved sessions under a `sessions/` subdirectory: one `<name>.json` per ses
 | 2 | Linux | `${XDG_CONFIG_HOME:-~/.config}/fleetcom/sessions` |
 | 2 | macOS | `~/Library/Application Support/fleetcom/sessions` |
 
-The platform default is [`dirs::config_dir()`](https://docs.rs/dirs/latest/dirs/fn.config_dir.html) joined with `fleetcom`. The directory is created on the first save.
+The platform default is [`dirs::config_dir()`](https://docs.rs/dirs/latest/dirs/fn.config_dir.html) joined with `fleetcom`. The first save creates missing session directories with mode `0700`; recipe files use mode `0600`.
 
 ## First-run walkthrough
 
@@ -160,7 +160,7 @@ A second `fleetcom` prints a waiting notice, then attaches when the active clien
 
 ### Shutdown is graceful-first
 
-`X`, `Q`, `--kill`, and daemon signals send `SIGTERM` to the job's *process group* and escalate to `SIGKILL` after two seconds. `fleetcom` holds an exited leader unreaped until task removal, which reserves the process-group ID and keeps background children signalable. A child created by `cmd &` in a non-interactive shell remains in that group. A process that calls `setsid` or double-forks out of the group escapes this sweep and must be terminated separately
+`X`, `Q`, `--kill`, and daemon shutdown signals send `SIGTERM` to each job's *process group*, then escalate to `SIGKILL` after two seconds. Removing one task (`X`) keeps an exited leader unreaped through escalation, reserving the process-group ID so background children remain signalable. During full shutdown (`Q`/`--kill`), checking whether a group is empty reaps its exited leader. A `TERM`-ignoring member that outlives the leader can then become unsafe to signal by group ID and survive daemon shutdown. A child created by `cmd &` in a non-interactive shell normally remains in its parent's group. A process that calls `setsid` or otherwise leaves the group is outside the sweep and must be terminated separately
 
 ### `--foreground` is ephemeral
 

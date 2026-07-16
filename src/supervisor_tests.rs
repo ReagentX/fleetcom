@@ -462,6 +462,39 @@ fn clear_watch_stops_screen_stream_and_resets_dedup() {
     );
 }
 
+/// `clear_watch` restores the watched task's live viewport.
+#[test]
+fn clear_watch_snaps_the_watched_task_live() {
+    // Use a short grid to build scrollback quickly.
+    let mut s = sup(6, 80);
+    s.apply(Command::Spawn {
+        command: "seq 1 200; sleep 30".into(),
+        cwd: here(),
+        group: None,
+    });
+    let id = first_id(&mut s);
+    s.apply(Command::Watch { id: Some(id) });
+
+    // Retry until output has produced retained history.
+    let scrolled = wait_until(Duration::from_secs(5), || {
+        s.tick();
+        let _ = s.drain();
+        s.apply(Command::Scrollback {
+            id,
+            action: ScrollAction::Up(3),
+        });
+        s.tasks[0].scroll_offset() > 0
+    });
+    assert!(scrolled, "the task never accrued scrollback");
+
+    s.clear_watch();
+    assert_eq!(
+        s.tasks[0].scroll_offset(),
+        0,
+        "disconnect must return the watched task's viewport to live"
+    );
+}
+
 /// `Restart`'s contract: a finished task reruns in place (same id, tag
 /// carried over), and the command really re-executes (the marker file
 /// gains one line per run).
@@ -1655,7 +1688,7 @@ fn spawn_resuming_claude_injects_only_the_capture_channel() {
 }
 
 /// Rerun prefers the capture-file ID, stores the resulting resume command,
-/// and retains the displaced run's capture file while that run is reaped.
+/// and deletes the displaced run's capture after deriving the resume command.
 #[test]
 fn rerun_resumes_the_captured_conversation() {
     use crate::protocol::Lifecycle;
@@ -1704,11 +1737,10 @@ fn rerun_resumes_the_captured_conversation() {
         reap_until(&mut s, Duration::from_secs(5), |s| s.graveyard.is_empty()),
         "the displaced run was never collected"
     );
-    // The old run's file is unreachable from the fresh run and survives
-    // as bounded litter: install never deletes.
+    // The resume command retains the ID after the source capture is deleted.
     assert!(
-        cap.exists(),
-        "rerun must not delete the old run's capture file"
+        !cap.exists(),
+        "rerun must delete the displaced run's capture file"
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -1753,8 +1785,12 @@ fn rerun_cannot_read_the_old_runs_stale_capture() {
     let new_cap = s.tasks[0].capture_file.clone().expect("capture file set");
     assert_ne!(new_cap, old_cap, "the fresh run needs its own capture file");
     assert_eq!(s.tasks[0].command, format!("claude --resume '{CAP_ID}'"));
+    assert!(
+        !old_cap.exists(),
+        "rerun must delete the displaced run's capture file"
+    );
 
-    // A later write from the displaced run remains in its capture file.
+    // A late hook write can recreate the old path, but the new run cannot read it.
     std::fs::write(&old_cap, &stale).unwrap();
     let text = save_and_read(&mut s, &config, "stalecap");
     assert!(
@@ -1765,8 +1801,6 @@ fn rerun_cannot_read_the_old_runs_stale_capture() {
         !text.contains(CAP_OTHER),
         "the old run's stale capture must be unreachable; got {text}"
     );
-    // Bounded litter: install never deletes the superseded file.
-    assert!(old_cap.exists());
     let _ = std::fs::remove_dir_all(&dir);
 }
 

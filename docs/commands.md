@@ -79,7 +79,7 @@ Tasks retain 2,000 lines of scrollback. While attached to an inline child, wheel
 
 #### Detach vs. quit
 
-`q` (and `Ctrl-C`) disconnects the client and leaves the daemon and its jobs running; the next `fleetcom` reattaches. `Q` kills every job (`TERM` to each process group, `KILL` after a 2 s grace for any that ignore it) and stops the daemon. `Ctrl-C` is intercepted only in the dashboard; while attached it belongs to the child.
+From the dashboard, `q` or `Ctrl-C` disconnects the client and leaves the daemon and its jobs running; the next `fleetcom` reattaches. `Q` stops the daemon after sending `TERM` to each job's process group, then `KILL` after a 2 s grace. Processes that have moved to another group are outside this sweep. A `TERM`-ignoring member can also survive if its leader exits during shutdown, because checking group emptiness releases the process-group ID reservation before escalation (see [Shutdown is graceful-first](README.md#shutdown-is-graceful-first)). Outside attached mode, `Ctrl-C` disconnects the client; while attached, it belongs to the child. In prompts and pickers, `Esc` cancels without disconnecting.
 
 #### Grouping and tagging
 

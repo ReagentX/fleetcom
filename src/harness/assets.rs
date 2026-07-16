@@ -140,6 +140,15 @@ impl CaptureAssets {
     }
 }
 
+/// Remove this supervisor's capture namespace on drop.
+impl Drop for CaptureAssets {
+    fn drop(&mut self) {
+        // Ignore shutdown cleanup errors and preserve sibling namespaces under
+        // the shared capture root.
+        let _ = fs::remove_dir_all(&self.dir);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
@@ -478,6 +487,29 @@ mod tests {
             .unwrap();
         assert!(child.wait().unwrap().success());
         assert_eq!(fs::read_to_string(&cap).unwrap(), payload);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Drop removes only the owned namespace and its contents.
+    #[test]
+    fn drop_removes_only_the_incarnation_namespace() {
+        let root = temp("assets_drop");
+        let sibling = root.join("99999-0123456789ab");
+        fs::create_dir_all(&sibling).unwrap();
+        fs::write(sibling.join("task-1-0.json"), "{}").unwrap();
+
+        let assets = CaptureAssets::install(&root, std::process::id()).unwrap();
+        let ns = namespace(&assets, &root);
+        // Namespace cleanup includes task capture files.
+        fs::write(assets.paths_for(1, 0).capture_file, "{}").unwrap();
+        drop(assets);
+
+        assert!(!ns.exists(), "drop must remove the incarnation namespace");
+        assert!(root.exists(), "drop must leave the shared root");
+        assert!(
+            sibling.join("task-1-0.json").exists(),
+            "drop must never touch another process's namespace"
+        );
         let _ = fs::remove_dir_all(&root);
     }
 
