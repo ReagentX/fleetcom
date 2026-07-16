@@ -160,7 +160,7 @@ A second `fleetcom` prints a waiting notice, then attaches when the active clien
 
 ### Shutdown is graceful-first
 
-`X`, `Q`, `--kill`, and daemon signals send `SIGTERM` to the job's *process group* and escalate to `SIGKILL` after two seconds. `fleetcom` holds an exited leader unreaped until task removal, which reserves the process-group ID and keeps background children signalable. A child created by `cmd &` in a non-interactive shell remains in that group. A process that calls `setsid` or double-forks out of the group escapes this sweep and must be terminated separately
+`X`, `Q`, `--kill`, and daemon shutdown signals send `SIGTERM` to each job's *process group*, then escalate to `SIGKILL` after two seconds. Removing one task (`X`) keeps an exited leader unreaped through escalation, reserving the process-group ID so background children remain signalable. During full shutdown (`Q`/`--kill`), checking whether a group is empty reaps its exited leader. A `TERM`-ignoring member that outlives the leader can then become unsafe to signal by group ID and survive daemon shutdown. A child created by `cmd &` in a non-interactive shell normally remains in its parent's group. A process that calls `setsid` or otherwise leaves the group is outside the sweep and must be terminated separately
 
 ### `--foreground` is ephemeral
 
