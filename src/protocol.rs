@@ -90,6 +90,13 @@ pub enum Command {
         col: u16,
         row: u16,
     },
+    /// One key press over an attached task, carried semantically rather than
+    /// pre-encoded. Routing is core-side for the same reason as `Paste` and
+    /// `Mouse`: the bytes a key produces depend on the child's cursor-key mode
+    /// (DECCKM / DECSET 1), which lives in its emulator. The client cannot see
+    /// it, so a client that byte-encoded arrows would pick the wrong SS3-vs-CSI
+    /// form and drop the modifier combinations the child's mode dictates.
+    Key { id: u64, code: Key, mods: Mods },
     /// Move a task's scrollback viewport.
     Scrollback { id: u64, action: ScrollAction },
     /// Write the current task set as a named session recipe.
@@ -129,6 +136,52 @@ pub enum MouseKind {
     Press(MouseBtn),
     Drag(MouseBtn),
     Release(MouseBtn),
+}
+
+/// A semantic key press in a [`Command::Key`], mirroring the keys the client
+/// can produce. Unmappable keys are never carried: the client only sends what
+/// encodes to bytes, so there is no `Null`/unmappable variant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Key {
+    Char(char),
+    /// Function-key number. `1..=12` encode; anything else encodes to nothing.
+    F(u8),
+    Up,
+    Down,
+    Left,
+    Right,
+    Home,
+    End,
+    PageUp,
+    PageDown,
+    Insert,
+    Delete,
+    Enter,
+    Tab,
+    BackTab,
+    Backspace,
+    Esc,
+}
+
+/// The modifier state a [`Command::Key`] carries: exactly the three bits xterm's
+/// modifier parameter is built from. Shift on a printable key is already folded
+/// into the `char`; it matters here only for the nav/cursor/function encodings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Mods {
+    pub shift: bool,
+    pub alt: bool,
+    pub ctrl: bool,
+}
+
+impl Mods {
+    /// xterm's modifier parameter `1 + shift + 2·alt + 4·ctrl`, or `None` when
+    /// unmodified. `None` is load-bearing twice: the unmodified sequence omits
+    /// the `;m` field, and it is also what selects the SS3-vs-CSI cursor-key
+    /// form (any modifier forces CSI even in application-cursor mode).
+    pub fn param(self) -> Option<u8> {
+        let bits = self.shift as u8 + 2 * self.alt as u8 + 4 * self.ctrl as u8;
+        (bits != 0).then_some(1 + bits)
+    }
 }
 
 /// A core→client message. The client keeps a local mirror of the task set and
@@ -235,6 +288,16 @@ fn path_from_b64(v: &jzon::JsonValue) -> Option<PathBuf> {
 /// Decode a JSON number as a `u16`, rejecting out-of-range values.
 fn u16_from(v: &jzon::JsonValue) -> Option<u16> {
     u16::try_from(v.as_u64()?).ok()
+}
+
+/// Decode an optional boolean flag: missing and null both mean `false` (a mod
+/// key not held), a bool is itself, any other type rejects the message. Lets
+/// the encoder omit unheld modifiers instead of writing `false` three times.
+fn bool_flag(v: &jzon::JsonValue) -> Option<bool> {
+    if v.is_null() {
+        return Some(false);
+    }
+    v.as_bool()
 }
 
 /// Decode an optional-string field: missing and null both mean the cleared
@@ -440,6 +503,48 @@ pub fn encode_command(cmd: &Command) -> (u8, Vec<u8>) {
             let _ = o.insert("col", *col as u64);
             let _ = o.insert("row", *row as u64);
         }
+        Command::Key { id, code, mods } => {
+            let _ = o.insert("t", "key");
+            let _ = o.insert("id", *id);
+            // A short tag names the variant; `Char`/`F` carry an extra field.
+            let tag = match code {
+                Key::Char(c) => {
+                    let mut b = [0u8; 4];
+                    let _ = o.insert("ch", &*c.encode_utf8(&mut b));
+                    "ch"
+                }
+                Key::F(n) => {
+                    let _ = o.insert("n", *n as u64);
+                    "f"
+                }
+                Key::Up => "up",
+                Key::Down => "dn",
+                Key::Left => "lt",
+                Key::Right => "rt",
+                Key::Home => "home",
+                Key::End => "end",
+                Key::PageUp => "pgup",
+                Key::PageDown => "pgdn",
+                Key::Insert => "ins",
+                Key::Delete => "del",
+                Key::Enter => "ent",
+                Key::Tab => "tab",
+                Key::BackTab => "btab",
+                Key::Backspace => "bs",
+                Key::Esc => "esc",
+            };
+            let _ = o.insert("k", tag);
+            // Absent mod keys encode a held-nothing bit; see `bool_flag`.
+            if mods.shift {
+                let _ = o.insert("sh", true);
+            }
+            if mods.alt {
+                let _ = o.insert("al", true);
+            }
+            if mods.ctrl {
+                let _ = o.insert("ct", true);
+            }
+        }
         Command::Scrollback { id, action } => {
             let _ = o.insert("t", "sb");
             let _ = o.insert("id", *id);
@@ -549,6 +654,45 @@ pub fn decode_command(kind: u8, payload: &[u8]) -> Option<Command> {
                 },
                 col: u16_from(&v["col"])?,
                 row: u16_from(&v["row"])?,
+            }
+        }
+        "key" => {
+            let code = match v["k"].as_str()? {
+                "ch" => {
+                    // Exactly one char: a multi-char string is malformed.
+                    let mut it = v["ch"].as_str()?.chars();
+                    let c = it.next()?;
+                    if it.next().is_some() {
+                        return None;
+                    }
+                    Key::Char(c)
+                }
+                "f" => Key::F(u8::try_from(v["n"].as_u64()?).ok()?),
+                "up" => Key::Up,
+                "dn" => Key::Down,
+                "lt" => Key::Left,
+                "rt" => Key::Right,
+                "home" => Key::Home,
+                "end" => Key::End,
+                "pgup" => Key::PageUp,
+                "pgdn" => Key::PageDown,
+                "ins" => Key::Insert,
+                "del" => Key::Delete,
+                "ent" => Key::Enter,
+                "tab" => Key::Tab,
+                "btab" => Key::BackTab,
+                "bs" => Key::Backspace,
+                "esc" => Key::Esc,
+                _ => return None,
+            };
+            Command::Key {
+                id: v["id"].as_u64()?,
+                code,
+                mods: Mods {
+                    shift: bool_flag(&v["sh"])?,
+                    alt: bool_flag(&v["al"])?,
+                    ctrl: bool_flag(&v["ct"])?,
+                },
             }
         }
         "sb" => Command::Scrollback {
@@ -800,6 +944,34 @@ mod tests {
                 kind: MouseKind::Release(MouseBtn::Right),
                 col: 10,
                 row: 5,
+            },
+            Command::Key {
+                id: 9,
+                code: Key::Char('λ'),
+                mods: Mods::default(),
+            },
+            Command::Key {
+                id: 9,
+                code: Key::F(7),
+                mods: Mods {
+                    ctrl: true,
+                    ..Mods::default()
+                },
+            },
+            Command::Key {
+                id: 9,
+                // A modified arrow carries all three bits through the wire.
+                code: Key::Left,
+                mods: Mods {
+                    shift: true,
+                    alt: true,
+                    ctrl: true,
+                },
+            },
+            Command::Key {
+                id: 9,
+                code: Key::Enter,
+                mods: Mods::default(),
             },
             Command::Scrollback {
                 id: 3,

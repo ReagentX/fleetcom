@@ -318,6 +318,17 @@ impl Supervisor {
                     self.notice_refused(id, "mouse input", r.len);
                 }
             }
+            // Keys land here (not as pre-encoded `Input`) for the same reason
+            // as `Paste`/`Mouse`: the byte sequence depends on the child's
+            // cursor-key mode, which only this side of the socket can see.
+            Command::Key { id, code, mods } => {
+                let refused = self
+                    .by_id_mut(id)
+                    .and_then(|t| t.send_key(code, mods).err());
+                if let Some(r) = refused {
+                    self.notice_refused(id, "key input", r.len);
+                }
+            }
             Command::Scrollback { id, action } => {
                 if let Some(t) = self.by_id_mut(id) {
                     t.scroll_view(action);
