@@ -2,8 +2,6 @@
 
 `fleetcom` supervises your local development fleet: multiplexers, application servers, REPLs, builds, tests, and AI agent sessions.
 
-Running several long-lived commands is pesky once they span terminal panes or need to survive a disconnect. `fleetcom` gives each command its own PTY and exposes every screen through one dashboard. A daemon owns the jobs, so closing the client does not stop them.
-
 ## Key Features
 
 ### Fleet view
@@ -26,11 +24,13 @@ Press `Enter` to take control of a task, then `^\` to return to the fleet withou
 
 ## Operational model
 
-- Runs each command in its own PTY and groups tasks by state, by working directory, or by custom named groups.
-- Keeps jobs running after the client disconnects.
-- Saves and reloads task recipes with directories, commands, group assignments, and display names.
-- Preserves supported `claude`, `codex`, and `grok` conversations so saved or rerun tasks can resume them.
-- Launches commands in other directories through the `@` picker.
+Running several long-lived commands is pesky once they span terminal panes or need to survive a disconnect. `fleetcom`:
+
+- Runs each command in its own PTY and groups tasks by state, working directory, or named group.
+- Delegates jobs to a daemon, so a disconnecting client stops nothing.
+- Saves and reloads task recipes: directories, commands, group assignments, and display names.
+- Reruns a completed task in place, keeping its identity, group, and name.
+- Preserves `claude`, `codex`, and `grok` conversations, so saved or rerun tasks resume instead of starting fresh.
 
 ## Documentation
 
