@@ -216,8 +216,17 @@ impl Supervisor {
     /// connection, not the task set: without this, the next client would be
     /// streamed full `Screen` frames for a task it never asked about. Its own
     /// watch state starts `None`, so it never sends the `Watch{None}` that
-    /// would stop them.
+    /// would stop them. The viewport reset is the same ownership rule: a
+    /// client that detaches while scrolled back would otherwise leave the
+    /// task frozen in scrollback, showing the next client stale content
+    /// until its first keystroke snaps live.
     pub fn clear_watch(&mut self) {
+        // Mirror the Watch-switch path: the old target returns to live output.
+        if let Some(old) = self.watched
+            && let Some(t) = self.by_id_mut(old)
+        {
+            t.scroll_view(ScrollAction::Live);
+        }
         self.watched = None;
         self.last_screen = None;
     }
@@ -645,6 +654,14 @@ impl Supervisor {
                 // would straight-SIGKILL stragglers of the old run.
                 let mut old = std::mem::replace(&mut self.tasks[i], fresh);
                 old.terminate();
+                // Remove the displaced run's capture file, as `Remove` does:
+                // the resume command above already read it, and the
+                // replacement's per-run path can never name it. The task's
+                // own recorded path is the authority; the current client may
+                // use a different capture root.
+                if let Some(cap) = &old.capture_file {
+                    let _ = std::fs::remove_file(cap);
+                }
                 self.graveyard.push(old);
                 // Reset the fingerprint for the replacement task's screen.
                 if self.watched == Some(id) {
