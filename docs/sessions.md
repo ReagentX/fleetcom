@@ -18,25 +18,33 @@ The filename derives from the session name. `fleetcom` trims leading and trailin
 
 ## Format
 
-A session is a JSON object that maps each working directory to an ordered list of entries. An entry with neither a group nor a name is a command string. An entry carrying either is an object with `cmd` plus the optional `group` and `name` fields:
+A session file is a JSON object with two fields. `name` holds the session name as typed, trimmed but not sanitized. `dirs` maps each working directory to an ordered list of entries. An entry with neither a group nor a name is a command string. An entry carrying either is an object with `cmd` plus the optional `group` and `name` fields:
 
 ```json
 {
-  "/home/you/work/api": [
-    "cargo watch -x test",
-    { "cmd": "cargo run", "group": "api", "name": "api server" }
-  ],
-  "/tmp": [
-    "top"
-  ]
+  "name": "work/api",
+  "dirs": {
+    "/home/you/work/api": [
+      "cargo watch -x test",
+      { "cmd": "cargo run", "group": "api", "name": "api server" }
+    ],
+    "/tmp": [
+      "top"
+    ]
+  }
 }
 ```
 
-- Keys are directory paths: each task's working directory.
+- `name` exists because sanitization collapses distinct session names onto one filename: `a/b` and `a.b` both save to `a_b.json`. Saving compares the stored name against the incoming one and refuses a mismatch with an error naming both sessions. The load picker also displays it, so the list shows `a/b`, not `a_b`.
+- Keys under `dirs` are directory paths: each task's working directory.
 - Values are ordered lists. A string member is a bare shell command; the object form adds the optional group and display name assigned on load. Order is preserved, and each command runs in its own PTY under that directory.
 - Directories serialize alphabetically. Command order remains stable within each directory.
 
-The schema is a flat map with no version field or metadata, so it remains practical to edit by hand. On load, the daemon removes control characters, trims surrounding whitespace, and limits group and display names to 64 characters. `Unassigned` maps to no group but remains a legal display name. Invalid JSON fails the entire load. Within valid JSON, `fleetcom` drops any member that matches neither entry form, including a non-string scalar, an object without a string `cmd`, or an object with a non-string `group` or `name`.
+There is no version field; the shape discriminates the schema. An object-valued `dirs` marks the wrapped form shown above. The loader also accepts a flat map whose top-level keys are directories and whose values are entry arrays. In that form, an array-valued key named `dirs` remains a directory entry. Flat-map files list by filename stem because they have no stored name. Saving one writes the wrapped form and permits overwriting it without a stored-name collision check.
+
+Saves are atomic: `fleetcom` writes and syncs a private temporary file in the session directory, then renames it over the recipe. Recipes persist full command lines, which can embed secrets. New session directories use mode 0700, saves remove group and other permissions from existing session directories, and recipe files use mode 0600.
+
+The file is plain JSON and practical to edit by hand. Editing the `name` field changes which session the file claims to be: collision checks compare it, so a save under the old name will be refused. On load, the daemon removes control characters, trims surrounding whitespace, and limits group and display names to 64 characters. `Unassigned` maps to no group but remains a legal display name. Invalid JSON fails the entire load. Within valid JSON, `fleetcom` drops any member that matches neither entry form, including a non-string scalar, an object without a string `cmd`, or an object with a non-string `group` or `name`.
 
 Commands with neither a group nor a name use the string form. String and object entries can appear in the same directory array.
 
@@ -44,16 +52,19 @@ A bare agent command does not identify its conversation, so saving it verbatim w
 
 ```json
 {
-  "/home/you/work/api": [
-    "claude --resume 'c8c4a5cc-0b32-4ba0-a6b4-6ed08c218e0d'",
-    { "cmd": "codex resume '019f5453-de22-7240-b2e5-0d32692aa6d9'", "name": "reviewer" }
-  ]
+  "name": "agents",
+  "dirs": {
+    "/home/you/work/api": [
+      "claude --resume 'c8c4a5cc-0b32-4ba0-a6b4-6ed08c218e0d'",
+      { "cmd": "codex resume '019f5453-de22-7240-b2e5-0d32692aa6d9'", "name": "reviewer" }
+    ]
+  }
 }
 ```
 
 ## Saving and loading
 
-- Save: `w` in the dashboard, type a name, `Enter`. Writes each task's directory, command, and optional group and name to `<name>.json`.
+- Save: `w` in the dashboard, type a name, `Enter`. Writes the session name plus each task's directory, command, and optional group and name to `<name>.json`.
 - Load in-app: `o`, pick from the list, `Enter`.
 - Load at launch: `fleetcom <name>`.
 

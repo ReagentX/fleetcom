@@ -23,3 +23,12 @@ jobs:
       - run: rustup update stable && rustup default stable
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test --verbose
+
+  MSRV:
+    name: fleetcom MSRV (rust-version floor)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Verify the package with its declared minimum Rust version.
+      - run: rustup update 1.88 && rustup default 1.88
+      - run: cargo check --all-targets
