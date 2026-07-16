@@ -5,7 +5,7 @@ use std::{
     collections::BTreeMap,
     fs,
     io::{self, Write},
-    os::unix::fs::OpenOptionsExt,
+    os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
 };
@@ -136,7 +136,20 @@ fn from_json(text: &str) -> io::Result<(Option<String>, SessionConfig)> {
 static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
 pub fn save_in(dir: &Path, name: &str, cfg: &SessionConfig) -> io::Result<PathBuf> {
-    fs::create_dir_all(dir)?;
+    // Contents are 0600, so filenames are the residual surface: a umask
+    // directory on a multi-user host with traversable parents lets anyone
+    // enumerate session names and sizes. Create private, and re-tighten a
+    // pre-fix directory on its next save — the same on-touch correction the
+    // rename below applies to 0644 files. Only `dir` itself is corrected:
+    // freshly created parents get 0700 from the builder, but an existing
+    // config root (`~/.config`) is shared state this crate never `chmod`s.
+    fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(dir)?;
+    if fs::metadata(dir)?.permissions().mode() & 0o077 != 0 {
+        fs::set_permissions(dir, fs::Permissions::from_mode(0o700))?;
+    }
     let trimmed = name.trim();
     let file_name = format!("{}.json", sanitize(name));
     let file = dir.join(&file_name);
@@ -394,7 +407,6 @@ mod tests {
     /// 0600 onto it via the rename.
     #[test]
     fn saves_owner_only_and_fixes_legacy_permissions() {
-        use std::os::unix::fs::PermissionsExt;
         let dir = temp("session_mode");
         let mut cfg = SessionConfig::new();
         cfg.insert("~/p".into(), vec![e("run --api-key hunter2")]);
@@ -407,6 +419,29 @@ mod tests {
         save_in(&dir, "keys", &cfg).unwrap();
         assert_eq!(mode(&file), 0o600);
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Filenames are the residual surface once contents are 0600: a fresh
+    /// sessions dir is created private (its created parents too), and a
+    /// pre-fix umask directory is re-tightened on its next save.
+    #[test]
+    fn sessions_dir_is_created_private_and_retightened() {
+        let base = temp("session_dir_mode");
+        let mode = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        let mut cfg = SessionConfig::new();
+        cfg.insert("~/p".into(), vec![e("vim")]);
+
+        let nested = base.join("parent").join("sessions");
+        save_in(&nested, "fresh", &cfg).unwrap();
+        assert_eq!(mode(&nested), 0o700);
+        assert_eq!(mode(&base.join("parent")), 0o700);
+
+        let loose = base.join("loose");
+        fs::create_dir(&loose).unwrap();
+        fs::set_permissions(&loose, fs::Permissions::from_mode(0o755)).unwrap();
+        save_in(&loose, "old", &cfg).unwrap();
+        assert_eq!(mode(&loose), 0o700);
+        let _ = fs::remove_dir_all(&base);
     }
 
     /// The temp is renamed away on success; only the recipe remains.
