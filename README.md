@@ -2,7 +2,25 @@
 
 Running several long-lived commands becomes cumbersome once they span terminal panes or need to survive a disconnect. `fleetcom` gives each command its own PTY and exposes every screen through one dashboard. A daemon owns the jobs, so closing the client does not stop them.
 
-The scope is intentionally narrower than a terminal multiplexer. Each task is one command rather than a persistent shell session, which gives the dashboard explicit state, output, directory, and lifecycle data for every process.
+## Key Features
+
+### Fleet view
+
+`fleetcom` supervises your local development fleet: multiplexers, application servers, REPLs, builds, tests, and AI agent sessions.
+
+![`fleetcom` fleet view](docs/img/home.png)
+
+### Quick peek
+
+Press `Space` to quick peek at a task without attaching to it.
+
+![`fleetcom` quick peek](docs/img/quickpeek.png)
+
+### Attach and interact
+
+Press enter to attach and interact with a task.
+
+![`fleetcom` attach](docs/img/attach.png)
 
 ## Operational model
 
