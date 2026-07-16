@@ -1402,6 +1402,162 @@ fn load_session_renormalizes_hand_edited_groups() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Launch context whose env carries only `FLEETCOM_CONFIG_DIR` (plus any
+/// `extra` pairs), for load-reporting tests that plant recipe files by hand.
+fn config_ctx(config: &Path, cwd: PathBuf, extra: &[(&str, &str)]) -> LaunchContext {
+    let mut env: Vec<(std::ffi::OsString, std::ffi::OsString)> = vec![(
+        "FLEETCOM_CONFIG_DIR".into(),
+        config.as_os_str().to_os_string(),
+    )];
+    for (k, v) in extra {
+        env.push(((*k).into(), (*v).into()));
+    }
+    LaunchContext { env, cwd }
+}
+
+/// A recipe file with broken JSON must surface the parse error, not claim
+/// the file doesn't exist: `load_in` already produced the precise message,
+/// and reporting absence would send the user hunting for a file that is
+/// right there.
+#[test]
+fn load_surfaces_parse_errors_instead_of_absence() {
+    let dir = scratch("sess_parse_err");
+    let config = dir.join("config");
+    std::fs::create_dir_all(config.join("sessions")).unwrap();
+    std::fs::write(config.join("sessions").join("broken.json"), "{not json").unwrap();
+    let mut s = Supervisor::new(24, 80);
+    s.set_launch_context(config_ctx(&config, dir.clone(), &[]));
+    s.apply(Command::LoadSession {
+        name: "broken".into(),
+    });
+    let evs = s.drain();
+    assert!(
+        evs.iter().any(
+            |e| matches!(e, Event::Status(m) if m.starts_with("session 'broken' failed to load:"))
+        ),
+        "a parse failure must carry load_in's error; got {evs:?}"
+    );
+    assert!(
+        !evs.iter()
+            .any(|e| matches!(e, Event::Status(m) if m.contains("not found"))),
+        "a parse failure must not read as absence; got {evs:?}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A recipe that genuinely doesn't exist still reads as "not found".
+#[test]
+fn load_missing_session_reads_as_not_found() {
+    let dir = scratch("sess_missing");
+    let config = dir.join("config");
+    let mut s = Supervisor::new(24, 80);
+    s.set_launch_context(config_ctx(&config, dir.clone(), &[]));
+    s.apply(Command::LoadSession {
+        name: "ghost".into(),
+    });
+    assert!(
+        s.drain()
+            .iter()
+            .any(|e| matches!(e, Event::Status(m) if m == "session 'ghost' not found")),
+        "a missing recipe must still read as not found"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Entries whose spawn fails must land in a visible bucket: the old
+/// `.is_ok()` gate counted them in neither `spawned` nor `skipped`, so the
+/// status line read as clean success while tasks silently never started.
+/// `SHELL` pointing at a nonexistent binary makes every `admit` fail.
+#[test]
+fn load_reports_admit_failures_not_clean_success() {
+    let dir = scratch("sess_admit_fail");
+    let config = dir.join("config");
+    std::fs::create_dir_all(config.join("sessions")).unwrap();
+    std::fs::write(
+        config.join("sessions").join("fleet.json"),
+        format!(r#"{{"{}": ["true", "true"]}}"#, dir.display()),
+    )
+    .unwrap();
+    let mut s = Supervisor::new(24, 80);
+    s.set_launch_context(config_ctx(
+        &config,
+        dir.clone(),
+        &[("SHELL", "/nonexistent/no-such-shell")],
+    ));
+    s.apply(Command::LoadSession {
+        name: "fleet".into(),
+    });
+    let evs = s.drain();
+    assert!(
+        evs.iter().any(|e| matches!(e, Event::Status(m)
+                if m.contains("2 failed to spawn") && !m.contains("task(s)"))),
+        "failed spawns must be reported, never folded into success; got {evs:?}"
+    );
+    s.tick();
+    assert!(
+        s.drain()
+            .iter()
+            .any(|e| matches!(e, Event::Tasks(v) if v.is_empty())),
+        "no task may exist when every spawn failed"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A `Spawn` whose command exceeds `MAX_COMMAND_LEN` is refused with a
+/// notice and no task: execve would fail it with E2BIG anyway, and a task
+/// set of such commands would push `Tasks` snapshots past `MAX_FRAME`,
+/// silently freezing the UI (see `daemon::send_event`).
+#[test]
+fn spawn_refuses_over_length_command() {
+    let mut s = sup(24, 80);
+    s.apply(Command::Spawn {
+        command: "x".repeat(MAX_COMMAND_LEN + 1),
+        cwd: here(),
+        group: None,
+    });
+    assert!(
+        s.drain()
+            .iter()
+            .any(|e| matches!(e, Event::Status(m) if m.contains("command too long"))),
+        "an over-length spawn must be refused with a notice"
+    );
+    s.tick();
+    assert!(
+        s.drain()
+            .iter()
+            .any(|e| matches!(e, Event::Tasks(v) if v.is_empty())),
+        "no task may exist after a refused spawn"
+    );
+}
+
+/// An over-length recipe entry counts as skipped in the load status; the
+/// in-bounds entry beside it still spawns.
+#[test]
+fn load_skips_over_length_commands() {
+    let dir = scratch("sess_cmd_len");
+    let config = dir.join("config");
+    std::fs::create_dir_all(config.join("sessions")).unwrap();
+    std::fs::write(
+        config.join("sessions").join("big.json"),
+        format!(
+            r#"{{"{}": ["true", "{}"]}}"#,
+            dir.display(),
+            "x".repeat(MAX_COMMAND_LEN + 1)
+        ),
+    )
+    .unwrap();
+    let mut s = Supervisor::new(24, 80);
+    s.set_launch_context(config_ctx(&config, dir.clone(), &[]));
+    s.apply(Command::LoadSession { name: "big".into() });
+    let evs = s.drain();
+    assert!(
+        evs.iter().any(|e| matches!(e, Event::Status(m)
+                if m.contains("1 task(s)") && m.contains("1 skipped"))),
+        "the over-length entry must be counted as skipped; got {evs:?}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Spawns inherit only the installed launch-context environment.
 #[test]
 fn spawn_uses_the_launch_context_env_not_the_process_env() {

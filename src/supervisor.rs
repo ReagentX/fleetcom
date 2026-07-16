@@ -53,6 +53,17 @@ const _: () = assert!(MAX_CELLS >= MAX_DIM as u32);
 /// guardrail, not a working limit.
 const MAX_TASKS: usize = 256;
 
+/// Ceiling on one command string, in bytes (`str::len`; the limit exists for
+/// argv and frame arithmetic, both byte-denominated). `$SHELL -c <command>`
+/// passes the command as a single argv string, and Linux's MAX_ARG_STRLEN
+/// caps any one argv string at 128 KiB: anything larger fails execve with
+/// E2BIG anyway, so refusing at half that turns an inscrutable downstream
+/// spawn failure into a clear message. It also restores the frame-size
+/// invariant: `MAX_TASKS` × 64 KiB ≈ 16 MiB of command text per `Tasks`
+/// snapshot, comfortably under the 64 MiB `MAX_FRAME` that `send_event`
+/// silently enforces by skipping oversized events.
+const MAX_COMMAND_LEN: usize = 64 * 1024;
+
 /// How long a SIGTERMed job gets to exit before SIGKILL. TERM-respecting
 /// processes exit in milliseconds, so this is the *ceiling* on quit latency,
 /// not the norm; 2 s is enough for any real flush handler while keeping a
@@ -604,6 +615,16 @@ impl Supervisor {
     }
 
     fn spawn(&mut self, command: &str, cwd: PathBuf, group: Option<String>) {
+        // Refuse here rather than let execve discover E2BIG (or a snapshot
+        // outgrow `MAX_FRAME`) later: see `MAX_COMMAND_LEN`.
+        if command.len() > MAX_COMMAND_LEN {
+            self.status(format!(
+                "command too long ({} bytes, limit {}), not spawning",
+                command.len(),
+                crate::format::bytes(MAX_COMMAND_LEN)
+            ));
+            return;
+        }
         if self.tasks.len() >= MAX_TASKS {
             self.status(format!("task limit reached ({MAX_TASKS}), not spawning"));
             return;
@@ -752,20 +773,29 @@ impl Supervisor {
     /// Missing dirs are skipped rather than spawning tasks doomed to fail on
     /// chdir.
     fn load_session(&mut self, name: &str) {
-        let cfg = match self
-            .sessions_root()
-            .map(|root| session::load_in(&root, name))
-        {
-            Some(Ok(c)) => c,
-            _ => {
+        let Some(root) = self.sessions_root() else {
+            self.status("load failed: no config directory available");
+            return;
+        };
+        let cfg = match session::load_in(&root, name) {
+            Ok(c) => c,
+            // Absence and failure are different truths: only a missing file
+            // reads as "not found". A parse error (a hand-edited recipe with
+            // broken JSON) carries `load_in`'s message instead of masquerading
+            // as a file that doesn't exist.
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
                 self.status(format!("session '{name}' not found"));
+                return;
+            }
+            Err(e) => {
+                self.status(format!("session '{name}' failed to load: {e}"));
                 return;
             }
         };
         let Some(launch) = self.launch_or_refuse() else {
             return;
         };
-        let (mut spawned, mut skipped) = (0usize, 0usize);
+        let (mut spawned, mut skipped, mut failed) = (0usize, 0usize, 0usize);
         for (dir, entries) in &cfg {
             let resolved = path::resolve(&launch.cwd, dir);
             if !resolved.is_dir() {
@@ -773,33 +803,41 @@ impl Supervisor {
                 continue;
             }
             for entry in entries {
-                if self.tasks.len() >= MAX_TASKS {
+                if self.tasks.len() >= MAX_TASKS || entry.cmd.len() > MAX_COMMAND_LEN {
                     skipped += 1;
                     continue;
                 }
                 // `admit` normalizes the persisted labels before assignment.
-                if self
-                    .admit(
-                        &entry.cmd,
-                        &resolved,
-                        &launch.env,
-                        entry.group.clone(),
-                        entry.name.clone(),
-                    )
-                    .is_ok()
-                {
-                    spawned += 1;
+                match self.admit(
+                    &entry.cmd,
+                    &resolved,
+                    &launch.env,
+                    entry.group.clone(),
+                    entry.name.clone(),
+                ) {
+                    Ok(()) => spawned += 1,
+                    // Spawn failures land in their own bucket: folding them
+                    // into `spawned` would report success, dropping them
+                    // would make the arithmetic silently miss entries.
+                    Err(_) => failed += 1,
                 }
             }
         }
-        let status = if skipped > 0 {
-            format!(
-                "loaded '{name}': {spawned} task(s), {skipped} skipped (missing dir or task limit)"
-            )
-        } else {
-            format!("loaded '{name}': {spawned} task(s)")
-        };
-        self.status(status);
+        // Only non-zero buckets appear; `spawned` alone covers the empty
+        // recipe so the line is never bare.
+        let mut parts = Vec::new();
+        if spawned > 0 || (skipped == 0 && failed == 0) {
+            parts.push(format!("{spawned} task(s)"));
+        }
+        if skipped > 0 {
+            parts.push(format!(
+                "{skipped} skipped (missing dir, task limit, or command too long)"
+            ));
+        }
+        if failed > 0 {
+            parts.push(format!("{failed} failed to spawn"));
+        }
+        self.status(format!("loaded '{name}': {}", parts.join(", ")));
     }
 }
 
