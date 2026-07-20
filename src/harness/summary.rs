@@ -21,8 +21,9 @@
 //!
 //! Normalization removes spinner glyphs, elapsed counters, throughput data,
 //! and key hints while preserving the CLI's status text. The only synthesized
-//! status is `awaiting approval` for claude's approval menu. Corpus fixtures
-//! in `tests/corpus` pin the supported screen structures.
+//! status is `awaiting approval`, for approval menus: claude's dialog and
+//! codex's modal. Corpus fixtures in `tests/corpus` pin the supported screen
+//! structures.
 
 use std::path::Path;
 
@@ -211,15 +212,21 @@ fn claude_welcome_label(rows: &[String]) -> Option<String> {
 
 // ----------------------------------------------------------------- codex --
 
-/// codex (inline UI, primary screen). The pin is its status bar (the
-/// bottom-most non-blank row) with the composer above it; status rows sit
-/// above the composer, and scrollback beyond the first foreign row is out of
-/// bounds.
+/// codex (inline UI, primary screen). The pin is its composer: the
+/// bottom-most column-0 `›` row that is not a modal selector; status rows
+/// sit above it, and scrollback beyond the first foreign row is out of
+/// bounds. The approval modal removes the composer and is checked first.
+/// Both observed layout generations anchor: token bar as the bottom row,
+/// or hint rows below the composer with no token bar painted (codex-cli
+/// 0.144.6, sighted 2026-07-20).
 pub struct CodexSummary;
 
 impl SummaryAdapter for CodexSummary {
     fn live_preview(&self, screen: &dyn ScreenFacts) -> Option<(String, &'static str)> {
         let rows = screen.live_rows();
+        if let Some(hit) = codex_approval(&rows) {
+            return Some(hit);
+        }
         let composer = codex_composer(&rows)?;
         codex_status(&rows, composer)
     }
@@ -232,28 +239,66 @@ impl SummaryAdapter for CodexSummary {
     }
 }
 
-/// codex's status bar is the bottom-most non-blank row of its inline UI:
-/// `{model} · {…} in · {…} out`. Its absence (codex exited and left its
-/// resume hint as the last row, or something else owns the screen) fails
-/// the whole pin.
-fn codex_token_line(rows: &[String]) -> Option<usize> {
-    let i = rows.iter().rposition(|r| !r.is_empty())?;
-    let segs: Vec<&str> = rows[i].trim().split(" · ").collect();
-    (segs.len() >= 3
-        && !segs[0].is_empty()
-        && segs[segs.len() - 2].ends_with(" in")
-        && segs[segs.len() - 1].ends_with(" out"))
-    .then_some(i)
+/// `› 1. Yes, proceed (y)`: the modal's selected option row — column-0 `›`,
+/// one digit, `. `.
+fn codex_menu_head(row: &str) -> bool {
+    row.strip_prefix("› ")
+        .and_then(|r| r.strip_prefix(|c: char| c.is_ascii_digit()))
+        .is_some_and(|r| r.starts_with(". "))
 }
 
-/// The composer row (`› …`, column 0) within three rows above the status
-/// bar. Prompt echoes in scrollback share the `›` head but sit above the
-/// composer, which is why the search runs bottom-up from the bar.
+/// An unselected modal option: indented, `{digit}. `-headed.
+fn codex_numbered_option(row: &str) -> bool {
+    let t = row.trim_start();
+    let digits = t.chars().take_while(char::is_ascii_digit).count();
+    t.len() > digits && digits >= 1 && t[digits..].starts_with(". ")
+}
+
+/// codex's approval modal: a selector row with an indented numbered sibling
+/// below it, pinned to the last nine painted rows (the modal has no
+/// composer to pin on — it removes the composer and token bar outright,
+/// and that removal is the disambiguator: a menu quoted in the
+/// conversation always has the live composer somewhere below it, so any
+/// non-selector `›` row below the selector suppresses the match). Second
+/// member of the approval-menu synthesis class (module docs).
+fn codex_approval(rows: &[String]) -> Option<(String, &'static str)> {
+    let last = rows.iter().rposition(|r| !r.is_empty())?;
+    let i = (last.saturating_sub(8)..=last).find(|&i| codex_menu_head(&rows[i]))?;
+    let sibling = rows[i + 1..].iter().find(|r| !r.is_empty())?;
+    if !(sibling.starts_with(' ') && codex_numbered_option(sibling)) {
+        return None;
+    }
+    rows[i + 1..]
+        .iter()
+        .all(|r| !r.starts_with('›') || codex_menu_head(r))
+        .then(|| ("awaiting approval".to_string(), "codex:approval-menu"))
+}
+
+/// The token/status bar, when painted: the bottom-most
+/// `{model} · {…} in · {…} out` row among the last six painted rows.
+/// Deliberately decoupled from the composer pin — the live-sighted working
+/// layout omits the bar entirely, and the anchor then fires without a
+/// model prefix.
+fn codex_token_line(rows: &[String]) -> Option<usize> {
+    let last = rows.iter().rposition(|r| !r.is_empty())?;
+    (last.saturating_sub(5)..=last).rev().find(|&i| {
+        let segs: Vec<&str> = rows[i].trim().split(" · ").collect();
+        segs.len() >= 3
+            && !segs[0].is_empty()
+            && segs[segs.len() - 2].ends_with(" in")
+            && segs[segs.len() - 1].ends_with(" out")
+    })
+}
+
+/// The composer: the bottom-most column-0 `›` row that is not a modal
+/// selector. Rows below it are tolerated, never required — blank rows,
+/// indented affordance hints (`tab to queue message`), or the token bar —
+/// because the working layout can paint hints below the composer with no
+/// bar at all. Prompt echoes in scrollback share the `›` head but sit
+/// above the composer, which is why the bottom-most wins.
 fn codex_composer(rows: &[String]) -> Option<usize> {
-    let token = codex_token_line(rows)?;
-    (token.saturating_sub(3)..token)
-        .rev()
-        .find(|&i| rows[i].starts_with('›'))
+    rows.iter()
+        .rposition(|r| (r.as_str() == "›" || r.starts_with("› ")) && !codex_menu_head(r))
 }
 
 /// Walk up from the composer through the status region: blanks and indented
@@ -707,10 +752,86 @@ mod tests {
         assert_eq!(CodexSummary.live_preview(&behind_reply), None);
     }
 
-    /// Without the status bar as the bottom row (codex exited; its resume
-    /// hint owns the floor) the whole pin fails.
+    /// The live-sighted working layout (codex-cli 0.144.6, 2026-07-20):
+    /// a hint row below the composer, no token bar painted. The composer
+    /// pin tolerates the rows below it, the anchor fires, and the absent
+    /// bar means no model label — `Working` with no prefix is correct.
     #[test]
-    fn codex_requires_the_status_bar_pin() {
+    fn codex_hint_row_layout_anchors_without_a_token_bar() {
+        let hinted = rs(&[
+            "• Running cargo test --test daemon_env",
+            "",
+            "",
+            "• Working (10m 26s • esc to interrupt)",
+            "",
+            "›",
+            "",
+            "  tab to queue message",
+        ]);
+        assert_eq!(
+            CodexSummary.live_preview(&hinted),
+            Some(("Working".to_string(), "codex:working"))
+        );
+        assert_eq!(CodexSummary.model_label(&hinted), None);
+    }
+
+    /// The approval modal replaces composer and token bar with a numbered
+    /// menu; the selector row plus a numbered sibling synthesizes the
+    /// label, wherever the selection sits.
+    #[test]
+    fn codex_approval_modal_synthesizes_on_any_selection() {
+        let on_first = rs(&[
+            "  Would you like to run the following command?",
+            "",
+            "  $ cargo test --test daemon_env",
+            "",
+            "› 1. Yes, proceed (y)",
+            "  2. Yes, and don't ask again for commands that start with `cargo test` (p)",
+            "  3. No, and tell Codex what to do differently (esc)",
+            "",
+            "  Press enter to confirm or esc to cancel",
+        ]);
+        assert_eq!(
+            CodexSummary.live_preview(&on_first),
+            Some(("awaiting approval".to_string(), "codex:approval-menu"))
+        );
+
+        let on_second = rs(&[
+            "  1. Yes, proceed (y)",
+            "› 2. Yes, and don't ask again (p)",
+            "  3. No (esc)",
+            "",
+            "  Press enter to confirm or esc to cancel",
+        ]);
+        assert_eq!(
+            CodexSummary.live_preview(&on_second),
+            Some(("awaiting approval".to_string(), "codex:approval-menu"))
+        );
+    }
+
+    /// A menu quoted in the conversation always has the live composer
+    /// somewhere below it; the composer's presence suppresses the modal
+    /// match, and the quote is a foreign row to the status scan — no
+    /// anchor, floor tier.
+    #[test]
+    fn codex_quoted_menu_with_a_live_composer_is_not_a_modal() {
+        let quoted = rs(&[
+            "• I found these options in the doc:",
+            "",
+            "› 1. Yes, proceed (y)",
+            "  2. No, cancel (esc)",
+            "",
+            "›",
+            "",
+            "  gpt-5.6-sol high · 0 in · 0 out",
+        ]);
+        assert_eq!(CodexSummary.live_preview(&quoted), None);
+    }
+
+    /// Without any composer row (codex exited; its resume hint owns the
+    /// floor) the whole pin fails.
+    #[test]
+    fn codex_requires_the_composer_pin() {
         let exited = rs(&[
             "• Ran sleep 5 && echo ok",
             "",
@@ -825,6 +946,21 @@ mod tests {
                 "codex:ran",
             ),
             Case(
+                "preview_codex_hint_row",
+                include_bytes!("../../tests/corpus/preview_codex_hint_row.bin"),
+                &CodexSummary,
+                // No token bar in this layout: no model prefix, correctly.
+                "Working",
+                "codex:working",
+            ),
+            Case(
+                "preview_codex_approval",
+                include_bytes!("../../tests/corpus/preview_codex_approval.bin"),
+                &CodexSummary,
+                "awaiting approval",
+                "codex:approval-menu",
+            ),
+            Case(
                 "preview_grok_working",
                 include_bytes!("../../tests/corpus/preview_grok_working.bin"),
                 &GrokSummary,
@@ -921,6 +1057,24 @@ mod tests {
                 // The floor trims the status bar's self-indentation
                 // (layout, not meaning; see the cascade's floor arm).
                 "gpt-5.6-sol high · 5.26K used · 28.2K in · 78 out".to_string(),
+                PreviewSource::Floor,
+                None
+            )
+        );
+
+        // A modal-shaped menu quoted in the body with the live composer
+        // below it: the composer suppresses the approval match, the quote
+        // is foreign to the status scan, and the floor tier reports.
+        let p = resolve_corpus(
+            include_bytes!("../../tests/corpus/preview_codex_body_menu.bin"),
+            &CodexSummary,
+            40,
+            120,
+        );
+        assert_eq!(
+            parts(&p),
+            (
+                "gpt-5.6-sol high · 0 in · 0 out".to_string(),
                 PreviewSource::Floor,
                 None
             )

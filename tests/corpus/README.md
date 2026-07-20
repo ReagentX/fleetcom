@@ -38,6 +38,12 @@ screens came from claude 2.1.215, codex-cli 0.144.6, and grok 0.2.102.
 Identifying and user-configured text is replaced with alignment-preserving
 synthetic values. Geometry is 40×120 unless noted.
 
+The `preview_codex_hint_row` and `preview_codex_approval` fixtures are
+paste-derived from a maintainer live sighting (2026-07-20, codex-cli 0.144.6
+— the same version as the snapshot captures; these are uncaptured states,
+not drift): indentation is approximate, so their tests key on trimmed heads
+and column-0 discipline only. `preview_codex_body_menu` is synthetic.
+
 | Fixture | Scenario | Coverage |
 | --- | --- | --- |
 | `preview_claude_working.bin` | claude spinner with the tmux focus-events hint row | `claude:spinner` extraction through an indented hint row |
@@ -52,6 +58,9 @@ synthetic values. Geometry is 40×120 unless noted.
 | `preview_codex_working_over_ran.bin` | codex working with a `• Ran` row higher in the same turn | `codex:working` wins at the pin; the stale row never surfaces |
 | `preview_codex_scrollback.bin` | codex finished turn, `• Ran` from the prior turn in scrollback | the scan stops at the reply bullet and resolves to the floor tier |
 | `preview_codex_ran.bin` | codex transient completion (synthetic: no raw capture holds it) | `codex:ran` extraction through the `└` attachment row |
+| `preview_codex_hint_row.bin` | codex working with `tab to queue message` below the composer, no token bar | `codex:working` through the composer pin; no model prefix without the bar |
+| `preview_codex_approval.bin` | codex approval modal: composer and token bar replaced by a numbered menu | `codex:approval-menu` synthesizes `awaiting approval` |
+| `preview_codex_body_menu.bin` | modal-shaped menu quoted in the body, live composer below | negative: the composer's presence suppresses the modal match; floor tier reports |
 | `preview_grok_working.bin` | grok braille spinner with elapsed/throughput ticker | `grok:spinner` cut at the label's `…`; border label read |
 | `preview_grok_worked.bin` | grok `Worked for 8.7s` completion row above the box | `grok:worked` kept verbatim |
 | `preview_grok_idle.bin` | grok idle session | fall-through to the marker |
