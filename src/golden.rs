@@ -577,10 +577,8 @@ fn semantic_dec_scrollregion_charset_translation() {
     assert_eq!(al.grid().cursor.point, Point::new(Line(39), Column(0)));
 }
 
-/// Verify that `ObservedTerm` forwards parser events by comparing each corpus
-/// replay through `Emulator` with a replay through the raw backend. The
-/// comparison covers the screen, cursor, and alternate-screen mode; the other
-/// golden tests exercise only the raw backend.
+/// Compare `ObservedTerm` and the raw backend across the corpus: screen,
+/// cursor, and alternate-screen mode must match.
 #[test]
 fn emulator_wrapper_matches_the_raw_backend_on_every_fixture() {
     let fixtures: [(&str, &[u8]); 12] = [

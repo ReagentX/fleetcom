@@ -45,10 +45,8 @@ pub trait SummaryAdapter: Sync {
         None
     }
 
-    /// Display-time rewrite for the Title tier's text. Per-CLI title
-    /// knowledge lives here, in tier 1: the capture layer (the emulator's
-    /// title events) stays program-agnostic and closed to per-program
-    /// mappings. `None` renders the captured title verbatim.
+    /// Optionally normalize a captured title for display. Emulator title
+    /// capture remains program-agnostic; `None` renders the title verbatim.
     fn normalize_title(&self, _title: &str) -> Option<String> {
         None
     }
@@ -90,7 +88,7 @@ const CLAUDE_SPINNER: &[char] = &['·', '✢', '✳', '✶', '✻', '✽'];
 
 /// claude (alt screen). Working state: a column-0 spinner row directly above
 /// the input box's top separator. Approval state: the dialog replaces the
-/// input box entirely, which is what licenses the menu match.
+/// input box entirely; the menu match fires only when that box is gone.
 pub struct ClaudeSummary;
 
 impl SummaryAdapter for ClaudeSummary {
@@ -107,18 +105,9 @@ impl SummaryAdapter for ClaudeSummary {
         claude_welcome_label(&screen.live_rows())
     }
 
-    /// claude's titles lead with an animated frame. Two observed shapes:
-    /// the launch title `✳ Claude Code` (asterisk-bloom frame, captured
-    /// 2026-07-19) and the in-session `{braille} {session summary}`
-    /// (braille frame, animated per frame — `⠐ Review fleetcom preview
-    /// design document`, sighted 2026-07-20). A frozen interim frame reads
-    /// as stuck, and canonicalizing to `✻` dedupes the animation BEFORE
-    /// the min-hold: the rendered text is constant and never re-renders.
-    /// The braille test is a range check over U+2800..=U+28FF, not a frame
-    /// list — codex's captured title churn already showed the braille
-    /// vocabulary is large. Non-frame-led titles pass through verbatim.
-    /// grok's title is static (`grok`) and codex never reaches the Title
-    /// tier, so neither maps.
+    /// Canonicalize a leading claude spinner or braille frame to `✻` so title
+    /// animation does not change the rendered text. Other titles pass through
+    /// unchanged.
     fn normalize_title(&self, title: &str) -> Option<String> {
         let mut chars = title.chars();
         let frame = chars.next()?;
@@ -147,8 +136,8 @@ fn claude_box_top(rows: &[String]) -> Option<usize> {
 /// (the tmux focus-events notice, the right-aligned `● high · /effort`) are
 /// indented while the spinner paints at column 0; a column-0 row that is not
 /// spinner-shaped aborts the scan: body text reaching the chrome, or the
-/// wrapped tail of a status row too wide for the window. Both must fail
-/// structurally rather than risk matching something status-shaped.
+/// wrapped tail of a status row too wide for the window. Both fail the
+/// structural check instead of matching status-shaped body text.
 fn claude_spinner_status(rows: &[String], top: usize) -> Option<(String, &'static str)> {
     for i in (top.saturating_sub(3)..top).rev() {
         let row = &rows[i];
@@ -159,16 +148,15 @@ fn claude_spinner_status(rows: &[String], top: usize) -> Option<(String, &'stati
             // The spinner row's parenthetical contributes its slow
             // semantic tail to whichever text wins the head.
             let tail = claude_semantic_tail(row);
-            // The spinner confirms the working state; only then is the
-            // concrete-action row worth preferring over the rotating verb.
+            // The spinner confirms the working state; only then prefer the
+            // concrete-action row over the rotating verb.
             if let Some(action) = claude_action_row(rows, i) {
                 return Some((format!("{action}{tail}"), "claude:action-row"));
             }
             return Some((format!("{verb}{tail}"), "claude:spinner"));
         }
-        // The waiting row is self-describing: no action-row probe — the
-        // col-0 `⏺` rows above it are body prose, and probing them would
-        // widen the false-positive surface for nothing.
+        // Waiting rows need no action-row probe: col-0 `⏺` rows above are
+        // body prose, and probing them only widens false positives.
         if let Some(waiting) = claude_waiting_text(row) {
             return Some((waiting, "claude:waiting-agents"));
         }
@@ -178,14 +166,9 @@ fn claude_spinner_status(rows: &[String], top: usize) -> Option<(String, &'stati
     None
 }
 
-/// The ellipsis-less waiting row: `✻ Waiting for {n} background agent(s)
-/// to finish`, returned verbatim after the glyph. An explicit pattern, not
-/// a loosened spinner rule: the `…` guard on the spinner extraction cannot
-/// relax without re-opening the `·`-as-body-bullet false positive, so
-/// ellipsis-less states are admitted one sighted shape at a time — the
-/// designed maintenance model. No semantic-tail extraction: the sighted
-/// row carries no parenthetical (extend only on a future sighting). Live
-/// sighting 2026-07-20, claude 2.1.215.
+/// Match `Waiting for {n} background agent(s) to finish` after a recognized
+/// spinner frame. Keeping this separate from ellipsis-terminated spinner rows
+/// prevents `·` body bullets from matching.
 fn claude_waiting_text(row: &str) -> Option<String> {
     let mut chars = row.chars();
     if !CLAUDE_SPINNER.contains(&chars.next()?) || chars.next()? != ' ' {
@@ -220,13 +203,9 @@ fn claude_spinner_text(row: &str) -> Option<String> {
 
 /// The spinner parenthetical's slow semantic tail:
 /// `(1m 8s · ↓ 2.1k tokens · thinking with high effort)` keeps
-/// ` · thinking with high effort`. Segments the classifier positively
-/// recognizes as tickers drop; everything else is semantic until proven
-/// otherwise and survives verbatim, in order, as ` · {seg}` each. The
-/// survivors change only at state transitions, so the no-hold anchor
-/// policy is unaffected — which is exactly why tickers must drop rather
-/// than ride along. No parenthetical yields an empty tail; an unclosed
-/// one is CLI-side truncation and parses to the cut.
+/// ` · thinking with high effort`. Recognized ticker segments drop;
+/// everything else is kept in order as ` · {seg}`. No parenthetical yields
+/// an empty tail; an unclosed one is parsed to the cut.
 fn claude_semantic_tail(row: &str) -> String {
     let Some(open) = row.find("… (") else {
         return String::new();
@@ -246,9 +225,9 @@ fn claude_semantic_tail(row: &str) -> String {
 }
 
 /// Whether one parenthetical segment is recognized ticker churn: elapsed
-/// time (every whitespace token digits — dot tolerated — plus an `s`/`m`/`h`
-/// unit: `6s`, `1m 8s`, `2h 3m`), token/throughput counters (`↓`/`↑`-headed
-/// or `tokens`-suffixed), or the `esc to interrupt` affordance.
+/// time (each whitespace token is digits, optional dot, then `s`/`m`/`h`:
+/// `6s`, `1m 8s`, `2h 3m`), token/throughput counters (`↓`/`↑`-headed or
+/// `tokens`-suffixed), or the `esc to interrupt` affordance.
 fn claude_ticker_segment(seg: &str) -> bool {
     if seg == "esc to interrupt"
         || seg == "tokens"
@@ -295,10 +274,8 @@ fn claude_approval(rows: &[String]) -> Option<(String, &'static str)> {
 }
 
 /// `Fable 5 with high effort` from the welcome box → `Fable 5 (high)`. The
-/// box is the stable source: the statusline rows below the input box render
-/// user-configured text (different on every machine) and must never be
-/// read. The box scrolls away as the conversation grows and the label
-/// simply drops off.
+/// welcome box is the stable source; user-configurable statusline rows are not
+/// parsed. When the box scrolls away, the label is unavailable.
 fn claude_welcome_label(rows: &[String]) -> Option<String> {
     let start = rows
         .iter()
@@ -330,9 +307,7 @@ fn claude_welcome_label(rows: &[String]) -> Option<String> {
 /// bottom-most column-0 `›` row that is not a modal selector; status rows
 /// sit above it, and scrollback beyond the first foreign row is out of
 /// bounds. The approval modal removes the composer and is checked first.
-/// Both observed layout generations anchor: token bar as the bottom row,
-/// or hint rows below the composer with no token bar painted (codex-cli
-/// 0.144.6, sighted 2026-07-20).
+/// A token bar or indented hint rows may appear below the composer.
 pub struct CodexSummary;
 
 impl SummaryAdapter for CodexSummary {
@@ -353,8 +328,8 @@ impl SummaryAdapter for CodexSummary {
     }
 }
 
-/// `› 1. Yes, proceed (y)`: the modal's selected option row — column-0 `›`,
-/// one digit, `. `.
+/// `› 1. Yes, proceed (y)`: the modal's selected option row (column-0 `›`,
+/// one digit, `. `).
 fn codex_menu_head(row: &str) -> bool {
     row.strip_prefix("› ")
         .and_then(|r| r.strip_prefix(|c: char| c.is_ascii_digit()))
@@ -369,12 +344,10 @@ fn codex_numbered_option(row: &str) -> bool {
 }
 
 /// codex's approval modal: a selector row with an indented numbered sibling
-/// below it, pinned to the last nine painted rows (the modal has no
-/// composer to pin on — it removes the composer and token bar outright,
-/// and that removal is the disambiguator: a menu quoted in the
-/// conversation always has the live composer somewhere below it, so any
-/// non-selector `›` row below the selector suppresses the match). Second
-/// member of the approval-menu synthesis class (module docs).
+/// below it, pinned to the last nine painted rows. The modal removes the
+/// composer and token bar; that absence is the disambiguator (a menu quoted
+/// in the conversation always has the live composer below it, so any
+/// non-selector `›` row under the selector suppresses the match).
 fn codex_approval(rows: &[String]) -> Option<(String, &'static str)> {
     let last = rows.iter().rposition(|r| !r.is_empty())?;
     let i = (last.saturating_sub(8)..=last).find(|&i| codex_menu_head(&rows[i]))?;
@@ -390,9 +363,8 @@ fn codex_approval(rows: &[String]) -> Option<(String, &'static str)> {
 
 /// The token/status bar, when painted: the bottom-most
 /// `{model} · {…} in · {…} out` row among the last six painted rows.
-/// Deliberately decoupled from the composer pin — the live-sighted working
-/// layout omits the bar entirely, and the anchor then fires without a
-/// model prefix.
+/// Independent of the composer pin because the bar may be absent; without it,
+/// the anchor has no model prefix.
 fn codex_token_line(rows: &[String]) -> Option<usize> {
     let last = rows.iter().rposition(|r| !r.is_empty())?;
     (last.saturating_sub(5)..=last).rev().find(|&i| {
@@ -405,11 +377,11 @@ fn codex_token_line(rows: &[String]) -> Option<usize> {
 }
 
 /// The composer: the bottom-most column-0 `›` row that is not a modal
-/// selector. Rows below it are tolerated, never required — blank rows,
-/// indented affordance hints (`tab to queue message`), or the token bar —
-/// because the working layout can paint hints below the composer with no
-/// bar at all. Prompt echoes in scrollback share the `›` head but sit
-/// above the composer, which is why the bottom-most wins.
+/// selector. Rows below it are tolerated, never required: blank rows,
+/// indented affordance hints (`tab to queue message`), or the token bar.
+/// The working layout can paint hints below the composer with no bar at
+/// all. Prompt echoes in scrollback share the `›` head but sit above the
+/// composer, so the bottom-most wins.
 fn codex_composer(rows: &[String]) -> Option<usize> {
     rows.iter()
         .rposition(|r| (r.as_str() == "›" || r.starts_with("› ")) && !codex_menu_head(r))
@@ -445,7 +417,7 @@ fn codex_status(rows: &[String], composer: usize) -> Option<(String, &'static st
 /// parenthetical is the elapsed counter plus interrupt affordance, dropped
 /// whole: an unclosed paren is CLI-side truncation mid-affordance and drops
 /// to the end. Of the ` · ` suffixes, `/`-headed segments are key hints;
-/// everything else is slow-moving state worth keeping, with its own ellipsis
+/// everything else is slow-moving state and is kept, with its own ellipsis
 /// when the CLI truncated it.
 fn codex_working(after_paren: &str) -> String {
     let mut out = String::from("Working");
@@ -746,10 +718,8 @@ mod tests {
         );
     }
 
-    /// Parenthetical segments: every recognized ticker shape drops — alone
-    /// and beside a kept segment — and an unknown segment survives
-    /// verbatim. The sighted row keeps its effort note; a bare row is
-    /// unchanged.
+    /// Parenthetical segments: recognized ticker shapes are dropped and
+    /// unknown segments are preserved. A bare row is unchanged.
     #[test]
     fn claude_parenthetical_keeps_slow_segments_and_drops_tickers() {
         let sep = "─".repeat(120);
@@ -815,9 +785,8 @@ mod tests {
         );
     }
 
-    /// The ellipsis-less waiting row (live sighting 2026-07-20, claude
-    /// 2.1.215): exact shape extracts verbatim on any spinner frame,
-    /// singular or plural; near-miss shapes stay foreign and abort.
+    /// The ellipsis-less waiting row extracts verbatim for singular and plural
+    /// counts; near-miss shapes remain foreign and abort.
     #[test]
     fn claude_waiting_row_matches_exactly_and_never_probes() {
         let sep = "─".repeat(120);
@@ -851,8 +820,8 @@ mod tests {
         assert_eq!(spin("✻ Waiting patiently"), None);
         assert_eq!(spin("· Waiting for review comments to land"), None);
 
-        // Self-describing: an action row above the waiting row is body
-        // prose to this state and must not win the head.
+        // An action row above the waiting row is body prose in this state
+        // and must not win the head.
         let rows = [
             "⏺ Running 1 shell command…",
             "",
@@ -870,9 +839,7 @@ mod tests {
         );
     }
 
-    /// Title display: every spinner frame canonicalizes to `✻`, giving
-    /// constant text across frame rotation (the churn fix); non-frame
-    /// titles pass through untouched.
+    /// Every spinner frame canonicalizes to `✻`; non-frame titles pass through.
     #[test]
     fn claude_title_frames_canonicalize_to_constant_text() {
         for frame in CLAUDE_SPINNER {
@@ -886,8 +853,7 @@ mod tests {
         let b = ClaudeSummary.normalize_title("✽ Claude Code");
         assert_eq!(a, b, "two frames must normalize identically");
 
-        // The in-session shape: a braille frame plus the session summary,
-        // animated per frame (sighted 2026-07-20).
+        // A braille frame plus the session summary.
         assert_eq!(
             ClaudeSummary.normalize_title("⠐ Review fleetcom preview design document"),
             Some("✻ Review fleetcom preview design document".to_string())
@@ -1048,10 +1014,8 @@ mod tests {
         assert_eq!(CodexSummary.live_preview(&behind_reply), None);
     }
 
-    /// The live-sighted working layout (codex-cli 0.144.6, 2026-07-20):
-    /// a hint row below the composer, no token bar painted. The composer
-    /// pin tolerates the rows below it, the anchor fires, and the absent
-    /// bar means no model label — `Working` with no prefix is correct.
+    /// A hint row may follow the composer without a token bar. The anchor
+    /// still fires, without a model prefix.
     #[test]
     fn codex_hint_row_layout_anchors_without_a_token_bar() {
         let hinted = rs(&[
@@ -1107,7 +1071,7 @@ mod tests {
 
     /// A menu quoted in the conversation always has the live composer
     /// somewhere below it; the composer's presence suppresses the modal
-    /// match, and the quote is a foreign row to the status scan — no
+    /// match, and the quote is a foreign row to the status scan: no
     /// anchor, floor tier.
     #[test]
     fn codex_quoted_menu_with_a_live_composer_is_not_a_modal() {
@@ -1245,8 +1209,7 @@ mod tests {
                 "preview_claude_waiting",
                 include_bytes!("../../tests/corpus/preview_claude_waiting.bin"),
                 &ClaudeSummary,
-                // The sighted screen is mid-session: the welcome box has
-                // scrolled off, so no model label prefixes the text.
+                // The welcome box is absent, so there is no model prefix.
                 "Waiting for 1 background agent to finish",
                 "claude:waiting-agents",
             ),
@@ -1359,8 +1322,7 @@ mod tests {
         assert_eq!(
             parts(&p),
             (
-                // The floor trims the status bar's self-indentation
-                // (layout, not meaning; see the cascade's floor arm).
+                // Floor previews omit the status bar's indentation.
                 "gpt-5.6-sol high · 5.26K used · 28.2K in · 78 out".to_string(),
                 PreviewSource::Floor,
                 None

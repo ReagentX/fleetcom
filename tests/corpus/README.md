@@ -33,19 +33,13 @@ feed the bytes to the emulator verbatim.
 The `preview_*.bin` fixtures pin summary-adapter extraction, normalization,
 and fallback behavior. Each fixture is a constructed repaint stream: optional
 alternate-screen entry, clear, home, then sanitized screen rows joined with
-CRLF. Claude and Grok use the alternate screen; Codex is inline. The source
-screens came from claude 2.1.215, codex-cli 0.144.6, and grok 0.2.102.
-Identifying and user-configured text is replaced with alignment-preserving
-synthetic values. Geometry is 40×120 unless noted.
+CRLF. Claude and Grok use the alternate screen; Codex is inline. Identifying
+and user-configured text is replaced with alignment-preserving synthetic
+values. Geometry is 40×120 unless noted.
 
-The `preview_codex_hint_row` and `preview_codex_approval` fixtures are
-paste-derived from a maintainer live sighting (2026-07-20, codex-cli 0.144.6
-— the same version as the snapshot captures; these are uncaptured states,
-not drift): indentation is approximate, so their tests key on trimmed heads
-and column-0 discipline only. `preview_codex_body_menu` is synthetic. `preview_claude_waiting` is
-paste-derived from a maintainer live sighting (2026-07-20, claude 2.1.215):
-the ellipsis-less waiting-for-agents spinner state, mid-session (welcome box
-scrolled off), with agent-roster rows below the input box.
+The Codex hint-row and approval fixtures use approximate indentation, so their
+tests match trimmed heads and column-0 structure. The Claude waiting fixture
+omits the welcome box and includes agent-roster rows below the input box.
 
 | Fixture | Scenario | Coverage |
 | --- | --- | --- |
@@ -60,7 +54,7 @@ scrolled off), with agent-roster rows below the input box.
 | `preview_codex_working.bin` | codex `• Working (7s • esc to interrupt) · 1 background terminal running · /ps to view · /stop to close` | `codex:working` normalization: affordances stripped, slow suffix kept |
 | `preview_codex_working_over_ran.bin` | codex working with a `• Ran` row higher in the same turn | `codex:working` wins at the pin; the stale row never surfaces |
 | `preview_codex_scrollback.bin` | codex finished turn, `• Ran` from the prior turn in scrollback | the scan stops at the reply bullet and resolves to the floor tier |
-| `preview_codex_ran.bin` | codex transient completion (synthetic: no raw capture holds it) | `codex:ran` extraction through the `└` attachment row |
+| `preview_codex_ran.bin` | codex transient completion row | `codex:ran` extraction through the `└` attachment row |
 | `preview_codex_hint_row.bin` | codex working with `tab to queue message` below the composer, no token bar | `codex:working` through the composer pin; no model prefix without the bar |
 | `preview_codex_approval.bin` | codex approval modal: composer and token bar replaced by a numbered menu | `codex:approval-menu` synthesizes `awaiting approval` |
 | `preview_codex_body_menu.bin` | modal-shaped menu quoted in the body, live composer below | negative: the composer's presence suppresses the modal match; floor tier reports |

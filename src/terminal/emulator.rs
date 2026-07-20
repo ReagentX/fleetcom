@@ -1493,9 +1493,8 @@ mod tests {
         assert_eq!(emu.title(), None, "ResetTitle must unset the capture");
     }
 
-    /// A title just before the alt entry stages and is promoted into the
-    /// new epoch at the entry event: children emit the title bytes just
-    /// before DECSET 1049, and no glyphs intervene to disclaim it.
+    /// A title immediately before alt-screen entry is promoted from staging
+    /// into the new epoch when no glyph intervenes.
     #[test]
     fn title_entering_alt_in_one_chunk_is_honored() {
         let mut emu = Emulator::new(4, 20, 0);

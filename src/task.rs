@@ -2032,12 +2032,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Full cascade end to end: an agent-shaped child paints a codex-shaped
-    /// working screen into a real PTY, repaints it with the completion row,
-    /// and exits; the summary adapter anchors the live preview and
-    /// finalization freezes the completion. The adapter is installed
-    /// manually because the child is `printf` under `$SHELL`, not `codex`:
-    /// no real agent CLI runs here.
+    /// End-to-end adapter path: a PTY screen resolves as a Codex anchor while
+    /// live and after exit. The test installs the adapter directly because the
+    /// child command is `printf`.
     #[test]
     fn summary_adapter_anchors_live_and_freezes_completion_at_exit() {
         use crate::preview::PreviewSource;

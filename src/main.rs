@@ -30,7 +30,6 @@ mod testutil;
 mod transport;
 mod ui;
 
-// Expose terminal modules through the crate root.
 pub(crate) use terminal::{ansi, emulator, format, frame};
 
 use std::{
