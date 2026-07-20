@@ -13,6 +13,7 @@ use crossterm::{
 use crate::{
     app::{App, DirKind, GroupMode, Mode, Row},
     format::{pad, rel_time, truncate},
+    preview::PreviewSource,
     protocol::{Lifecycle, TaskView},
 };
 
@@ -160,11 +161,14 @@ fn render_dashboard(out: &mut impl Write, app: &App) -> io::Result<()> {
             Row::Section(label) => dim(out, y, &format!("  {label}"), cols)?,
             Row::Task(ti) => {
                 let v = &app.views[*ti];
-                let line = task_row(v, cols);
                 if app.selected_id == Some(v.id) {
-                    rev(out, y, &line, cols)?;
+                    rev(out, y, &task_row(v, cols), cols)?;
+                } else if v.source == PreviewSource::Marker {
+                    // The marker is a placeholder, not output: dim the
+                    // preview cell so it reads as metadata.
+                    dim_preview_row(out, y, v, cols)?;
                 } else {
-                    put(out, y, &line, cols)?;
+                    put(out, y, &task_row(v, cols), cols)?;
                 }
             }
         }
@@ -304,7 +308,9 @@ fn row_age(v: &TaskView) -> Duration {
     edge.unwrap_or(v.started_ago)
 }
 
-fn task_row(v: &TaskView, cols: usize) -> String {
+/// Split a task row into its leading, preview, and time cells so the preview
+/// can be styled independently.
+fn task_row_parts(v: &TaskView, cols: usize) -> (String, String, String) {
     let glyph = match v.lifecycle {
         Lifecycle::Active => "✻",
         Lifecycle::Idle => "∙",
@@ -320,15 +326,34 @@ fn task_row(v: &TaskView, cols: usize) -> String {
     let used = 2 + 2 + 2 + title_w + 1 + 1 + time.chars().count();
     let prev_w = cols.saturating_sub(used);
     let preview = truncate(&v.preview, prev_w);
-    format!(
-        "  {g} {tg}{t:<tw$} {p:<pw$} {tm}",
-        g = glyph,
-        tg = tag,
-        t = title,
-        tw = title_w,
-        p = preview,
-        pw = prev_w,
-        tm = time,
+    (
+        format!("  {glyph} {tag}{title:<title_w$} "),
+        format!("{preview:<prev_w$}"),
+        format!(" {time}"),
+    )
+}
+
+fn task_row(v: &TaskView, cols: usize) -> String {
+    let (lead, preview, time) = task_row_parts(v, cols);
+    format!("{lead}{preview}{time}")
+}
+
+/// Paint a task row with only its padded preview cell dimmed.
+fn dim_preview_row(out: &mut impl Write, y: u16, v: &TaskView, cols: usize) -> io::Result<()> {
+    let (lead, preview, time) = task_row_parts(v, cols);
+    let display = pad(&format!("{lead}{preview}{time}"), cols);
+    let mut chars = display.chars();
+    let lead: String = chars.by_ref().take(lead.chars().count()).collect();
+    let preview: String = chars.by_ref().take(preview.chars().count()).collect();
+    let rest: String = chars.collect();
+    queue!(
+        out,
+        MoveTo(0, y),
+        Print(lead),
+        SetAttribute(Attribute::Dim),
+        Print(preview),
+        SetAttribute(Attribute::Reset),
+        Print(rest)
     )
 }
 
@@ -384,14 +409,33 @@ fn render_peek(out: &mut impl Write, app: &App) -> io::Result<()> {
         MoveTo(x0 as u16, by),
         Print(format!("└{}┘", "─".repeat(inner_w)))
     )?;
+    // The peek footer identifies the preview source and in-process matcher.
+    let footer = format!(
+        " space/esc close · enter attach · preview: {} ",
+        preview_provenance(v)
+    );
     queue!(
         out,
         MoveTo((x0 + 2) as u16, by),
         SetAttribute(Attribute::Dim),
-        Print(truncate(" space/esc close · enter attach ", inner_w)),
+        Print(truncate(&footer, inner_w)),
         SetAttribute(Attribute::Reset)
     )?;
     Ok(())
+}
+
+/// The peek footer's provenance label: source, then the matcher rule when
+/// one produced it, then the frozen flag. Examples: `title`, `floor (frozen)`.
+fn preview_provenance(v: &TaskView) -> String {
+    let mut s = v.source.label().to_string();
+    if let Some(rule) = v.rule {
+        s.push('/');
+        s.push_str(rule);
+    }
+    if v.frozen {
+        s.push_str(" (frozen)");
+    }
+    s
 }
 
 /// The varying content of a bottom-panel picker; `render_panel` owns the
@@ -684,6 +728,9 @@ mod tests {
             lifecycle: Lifecycle::Active,
             parked: false,
             preview: String::new(),
+            source: PreviewSource::Floor,
+            frozen: false,
+            rule: None,
             started_ago: std::time::Duration::from_secs(5),
             quiet_ago: None,
             finished_ago: None,
@@ -746,6 +793,20 @@ mod tests {
             !row.contains("cargo test"),
             "the name replaces the command: {row:?}"
         );
+    }
+
+    /// The peek footer's provenance label composes source, rule, and frozen.
+    #[test]
+    fn preview_provenance_label_shapes() {
+        let mut v = view(None);
+        assert_eq!(preview_provenance(&v), "floor");
+        v.source = PreviewSource::Title;
+        v.frozen = true;
+        assert_eq!(preview_provenance(&v), "title (frozen)");
+        v.source = PreviewSource::Anchor;
+        v.rule = Some("claude-status");
+        v.frozen = false;
+        assert_eq!(preview_provenance(&v), "anchor/claude-status");
     }
 
     /// The attached bar shows both the name and the command for a named task.

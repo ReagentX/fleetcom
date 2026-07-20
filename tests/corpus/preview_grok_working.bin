@@ -1,0 +1,39 @@
+[?1049h[2J[H
+  ~/Projects/fixture-sources                                                                                14K / 500K
+
+
+     ❯ run: sleep 5 && echo ok                                                                               7:34 PM
+
+
+     ◆ Thought for 0.3s
+  ┃  ◆ Run Sleep 5 seconds then echo ok
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    ⠼ Sleep 5 seconds then echo ok… 1.5s                                                         2.8s ⇣14.2k [↓][stop]
+
+  ╭──────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+  │ ❯                                                                                                                │
+  ╰────────────────────────────────────────────────────────────────────────────── Grok 4.5 (xhigh) · always-approve ─╯
+
+  Shift+Tab:mode  │  Ctrl+c:cancel  │  Ctrl+g:send to bg  │  Ctrl+x:shortcuts

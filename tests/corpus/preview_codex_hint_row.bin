@@ -1,0 +1,14 @@
+[2J[H✔ You approved codex to run cargo test --test daemon_env
+
+• Ran cargo test --test daemon_env
+  └ test spawn_runs_the_command ... ok
+    test result: ok. 1 passed; 0 failed
+
+• Running cargo test --test daemon_env
+
+
+• Working (10m 26s • esc to interrupt)
+
+›
+
+  tab to queue message

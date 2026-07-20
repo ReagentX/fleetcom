@@ -1,0 +1,40 @@
+[?1049h[2J[H
+╭─── Claude Code v2.1.215 ─────────────────────────────────────────────────────────────────────────────────────────────╮
+│                                                    │ Tips for getting started                                        │
+│              Welcome back Fleet Pilot!             │ Run /init to create a CLAUDE.md file with instructions for Cla… │
+│                                                    │ ─────────────────────────────────────────────────────────────── │
+│                       ▐▛███▜▌                      │ What's new                                                      │
+│                      ▝▜█████▛▘                     │ Claude no longer runs the `/verify` and `/code-review` skills … │
+│                        ▘▘ ▝▝                       │ Fixed single-segment `dir/**` allow rules like `Edit(src/**)` … │
+│ Fable 5 with high effort · Claude Max ·            │ Fixed a permission-check bypass affecting commands run in Wind… │
+│ anonymized-account0@example.invalid's Organization │ /release-notes for more                                         │
+│             ~/Projects/fixture-sources             │                                                                 │
+╰──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+
+
+❯ run: sleep 5 && echo ok
+
+⏺ Running 1 shell command…
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+· Hashing… (3s · ↓ 52 tokens)
+                   tmux focus-events off · add 'set -g focus-events on' to ~/.tmux.conf and reattach for focus tracking
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ 
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  (statusline scrubbed: user-configured row)                                         
+  ⏸ manual mode on · ← 2 agents

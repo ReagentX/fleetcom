@@ -354,6 +354,8 @@ impl Supervisor {
             // Scrape after process exit and reader EOF, when every child byte
             // is present in the grid (see `Task::scrape_exit_hint`).
             t.scrape_exit_hint();
+            // Freeze the preview from the complete output and final screen.
+            t.finalize_preview();
             if t.overdue(now, self.kill_grace) {
                 t.force_kill();
             }
@@ -409,32 +411,36 @@ impl Supervisor {
     /// `drain`ed events, never a `Task`.
     pub fn tick(&mut self) {
         self.reap();
+        let now = Instant::now();
         // vte re-checks its ?2026 sync timeout only when bytes arrive, so a
         // child that opens BSU and stalls would freeze its view. This tick is
         // the loop's only periodic path (the idle backstop guarantees one at
         // least every 200 ms), so an expired sync flushes here, before the
-        // snapshot below reads the grids, letting the same tick ship it.
-        for t in &self.tasks {
-            t.flush_expired_sync();
-        }
-        let now = Instant::now();
-
+        // preview resolution reads the grid, letting the same tick ship it.
+        // Resolution mutates per-task hold state; all tasks use one timestamp.
         let views = self
             .tasks
-            .iter()
-            .map(|t| TaskView {
-                id: t.id,
-                command: t.command.clone(),
-                cwd: t.cwd.clone(),
-                tagged: t.tagged,
-                group: t.group.clone(),
-                name: t.name.clone(),
-                lifecycle: t.lifecycle(now, IDLE_AFTER),
-                parked: t.parked(now, SORT_IDLE_AFTER),
-                preview: t.preview(),
-                started_ago: now.duration_since(t.started),
-                quiet_ago: t.finished.is_none().then(|| t.quiet_for(now)),
-                finished_ago: t.finished.map(|f| now.duration_since(f)),
+            .iter_mut()
+            .map(|t| {
+                t.flush_expired_sync();
+                let preview = t.resolve_preview(now);
+                TaskView {
+                    id: t.id,
+                    command: t.command.clone(),
+                    cwd: t.cwd.clone(),
+                    tagged: t.tagged,
+                    group: t.group.clone(),
+                    name: t.name.clone(),
+                    lifecycle: t.lifecycle(now, IDLE_AFTER),
+                    parked: t.parked(now, SORT_IDLE_AFTER),
+                    preview: preview.text,
+                    source: preview.source,
+                    frozen: preview.frozen,
+                    rule: preview.rule,
+                    started_ago: now.duration_since(t.started),
+                    quiet_ago: t.finished.is_none().then(|| t.quiet_for(now)),
+                    finished_ago: t.finished.map(|f| now.duration_since(f)),
+                }
             })
             .collect();
         self.events.push(Event::Tasks(views));

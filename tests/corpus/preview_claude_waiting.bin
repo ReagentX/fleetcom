@@ -1,0 +1,17 @@
+[?1049h[2J[H⏺ I'll spawn an Explore agent to map the text-input prompt editing surface before drafting the phase specs.
+
+⏺ Explore(Map text-input prompt editing)
+  ⎿  Running in background (↓ 1.2k tokens)
+  ⎿  Tell the agent what to explore
+
+⏺ The specs need the editing map before the loop kicks off; waiting on the background agent's report.
+
+✻ Waiting for 1 background agent to finish
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ draft the phase specs and kick off the loop
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  (statusline scrubbed: user-configured row)
+  ⏵⏵ auto mode on (shift+tab to cycle)
+
+⏺ main
+◯ Explore  Map text-input prompt editing
