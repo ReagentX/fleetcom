@@ -224,13 +224,12 @@ pub struct TaskView {
     /// idle threshold; `false` once finished.
     pub parked: bool,
     pub preview: String,
-    /// Provenance of `preview` (see [`PreviewSource`]).
+    /// Provenance of `preview`.
     pub source: PreviewSource,
     /// Whether the preview froze at output-complete and can no longer change.
     pub frozen: bool,
-    /// Fine-grained matcher id behind an adapter-produced preview. Never
-    /// encoded: an in-process core hands it to the peek footer directly, and
-    /// a socket frame decodes it as `None`.
+    /// Matcher ID for an adapter-produced preview. It is available only
+    /// in-process and is not encoded on the wire.
     pub rule: Option<&'static str>,
     pub started_ago: Duration,
     /// Time since the last PTY output; `Some` only while the task is live.
@@ -753,7 +752,7 @@ pub fn encode_event(ev: &Event) -> (u8, Vec<u8>) {
                 insert_opt_str(&mut o, "name", &tv.name);
                 let _ = o.insert("life", lifecycle_str(tv.lifecycle));
                 let _ = o.insert("preview", tv.preview.as_str());
-                // `rule` deliberately stays off the wire (see `TaskView`).
+                // Matcher rules are process-local and omitted from the wire.
                 let _ = o.insert("src", tv.source.label());
                 let _ = o.insert("frozen", tv.frozen);
                 let _ = o.insert("started_ms", tv.started_ago.as_millis() as u64);
@@ -833,9 +832,8 @@ pub fn decode_event(kind: u8, payload: &[u8]) -> Option<Event> {
                         } else {
                             tv["parked"].as_bool()?
                         };
-                        // Pre-preview daemons omit both keys: fall back to
-                        // the floor default, never to a dropped frame,
-                        // exactly like `parked` above.
+                        // Missing preview metadata uses conservative defaults
+                        // so the task frame remains usable.
                         let source = if tv["src"].is_null() {
                             PreviewSource::Floor
                         } else {
@@ -1481,7 +1479,7 @@ mod tests {
         let (k, p) = encode_event(&tasks);
         assert_eq!(decode_event(k, &p), Some(tasks));
 
-        // A daemon-side rule is dropped by encoding, not carried.
+        // Encoding omits the process-local matcher rule.
         let ruled = Event::Tasks(vec![TaskView {
             source: PreviewSource::Anchor,
             rule: Some("claude-status"),
@@ -1502,9 +1500,7 @@ mod tests {
         }
     }
 
-    /// A frame from a daemon predating the preview fields decodes with the
-    /// floor default, exactly like the `parked` fallback: skew degrades the
-    /// provenance, never the frame.
+    /// Missing preview metadata decodes to an unfrozen Floor source.
     #[test]
     fn tasks_frame_without_preview_keys_decodes_with_floor_defaults() {
         let old = r#"{"t":"tasks","tasks":[{"id":1,"command":"x","cwd":"Lw==","tagged":false,"life":"active","preview":"p","started_ms":0,"parked":false}]}"#;

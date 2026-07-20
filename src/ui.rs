@@ -308,9 +308,8 @@ fn row_age(v: &TaskView) -> Duration {
     edge.unwrap_or(v.started_ago)
 }
 
-/// The row's three cells — everything left of the preview, the padded preview
-/// cell, and the time column — split so `dim_preview_row` can restyle the
-/// preview cell alone.
+/// Split a task row into its leading, preview, and time cells so the preview
+/// can be styled independently.
 fn task_row_parts(v: &TaskView, cols: usize) -> (String, String, String) {
     let glyph = match v.lifecycle {
         Lifecycle::Active => "✻",
@@ -339,8 +338,7 @@ fn task_row(v: &TaskView, cols: usize) -> String {
     format!("{lead}{preview}{time}")
 }
 
-/// Paint one row with a dimmed preview cell, restyling the padded plain text
-/// like the header does so truncation cannot desync the styled runs.
+/// Paint a task row with only its padded preview cell dimmed.
 fn dim_preview_row(out: &mut impl Write, y: u16, v: &TaskView, cols: usize) -> io::Result<()> {
     let (lead, preview, time) = task_row_parts(v, cols);
     let display = pad(&format!("{lead}{preview}{time}"), cols);
@@ -411,8 +409,7 @@ fn render_peek(out: &mut impl Write, app: &App) -> io::Result<()> {
         MoveTo(x0 as u16, by),
         Print(format!("└{}┘", "─".repeat(inner_w)))
     )?;
-    // Debug affordance: where the row's preview came from. `rule` is only
-    // ever present in-process (it does not cross the wire).
+    // The peek footer identifies the preview source and in-process matcher.
     let footer = format!(
         " space/esc close · enter attach · preview: {} ",
         preview_provenance(v)
@@ -428,7 +425,7 @@ fn render_peek(out: &mut impl Write, app: &App) -> io::Result<()> {
 }
 
 /// The peek footer's provenance label: source, then the matcher rule when
-/// one produced it, then the frozen flag — e.g. `title` or `floor (frozen)`.
+/// one produced it, then the frozen flag. Examples: `title`, `floor (frozen)`.
 fn preview_provenance(v: &TaskView) -> String {
     let mut s = v.source.label().to_string();
     if let Some(rule) = v.rule {

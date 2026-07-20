@@ -1,24 +1,19 @@
-//! Dashboard-preview resolution: one [`Preview`] per task, chosen by a
-//! provenance cascade over facts the emulator already tracks and debounced
-//! through hold timers so the column changes only when meaning changes.
+//! Dashboard-preview resolution: one [`Preview`] per task, selected from
+//! emulator state and stabilized with hold timers.
 //! Liveness and outcome stay with the glyph and age columns.
 
 use std::time::{Duration, Instant};
 
 use crate::{emulator::Emulator, harness::summary::SummaryAdapter};
 
-// Both holds are wall-clock: tick spacing varies ≈25× (8 ms frame minimum
-// under load, 200 ms idle backstop), so a tick-counted debounce would be
-// load-dependent.
+// Holds use elapsed time because tick intervals range from the 8 ms frame
+// minimum to the 200 ms idle backstop.
 
-/// Minimum spacing between rendered title changes: above the spinner cadence
-/// of title-animating children, below reading annoyance.
+/// Minimum interval between rendered title changes.
 pub const TITLE_MIN_HOLD: Duration = Duration::from_millis(500);
 
-/// Continuous absence of a rendered-rank-or-better candidate before a
-/// demotion commits: more than one 200 ms quiet-tick gap with margin, so a
-/// single-tick transient (a partial repaint, a held sync frame) never demotes
-/// the rendered preview.
+/// Time a lower-ranked candidate must persist before it replaces the rendered
+/// preview.
 pub const DEMOTION_HOLD: Duration = Duration::from_millis(600);
 
 /// Preview text for an alternate-screen child with no usable title.
@@ -52,12 +47,9 @@ impl PreviewSource {
     }
 }
 
-/// One resolved preview. `frozen` is mutability, orthogonal to `source`: a
-/// finished task reports its last source with `frozen: true`, which a
-/// `Frozen` variant would erase. `rule` is the summary-adapter matcher id
-/// behind an Anchor preview (`None` for every other tier), and it stays
-/// daemon-side — the peek footer sees it only in-process, never over the
-/// wire.
+/// One resolved preview. `frozen` marks an immutable final value. `rule` is
+/// the summary-adapter matcher ID for an Anchor preview and is `None` for
+/// other sources.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Preview {
     pub text: String,
@@ -88,7 +80,7 @@ pub trait ScreenFacts {
     /// Every live-viewport row, trailing padding trimmed: the summary
     /// adapters' structural scan input.
     fn live_rows(&self) -> Vec<String>;
-    /// The floor snapshotted at the most recent alt-screen exit — what the
+    /// The floor snapshotted at the most recent alt-screen exit: what the
     /// 1049l restore left visible; `None` before the first exit.
     fn alt_leave_floor(&self) -> Option<&str>;
 }
@@ -123,8 +115,7 @@ impl ScreenFacts for Emulator {
     }
 }
 
-/// The instantaneous candidate. Every branch is a fact the emulator tracks
-/// or an extraction from it; nothing is fabricated:
+/// Resolve the instantaneous candidate in descending priority:
 /// 1. summary adapter: the normalized live status when the CLI's working
 ///    structure is present, `{model label} · `-prefixed when the adapter
 ///    reads one from stable chrome
@@ -164,7 +155,7 @@ fn cascade(screen: &impl ScreenFacts, adapter: Option<&dyn SummaryAdapter>) -> P
     // Leading indentation is layout, not meaning: codex's status bar (an
     // inline UI's bottom-most row, the floor of an idle codex task) indents
     // itself, and the spaces waste preview width. Trimmed here, not in
-    // `live_floor` — the emulator's row stays a faithful fact because it
+    // `live_floor`: the emulator's row stays a faithful fact because it
     // doubles as the teardown-snapshot comparator.
     let floor = screen.live_floor();
     let trimmed = floor.trim_start();
@@ -175,14 +166,11 @@ fn cascade(screen: &impl ScreenFacts, adapter: Option<&dyn SummaryAdapter>) -> P
     })
 }
 
-/// Candidate-recompute key: `(revision, alt epoch, alt bit, title, finished)`.
-/// Titles and the alt bit cannot change without a revision bump (the
-/// emulator's advance bookkeeping guarantees it), but the composite is cheap
-/// and self-documenting.
+/// State that invalidates the cached preview candidate.
 type ResolveKey = (u64, u64, bool, Option<String>, bool);
 
-/// Per-task resolution state. Lives on `Task` and resets with it: a rerun
-/// replaces the whole `Task`, so run-scoped state needs no external map.
+/// Per-task preview resolution state. A rerun replaces the `Task` and resets
+/// this state.
 #[derive(Debug)]
 pub struct PreviewState {
     rendered: Preview,
@@ -192,20 +180,16 @@ pub struct PreviewState {
     pending_candidate: Option<Preview>,
     /// Start of the demotion hold: the first resolution whose candidate
     /// ranked below the rendered source. Pending-candidate changes never
-    /// reset it — the timer measures continuous absence of
+    /// reset it: the timer measures continuous absence of
     /// rendered-or-higher, so a flapping demoted candidate cannot postpone
     /// the commit forever.
     downgrade_pending_since: Option<Instant>,
     /// Instant of the last rendered title: the min-hold deadline base.
     last_title_render: Option<Instant>,
     last_key: Option<ResolveKey>,
-    /// Screen mode that produced the rendered preview, stamped at every
-    /// render commit; `finalize`'s teardown predicate compares it against
-    /// the final screen. Per-render rather than per-resolve because the
-    /// exit's own 1049l output wakes the core, so a resolve routinely runs
-    /// between teardown and reader EOF — a live-resolve bit would flip
-    /// primary on that tick while the demotion hold still keeps the
-    /// alt-committed preview rendered.
+    /// Whether the rendered preview was committed on the alternate screen.
+    /// Finalization combines this with the exit snapshot to detect a restored
+    /// primary screen.
     rendered_under_alt: bool,
     finalized: bool,
 }
@@ -268,8 +252,8 @@ impl PreviewState {
     }
 
     /// One pass of the candidate-vs-rendered transition table. `alt` is the
-    /// alt bit of the screen this resolution ran against; every commit —
-    /// demotion-hold expiries included — stamps it onto the render.
+    /// alt bit of the screen this resolution ran against; every commit
+    /// (demotion-hold expiries included) stamps it onto the render.
     fn step(&mut self, now: Instant, alt: bool) {
         use std::cmp::Ordering;
         match self.candidate.source.cmp(&self.rendered.source) {
@@ -279,8 +263,8 @@ impl PreviewState {
                 self.render(cand, now, alt);
             }
             Ordering::Equal => {
-                // Rank ≥ rendered: a pending demotion was a one-tick repaint
-                // miss; recover with no visible change.
+                // A recovered rank cancels a pending demotion without a
+                // visible change.
                 self.cancel_demotion();
                 if self.candidate == self.rendered {
                     return;
@@ -337,38 +321,12 @@ impl PreviewState {
         self.downgrade_pending_since = None;
     }
 
-    /// Freeze the preview once the task's output is complete. Re-resolves
-    /// the cascade — anchor tier included, which is how a primary-screen
-    /// agent's final completion row (codex's `• Ran …`) freezes — against
-    /// the final screen instead of freezing the last rendered value: output
-    /// can land between the last resolution tick and output-complete (a
-    /// stream's final `test result: ok` flush), and the final resolve must
-    /// see it. `exit_line` outranks everything when present: it is the
-    /// adapter's synthetic exit summary from retained text (a v1 dead slot;
-    /// see [`SummaryAdapter::exit_preview`]). One carve-out,
-    /// `alt_torn_down_at_exit`: the rendered preview was committed under
-    /// the alternate screen and the final screen is primary, so the exit's
-    /// 1049l restored pre-launch junk (alt-screen agent CLIs print nothing
-    /// afterward) and the held preview freezes instead — a stale but
-    /// meaningful line under a truthful outcome glyph beats shell junk. The
-    /// predicate reads the per-render stamp, not a latched ever-entered-alt
-    /// bit: a child that leaves the alt screen and then lives on the
-    /// primary screen has its demotion hold expire and commit the floor,
-    /// stamped primary, and there the floor IS the honest final value. A
-    /// sub-hold exit teardown keeps the alt-committed preview rendered
-    /// precisely because the demotion hold absorbs the flip. The carve-out
-    /// additionally demands that the final floor still equal the floor
-    /// snapshotted at the alt exit: a changed floor means the child wrote
-    /// real primary output after teardown (`tui; echo done`), and the
-    /// fresh cascade must pick it up even inside the hold. The
-    /// discriminator is visible content, never byte arrival — claude's
-    /// exit emits title-reset controls that can land in a chunk after the
-    /// 1049l, so bytes arrive while nothing visible changes, and a
-    /// byte/revision test would freeze restored junk for exactly the CLI
-    /// the carve-out serves. Control-only chunks do not move the floor;
-    /// written output does. Holds do not apply: finalization overrides the whole transition
-    /// table. Idempotent; later resolutions short-circuit to the frozen
-    /// value.
+    /// Freeze the preview once output is complete. An `exit_line` takes
+    /// precedence; otherwise the final screen is resolved without hold timers.
+    /// If an alternate-screen render is followed only by restoration of the
+    /// snapshotted primary floor, the rendered preview is retained. A
+    /// different final floor is resolved normally.
+    /// Repeated calls are no-ops.
     pub fn finalize(
         &mut self,
         screen: &impl ScreenFacts,
@@ -503,7 +461,7 @@ mod tests {
     }
 
     /// Fixed-output adapter: the cascade tests here cover the slot's
-    /// plumbing (rank, label prefix, freeze), not extraction — that lives
+    /// plumbing (rank, label prefix, freeze), not extraction; that lives
     /// with the adapters in `harness::summary`.
     struct StubAdapter {
         live: Option<(&'static str, &'static str)>,
@@ -607,7 +565,6 @@ mod tests {
     }
 
     /// An adapter exit line outranks the final screen and freezes verbatim.
-    /// No v1 adapter produces one; the slot's plumbing is pinned here.
     #[test]
     fn finalize_prefers_an_adapter_exit_line() {
         let t0 = Instant::now();
@@ -719,7 +676,7 @@ mod tests {
         let p = st.resolve(t0 + ms(300), false, &s, None).clone();
         assert_eq!((p.text.as_str(), p.source), ("app", PreviewSource::Title));
 
-        // The next demotion measures from its own start, not the old stamp.
+        // The next demotion starts a new hold interval.
         s.clear_title();
         st.resolve(t0 + ms(400), false, &s, None);
         assert_eq!(
@@ -816,10 +773,8 @@ mod tests {
         assert_eq!(s.floor_calls.get(), 2, "a revision bump must recompute");
     }
 
-    /// A resize-shaped change — revision bumped, floor reflowed, alt bit,
-    /// epoch, and title untouched — invalidates the key and recomputes the
-    /// candidate (the emulator bumps its revision on resize for exactly
-    /// this).
+    /// A resize invalidates the key and recomputes the reflowed floor even
+    /// when the alternate-screen state and title are unchanged.
     #[test]
     fn a_resize_shaped_revision_bump_recomputes_the_candidate() {
         let t0 = Instant::now();
@@ -853,8 +808,8 @@ mod tests {
         );
     }
 
-    /// Alt torn down at exit: the restored primary junk must not replace the
-    /// last rendered preview, and the frozen value never moves again.
+    /// Alternate-screen teardown with an unchanged restored primary floor
+    /// retains and freezes the last rendered preview.
     #[test]
     fn finalize_keeps_the_rendered_preview_across_alt_teardown() {
         let t0 = Instant::now();
@@ -881,12 +836,8 @@ mod tests {
         );
     }
 
-    /// The likely interleaving, not the lucky one: the 1049l output itself
-    /// wakes the core, so a resolve routinely runs between alt teardown and
-    /// reader EOF. The teardown stamp travels with the rendered preview —
-    /// the demotion hold keeps the alt-committed title rendered through
-    /// that tick — so finalization must still keep it over the restored
-    /// primary junk.
+    /// A resolution between alternate-screen teardown and reader EOF retains
+    /// the alternate-screen render through the demotion hold and finalization.
     #[test]
     fn finalize_keeps_the_render_when_a_resolve_saw_the_teardown() {
         let t0 = Instant::now();
@@ -913,11 +864,8 @@ mod tests {
         );
     }
 
-    /// The stamp is per-render, not a latched ever-entered-alt bit: a child
-    /// that leaves the alt screen and lives on the primary screen long
-    /// enough for the demotion hold to commit gets a primary-stamped floor,
-    /// and finalization trusts the final screen — the floor is the honest
-    /// final value there.
+    /// When the demotion hold commits a primary-screen floor after teardown,
+    /// finalization resolves the final primary screen.
     #[test]
     fn finalize_trusts_the_screen_after_a_primary_commit() {
         let t0 = Instant::now();
@@ -949,10 +897,8 @@ mod tests {
         );
     }
 
-    /// `tui; echo done`: the child leaves the alt screen, prints a real
-    /// final line, and exits inside the demotion hold. The changed floor
-    /// defeats the teardown carve-out — the fresh cascade freezes the line
-    /// instead of a stale title discarding it.
+    /// Primary output written after alternate-screen teardown changes the
+    /// snapshotted floor and is frozen even inside the demotion hold.
     #[test]
     fn finalize_freezes_primary_output_written_after_teardown() {
         let t0 = Instant::now();
@@ -977,10 +923,9 @@ mod tests {
         );
     }
 
-    /// Control-only chunks after teardown — claude's exit emits title
-    /// resets that can land after the 1049l — advance the revision without
-    /// moving the floor. The carve-out compares visible content, not byte
-    /// arrival, so the held preview still freezes.
+    /// Control-only chunks after teardown can advance the revision without
+    /// moving the floor. Finalization compares visible content and retains
+    /// the held preview.
     #[test]
     fn finalize_holds_through_control_only_output_after_teardown() {
         let t0 = Instant::now();
@@ -1007,12 +952,8 @@ mod tests {
         );
     }
 
-    /// One read coalescing the 1049l with the successor's line — routine
-    /// on a loaded machine, since PTY reads do not preserve write
-    /// boundaries. The alt-exit observer snapshots at the mode event,
-    /// before the same read's successor bytes parse, so the finalize
-    /// comparison sees the line as new output and freezes it:
-    /// deterministic in read boundaries.
+    /// When one read contains 1049l and subsequent primary-screen output, the
+    /// exit snapshot excludes that output and finalization freezes it.
     #[test]
     fn finalize_freezes_coalesced_output_after_teardown() {
         let t0 = Instant::now();
@@ -1026,7 +967,7 @@ mod tests {
             "premise: the title rendered under the alt screen"
         );
 
-        // Teardown and the real final line arrive in ONE read.
+        // Teardown and the final line arrive in one read.
         emu.process(b"\x1b[?1049ldone\r\n");
         assert_eq!(
             emu.alt_leave_floor(),
@@ -1041,10 +982,8 @@ mod tests {
         );
     }
 
-    /// A resize between teardown and finalize reflows the restored junk.
-    /// The emulator re-snapshots the reflowed floor (both comparison sides
-    /// move together), so the reflow does not read as post-teardown output
-    /// and the held title still freezes.
+    /// A resize between teardown and finalization re-snapshots an unchanged
+    /// restored floor, so the held title remains eligible to freeze.
     #[test]
     fn finalize_holds_across_a_resize_after_teardown() {
         let t0 = Instant::now();
@@ -1074,9 +1013,8 @@ mod tests {
         );
     }
 
-    /// The dirty variant: real output after teardown, then a resize. The
-    /// pre-resize floor already differs from the snapshot, the mismatch is
-    /// evidence and stands, and finalize freezes the output floor.
+    /// A resize after primary output preserves the mismatch with the
+    /// alternate-screen exit snapshot, so finalization freezes the output.
     #[test]
     fn finalize_freezes_output_across_a_resize_after_teardown() {
         let t0 = Instant::now();
@@ -1121,9 +1059,7 @@ mod tests {
         );
     }
 
-    /// The floor drops leading indentation: an idle codex task's floor is
-    /// its self-indented status bar, and the spaces waste preview width.
-    /// Layout, not meaning.
+    /// Floor previews remove leading layout indentation.
     #[test]
     fn floor_preview_trims_leading_indentation() {
         let mut st = PreviewState::new();

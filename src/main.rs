@@ -30,7 +30,7 @@ mod testutil;
 mod transport;
 mod ui;
 
-// Re-exported at the root so call sites keep their short `crate::ansi`-style paths.
+// Expose terminal modules through the crate root.
 pub(crate) use terminal::{ansi, emulator, format, frame};
 
 use std::{

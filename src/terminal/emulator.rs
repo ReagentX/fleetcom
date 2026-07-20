@@ -35,14 +35,9 @@ pub enum MouseProtocolEncoding {
     Sgr,
 }
 
-/// Routes the backend's `Event::PtyWrite` probe responses into a buffer.
-/// The listener fires inside `Processor::advance`, while the caller holds
-/// the emulator lock, so it only stores, never blocks; the caller drains,
-/// filters, and sanitizes after `advance` returns. Every other backend
-/// event (titles, clipboard, color requests, bell) is discarded here: the
-/// default-deny probe policy starts with what never gets buffered, and
-/// titles are observed at their handler event by [`ObservedTerm`], not
-/// through this listener.
+/// Buffers backend-generated PTY responses while the parser advances. Other
+/// backend events are discarded; [`ObservedTerm`] captures titles directly
+/// from parser events.
 pub struct ProbeSink {
     responses: Arc<Mutex<Vec<String>>>,
 }
@@ -128,7 +123,7 @@ fn is_bidi_control(c: char) -> bool {
 /// Sanitize child-controlled title text: strip C0/C1 controls and bidi
 /// formatting controls, collapse each whitespace run to one space, trim the
 /// ends, cap at [`TITLE_MAX_BYTES`] on a char boundary. Empty output means
-/// the caller must unset its capture — a blank label is never displayed.
+/// the caller must unset its capture: a blank label is never displayed.
 fn sanitize_title(raw: &str) -> String {
     let mut out = String::new();
     for c in raw.chars() {
@@ -161,11 +156,8 @@ fn sanitize_title(raw: &str) -> String {
     out
 }
 
-/// A sanitized title plus the alt-screen epoch it was captured in — at the
-/// title event itself, or by promotion from staging at the entry event (see
-/// [`ObservedTerm::observe_title`]). The title is honored only while its
-/// epoch is current: each alt-screen entry starts a new epoch, so a title
-/// from a previous full-screen app never labels the app that replaced it.
+/// A sanitized title and the alternate-screen epoch that owns it. Each
+/// alternate-screen entry starts a new epoch.
 struct CapturedTitle {
     text: String,
     alt_epoch: u64,
@@ -276,11 +268,7 @@ impl Emulator {
         }
     }
 
-    /// The shared bookkeeping step behind every grid advance — `process` and
-    /// both sync-frame landings. Nothing but the revision bump remains:
-    /// epochs, teardown snapshots, and title ownership are all observed at
-    /// their parser events by [`ObservedTerm`], so no preview semantics
-    /// depend on where PTY reads split.
+    /// Record one parser or synchronized-frame advance.
     fn observe_advance(&mut self) {
         self.revision += 1;
     }
@@ -332,7 +320,7 @@ impl Emulator {
     /// timeout, landing the buffered frame in the grid; returns any
     /// allowlisted probe replies the landed bytes generated. Exists for
     /// reader EOF: every child fd is closed, so the closing ESU can never
-    /// arrive and `flush_expired_sync`'s deadline wait protects nothing —
+    /// arrive and `flush_expired_sync`'s deadline wait protects nothing:
     /// the frame is landed, not torn. No-op when no sync is open.
     pub fn finish_output(&mut self) -> Vec<String> {
         if self.parser.sync_timeout().sync_timeout().is_none() {
@@ -469,14 +457,8 @@ impl Emulator {
 
     /// Resize the grid to `rows`×`cols`.
     pub fn resize(&mut self, rows: u16, cols: u16) {
-        // The teardown snapshot must survive the reflow: when the floor
-        // still equals it (nothing written since the alt exit), the resize
-        // rewraps one side of the finalize comparison, so re-snapshot the
-        // reflowed floor afterwards to keep both sides equal. When they
-        // already differ, real output arrived and the mismatch is evidence
-        // — leave it standing. Never simply clear: a cleared snapshot
-        // fails the teardown carve-out and freezes restored junk, the
-        // wrong direction. Exact equality in both branches; no heuristic.
+        // Re-snapshot an unchanged restored floor after reflow. A floor that
+        // already differs records primary output after the alt-screen exit.
         let untouched = self
             .alt
             .leave_floor
@@ -489,11 +471,8 @@ impl Emulator {
         if untouched {
             self.alt.leave_floor = Some(live_floor_of(&self.term));
         }
-        // A resize reflows the grid — wrapping, row positions — without any
-        // bytes arriving, so revision-keyed pollers must re-read. A bare
-        // bump, not `observe_advance`: that step consumes byte-driven state
-        // (a pending title event) that a resize never produces, and
-        // consuming it here would misattribute it.
+        // Reflow changes grid contents without parser input, so cached screen
+        // facts must be invalidated.
         self.revision += 1;
     }
 
@@ -522,21 +501,20 @@ impl Emulator {
         self.alt.epoch
     }
 
-    /// The floor snapshotted at the most recent alt-screen exit (see the
-    /// field docs); `None` until the child first leaves the alt screen.
+    /// The live floor captured at the most recent alt-screen exit, or `None`
+    /// before the first exit.
     pub fn alt_leave_floor(&self) -> Option<&str> {
         self.alt.leave_floor.as_deref()
     }
 
     /// The window title. On the alternate screen: the captured title,
-    /// honored only while its alt-screen epoch is current — a title from a
+    /// honored only while its alt-screen epoch is current; a title from a
     /// previous alt session reads as `None`. On the primary screen: a live
     /// staged announce (a title not yet disclaimed by printed output)
     /// surfaces first, then a still-current captured title.
     pub fn title(&self) -> Option<&str> {
-        // On the primary screen a live staged announce surfaces, so shell
-        // titles read as before; the preview cascade never consults titles
-        // there. The captured title keeps its epoch gate unchanged.
+        // Surface a staged primary-screen title until printable output
+        // disclaims it or an alternate-screen entry claims it.
         if !self.alternate_screen()
             && let Some(staged) = self.alt.staged_title.as_deref()
         {
@@ -550,7 +528,7 @@ impl Emulator {
     }
 
     /// The last non-blank row of the live screen, trailing padding trimmed;
-    /// empty when the screen is blank. Ignores the scrollback view offset —
+    /// empty when the screen is blank. Ignores the scrollback view offset:
     /// `contents` follows `display_offset`, which would make a scrolled-back
     /// task preview historical rows instead of live output.
     pub fn live_floor(&self) -> String {
@@ -567,10 +545,8 @@ impl Emulator {
     }
 }
 
-/// The last non-blank row of `term`'s live screen, trailing padding
-/// trimmed; empty when the screen is blank (see [`Emulator::live_floor`]).
-/// Free over the term so the alt-exit observer can snapshot mid-advance,
-/// while the `&mut Term` is borrowed as a handler.
+/// The last non-blank live row, with trailing padding removed. This free
+/// function can run while `Term` is borrowed through a parser handler.
 fn live_floor_of(term: &Term<ProbeSink>) -> String {
     for row in (0..term.grid().screen_lines() as i32).rev() {
         let text = live_row_text_of(term, row);
@@ -608,16 +584,10 @@ fn live_row_text_of(term: &Term<ProbeSink>, row: i32) -> String {
     text
 }
 
-/// Alt-screen and title facts observed at parser-event granularity: every
-/// field moves at its exact event, never at read boundaries, so no preview
-/// semantics depend on where PTY reads split — a read that coalesces a
-/// teardown with successor output, a leave and re-enter, or a title with a
-/// following mode flip all observe identically however the reads land.
-///
-/// The one accepted residual: a title emitted between two apps (after A's
-/// 1049l, before B's 1049h) with no intervening glyphs stages into B —
-/// indistinguishable from grok's legitimate pre-entry announce by any fact
-/// held here.
+/// Alternate-screen and title state updated at parser-event boundaries. A
+/// primary-screen title with no following printable output is assigned to the
+/// next alternate-screen entry; the state cannot distinguish that announce
+/// from a title emitted between two full-screen applications.
 #[derive(Default)]
 struct AltScreen {
     /// Count of alt-screen entries. Compared against
@@ -630,52 +600,39 @@ struct AltScreen {
     /// The live floor captured at each alt-screen exit, at the mode event
     /// itself: successor bytes in the same read have not parsed yet, so
     /// this is exactly what the restore left visible. Preview finalization
-    /// compares the final floor against it to tell restored pre-launch
-    /// junk from real primary output written after teardown.
+    /// compares the final floor against it to distinguish restored primary
+    /// content from content written after teardown.
     leave_floor: Option<String>,
     /// Sanitized title owned by an alt session, epoch-stamped at its event.
     title: Option<CapturedTitle>,
-    /// Sanitized title announced on the primary screen, awaiting the next
-    /// alt entry: grok titles the window just before its 1049h, and the
-    /// entry event promotes this into the new epoch. Printable output
-    /// disclaims it (see the `input` forward); a reset clears it.
+    /// Sanitized title announced on the primary screen and awaiting the next
+    /// alternate-screen entry. Printable output disclaims it; a reset clears
+    /// it.
     staged_title: Option<String>,
     /// Mirror of the backend's raw (unsanitized) current title, kept only
     /// so the title-stack shadow pushes what the backend pushes.
     raw_title: Option<String>,
-    /// Mirror of the backend's title stack. A pop restores through the
-    /// backend's own internal `set_title`, which never re-enters the
-    /// wrapper, so the pop is replayed against this shadow instead. Same
-    /// bound and eviction as the backend (`TITLE_STACK_MAX_DEPTH`, pinned
-    /// `=0.26.0`).
+    /// Shadow of the backend title stack, needed because a backend pop does
+    /// not emit a handler title event.
     title_stack: Vec<Option<String>>,
 }
 
-/// The backend's `TITLE_STACK_MAX_DEPTH` (term/mod.rs, pinned `=0.26.0`):
-/// the shadow stack must evict exactly when the backend does or a deep
-/// stack would desynchronize pops.
+/// Capacity of the backend title stack mirrored by [`AltScreen::title_stack`].
 const TITLE_STACK_SHADOW_MAX: usize = 4096;
 
 /// Delegating [`Handler`] that forwards every parser event to the wrapped
 /// [`Term`] and observes alt-screen transitions the moment they happen.
 ///
-/// # Missed-forward hazard
+/// # Forwarding invariant
 ///
-/// Every `Handler` method has an empty `{}` default, so a missing forward
-/// compiles silently and swallows that escape. Two fences hold: the
-/// backend is pinned `=0.26.0` in Cargo.toml, and
-/// `golden::emulator_wrapper_matches_the_raw_backend_on_every_fixture`
-/// replays every corpus fixture through this wrapper and diffs the full
-/// screen, cursor, and mode against a raw backend replay — a swallowed
-/// method breaks it loudly (the classic goldens alone cannot serve: they
-/// drive the raw backend and never touch this path). The forwards below
-/// are mechanically generated from the vte 0.15 trait: 71 methods,
-/// count-verified against the trait definition.
+/// `Handler` methods default to no-ops, so every method must delegate to
+/// `Term`. `golden::emulator_wrapper_matches_the_raw_backend_on_every_fixture`
+/// compares wrapper and raw-backend replays to detect missing delegation.
 ///
-/// # Why this is sound under `?2026`
+/// # Synchronized updates
 ///
 /// The parser buffers a synchronized-update frame and drives the handler
-/// only when the frame lands (in `advance` or `stop_sync` — both routed
+/// only when the frame lands (in `advance` or `stop_sync`, both routed
 /// through this wrapper), so these events fire exactly when the grid
 /// moves: the observer can never see a transition the grid has not
 /// performed, which no byte-scanner could guarantee.
@@ -685,11 +642,8 @@ struct ObservedTerm<'a> {
 }
 
 impl ObservedTerm<'_> {
-    /// Compare the wrapped term's alt bit against the last observed value
-    /// after a delegated mode-touching event. Mode-number-agnostic by
-    /// design — no 1049/1047/47 literals: the bit compare tracks whatever
-    /// modes the backend maps to the alt screen, surviving backend
-    /// changes.
+    /// Update alternate-screen state after a delegated mode change by
+    /// comparing the backend's current and previously observed mode bits.
     fn observe_alt(&mut self) {
         let alt = self.term.mode().contains(TermMode::ALT_SCREEN);
         if alt && !self.alt.last_alt {
@@ -710,18 +664,10 @@ impl ObservedTerm<'_> {
         self.alt.last_alt = alt;
     }
 
-    /// Title ownership at the event. A title set ON the alt screen labels
-    /// the current epoch, where it was spoken. A title set on the primary
-    /// screen is STAGED for the next alt entry — grok announces its title
-    /// just before its 1049h — and promoted at the entry event. A reset,
-    /// or a title that sanitizes to nothing, clears both: `printf
-    /// '\x1b]0;\x07'` un-titles the window, it does not freeze a stale
-    /// one. Staging is disclaimed by printable output (`input`), never by
-    /// control traffic: grok's gap between its title and 1049h is clears
-    /// and cursor moves, which must not disclaim, while a shell prompt
-    /// always prints glyphs, so a prompt-titling shell cannot leak its
-    /// title into the next app. Input-only is the deliberate, minimal
-    /// rule.
+    /// Assign a sanitized title to the current alternate-screen epoch or
+    /// stage it for the next entry when on the primary screen. An empty title
+    /// clears captured and staged titles. Printable output, but not control
+    /// traffic, disclaims a staged title.
     fn observe_title(&mut self, title: Option<String>) {
         self.alt.raw_title.clone_from(&title);
         let text = title
@@ -743,7 +689,7 @@ impl ObservedTerm<'_> {
     }
 }
 
-/// Mechanical forwards. Five carry observations after delegating:
+/// Handler delegation. Five methods also update observed state:
 /// `set_private_mode`, `unset_private_mode`, and `reset_state` observe the
 /// alt bit (RIS exits the alt screen too); `set_title` observes title
 /// ownership; `input` disclaims a staged title. `push_title`/`pop_title`
@@ -762,10 +708,7 @@ impl Handler for ObservedTerm<'_> {
     }
     fn input(&mut self, a0: char) {
         self.term.input(a0);
-        // Printable output disclaims a staged title (rationale on
-        // `observe_title`). One branch, predictably not-taken: staging is
-        // only ever live between a primary-screen title and the next alt
-        // entry.
+        // Printable output disclaims a staged primary-screen title.
         if self.alt.staged_title.is_some() {
             self.alt.staged_title = None;
         }
@@ -875,11 +818,8 @@ impl Handler for ObservedTerm<'_> {
     fn reset_state(&mut self) {
         self.term.reset_state();
         self.observe_alt();
-        // RIS clears the backend's title and title stack directly, without
-        // a handler event (term/mod.rs `reset_state`): mirror both, and
-        // drop any staged announce with the rest of the pre-reset world.
-        // The captured title stays — it is epoch-gated and expires at the
-        // next entry, matching the pre-observer behavior.
+        // RIS clears the backend title and title stack without separate
+        // handler events. The captured title remains epoch-gated.
         self.alt.raw_title = None;
         self.alt.title_stack.clear();
         self.alt.staged_title = None;
@@ -1487,7 +1427,7 @@ mod tests {
         assert_eq!(sanitize_title("\x01\x02\x03"), "");
     }
 
-    /// Each bidi formatting control is stripped individually — the fixed set
+    /// Each bidi formatting control is stripped individually: the fixed set
     /// the sanitizer names, not a general `Cf` sweep.
     #[test]
     fn sanitize_strips_each_bidi_control() {
@@ -1554,7 +1494,7 @@ mod tests {
     }
 
     /// A title just before the alt entry stages and is promoted into the
-    /// new epoch at the entry event — children emit the title bytes just
+    /// new epoch at the entry event: children emit the title bytes just
     /// before DECSET 1049, and no glyphs intervene to disclaim it.
     #[test]
     fn title_entering_alt_in_one_chunk_is_honored() {
@@ -1564,10 +1504,8 @@ mod tests {
         assert_eq!(emu.title(), Some("app"));
     }
 
-    /// A primary-screen title followed by printed output is the shell
-    /// titling itself: the glyphs are what disclaim it now — a bare title
-    /// with only control traffic until the entry stays valid by the
-    /// staging rule, deliberately (that is grok's announce shape).
+    /// Printable primary-screen output disclaims a staged title; control-only
+    /// traffic leaves it available for the next alternate-screen entry.
     #[test]
     fn title_before_alt_entry_in_a_prior_chunk_expires() {
         let mut emu = Emulator::new(4, 20, 0);
@@ -1582,11 +1520,8 @@ mod tests {
         );
     }
 
-    /// The maintainer's counterexample: app A titles itself inside alt
-    /// epoch 1, then bounces to app B. Whether the title, the 1049l, and
-    /// the 1049h share one read or split before the 1049l, the outcome is
-    /// identical — the title event stamped epoch 1 at the event, and the
-    /// bounce advanced to 2.
+    /// A leave and re-entry expires the first alternate-screen epoch's title,
+    /// independent of how the bytes are split across reads.
     #[test]
     fn in_alt_title_expires_across_a_bounce_on_any_read_boundary() {
         for split in [false, true] {
@@ -1609,7 +1544,7 @@ mod tests {
     }
 
     /// grok's announce shape: a primary-screen title, a control-only gap
-    /// (clears and cursor moves), then the alt entry — honored on either
+    /// (clears and cursor moves), then the alt entry. Honored on either
     /// read boundary, because control traffic never disclaims staging.
     #[test]
     fn staged_title_survives_a_control_only_gap_into_the_entry() {
@@ -1637,10 +1572,8 @@ mod tests {
         assert_eq!(emu.title(), None);
     }
 
-    /// The accepted residual, pinned as documented behavior: a title
-    /// emitted between two apps — after A's 1049l, before B's 1049h — with
-    /// no intervening glyphs stages into B. No fact held here can tell it
-    /// from grok's legitimate pre-entry announce (`AltScreen` docs).
+    /// A primary-screen title between two alternate-screen sessions stages
+    /// into the second session when no printable output intervenes.
     #[test]
     fn inter_app_title_with_no_glyphs_stages_into_the_next_app() {
         let mut emu = Emulator::new(4, 20, 0);
@@ -1667,7 +1600,7 @@ mod tests {
 
     /// A title followed by leaving the alt screen: the title event fires
     /// while the alt screen is still active, capturing into the current
-    /// epoch, and the exit keeps the epoch — so it stays honored.
+    /// epoch, and the exit keeps the epoch, so it stays honored.
     #[test]
     fn title_just_before_alt_exit_stays_honored() {
         let mut emu = Emulator::new(4, 20, 0);
@@ -1694,9 +1627,8 @@ mod tests {
         assert_eq!(emu.title(), Some("app"));
     }
 
-    /// The expired-timeout landing, same premise: sleeping past vte's 150 ms
-    /// deadline is a minimum-duration wait, so expiry is guaranteed, not
-    /// raced.
+    /// An expired synchronized frame updates the revision, alternate-screen
+    /// epoch, and title when it lands.
     #[test]
     fn flush_expired_sync_runs_the_advance_bookkeeping() {
         let mut emu = Emulator::new(4, 20, 0);
@@ -1737,11 +1669,8 @@ mod tests {
         assert_eq!(emu.revision(), before + 1);
     }
 
-    /// The alt-exit snapshot captures what the 1049l restore left visible,
-    /// at the mode event itself: text after the 1049l — in a later read OR
-    /// coalesced into the same one — moves the floor without touching the
-    /// snapshot. PTY reads do not preserve write boundaries, so the
-    /// coalesced case is routine on a loaded machine, not rare.
+    /// The alternate-screen exit snapshot captures the restored floor before
+    /// any following bytes, including bytes coalesced into the same read.
     #[test]
     fn alt_leave_floor_snapshots_the_restore() {
         let mut emu = Emulator::new(4, 20, 0);
@@ -1769,9 +1698,8 @@ mod tests {
         assert_eq!(emu.live_floor(), "coalesced");
     }
 
-    /// The maintainer's epoch regression: a leave and re-enter inside one
-    /// read must advance the epoch and expire the previous app's title —
-    /// read boundaries are not allowed to decide title expiry.
+    /// A leave and re-entry within one read advances the epoch and expires the
+    /// preceding alternate-screen title.
     #[test]
     fn same_read_alt_bounce_advances_the_epoch_and_expires_the_title() {
         let mut emu = Emulator::new(4, 20, 0);

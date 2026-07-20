@@ -354,9 +354,7 @@ impl Supervisor {
             // Scrape after process exit and reader EOF, when every child byte
             // is present in the grid (see `Task::scrape_exit_hint`).
             t.scrape_exit_hint();
-            // Same gate: freeze the preview once output is complete, off the
-            // final screen rather than the last-rendered value (see
-            // `Task::finalize_preview`).
+            // Freeze the preview from the complete output and final screen.
             t.finalize_preview();
             if t.overdue(now, self.kill_grace) {
                 t.force_kill();
@@ -418,9 +416,8 @@ impl Supervisor {
         // child that opens BSU and stalls would freeze its view. This tick is
         // the loop's only periodic path (the idle backstop guarantees one at
         // least every 200 ms), so an expired sync flushes here, before the
-        // preview resolve reads the grid, letting the same tick ship it.
-        // Iteration is `&mut` because preview resolution mutates per-task
-        // hold state; every task resolves against the one `now` above.
+        // preview resolution reads the grid, letting the same tick ship it.
+        // Resolution mutates per-task hold state; all tasks use one timestamp.
         let views = self
             .tasks
             .iter_mut()

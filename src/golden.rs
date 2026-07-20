@@ -577,14 +577,10 @@ fn semantic_dec_scrollregion_charset_translation() {
     assert_eq!(al.grid().cursor.point, Point::new(Line(39), Column(0)));
 }
 
-/// Differential canary for the Emulator's delegating [`Handler`] wrapper
-/// (`ObservedTerm` in `terminal::emulator`): every corpus fixture replayed
-/// through the Emulator must land on exactly the screen, cursor, and mode a
-/// raw backend replay produces. All 71 Handler methods have empty defaults,
-/// so a missed forward compiles silently and swallows escapes — this
-/// comparison is what breaks loudly instead. The classic `alacritty()`
-/// goldens above deliberately bypass the Emulator (they pin the raw
-/// backend), so they cannot serve as that fence.
+/// Verify that `ObservedTerm` forwards parser events by comparing each corpus
+/// replay through `Emulator` with a replay through the raw backend. The
+/// comparison covers the screen, cursor, and alternate-screen mode; the other
+/// golden tests exercise only the raw backend.
 #[test]
 fn emulator_wrapper_matches_the_raw_backend_on_every_fixture() {
     let fixtures: [(&str, &[u8]); 12] = [

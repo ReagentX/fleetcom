@@ -339,11 +339,8 @@ pub struct Task {
     pub harness: Option<&'static dyn crate::harness::Harness>,
     /// Harness home resolved from this run's launch environment.
     pub harness_home: Option<PathBuf>,
-    /// Summary adapter selected at spawn from the requested command,
-    /// deliberately not keyed off `harness`: that field is set only when
-    /// detection *and* capture-asset install succeed, and an
-    /// instrumentation failure must not silently kill dashboard summaries.
-    /// Adapter output is display-only (`harness::summary` module docs).
+    /// Display-only summary adapter selected from the requested command,
+    /// independently of session-capture instrumentation.
     pub summary_adapter: Option<&'static dyn crate::harness::summary::SummaryAdapter>,
     /// Run number used to give each rerun a distinct capture path.
     pub run: u32,
@@ -625,11 +622,9 @@ impl Task {
         Ok(())
     }
 
-    /// Whether the child exited and the PTY reader reached EOF, so no more
-    /// bytes can ever reach the grid. A missing reader handle counts as
-    /// complete. The reader ends on `Ok(0) | Err(_)` without distinguishing
-    /// clean EOF from a read error, so the name claims completeness, not
-    /// cleanliness.
+    /// Whether the child exited and the PTY reader stopped, so no more bytes
+    /// can reach the grid. A missing reader handle counts as complete; the
+    /// reader treats EOF and read errors identically.
     pub(crate) fn output_complete(&self) -> bool {
         self.finished.is_some() && self.handle.as_ref().is_none_or(JoinHandle::is_finished)
     }
@@ -644,10 +639,9 @@ impl Task {
         self.scraped = true;
         let text = {
             let mut emu = grid(&self.parser);
-            // The gate above holds: reader EOF means no ESU can ever close an
-            // open `?2026` frame, so land it before reading, or a hint printed
-            // inside the frame is invisible to the scrape. Probe replies are
-            // dropped because every slave fd is closed — nothing reads them.
+            // Land any open synchronized frame before scraping. The reader is
+            // stopped, so no closing ESU can arrive; all slave fds are closed,
+            // so generated probe replies have no recipient.
             let _ = emu.finish_output();
             emu.text_with_history()
         };
@@ -759,11 +753,9 @@ impl Task {
             .clone()
     }
 
-    /// Freeze the preview once per task life at `output_complete`. Lands any
-    /// open `?2026` frame first so the final resolve sees every byte;
-    /// `scrape_exit_hint` does the same for its own read, and whichever runs
-    /// second no-ops. The adapter's `exit_preview` slot reads retained text,
-    /// paid for only when an adapter exists (no v1 adapter returns one).
+    /// Freeze the preview once output is complete. Any open `?2026` frame is
+    /// landed first, and retained text is read only when an adapter is
+    /// selected.
     pub(crate) fn finalize_preview(&mut self) {
         if self.preview.finalized() || !self.output_complete() {
             return;
@@ -1941,12 +1933,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Alt teardown at exit: the child enters the alt screen, titles it, and
-    /// exits through 1049l. The restored primary junk must not replace the
-    /// last rendered preview; it freezes with its source preserved. The
-    /// teardown is fenced behind a second flag so the test can force a
-    /// resolve on the torn-down screen before EOF — the interleaving the
-    /// core actually produces, since the 1049l output is what wakes it.
+    /// A resolution after 1049l but before reader EOF retains and freezes the
+    /// alternate-screen title when the restored primary floor is unchanged.
     #[test]
     fn finalize_preview_keeps_the_last_render_across_alt_teardown() {
         use crate::preview::PreviewSource;
@@ -1975,9 +1963,8 @@ mod tests {
             }),
             "teardown never reached the grid"
         );
-        // The killer tick: resolve against the torn-down screen while the
-        // child still lives. The demotion hold keeps the title rendered,
-        // and the render's alt stamp must survive this resolve.
+        // Resolve against the restored primary screen before reader EOF. The
+        // demotion hold retains the alternate-screen title and mode stamp.
         assert_eq!(
             t.resolve_preview(Instant::now()).source,
             PreviewSource::Title,
@@ -2005,13 +1992,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// `tui; echo done` at the PTY level: teardown, then a real primary
-    /// line, then exit inside the demotion hold. The frozen preview is the
-    /// line, not the stale title. The 1049l and the line are written
-    /// together, without a separating sleep: the alt-exit observer
-    /// snapshots at the mode event, so the read boundary is immaterial —
-    /// coalesced or split, the result is the same. That is the fix's
-    /// point.
+    /// Alternate-screen teardown followed by primary output freezes the
+    /// primary line even when both are written together inside the demotion
+    /// hold.
     #[test]
     fn finalize_preview_freezes_primary_output_after_alt_teardown() {
         use crate::preview::PreviewSource;
@@ -2053,7 +2036,7 @@ mod tests {
     /// working screen into a real PTY, repaints it with the completion row,
     /// and exits; the summary adapter anchors the live preview and
     /// finalization freezes the completion. The adapter is installed
-    /// manually because the child is `printf` under `$SHELL`, not `codex` —
+    /// manually because the child is `printf` under `$SHELL`, not `codex`:
     /// no real agent CLI runs here.
     #[test]
     fn summary_adapter_anchors_live_and_freezes_completion_at_exit() {

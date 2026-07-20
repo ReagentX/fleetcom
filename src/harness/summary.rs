@@ -1,85 +1,54 @@
-//! Per-agent summary adapters: the Anchor tier of the dashboard-preview
-//! cascade (see [`crate::preview`]). Each adapter reads one agent CLI's
-//! bottom chrome from the live grid and extracts the CLI's own status words.
+//! Display-only summary adapters for the Anchor tier of the dashboard preview.
+//! Each adapter extracts status text from an agent CLI's bottom chrome.
 //!
 //! # Display-only contract
 //!
-//! Adapter output is rendered in the dashboard preview column and nowhere
-//! else. It never enters a shell command, so the harness module's
-//! [`is_uuid`](super::is_uuid) insertion boundary does not apply here — and
-//! no adapter output may ever be routed onto a path where it would.
+//! Adapter output is rendered in the dashboard and never enters a shell
+//! command. It is therefore outside the session-ID validation boundary in
+//! [`is_uuid`](super::is_uuid).
 //!
 //! # Anchor discipline
 //!
-//! The dangerous failure is a false positive: codex scrollback holds
-//! `• Ran …` rows from every prior turn, a conversation *about* a numbered
-//! menu paints `❯ 1. Yes` into the body, and an agent cat-ing a document can
-//! paint status-shaped rows anywhere on the grid. Every matcher therefore:
+//! Status-shaped text can also appear in scrollback or conversation content.
+//! To avoid treating it as live status, every matcher:
 //!
-//! 1. locates the chrome region structurally — claude's separator-pair input
-//!    box, codex's status bar and composer, grok's bordered input box — and
+//! 1. locates the chrome region structurally (claude's separator-pair input
+//!    box, codex's status bar and composer, grok's bordered input box) and
 //!    scans only rows pinned to it, never the whole grid;
-//! 2. extracts only when the working structure sits at the pinned position.
-//!    A missing anchor returns `None` and the cascade degrades to
-//!    title/marker/floor, which is honest where a body match would lie;
-//! 3. keys on the row head (glyph + verb prefix) and never requires trailing
-//!    components: the CLIs truncate their status rows at a word boundary
-//!    with an appended ellipsis at narrow widths, and the affordances and
-//!    suffixes that truncate first are exactly what normalization strips. A
-//!    truncated extraction keeps the CLI's own ellipsis verbatim. A window
-//!    narrow enough to wrap the ellipsis itself breaks the row structure,
-//!    which fails the pin and falls through.
+//! 2. returns `None` when the expected structure is absent or inconsistent;
+//! 3. matches row prefixes so status rows truncated with an ellipsis at narrow
+//!    widths remain recognizable. A wrapped row fails the structural check.
 //!
-//! Normalization removes churn — spinner glyphs, elapsed counters, token and
-//! throughput tickers, `esc to interrupt` and `/ps`/`/stop` affordances —
-//! and never paraphrases: the preview shows the child's own words — a
-//! placeholder verb, a task-derived phrase, a command line — verbatim.
-//! The one synthesized label is `awaiting approval` for claude's approval
-//! menu, whose literal text (`❯ 1. Yes`) is meaningless in a dashboard
-//! column; keep it the only one.
-//!
-//! Matchers encode screens observed on claude 2.1.215, codex-cli 0.144.6,
-//! and grok 0.2.102 (fixtures: `tests/corpus/README.md`). They share the
-//! harness module's brittleness posture: each constant names the exact
-//! screen it came from, and the corpus tests break loudly when a CLI
-//! repaints its chrome.
+//! Normalization removes spinner glyphs, elapsed counters, throughput data,
+//! and key hints while preserving the CLI's status text. The only synthesized
+//! status is `awaiting approval` for claude's approval menu. Corpus fixtures
+//! in `tests/corpus` pin the supported screen structures.
 
 use std::path::Path;
 
 use crate::preview::ScreenFacts;
 
-/// One agent CLI's screen knowledge: live status extraction and the model
-/// label, both display-only (module docs).
+/// Display-only status and model-label extraction for one agent CLI.
 pub trait SummaryAdapter: Sync {
-    /// The normalized live status and the matcher id that produced it, when
-    /// the CLI's working structure is present at its pinned position. `None`
-    /// on any structural doubt: a missed anchor degrades to title/marker,
-    /// a guessed one lies.
+    /// Return normalized live status and its matcher ID when the expected
+    /// chrome structure is present.
     fn live_preview(&self, screen: &dyn ScreenFacts) -> Option<(String, &'static str)>;
 
-    /// Model label from a stable chrome row — claude's welcome box, codex's
-    /// status bar, grok's input-box border — never from user-configurable
-    /// rows (claude's statusline differs on every machine). The cascade
-    /// prepends `{label} · ` when `live_preview` fires.
+    /// Return a model label from stable CLI chrome. The preview cascade
+    /// prepends it to live status as `{label} · `.
     fn model_label(&self, screen: &dyn ScreenFacts) -> Option<String>;
 
-    /// Synthetic exit line derived from retained terminal text, frozen as
-    /// the final preview when returned. The slot exists for synthetic exit
-    /// lines later; no v1 implementation returns `Some`.
+    /// Return an optional final summary derived from retained terminal text.
+    /// The default implementation produces no summary.
     fn exit_preview(&self, _retained_text: &str) -> Option<String> {
         None
     }
 }
 
-/// Select the adapter for a requested command: basename match on the first
-/// whitespace-separated word. Deliberately wider than harness detection —
-/// `claude --model opus` paints a claude screen even though its command line
-/// is opaque to resume rewriting, and a wrong pick can only mis-read a
-/// screen into `None`, never rewrite a command. Env prefixes (`FOO=bar
-/// claude`) and compound shell commands select nothing: their first word is
-/// not the program. Selection is also independent of [`super::detect`]:
-/// `Task::harness` is set only when detection *and* capture-asset install
-/// succeed, and an instrumentation failure must not kill summaries.
+/// Select an adapter by the basename of the command's first
+/// whitespace-separated word. Arguments are accepted; environment prefixes
+/// and compound shell commands do not select an adapter. Selection is
+/// independent of session-capture instrumentation.
 pub fn select(command: &str) -> Option<&'static dyn SummaryAdapter> {
     let first = command.split_whitespace().next()?;
     match Path::new(first).file_name()?.to_str()? {
@@ -106,10 +75,8 @@ fn is_rule_row(row: &str) -> bool {
 
 // ---------------------------------------------------------------- claude --
 
-/// Spinner frames observed in claude 2.1.215's working states (the
-/// `claude_resume.bin` stream cycles exactly these). `·` is a frame, not
-/// punctuation: the glyph alone never matches without the `…`-terminated
-/// verb after it.
+/// Accepted claude spinner frames. A frame matches only when followed by a
+/// space and an `…`-terminated status phrase.
 const CLAUDE_SPINNER: &[char] = &['·', '✢', '✳', '✶', '✻', '✽'];
 
 /// claude (alt screen). Working state: a column-0 spinner row directly above
@@ -122,8 +89,7 @@ impl SummaryAdapter for ClaudeSummary {
         let rows = screen.live_rows();
         match claude_box_top(&rows) {
             Some(top) => claude_spinner_status(&rows, top),
-            // No input box: only the approval dialog removes it, so only
-            // here may the menu shape mean anything.
+            // Consider approval menus only when the normal input box is absent.
             None => claude_approval(&rows),
         }
     }
@@ -134,7 +100,7 @@ impl SummaryAdapter for ClaudeSummary {
 }
 
 /// Index of the input box's top separator. The bottom-most full-width rule
-/// is the box's bottom edge — only statusline rows render below it — a
+/// is the box's bottom edge (only statusline rows render below it); a
 /// second rule within six rows is its top edge, and a `❯`-headed row between
 /// them is the input line. Body text above and statusline rows below never
 /// enter the scan.
@@ -152,9 +118,9 @@ fn claude_box_top(rows: &[String]) -> Option<usize> {
 /// Scan the three rows above the input box for the spinner row. Hint rows
 /// (the tmux focus-events notice, the right-aligned `● high · /effort`) are
 /// indented while the spinner paints at column 0; a column-0 row that is not
-/// spinner-shaped aborts the scan — it is body text reaching the chrome or
-/// the wrapped tail of a status row too wide for the window, and both must
-/// fail structurally rather than risk matching something status-shaped.
+/// spinner-shaped aborts the scan: body text reaching the chrome, or the
+/// wrapped tail of a status row too wide for the window. Both must fail
+/// structurally rather than risk matching something status-shaped.
 fn claude_spinner_status(rows: &[String], top: usize) -> Option<(String, &'static str)> {
     for i in (top.saturating_sub(3)..top).rev() {
         let row = &rows[i];
@@ -172,14 +138,9 @@ fn claude_spinner_status(rows: &[String], top: usize) -> Option<(String, &'stati
     None
 }
 
-/// `✻ Hashing… (6s · ↓ 87 tokens)` → `Hashing…`: one spinner frame, a space,
-/// the status phrase through its first `…`. The phrase is not always a
-/// single placeholder verb — observed live: task-derived text with embedded
-/// parens and digits (`✳ Overseeing phase 4 (adapters)…`) — and nothing here
-/// keys on its shape. The trailing parenthetical (elapsed/token counters or
-/// free-text progress) and any `esc to interrupt` affordance sit after the
-/// `…` and drop; CLI-side truncation also ends at a word boundary with its
-/// own `…`, so the same cut keeps a truncated phrase's ellipsis verbatim.
+/// Extract the text through the first `…` after a claude spinner frame.
+/// Task-derived phrases may contain spaces, parentheses, and digits. Text
+/// after the ellipsis, including counters and key hints, is discarded.
 fn claude_spinner_text(row: &str) -> Option<String> {
     let mut chars = row.chars();
     if !CLAUDE_SPINNER.contains(&chars.next()?) || chars.next()? != ' ' {
@@ -196,8 +157,8 @@ fn claude_spinner_text(row: &str) -> Option<String> {
 /// The concrete-action row above a confirmed spinner: skip the blank gap,
 /// probe exactly one row. `⏺ Running 1 shell command…` names real work while
 /// the spinner phrase rotates per request, so it wins when both are
-/// present. The probe requires the `⏺` head and a single trailing `…` —
-/// `⏺ ok`-style reply rows fail it — and anything else keeps the spinner
+/// present. The probe requires the `⏺` head and a single trailing `…`
+/// (`⏺ ok`-style reply rows fail it); anything else keeps the spinner
 /// phrase: scanning further up would be a body hunt.
 fn claude_action_row(rows: &[String], spinner: usize) -> Option<String> {
     let row = rows[..spinner].iter().rev().find(|r| !r.is_empty())?;
@@ -206,11 +167,9 @@ fn claude_action_row(rows: &[String], spinner: usize) -> Option<String> {
     (text.find('…') == Some(tail)).then(|| text.to_string())
 }
 
-/// The approval dialog's selector row, reachable only with the input box
-/// gone: `❯ 1. …` with a `2. …` option below, pinned to the last nine rows
-/// of painted content. Returns the one synthesized label — `❯ 1. Yes` is
-/// meaningless in a dashboard column (module docs; keep it the only
-/// paraphrase).
+/// Match an approval selector only when the input box is absent: `❯ 1. …`
+/// with a `2. …` option below, within the last nine painted rows. Returns the
+/// synthesized label `awaiting approval`.
 fn claude_approval(rows: &[String]) -> Option<(String, &'static str)> {
     let last = rows.iter().rposition(|r| !r.is_empty())?;
     let i = (last.saturating_sub(8)..=last).find(|&i| rows[i].trim_start().starts_with("❯ 1. "))?;
@@ -252,8 +211,8 @@ fn claude_welcome_label(rows: &[String]) -> Option<String> {
 
 // ----------------------------------------------------------------- codex --
 
-/// codex (inline UI, primary screen). The pin is its status bar — the
-/// bottom-most non-blank row — with the composer above it; status rows sit
+/// codex (inline UI, primary screen). The pin is its status bar (the
+/// bottom-most non-blank row) with the composer above it; status rows sit
 /// above the composer, and scrollback beyond the first foreign row is out of
 /// bounds.
 pub struct CodexSummary;
@@ -274,8 +233,8 @@ impl SummaryAdapter for CodexSummary {
 }
 
 /// codex's status bar is the bottom-most non-blank row of its inline UI:
-/// `{model} · {…} in · {…} out`. Its absence — codex exited and left its
-/// resume hint as the last row, or something else owns the screen — fails
+/// `{model} · {…} in · {…} out`. Its absence (codex exited and left its
+/// resume hint as the last row, or something else owns the screen) fails
 /// the whole pin.
 fn codex_token_line(rows: &[String]) -> Option<usize> {
     let i = rows.iter().rposition(|r| !r.is_empty())?;
@@ -299,8 +258,8 @@ fn codex_composer(rows: &[String]) -> Option<usize> {
 
 /// Walk up from the composer through the status region: blanks and indented
 /// rows (tool-output attachments like `└ ok`, wrapped continuations) are
-/// skipped, and the first column-0 row decides. Only two heads extract —
-/// `• Working (` and `• Ran ` — and any other column-0 row (a reply bullet,
+/// skipped, and the first column-0 row decides. Only two heads extract
+/// (`• Working (` and `• Ran `); any other column-0 row (a reply bullet,
 /// a `⚠` notice, a turn separator) stops the scan: scrollback holds `• Ran`
 /// rows from every prior turn, and skipping an unknown row to reach one
 /// would resurface stale work as live status.
@@ -325,7 +284,7 @@ fn codex_status(rows: &[String], composer: usize) -> Option<(String, &'static st
 /// `7s • esc to interrupt) · 1 background terminal running · /ps to view ·
 /// /stop to close` → `Working · 1 background terminal running`. The
 /// parenthetical is the elapsed counter plus interrupt affordance, dropped
-/// whole — an unclosed paren is CLI-side truncation mid-affordance and drops
+/// whole: an unclosed paren is CLI-side truncation mid-affordance and drops
 /// to the end. Of the ` · ` suffixes, `/`-headed segments are key hints;
 /// everything else is slow-moving state worth keeping, with its own ellipsis
 /// when the CLI truncated it.
@@ -345,8 +304,8 @@ fn codex_working(after_paren: &str) -> String {
 
 // ------------------------------------------------------------------ grok --
 
-/// grok (alt screen). The pin is its bordered input box; the status row —
-/// braille spinner while working, `Worked for {n}s` after a turn — is the
+/// grok (alt screen). The pin is its bordered input box; the status row
+/// (braille spinner while working, `Worked for {n}s` after a turn) is the
 /// first painted row above the box's top border.
 pub struct GrokSummary;
 
@@ -392,7 +351,7 @@ fn grok_input_box(rows: &[String]) -> Option<(usize, usize)> {
 
 /// `⠼ Sleep 5 seconds then echo ok… 1.5s 2.8s ⇣14.2k [↓][stop]` → the label
 /// through its `…`: a braille spinner frame, a space, text cut at the first
-/// `…` — everything after it is elapsed/throughput ticker. A wrapped status
+/// `…`. Everything after it is elapsed/throughput ticker. A wrapped status
 /// row leaves its `…` tail on the probe row with no spinner head, which
 /// fails here and falls through.
 fn grok_spinner_text(t: &str) -> Option<String> {
@@ -607,11 +566,8 @@ mod tests {
         );
     }
 
-    /// Observed live (claude 2.1.215, 2026-07-20): the spinner row carried
-    /// a task-derived phrase — multi-word, embedded parens and digits —
-    /// with a free-text parenthetical after it, not a token counter. The
-    /// structural cut (glyph + space + text through the first `…`)
-    /// extracts it verbatim; nothing may key on a single-verb shape.
+    /// Task-derived spinner phrases may contain spaces, parentheses, and
+    /// digits; extraction keeps everything through the first ellipsis.
     #[test]
     fn claude_spinner_extracts_task_derived_phrases() {
         let sep = "─".repeat(120);
@@ -682,7 +638,7 @@ mod tests {
     }
 
     /// Working-row normalization: parenthetical dropped (unclosed included),
-    /// `/`-hint suffixes dropped, slow suffixes kept — with the CLI's own
+    /// `/`-hint suffixes dropped, slow suffixes kept, with the CLI's own
     /// ellipsis when truncated.
     #[test]
     fn codex_working_normalization() {
@@ -889,8 +845,8 @@ mod tests {
         }
     }
 
-    /// Honest-degradation fixtures: idle and post-turn screens carry no
-    /// anchor and fall through to the marker (alt screen, no title).
+    /// Idle and post-turn screens have no anchor and resolve to the
+    /// alternate-screen marker.
     #[test]
     fn corpus_idle_states_fall_through() {
         let cases: [(&str, &[u8], &dyn SummaryAdapter); 4] = [
@@ -925,7 +881,7 @@ mod tests {
         }
     }
 
-    /// Negative fixtures: status-shaped text in the body never extracts.
+    /// Status-shaped conversation text does not extract.
     /// The claude fixtures quote an approval menu in the conversation; the
     /// codex fixtures hold `• Ran` in scrollback behind a finished turn.
     #[test]
@@ -1026,9 +982,8 @@ mod tests {
         );
     }
 
-    /// Pathological width: the window wraps the status row's own ellipsis
-    /// onto the probe row. The structure check fails and the preview falls
-    /// through — degradation, never a false positive.
+    /// At 30 columns, a wrapped status ellipsis fails the structure check and
+    /// resolves to the alternate-screen marker.
     #[test]
     fn corpus_wrapped_ellipsis_falls_through() {
         let p = resolve_corpus(

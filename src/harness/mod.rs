@@ -12,8 +12,8 @@
 //! Every ID returned by `parse_capture`, `scrape_exit`, or `correlate_fs`
 //! eventually enters a shell command. These methods must therefore return only
 //! strings accepted by [`is_uuid`]. Free-text names, paths, and malformed IDs
-//! yield `None`. The `summary` submodule is the one exemption: its output is
-//! display-only and must never reach a command line (see its module docs).
+//! yield `None`. Summary adapters are display-only and do not return session
+//! IDs.
 
 pub mod assets;
 mod claude;
