@@ -299,7 +299,10 @@ impl App {
     /// non-daemon escape hatch, and the deterministic target the UI harnesses use.
     pub fn new_foreground(rows: u16, cols: u16) -> App {
         App::assemble(rows, cols, |pr, c, wait_tx| {
-            Box::new(ThreadTransport::spawn(Supervisor::new(pr, c), wait_tx))
+            Box::new(ThreadTransport::spawn(
+                Supervisor::new(pr, c, crate::supervisor::resolve_scrollback()),
+                wait_tx,
+            ))
         })
     }
 
@@ -1453,7 +1456,7 @@ mod tests {
         /// Uses this process's launch context.
         fn new_local(rows: u16, cols: u16) -> App {
             App::assemble(rows, cols, |pr, c, _wait_tx| {
-                let mut sup = Supervisor::new(pr, c);
+                let mut sup = Supervisor::new(pr, c, 2000);
                 sup.set_launch_context(crate::protocol::LaunchContext::here());
                 Box::new(LocalTransport::new(sup))
             })
@@ -1463,7 +1466,7 @@ mod tests {
         /// the core's session root instead of inheriting this process's env.
         fn new_local_with_ctx(rows: u16, cols: u16, ctx: crate::protocol::LaunchContext) -> App {
             App::assemble(rows, cols, move |pr, c, _wait_tx| {
-                let mut sup = Supervisor::new(pr, c);
+                let mut sup = Supervisor::new(pr, c, 2000);
                 sup.set_launch_context(ctx);
                 Box::new(LocalTransport::new(sup))
             })

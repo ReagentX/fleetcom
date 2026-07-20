@@ -9,6 +9,7 @@
 | `fleetcom` | Connect to the daemon (autostarting it if needed) and open the dashboard |
 | `fleetcom <session>` | Load a saved [session](sessions.md) at startup, then open the dashboard |
 | `fleetcom --foreground` | Run the core in-process, no daemon; jobs die when you quit |
+| `fleetcom --scrollback <lines>` | Set per-task scrollback depth (default 2,000, max 100,000); see [Scrollback](#scrollback) |
 | `fleetcom --kill` | Stop the daemon and kill every job it owns; works even while another client is attached (it signals the daemon rather than queueing behind the socket) |
 | `fleetcom --help` / `-h` | Print usage and exit |
 | `fleetcom --version` / `-V` | Print the version and exit |
@@ -68,7 +69,7 @@ Modified Enter, paste, and mouse input require state-dependent encoding:
 
 #### Scrollback
 
-Tasks retain 2,000 lines of scrollback. While attached to an inline child, wheel-up over its output enters scrollback; `Shift+PageUp` also enters it (`Ctrl+PageUp` and `Alt+PageUp` work when Shift is intercepted). The status bar shows `[scroll ↑N]`. The wheel scrolls, `PageUp`/`PageDown` move by pages, `↑`/`↓` by lines, and `Home` jumps to the oldest row. `Esc`, `Enter`, `q`, `End`, or reaching the bottom returns to live output. Typing also returns to live and forwards the key. Detaching or switching tasks resets the view.
+Tasks retain 2,000 lines of scrollback by default. `--scrollback <lines>` or the `FLEETCOM_SCROLLBACK` environment variable overrides the depth (the flag wins), clamped to 100,000; `0` disables scrollback, and an unparseable env value falls back to the default rather than failing startup. The value is read when a supervisor starts, so it applies to a `--foreground` run or to a daemon the invocation autostarts — an already-running daemon keeps its depth until `fleetcom --kill`. While attached to an inline child, wheel-up over its output enters scrollback; `Shift+PageUp` also enters it (`Ctrl+PageUp` and `Alt+PageUp` work when Shift is intercepted). The status bar shows `[scroll ↑N]`. The wheel scrolls, `PageUp`/`PageDown` move by pages, `↑`/`↓` by lines, and `Home` jumps to the oldest row. `Esc`, `Enter`, `q`, `End`, or reaching the bottom returns to live output. Typing also returns to live and forwards the key. Detaching or switching tasks resets the view.
 
 #### Destroy is Shift-gated
 

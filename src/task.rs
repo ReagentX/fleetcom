@@ -28,9 +28,6 @@ use crate::{
     protocol::{Key, Lifecycle, Mods, MouseKind, ScrollAction, env_get},
 };
 
-/// Number of history rows retained by each task's terminal grid.
-const SCROLLBACK: usize = 2000;
-
 /// Maximum bytes admitted to one task's writer queue but not yet written to the
 /// PTY. This admits one maximum-size paste with headroom while bounding queued
 /// input when a child stops reading.
@@ -449,10 +446,11 @@ fn wait_code(status: &rustix::process::WaitIdStatus) -> i32 {
 }
 
 impl Task {
-    /// Spawn `exec_command` under `$SHELL -c` in a fresh `rows`×`cols` PTY.
-    /// The task keeps `command` for the UI and recipes, while only
-    /// `exec_command` carries instrumentation. The child receives exactly
-    /// `env`; `waker` notifies the core when terminal output arrives.
+    /// Spawn `exec_command` under `$SHELL -c` in a fresh `rows`×`cols` PTY
+    /// whose grid retains `scrollback` history rows. The task keeps `command`
+    /// for the UI and recipes, while only `exec_command` carries
+    /// instrumentation. The child receives exactly `env`; `waker` notifies
+    /// the core when terminal output arrives.
     #[allow(clippy::too_many_arguments)] // All arguments define task launch state.
     pub fn spawn(
         id: u64,
@@ -461,6 +459,7 @@ impl Task {
         cwd: &Path,
         rows: u16,
         cols: u16,
+        scrollback: usize,
         env: &[(OsString, OsString)],
         waker: Waker,
     ) -> io::Result<Task> {
@@ -510,7 +509,7 @@ impl Task {
         let mut reader = pair.master.try_clone_reader().map_err(io_err)?;
         let writer = pair.master.take_writer().map_err(io_err)?;
 
-        let parser = Arc::new(FairMutex::new(Emulator::new(rows, cols, SCROLLBACK)));
+        let parser = Arc::new(FairMutex::new(Emulator::new(rows, cols, scrollback)));
         let last_activity = Arc::new(Mutex::new(Instant::now()));
 
         // The writer channel exists before the reader thread because the
@@ -1033,6 +1032,7 @@ mod tests {
             &here(),
             24,
             80,
+            2000,
             &env_here(),
             no_waker(),
         )
@@ -1138,6 +1138,7 @@ mod tests {
             &here(),
             24,
             80,
+            2000,
             &env_here(),
             no_waker(),
         )
@@ -1179,7 +1180,8 @@ mod tests {
         // must survive its session leader's exit (leader death HUPs the
         // foreground group) to *be* a straggler.
         let cmd = format!("trap '' HUP; sleep 300 & echo $! > {}", spid.display());
-        let mut t = Task::spawn(5, &cmd, &cmd, &here(), 24, 80, &sh_env(), no_waker()).unwrap();
+        let mut t =
+            Task::spawn(5, &cmd, &cmd, &here(), 24, 80, 2000, &sh_env(), no_waker()).unwrap();
         wait_finished(&mut t); // leader exits as soon as the background job is up
         let straggler = read_pid(&spid);
         assert!(kill(straggler, None).is_ok(), "straggler should be alive");
@@ -1239,7 +1241,8 @@ mod tests {
         // `trap '' HUP` first: the `&` child must survive its session
         // leader's exit to be a straggler (see the terminate test above).
         let cmd = format!("trap '' HUP; sleep 300 & echo $! > {}", spid.display());
-        let mut t = Task::spawn(31, &cmd, &cmd, &here(), 24, 80, &sh_env(), no_waker()).unwrap();
+        let mut t =
+            Task::spawn(31, &cmd, &cmd, &here(), 24, 80, 2000, &sh_env(), no_waker()).unwrap();
         wait_finished(&mut t);
         let straggler = read_pid(&spid);
 
@@ -1866,7 +1869,8 @@ mod tests {
              printf 'Resume this session with:\\nclaude --resume {ID}\\n'",
             f = flag.display()
         );
-        let mut t = Task::spawn(20, &cmd, &cmd, &here(), 24, 80, &sh_env(), no_waker()).unwrap();
+        let mut t =
+            Task::spawn(20, &cmd, &cmd, &here(), 24, 80, 2000, &sh_env(), no_waker()).unwrap();
         t.harness = Some(&crate::harness::Claude);
 
         // Hold the grid before output so the reader cannot process bytes or
@@ -1904,7 +1908,8 @@ mod tests {
         const ID: &str = "7f3b9c1e-5a2d-4e8f-9b6a-0c4d2e8f1a3b";
         let cmd =
             format!("printf '\\033[?2026hResume this session with:\\nclaude --resume {ID}\\n'");
-        let mut t = Task::spawn(21, &cmd, &cmd, &here(), 24, 80, &sh_env(), no_waker()).unwrap();
+        let mut t =
+            Task::spawn(21, &cmd, &cmd, &here(), 24, 80, 2000, &sh_env(), no_waker()).unwrap();
         t.harness = Some(&crate::harness::Claude);
         assert!(
             wait_until(Duration::from_secs(60), || {
@@ -1933,7 +1938,8 @@ mod tests {
             "until [ -e '{}' ]; do sleep 0.05; done; printf 'test result: ok\\n'",
             flag.display()
         );
-        let mut t = Task::spawn(40, &cmd, &cmd, &here(), 24, 80, &sh_env(), no_waker()).unwrap();
+        let mut t =
+            Task::spawn(40, &cmd, &cmd, &here(), 24, 80, 2000, &sh_env(), no_waker()).unwrap();
         // The last live resolution predates every byte of output.
         let early = t.resolve_preview(Instant::now());
         assert!(!early.frozen);
@@ -1970,7 +1976,8 @@ mod tests {
             td = teardown.display(),
             ex = exit.display()
         );
-        let mut t = Task::spawn(41, &cmd, &cmd, &here(), 24, 80, &sh_env(), no_waker()).unwrap();
+        let mut t =
+            Task::spawn(41, &cmd, &cmd, &here(), 24, 80, 2000, &sh_env(), no_waker()).unwrap();
         assert!(
             wait_until(Duration::from_secs(5), || {
                 t.resolve_preview(Instant::now()).source == PreviewSource::Title
@@ -2028,7 +2035,8 @@ mod tests {
              printf '\\033[?1049ldone\\n'",
             flag.display()
         );
-        let mut t = Task::spawn(43, &cmd, &cmd, &here(), 24, 80, &sh_env(), no_waker()).unwrap();
+        let mut t =
+            Task::spawn(43, &cmd, &cmd, &here(), 24, 80, 2000, &sh_env(), no_waker()).unwrap();
         assert!(
             wait_until(Duration::from_secs(5), || {
                 t.resolve_preview(Instant::now()).source == PreviewSource::Title
@@ -2067,7 +2075,8 @@ mod tests {
              printf '\\033[H\\033[2J• Ran echo ok\\n\\n› \\n  synth-model high · 2 in · 3 out'",
             f = flag.display()
         );
-        let mut t = Task::spawn(42, &cmd, &cmd, &here(), 24, 80, &sh_env(), no_waker()).unwrap();
+        let mut t =
+            Task::spawn(42, &cmd, &cmd, &here(), 24, 80, 2000, &sh_env(), no_waker()).unwrap();
         assert!(t.summary_adapter.is_none(), "printf selects nothing");
         t.summary_adapter = crate::harness::summary::select("codex");
         assert!(t.summary_adapter.is_some());
@@ -2124,7 +2133,8 @@ mod tests {
              head -c 11 > {}",
             out.display()
         );
-        let mut t = Task::spawn(11, &cmd, &cmd, &here(), 24, 80, &sh_env(), no_waker()).unwrap();
+        let mut t =
+            Task::spawn(11, &cmd, &cmd, &here(), 24, 80, 2000, &sh_env(), no_waker()).unwrap();
         let mut got = Vec::new();
         wait_until(Duration::from_secs(5), || {
             got = std::fs::read(&out).unwrap_or_default();

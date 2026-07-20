@@ -49,7 +49,7 @@ use crate::{
         Command, Event, LaunchContext, PROTOCOL_VERSION, decode_command, decode_event,
         decode_hello, encode_command, encode_event, encode_hello, hello_version,
     },
-    supervisor::Supervisor,
+    supervisor::{self, Supervisor},
 };
 
 /// Maximum duration of the hello handshake, on the daemon side and the
@@ -319,6 +319,14 @@ fn spawn_daemon() -> io::Result<()> {
         .stdout(Stdio::null())
         .stderr(log.map(Stdio::from).unwrap_or_else(Stdio::null))
         .process_group(0);
+    // `--scrollback` lives in this process as typed state (`scrollback_flag`;
+    // the crate's `forbid(unsafe_code)` rules out `env::set_var`), which dies
+    // at this process boundary. The inherited environment is the one channel
+    // that reaches an autostarted daemon without a wire-protocol change, so
+    // forward the flag as the env var it stands in for.
+    if let Some(lines) = supervisor::scrollback_flag() {
+        cmd.env(supervisor::FLEETCOM_SCROLLBACK, lines.to_string());
+    }
     cmd.spawn()?;
     Ok(())
 }
@@ -445,7 +453,10 @@ pub fn run_daemon() -> io::Result<()> {
 
     // 24x80 until the first client's Resize, which arrives before any Spawn.
     // Each connection supplies its launch context in the hello frame.
-    let mut sup = Supervisor::new(24, 80);
+    // Scrollback resolves from this process's env, which an autostarted
+    // daemon inherited from its first client: the value is fixed for this
+    // daemon's lifetime, so changing it takes a `--kill` and a fresh start.
+    let mut sup = Supervisor::new(24, 80, supervisor::resolve_scrollback());
 
     // A signalled daemon shuts down *cleanly*: TERM each job's group with a
     // KILL after the grace, remove the socket. Dying without that cleanup

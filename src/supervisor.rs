@@ -9,7 +9,7 @@ use std::{
     ffi::OsString,
     io,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex, mpsc::Sender},
+    sync::{Arc, Mutex, OnceLock, mpsc::Sender},
     time::{Duration, Instant},
 };
 
@@ -54,6 +54,61 @@ const MAX_TASKS: usize = 256;
 /// Maximum command length in bytes. Direct spawns and session loads enforce
 /// this limit to bound shell arguments and serialized task snapshots.
 const MAX_COMMAND_LEN: usize = 64 * 1024;
+
+/// Env var overriding per-task terminal scrollback (history rows). Read once,
+/// when a supervisor is constructed, so a change reaches the tasks of the
+/// *next* daemon: an already-running daemon keeps its value until
+/// `fleetcom --kill`.
+pub const FLEETCOM_SCROLLBACK: &str = "FLEETCOM_SCROLLBACK";
+
+/// History rows retained by each task's terminal grid absent any override.
+pub const DEFAULT_SCROLLBACK: usize = 2000;
+
+/// Ceiling on the scrollback override: alacritty's own config cap. History
+/// rows are lazily allocated, so a large limit costs memory only when a task
+/// actually scrolls, but a stray huge value must not be able to balloon the
+/// daemon.
+const MAX_SCROLLBACK: usize = 100_000;
+
+/// The validated `--scrollback` value, installed at most once, at startup, by
+/// `main`. A typed stand-in for writing [`FLEETCOM_SCROLLBACK`] into this
+/// process's environment: `std::env::set_var` is unsafe in edition 2024 and
+/// the crate forbids unsafe code. `spawn_daemon` forwards it across the
+/// process boundary as the real env var.
+static SCROLLBACK_FLAG: OnceLock<usize> = OnceLock::new();
+
+/// Install the `--scrollback` flag value; the first write wins. `main` calls
+/// this before any supervisor construction or daemon autostart, so every
+/// spawner observes it.
+pub fn set_scrollback_flag(lines: usize) {
+    let _ = SCROLLBACK_FLAG.set(lines);
+}
+
+/// The installed `--scrollback` flag value, if any.
+pub fn scrollback_flag() -> Option<usize> {
+    SCROLLBACK_FLAG.get().copied()
+}
+
+/// Effective per-task scrollback for a supervisor constructed now: the
+/// `--scrollback` flag, else [`FLEETCOM_SCROLLBACK`], else
+/// [`DEFAULT_SCROLLBACK`].
+pub fn resolve_scrollback() -> usize {
+    effective_scrollback(
+        scrollback_flag(),
+        std::env::var(FLEETCOM_SCROLLBACK).ok().as_deref(),
+    )
+}
+
+/// Pure core of [`resolve_scrollback`]. The two sources fail differently by
+/// design: the flag was already validated by `parse_args` (its user is
+/// present to see a refusal), while an unparseable env value falls back to
+/// the default because a daemon must never fail to start over a typo'd,
+/// set-and-forgotten variable. Both are clamped to [`MAX_SCROLLBACK`]; zero
+/// is legal and means no scrollback.
+fn effective_scrollback(flag: Option<usize>, env: Option<&str>) -> usize {
+    flag.or_else(|| env.and_then(|v| v.parse().ok()))
+        .map_or(DEFAULT_SCROLLBACK, |lines| lines.min(MAX_SCROLLBACK))
+}
 
 /// How long a SIGTERMed job gets to exit before SIGKILL. TERM-respecting
 /// processes exit in milliseconds, so this is the *ceiling* on quit latency,
@@ -145,6 +200,10 @@ pub struct Supervisor {
     /// runs at this size, so attach never reflows.
     rows: u16,
     cols: u16,
+    /// History rows per task terminal grid, fixed at construction: the owning
+    /// process resolves it once (flag, env var, default) and every task this
+    /// supervisor spawns gets the same depth.
+    scrollback: usize,
     /// The task whose screen the client is watching (attach/peek), or `None`.
     watched: Option<u64>,
     /// The last `Screen` we emitted (`(id, formatted, cursor, hide)`), so an
@@ -170,13 +229,14 @@ pub struct Supervisor {
 }
 
 impl Supervisor {
-    pub fn new(rows: u16, cols: u16) -> Supervisor {
+    pub fn new(rows: u16, cols: u16, scrollback: usize) -> Supervisor {
         Supervisor {
             tasks: Vec::new(),
             graveyard: Vec::new(),
             next_id: 1,
             rows,
             cols,
+            scrollback,
             watched: None,
             last_screen: None,
             launch: None,
@@ -578,6 +638,7 @@ impl Supervisor {
             cwd,
             self.rows,
             self.cols,
+            self.scrollback,
             &env,
             Arc::clone(&self.waker),
         )?;

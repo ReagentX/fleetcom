@@ -75,8 +75,10 @@ Usage:
                                      fleetcom starts it automatically)
 
 Options:
-  -h, --help     print this help
-  -V, --version  print the version
+  -h, --help            print this help
+  -V, --version         print the version
+  --scrollback <lines>  per-task terminal scrollback in lines
+                        (default 2000, max 100000, 0 disables)
 ";
 
 /// What a command line asks for, one variant per mutually-exclusive mode.
@@ -91,6 +93,8 @@ enum Invocation {
     Client {
         foreground: bool,
         session: Option<String>,
+        /// Validated `--scrollback` value; resolution clamps it later.
+        scrollback: Option<usize>,
     },
 }
 
@@ -100,13 +104,24 @@ enum Invocation {
 fn parse_args(args: &[String]) -> Result<Invocation, String> {
     let (mut daemon, mut kill, mut foreground) = (false, false, false);
     let mut session: Option<String> = None;
-    for a in args {
+    let mut scrollback: Option<usize> = None;
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
         match a.as_str() {
             "-h" | "--help" => return Ok(Invocation::Help),
             "-V" | "--version" => return Ok(Invocation::Version),
             "--daemon" => daemon = true,
             "--kill" => kill = true,
             "--foreground" => foreground = true,
+            "--scrollback" => {
+                let v = it
+                    .next()
+                    .ok_or_else(|| "--scrollback requires a value".to_string())?;
+                scrollback = Some(
+                    v.parse()
+                        .map_err(|_| format!("invalid --scrollback value '{v}'"))?,
+                );
+            }
             f if f.starts_with('-') => return Err(format!("unrecognized flag '{f}'")),
             name => {
                 if session.is_some() {
@@ -118,10 +133,10 @@ fn parse_args(args: &[String]) -> Result<Invocation, String> {
             }
         }
     }
-    if daemon && (kill || foreground || session.is_some()) {
+    if daemon && (kill || foreground || session.is_some() || scrollback.is_some()) {
         return Err("--daemon takes no other arguments".to_string());
     }
-    if kill && (foreground || session.is_some()) {
+    if kill && (foreground || session.is_some() || scrollback.is_some()) {
         return Err("--kill takes no other arguments".to_string());
     }
     match (daemon, kill) {
@@ -130,13 +145,14 @@ fn parse_args(args: &[String]) -> Result<Invocation, String> {
         _ => Ok(Invocation::Client {
             foreground,
             session,
+            scrollback,
         }),
     }
 }
 
 fn main() -> io::Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let (foreground, session) = match parse_args(&args) {
+    let (foreground, session, scrollback) = match parse_args(&args) {
         Ok(Invocation::Help) => {
             print!("{USAGE}");
             return Ok(());
@@ -152,13 +168,25 @@ fn main() -> io::Result<()> {
         Ok(Invocation::Client {
             foreground,
             session,
-        }) => (foreground, session),
+            scrollback,
+        }) => (foreground, session, scrollback),
         Err(e) => {
             eprintln!("fleetcom: {e}");
             eprintln!("try 'fleetcom --help'");
             std::process::exit(2);
         }
     };
+
+    // Installed before App construction because tasks are spawned by whichever
+    // process owns the Supervisor: this process under `--foreground`, or a
+    // daemon that `App::connect` autostarts as a child. The in-process
+    // supervisor reads the flag through `resolve_scrollback`; `spawn_daemon`
+    // forwards it to the daemon child as `FLEETCOM_SCROLLBACK` — the
+    // inherited environment is the one channel that reaches an autostarted
+    // daemon without a wire-protocol change.
+    if let Some(lines) = scrollback {
+        supervisor::set_scrollback_flag(lines);
+    }
 
     install_panic_hook();
 
@@ -306,23 +334,53 @@ mod tests {
             parse(&[]),
             Ok(Invocation::Client {
                 foreground: false,
-                session: None
+                session: None,
+                scrollback: None
             })
         );
         assert_eq!(
             parse(&["work"]),
             Ok(Invocation::Client {
                 foreground: false,
-                session: Some("work".into())
+                session: Some("work".into()),
+                scrollback: None
             })
         );
         assert_eq!(
             parse(&["--foreground", "work"]),
             Ok(Invocation::Client {
                 foreground: true,
-                session: Some("work".into())
+                session: Some("work".into()),
+                scrollback: None
             })
         );
+    }
+
+    /// `--scrollback` takes a number and refuses anything else: the flag user
+    /// is present to see the error, unlike the tolerated env-var path.
+    #[test]
+    fn scrollback_flag_parses_and_rejects() {
+        assert_eq!(
+            parse(&["--scrollback", "5000"]),
+            Ok(Invocation::Client {
+                foreground: false,
+                session: None,
+                scrollback: Some(5000)
+            })
+        );
+        assert_eq!(
+            parse(&["--scrollback", "0", "work"]),
+            Ok(Invocation::Client {
+                foreground: false,
+                session: Some("work".into()),
+                scrollback: Some(0)
+            })
+        );
+        assert!(parse(&["--scrollback", "garbage"]).is_err());
+        assert!(parse(&["--scrollback"]).is_err());
+        assert!(parse(&["--scrollback", "-5"]).is_err());
+        assert!(parse(&["--daemon", "--scrollback", "5000"]).is_err());
+        assert!(parse(&["--kill", "--scrollback", "5000"]).is_err());
     }
 
     #[test]

@@ -62,6 +62,7 @@ From the project root:
 | `fleetcom` | Connect to the daemon, autostarting it when necessary, and open the dashboard |
 | `fleetcom <session>` | Load a saved session, then open the dashboard |
 | `fleetcom --foreground` | Run in-process without a daemon; jobs stop when the client quits |
+| `fleetcom --scrollback <lines>` | Set per-task scrollback (default 2000); read at supervisor start, so a running daemon keeps its value until `--kill` |
 | `fleetcom --kill` | Stop the daemon and every job it owns |
 | `fleetcom --help` / `--version` | Print usage or version information and exit |
 

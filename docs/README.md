@@ -150,6 +150,18 @@ Because the daemon holds each PTY master, daemon termination closes the terminal
 
 Each launch uses the launching client's environment and working directory, sent once per connection during the hello handshake. Connect from a venv terminal and your spawns, reruns, and session loads all see that venv, whichever client originally autostarted the daemon. Environment is never written to disk; session files store only directories, commands, group assignments, and display names
 
+### Scrollback depth is fixed per supervisor
+
+Each task's terminal keeps a scrollback history whose depth is resolved once, when the owning supervisor starts:
+
+| Order | Condition | Depth |
+| -- | -- | -- |
+| 1 | `--scrollback <lines>` was passed | that value, clamped to 100,000 |
+| 2 | `FLEETCOM_SCROLLBACK` parses as a whole number | that value, clamped to 100,000 |
+| 3 | otherwise | 2,000 |
+
+`0` disables scrollback. An unparseable `FLEETCOM_SCROLLBACK` falls back to 2,000 rather than failing daemon startup. The daemon resolves the depth at startup from its inherited environment — that of the client that autostarted it — so a changed value reaches only the tasks of a *new* daemon: stop the current one with `fleetcom --kill` first. `--foreground` runs resolve in-process, per invocation
+
 ### Client and daemon protocol versions must match
 
 The daemon rejects a mismatch during the handshake. Stop an incompatible daemon with `fleetcom --kill`, which also terminates every running job, then start a new client
