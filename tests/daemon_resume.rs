@@ -203,6 +203,25 @@ fn value_after<'a>(argv: &'a [String], flag: &str) -> &'a str {
         .unwrap_or_else(|| panic!("{flag} carries no value: {argv:?}"))
 }
 
+/// The namespace layout itself is pinned by the supervisor capture unit tests;
+/// the integration-only facts are the DAEMON's pid in the namespace name (a
+/// cross-process fact) and the asset existing on disk.
+fn assert_daemon_namespaced(asset: &Path, daemon_pid: u32, what: &str, argv: &[String]) {
+    let ns = asset
+        .parent()
+        .unwrap_or_else(|| panic!("the {what} must sit in a namespace"));
+    assert!(
+        ns.file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.starts_with(&format!("{daemon_pid}-"))),
+        "the namespace must carry the daemon's pid prefix: {argv:?}"
+    );
+    assert!(
+        asset.is_file(),
+        "the daemon's namespace must hold the installed {what}"
+    );
+}
+
 /// Save once and return the persisted recipe. Each caller first waits for its
 /// ID channel, and the daemon scrapes finished tasks before reading IDs. As a
 /// result, one save must already contain the resume form.
@@ -261,22 +280,7 @@ fn claude_spawn_save_load_resumes_the_conversation() {
     let id = value_after(&argv, "--session-id").to_string();
     assert_eq!(id.len(), 36, "pinned id must be uuid-shaped: {argv:?}");
     let settings = PathBuf::from(value_after(&argv, "--settings"));
-    // The namespace layout itself is pinned by the supervisor capture unit
-    // tests; the integration-only facts are the DAEMON's pid in the
-    // namespace name (a cross-process fact) and the asset existing on disk.
-    let ns = settings
-        .parent()
-        .expect("the overlay must sit in a namespace");
-    assert!(
-        ns.file_name()
-            .and_then(|n| n.to_str())
-            .is_some_and(|n| n.starts_with(&format!("{}-", daemon.0.id()))),
-        "the namespace must carry the daemon's pid prefix: {argv:?}"
-    );
-    assert!(
-        settings.is_file(),
-        "the daemon's namespace must hold the installed settings overlay"
-    );
+    assert_daemon_namespaced(&settings, daemon.0.id(), "settings overlay", &argv);
 
     // The pinned id rides `resume_id` from spawn: one save suffices.
     let recipe = save_once(&mut stream, &s.recipe("story"), "story");
@@ -330,20 +334,7 @@ fn codex_capture_file_drives_save_and_load_resumes() {
         .and_then(|v| v.strip_suffix(r#""]"#))
         .map(PathBuf::from)
         .unwrap_or_else(|| panic!("spawn must route notify at one script: {argv:?}"));
-    // The namespace layout itself is pinned by the supervisor capture unit
-    // tests; the integration-only facts are the DAEMON's pid in the
-    // namespace name (a cross-process fact) and the asset existing on disk.
-    let ns = script.parent().expect("the script must sit in a namespace");
-    assert!(
-        ns.file_name()
-            .and_then(|n| n.to_str())
-            .is_some_and(|n| n.starts_with(&format!("{}-", daemon.0.id()))),
-        "the namespace must carry the daemon's pid prefix: {argv:?}"
-    );
-    assert!(
-        script.is_file(),
-        "the daemon's namespace must hold the installed notify script"
-    );
+    assert_daemon_namespaced(&script, daemon.0.id(), "notify script", &argv);
 
     // The stub exits silently, so its capture write is the only id channel;
     // wait for the file, then a single save must persist the resuming form.

@@ -6,10 +6,7 @@ mod common;
 
 use std::{io::Write, time::Duration};
 
-use common::{
-    PROTOCOL_VERSION, hello_frame, read_frame, spawn_frame, start_daemon_raw, stop_daemon,
-    wait_until,
-};
+use common::{shake_hands_env, spawn_frame, start_daemon_raw, stop_daemon, wait_until};
 
 #[test]
 fn spawn_runs_under_the_hello_env() {
@@ -29,15 +26,7 @@ fn spawn_runs_under_the_hello_env() {
         (b"FLEETCOM_MARKER".as_slice(), b"from-client".as_slice()),
         (b"FLEETCOM_BAD".as_slice(), b"ok\xff\xfe".as_slice()),
     ];
-    stream
-        .write_all(&hello_frame(PROTOCOL_VERSION, &env, &cwd))
-        .unwrap();
-    let (_, payload) = read_frame(&mut stream).expect("no reply to hello");
-    assert!(
-        String::from_utf8_lossy(&payload).contains("hello_ok"),
-        "hello was refused: {}",
-        String::from_utf8_lossy(&payload)
-    );
+    shake_hands_env(&mut stream, &cwd, &env);
 
     let out = dir.join("out");
     let command = format!(

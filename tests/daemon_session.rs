@@ -10,8 +10,8 @@ use std::{
 };
 
 use common::{
-    PROTOCOL_VERSION, control_frame, hello_frame, read_frame, start_daemon, start_daemon_raw,
-    stop_daemon, wait_until,
+    control_frame, read_frame, shake_hands_env, start_daemon, start_daemon_raw, stop_daemon,
+    wait_until,
 };
 
 #[test]
@@ -70,15 +70,7 @@ fn session_commands_follow_the_hello_config_dir() {
     let client_cfg_str = client_cfg.display().to_string();
     let env: Vec<(&[u8], &[u8])> =
         vec![(b"FLEETCOM_CONFIG_DIR".as_slice(), client_cfg_str.as_bytes())];
-    stream
-        .write_all(&hello_frame(PROTOCOL_VERSION, &env, &cwd))
-        .unwrap();
-    let (_, payload) = read_frame(&mut stream).expect("no reply to hello");
-    assert!(
-        String::from_utf8_lossy(&payload).contains("hello_ok"),
-        "hello was refused: {}",
-        String::from_utf8_lossy(&payload)
-    );
+    shake_hands_env(&mut stream, &cwd, &env);
 
     stream
         .write_all(&control_frame(r#"{"t":"save","name":"where"}"#))
