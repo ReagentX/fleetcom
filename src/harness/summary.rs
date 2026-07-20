@@ -129,19 +129,24 @@ fn claude_spinner_status(rows: &[String], top: usize) -> Option<(String, &'stati
             continue;
         }
         let verb = claude_spinner_text(row)?;
+        // The spinner row's parenthetical contributes its slow semantic
+        // tail to whichever text wins the head.
+        let tail = claude_semantic_tail(row);
         // The spinner confirms the working state; only then is the
         // concrete-action row worth preferring over the rotating verb.
         if let Some(action) = claude_action_row(rows, i) {
-            return Some((action, "claude:action-row"));
+            return Some((format!("{action}{tail}"), "claude:action-row"));
         }
-        return Some((verb, "claude:spinner"));
+        return Some((format!("{verb}{tail}"), "claude:spinner"));
     }
     None
 }
 
 /// Extract the text through the first `…` after a claude spinner frame.
-/// Task-derived phrases may contain spaces, parentheses, and digits. Text
-/// after the ellipsis, including counters and key hints, is discarded.
+/// Task-derived phrases may contain spaces, parentheses, and digits. The
+/// parenthetical after the ellipsis is not discarded wholesale: its
+/// recognized tickers drop and its slow segments survive through
+/// [`claude_semantic_tail`].
 fn claude_spinner_text(row: &str) -> Option<String> {
     let mut chars = row.chars();
     if !CLAUDE_SPINNER.contains(&chars.next()?) || chars.next()? != ' ' {
@@ -153,6 +158,57 @@ fn claude_spinner_text(row: &str) -> Option<String> {
         .next()?
         .is_alphanumeric()
         .then(|| text.to_string())
+}
+
+/// The spinner parenthetical's slow semantic tail:
+/// `(1m 8s · ↓ 2.1k tokens · thinking with high effort)` keeps
+/// ` · thinking with high effort`. Segments the classifier positively
+/// recognizes as tickers drop; everything else is semantic until proven
+/// otherwise and survives verbatim, in order, as ` · {seg}` each. The
+/// survivors change only at state transitions, so the no-hold anchor
+/// policy is unaffected — which is exactly why tickers must drop rather
+/// than ride along. No parenthetical yields an empty tail; an unclosed
+/// one is CLI-side truncation and parses to the cut.
+fn claude_semantic_tail(row: &str) -> String {
+    let Some(open) = row.find("… (") else {
+        return String::new();
+    };
+    let inner = &row[open + "… (".len()..];
+    let inner = inner.strip_suffix(')').unwrap_or(inner);
+    let mut out = String::new();
+    for seg in inner.split(" · ") {
+        let seg = seg.trim();
+        if seg.is_empty() || claude_ticker_segment(seg) {
+            continue;
+        }
+        out.push_str(" · ");
+        out.push_str(seg);
+    }
+    out
+}
+
+/// Whether one parenthetical segment is recognized ticker churn: elapsed
+/// time (every whitespace token digits — dot tolerated — plus an `s`/`m`/`h`
+/// unit: `6s`, `1m 8s`, `2h 3m`), token/throughput counters (`↓`/`↑`-headed
+/// or `tokens`-suffixed), or the `esc to interrupt` affordance.
+fn claude_ticker_segment(seg: &str) -> bool {
+    if seg == "esc to interrupt"
+        || seg == "tokens"
+        || seg.starts_with('↓')
+        || seg.starts_with('↑')
+        || seg.ends_with(" tokens")
+    {
+        return true;
+    }
+    !seg.is_empty()
+        && seg.split_whitespace().all(|tok| {
+            let Some((num, unit)) = tok.split_at_checked(tok.len() - 1) else {
+                return false;
+            };
+            matches!(unit, "s" | "m" | "h")
+                && num.starts_with(|c: char| c.is_ascii_digit())
+                && num.chars().all(|c| c.is_ascii_digit() || c == '.')
+        })
 }
 
 /// The concrete-action row above a confirmed spinner: skip the blank gap,
@@ -625,8 +681,78 @@ mod tests {
         assert_eq!(
             ClaudeSummary.live_preview(&s),
             Some((
-                "Overseeing phase 4 (adapters)…".to_string(),
+                "Overseeing phase 4 (adapters)… · almost done thinking with high effort"
+                    .to_string(),
                 "claude:spinner"
+            ))
+        );
+    }
+
+    /// Parenthetical segments: every recognized ticker shape drops — alone
+    /// and beside a kept segment — and an unknown segment survives
+    /// verbatim. The sighted row keeps its effort note; a bare row is
+    /// unchanged.
+    #[test]
+    fn claude_parenthetical_keeps_slow_segments_and_drops_tickers() {
+        let sep = "─".repeat(120);
+        let spin = |row: &str| {
+            let rows = [row, &sep, "❯", &sep];
+            ClaudeSummary.live_preview(&rs(&rows))
+        };
+        assert_eq!(
+            spin("✻ Envisioning… (1m 8s · ↓ 2.1k tokens · thinking with high effort)"),
+            Some((
+                "Envisioning… · thinking with high effort".to_string(),
+                "claude:spinner"
+            ))
+        );
+        for ticker in [
+            "6s",
+            "1m 8s",
+            "2h 3m",
+            "8.7s",
+            "↓ 87 tokens",
+            "↑ 1.2k tokens",
+            "↓ 2.1k",
+            "2.1k tokens",
+            "esc to interrupt",
+        ] {
+            assert_eq!(
+                spin(&format!("✻ Hashing… ({ticker})")),
+                Some(("Hashing…".to_string(), "claude:spinner")),
+                "{ticker:?} must drop"
+            );
+            assert_eq!(
+                spin(&format!("✻ Hashing… ({ticker} · thinking)")),
+                Some(("Hashing… · thinking".to_string(), "claude:spinner")),
+                "{ticker:?} must drop beside a kept segment"
+            );
+        }
+        assert_eq!(
+            spin("✽ Concocting…"),
+            Some(("Concocting…".to_string(), "claude:spinner")),
+            "a row with no parenthetical is unchanged"
+        );
+    }
+
+    /// The action row wins the head while the spinner row's parenthetical
+    /// still contributes the semantic tail.
+    #[test]
+    fn claude_action_row_carries_the_spinner_rows_semantic_tail() {
+        let sep = "─".repeat(120);
+        let rows = [
+            "⏺ Running 1 shell command…",
+            "",
+            "✻ Envisioning… (1m 8s · ↓ 2.1k tokens · thinking with high effort)",
+            &sep,
+            "❯",
+            &sep,
+        ];
+        assert_eq!(
+            ClaudeSummary.live_preview(&rs(&rows)),
+            Some((
+                "Running 1 shell command… · thinking with high effort".to_string(),
+                "claude:action-row"
             ))
         );
     }
