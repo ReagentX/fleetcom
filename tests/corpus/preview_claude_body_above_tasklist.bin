@@ -1,0 +1,12 @@
+[?1049h[2J[H✻ Hashing… (6s · ↓ 87 tokens)
+
+⏺ The phase list below is queued, not running.
+  ⎿  ✔ Phase 0: verify facts
+     ◼ Phase 1: dashboard polish
+     ◼ Phase 2: glyph timing
+     ◼ Phase 3: scrollback config
+     ◻ Phase 4: caret navigation
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  (statusline scrubbed: user-configured row)

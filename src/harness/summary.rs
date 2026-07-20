@@ -86,9 +86,14 @@ fn is_rule_row(row: &str) -> bool {
 /// space and an `…`-terminated status phrase.
 const CLAUDE_SPINNER: &[char] = &['·', '✢', '✳', '✶', '✻', '✽'];
 
-/// claude (alt screen). Working state: a column-0 spinner row directly above
-/// the input box's top separator. Approval state: the dialog replaces the
-/// input box entirely; the menu match fires only when that box is gone.
+/// Maximum rows scanned above the input box for a status row. This covers an
+/// indented task-list block while keeping the scan pinned to nearby chrome.
+const CLAUDE_STATUS_WINDOW: usize = 16;
+
+/// claude (alt screen). Working state: a column-0 spinner row above the
+/// input box's top separator, within [`CLAUDE_STATUS_WINDOW`] rows of it.
+/// Approval state: the dialog replaces the input box entirely; the menu
+/// match fires only when that box is gone.
 pub struct ClaudeSummary;
 
 impl SummaryAdapter for ClaudeSummary {
@@ -132,14 +137,11 @@ fn claude_box_top(rows: &[String]) -> Option<usize> {
         .then_some(top)
 }
 
-/// Scan the three rows above the input box for the spinner row. Hint rows
-/// (the tmux focus-events notice, the right-aligned `● high · /effort`) are
-/// indented while the spinner paints at column 0; a column-0 row that is not
-/// spinner-shaped aborts the scan: body text reaching the chrome, or the
-/// wrapped tail of a status row too wide for the window. Both fail the
-/// structural check instead of matching status-shaped body text.
+/// Scan above the input box for a spinner or waiting row. Empty and indented
+/// hint/task-list rows may separate it from the box. Any other column-0 row,
+/// including body prose or a wrapped status tail, invalidates the structure.
 fn claude_spinner_status(rows: &[String], top: usize) -> Option<(String, &'static str)> {
-    for i in (top.saturating_sub(3)..top).rev() {
+    for i in (top.saturating_sub(CLAUDE_STATUS_WINDOW)..top).rev() {
         let row = &rows[i];
         if row.is_empty() || row.starts_with(' ') {
             continue;
@@ -253,7 +255,7 @@ fn claude_ticker_segment(seg: &str) -> bool {
 /// the spinner phrase rotates per request, so it wins when both are
 /// present. The probe requires the `⏺` head and a single trailing `…`
 /// (`⏺ ok`-style reply rows fail it); anything else keeps the spinner
-/// phrase: scanning further up would be a body hunt.
+/// phrase; scanning further up could match conversation content.
 fn claude_action_row(rows: &[String], spinner: usize) -> Option<String> {
     let row = rows[..spinner].iter().rev().find(|r| !r.is_empty())?;
     let text = row.strip_prefix("⏺ ")?.trim();
@@ -907,6 +909,64 @@ mod tests {
         assert_eq!(ClaudeSummary.live_preview(&menu), None);
     }
 
+    /// The status scan crosses bounded indented gaps but stops at body prose.
+    #[test]
+    fn claude_scan_crosses_task_list_gaps_within_the_window() {
+        let sep = "─".repeat(120);
+        let behind_gap = |status: &str, gap: usize| {
+            let mut rows = vec![status.to_string()];
+            rows.push("  ⎿  ✔ Phase 0: verify facts".to_string());
+            rows.extend((1..gap).map(|i| format!("     ◼ Phase {i}: generic step")));
+            rows.extend([sep.clone(), "❯".to_string(), sep.clone()]);
+            let refs: Vec<&str> = rows.iter().map(String::as_str).collect();
+            ClaudeSummary.live_preview(&rs(&refs))
+        };
+        for gap in [4, 15] {
+            assert_eq!(
+                behind_gap(
+                    "✢ Running phase 1 (dashboard UI)… (4m 20s · ↓ 17.1k tokens)",
+                    gap
+                ),
+                Some((
+                    "Running phase 1 (dashboard UI)…".to_string(),
+                    "claude:spinner"
+                )),
+                "gap of {gap} indented rows"
+            );
+        }
+        for gap in [16, 17, 24] {
+            assert_eq!(
+                behind_gap(
+                    "✢ Running phase 1 (dashboard UI)… (4m 20s · ↓ 17.1k tokens)",
+                    gap
+                ),
+                None,
+                "gap of {gap} indented rows must exhaust the window"
+            );
+        }
+
+        // Waiting rows use the same bounded scan.
+        assert_eq!(
+            behind_gap("✻ Waiting for 2 background agents to finish", 5),
+            Some((
+                "Waiting for 2 background agents to finish".to_string(),
+                "claude:waiting-agents"
+            ))
+        );
+
+        // Column-0 body prose invalidates the status structure.
+        let prose = rs(&[
+            "✢ Running phase 1 (dashboard UI)… (4m 20s · ↓ 17.1k tokens)",
+            "⏺ The phase list below is queued, not running.",
+            "  ⎿  ✔ Phase 0: verify facts",
+            "     ◼ Phase 1: dashboard polish",
+            &sep,
+            "❯",
+            &sep,
+        ]);
+        assert_eq!(ClaudeSummary.live_preview(&prose), None);
+    }
+
     /// The approval menu synthesizes its label only with the input box gone,
     /// and requires the `2.` sibling below the selector.
     #[test]
@@ -1192,6 +1252,14 @@ mod tests {
                 "claude:approval-menu",
             ),
             Case(
+                "preview_claude_tasklist",
+                include_bytes!("../../tests/corpus/preview_claude_tasklist.bin"),
+                &ClaudeSummary,
+                // Without the welcome box, the preview has no model prefix.
+                "Running phase 1 (dashboard UI)…",
+                "claude:spinner",
+            ),
+            Case(
                 "preview_codex_working",
                 include_bytes!("../../tests/corpus/preview_codex_working.bin"),
                 &CodexSummary,
@@ -1305,6 +1373,15 @@ mod tests {
         // Menu touching the chrome window on an idle screen: abort, marker.
         let p = resolve_corpus(
             include_bytes!("../../tests/corpus/preview_claude_body_menu_idle.bin"),
+            &ClaudeSummary,
+            40,
+            120,
+        );
+        assert_eq!(parts(&p), (MARKER.to_string(), PreviewSource::Marker, None));
+
+        // Body prose between spinner-shaped text and the task list yields the marker.
+        let p = resolve_corpus(
+            include_bytes!("../../tests/corpus/preview_claude_body_above_tasklist.bin"),
             &ClaudeSummary,
             40,
             120,

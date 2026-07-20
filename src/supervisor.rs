@@ -9,7 +9,7 @@ use std::{
     ffi::OsString,
     io,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex, mpsc::Sender},
+    sync::{Arc, Mutex, OnceLock, mpsc::Sender},
     time::{Duration, Instant},
 };
 
@@ -22,16 +22,9 @@ use crate::{
     task::Task,
 };
 
-/// No output for this long ⇒ `Lifecycle::Idle`. Owned here because the core, not
-/// the client, computes lifecycle. It holds the clock and the live parser.
-const IDLE_AFTER: Duration = Duration::from_millis(600);
-
-/// No output for this long ⇒ parked: idle for status-sort *placement*. A
-/// second window over the same `last_activity` signal as `IDLE_AFTER`: 600 ms
-/// flips the per-row glyph, 10 s moves the row. A cadence shorter than the
-/// window (`top` bursts every 1–2 s) resets the signal before it can
-/// expire and never produces a placement edge: the window is the debounce.
-const SORT_IDLE_AFTER: Duration = Duration::from_secs(10);
+/// Quiet period after which a live task becomes idle. Lifecycle and placement
+/// use this same threshold.
+const IDLE_AFTER: Duration = Duration::from_secs(10);
 
 /// Send-on-change fingerprint for the watched screen and scrollback offset.
 type LastScreen = (u64, Vec<u8>, (u16, u16), bool, (bool, bool, bool), usize);
@@ -56,6 +49,44 @@ const MAX_TASKS: usize = 256;
 /// Maximum command length in bytes. Direct spawns and session loads enforce
 /// this limit to bound shell arguments and serialized task snapshots.
 const MAX_COMMAND_LEN: usize = 64 * 1024;
+
+/// Environment variable overriding per-task terminal history depth.
+pub const FLEETCOM_SCROLLBACK: &str = "FLEETCOM_SCROLLBACK";
+
+/// Default history rows retained by each task's terminal grid.
+pub const DEFAULT_SCROLLBACK: usize = 2000;
+
+/// Maximum configured history rows per task.
+const MAX_SCROLLBACK: usize = 100_000;
+
+/// Process-local value supplied by `--scrollback`.
+static SCROLLBACK_FLAG: OnceLock<usize> = OnceLock::new();
+
+/// Install the `--scrollback` flag value. The first call wins.
+pub fn set_scrollback_flag(lines: usize) {
+    let _ = SCROLLBACK_FLAG.set(lines);
+}
+
+/// The installed `--scrollback` flag value, if any.
+pub fn scrollback_flag() -> Option<usize> {
+    SCROLLBACK_FLAG.get().copied()
+}
+
+/// Resolve per-task scrollback from the flag, environment, or default.
+pub fn resolve_scrollback() -> usize {
+    effective_scrollback(
+        scrollback_flag(),
+        std::env::var(FLEETCOM_SCROLLBACK).ok().as_deref(),
+    )
+}
+
+/// Resolve explicit scrollback sources. The flag takes precedence; invalid
+/// environment values use the default; overrides are clamped; zero disables
+/// history.
+fn effective_scrollback(flag: Option<usize>, env: Option<&str>) -> usize {
+    flag.or_else(|| env.and_then(|v| v.parse().ok()))
+        .map_or(DEFAULT_SCROLLBACK, |lines| lines.min(MAX_SCROLLBACK))
+}
 
 /// How long a SIGTERMed job gets to exit before SIGKILL. TERM-respecting
 /// processes exit in milliseconds, so this is the *ceiling* on quit latency,
@@ -147,6 +178,8 @@ pub struct Supervisor {
     /// runs at this size, so attach never reflows.
     rows: u16,
     cols: u16,
+    /// History rows used by every task this supervisor spawns.
+    scrollback: usize,
     /// The task whose screen the client is watching (attach/peek), or `None`.
     watched: Option<u64>,
     /// The last `Screen` we emitted (`(id, formatted, cursor, hide)`), so an
@@ -172,13 +205,14 @@ pub struct Supervisor {
 }
 
 impl Supervisor {
-    pub fn new(rows: u16, cols: u16) -> Supervisor {
+    pub fn new(rows: u16, cols: u16, scrollback: usize) -> Supervisor {
         Supervisor {
             tasks: Vec::new(),
             graveyard: Vec::new(),
             next_id: 1,
             rows,
             cols,
+            scrollback,
             watched: None,
             last_screen: None,
             launch: None,
@@ -432,7 +466,7 @@ impl Supervisor {
                     group: t.group.clone(),
                     name: t.name.clone(),
                     lifecycle: t.lifecycle(now, IDLE_AFTER),
-                    parked: t.parked(now, SORT_IDLE_AFTER),
+                    parked: t.parked(now, IDLE_AFTER),
                     preview: preview.text,
                     source: preview.source,
                     frozen: preview.frozen,
@@ -580,6 +614,7 @@ impl Supervisor {
             cwd,
             self.rows,
             self.cols,
+            self.scrollback,
             &env,
             Arc::clone(&self.waker),
         )?;

@@ -24,6 +24,7 @@ use crossterm::{
 };
 
 use crate::{
+    editbuf::EditBuffer,
     path,
     protocol::{
         Command, Event, Key, Lifecycle, Mods, MouseBtn, MouseKind, ScreenView, ScrollAction,
@@ -145,7 +146,7 @@ pub struct App {
     pub selected_id: Option<u64>,
     pub mode: Mode,
     pub group_mode: GroupMode,
-    pub input: String,
+    pub input: EditBuffer,
     /// Directory a spawned command runs in. Set to `invocation_dir` for the `n`
     /// flow, or to the picked directory for the `@` flow.
     pub spawn_cwd: PathBuf,
@@ -165,11 +166,11 @@ pub struct App {
     pub invocation_dir: PathBuf,
     pub invocation_label: String,
     // `@` directory-picker state (only meaningful in `Mode::PickDir`).
-    pub dir_input: String,
+    pub dir_input: EditBuffer,
     pub dir_candidates: Vec<DirCand>,
     pub dir_sel: usize,
     // `g` group-picker state (only meaningful in `Mode::PickGroup`).
-    pub group_input: String,
+    pub group_input: EditBuffer,
     pub group_candidates: Vec<GroupCand>,
     pub group_sel: usize,
     /// Id of the task being reassigned by the open group picker.
@@ -237,9 +238,8 @@ fn step_down(sel: usize, len: usize) -> usize {
 /// Tagged wins over everything; completed is classified by `lifecycle`, never
 /// by trusting `parked == false`, so a core that ever shipped both signals
 /// still lands finished tasks in Completed. Placement follows `parked`, the
-/// core's 10 s debounced quiet signal, not the instantaneous `Lifecycle::Idle`:
-/// `top`-cadence output flaps the 600 ms glyph edge, and the glyph may flicker
-/// but the row must not change sections.
+/// core's debounced quiet signal: it shares the 10 s window with
+/// `Lifecycle::Idle`, so the idle glyph and the row's section flip together.
 fn bucket(v: &TaskView) -> u8 {
     if v.tagged {
         0
@@ -300,7 +300,10 @@ impl App {
     /// non-daemon escape hatch, and the deterministic target the UI harnesses use.
     pub fn new_foreground(rows: u16, cols: u16) -> App {
         App::assemble(rows, cols, |pr, c, wait_tx| {
-            Box::new(ThreadTransport::spawn(Supervisor::new(pr, c), wait_tx))
+            Box::new(ThreadTransport::spawn(
+                Supervisor::new(pr, c, crate::supervisor::resolve_scrollback()),
+                wait_tx,
+            ))
         })
     }
 
@@ -333,7 +336,7 @@ impl App {
             selected_id: None,
             mode: Mode::Dashboard,
             group_mode: GroupMode::State,
-            input: String::new(),
+            input: EditBuffer::default(),
             spawn_cwd: invocation_dir.clone(),
             spawn_group: None,
             focused_id: None,
@@ -342,10 +345,10 @@ impl App {
             last_frame: Vec::new(),
             invocation_dir,
             invocation_label,
-            dir_input: String::new(),
+            dir_input: EditBuffer::default(),
             dir_candidates: Vec::new(),
             dir_sel: 0,
-            group_input: String::new(),
+            group_input: EditBuffer::default(),
             group_candidates: Vec::new(),
             group_sel: 0,
             group_target: None,
@@ -528,6 +531,44 @@ impl App {
         let pos = self.selected_pos(&order).unwrap_or(0);
         let next = (pos + 1) % order.len();
         self.selected_id = Some(self.views[order[next]].id);
+    }
+
+    /// Index within `sections` of the section holding the selected task.
+    fn selected_section(&self, sections: &[(String, Vec<usize>)]) -> Option<usize> {
+        let id = self.selected_id?;
+        sections
+            .iter()
+            .position(|(_, idxs)| idxs.iter().any(|&i| self.views[i].id == id))
+    }
+
+    /// Select the first task in the next section, wrapping to the first.
+    /// With no current selection, select the first section.
+    fn select_next_section(&mut self) {
+        let sections = self.sections();
+        if sections.is_empty() {
+            self.selected_id = None;
+            return;
+        }
+        let next = match self.selected_section(&sections) {
+            Some(cur) => (cur + 1) % sections.len(),
+            None => 0,
+        };
+        self.selected_id = Some(self.views[sections[next].1[0]].id);
+    }
+
+    /// Select the first task in the previous section, wrapping to the last.
+    /// With no current selection, select the last section.
+    fn select_prev_section(&mut self) {
+        let sections = self.sections();
+        if sections.is_empty() {
+            self.selected_id = None;
+            return;
+        }
+        let prev = match self.selected_section(&sections) {
+            Some(cur) => (cur + sections.len() - 1) % sections.len(),
+            None => sections.len() - 1,
+        };
+        self.selected_id = Some(self.views[sections[prev].1[0]].id);
     }
 
     /// Tell the core which task's screen we need (attach/peek), sending `Watch`
@@ -743,7 +784,7 @@ impl App {
     /// Navigate into `dir`: retype the input as its path (trailing slash) so
     /// completion continues inside it, with the dir itself selected as row 0.
     fn enter_dir(&mut self, dir: PathBuf) {
-        self.dir_input = format!("{}/", path::abbreviate(&dir));
+        self.dir_input = EditBuffer::seeded(format!("{}/", path::abbreviate(&dir)));
         self.refresh_dir_candidates();
     }
 
@@ -829,7 +870,7 @@ impl App {
     fn open_rename_prompt(&mut self) {
         if let Some(i) = self.selected_task() {
             self.rename_target = Some(self.views[i].id);
-            self.input = self.views[i].name.clone().unwrap_or_default();
+            self.input = EditBuffer::seeded(self.views[i].name.clone().unwrap_or_default());
             self.mode = Mode::Rename;
         }
     }
@@ -894,6 +935,8 @@ impl App {
             }
             KeyCode::Up | KeyCode::Char('k') => self.select_up(),
             KeyCode::Down | KeyCode::Char('j') => self.select_down(),
+            KeyCode::Tab => self.select_next_section(),
+            KeyCode::BackTab => self.select_prev_section(),
             KeyCode::Char(' ') => {
                 if self.selected_task().is_some() {
                     self.mode = Mode::Peek;
@@ -950,16 +993,15 @@ impl App {
     fn on_key_textinput(&mut self, k: KeyEvent, submit: fn(&mut App, &str)) {
         match k.code {
             KeyCode::Enter => {
-                let text = self.input.trim().to_string();
-                submit(self, &text);
+                // Submit the text on both sides of the caret.
+                let text = self.input.take();
+                submit(self, text.trim());
                 self.close_prompt();
             }
             KeyCode::Esc => self.close_prompt(),
-            KeyCode::Backspace => {
-                self.input.pop();
+            _ => {
+                on_key_edit(&mut self.input, k);
             }
-            KeyCode::Char(c) => self.input.push(c),
-            _ => {}
         }
     }
 
@@ -1000,6 +1042,17 @@ impl App {
     }
 
     fn on_key_pickdir(&mut self, k: KeyEvent) {
+        // Tab descends; Right descends at the end and moves the caret elsewhere.
+        if k.code == KeyCode::Tab || (k.code == KeyCode::Right && self.dir_input.at_end()) {
+            // Descend into the highlighted dir; a no-op on the current-dir row.
+            if let Some(c) = self.dir_candidates.get(self.dir_sel)
+                && c.kind != DirKind::Use
+            {
+                let path = c.path.clone();
+                self.enter_dir(path);
+            }
+            return;
+        }
         match k.code {
             KeyCode::Esc => {
                 self.dir_input.clear();
@@ -1008,15 +1061,6 @@ impl App {
             }
             KeyCode::Up => self.dir_sel = self.dir_sel.saturating_sub(1),
             KeyCode::Down => self.dir_sel = step_down(self.dir_sel, self.dir_candidates.len()),
-            KeyCode::Tab | KeyCode::Right => {
-                // Descend into the highlighted dir; a no-op on the current-dir row.
-                if let Some(c) = self.dir_candidates.get(self.dir_sel)
-                    && c.kind != DirKind::Use
-                {
-                    let path = c.path.clone();
-                    self.enter_dir(path);
-                }
-            }
             KeyCode::Enter => {
                 if let Some(c) = self.dir_candidates.get(self.dir_sel) {
                     let path = c.path.clone();
@@ -1028,15 +1072,12 @@ impl App {
                     }
                 }
             }
-            KeyCode::Backspace => {
-                self.dir_input.pop();
-                self.refresh_dir_candidates();
+            // Caret motion does not affect directory candidates.
+            _ => {
+                if on_key_edit(&mut self.dir_input, k) == Some(true) {
+                    self.refresh_dir_candidates();
+                }
             }
-            KeyCode::Char(c) => {
-                self.dir_input.push(c);
-                self.refresh_dir_candidates();
-            }
-            _ => {}
         }
     }
 
@@ -1051,7 +1092,7 @@ impl App {
                 // Enter assigns the highlighted group, or creates the typed
                 // group when no existing name matches.
                 let group = if !self.group_input.is_empty() && self.group_candidates.len() < 2 {
-                    Some(self.group_input.clone())
+                    Some(self.group_input.as_str().to_string())
                 } else {
                     self.group_candidates
                         .get(self.group_sel)
@@ -1062,15 +1103,12 @@ impl App {
                 }
                 self.close_group_picker();
             }
-            KeyCode::Backspace => {
-                self.group_input.pop();
-                self.refresh_group_candidates();
+            // Caret motion does not affect group candidates.
+            _ => {
+                if on_key_edit(&mut self.group_input, k) == Some(true) {
+                    self.refresh_group_candidates();
+                }
             }
-            KeyCode::Char(c) => {
-                self.group_input.push(c);
-                self.refresh_group_candidates();
-            }
-            _ => {}
         }
     }
 
@@ -1174,15 +1212,14 @@ impl App {
                 }
             }
             Mode::Spawn | Mode::SaveSession | Mode::Rename => {
-                self.input.extend(s.chars().filter(|c| !c.is_control()));
+                paste_into(&mut self.input, s);
             }
             Mode::PickDir => {
-                self.dir_input.extend(s.chars().filter(|c| !c.is_control()));
+                paste_into(&mut self.dir_input, s);
                 self.refresh_dir_candidates();
             }
             Mode::PickGroup => {
-                self.group_input
-                    .extend(s.chars().filter(|c| !c.is_control()));
+                paste_into(&mut self.group_input, s);
                 self.refresh_group_candidates();
             }
             _ => {}
@@ -1363,6 +1400,57 @@ fn key_event_to_key(ev: KeyEvent) -> Option<(Key, Mods)> {
     Some((code, mods))
 }
 
+/// Apply prompt editing keys. Returns `Some(true)` for text changes,
+/// `Some(false)` for caret motion or ignored Ctrl chords, and `None` for
+/// unsupported keys. Ctrl-A and Ctrl-E move to the start and end.
+fn on_key_edit(buf: &mut EditBuffer, k: KeyEvent) -> Option<bool> {
+    let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
+    match k.code {
+        KeyCode::Backspace => {
+            buf.backspace();
+            Some(true)
+        }
+        KeyCode::Left => {
+            buf.left();
+            Some(false)
+        }
+        KeyCode::Right => {
+            buf.right();
+            Some(false)
+        }
+        KeyCode::Home => {
+            buf.home();
+            Some(false)
+        }
+        KeyCode::End => {
+            buf.end();
+            Some(false)
+        }
+        KeyCode::Char('a') if ctrl => {
+            buf.home();
+            Some(false)
+        }
+        KeyCode::Char('e') if ctrl => {
+            buf.end();
+            Some(false)
+        }
+        KeyCode::Char(c) if !ctrl => {
+            buf.insert(c);
+            Some(true)
+        }
+        // Ignore unbound Ctrl chords without inserting their character.
+        KeyCode::Char(_) => Some(false),
+        _ => None,
+    }
+}
+
+/// Insert pasted text at the caret after removing control characters.
+fn paste_into(buf: &mut EditBuffer, s: &str) {
+    for c in s.chars().filter(|c| !c.is_control()) {
+        buf.insert(c);
+    }
+}
+
 /// Split a typed path into (directory-so-far, trailing fragment). The fragment
 /// is prefix-matched against candidates; the directory is what we list.
 fn split_input(input: &str) -> (&str, &str) {
@@ -1411,7 +1499,7 @@ mod tests {
         /// Uses this process's launch context.
         fn new_local(rows: u16, cols: u16) -> App {
             App::assemble(rows, cols, |pr, c, _wait_tx| {
-                let mut sup = Supervisor::new(pr, c);
+                let mut sup = Supervisor::new(pr, c, 2000);
                 sup.set_launch_context(crate::protocol::LaunchContext::here());
                 Box::new(LocalTransport::new(sup))
             })
@@ -1421,7 +1509,7 @@ mod tests {
         /// the core's session root instead of inheriting this process's env.
         fn new_local_with_ctx(rows: u16, cols: u16, ctx: crate::protocol::LaunchContext) -> App {
             App::assemble(rows, cols, move |pr, c, _wait_tx| {
-                let mut sup = Supervisor::new(pr, c);
+                let mut sup = Supervisor::new(pr, c, 2000);
                 sup.set_launch_context(ctx);
                 Box::new(LocalTransport::new(sup))
             })
@@ -1738,11 +1826,11 @@ mod tests {
         );
     }
 
-    /// A glyph-idle but not-parked task stays in "Running": `lifecycle` flaps
-    /// at the 600 ms edge for tools like `top` whose output arrives in 1-2 s
-    /// bursts, so placement keys off the debounced `parked`, never the glyph.
+    /// One window drives both signals, so a live core ships `Lifecycle::Idle`
+    /// and `parked` together: an idle-glyph task lands in the "Idle" section
+    /// under state grouping. Glyph and placement agree.
     #[test]
-    fn glyph_idle_without_parked_stays_in_running() {
+    fn idle_glyph_task_lands_in_idle_section() {
         let mut app = App::new_local(30, 100);
         let inv = app.invocation_dir.clone();
         app.spawn_in("sleep 5", inv); // id 1
@@ -1750,9 +1838,9 @@ mod tests {
 
         let i = app.views.iter().position(|v| v.id == 1).unwrap();
         app.views[i].lifecycle = Lifecycle::Idle;
-        app.views[i].parked = false;
+        app.views[i].parked = true;
 
-        assert_eq!(app.section_ids(), vec![("Running".to_string(), vec![1])]);
+        assert_eq!(app.section_ids(), vec![("Idle".to_string(), vec![1])]);
     }
 
     /// Selection is bound to a task id, so a `parked` flip (re-bucketing the
@@ -2093,6 +2181,116 @@ mod tests {
         assert_eq!(app.selected_id, Some(1));
     }
 
+    /// Build two two-task sections: In use [3, 4] and Running [1, 2].
+    fn app_with_two_sections() -> App {
+        let mut app = App::new_local(30, 100);
+        let inv = app.invocation_dir.clone();
+        for _ in 0..4 {
+            app.spawn_in("sleep 5", inv.clone());
+        }
+        app.pump();
+        app.transport.send(Command::Tag { id: 3, on: true });
+        app.transport.send(Command::Tag { id: 4, on: true });
+        app.pump();
+        assert_eq!(
+            app.section_ids(),
+            vec![
+                ("In use".to_string(), vec![3, 4]),
+                ("Running".to_string(), vec![1, 2]),
+            ],
+            "tags split the list into two two-task sections"
+        );
+        app
+    }
+
+    /// Next-section navigation selects its first task and wraps forward.
+    #[test]
+    fn tab_jumps_to_next_section_first_task() {
+        let mut app = app_with_two_sections();
+
+        // From In use, select Running's first task.
+        app.selected_id = Some(4);
+        app.select_next_section();
+        assert_eq!(
+            app.selected_id,
+            Some(1),
+            "next section's first, not same offset"
+        );
+
+        // From the last section, wrap to the first task in In use.
+        app.selected_id = Some(2);
+        app.select_next_section();
+        assert_eq!(app.selected_id, Some(3), "forward from last section wraps");
+    }
+
+    /// Previous-section navigation selects its first task and wraps backward.
+    #[test]
+    fn backtab_jumps_to_previous_section_first_task() {
+        let mut app = app_with_two_sections();
+
+        // From Running, select In use's first task.
+        app.selected_id = Some(2);
+        app.select_prev_section();
+        assert_eq!(
+            app.selected_id,
+            Some(3),
+            "previous section's first, not current's"
+        );
+
+        // From the first section, wrap to Running's first task.
+        app.selected_id = Some(3);
+        app.select_prev_section();
+        assert_eq!(
+            app.selected_id,
+            Some(1),
+            "backward from first section wraps"
+        );
+    }
+
+    /// Section navigation keeps a single task selected.
+    #[test]
+    fn section_nav_is_noop_with_one_task() {
+        let mut app = App::new_local(30, 100);
+        let inv = app.invocation_dir.clone();
+        app.spawn_in("sleep 5", inv);
+        app.pump();
+        app.resolve_selection();
+        assert_eq!(app.selected_id, Some(1));
+
+        app.select_next_section();
+        assert_eq!(app.selected_id, Some(1));
+        app.select_prev_section();
+        assert_eq!(app.selected_id, Some(1));
+    }
+
+    /// Without a selection, navigation chooses the boundary section.
+    #[test]
+    fn section_nav_defaults_without_selection() {
+        let mut app = app_with_two_sections();
+
+        app.selected_id = None;
+        app.select_next_section();
+        assert_eq!(
+            app.selected_id,
+            Some(3),
+            "no selection: first section's first"
+        );
+
+        app.selected_id = None;
+        app.select_prev_section();
+        assert_eq!(
+            app.selected_id,
+            Some(1),
+            "no selection: last section's first"
+        );
+
+        let mut empty = App::new_local(30, 100);
+        empty.select_next_section();
+        assert_eq!(empty.selected_id, None);
+        empty.select_prev_section();
+        assert_eq!(empty.selected_id, None);
+    }
+
     /// Supported crossterm keys and modifiers map to their wire representation.
     #[test]
     fn key_event_maps_to_semantic_key() {
@@ -2185,7 +2383,7 @@ mod tests {
         let mut app = App::new_local(30, 100);
         app.mode = Mode::Spawn;
         app.on_paste("cargo\ttest\r\n --all");
-        assert_eq!(app.input, "cargotest --all");
+        assert_eq!(app.input.as_str(), "cargotest --all");
         assert!(app.mode == Mode::Spawn, "paste must not submit");
     }
 
@@ -2414,6 +2612,10 @@ mod tests {
         KeyEvent::new(code, KeyModifiers::NONE)
     }
 
+    fn ctrl(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::CONTROL)
+    }
+
     /// `g` opens the picker only when a task is selected, pinning the target
     /// to that task's id.
     #[test]
@@ -2592,7 +2794,7 @@ mod tests {
         app.on_key_dashboard(key(KeyCode::Char('R')));
         assert!(app.mode == Mode::Rename);
         assert_eq!(app.rename_target, Some(1));
-        assert_eq!(app.input, "", "an unnamed task prefills empty");
+        assert_eq!(app.input.as_str(), "", "an unnamed task prefills empty");
 
         // A named task prefills its name.
         app.on_key_rename(key(KeyCode::Esc));
@@ -2602,7 +2804,7 @@ mod tests {
         });
         app.pump();
         app.on_key_dashboard(key(KeyCode::Char('R')));
-        assert_eq!(app.input, "api");
+        assert_eq!(app.input.as_str(), "api");
     }
 
     /// Enter sends the trimmed name and returns to the dashboard.
@@ -2638,7 +2840,7 @@ mod tests {
         app.pump();
         app.resolve_selection();
         app.on_key_dashboard(key(KeyCode::Char('R')));
-        assert_eq!(app.input, "api");
+        assert_eq!(app.input.as_str(), "api");
         for _ in 0.."api".len() {
             app.on_key_rename(key(KeyCode::Backspace));
         }
@@ -2671,6 +2873,204 @@ mod tests {
         app.pump();
         let v = app.views.iter().find(|v| v.id == 1).unwrap();
         assert_eq!(v.name.as_deref(), Some("api"), "Esc must send nothing");
+    }
+
+    // --- prompt caret editing ----------------------------------------------
+
+    /// Left/Right, Ctrl-A/Ctrl-E, and Home/End reposition the caret in the
+    /// rename prompt, and edits land at it.
+    #[test]
+    fn rename_caret_keys_edit_mid_name() {
+        let mut app = App::new_local(30, 100);
+        let inv = app.invocation_dir.clone();
+        app.spawn_in("sleep 5", inv);
+        app.transport.send(Command::SetName {
+            id: 1,
+            name: Some("api".to_string()),
+        });
+        app.pump();
+        app.resolve_selection();
+        app.on_key_dashboard(key(KeyCode::Char('R')));
+        assert_eq!(app.input.as_str(), "api");
+
+        // Move after "a" and insert within the name.
+        app.on_key_rename(key(KeyCode::Left));
+        app.on_key_rename(key(KeyCode::Left));
+        app.on_key_rename(key(KeyCode::Char('x')));
+        assert_eq!(app.input.as_str(), "axpi");
+
+        // Ctrl-A jumps to the start; typing prepends.
+        app.on_key_rename(ctrl(KeyCode::Char('a')));
+        app.on_key_rename(key(KeyCode::Char('z')));
+        assert_eq!(app.input.as_str(), "zaxpi");
+
+        // Ctrl-E returns to the end; typing appends.
+        app.on_key_rename(ctrl(KeyCode::Char('e')));
+        app.on_key_rename(key(KeyCode::Char('!')));
+        assert_eq!(app.input.as_str(), "zaxpi!");
+
+        // Backspace removes only the char before the caret.
+        app.on_key_rename(key(KeyCode::Left));
+        app.on_key_rename(key(KeyCode::Backspace));
+        assert_eq!(app.input.as_str(), "zaxp!");
+
+        // Home/End alias the chords.
+        app.on_key_rename(key(KeyCode::Home));
+        app.on_key_rename(key(KeyCode::Char('0')));
+        app.on_key_rename(key(KeyCode::End));
+        app.on_key_rename(key(KeyCode::Char('9')));
+        assert_eq!(app.input.as_str(), "0zaxp!9");
+    }
+
+    /// Unbound Ctrl chords do not insert their literal letters.
+    #[test]
+    fn ctrl_chords_never_insert_their_letter() {
+        let mut app = App::new_local(30, 100);
+        let inv = app.invocation_dir.clone();
+        app.spawn_grouped("sleep 5", inv, "alpha"); // id 1
+        app.pump();
+        app.resolve_selection();
+
+        app.on_key_dashboard(key(KeyCode::Char('w')));
+        app.on_key_savesession(ctrl(KeyCode::Char('k')));
+        assert!(app.input.is_empty(), "Ctrl-K must not insert into a prompt");
+        app.on_key_savesession(key(KeyCode::Esc));
+
+        app.on_key_dashboard(key(KeyCode::Char('@')));
+        app.on_key_pickdir(ctrl(KeyCode::Char('k')));
+        assert!(app.dir_input.is_empty(), "Ctrl-K must not filter the dirs");
+        app.on_key_pickdir(key(KeyCode::Esc));
+
+        app.on_key_dashboard(key(KeyCode::Char('g')));
+        let before = app.group_candidates.len();
+        app.on_key_pickgroup(ctrl(KeyCode::Char('k')));
+        assert!(
+            app.group_input.is_empty(),
+            "Ctrl-K must not filter the groups"
+        );
+        assert_eq!(app.group_candidates.len(), before);
+    }
+
+    /// In the `@` picker, Right descends only when the caret sits at the end
+    /// of the typed path; off the end it is caret motion.
+    #[test]
+    fn pickdir_right_descends_only_from_the_end() {
+        let dir = temp("caret_pickdir");
+        std::fs::create_dir_all(dir.join("alpha")).unwrap();
+        let mut app = App::new_local(30, 100);
+        app.invocation_dir = dir.clone();
+
+        app.on_key_dashboard(key(KeyCode::Char('@')));
+        for c in "al".chars() {
+            app.on_key_pickdir(key(KeyCode::Char(c)));
+        }
+        assert_eq!(app.dir_sel, 1, "the fragment preselects alpha");
+
+        // Off the end (one left), Right moves the caret without descending.
+        app.on_key_pickdir(key(KeyCode::Left));
+        app.on_key_pickdir(key(KeyCode::Right));
+        assert_eq!(
+            app.dir_input.as_str(),
+            "al",
+            "Right off-end must not descend"
+        );
+
+        // That Right returned the caret to the end, so the next one descends.
+        app.on_key_pickdir(key(KeyCode::Right));
+        assert!(
+            app.dir_input.ends_with("alpha/"),
+            "Right at end descends: {:?}",
+            app.dir_input.as_str()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Typing after caret motion still refreshes the `@` candidates; the
+    /// motion itself does not.
+    #[test]
+    fn pickdir_refreshes_on_edits_not_caret_motion() {
+        let dir = temp("caret_pickdir_refresh");
+        std::fs::create_dir_all(dir.join("alpha")).unwrap();
+        let mut app = App::new_local(30, 100);
+        app.invocation_dir = dir.clone();
+
+        app.on_key_dashboard(key(KeyCode::Char('@')));
+        app.on_key_pickdir(key(KeyCode::Char('l')));
+        assert_eq!(app.dir_candidates.len(), 1, "\"l\" matches nothing");
+
+        app.on_key_pickdir(key(KeyCode::Home));
+        assert_eq!(app.dir_candidates.len(), 1, "caret motion must not refresh");
+
+        // "a" typed at the start makes the buffer "al": a match again.
+        app.on_key_pickdir(key(KeyCode::Char('a')));
+        assert_eq!(app.dir_input.as_str(), "al");
+        assert!(
+            app.dir_candidates.iter().any(|c| c.label == "alpha"),
+            "an edit at the caret refreshes the candidates"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Caret-positioned edits refresh the group filter like end-of-line ones.
+    #[test]
+    fn pickgroup_caret_edits_refresh_the_filter() {
+        let mut app = App::new_local(30, 100);
+        let inv = app.invocation_dir.clone();
+        app.spawn_grouped("sleep 5", inv.clone(), "alpha"); // id 1
+        app.spawn_grouped("sleep 5", inv, "beta"); // id 2
+        app.pump();
+        app.resolve_selection();
+        app.on_key_dashboard(key(KeyCode::Char('g')));
+
+        app.on_key_pickgroup(key(KeyCode::Char('b')));
+        assert_eq!(app.group_candidates.len(), 2, "\"b\" matches beta");
+
+        app.on_key_pickgroup(key(KeyCode::Left));
+        assert_eq!(
+            app.group_candidates.len(),
+            2,
+            "caret motion must not refresh"
+        );
+
+        // "a" before the 'b' makes the filter "ab": nothing matches now.
+        app.on_key_pickgroup(key(KeyCode::Char('a')));
+        assert_eq!(app.group_input.as_str(), "ab");
+        assert_eq!(app.group_candidates.len(), 1, "the caret edit re-filtered");
+    }
+
+    /// A paste inserts at the caret and leaves the caret after the pasted text.
+    #[test]
+    fn paste_lands_at_the_caret() {
+        let mut app = App::new_local(30, 100);
+        app.mode = Mode::Spawn;
+        for c in "cargo t".chars() {
+            app.on_key_spawn(key(KeyCode::Char(c)));
+        }
+        app.on_key_spawn(key(KeyCode::Left)); // caret before 't'
+        app.on_paste("x\ny"); // control chars still stripped
+        assert_eq!(app.input.as_str(), "cargo xyt");
+        app.on_key_spawn(key(KeyCode::Char('z')));
+        assert_eq!(
+            app.input.as_str(),
+            "cargo xyzt",
+            "caret sits after the paste"
+        );
+    }
+
+    /// Multibyte characters move, insert, and delete as whole units.
+    #[test]
+    fn multibyte_chars_edit_cleanly_in_a_prompt() {
+        let mut app = App::new_local(30, 100);
+        app.on_key_dashboard(key(KeyCode::Char('w')));
+        app.on_key_savesession(key(KeyCode::Char('é')));
+        app.on_key_savesession(key(KeyCode::Left));
+        app.on_key_savesession(key(KeyCode::Char('日')));
+        assert_eq!(app.input.as_str(), "日é");
+        app.on_key_savesession(key(KeyCode::Backspace));
+        assert_eq!(app.input.as_str(), "é");
+        app.on_key_savesession(key(KeyCode::Right));
+        app.on_key_savesession(key(KeyCode::Backspace));
+        assert!(app.input.is_empty());
     }
 
     // --- spawn group inheritance -------------------------------------------

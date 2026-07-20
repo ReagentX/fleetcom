@@ -10,8 +10,11 @@ use crossterm::{
     style::{Attribute, Print, SetAttribute},
 };
 
+use unicode_width::UnicodeWidthStr;
+
 use crate::{
     app::{App, DirKind, GroupMode, Mode, Row},
+    editbuf::EditBuffer,
     format::{pad, rel_time, truncate},
     preview::PreviewSource,
     protocol::{Lifecycle, TaskView},
@@ -183,7 +186,7 @@ fn render_dashboard(out: &mut impl Write, app: &App) -> io::Result<()> {
     // transient save/load notice, else the key hint.
     let cmd_y = rows.saturating_sub(2);
     match cmdline(app) {
-        Some(line) => put(out, cmd_y, &line, cols)?,
+        Some((line, _)) => put(out, cmd_y, &line, cols)?,
         None => match &app.status {
             Some(s) => put(out, cmd_y, &format!("  {s}"), cols)?,
             None => dim(
@@ -208,14 +211,14 @@ fn render_dashboard(out: &mut impl Write, app: &App) -> io::Result<()> {
         out,
         rows.saturating_sub(1),
         &format!(
-            "  ↑↓ select · enter attach · space peek · n/@ new · s sort · m tag · g group · R rename · r rerun · X kill · {exit_hint}"
+            "  ↑↓ select · enter attach · space peek · m tag · g group · R rename · r rerun · X kill · {exit_hint}"
         ),
         cols,
     )?;
 
     match cmdline(app) {
-        Some(line) => {
-            let cx = truncate(&line, cols).chars().count() as u16;
+        Some((line, cx)) => {
+            let cx = clamp_caret(cx, &line, cols);
             queue!(out, MoveTo(cx, cmd_y), Show)?;
         }
         None => queue!(out, Hide)?,
@@ -223,21 +226,39 @@ fn render_dashboard(out: &mut impl Write, app: &App) -> io::Result<()> {
     Ok(())
 }
 
-/// The editable bottom line for the text-input modes, or `None` when the command
-/// line should show a hint/status instead.
-fn cmdline(app: &App) -> Option<String> {
-    match app.mode {
-        Mode::Spawn => Some(spawn_prompt(app)),
-        Mode::SaveSession => Some(format!("  save session as: {}", app.input)),
-        Mode::Rename => Some(format!("  rename task: {}", app.input)),
-        _ => None,
-    }
+/// The editable bottom line for the text-input modes (the rendered line and
+/// the caret's display column), or `None` when the command line should show a
+/// hint/status instead.
+fn cmdline(app: &App) -> Option<(String, u16)> {
+    let prefix = match app.mode {
+        Mode::Spawn => spawn_prefix(app),
+        Mode::SaveSession => "  save session as: ".to_string(),
+        Mode::Rename => "  rename task: ".to_string(),
+        _ => return None,
+    };
+    Some(caret_line(&prefix, &app.input))
 }
 
-/// Render the `❯` command line with optional directory and group destinations.
-fn spawn_prompt(app: &App) -> String {
+/// Compose `prefix` + the buffer text with the caret's display column: the
+/// width of the prefix plus the width of the text before the caret. Widths are
+/// terminal columns (wide glyphs count 2), not scalar counts. The column is
+/// unclamped; `clamp_caret` bounds it to what actually gets painted.
+fn caret_line(prefix: &str, buf: &EditBuffer) -> (String, u16) {
+    let cx = (prefix.width() + buf.before_caret().width()) as u16;
+    (format!("{prefix}{}", buf.as_str()), cx)
+}
+
+/// Bound a caret column to the painted, `cols`-truncated line. An overflowing
+/// prompt keeps its plain truncation, so a caret past the cut pins at the right
+/// edge rather than scrolling the line to stay visible.
+fn clamp_caret(cx: u16, line: &str, cols: usize) -> u16 {
+    cx.min(truncate(line, cols).width() as u16)
+}
+
+/// The `❯` prompt prefix with optional directory and group destinations.
+fn spawn_prefix(app: &App) -> String {
     let dir = (app.spawn_cwd != app.invocation_dir).then(|| app.dir_label(&app.spawn_cwd));
-    prompt_line(dir.as_deref(), app.spawn_group.as_deref(), &app.input)
+    prompt_line(dir.as_deref(), app.spawn_group.as_deref(), "")
 }
 
 /// Assemble the spawn prompt from its optional `▸` destination segments.
@@ -292,13 +313,8 @@ fn attached_title(v: &TaskView) -> String {
     }
 }
 
-/// The time column's age: the task's last meaningful edge, not always launch.
-/// Finished rows count from exit, parked rows from their last output, running
-/// rows from launch. Quiet age keys off `parked` (the 10 s placement window),
-/// not `Lifecycle::Idle` (the 600 ms glyph edge): a `top`-cadence task flaps
-/// the glyph on every refresh and would flap the column with it. A `None` edge
-/// means the frame came from a daemon that predates the field; it falls back
-/// to launch age, exactly the old column.
+/// Age shown for a task: time since exit when finished, last output when
+/// parked, or launch otherwise. Missing edge timestamps fall back to launch.
 fn row_age(v: &TaskView) -> Duration {
     let edge = match (v.lifecycle, v.parked) {
         (Lifecycle::Ok | Lifecycle::Failed, _) => v.finished_ago,
@@ -528,14 +544,13 @@ fn render_pickdir(out: &mut impl Write, app: &App) -> io::Result<()> {
         Some(DirKind::Into) => "enter/tab open",
         None => "",
     };
-    let cx = truncate(&format!("  @ {}", app.dir_input), app.cols as usize)
-        .chars()
-        .count() as u16;
+    let (line, cx) = caret_line("  @ ", &app.dir_input);
+    let cx = clamp_caret(cx, &line, app.cols as usize);
     render_panel(
         out,
         app,
         &Panel {
-            header: format!("  @ {}   ", app.dir_input),
+            header: format!("  @ {}   ", app.dir_input.as_str()),
             labels: &labels,
             sel: app.dir_sel,
             max_rows: 8,
@@ -566,14 +581,13 @@ fn render_pickgroup(out: &mut impl Write, app: &App) -> io::Result<()> {
             None => "",
         }
     };
-    let cx = truncate(&format!("  g {}", app.group_input), app.cols as usize)
-        .chars()
-        .count() as u16;
+    let (line, cx) = caret_line("  g ", &app.group_input);
+    let cx = clamp_caret(cx, &line, app.cols as usize);
     render_panel(
         out,
         app,
         &Panel {
-            header: format!("  g {}   ", app.group_input),
+            header: format!("  g {}   ", app.group_input.as_str()),
             labels: &labels,
             sel: app.group_sel,
             max_rows: 8,
@@ -755,10 +769,7 @@ mod tests {
         }
     }
 
-    /// The time column follows the debounced state: exit age once finished,
-    /// quiet age while parked, launch age otherwise, even when the glyph's
-    /// instantaneous `Idle` disagrees. A `None` edge (old-daemon frame) falls
-    /// back to launch age.
+    /// The time column uses exit, quiet, or launch age according to task state.
     #[test]
     fn task_row_time_column_follows_the_debounced_state() {
         let quiet = Some(Duration::from_secs(4 * 60)); // renders "4m"
@@ -767,10 +778,9 @@ mod tests {
             (Lifecycle::Ok, false, None, exited, "3s"),
             (Lifecycle::Failed, false, None, exited, "3s"),
             (Lifecycle::Idle, true, quiet, None, "4m"),
-            (Lifecycle::Idle, true, None, None, "2h"), // old daemon: no quiet edge
-            (Lifecycle::Idle, false, quiet, None, "2h"), // glyph idles; placement has not
+            (Lifecycle::Idle, true, None, None, "2h"), // missing quiet timestamp
             (Lifecycle::Active, false, None, None, "2h"),
-            (Lifecycle::Ok, false, None, None, "2h"), // old daemon: no exit edge
+            (Lifecycle::Ok, false, None, None, "2h"), // missing exit timestamp
         ];
         for (lifecycle, parked, quiet_ago, finished_ago, want) in cases {
             let row = task_row(&timed_view(lifecycle, parked, quiet_ago, finished_ago), 80);

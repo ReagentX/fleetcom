@@ -49,7 +49,7 @@ use crate::{
         Command, Event, LaunchContext, PROTOCOL_VERSION, decode_command, decode_event,
         decode_hello, encode_command, encode_event, encode_hello, hello_version,
     },
-    supervisor::Supervisor,
+    supervisor::{self, Supervisor},
 };
 
 /// Maximum duration of the hello handshake, on the daemon side and the
@@ -319,6 +319,10 @@ fn spawn_daemon() -> io::Result<()> {
         .stdout(Stdio::null())
         .stderr(log.map(Stdio::from).unwrap_or_else(Stdio::null))
         .process_group(0);
+    // Pass the client's scrollback flag to the daemon through its environment.
+    if let Some(lines) = supervisor::scrollback_flag() {
+        cmd.env(supervisor::FLEETCOM_SCROLLBACK, lines.to_string());
+    }
     cmd.spawn()?;
     Ok(())
 }
@@ -445,7 +449,8 @@ pub fn run_daemon() -> io::Result<()> {
 
     // 24x80 until the first client's Resize, which arrives before any Spawn.
     // Each connection supplies its launch context in the hello frame.
-    let mut sup = Supervisor::new(24, 80);
+    // Use one scrollback depth for every task owned by this daemon.
+    let mut sup = Supervisor::new(24, 80, supervisor::resolve_scrollback());
 
     // A signalled daemon shuts down *cleanly*: TERM each job's group with a
     // KILL after the grace, remove the socket. Dying without that cleanup

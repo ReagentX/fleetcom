@@ -11,9 +11,23 @@ fn here() -> PathBuf {
 
 /// Build a supervisor with this process's launch context.
 fn sup(rows: u16, cols: u16) -> Supervisor {
-    let mut s = Supervisor::new(rows, cols);
+    let mut s = Supervisor::new(rows, cols, 2000);
     s.set_launch_context(LaunchContext::here());
     s
+}
+
+/// Scrollback resolution applies precedence, clamping, and environment fallback.
+#[test]
+fn scrollback_resolution_precedence_clamp_and_fallback() {
+    assert_eq!(effective_scrollback(None, None), 2000);
+    assert_eq!(effective_scrollback(None, Some("500")), 500);
+    assert_eq!(effective_scrollback(None, Some("0")), 0);
+    assert_eq!(effective_scrollback(None, Some("999999999")), 100_000);
+    assert_eq!(effective_scrollback(None, Some("garbage")), 2000);
+    assert_eq!(effective_scrollback(None, Some("-5")), 2000);
+    assert_eq!(effective_scrollback(Some(5000), Some("500")), 5000);
+    assert_eq!(effective_scrollback(Some(999_999_999), None), 100_000);
+    assert_eq!(effective_scrollback(Some(0), Some("500")), 0);
 }
 
 /// The recipe groups commands by dir and preserves spawn order within a dir.
@@ -1203,7 +1217,7 @@ fn shutdown_is_prompt_when_every_group_is_already_empty() {
 fn session_commands_use_the_launch_context_config_dir() {
     let dir = scratch("sess_root");
     let config = dir.join("config");
-    let mut s = Supervisor::new(24, 80);
+    let mut s = Supervisor::new(24, 80, 2000);
     s.set_launch_context(LaunchContext {
         env: vec![(
             "FLEETCOM_CONFIG_DIR".into(),
@@ -1253,7 +1267,7 @@ fn load_session_restores_saved_groups() {
         )],
         cwd: dir.clone(),
     };
-    let mut s = Supervisor::new(24, 80);
+    let mut s = Supervisor::new(24, 80, 2000);
     s.set_launch_context(ctx.clone());
     s.apply(Command::Spawn {
         command: "sleep 30".into(),
@@ -1275,7 +1289,7 @@ fn load_session_restores_saved_groups() {
         "save must still count commands"
     );
 
-    let mut fresh = Supervisor::new(24, 80);
+    let mut fresh = Supervisor::new(24, 80, 2000);
     fresh.set_launch_context(ctx);
     fresh.apply(Command::LoadSession {
         name: "fleet".into(),
@@ -1314,7 +1328,7 @@ fn load_session_restores_saved_names() {
         )],
         cwd: dir.clone(),
     };
-    let mut s = Supervisor::new(24, 80);
+    let mut s = Supervisor::new(24, 80, 2000);
     s.set_launch_context(ctx.clone());
     s.apply(Command::Spawn {
         command: "sleep 30".into(),
@@ -1339,7 +1353,7 @@ fn load_session_restores_saved_names() {
         name: "fleet".into(),
     });
 
-    let mut fresh = Supervisor::new(24, 80);
+    let mut fresh = Supervisor::new(24, 80, 2000);
     fresh.set_launch_context(ctx);
     fresh.apply(Command::LoadSession {
         name: "fleet".into(),
@@ -1380,7 +1394,7 @@ fn load_session_renormalizes_hand_edited_groups() {
         ),
     )
     .unwrap();
-    let mut s = Supervisor::new(24, 80);
+    let mut s = Supervisor::new(24, 80, 2000);
     s.set_launch_context(LaunchContext {
         env: vec![("FLEETCOM_CONFIG_DIR".into(), config.into_os_string())],
         cwd: dir.clone(),
@@ -1421,7 +1435,7 @@ fn load_surfaces_parse_errors_instead_of_absence() {
     let config = dir.join("config");
     std::fs::create_dir_all(config.join("sessions")).unwrap();
     std::fs::write(config.join("sessions").join("broken.json"), "{not json").unwrap();
-    let mut s = Supervisor::new(24, 80);
+    let mut s = Supervisor::new(24, 80, 2000);
     s.set_launch_context(config_ctx(&config, dir.clone(), &[]));
     s.apply(Command::LoadSession {
         name: "broken".into(),
@@ -1446,7 +1460,7 @@ fn load_surfaces_parse_errors_instead_of_absence() {
 fn load_missing_session_reads_as_not_found() {
     let dir = scratch("sess_missing");
     let config = dir.join("config");
-    let mut s = Supervisor::new(24, 80);
+    let mut s = Supervisor::new(24, 80, 2000);
     s.set_launch_context(config_ctx(&config, dir.clone(), &[]));
     s.apply(Command::LoadSession {
         name: "ghost".into(),
@@ -1472,7 +1486,7 @@ fn load_reports_admit_failures_not_clean_success() {
         format!(r#"{{"{}": ["true", "true"]}}"#, dir.display()),
     )
     .unwrap();
-    let mut s = Supervisor::new(24, 80);
+    let mut s = Supervisor::new(24, 80, 2000);
     s.set_launch_context(config_ctx(
         &config,
         dir.clone(),
@@ -1536,7 +1550,7 @@ fn load_skips_over_length_commands() {
         ),
     )
     .unwrap();
-    let mut s = Supervisor::new(24, 80);
+    let mut s = Supervisor::new(24, 80, 2000);
     s.set_launch_context(config_ctx(&config, dir.clone(), &[]));
     s.apply(Command::LoadSession { name: "big".into() });
     let evs = s.drain();
@@ -1557,7 +1571,7 @@ fn spawn_uses_the_launch_context_env_not_the_process_env() {
     );
     let dir = scratch("hello_env");
     let out = dir.join("out");
-    let mut s = Supervisor::new(24, 80);
+    let mut s = Supervisor::new(24, 80, 2000);
     s.set_launch_context(LaunchContext {
         env: vec![("FLEETCOM_MARKER".into(), "xyzzy".into())],
         cwd: dir.clone(),
@@ -1582,7 +1596,7 @@ fn spawn_uses_the_launch_context_env_not_the_process_env() {
 /// rerun, session load) with a status notice.
 #[test]
 fn launch_without_context_is_refused() {
-    let mut s = Supervisor::new(24, 80);
+    let mut s = Supervisor::new(24, 80, 2000);
     s.apply(Command::Spawn {
         command: "true".into(),
         cwd: here(),
@@ -1707,7 +1721,7 @@ fn spawn_claude_pins_an_id_and_layers_settings() {
     let dir = scratch("cap_claude");
     let (bin, runtime) = (dir.join("bin"), dir.join("run"));
     install_stub(&bin, "claude", &dir);
-    let mut s = Supervisor::new(24, 80);
+    let mut s = Supervisor::new(24, 80, 2000);
     s.set_launch_context(agent_ctx(&bin, &runtime, dir.clone()));
     s.apply(Command::Spawn {
         command: "claude".into(),
@@ -1785,7 +1799,7 @@ fn spawn_claude_pins_an_id_and_layers_settings() {
 fn spawn_non_agent_command_is_not_instrumented() {
     let dir = scratch("cap_plain");
     let runtime = dir.join("run");
-    let mut s = Supervisor::new(24, 80);
+    let mut s = Supervisor::new(24, 80, 2000);
     s.set_launch_context(agent_ctx(&dir.join("bin"), &runtime, dir.clone()));
     s.apply(Command::Spawn {
         command: "printf ok".into(),
@@ -1811,7 +1825,7 @@ fn spawn_resuming_claude_injects_only_the_capture_channel() {
     let dir = scratch("cap_resume");
     let (bin, runtime) = (dir.join("bin"), dir.join("run"));
     install_stub(&bin, "claude", &dir);
-    let mut s = Supervisor::new(24, 80);
+    let mut s = Supervisor::new(24, 80, 2000);
     s.set_launch_context(agent_ctx(&bin, &runtime, dir.clone()));
     s.apply(Command::Spawn {
         command: format!("claude --resume {CAP_ID}"),
@@ -1842,7 +1856,7 @@ fn rerun_resumes_the_captured_conversation() {
     let dir = scratch("cap_rerun");
     let (bin, runtime) = (dir.join("bin"), dir.join("run"));
     install_stub(&bin, "claude", &dir);
-    let mut s = Supervisor::new(24, 80);
+    let mut s = Supervisor::new(24, 80, 2000);
     s.set_launch_context(agent_ctx(&bin, &runtime, dir.clone()));
     s.apply(Command::Spawn {
         command: "claude".into(),
@@ -1904,7 +1918,7 @@ fn rerun_cannot_read_the_old_runs_stale_capture() {
         "claude",
         &format!("printf 'Resume this session with:\\nclaude --resume {CAP_ID}\\n'"),
     );
-    let mut s = Supervisor::new(24, 80);
+    let mut s = Supervisor::new(24, 80, 2000);
     s.set_launch_context(agent_ctx_plus(
         &bin,
         &runtime,
@@ -1958,7 +1972,7 @@ fn remove_deletes_the_capture_file() {
     let dir = scratch("cap_remove");
     let (bin, runtime) = (dir.join("bin"), dir.join("run"));
     install_stub(&bin, "claude", &dir);
-    let mut s = Supervisor::new(24, 80);
+    let mut s = Supervisor::new(24, 80, 2000);
     s.set_launch_context(agent_ctx(&bin, &runtime, dir.clone()));
     s.apply(Command::Spawn {
         command: "claude".into(),
@@ -1983,7 +1997,7 @@ fn reconnect_with_unchanged_root_preserves_capture_files() {
     let dir = scratch("cap_reconnect");
     let (bin, runtime) = (dir.join("bin"), dir.join("run"));
     install_stub(&bin, "claude", &dir);
-    let mut s = Supervisor::new(24, 80);
+    let mut s = Supervisor::new(24, 80, 2000);
     s.set_launch_context(agent_ctx(&bin, &runtime, dir.clone()));
     s.apply(Command::Spawn {
         command: "claude".into(),
@@ -2014,7 +2028,7 @@ fn returning_to_a_prior_root_preserves_its_live_captures() {
     let dir = scratch("cap_aba");
     let (bin, root_a, root_b) = (dir.join("bin"), dir.join("run-a"), dir.join("run-b"));
     install_stub(&bin, "claude", &dir);
-    let mut s = Supervisor::new(24, 80);
+    let mut s = Supervisor::new(24, 80, 2000);
     s.set_launch_context(agent_ctx(&bin, &root_a, dir.clone()));
     s.apply(Command::Spawn {
         command: "claude".into(),
@@ -2065,7 +2079,7 @@ fn remove_deletes_the_capture_file_under_the_spawn_root() {
     let dir = scratch("cap_remove_cross");
     let (bin, root_a, root_b) = (dir.join("bin"), dir.join("run-a"), dir.join("run-b"));
     install_stub(&bin, "claude", &dir);
-    let mut s = Supervisor::new(24, 80);
+    let mut s = Supervisor::new(24, 80, 2000);
     s.set_launch_context(agent_ctx(&bin, &root_a, dir.clone()));
     s.apply(Command::Spawn {
         command: "claude".into(),
@@ -2114,7 +2128,7 @@ fn spawn_codex_installs_the_notify_override() {
     let dir = scratch("cap_codex");
     let (bin, runtime) = (dir.join("bin"), dir.join("run"));
     install_stub(&bin, "codex", &dir);
-    let mut s = Supervisor::new(24, 80);
+    let mut s = Supervisor::new(24, 80, 2000);
     // Keep config lookup within this test's scratch directory.
     s.set_launch_context(agent_ctx_plus(
         &bin,
@@ -2157,7 +2171,7 @@ fn spawn_grok_pins_an_id_and_injects_nothing_else() {
     let dir = scratch("cap_grok");
     let (bin, runtime, config) = (dir.join("bin"), dir.join("run"), dir.join("config"));
     install_stub(&bin, "grok", &dir);
-    let mut s = Supervisor::new(24, 80);
+    let mut s = Supervisor::new(24, 80, 2000);
     // Keep save-time correlation inside the scratch tree.
     s.set_launch_context(agent_ctx_plus(
         &bin,
@@ -2217,7 +2231,7 @@ fn exit_hint_is_scraped_and_saved_as_a_resume() {
         "claude",
         &format!("printf 'Resume this session with:\\nclaude --resume {CAP_ID}\\n'"),
     );
-    let mut s = Supervisor::new(24, 80);
+    let mut s = Supervisor::new(24, 80, 2000);
     s.set_launch_context(agent_ctx_plus(
         &bin,
         &runtime,
@@ -2256,7 +2270,7 @@ fn save_scrapes_a_finished_task_without_reap() {
         "claude",
         &format!("printf 'Resume this session with:\\nclaude --resume {CAP_ID}\\n'"),
     );
-    let mut s = Supervisor::new(24, 80);
+    let mut s = Supervisor::new(24, 80, 2000);
     s.set_launch_context(agent_ctx_plus(
         &bin,
         &runtime,
@@ -2297,7 +2311,7 @@ fn rerun_scrapes_a_finished_task_without_reap() {
         "claude",
         &format!("printf 'Resume this session with:\\nclaude --resume {CAP_ID}\\n'"),
     );
-    let mut s = Supervisor::new(24, 80);
+    let mut s = Supervisor::new(24, 80, 2000);
     s.set_launch_context(agent_ctx(&bin, &runtime, dir.clone()));
     s.apply(Command::Spawn {
         command: "claude".into(),
@@ -2338,7 +2352,7 @@ fn resume_id_precedence_scrape_over_capture_over_spawn() {
             d = done.display()
         ),
     );
-    let mut s = Supervisor::new(24, 80);
+    let mut s = Supervisor::new(24, 80, 2000);
     s.set_launch_context(agent_ctx_plus(
         &bin,
         &runtime,
@@ -2400,7 +2414,7 @@ fn save_falls_back_to_fs_correlation_for_a_silent_codex() {
     let now_ms = now_ms();
     let id = write_rollout(&codex_home, now_ms, 1, &dir);
 
-    let mut s = Supervisor::new(24, 80);
+    let mut s = Supervisor::new(24, 80, 2000);
     s.set_launch_context(agent_ctx_plus(
         &bin,
         &runtime,
@@ -2445,7 +2459,7 @@ fn save_correlates_against_the_spawn_time_home() {
     let id_a = write_rollout(&home_a, now_ms, 1, &dir);
     let id_b = write_rollout(&home_b, now_ms, 2, &dir);
 
-    let mut s = Supervisor::new(24, 80);
+    let mut s = Supervisor::new(24, 80, 2000);
     s.set_launch_context(agent_ctx_plus(
         &bin,
         &runtime,
@@ -2532,7 +2546,7 @@ fn home_only_launch_env_targets_the_clients_dot_codex() {
     let now_ms = now_ms();
     let id = write_rollout(&codex_home, now_ms, 1, &dir);
 
-    let mut s = Supervisor::new(24, 80);
+    let mut s = Supervisor::new(24, 80, 2000);
     s.set_launch_context(agent_ctx_plus(
         &bin,
         &runtime,
@@ -2589,7 +2603,7 @@ fn stale_inherited_notify_chain_is_never_executed() {
         "codex",
         &format!("\"${{FLEETCOM_CAPTURE_FILE%/*}}/codex-notify.sh\" '{payload}'"),
     );
-    let mut s = Supervisor::new(24, 80);
+    let mut s = Supervisor::new(24, 80, 2000);
     let mut ctx = agent_ctx_plus(&bin, &runtime, dir.clone(), &[("CODEX_HOME", &codex_home)]);
     ctx.env.push((
         crate::harness::NOTIFY_CHAIN_ENV.into(),
@@ -2627,7 +2641,7 @@ fn agent_save_without_any_id_keeps_the_plain_command() {
     // nothing to find, and the notify routing nothing to read.
     let codex_home = dir.join("codex_home");
     install_stub(&bin, "codex", &dir);
-    let mut s = Supervisor::new(24, 80);
+    let mut s = Supervisor::new(24, 80, 2000);
     s.set_launch_context(agent_ctx_plus(
         &bin,
         &runtime,
@@ -2701,7 +2715,7 @@ fn config_toml_notify_chains_through_the_injected_script() {
             chain = NOTIFY_CHAIN_ENV,
         ),
     );
-    let mut s = Supervisor::new(24, 80);
+    let mut s = Supervisor::new(24, 80, 2000);
     s.set_launch_context(agent_ctx_plus(
         &bin,
         &runtime,
@@ -2761,7 +2775,7 @@ fn unrepresentable_config_notify_suppresses_injection() {
     )
     .unwrap();
     install_stub(&bin, "codex", &dir);
-    let mut s = Supervisor::new(24, 80);
+    let mut s = Supervisor::new(24, 80, 2000);
     s.set_launch_context(agent_ctx_plus(
         &bin,
         &runtime,
@@ -2804,7 +2818,7 @@ fn unrepresentable_config_notify_suppresses_injection() {
 fn non_agent_entries_survive_save_as_plain_strings() {
     let dir = scratch("plain_save");
     let config = dir.join("config");
-    let mut s = Supervisor::new(24, 80);
+    let mut s = Supervisor::new(24, 80, 2000);
     s.set_launch_context(LaunchContext {
         env: vec![
             ("SHELL".into(), "/bin/sh".into()),

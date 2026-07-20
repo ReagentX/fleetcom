@@ -1,0 +1,14 @@
+[?1049h[2J[H✢ Running phase 1 (dashboard UI)… (4m 20s · ↓ 17.1k tokens)
+  ⎿  ✔ Phase 0: verify facts
+     ◼ Phase 1: dashboard polish
+     ◼ Phase 2: glyph timing
+     ◼ Phase 3: scrollback config
+     ◻ Phase 4: caret navigation
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ c
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  (statusline scrubbed: user-configured row)
+  ⏵⏵ auto mode on (shift+tab to cycle)
+
+⏺ main
+◯ general-purpose  Phase 1 worker    45s · ↓ 17.1k tokens
