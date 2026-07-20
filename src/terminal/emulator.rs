@@ -35,22 +35,47 @@ pub enum MouseProtocolEncoding {
     Sgr,
 }
 
-/// Routes the backend's `Event::PtyWrite` probe responses into a buffer. The
-/// listener fires inside `Processor::advance`, while the caller holds the
-/// emulator lock, so it only appends, never blocks; the caller drains and
-/// filters after `advance` returns. Every other backend event (title,
-/// clipboard, color requests, bell) is discarded here: the default-deny probe
-/// policy starts with what never gets buffered.
-pub struct ProbeSink(Arc<Mutex<Vec<String>>>);
+/// The last title event of an advance, if any: `Some(text)` for a set,
+/// `None` for a reset (RIS or a title-stack pop). One slot, not a queue —
+/// only the final title of a chunk can be displayed, so earlier ones carry
+/// no information. Chunk-granular observation is the documented contract.
+type PendingTitle = Option<Option<String>>;
+
+/// Routes the backend's `Event::PtyWrite` probe responses into a buffer and
+/// records the advance's last title event. The listener fires inside
+/// `Processor::advance`, while the caller holds the emulator lock, so it only
+/// stores, never blocks; the caller drains, filters, and sanitizes after
+/// `advance` returns. Every other backend event (clipboard, color requests,
+/// bell) is discarded here: the default-deny probe policy starts with what
+/// never gets buffered.
+pub struct ProbeSink {
+    responses: Arc<Mutex<Vec<String>>>,
+    title_event: Arc<Mutex<PendingTitle>>,
+}
 
 impl EventListener for ProbeSink {
     fn send_event(&self, event: Event) {
-        if let Event::PtyWrite(text) = event {
-            let mut buf = self
-                .0
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            buf.push(text);
+        match event {
+            Event::PtyWrite(text) => {
+                let mut buf = self
+                    .responses
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                buf.push(text);
+            }
+            Event::Title(title) => {
+                *self
+                    .title_event
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Some(title));
+            }
+            Event::ResetTitle => {
+                *self
+                    .title_event
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(None);
+            }
+            _ => {}
         }
     }
 }
@@ -106,6 +131,66 @@ fn is_digits(s: &str) -> bool {
     !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit())
 }
 
+/// Sanitized-title cap in UTF-8 bytes. Truncation lands on a char boundary,
+/// so the result can undershoot by up to three bytes.
+const TITLE_MAX_BYTES: usize = 512;
+
+/// The bidi formatting controls stripped from titles: ALM, LRM/RLM, the
+/// LRE/RLE/PDF/LRO/RLO embedding block, and the LRI/RLI/FSI/PDI isolate
+/// block. A fixed set instead of a general-category `Cf` strip: `Cf` needs a
+/// Unicode table and would also delete ZWJ (U+200D), mangling joined emoji.
+fn is_bidi_control(c: char) -> bool {
+    matches!(
+        c,
+        '\u{061C}' | '\u{200E}' | '\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}'
+    )
+}
+
+/// Sanitize child-controlled title text: strip C0/C1 controls and bidi
+/// formatting controls, collapse each whitespace run to one space, trim the
+/// ends, cap at [`TITLE_MAX_BYTES`] on a char boundary. Empty output means
+/// the caller must unset its capture — a blank label is never displayed.
+fn sanitize_title(raw: &str) -> String {
+    let mut out = String::new();
+    for c in raw.chars() {
+        // `is_control` is category Cc: C0, DEL, and C1.
+        if c.is_control() || is_bidi_control(c) {
+            continue;
+        }
+        if c.is_whitespace() {
+            // Collapsing also trims the start: a leading run sees empty
+            // output and pushes nothing.
+            if !out.is_empty() && !out.ends_with(' ') {
+                out.push(' ');
+            }
+            continue;
+        }
+        out.push(c);
+    }
+    if out.len() > TITLE_MAX_BYTES {
+        let mut cut = TITLE_MAX_BYTES;
+        while !out.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        out.truncate(cut);
+    }
+    // Runs are already collapsed, so at most one trailing space survives
+    // (possibly exposed by the truncation).
+    if out.ends_with(' ') {
+        out.pop();
+    }
+    out
+}
+
+/// A sanitized title plus the alt-screen epoch it was captured in. The title
+/// is honored only while its epoch is current: each alt-screen entry starts a
+/// new epoch, so a title from the shell (or a previous full-screen app) never
+/// labels the app that replaced it.
+struct CapturedTitle {
+    text: String,
+    alt_epoch: u64,
+}
+
 /// Maximum number of zero-width characters retained per cell. This bounds
 /// the otherwise unbounded vector created by repeated zero-width input.
 const MAX_ZEROWIDTH: usize = 16;
@@ -120,6 +205,19 @@ pub struct Emulator {
     term: Term<ProbeSink>,
     parser: Processor,
     responses: Arc<Mutex<Vec<String>>>,
+    /// Written by the listener during an advance, consumed by
+    /// `observe_advance` afterwards.
+    title_event: Arc<Mutex<PendingTitle>>,
+    captured_title: Option<CapturedTitle>,
+    /// Count of alt-screen entries. Compared against
+    /// `CapturedTitle::alt_epoch` to expire titles at app boundaries.
+    alt_epoch: u64,
+    /// Alt bit as of the last bookkeeping step: entry detection needs the
+    /// previous value, and the mode register only holds the current one.
+    last_alt_screen: bool,
+    /// Bumped once per grid advance; cheap change detection for consumers
+    /// that poll the grid.
+    revision: u64,
     /// Bytes ingested since the last zero-width scan.
     bytes_since_sweep: usize,
 }
@@ -179,6 +277,7 @@ impl Emulator {
     /// A fresh `rows`×`cols` grid retaining `scrollback` rows of history.
     pub fn new(rows: u16, cols: u16, scrollback: usize) -> Self {
         let responses = Arc::new(Mutex::new(Vec::new()));
+        let title_event = Arc::new(Mutex::new(None));
         let config = Config {
             // Use fleetcom's per-task history limit instead of the backend
             // default.
@@ -191,13 +290,53 @@ impl Emulator {
                 lines: rows as usize,
                 columns: cols as usize,
             },
-            ProbeSink(Arc::clone(&responses)),
+            ProbeSink {
+                responses: Arc::clone(&responses),
+                title_event: Arc::clone(&title_event),
+            },
         );
         Self {
             term,
             parser: Processor::new(),
             responses,
+            title_event,
+            captured_title: None,
+            alt_epoch: 0,
+            last_alt_screen: false,
+            revision: 0,
             bytes_since_sweep: 0,
+        }
+    }
+
+    /// The shared bookkeeping step behind every grid advance — `process` and
+    /// both sync-frame landings — so all three paths observe identical state
+    /// transitions. Ordering is load-bearing: the epoch compare precedes
+    /// title stamping, so a title anywhere in a chunk that also enters the
+    /// alt screen lands in the new epoch (children emit the title bytes just
+    /// before DECSET 1049).
+    fn observe_advance(&mut self) {
+        self.revision += 1;
+        let alt = self.alternate_screen();
+        if alt && !self.last_alt_screen {
+            self.alt_epoch += 1;
+        }
+        self.last_alt_screen = alt;
+        let pending = self
+            .title_event
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(event) = pending {
+            // A reset and a title that sanitizes to nothing both unset the
+            // capture: `printf '\x1b]0;\x07'` clears a title, it does not
+            // freeze a stale one.
+            self.captured_title = event
+                .map(|raw| sanitize_title(&raw))
+                .filter(|text| !text.is_empty())
+                .map(|text| CapturedTitle {
+                    text,
+                    alt_epoch: self.alt_epoch,
+                });
         }
     }
 
@@ -206,6 +345,7 @@ impl Emulator {
     /// caller owns delivering them to the child.
     pub fn process(&mut self, bytes: &[u8]) -> Vec<String> {
         self.parser.advance(&mut self.term, bytes);
+        self.observe_advance();
         self.bytes_since_sweep = self.bytes_since_sweep.saturating_add(bytes.len());
         if self.bytes_since_sweep >= SWEEP_INTERVAL_BYTES {
             self.bytes_since_sweep = 0;
@@ -231,6 +371,7 @@ impl Emulator {
             return Vec::new();
         }
         self.parser.stop_sync(&mut self.term);
+        self.observe_advance();
         self.drain_allowed()
     }
 
@@ -245,6 +386,7 @@ impl Emulator {
             return Vec::new();
         }
         self.parser.stop_sync(&mut self.term);
+        self.observe_advance();
         self.drain_allowed()
     }
 
@@ -383,6 +525,68 @@ impl Emulator {
             self.term.grid().screen_lines() as u16,
             self.term.grid().columns() as u16,
         )
+    }
+}
+
+/// Capture accessors for the dashboard-preview resolution layer, which lands
+/// in a later phase; the allow comes off with its first caller.
+#[allow(dead_code)]
+impl Emulator {
+    /// Monotonic count of grid advances. Bumps on every `process` call and
+    /// on each sync-frame landing; equal reads mean the grid did not advance
+    /// in between, so a poller can skip re-reading it.
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    /// Count of alt-screen entries observed so far.
+    pub fn alt_epoch(&self) -> u64 {
+        self.alt_epoch
+    }
+
+    /// The captured window title, honored only while its alt-screen epoch is
+    /// current: a title set before the child entered the alt screen, or
+    /// during a previous alt session, reads as `None`.
+    pub fn title(&self) -> Option<&str> {
+        self.captured_title
+            .as_ref()
+            .filter(|t| t.alt_epoch == self.alt_epoch)
+            .map(|t| t.text.as_str())
+    }
+
+    /// The last non-blank row of the live screen, trailing padding trimmed;
+    /// empty when the screen is blank. Ignores the scrollback view offset —
+    /// `contents` follows `display_offset`, which would make a scrolled-back
+    /// task preview historical rows instead of live output.
+    pub fn live_floor(&self) -> String {
+        let grid = self.term.grid();
+        // Rows 0..screen_lines address the live viewport regardless of the
+        // display offset; only display iteration follows the offset.
+        for row in (0..grid.screen_lines() as i32).rev() {
+            let line = &grid[Line(row)];
+            let mut text = String::new();
+            for col in 0..grid.columns() {
+                let cell = &line[Column(col)];
+                // Spacers have no glyph; terminal tabs occupy visible spaces.
+                if cell
+                    .flags
+                    .intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER)
+                {
+                    continue;
+                }
+                text.push(if cell.c == '\t' { ' ' } else { cell.c });
+                if let Some(zerowidth) = cell.zerowidth() {
+                    text.extend(zerowidth.iter());
+                }
+            }
+            while text.ends_with(' ') {
+                text.pop();
+            }
+            if !text.is_empty() {
+                return text;
+            }
+        }
+        String::new()
     }
 }
 
@@ -870,5 +1074,195 @@ mod tests {
         let (line_after, len_after) = find_h(&emu);
         assert_eq!(line_after, line, "row must not have moved");
         assert_eq!(len_after, MAX_ZEROWIDTH);
+    }
+
+    /// C0, DEL, and C1 controls are stripped from titles.
+    #[test]
+    fn sanitize_strips_c0_and_c1_controls() {
+        assert_eq!(sanitize_title("a\x07b\x1bc\u{7f}d\u{9b}e"), "abcde");
+        assert_eq!(sanitize_title("\x01\x02\x03"), "");
+    }
+
+    /// Each bidi formatting control is stripped individually — the fixed set
+    /// the sanitizer names, not a general `Cf` sweep.
+    #[test]
+    fn sanitize_strips_each_bidi_control() {
+        let bidi = [
+            '\u{061C}', '\u{200E}', '\u{200F}', '\u{202A}', '\u{202B}', '\u{202C}', '\u{202D}',
+            '\u{202E}', '\u{2066}', '\u{2067}', '\u{2068}', '\u{2069}',
+        ];
+        for c in bidi {
+            assert_eq!(sanitize_title(&format!("a{c}b")), "ab", "U+{:04X}", c as u32);
+        }
+    }
+
+    /// ZWJ (U+200D) must survive: it is format-category like the bidi
+    /// controls, but stripping it would break joined emoji.
+    #[test]
+    fn sanitize_preserves_zwj_sequences() {
+        let technologist = "\u{1F469}\u{200D}\u{1F4BB}";
+        assert_eq!(sanitize_title(technologist), technologist);
+    }
+
+    /// Whitespace runs collapse to one space and the ends are trimmed.
+    #[test]
+    fn sanitize_collapses_and_trims_whitespace() {
+        assert_eq!(sanitize_title("  a \t\r\n b  "), "a b");
+        assert_eq!(sanitize_title(" \t "), "");
+    }
+
+    /// The byte cap cannot split a UTF-8 sequence: 512 is not a multiple of
+    /// three, so a stream of three-byte chars must cut at the previous
+    /// boundary.
+    #[test]
+    fn sanitize_caps_on_a_char_boundary() {
+        let long = "\u{20AC}".repeat(200); // 600 bytes of '€'
+        let out = sanitize_title(&long);
+        assert!(out.len() <= TITLE_MAX_BYTES);
+        assert_eq!(out.len(), 510);
+        assert_eq!(out.chars().count(), 170);
+    }
+
+    /// Within one chunk only the last title event matters; an empty OSC title
+    /// and a ResetTitle (title-stack pop, CSI 23 t) both unset the capture
+    /// rather than freezing the previous one.
+    #[test]
+    fn empty_title_and_reset_unset_the_capture() {
+        let mut emu = Emulator::new(4, 20, 0);
+        emu.process(b"\x1b]0;first\x07\x1b]0;second\x07");
+        assert_eq!(emu.title(), Some("second"), "last event of a chunk wins");
+        emu.process(b"\x1b]0;\x07");
+        assert_eq!(emu.title(), None, "an empty title clears, never blanks");
+
+        // CSI 22 t pushes the pre-title state (no title); popping it back
+        // with CSI 23 t makes the backend emit ResetTitle.
+        let mut emu = Emulator::new(4, 20, 0);
+        emu.process(b"\x1b[22t");
+        emu.process(b"\x1b]0;named\x07");
+        assert_eq!(emu.title(), Some("named"));
+        emu.process(b"\x1b[23t");
+        assert_eq!(emu.title(), None, "ResetTitle must unset the capture");
+    }
+
+    /// A title in the same chunk that enters the alt screen stamps into the
+    /// new epoch: the epoch compare runs before title consumption, because
+    /// children emit the title bytes just before DECSET 1049.
+    #[test]
+    fn title_entering_alt_in_one_chunk_is_honored() {
+        let mut emu = Emulator::new(4, 20, 0);
+        emu.process(b"\x1b]0;app\x07\x1b[?1049h");
+        assert_eq!(emu.alt_epoch(), 1);
+        assert_eq!(emu.title(), Some("app"));
+    }
+
+    /// A title captured in an earlier chunk predates the alt entry and is
+    /// not honored once the child enters the alt screen.
+    #[test]
+    fn title_before_alt_entry_in_a_prior_chunk_expires() {
+        let mut emu = Emulator::new(4, 20, 0);
+        emu.process(b"\x1b]0;shell\x07");
+        assert_eq!(emu.title(), Some("shell"));
+        emu.process(b"\x1b[?1049h");
+        assert_eq!(emu.title(), None, "an epoch-0 title cannot label the app");
+    }
+
+    /// Each alt entry advances the epoch and expires prior titles; leaving
+    /// does not advance it, so a title stays honored across the exit.
+    #[test]
+    fn each_alt_entry_advances_the_epoch() {
+        let mut emu = Emulator::new(4, 20, 0);
+        emu.process(b"\x1b]0;one\x07\x1b[?1049h");
+        assert_eq!(emu.alt_epoch(), 1);
+        emu.process(b"\x1b[?1049l");
+        assert_eq!(emu.alt_epoch(), 1, "leaving must not advance the epoch");
+        assert_eq!(emu.title(), Some("one"), "epoch still current after exit");
+        emu.process(b"\x1b[?1049h");
+        assert_eq!(emu.alt_epoch(), 2);
+        assert_eq!(emu.title(), None, "re-entry expires the previous title");
+    }
+
+    /// A title followed by leaving the alt screen in the same chunk reads as
+    /// primary: the exit keeps the epoch, so the title stamps as current.
+    #[test]
+    fn title_leaving_alt_in_one_chunk_reads_as_primary() {
+        let mut emu = Emulator::new(4, 20, 0);
+        emu.process(b"\x1b[?1049h");
+        assert_eq!(emu.alt_epoch(), 1);
+        emu.process(b"\x1b]0;done\x07\x1b[?1049l");
+        assert!(!emu.alternate_screen());
+        assert_eq!(emu.title(), Some("done"));
+    }
+
+    /// The end-of-life landing runs the same bookkeeping as `process`: a
+    /// title and alt entry buffered inside a never-closed ?2026 frame must
+    /// count when `finish_output` lands it.
+    #[test]
+    fn finish_output_runs_the_advance_bookkeeping() {
+        let mut emu = Emulator::new(4, 20, 0);
+        emu.process(b"\x1b[?2026h\x1b]0;app\x07\x1b[?1049hui");
+        let rev = emu.revision();
+        assert_eq!(emu.alt_epoch(), 0, "premise: the open frame buffers 1049h");
+        assert_eq!(emu.title(), None, "premise: the open frame buffers OSC 0");
+        emu.finish_output();
+        assert_eq!(emu.revision(), rev + 1, "the landing is a grid advance");
+        assert_eq!(emu.alt_epoch(), 1);
+        assert_eq!(emu.title(), Some("app"));
+    }
+
+    /// The expired-timeout landing, same premise: sleeping past vte's 150 ms
+    /// deadline is a minimum-duration wait, so expiry is guaranteed, not
+    /// raced.
+    #[test]
+    fn flush_expired_sync_runs_the_advance_bookkeeping() {
+        let mut emu = Emulator::new(4, 20, 0);
+        emu.process(b"\x1b[?2026h\x1b]0;app\x07\x1b[?1049hui");
+        let rev = emu.revision();
+        std::thread::sleep(Duration::from_millis(200));
+        emu.flush_expired_sync();
+        assert_eq!(emu.revision(), rev + 1, "the landing is a grid advance");
+        assert_eq!(emu.alt_epoch(), 1);
+        assert_eq!(emu.title(), Some("app"));
+    }
+
+    /// The revision counts every `process` call; a landing hook that finds
+    /// no open frame did not advance the grid and must not bump it.
+    #[test]
+    fn revision_is_monotonic_and_noop_landings_do_not_bump() {
+        let mut emu = Emulator::new(4, 20, 0);
+        assert_eq!(emu.revision(), 0);
+        emu.process(b"a");
+        assert_eq!(emu.revision(), 1);
+        emu.process(b"b");
+        assert_eq!(emu.revision(), 2);
+        emu.flush_expired_sync();
+        assert_eq!(emu.revision(), 2, "no open frame: nothing advanced");
+        emu.finish_output();
+        assert_eq!(emu.revision(), 2, "no open frame: nothing advanced");
+    }
+
+    /// `live_floor` reads the live grid's last non-blank row even while the
+    /// viewport is scrolled back; `contents` follows the offset instead.
+    #[test]
+    fn live_floor_ignores_the_scrollback_offset() {
+        let mut emu = Emulator::new(4, 10, 100);
+        for i in 0..12 {
+            emu.process(format!("l{i}\r\n").as_bytes());
+        }
+        emu.process(b"latest");
+        assert_eq!(emu.live_floor(), "latest");
+        emu.set_scrollback(usize::MAX);
+        assert!(
+            emu.contents().starts_with("l0"),
+            "premise: the view shows history"
+        );
+        assert!(!emu.contents().contains("latest"));
+        assert_eq!(emu.live_floor(), "latest", "the floor must not follow the view");
+    }
+
+    /// A blank screen has no floor.
+    #[test]
+    fn live_floor_of_a_blank_screen_is_empty() {
+        let emu = Emulator::new(4, 10, 0);
+        assert_eq!(emu.live_floor(), "");
     }
 }
