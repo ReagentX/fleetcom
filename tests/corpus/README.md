@@ -41,7 +41,9 @@ The Codex hint-row and approval fixtures use approximate indentation, so their
 tests match trimmed heads and column-0 structure. The Claude waiting fixture
 omits the welcome box and includes agent-roster rows below the input box. The
 Claude task-list fixtures use generic phase names in a task-list layout; both
-omit the welcome box.
+omit the welcome box. The Claude workflow-wait fixture keeps the sighted
+layout (2026-07-20, claude 2.1.215) with its prose paraphrased to generic
+wording.
 
 | Fixture | Scenario | Coverage |
 | --- | --- | --- |
@@ -62,7 +64,8 @@ omit the welcome box.
 | `preview_codex_hint_row.bin` | codex working with `tab to queue message` below the composer, no token bar | `codex:working` through the composer pin; no model prefix without the bar |
 | `preview_codex_approval.bin` | codex approval modal: composer and token bar replaced by a numbered menu | `codex:approval-menu` synthesizes `awaiting approval` |
 | `preview_codex_body_menu.bin` | modal-shaped menu quoted in the body, live composer below | negative: the composer's presence suppresses the modal match; floor tier reports |
-| `preview_claude_waiting.bin` | claude waiting on a backgrounded subagent, `⏺` prose and agent roster around the box | `claude:waiting-agents` extracts the ellipsis-less row verbatim; no model label mid-session |
+| `preview_claude_waiting.bin` | claude waiting on a backgrounded subagent, `⏺` prose and agent roster around the box | `claude:waiting` extracts the ellipsis-less row verbatim; no model label mid-session |
+| `preview_claude_workflow_wait.bin` | claude waiting on a dynamic workflow, 19 blank rows above the box, workflow roster below | `claude:waiting` family match across a blank run; the roster row stays out of scan |
 | `preview_grok_working.bin` | grok braille spinner with elapsed/throughput ticker | `grok:spinner` cut at the label's `…`; border label read |
 | `preview_grok_worked.bin` | grok `Worked for 8.7s` completion row above the box | `grok:worked` kept verbatim |
 | `preview_grok_idle.bin` | grok idle session | fall-through to the marker |
