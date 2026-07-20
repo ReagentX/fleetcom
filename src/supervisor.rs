@@ -22,16 +22,14 @@ use crate::{
     task::Task,
 };
 
-/// No output for this long ⇒ `Lifecycle::Idle`. Owned here because the core, not
-/// the client, computes lifecycle. It holds the clock and the live parser.
-const IDLE_AFTER: Duration = Duration::from_millis(600);
-
-/// No output for this long ⇒ parked: idle for status-sort *placement*. A
-/// second window over the same `last_activity` signal as `IDLE_AFTER`: 600 ms
-/// flips the per-row glyph, 10 s moves the row. A cadence shorter than the
-/// window (`top` bursts every 1–2 s) resets the signal before it can
-/// expire and never produces a placement edge: the window is the debounce.
-const SORT_IDLE_AFTER: Duration = Duration::from_secs(10);
+/// No output for this long ⇒ idle: one window over `last_activity` drives
+/// `Lifecycle::Idle`, `parked`, and every UI reading of "idle" (glyph, header
+/// tallies, sort placement), so they agree at a single edge. Owned here
+/// because the core, not the client, computes lifecycle: it holds the clock
+/// and the live parser. The width is the debounce: a cadence shorter than the
+/// window (`top` bursts every 1–2 s) resets the signal before it can expire
+/// and never produces an idle edge.
+const IDLE_AFTER: Duration = Duration::from_secs(10);
 
 /// Send-on-change fingerprint for the watched screen and scrollback offset.
 type LastScreen = (u64, Vec<u8>, (u16, u16), bool, (bool, bool, bool), usize);
@@ -432,7 +430,7 @@ impl Supervisor {
                     group: t.group.clone(),
                     name: t.name.clone(),
                     lifecycle: t.lifecycle(now, IDLE_AFTER),
-                    parked: t.parked(now, SORT_IDLE_AFTER),
+                    parked: t.parked(now, IDLE_AFTER),
                     preview: preview.text,
                     source: preview.source,
                     frozen: preview.frozen,

@@ -237,9 +237,8 @@ fn step_down(sel: usize, len: usize) -> usize {
 /// Tagged wins over everything; completed is classified by `lifecycle`, never
 /// by trusting `parked == false`, so a core that ever shipped both signals
 /// still lands finished tasks in Completed. Placement follows `parked`, the
-/// core's 10 s debounced quiet signal, not the instantaneous `Lifecycle::Idle`:
-/// `top`-cadence output flaps the 600 ms glyph edge, and the glyph may flicker
-/// but the row must not change sections.
+/// core's debounced quiet signal: it shares the 10 s window with
+/// `Lifecycle::Idle`, so the idle glyph and the row's section flip together.
 fn bucket(v: &TaskView) -> u8 {
     if v.tagged {
         0
@@ -1738,11 +1737,11 @@ mod tests {
         );
     }
 
-    /// A glyph-idle but not-parked task stays in "Running": `lifecycle` flaps
-    /// at the 600 ms edge for tools like `top` whose output arrives in 1-2 s
-    /// bursts, so placement keys off the debounced `parked`, never the glyph.
+    /// One window drives both signals, so a live core ships `Lifecycle::Idle`
+    /// and `parked` together: an idle-glyph task lands in the "Idle" section
+    /// under state grouping — glyph and placement agree.
     #[test]
-    fn glyph_idle_without_parked_stays_in_running() {
+    fn idle_glyph_task_lands_in_idle_section() {
         let mut app = App::new_local(30, 100);
         let inv = app.invocation_dir.clone();
         app.spawn_in("sleep 5", inv); // id 1
@@ -1750,9 +1749,9 @@ mod tests {
 
         let i = app.views.iter().position(|v| v.id == 1).unwrap();
         app.views[i].lifecycle = Lifecycle::Idle;
-        app.views[i].parked = false;
+        app.views[i].parked = true;
 
-        assert_eq!(app.section_ids(), vec![("Running".to_string(), vec![1])]);
+        assert_eq!(app.section_ids(), vec![("Idle".to_string(), vec![1])]);
     }
 
     /// Selection is bound to a task id, so a `parked` flip (re-bucketing the

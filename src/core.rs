@@ -66,9 +66,9 @@ pub enum LoopExit {
 const FRAME_MIN: Duration = Duration::from_millis(8);
 
 /// Idle backstop: with nothing queued, tick this often anyway so time-based
-/// dashboard state advances (`started_ago`, and the 600 ms Active→Idle edge) even
-/// though no wake marks the passage of time. Also the ceiling on how long a
-/// missed wake could stall a repaint.
+/// dashboard state advances (`started_ago`, and the Active→Idle edge at the
+/// idle window) even though no wake marks the passage of time. Also the
+/// ceiling on how long a missed wake could stall a repaint.
 const FALLBACK: Duration = Duration::from_millis(200);
 
 /// How long to block before the next tick is due: honor the frame floor while

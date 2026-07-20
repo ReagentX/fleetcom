@@ -294,11 +294,12 @@ fn attached_title(v: &TaskView) -> String {
 
 /// The time column's age: the task's last meaningful edge, not always launch.
 /// Finished rows count from exit, parked rows from their last output, running
-/// rows from launch. Quiet age keys off `parked` (the 10 s placement window),
-/// not `Lifecycle::Idle` (the 600 ms glyph edge): a `top`-cadence task flaps
-/// the glyph on every refresh and would flap the column with it. A `None` edge
-/// means the frame came from a daemon that predates the field; it falls back
-/// to launch age, exactly the old column.
+/// rows from launch. Quiet age keys off `parked`, the core's debounced quiet
+/// signal — the same 10 s window that flips `Lifecycle::Idle`, so glyph,
+/// placement, and column all move at one edge (a `top`-cadence task resets
+/// the signal every burst and never reaches it). A `None` edge means the
+/// frame came from a daemon that predates the field; it falls back to launch
+/// age, exactly the old column.
 fn row_age(v: &TaskView) -> Duration {
     let edge = match (v.lifecycle, v.parked) {
         (Lifecycle::Ok | Lifecycle::Failed, _) => v.finished_ago,
@@ -756,9 +757,9 @@ mod tests {
     }
 
     /// The time column follows the debounced state: exit age once finished,
-    /// quiet age while parked, launch age otherwise, even when the glyph's
-    /// instantaneous `Idle` disagrees. A `None` edge (old-daemon frame) falls
-    /// back to launch age.
+    /// quiet age while parked, launch age otherwise. Glyph and placement
+    /// share one window, so `Idle` and `parked` arrive together in live
+    /// frames. A `None` edge (old-daemon frame) falls back to launch age.
     #[test]
     fn task_row_time_column_follows_the_debounced_state() {
         let quiet = Some(Duration::from_secs(4 * 60)); // renders "4m"
@@ -768,7 +769,6 @@ mod tests {
             (Lifecycle::Failed, false, None, exited, "3s"),
             (Lifecycle::Idle, true, quiet, None, "4m"),
             (Lifecycle::Idle, true, None, None, "2h"), // old daemon: no quiet edge
-            (Lifecycle::Idle, false, quiet, None, "2h"), // glyph idles; placement has not
             (Lifecycle::Active, false, None, None, "2h"),
             (Lifecycle::Ok, false, None, None, "2h"), // old daemon: no exit edge
         ];

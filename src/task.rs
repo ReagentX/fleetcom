@@ -722,8 +722,9 @@ impl Task {
     }
 
     /// Idle for *placement*: live and quiet past `window`. The same signal
-    /// `lifecycle` reads, under the caller's (much longer) window; a finished
-    /// task is never parked because its exit state already places it.
+    /// `lifecycle` reads, and the supervisor passes both the same window, so
+    /// glyph and placement flip at one edge; a finished task is never parked
+    /// because its exit state already places it.
     pub fn parked(&self, now: Instant, window: Duration) -> bool {
         self.finished.is_none() && self.quiet_for(now) > window
     }
@@ -1070,31 +1071,51 @@ mod tests {
         wait_finished(&mut t);
         assert_eq!(t.exit_code, Some(3));
         assert_eq!(
-            t.lifecycle(Instant::now(), Duration::from_millis(600)),
+            t.lifecycle(Instant::now(), Duration::from_secs(10)),
             Lifecycle::Failed
         );
         t.terminate();
     }
 
-    /// Parked reads the same quiet signal as `lifecycle` under its own
-    /// window: 1 s of quiet is past a 600 ms glyph edge but inside a 10 s
-    /// placement window; 11 s crosses both.
+    /// `lifecycle` and `parked` read the same quiet signal under the same
+    /// window, so they flip together at one edge: 9 s of quiet is inside a
+    /// 10 s window (active, unparked), 11 s is past it (idle, parked).
     #[test]
-    fn parked_uses_its_own_window_over_the_idle_signal() {
+    fn lifecycle_and_parked_agree_across_the_window_edge() {
         let mut t = spawn(5, "sleep 5");
         // `sleep` writes nothing, so `last_activity` keeps its spawn value
         // and the injected `now`s measure against a fixed instant.
         let quiet_since = *t.last_activity.lock().unwrap();
-        let now = quiet_since + Duration::from_secs(1);
-        assert_eq!(
-            t.lifecycle(now, Duration::from_millis(600)),
-            Lifecycle::Idle
-        );
-        assert!(!t.parked(now, Duration::from_secs(10)));
-        assert!(t.parked(
-            quiet_since + Duration::from_secs(11),
-            Duration::from_secs(10)
-        ));
+        let window = Duration::from_secs(10);
+
+        let inside = quiet_since + Duration::from_secs(9);
+        assert_eq!(t.lifecycle(inside, window), Lifecycle::Active);
+        assert!(!t.parked(inside, window));
+
+        let past = quiet_since + Duration::from_secs(11);
+        assert_eq!(t.lifecycle(past, window), Lifecycle::Idle);
+        assert!(t.parked(past, window));
+        t.terminate();
+    }
+
+    /// The window is the debounce: quiet gaps shorter than the window never
+    /// show `Idle`, no matter how many accumulate. Each simulated output
+    /// burst resets `last_activity`, so a sub-window cadence (`top` every
+    /// 1–2 s, here 9 s to hug the edge) cannot produce an idle edge even
+    /// though the gaps sum to several windows.
+    #[test]
+    fn sub_window_quiet_gaps_never_read_as_idle() {
+        let mut t = spawn(7, "sleep 5");
+        let window = Duration::from_secs(10);
+        let start = *t.last_activity.lock().unwrap();
+        for gaps in 1..=4u32 {
+            let probe = start + Duration::from_secs(9) * gaps;
+            assert_eq!(t.lifecycle(probe, window), Lifecycle::Active);
+            assert!(!t.parked(probe, window));
+            // The burst that ends this gap: the reader thread would stamp
+            // `last_activity` on output; the test stamps it directly.
+            *t.last_activity.lock().unwrap() = probe;
+        }
         t.terminate();
     }
 
