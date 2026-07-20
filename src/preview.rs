@@ -138,8 +138,15 @@ fn cascade(screen: &impl ScreenFacts, adapter: Option<&dyn SummaryAdapter>) -> P
     }
     if screen.alternate_screen() {
         return match screen.title() {
+            // The adapter may rewrite the title for display (claude's
+            // rotating spinner-frame prefix canonicalizes so the text
+            // stays constant); capture itself remains program-agnostic.
+            // Source stays Title and rule stays None: rules are anchor
+            // matcher ids, and a rewritten title is still a title.
             Some(text) => Preview {
-                text: text.to_string(),
+                text: adapter
+                    .and_then(|a| a.normalize_title(text))
+                    .unwrap_or_else(|| text.to_string()),
                 source: PreviewSource::Title,
                 rule: None,
                 frozen: false,

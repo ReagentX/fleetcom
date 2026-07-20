@@ -44,6 +44,14 @@ pub trait SummaryAdapter: Sync {
     fn exit_preview(&self, _retained_text: &str) -> Option<String> {
         None
     }
+
+    /// Display-time rewrite for the Title tier's text. Per-CLI title
+    /// knowledge lives here, in tier 1: the capture layer (the emulator's
+    /// title events) stays program-agnostic and closed to per-program
+    /// mappings. `None` renders the captured title verbatim.
+    fn normalize_title(&self, _title: &str) -> Option<String> {
+        None
+    }
 }
 
 /// Select an adapter by the basename of the command's first
@@ -98,6 +106,25 @@ impl SummaryAdapter for ClaudeSummary {
     fn model_label(&self, screen: &dyn ScreenFacts) -> Option<String> {
         claude_welcome_label(&screen.live_rows())
     }
+
+    /// claude's titles lead with an animated frame. Two observed shapes:
+    /// the launch title `✳ Claude Code` (asterisk-bloom frame, captured
+    /// 2026-07-19) and the in-session `{braille} {session summary}`
+    /// (braille frame, animated per frame — `⠐ Review fleetcom preview
+    /// design document`, sighted 2026-07-20). A frozen interim frame reads
+    /// as stuck, and canonicalizing to `✻` dedupes the animation BEFORE
+    /// the min-hold: the rendered text is constant and never re-renders.
+    /// The braille test is a range check over U+2800..=U+28FF, not a frame
+    /// list — codex's captured title churn already showed the braille
+    /// vocabulary is large. Non-frame-led titles pass through verbatim.
+    /// grok's title is static (`grok`) and codex never reaches the Title
+    /// tier, so neither maps.
+    fn normalize_title(&self, title: &str) -> Option<String> {
+        let mut chars = title.chars();
+        let frame = chars.next()?;
+        let framed = CLAUDE_SPINNER.contains(&frame) || ('\u{2800}'..='\u{28FF}').contains(&frame);
+        (framed && chars.next()? == ' ').then(|| format!("✻ {}", chars.as_str()))
+    }
 }
 
 /// Index of the input box's top separator. The bottom-most full-width rule
@@ -128,18 +155,49 @@ fn claude_spinner_status(rows: &[String], top: usize) -> Option<(String, &'stati
         if row.is_empty() || row.starts_with(' ') {
             continue;
         }
-        let verb = claude_spinner_text(row)?;
-        // The spinner row's parenthetical contributes its slow semantic
-        // tail to whichever text wins the head.
-        let tail = claude_semantic_tail(row);
-        // The spinner confirms the working state; only then is the
-        // concrete-action row worth preferring over the rotating verb.
-        if let Some(action) = claude_action_row(rows, i) {
-            return Some((format!("{action}{tail}"), "claude:action-row"));
+        if let Some(verb) = claude_spinner_text(row) {
+            // The spinner row's parenthetical contributes its slow
+            // semantic tail to whichever text wins the head.
+            let tail = claude_semantic_tail(row);
+            // The spinner confirms the working state; only then is the
+            // concrete-action row worth preferring over the rotating verb.
+            if let Some(action) = claude_action_row(rows, i) {
+                return Some((format!("{action}{tail}"), "claude:action-row"));
+            }
+            return Some((format!("{verb}{tail}"), "claude:spinner"));
         }
-        return Some((format!("{verb}{tail}"), "claude:spinner"));
+        // The waiting row is self-describing: no action-row probe — the
+        // col-0 `⏺` rows above it are body prose, and probing them would
+        // widen the false-positive surface for nothing.
+        if let Some(waiting) = claude_waiting_text(row) {
+            return Some((waiting, "claude:waiting-agents"));
+        }
+        // Foreign column-0 row: abort (see above).
+        return None;
     }
     None
+}
+
+/// The ellipsis-less waiting row: `✻ Waiting for {n} background agent(s)
+/// to finish`, returned verbatim after the glyph. An explicit pattern, not
+/// a loosened spinner rule: the `…` guard on the spinner extraction cannot
+/// relax without re-opening the `·`-as-body-bullet false positive, so
+/// ellipsis-less states are admitted one sighted shape at a time — the
+/// designed maintenance model. No semantic-tail extraction: the sighted
+/// row carries no parenthetical (extend only on a future sighting). Live
+/// sighting 2026-07-20, claude 2.1.215.
+fn claude_waiting_text(row: &str) -> Option<String> {
+    let mut chars = row.chars();
+    if !CLAUDE_SPINNER.contains(&chars.next()?) || chars.next()? != ' ' {
+        return None;
+    }
+    let text = chars.as_str();
+    let n = text.strip_prefix("Waiting for ")?;
+    let digits = n.chars().take_while(char::is_ascii_digit).count();
+    let tail = &n[digits..];
+    (digits >= 1
+        && (tail == " background agent to finish" || tail == " background agents to finish"))
+        .then(|| text.to_string())
 }
 
 /// Extract the text through the first `…` after a claude spinner frame.
@@ -757,6 +815,118 @@ mod tests {
         );
     }
 
+    /// The ellipsis-less waiting row (live sighting 2026-07-20, claude
+    /// 2.1.215): exact shape extracts verbatim on any spinner frame,
+    /// singular or plural; near-miss shapes stay foreign and abort.
+    #[test]
+    fn claude_waiting_row_matches_exactly_and_never_probes() {
+        let sep = "─".repeat(120);
+        let spin = |row: &str| {
+            let rows = [row, &sep, "❯", &sep];
+            ClaudeSummary.live_preview(&rs(&rows))
+        };
+        for row in [
+            "✻ Waiting for 1 background agent to finish",
+            "· Waiting for 1 background agent to finish",
+        ] {
+            assert_eq!(
+                spin(row),
+                Some((
+                    "Waiting for 1 background agent to finish".to_string(),
+                    "claude:waiting-agents"
+                )),
+                "{row:?}"
+            );
+        }
+        assert_eq!(
+            spin("✻ Waiting for 3 background agents to finish"),
+            Some((
+                "Waiting for 3 background agents to finish".to_string(),
+                "claude:waiting-agents"
+            ))
+        );
+
+        // Wrong shapes abort to fall-through, glyph or not: the pattern
+        // carries the specificity, not the frame.
+        assert_eq!(spin("✻ Waiting patiently"), None);
+        assert_eq!(spin("· Waiting for review comments to land"), None);
+
+        // Self-describing: an action row above the waiting row is body
+        // prose to this state and must not win the head.
+        let rows = [
+            "⏺ Running 1 shell command…",
+            "",
+            "✻ Waiting for 1 background agent to finish",
+            &sep,
+            "❯",
+            &sep,
+        ];
+        assert_eq!(
+            ClaudeSummary.live_preview(&rs(&rows)),
+            Some((
+                "Waiting for 1 background agent to finish".to_string(),
+                "claude:waiting-agents"
+            ))
+        );
+    }
+
+    /// Title display: every spinner frame canonicalizes to `✻`, giving
+    /// constant text across frame rotation (the churn fix); non-frame
+    /// titles pass through untouched.
+    #[test]
+    fn claude_title_frames_canonicalize_to_constant_text() {
+        for frame in CLAUDE_SPINNER {
+            assert_eq!(
+                ClaudeSummary.normalize_title(&format!("{frame} Claude Code")),
+                Some("✻ Claude Code".to_string()),
+                "{frame:?}"
+            );
+        }
+        let a = ClaudeSummary.normalize_title("✢ Claude Code");
+        let b = ClaudeSummary.normalize_title("✽ Claude Code");
+        assert_eq!(a, b, "two frames must normalize identically");
+
+        // The in-session shape: a braille frame plus the session summary,
+        // animated per frame (sighted 2026-07-20).
+        assert_eq!(
+            ClaudeSummary.normalize_title("⠐ Review fleetcom preview design document"),
+            Some("✻ Review fleetcom preview design document".to_string())
+        );
+        assert_eq!(
+            ClaudeSummary.normalize_title("⠴ Review fleetcom preview design document"),
+            Some("✻ Review fleetcom preview design document".to_string()),
+            "mid-block braille frame"
+        );
+
+        assert_eq!(ClaudeSummary.normalize_title("zellij: main"), None);
+        assert_eq!(ClaudeSummary.normalize_title("✻"), None, "frame alone");
+    }
+
+    /// Cascade-level: with the claude adapter installed and no anchor on
+    /// the screen, a frame-led title renders canonicalized under the Title
+    /// tier; without an adapter it renders verbatim.
+    #[test]
+    fn title_tier_renders_the_normalized_title() {
+        let mut emu = Emulator::new(24, 80, 100);
+        emu.process(b"\x1b[?1049h\x1b]0;\xe2\x9c\xa2 Claude Code\x07conversation body");
+        let mut st = PreviewState::new();
+        let p = st
+            .resolve(Instant::now(), false, &emu, Some(&ClaudeSummary))
+            .clone();
+        assert_eq!(
+            (p.text.as_str(), p.source, p.rule),
+            ("✻ Claude Code", PreviewSource::Title, None)
+        );
+
+        let mut st = PreviewState::new();
+        let p = st.resolve(Instant::now(), false, &emu, None).clone();
+        assert_eq!(
+            (p.text.as_str(), p.source),
+            ("✢ Claude Code", PreviewSource::Title),
+            "no adapter: verbatim"
+        );
+    }
+
     /// A column-0 row in the chrome window that is not spinner-shaped aborts:
     /// a wrapped status tail and body text touching the chrome both refuse.
     #[test]
@@ -1070,6 +1240,15 @@ mod tests {
                 &CodexSummary,
                 "gpt-5.6-sol high · Ran sleep 5 && echo ok",
                 "codex:ran",
+            ),
+            Case(
+                "preview_claude_waiting",
+                include_bytes!("../../tests/corpus/preview_claude_waiting.bin"),
+                &ClaudeSummary,
+                // The sighted screen is mid-session: the welcome box has
+                // scrolled off, so no model label prefixes the text.
+                "Waiting for 1 background agent to finish",
+                "claude:waiting-agents",
             ),
             Case(
                 "preview_codex_hint_row",

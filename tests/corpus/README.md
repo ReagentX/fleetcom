@@ -42,7 +42,10 @@ The `preview_codex_hint_row` and `preview_codex_approval` fixtures are
 paste-derived from a maintainer live sighting (2026-07-20, codex-cli 0.144.6
 — the same version as the snapshot captures; these are uncaptured states,
 not drift): indentation is approximate, so their tests key on trimmed heads
-and column-0 discipline only. `preview_codex_body_menu` is synthetic.
+and column-0 discipline only. `preview_codex_body_menu` is synthetic. `preview_claude_waiting` is
+paste-derived from a maintainer live sighting (2026-07-20, claude 2.1.215):
+the ellipsis-less waiting-for-agents spinner state, mid-session (welcome box
+scrolled off), with agent-roster rows below the input box.
 
 | Fixture | Scenario | Coverage |
 | --- | --- | --- |
@@ -61,6 +64,7 @@ and column-0 discipline only. `preview_codex_body_menu` is synthetic.
 | `preview_codex_hint_row.bin` | codex working with `tab to queue message` below the composer, no token bar | `codex:working` through the composer pin; no model prefix without the bar |
 | `preview_codex_approval.bin` | codex approval modal: composer and token bar replaced by a numbered menu | `codex:approval-menu` synthesizes `awaiting approval` |
 | `preview_codex_body_menu.bin` | modal-shaped menu quoted in the body, live composer below | negative: the composer's presence suppresses the modal match; floor tier reports |
+| `preview_claude_waiting.bin` | claude waiting on a backgrounded subagent, `⏺` prose and agent roster around the box | `claude:waiting-agents` extracts the ellipsis-less row verbatim; no model label mid-session |
 | `preview_grok_working.bin` | grok braille spinner with elapsed/throughput ticker | `grok:spinner` cut at the label's `…`; border label read |
 | `preview_grok_worked.bin` | grok `Worked for 8.7s` completion row above the box | `grok:worked` kept verbatim |
 | `preview_grok_idle.bin` | grok idle session | fall-through to the marker |
