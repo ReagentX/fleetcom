@@ -2,9 +2,8 @@
 //!
 //! The caret is a byte offset that is always a `char` boundary, and every
 //! mutation goes through the ops here: no call site does its own boundary
-//! arithmetic. The vocabulary is deliberately minimal — insert, backspace,
-//! left, right, home, end — because the prompts are one-line command fields,
-//! not a text editor.
+//! arithmetic. Ops are insert, backspace, left, right, home, end: the prompts
+//! are one-line command fields, not a text editor.
 
 use std::ops::Deref;
 

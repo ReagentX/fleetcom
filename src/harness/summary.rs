@@ -89,8 +89,8 @@ const CLAUDE_SPINNER: &[char] = &['·', '✢', '✳', '✶', '✻', '✽'];
 /// Rows scanned above the input box for the status row. The original
 /// three-row window was calibrated on captures that predate the harness's
 /// task-list rendering: a `⎿`-headed attachment row plus one indented row
-/// per task between the spinner and the box — precisely the indented class
-/// the scan already skips, just longer. Sixteen rows covers realistic task
+/// per task between the spinner and the box (the same indented class the
+/// scan already skips, only longer). Sixteen rows covers realistic task
 /// lists with margin; the bound stays finite because the tier discipline
 /// pins scans to chrome, never the whole grid.
 const CLAUDE_STATUS_WINDOW: usize = 16;
@@ -150,8 +150,8 @@ fn claude_box_top(rows: &[String]) -> Option<usize> {
 /// status row too wide for the window. Both fail the structural check
 /// instead of matching status-shaped body text. The wide window's accepted
 /// residual: a spinner-shaped column-0 row up to sixteen rows above the box
-/// over an indented-only gap matches where the three-row window refused —
-/// but body prose is `⏺`-headed at column 0, so a real conversation between
+/// over an indented-only gap matches where the three-row window refused.
+/// Body prose is `⏺`-headed at column 0, so a real conversation between
 /// such a row and the box still aborts.
 fn claude_spinner_status(rows: &[String], top: usize) -> Option<(String, &'static str)> {
     for i in (top.saturating_sub(CLAUDE_STATUS_WINDOW)..top).rev() {
@@ -1399,7 +1399,7 @@ mod tests {
 
         // A spinner-shaped body row above a `⏺` prose row and the task list:
         // the prose row aborts inside the widened window, and the marker
-        // tier reports — the anchor never fires on body text.
+        // tier reports. The anchor never fires on body text.
         let p = resolve_corpus(
             include_bytes!("../../tests/corpus/preview_claude_body_above_tasklist.bin"),
             &ClaudeSummary,

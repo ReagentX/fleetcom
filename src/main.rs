@@ -183,9 +183,9 @@ fn main() -> io::Result<()> {
     // process owns the Supervisor: this process under `--foreground`, or a
     // daemon that `App::connect` autostarts as a child. The in-process
     // supervisor reads the flag through `resolve_scrollback`; `spawn_daemon`
-    // forwards it to the daemon child as `FLEETCOM_SCROLLBACK` — the
-    // inherited environment is the one channel that reaches an autostarted
-    // daemon without a wire-protocol change.
+    // forwards it to the daemon child as `FLEETCOM_SCROLLBACK`. The inherited
+    // environment is the one channel that reaches an autostarted daemon
+    // without a wire-protocol change.
     if let Some(lines) = scrollback {
         supervisor::set_scrollback_flag(lines);
     }

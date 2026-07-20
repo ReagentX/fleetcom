@@ -1843,7 +1843,7 @@ mod tests {
 
     /// One window drives both signals, so a live core ships `Lifecycle::Idle`
     /// and `parked` together: an idle-glyph task lands in the "Idle" section
-    /// under state grouping — glyph and placement agree.
+    /// under state grouping. Glyph and placement agree.
     #[test]
     fn idle_glyph_task_lands_in_idle_section() {
         let mut app = App::new_local(30, 100);
@@ -2219,8 +2219,8 @@ mod tests {
         app
     }
 
-    /// Tab targets the next section's first task — from mid-section it does
-    /// not preserve the within-section offset — and wraps from the last
+    /// Tab targets the next section's first task (from mid-section it does
+    /// not preserve the within-section offset) and wraps from the last
     /// section to the first.
     #[test]
     fn tab_jumps_to_next_section_first_task() {

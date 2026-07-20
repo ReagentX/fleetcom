@@ -226,8 +226,8 @@ fn render_dashboard(out: &mut impl Write, app: &App) -> io::Result<()> {
     Ok(())
 }
 
-/// The editable bottom line for the text-input modes — the rendered line and
-/// the caret's display column — or `None` when the command line should show a
+/// The editable bottom line for the text-input modes (the rendered line and
+/// the caret's display column), or `None` when the command line should show a
 /// hint/status instead.
 fn cmdline(app: &App) -> Option<(String, u16)> {
     let prefix = match app.mode {
@@ -316,7 +316,7 @@ fn attached_title(v: &TaskView) -> String {
 /// The time column's age: the task's last meaningful edge, not always launch.
 /// Finished rows count from exit, parked rows from their last output, running
 /// rows from launch. Quiet age keys off `parked`, the core's debounced quiet
-/// signal — the same 10 s window that flips `Lifecycle::Idle`, so glyph,
+/// signal: the same 10 s window that flips `Lifecycle::Idle`, so glyph,
 /// placement, and column all move at one edge (a `top`-cadence task resets
 /// the signal every burst and never reaches it). A `None` edge means the
 /// frame came from a daemon that predates the field; it falls back to launch

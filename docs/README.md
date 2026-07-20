@@ -160,7 +160,7 @@ Each task's terminal keeps a scrollback history whose depth is resolved once, wh
 | 2 | `FLEETCOM_SCROLLBACK` parses as a whole number | that value, clamped to 100,000 |
 | 3 | otherwise | 2,000 |
 
-`0` disables scrollback. An unparseable `FLEETCOM_SCROLLBACK` falls back to 2,000 rather than failing daemon startup. The daemon resolves the depth at startup from its inherited environment — that of the client that autostarted it — so a changed value reaches only the tasks of a *new* daemon: stop the current one with `fleetcom --kill` first. `--foreground` runs resolve in-process, per invocation
+`0` disables scrollback. An unparseable `FLEETCOM_SCROLLBACK` falls back to 2,000 rather than failing daemon startup. The daemon resolves the depth at startup from its inherited environment (the client that autostarted it), so a changed value reaches only the tasks of a *new* daemon: stop the current one with `fleetcom --kill` first. `--foreground` runs resolve in-process, per invocation
 
 ### Client and daemon protocol versions must match
 
