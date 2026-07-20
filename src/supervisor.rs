@@ -26,9 +26,6 @@ use crate::{
 /// use this same threshold.
 const IDLE_AFTER: Duration = Duration::from_secs(10);
 
-/// Send-on-change fingerprint for the watched screen and scrollback offset.
-type LastScreen = (u64, Vec<u8>, (u16, u16), bool, (bool, bool, bool), usize);
-
 /// Per-dimension PTY size limit. Resizes are clamped to `[1, MAX_DIM]` to keep
 /// grid dimensions valid and memory bounded.
 const MAX_DIM: u16 = 1000;
@@ -182,11 +179,12 @@ pub struct Supervisor {
     scrollback: usize,
     /// The task whose screen the client is watching (attach/peek), or `None`.
     watched: Option<u64>,
-    /// The last `Screen` we emitted (`(id, formatted, cursor, hide)`), so an
-    /// unchanged screen isn't re-serialized and re-sent every tick. Reset to
-    /// `None` whenever `watched` changes, so re-attaching always gets a fresh
-    /// full screen (the client cleared its copy on detach).
-    last_screen: Option<LastScreen>,
+    /// The last `Screen` we emitted, stored with `lines` empty: candidates are
+    /// built the same way, so `ScreenView` equality is the send-on-change
+    /// fingerprint and an unchanged screen isn't re-serialized and re-sent
+    /// every tick. Reset to `None` whenever `watched` changes, so re-attaching
+    /// always gets a fresh full screen (the client cleared its copy on detach).
+    last_screen: Option<ScreenView>,
     /// The current client's launch context, used for spawns and session paths.
     /// Spawning is refused until one is installed.
     launch: Option<LaunchContext>,
@@ -482,30 +480,29 @@ impl Supervisor {
         if let Some(id) = self.watched
             && let Some(t) = self.tasks.iter().find(|t| t.id == id)
         {
-            let (formatted, cursor, hide_cursor) = t.formatted();
-            let hints = t.input_hints();
+            let (formatted, cursor, hide) = t.formatted();
+            let (wants_mouse, alt_screen, alt_scroll) = t.input_hints();
             let sb = t.scroll_offset();
+            let mut view = ScreenView {
+                id,
+                // `lines` stays empty on both the stored and candidate copies
+                // so it never affects equality; it is filled only on the
+                // emitted copy.
+                lines: Vec::new(),
+                formatted,
+                cursor,
+                // Hide the live cursor while displaying scrollback.
+                hide_cursor: hide || sb > 0,
+                wants_mouse,
+                alt_screen,
+                alt_scroll,
+                scrollback: sb,
+            };
             // Send only when rendering or input-policy state changes.
-            let unchanged = matches!(
-                &self.last_screen,
-                Some((lid, lf, lc, lh, lhints, lsb))
-                    if *lid == id && *lf == formatted && *lc == cursor
-                        && *lh == hide_cursor && *lhints == hints && *lsb == sb
-            );
-            if !unchanged {
-                self.last_screen = Some((id, formatted.clone(), cursor, hide_cursor, hints, sb));
-                self.events.push(Event::Screen(ScreenView {
-                    id,
-                    lines: t.screen_lines(),
-                    formatted,
-                    cursor,
-                    // Hide the live cursor while displaying scrollback.
-                    hide_cursor: hide_cursor || sb > 0,
-                    wants_mouse: hints.0,
-                    alt_screen: hints.1,
-                    alt_scroll: hints.2,
-                    scrollback: sb,
-                }));
+            if self.last_screen.as_ref() != Some(&view) {
+                self.last_screen = Some(view.clone());
+                view.lines = t.screen_lines();
+                self.events.push(Event::Screen(view));
             }
         }
     }
