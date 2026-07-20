@@ -962,7 +962,9 @@ mod tests {
         assert_eq!(
             parts(&p),
             (
-                "  gpt-5.6-sol high · 5.26K used · 28.2K in · 78 out".to_string(),
+                // The floor trims the status bar's self-indentation
+                // (layout, not meaning; see the cascade's floor arm).
+                "gpt-5.6-sol high · 5.26K used · 28.2K in · 78 out".to_string(),
                 PreviewSource::Floor,
                 None
             )

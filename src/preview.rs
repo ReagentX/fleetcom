@@ -161,7 +161,18 @@ fn cascade(screen: &impl ScreenFacts, adapter: Option<&dyn SummaryAdapter>) -> P
             },
         };
     }
-    Preview::floor(screen.live_floor())
+    // Leading indentation is layout, not meaning: codex's status bar (an
+    // inline UI's bottom-most row, the floor of an idle codex task) indents
+    // itself, and the spaces waste preview width. Trimmed here, not in
+    // `live_floor` — the emulator's row stays a faithful fact because it
+    // doubles as the teardown-snapshot comparator.
+    let floor = screen.live_floor();
+    let trimmed = floor.trim_start();
+    Preview::floor(if trimmed.len() == floor.len() {
+        floor
+    } else {
+        trimmed.to_string()
+    })
 }
 
 /// Candidate-recompute key: `(revision, alt epoch, alt bit, title, finished)`.
@@ -1107,6 +1118,24 @@ mod tests {
         assert_eq!(
             (p.text.as_str(), p.source, p.frozen),
             ("step 2: done", PreviewSource::Title, true)
+        );
+    }
+
+    /// The floor drops leading indentation: an idle codex task's floor is
+    /// its self-indented status bar, and the spaces waste preview width.
+    /// Layout, not meaning.
+    #[test]
+    fn floor_preview_trims_leading_indentation() {
+        let mut st = PreviewState::new();
+        let t0 = Instant::now();
+        let s = FakeScreen::primary("  gpt-5.6-sol high · fleetcom · 89.9K used");
+        let p = st.resolve(t0, false, &s, None).clone();
+        assert_eq!(
+            (p.text.as_str(), p.source),
+            (
+                "gpt-5.6-sol high · fleetcom · 89.9K used",
+                PreviewSource::Floor
+            )
         );
     }
 }
