@@ -638,18 +638,15 @@ fn render_disconnected(out: &mut impl Write, app: &App) -> io::Result<()> {
         put(out, y, "", cols)?;
     }
 
-    let hint = if app.daemon_backed {
-        "r  reconnect        q  quit"
+    // A `--foreground` core has no daemon: naming one on this screen would
+    // contradict the mode, and there is no external process to reconnect to.
+    let (title, hint) = if app.daemon_backed {
+        ("⚠  daemon connection lost", "r  reconnect        q  quit")
     } else {
-        "core stopped        q  quit"
+        ("⚠  core stopped", "q  quit")
     };
     let mid = rows / 2;
-    put(
-        out,
-        mid.saturating_sub(1),
-        &center("⚠  daemon connection lost", cols),
-        cols,
-    )?;
+    put(out, mid.saturating_sub(1), &center(title, cols), cols)?;
     dim(out, mid + 1, &center(hint, cols), cols)?;
     Ok(())
 }
