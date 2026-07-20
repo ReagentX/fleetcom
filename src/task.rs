@@ -624,7 +624,15 @@ impl Task {
             return;
         }
         self.scraped = true;
-        let text = grid(&self.parser).text_with_history();
+        let text = {
+            let mut emu = grid(&self.parser);
+            // The gate above holds: reader EOF means no ESU can ever close an
+            // open `?2026` frame, so land it before reading, or a hint printed
+            // inside the frame is invisible to the scrape. Probe replies are
+            // dropped because every slave fd is closed — nothing reads them.
+            let _ = emu.finish_output();
+            emu.text_with_history()
+        };
         if let Some(id) = h.scrape_exit(&text) {
             self.scraped_id = Some(id);
         }
@@ -1837,6 +1845,32 @@ mod tests {
         });
         assert_eq!(t.scraped_id.as_deref(), Some(ID));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A child that dies with a `?2026` frame still open leaves its hint
+    /// buffered in the parser, and no ESU can ever arrive to release it: the
+    /// scrape must land the frame instead of reading pre-frame text.
+    #[test]
+    fn scrape_exit_hint_lands_an_open_sync_frame() {
+        const ID: &str = "7f3b9c1e-5a2d-4e8f-9b6a-0c4d2e8f1a3b";
+        let cmd = format!(
+            "printf '\\033[?2026hResume this session with:\\nclaude --resume {ID}\\n'"
+        );
+        let mut t = Task::spawn(21, &cmd, &cmd, &here(), 24, 80, &sh_env(), no_waker()).unwrap();
+        t.harness = Some(&crate::harness::Claude);
+        assert!(
+            wait_until(Duration::from_secs(60), || {
+                t.poll_exit().unwrap();
+                t.finished.is_some() && t.reader_done()
+            }),
+            "child never exited"
+        );
+        assert!(
+            !grid(&t.parser).text_with_history().contains(ID),
+            "premise: the unclosed frame still buffers the hint at scrape time"
+        );
+        t.scrape_exit_hint();
+        assert_eq!(t.scraped_id.as_deref(), Some(ID));
     }
 
     /// A child's cursor-position probe is answered on the wire: the reply

@@ -234,6 +234,20 @@ impl Emulator {
         self.drain_allowed()
     }
 
+    /// Terminate an open `?2026` synchronized update regardless of its
+    /// timeout, landing the buffered frame in the grid; returns any
+    /// allowlisted probe replies the landed bytes generated. Exists for
+    /// reader EOF: every child fd is closed, so the closing ESU can never
+    /// arrive and `flush_expired_sync`'s deadline wait protects nothing —
+    /// the frame is landed, not torn. No-op when no sync is open.
+    pub fn finish_output(&mut self) -> Vec<String> {
+        if self.parser.sync_timeout().sync_timeout().is_none() {
+            return Vec::new();
+        }
+        self.parser.stop_sync(&mut self.term);
+        self.drain_allowed()
+    }
+
     /// The visible screen as ANSI bytes, plus cursor position and whether the
     /// child hid the cursor.
     pub fn formatted(&self) -> (Vec<u8>, (u16, u16), bool) {
@@ -479,6 +493,33 @@ mod tests {
         );
 
         // The emulator parses normally after the forced flush.
+        emu.process(b" and on");
+        assert!(emu.contents().contains("and on"));
+    }
+
+    /// The end-of-life landing `finish_output` exists for: BSU, a hint, no
+    /// ESU ever. The frame must land without waiting out the sync timeout,
+    /// and a clean emulator must pass through untouched.
+    #[test]
+    fn finish_output_lands_an_open_sync_frame() {
+        let mut emu = Emulator::new(4, 20, 0);
+        assert!(
+            emu.finish_output().is_empty(),
+            "no open frame: the parser must not be touched"
+        );
+
+        emu.process(b"before\x1b[?2026hafter");
+        assert!(
+            !emu.text_with_history().contains("after"),
+            "premise: the unclosed frame buffers the text"
+        );
+        emu.finish_output();
+        assert!(
+            emu.text_with_history().contains("after"),
+            "finish_output must land the frame with the timeout still pending"
+        );
+
+        // The emulator parses normally after the landing.
         emu.process(b" and on");
         assert!(emu.contents().contains("and on"));
     }
