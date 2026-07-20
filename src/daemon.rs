@@ -299,7 +299,10 @@ fn connect_or_autostart_in(dir: &Path) -> io::Result<UnixStream> {
     }
     Err(io::Error::new(
         ErrorKind::TimedOut,
-        "daemon did not come up",
+        format!(
+            "daemon did not come up; check {}",
+            dir.join("daemon.log").display()
+        ),
     ))
 }
 

@@ -1,6 +1,6 @@
 # Sessions
 
-A session is a launch recipe, not a process snapshot. It records commands, working directories, and each task's optional group assignment and display name. Loading always starts new processes. Live process continuity belongs to the [daemon](README.md#storage-paths), which keeps jobs running across client disconnects.
+A session is a launch recipe, not a process snapshot. It records commands, working directories, and each task's optional group assignment and display name. Loading always starts new processes. Live process continuity belongs to the [daemon](README.md#storage-paths), which keeps tasks running across client disconnects.
 
 ## Storage
 
@@ -68,4 +68,4 @@ A bare agent command does not identify its conversation, so saving it verbatim w
 - Load in-app: `o`, pick from the list, `Enter`.
 - Load at launch: `fleetcom <name>`.
 
-Loading always spawns new processes from the stored commands. Existing jobs remain daemon state and never enter the session file. [Agent session resume](../src/harness/agent-resume.md) documents when supported agent commands can preserve their conversations across that relaunch.
+Loading always spawns new processes from the stored commands. Existing tasks remain daemon state and never enter the session file. [Agent session resume](../src/harness/agent-resume.md) documents when supported agent commands can preserve their conversations across that relaunch.

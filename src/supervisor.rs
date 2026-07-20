@@ -674,14 +674,14 @@ impl Supervisor {
     /// the best-known ID.
     fn rerun(&mut self, id: u64) {
         let Some(i) = self.index_of(id) else {
-            self.status(format!("rerun: no task {id}"));
+            self.status(format!("rerun failed: no task {id}"));
             return;
         };
         // Latch a recent exit and scrape its drained terminal before choosing
         // the rerun command.
         scrape_now(&mut self.tasks[i]);
         if self.tasks[i].finished.is_none() {
-            self.status("rerun: task is still running");
+            self.status("rerun failed: task is still running");
             return;
         }
         let Some(launch) = self.launch_or_refuse() else {

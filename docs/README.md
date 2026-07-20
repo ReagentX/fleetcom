@@ -5,7 +5,7 @@
 ## Index
 
 - [Commands](commands.md): every key and launch flag, including the routing mechanics
-- [How it works](how-it-works.md): the PTY emulation, input routing, and activity windows
+- [How it works](how-it-works.md): the PTY emulation, input routing, and activity grouping
 - [Sessions](sessions.md): the task recipe format and where it lives
 - [Agent session resume](../src/harness/agent-resume.md): when `fleetcom` can save resumable `claude`, `codex`, and `grok` commands
 - [Storage paths](#storage-paths): the socket, the lock, and the session paths
@@ -62,7 +62,7 @@ Run `fleetcom`. The first invocation starts the daemon and opens an empty dashbo
   fleetcom   0 running · 0 idle · 0 done      by state · dir · custom
 
   ❯ n run · @ dir · s sort · w save · o load
-  ↑↓ select · enter attach · space peek · n/@ new · s sort · m tag · g group · R rename · r rerun · X kill · q detach · Q quit
+  ↑↓ select · enter attach · space peek · m tag · g group · R rename · r rerun · X kill · q detach · Q quit
 ```
 
 Press `n`, enter a command, and press `Enter`. The command runs in its own PTY and appears under Running. Repeat the process for a second command:
@@ -75,7 +75,7 @@ Press `n`, enter a command, and press `Enter`. The command runs in its own PTY a
   ✻  npm run dev              VITE v5.0  ready in 312 ms         4s
 
   ❯ n run · @ dir · s sort · w save · o load
-  ↑↓ select · enter attach · space peek · n/@ new · s sort · m tag · g group · R rename · r rerun · X kill · q detach · Q quit
+  ↑↓ select · enter attach · space peek · m tag · g group · R rename · r rerun · X kill · q detach · Q quit
 ```
 
 Each row is `glyph · tag · command · latest output · age`. The age counts from the task's last meaningful edge: launch while running, last output once idle, exit once completed. `Space` peeks: a read-only box of the selected task's live screen, without leaving the dashboard:
@@ -85,7 +85,7 @@ Each row is `glyph · tag · command · latest output · age`. The age counts fr
   │ running 3 tests                                     │
   │ test result: ok. 42 passed; 0 failed                │
   │                                                     │
-  └ space/esc close · enter attach ─────────────────────┘
+  └ space/esc close · enter attach · preview: floor ────┘
 ```
 
 `Enter` attaches to the task. Keystrokes then go to its PTY, except for the reserved background chord shown in the status bar:
@@ -134,13 +134,13 @@ In custom mode, a new command inherits the selected task's group. The spawn prom
 
 The attached status bar shows both: `[attached] api tests · cargo watch -x test`. Names are daemon state, survive detach and rerun, and persist in saved [sessions](sessions.md).
 
-`w`, a name, and `Enter` save the fleet as a [session](sessions.md). `q` then disconnects while the daemon and both jobs continue running. A subsequent `fleetcom` invocation reconstructs the dashboard from the daemon's current task state. `Q` or `fleetcom --kill` stops the jobs (`TERM`, then `KILL` after a two-second grace period) and exits the daemon.
+`w`, a name, and `Enter` save the fleet as a [session](sessions.md). `q` then disconnects while the daemon and both tasks continue running. A subsequent `fleetcom` invocation reconstructs the dashboard from the daemon's current task state. `Q` or `fleetcom --kill` stops the tasks (`TERM`, then `KILL` after a two-second grace period) and exits the daemon.
 
 ## Operational constraints
 
 ### The fleet dies with the daemon
 
-Because the daemon holds each PTY master, daemon termination closes the terminals and the kernel sends `SIGHUP` to every task's process group. A clean shutdown sends `SIGTERM` before `SIGKILL`; a crash or direct `SIGKILL` provides no grace period. HUP-immune jobs (`nohup`, `trap '' HUP`) can survive, but the next daemon neither owns nor displays them. A panic while serving one client only drops that connection.
+Because the daemon holds each PTY master, daemon termination closes the terminals and the kernel sends `SIGHUP` to every task's process group. A clean shutdown sends `SIGTERM` before `SIGKILL`; a crash or direct `SIGKILL` provides no grace period. HUP-immune processes (`nohup`, `trap '' HUP`) can survive, but the next daemon neither owns nor displays them. A panic while serving one client only drops that connection.
 
 ### Commands run through the client's non-interactive shell
 
@@ -164,20 +164,20 @@ Each task's terminal keeps a scrollback history whose depth is resolved once, wh
 
 ### Client and daemon protocol versions must match
 
-The daemon rejects a mismatch during the handshake. Stop an incompatible daemon with `fleetcom --kill`, which also terminates every running job, then start a new client
+The daemon rejects a mismatch during the handshake. Stop an incompatible daemon with `fleetcom --kill`, which also terminates every running task, then start a new client.
 
 ### The daemon serves one client at a time
 
-A second `fleetcom` prints a waiting notice, then attaches when the active client disconnects (`q`). `Ctrl-C` while waiting aborts without touching the daemon
+A second `fleetcom` prints a waiting notice, then attaches when the active client disconnects (`q`). `Ctrl-C` while waiting aborts without touching the daemon.
 
 ### Shutdown is graceful-first
 
-`X`, `Q`, `--kill`, and daemon shutdown signals send `SIGTERM` to each job's *process group*, then escalate to `SIGKILL` after two seconds. Removing one task (`X`) keeps an exited leader unreaped through escalation, reserving the process-group ID so background children remain signalable. During full shutdown (`Q`/`--kill`), checking whether a group is empty reaps its exited leader. A `TERM`-ignoring member that outlives the leader can then become unsafe to signal by group ID and survive daemon shutdown. A child created by `cmd &` in a non-interactive shell normally remains in its parent's group. A process that calls `setsid` or otherwise leaves the group is outside the sweep and must be terminated separately
+`X`, `Q`, `--kill`, and daemon shutdown signals send `SIGTERM` to each task's *process group*, then escalate to `SIGKILL` after two seconds. Removing one task (`X`) keeps an exited leader unreaped through escalation, reserving the process-group ID so background children remain signalable. During full shutdown (`Q`/`--kill`), checking whether a group is empty reaps its exited leader. A `TERM`-ignoring member that outlives the leader can then become unsafe to signal by group ID and survive daemon shutdown. A child created by `cmd &` in a non-interactive shell normally remains in its parent's group. A process that calls `setsid` or otherwise leaves the group is outside the sweep and must be terminated separately.
 
 ### `--foreground` is ephemeral
 
-It runs the core in-process with no daemon, so the jobs die when you quit and there is nothing to reattach to
+It runs the core in-process with no daemon, so the tasks die when you quit and there is nothing to reattach to.
 
 ### Signalling the daemon is a clean shutdown
 
-`SIGTERM`/`SIGINT`/`SIGHUP` to the daemon group-kill every job, remove the socket, and exit. This is the same teardown as `Q` or `fleetcom --kill`
+`SIGTERM`/`SIGINT`/`SIGHUP` to the daemon group-kill every task, remove the socket, and exit. This is the same teardown as `Q` or `fleetcom --kill`.

@@ -8,9 +8,9 @@
 | -- | -- |
 | `fleetcom` | Connect to the daemon (autostarting it if needed) and open the dashboard |
 | `fleetcom <session>` | Load a saved [session](sessions.md) at startup, then open the dashboard |
-| `fleetcom --foreground` | Run the core in-process, no daemon; jobs die when you quit |
+| `fleetcom --foreground` | Run the core in-process, no daemon; tasks die when you quit |
 | `fleetcom --scrollback <lines>` | Set per-task scrollback depth (default 2,000, max 100,000); see [Scrollback](#scrollback) |
-| `fleetcom --kill` | Stop the daemon and kill every job it owns; works even while another client is attached (it signals the daemon rather than queueing behind the socket) |
+| `fleetcom --kill` | Stop the daemon and kill every task it owns; works even while another client is attached (it signals the daemon rather than queueing behind the socket) |
 | `fleetcom --help` / `-h` | Print usage and exit |
 | `fleetcom --version` / `-V` | Print the version and exit |
 
@@ -33,8 +33,8 @@
 | `X` | Kill a running task (`TERM`, then `KILL` after 2 s), or remove a finished one |
 | `w` | Save the current tasks as a session |
 | `o` | Load a saved session |
-| `q` (or `Ctrl-C`) | Disconnect; leave the daemon and jobs running |
-| `Q` | Quit; kill the jobs and stop the daemon |
+| `q` (or `Ctrl-C`) | Disconnect; leave the daemon and tasks running |
+| `Q` | Quit; kill the tasks and stop the daemon |
 
 ### Status glyphs
 
@@ -81,7 +81,7 @@ Tasks retain 2,000 lines of scrollback by default. `--scrollback <lines>` or the
 
 #### Detach vs. quit
 
-From the dashboard, `q` or `Ctrl-C` disconnects the client and leaves the daemon and its jobs running; the next `fleetcom` reattaches. `Q` stops the daemon after sending `TERM` to each job's process group, then `KILL` after a 2 s grace. Processes that have moved to another group are outside this sweep. A `TERM`-ignoring member can also survive if its leader exits during shutdown, because checking group emptiness releases the process-group ID reservation before escalation (see [Shutdown is graceful-first](README.md#shutdown-is-graceful-first)). Outside attached mode, `Ctrl-C` disconnects the client; while attached, it belongs to the child. In prompts and pickers, `Esc` cancels without disconnecting.
+From the dashboard, `q` or `Ctrl-C` disconnects the client and leaves the daemon and its tasks running; the next `fleetcom` reattaches. `Q` stops the daemon after sending `TERM` to each task's process group, then `KILL` after a 2 s grace. Processes that have moved to another group are outside this sweep. A `TERM`-ignoring member can also survive if its leader exits during shutdown, because checking group emptiness releases the process-group ID reservation before escalation (see [Shutdown is graceful-first](README.md#shutdown-is-graceful-first)). Outside attached mode, `Ctrl-C` disconnects the client; while attached, it belongs to the child. In prompts and pickers, `Esc` cancels without disconnecting.
 
 #### Grouping and tagging
 
@@ -132,6 +132,8 @@ The daemon normalizes every group name received from the picker or a [session](s
 ## Peek
 
 A centered box over the dashboard showing the selected task's live screen (the last screenful). `↑`/`↓` (or `k`/`j`) switch which task you're peeking at; `Enter` attaches to it; `r` reruns it if it has finished; `Space`, `Esc`, or `q` closes.
+
+The footer's `preview:` segment names the source of the row's dashboard preview: `floor` (the last non-blank row of the live screen), `marker` (a full-screen program with no usable title), `title` (the child's window title), or `anchor/<rule>` (a recognized agent status line, tagged with the matcher that extracted it).
 
 ## Attached
 

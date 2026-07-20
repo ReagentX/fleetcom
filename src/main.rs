@@ -71,8 +71,8 @@ fleetcom - a fleet-view supervisor for arbitrary shell commands
 Usage:
   fleetcom [<session>]               connect to the daemon (autostarting it),
                                      optionally loading a saved session
-  fleetcom --foreground [<session>]  run without a daemon; jobs die on quit
-  fleetcom --kill                    kill the daemon and every job it owns
+  fleetcom --foreground [<session>]  run without a daemon; tasks die on quit
+  fleetcom --kill                    kill the daemon and every task it owns
   fleetcom --daemon                  run the daemon (internal; the first
                                      fleetcom starts it automatically)
 
