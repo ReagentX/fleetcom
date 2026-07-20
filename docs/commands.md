@@ -113,7 +113,7 @@ The daemon removes control characters, trims surrounding whitespace, and limits 
 - Recent directories: ones you've launched in before; `Enter` runs there, `Tab`/`→` browses into them.
 - Subdirectories of the current path: `Enter` or `Tab`/`→` descends into one.
 
-Typing filters the rows; `Backspace` climbs the typed path; `↑`/`↓` move the highlight; `Esc` cancels. Completion updates on each input, permitting navigation and launch without leaving the dashboard.
+Typing filters the rows; `Backspace` climbs the typed path; `↑`/`↓` move the highlight; `Esc` cancels. Completion updates on each input, permitting navigation and launch without leaving the dashboard. `←`/`→` move the caret within the typed path — `→` descends only when the caret is at the end — and `Ctrl-A`/`Ctrl-E` (or `Home`/`End`) jump to either end; the same caret keys work in every `fleetcom` text field.
 
 ## The `g` group picker
 

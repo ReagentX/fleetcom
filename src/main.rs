@@ -11,6 +11,8 @@ compile_error!("fleetcom supports Unix platforms only.");
 mod app;
 mod core;
 mod daemon;
+// Caret-addressed single-line buffer backing the text prompts.
+mod editbuf;
 // Differential emulator tests over recorded PTY output.
 #[cfg(test)]
 mod golden;
