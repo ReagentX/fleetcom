@@ -28,6 +28,42 @@ feed the bytes to the emulator verbatim.
 | `dec_scrollregion.bin` | `printf` output with DEC line drawing (`ESC ( 0`) and `CSI 5;20r` | DEC charset translation; the non-top-anchored region does not scroll, and the later full-screen scroll retains one row |
 | `topregion_scroll.bin` | `printf` output with `CSI 1;20r`, 34 newlines through the bottom margin, and an isolation line below the region | top-anchored-region retention pinned at 35: 34 region scrolls plus the row preserved by `ESC[2J` |
 
+## Preview fixtures
+
+The `preview_*.bin` fixtures pin the summary adapters (`src/harness/summary.rs`):
+per-state agent-CLI screens whose extraction, normalization, and refusal
+behavior the adapter tests assert exactly. Unlike the raw recordings above,
+each is a constructed repaint stream — an optional alt-screen entry (claude
+and grok run on the alternate screen; codex is inline), clear, home, then the
+captured screen's rows joined with CRLF — trimmed from per-state snapshots of
+claude 2.1.215, codex-cli 0.144.6, and grok 0.2.102. All identifying content
+(names, account identifiers, filesystem paths, MCP server names, and every
+user-configured statusline row) is replaced with same-length synthetic values,
+so box borders stay column-aligned. Geometry is 40×120 unless noted.
+
+| Fixture | Scenario | Coverage |
+| --- | --- | --- |
+| `preview_claude_working.bin` | claude spinner with the tmux focus-events hint row | `claude:spinner` extraction through an indented hint row |
+| `preview_claude_working_tool.bin` | claude spinner over an indented tool-attachment row | `claude:spinner`; the attachment row is not the action row |
+| `preview_claude_action.bin` | claude `⏺ Running 1 shell command…` above the spinner | `claude:action-row` preferred over the rotating verb |
+| `preview_claude_approval.bin` | claude file-write approval dialog, input box replaced | `claude:approval-menu` synthesizes `awaiting approval` |
+| `preview_claude_idle.bin` | claude idle with the `Try "…"` placeholder | fall-through to the marker; the placeholder never anchors |
+| `preview_claude_done.bin` | claude after a finished turn (`✻ Crunched for 4s` in the body) | fall-through; body completion rows are out of the pinned window |
+| `preview_claude_body_menu.bin` | approval-menu text quoted in the body while the spinner runs | negative: the pinned spinner wins over body menu shapes |
+| `preview_claude_body_menu_idle.bin` | approval-menu text touching the chrome window, input box intact | negative: a foreign column-0 row aborts to fall-through |
+| `preview_codex_working.bin` | codex `• Working (7s • esc to interrupt) · 1 background terminal running · /ps to view · /stop to close` | `codex:working` normalization: affordances stripped, slow suffix kept |
+| `preview_codex_working_over_ran.bin` | codex working with a `• Ran` row higher in the same turn | `codex:working` wins at the pin; the stale row never surfaces |
+| `preview_codex_scrollback.bin` | codex finished turn, `• Ran` from the prior turn in scrollback | negative: the scan stops at the reply bullet; floor tier reports |
+| `preview_codex_ran.bin` | codex transient completion (synthetic: no raw capture holds it) | `codex:ran` extraction through the `└` attachment row |
+| `preview_grok_working.bin` | grok braille spinner with elapsed/throughput ticker | `grok:spinner` cut at the label's `…`; border label read |
+| `preview_grok_worked.bin` | grok `Worked for 8.7s` completion row above the box | `grok:worked` kept verbatim |
+| `preview_grok_idle.bin` | grok idle session | fall-through to the marker |
+| `preview_grok_splash.bin` | grok launch splash with resume hint above the box | fall-through; distinct views never anchor |
+| `preview_trunc_claude.bin` | synthetic 40×80: spinner row truncated inside its parenthetical | head match still extracts `Hashing…` |
+| `preview_trunc_codex.bin` | synthetic 40×80: working row truncated inside the `/ps` hint | head match still extracts; dropped suffix was strippable anyway |
+| `preview_trunc_grok.bin` | synthetic 40×80: spinner label truncated with the CLI's ellipsis | extraction keeps the CLI's own `…` verbatim |
+| `preview_wrap_grok.bin` | synthetic 40×30: the status row wraps its ellipsis onto the next row | pathological width fails the structure check and falls through |
+
 ## What the fixtures prove
 
 The fixtures provide evidence for three distinct boundaries:
@@ -43,4 +79,5 @@ The fixtures provide evidence for three distinct boundaries:
 
 `src/golden.rs` contains the absolute display and parser expectations.
 `src/harness/claude.rs`, `src/harness/codex.rs`, and `src/harness/grok.rs`
-contain the agent-resume scrape expectations.
+contain the agent-resume scrape expectations. `src/harness/summary.rs`
+contains the preview-fixture expectations.

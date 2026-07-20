@@ -339,6 +339,12 @@ pub struct Task {
     pub harness: Option<&'static dyn crate::harness::Harness>,
     /// Harness home resolved from this run's launch environment.
     pub harness_home: Option<PathBuf>,
+    /// Summary adapter selected at spawn from the requested command,
+    /// deliberately not keyed off `harness`: that field is set only when
+    /// detection *and* capture-asset install succeed, and an
+    /// instrumentation failure must not silently kill dashboard summaries.
+    /// Adapter output is display-only (`harness::summary` module docs).
+    pub summary_adapter: Option<&'static dyn crate::harness::summary::SummaryAdapter>,
     /// Run number used to give each rerun a distinct capture path.
     pub run: u32,
     /// Session ID injected or recognized at spawn. Later capture data or an
@@ -578,6 +584,7 @@ impl Task {
             name: None,
             harness: None,
             harness_home: None,
+            summary_adapter: crate::harness::summary::select(command),
             run: 0,
             resume_id: None,
             capture_file: None,
@@ -747,20 +754,27 @@ impl Task {
     pub fn resolve_preview(&mut self, now: Instant) -> Preview {
         let finished = self.finished.is_some();
         let emu = grid(&self.parser);
-        self.preview.resolve(now, finished, &*emu).clone()
+        self.preview
+            .resolve(now, finished, &*emu, self.summary_adapter)
+            .clone()
     }
 
     /// Freeze the preview once per task life at `output_complete`. Lands any
     /// open `?2026` frame first so the final resolve sees every byte;
     /// `scrape_exit_hint` does the same for its own read, and whichever runs
-    /// second no-ops.
+    /// second no-ops. The adapter's `exit_preview` slot reads retained text,
+    /// paid for only when an adapter exists (no v1 adapter returns one).
     pub(crate) fn finalize_preview(&mut self) {
         if self.preview.finalized() || !self.output_complete() {
             return;
         }
         let mut emu = grid(&self.parser);
         let _ = emu.finish_output();
-        self.preview.finalize(&*emu);
+        let exit_line = self
+            .summary_adapter
+            .and_then(|a| a.exit_preview(&emu.text_with_history()));
+        self.preview
+            .finalize(&*emu, self.summary_adapter, exit_line);
     }
 
     /// Full screen as ANSI bytes for attached mode, plus cursor state so we can
@@ -1875,9 +1889,8 @@ mod tests {
     #[test]
     fn scrape_exit_hint_lands_an_open_sync_frame() {
         const ID: &str = "7f3b9c1e-5a2d-4e8f-9b6a-0c4d2e8f1a3b";
-        let cmd = format!(
-            "printf '\\033[?2026hResume this session with:\\nclaude --resume {ID}\\n'"
-        );
+        let cmd =
+            format!("printf '\\033[?2026hResume this session with:\\nclaude --resume {ID}\\n'");
         let mut t = Task::spawn(21, &cmd, &cmd, &here(), 24, 80, &sh_env(), no_waker()).unwrap();
         t.harness = Some(&crate::harness::Claude);
         assert!(
@@ -1930,28 +1943,47 @@ mod tests {
 
     /// Alt teardown at exit: the child enters the alt screen, titles it, and
     /// exits through 1049l. The restored primary junk must not replace the
-    /// last rendered preview; it freezes with its source preserved.
+    /// last rendered preview; it freezes with its source preserved. The
+    /// teardown is fenced behind a second flag so the test can force a
+    /// resolve on the torn-down screen before EOF — the interleaving the
+    /// core actually produces, since the 1049l output is what wakes it.
     #[test]
     fn finalize_preview_keeps_the_last_render_across_alt_teardown() {
         use crate::preview::PreviewSource;
         let dir = temp("task_final_alt");
-        let flag = dir.join("flag");
+        let teardown = dir.join("teardown");
+        let exit = dir.join("exit");
         let cmd = format!(
             "printf 'prelaunch junk\\n'; \
              printf '\\033[?1049h\\033]0;working\\007app body'; \
-             until [ -e '{}' ]; do sleep 0.05; done; printf '\\033[?1049l'",
-            flag.display()
+             until [ -e '{td}' ]; do sleep 0.05; done; printf '\\033[?1049l'; \
+             until [ -e '{ex}' ]; do sleep 0.05; done",
+            td = teardown.display(),
+            ex = exit.display()
         );
         let mut t = Task::spawn(41, &cmd, &cmd, &here(), 24, 80, &sh_env(), no_waker()).unwrap();
-        // Resolve until the title renders, so the last live resolution sees
-        // the alt screen; no resolves run between the flag and EOF.
         assert!(
             wait_until(Duration::from_secs(5), || {
                 t.resolve_preview(Instant::now()).source == PreviewSource::Title
             }),
             "title never rendered"
         );
-        std::fs::write(&flag, b"").unwrap();
+        std::fs::write(&teardown, b"").unwrap();
+        assert!(
+            wait_until(Duration::from_secs(60), || {
+                !grid(&t.parser).alternate_screen()
+            }),
+            "teardown never reached the grid"
+        );
+        // The killer tick: resolve against the torn-down screen while the
+        // child still lives. The demotion hold keeps the title rendered,
+        // and the render's alt stamp must survive this resolve.
+        assert_eq!(
+            t.resolve_preview(Instant::now()).source,
+            PreviewSource::Title,
+            "premise: the demotion hold keeps the title rendered"
+        );
+        std::fs::write(&exit, b"").unwrap();
         assert!(
             wait_until(Duration::from_secs(60), || {
                 t.poll_exit().unwrap();
@@ -1969,6 +2001,107 @@ mod tests {
         assert_eq!(
             (p.text.as_str(), p.source, p.frozen),
             ("working", PreviewSource::Title, true)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `tui; echo done` at the PTY level: teardown, then a real primary
+    /// line, then exit inside the demotion hold. The frozen preview is the
+    /// line, not the stale title. The 1049l and the line are written
+    /// together, without a separating sleep: the alt-exit observer
+    /// snapshots at the mode event, so the read boundary is immaterial —
+    /// coalesced or split, the result is the same. That is the fix's
+    /// point.
+    #[test]
+    fn finalize_preview_freezes_primary_output_after_alt_teardown() {
+        use crate::preview::PreviewSource;
+        let dir = temp("task_final_alt_output");
+        let flag = dir.join("flag");
+        let cmd = format!(
+            "printf 'prelaunch junk\\n'; \
+             printf '\\033[?1049h\\033]0;working\\007app body'; \
+             until [ -e '{}' ]; do sleep 0.05; done; \
+             printf '\\033[?1049ldone\\n'",
+            flag.display()
+        );
+        let mut t = Task::spawn(43, &cmd, &cmd, &here(), 24, 80, &sh_env(), no_waker()).unwrap();
+        assert!(
+            wait_until(Duration::from_secs(5), || {
+                t.resolve_preview(Instant::now()).source == PreviewSource::Title
+            }),
+            "title never rendered"
+        );
+        std::fs::write(&flag, b"").unwrap();
+        assert!(
+            wait_until(Duration::from_secs(60), || {
+                t.poll_exit().unwrap();
+                t.output_complete()
+            }),
+            "child never completed"
+        );
+        t.finalize_preview();
+        let p = t.resolve_preview(Instant::now());
+        assert_eq!(
+            (p.text.as_str(), p.source, p.frozen),
+            ("done", PreviewSource::Floor, true),
+            "the post-teardown line must win over the stale title"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Full cascade end to end: an agent-shaped child paints a codex-shaped
+    /// working screen into a real PTY, repaints it with the completion row,
+    /// and exits; the summary adapter anchors the live preview and
+    /// finalization freezes the completion. The adapter is installed
+    /// manually because the child is `printf` under `$SHELL`, not `codex` —
+    /// no real agent CLI runs here.
+    #[test]
+    fn summary_adapter_anchors_live_and_freezes_completion_at_exit() {
+        use crate::preview::PreviewSource;
+        let dir = temp("task_anchor_e2e");
+        let flag = dir.join("flag");
+        let cmd = format!(
+            "printf '• Working (3s • esc to interrupt)\\n\\n› \\n  synth-model high · 1 in · 2 out'; \
+             until [ -e '{f}' ]; do sleep 0.05; done; \
+             printf '\\033[H\\033[2J• Ran echo ok\\n\\n› \\n  synth-model high · 2 in · 3 out'",
+            f = flag.display()
+        );
+        let mut t = Task::spawn(42, &cmd, &cmd, &here(), 24, 80, &sh_env(), no_waker()).unwrap();
+        assert!(t.summary_adapter.is_none(), "printf selects nothing");
+        t.summary_adapter = crate::harness::summary::select("codex");
+        assert!(t.summary_adapter.is_some());
+
+        let mut live = t.resolve_preview(Instant::now());
+        assert!(
+            wait_until(Duration::from_secs(5), || {
+                live = t.resolve_preview(Instant::now());
+                live.source == PreviewSource::Anchor
+            }),
+            "anchor never resolved, last preview {live:?}"
+        );
+        assert_eq!(
+            (live.text.as_str(), live.rule, live.frozen),
+            ("synth-model high · Working", Some("codex:working"), false)
+        );
+
+        std::fs::write(&flag, b"").unwrap();
+        assert!(
+            wait_until(Duration::from_secs(60), || {
+                t.poll_exit().unwrap();
+                t.output_complete()
+            }),
+            "child never completed"
+        );
+        t.finalize_preview();
+        let p = t.resolve_preview(Instant::now());
+        assert_eq!(
+            (p.text.as_str(), p.source, p.rule, p.frozen),
+            (
+                "synth-model high · Ran echo ok",
+                PreviewSource::Anchor,
+                Some("codex:ran"),
+                true
+            )
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -1488,7 +1488,11 @@ mod tests {
             ..base.clone()
         }]);
         let (k, p) = encode_event(&ruled);
-        assert!(!String::from_utf8(p.clone()).unwrap().contains("claude-status"));
+        assert!(
+            !String::from_utf8(p.clone())
+                .unwrap()
+                .contains("claude-status")
+        );
         match decode_event(k, &p) {
             Some(Event::Tasks(v)) => {
                 assert_eq!(v[0].source, PreviewSource::Anchor);

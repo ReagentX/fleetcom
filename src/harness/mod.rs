@@ -12,12 +12,14 @@
 //! Every ID returned by `parse_capture`, `scrape_exit`, or `correlate_fs`
 //! eventually enters a shell command. These methods must therefore return only
 //! strings accepted by [`is_uuid`]. Free-text names, paths, and malformed IDs
-//! yield `None`.
+//! yield `None`. The `summary` submodule is the one exemption: its output is
+//! display-only and must never reach a command line (see its module docs).
 
 pub mod assets;
 mod claude;
 mod codex;
 mod grok;
+pub mod summary;
 
 use std::{
     ffi::OsString,

@@ -1,0 +1,39 @@
+[?1049h[2J[H
+  ~/Projects/fixture-sources                                                                                14K / 500K
+
+
+     ❯ run: sleep 5 && echo ok                                                                               7:34 PM
+
+
+     ◆ Thought for 0.3s
+  ❙  ◆ Run Sleep 5 seconds then echo ok
+     ◆ Thought for 0.0s
+
+     Command finished successfully (exit 0):                                                                 7:34 PM
+
+     ok
+
+     Worked for 8.7s
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+  ╭──────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+  │ ❯                                                                                                                │
+  ╰────────────────────────────────────────────────────────────────────────────── Grok 4.5 (xhigh) · always-approve ─╯
+
+  Shift+Tab:mode  │  Ctrl+x:shortcuts

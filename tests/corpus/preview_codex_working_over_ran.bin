@@ -1,0 +1,39 @@
+[2J[H╭────────────────────────────────────────────────╮
+│ >_ OpenAI Codex (v0.144.6)                     │
+│                                                │
+│ model:     gpt-5.6-sol high   /model to change │
+│ directory: ~/Projects/fixture-sources          │
+╰────────────────────────────────────────────────╯
+
+  Tip: New Use /fast to enable our fastest inference with increased plan usage.
+
+⚠ MCP client for `demo-mcp-unresolved` failed to start: MCP startup failed: No such file or directory (os error 2)
+
+• You have 3 usage limit resets available. Run /usage to use one.
+
+⚠ MCP startup incomplete (failed: demo-mcp-unresolved)
+
+
+› run: sleep 5 && echo ok
+
+
+⚠ MCP client for `demo-mcp-unresolved` failed to start: MCP startup failed: No such file or directory (os error 2)
+
+⚠ MCP startup incomplete (failed: demo-mcp-unresolved)
+
+• I’m running that command now.
+
+• Ran sleep 5 && echo ok
+  └ ok
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+• ok
+
+• Working (14s • esc to interrupt)
+
+
+› Write tests for @filename
+
+  gpt-5.6-sol high · 5.26K used · 28.2K in · 78 out
+

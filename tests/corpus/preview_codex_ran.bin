@@ -1,0 +1,17 @@
+[2J[H╭────────────────────────────────────────────────╮
+│ >_ OpenAI Codex (v0.144.6)                     │
+│                                                │
+│ model:     gpt-5.6-sol high   /model to change │
+│ directory: ~/Projects/fixture-sources          │
+╰────────────────────────────────────────────────╯
+
+› run: sleep 5 && echo ok
+
+• Running it now.
+
+• Ran sleep 5 && echo ok
+  └ ok
+
+› Write tests for @filename
+
+  gpt-5.6-sol high · 5.26K used · 28.2K in · 78 out

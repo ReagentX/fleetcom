@@ -576,3 +576,77 @@ fn semantic_dec_scrollregion_charset_translation() {
     }
     assert_eq!(al.grid().cursor.point, Point::new(Line(39), Column(0)));
 }
+
+/// Differential canary for the Emulator's delegating [`Handler`] wrapper
+/// (`ObservedTerm` in `terminal::emulator`): every corpus fixture replayed
+/// through the Emulator must land on exactly the screen, cursor, and mode a
+/// raw backend replay produces. All 71 Handler methods have empty defaults,
+/// so a missed forward compiles silently and swallows escapes — this
+/// comparison is what breaks loudly instead. The classic `alacritty()`
+/// goldens above deliberately bypass the Emulator (they pin the raw
+/// backend), so they cannot serve as that fence.
+#[test]
+fn emulator_wrapper_matches_the_raw_backend_on_every_fixture() {
+    let fixtures: [(&str, &[u8]); 12] = [
+        (
+            "tmux_split",
+            include_bytes!("../tests/corpus/tmux_split.bin"),
+        ),
+        (
+            "vim_session",
+            include_bytes!("../tests/corpus/vim_session.bin"),
+        ),
+        (
+            "less_altscreen",
+            include_bytes!("../tests/corpus/less_altscreen.bin"),
+        ),
+        ("top_live", include_bytes!("../tests/corpus/top_live.bin")),
+        (
+            "shell_colors",
+            include_bytes!("../tests/corpus/shell_colors.bin"),
+        ),
+        ("build_log", include_bytes!("../tests/corpus/build_log.bin")),
+        (
+            "claude_resume",
+            include_bytes!("../tests/corpus/claude_resume.bin"),
+        ),
+        (
+            "codex_resume",
+            include_bytes!("../tests/corpus/codex_resume.bin"),
+        ),
+        (
+            "grok_resume",
+            include_bytes!("../tests/corpus/grok_resume.bin"),
+        ),
+        (
+            "wide_emoji",
+            include_bytes!("../tests/corpus/wide_emoji.bin"),
+        ),
+        (
+            "dec_scrollregion",
+            include_bytes!("../tests/corpus/dec_scrollregion.bin"),
+        ),
+        (
+            "topregion_scroll",
+            include_bytes!("../tests/corpus/topregion_scroll.bin"),
+        ),
+    ];
+    for (name, bytes) in fixtures {
+        let al = alacritty(bytes);
+        let mut emu = crate::testutil::corpus_emulator();
+        emu.process(bytes);
+        let (_, al_cursor, al_hidden) = ansi::formatted(&al);
+        let (_, emu_cursor, emu_hidden) = emu.formatted();
+        assert_eq!(emu.contents(), ansi::contents(&al), "{name}: screen");
+        assert_eq!(
+            (emu_cursor, emu_hidden),
+            (al_cursor, al_hidden),
+            "{name}: cursor"
+        );
+        assert_eq!(
+            emu.alternate_screen(),
+            al.mode().contains(TermMode::ALT_SCREEN),
+            "{name}: alt bit"
+        );
+    }
+}

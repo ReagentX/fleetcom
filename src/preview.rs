@@ -5,7 +5,7 @@
 
 use std::time::{Duration, Instant};
 
-use crate::emulator::Emulator;
+use crate::{emulator::Emulator, harness::summary::SummaryAdapter};
 
 // Both holds are wall-clock: tick spacing varies ≈25× (8 ms frame minimum
 // under load, 200 ms idle backstop), so a tick-counted debounce would be
@@ -36,8 +36,7 @@ pub enum PreviewSource {
     Marker,
     /// The child's window title, honored only on the alternate screen.
     Title,
-    /// Normalized adapter output: the cascade's top tier. No producer exists
-    /// this phase; adapters land later and fill the slot.
+    /// Normalized adapter output: the cascade's top tier.
     Anchor,
 }
 
@@ -55,8 +54,8 @@ impl PreviewSource {
 
 /// One resolved preview. `frozen` is mutability, orthogonal to `source`: a
 /// finished task reports its last source with `frozen: true`, which a
-/// `Frozen` variant would erase. `rule` is a fine-grained matcher id; no
-/// producer sets it this phase (adapters come later), and it stays
+/// `Frozen` variant would erase. `rule` is the summary-adapter matcher id
+/// behind an Anchor preview (`None` for every other tier), and it stays
 /// daemon-side — the peek footer sees it only in-process, never over the
 /// wire.
 #[derive(Debug, Clone, PartialEq)]
@@ -86,6 +85,12 @@ pub trait ScreenFacts {
     fn alternate_screen(&self) -> bool;
     fn title(&self) -> Option<&str>;
     fn live_floor(&self) -> String;
+    /// Every live-viewport row, trailing padding trimmed: the summary
+    /// adapters' structural scan input.
+    fn live_rows(&self) -> Vec<String>;
+    /// The floor snapshotted at the most recent alt-screen exit — what the
+    /// 1049l restore left visible; `None` before the first exit.
+    fn alt_leave_floor(&self) -> Option<&str>;
 }
 
 impl ScreenFacts for Emulator {
@@ -108,14 +113,38 @@ impl ScreenFacts for Emulator {
     fn live_floor(&self) -> String {
         Emulator::live_floor(self)
     }
+
+    fn live_rows(&self) -> Vec<String> {
+        Emulator::live_rows(self)
+    }
+
+    fn alt_leave_floor(&self) -> Option<&str> {
+        Emulator::alt_leave_floor(self)
+    }
 }
 
-/// The instantaneous candidate. Every branch is a fact the emulator tracks;
-/// nothing is fabricated:
-/// 1. [anchor slot — no producer this phase; adapters claim the top tier]
+/// The instantaneous candidate. Every branch is a fact the emulator tracks
+/// or an extraction from it; nothing is fabricated:
+/// 1. summary adapter: the normalized live status when the CLI's working
+///    structure is present, `{model label} · `-prefixed when the adapter
+///    reads one from stable chrome
 /// 2. alternate screen: the title while its epoch is current, else the marker
 /// 3. primary screen: the live floor
-fn cascade(screen: &impl ScreenFacts) -> Preview {
+fn cascade(screen: &impl ScreenFacts, adapter: Option<&dyn SummaryAdapter>) -> Preview {
+    if let Some(a) = adapter
+        && let Some((text, rule)) = a.live_preview(screen)
+    {
+        let text = match a.model_label(screen) {
+            Some(label) => format!("{label} · {text}"),
+            None => text,
+        };
+        return Preview {
+            text,
+            source: PreviewSource::Anchor,
+            rule: Some(rule),
+            frozen: false,
+        };
+    }
     if screen.alternate_screen() {
         return match screen.title() {
             Some(text) => Preview {
@@ -159,9 +188,14 @@ pub struct PreviewState {
     /// Instant of the last rendered title: the min-hold deadline base.
     last_title_render: Option<Instant>,
     last_key: Option<ResolveKey>,
-    /// Alt bit at the most recent live resolution; `finalize`'s teardown
-    /// predicate compares it against the final screen.
-    last_resolve_alt: bool,
+    /// Screen mode that produced the rendered preview, stamped at every
+    /// render commit; `finalize`'s teardown predicate compares it against
+    /// the final screen. Per-render rather than per-resolve because the
+    /// exit's own 1049l output wakes the core, so a resolve routinely runs
+    /// between teardown and reader EOF — a live-resolve bit would flip
+    /// primary on that tick while the demotion hold still keeps the
+    /// alt-committed preview rendered.
+    rendered_under_alt: bool,
     finalized: bool,
 }
 
@@ -181,7 +215,7 @@ impl PreviewState {
             downgrade_pending_since: None,
             last_title_render: None,
             last_key: None,
-            last_resolve_alt: false,
+            rendered_under_alt: false,
             finalized: false,
         }
     }
@@ -195,12 +229,14 @@ impl PreviewState {
     /// parameter, never read internally, so tests drive the holds with
     /// synthetic instants. The candidate is recomputed only when the
     /// resolution key changed; hold expiries commit the carried value
-    /// without a rescan.
+    /// without a rescan. `adapter` is the task's summary adapter, fixed for
+    /// the task's life, so it needs no slot in the resolution key.
     pub fn resolve(
         &mut self,
         now: Instant,
         finished: bool,
         screen: &impl ScreenFacts,
+        adapter: Option<&dyn SummaryAdapter>,
     ) -> &Preview {
         if self.finalized {
             return &self.rendered;
@@ -213,22 +249,23 @@ impl PreviewState {
             finished,
         );
         if self.last_key.as_ref() != Some(&key) {
-            self.candidate = cascade(screen);
+            self.candidate = cascade(screen, adapter);
             self.last_key = Some(key);
         }
-        self.last_resolve_alt = screen.alternate_screen();
-        self.step(now);
+        self.step(now, screen.alternate_screen());
         &self.rendered
     }
 
-    /// One pass of the candidate-vs-rendered transition table.
-    fn step(&mut self, now: Instant) {
+    /// One pass of the candidate-vs-rendered transition table. `alt` is the
+    /// alt bit of the screen this resolution ran against; every commit —
+    /// demotion-hold expiries included — stamps it onto the render.
+    fn step(&mut self, now: Instant, alt: bool) {
         use std::cmp::Ordering;
         match self.candidate.source.cmp(&self.rendered.source) {
             Ordering::Greater => {
                 self.cancel_demotion();
                 let cand = self.candidate.clone();
-                self.render(cand, now);
+                self.render(cand, now, alt);
             }
             Ordering::Equal => {
                 // Rank ≥ rendered: a pending demotion was a one-tick repaint
@@ -249,15 +286,15 @@ impl PreviewState {
                             .is_some_and(|t| now.duration_since(t) < TITLE_MIN_HOLD);
                         if !held {
                             let cand = self.candidate.clone();
-                            self.render(cand, now);
+                            self.render(cand, now, alt);
                         }
                     }
                     // The floor is live output; anchor text changes are
-                    // semantic (unreachable until adapters land). Both
+                    // semantic (a new verb, a new completion row). Both
                     // render immediately.
                     PreviewSource::Floor | PreviewSource::Anchor => {
                         let cand = self.candidate.clone();
-                        self.render(cand, now);
+                        self.render(cand, now, alt);
                     }
                 }
             }
@@ -268,19 +305,20 @@ impl PreviewState {
                     && let Some(latest) = self.pending_candidate.take()
                 {
                     self.downgrade_pending_since = None;
-                    self.render(latest, now);
+                    self.render(latest, now, alt);
                 }
             }
         }
     }
 
-    /// Commit `p` as the rendered preview; title renders stamp the min-hold
-    /// deadline base.
-    fn render(&mut self, p: Preview, now: Instant) {
+    /// Commit `p` as the rendered preview under the screen mode that
+    /// produced it; title renders stamp the min-hold deadline base.
+    fn render(&mut self, p: Preview, now: Instant, alt: bool) {
         if p.source == PreviewSource::Title {
             self.last_title_render = Some(now);
         }
         self.rendered = p;
+        self.rendered_under_alt = alt;
     }
 
     fn cancel_demotion(&mut self) {
@@ -289,29 +327,67 @@ impl PreviewState {
     }
 
     /// Freeze the preview once the task's output is complete. Re-resolves
-    /// the cascade against the final screen instead of freezing the last
-    /// rendered value: output can land between the last resolution tick and
-    /// output-complete (a stream's final `test result: ok` flush), and the
-    /// final resolve must see it. One carve-out, `alt_torn_down_at_exit`:
-    /// the task was on the alternate screen at its last live resolution and
-    /// the final screen is primary, so the exit's 1049l restored pre-launch
-    /// junk (alt-screen agent CLIs print nothing afterward) and the last
-    /// rendered preview freezes instead — a stale but meaningful line under
-    /// a truthful outcome glyph beats shell junk. Holds do not apply:
-    /// finalization overrides the whole transition table. Idempotent; later
-    /// resolutions short-circuit to the frozen value.
-    pub fn finalize(&mut self, screen: &impl ScreenFacts) {
+    /// the cascade — anchor tier included, which is how a primary-screen
+    /// agent's final completion row (codex's `• Ran …`) freezes — against
+    /// the final screen instead of freezing the last rendered value: output
+    /// can land between the last resolution tick and output-complete (a
+    /// stream's final `test result: ok` flush), and the final resolve must
+    /// see it. `exit_line` outranks everything when present: it is the
+    /// adapter's synthetic exit summary from retained text (a v1 dead slot;
+    /// see [`SummaryAdapter::exit_preview`]). One carve-out,
+    /// `alt_torn_down_at_exit`: the rendered preview was committed under
+    /// the alternate screen and the final screen is primary, so the exit's
+    /// 1049l restored pre-launch junk (alt-screen agent CLIs print nothing
+    /// afterward) and the held preview freezes instead — a stale but
+    /// meaningful line under a truthful outcome glyph beats shell junk. The
+    /// predicate reads the per-render stamp, not a latched ever-entered-alt
+    /// bit: a child that leaves the alt screen and then lives on the
+    /// primary screen has its demotion hold expire and commit the floor,
+    /// stamped primary, and there the floor IS the honest final value. A
+    /// sub-hold exit teardown keeps the alt-committed preview rendered
+    /// precisely because the demotion hold absorbs the flip. The carve-out
+    /// additionally demands that the final floor still equal the floor
+    /// snapshotted at the alt exit: a changed floor means the child wrote
+    /// real primary output after teardown (`tui; echo done`), and the
+    /// fresh cascade must pick it up even inside the hold. The
+    /// discriminator is visible content, never byte arrival — claude's
+    /// exit emits title-reset controls that can land in a chunk after the
+    /// 1049l, so bytes arrive while nothing visible changes, and a
+    /// byte/revision test would freeze restored junk for exactly the CLI
+    /// the carve-out serves. Control-only chunks do not move the floor;
+    /// written output does. Holds do not apply: finalization overrides the whole transition
+    /// table. Idempotent; later resolutions short-circuit to the frozen
+    /// value.
+    pub fn finalize(
+        &mut self,
+        screen: &impl ScreenFacts,
+        adapter: Option<&dyn SummaryAdapter>,
+        exit_line: Option<String>,
+    ) {
         if self.finalized {
             return;
         }
         self.finalized = true;
         self.cancel_demotion();
-        let alt_torn_down_at_exit = self.last_resolve_alt && !screen.alternate_screen();
+        if let Some(text) = exit_line {
+            self.rendered = Preview {
+                text,
+                source: PreviewSource::Anchor,
+                rule: None,
+                frozen: true,
+            };
+            return;
+        }
+        let alt_torn_down_at_exit = self.rendered_under_alt
+            && !screen.alternate_screen()
+            && screen
+                .alt_leave_floor()
+                .is_some_and(|snapshot| screen.live_floor() == snapshot);
         if alt_torn_down_at_exit {
             self.rendered.frozen = true;
             return;
         }
-        let mut fin = cascade(screen);
+        let mut fin = cascade(screen, adapter);
         fin.frozen = true;
         self.rendered = fin;
     }
@@ -331,6 +407,9 @@ mod tests {
         alt: bool,
         title: Option<String>,
         floor: String,
+        /// Floor at the last `leave_alt`, mirroring the emulator's
+        /// alt-exit snapshot.
+        alt_leave_floor: Option<String>,
         floor_calls: Cell<usize>,
     }
 
@@ -342,6 +421,7 @@ mod tests {
                 alt: false,
                 title: None,
                 floor: floor.into(),
+                alt_leave_floor: None,
                 floor_calls: Cell::new(0),
             }
         }
@@ -359,6 +439,8 @@ mod tests {
 
         fn leave_alt(&mut self) {
             self.alt = false;
+            // The emulator snapshots the restored floor at the alt exit.
+            self.alt_leave_floor = Some(self.floor.clone());
             self.advance();
         }
 
@@ -399,6 +481,134 @@ mod tests {
             self.floor_calls.set(self.floor_calls.get() + 1);
             self.floor.clone()
         }
+
+        fn live_rows(&self) -> Vec<String> {
+            vec![self.floor.clone()]
+        }
+
+        fn alt_leave_floor(&self) -> Option<&str> {
+            self.alt_leave_floor.as_deref()
+        }
+    }
+
+    /// Fixed-output adapter: the cascade tests here cover the slot's
+    /// plumbing (rank, label prefix, freeze), not extraction — that lives
+    /// with the adapters in `harness::summary`.
+    struct StubAdapter {
+        live: Option<(&'static str, &'static str)>,
+        label: Option<&'static str>,
+    }
+
+    impl SummaryAdapter for StubAdapter {
+        fn live_preview(&self, _screen: &dyn ScreenFacts) -> Option<(String, &'static str)> {
+            self.live.map(|(text, rule)| (text.to_string(), rule))
+        }
+
+        fn model_label(&self, _screen: &dyn ScreenFacts) -> Option<String> {
+            self.label.map(str::to_string)
+        }
+    }
+
+    /// The anchor tier outranks the title, carries its rule id, and prepends
+    /// the model label when the adapter reads one.
+    #[test]
+    fn anchor_outranks_title_and_prepends_the_label() {
+        let now = Instant::now();
+        let mut st = PreviewState::new();
+        let mut s = FakeScreen::primary("shell");
+        s.enter_alt();
+        s.set_title("app");
+        let adapter = StubAdapter {
+            live: Some(("Working", "stub:working")),
+            label: Some("model-x"),
+        };
+        let p = st.resolve(now, false, &s, Some(&adapter)).clone();
+        assert_eq!(
+            (p.text.as_str(), p.source, p.rule),
+            (
+                "model-x · Working",
+                PreviewSource::Anchor,
+                Some("stub:working")
+            )
+        );
+
+        // Without a label the anchor renders the bare status.
+        let bare = StubAdapter {
+            live: Some(("Working", "stub:working")),
+            label: None,
+        };
+        let mut st = PreviewState::new();
+        let p = st.resolve(now, false, &s, Some(&bare)).clone();
+        assert_eq!(p.text, "Working");
+    }
+
+    /// A lost anchor is a demotion: the title returns only after the hold,
+    /// exactly like any other rank drop.
+    #[test]
+    fn anchor_loss_demotes_through_the_hold() {
+        let t0 = Instant::now();
+        let mut st = PreviewState::new();
+        let mut s = FakeScreen::primary("shell");
+        s.enter_alt();
+        s.set_title("app");
+        let working = StubAdapter {
+            live: Some(("Working", "stub:working")),
+            label: None,
+        };
+        st.resolve(t0, false, &s, Some(&working));
+
+        let idle = StubAdapter {
+            live: None,
+            label: None,
+        };
+        s.advance();
+        assert_eq!(
+            st.resolve(t0, false, &s, Some(&idle)).source,
+            PreviewSource::Anchor,
+            "a lost anchor must not demote instantly"
+        );
+        let p = st
+            .resolve(t0 + DEMOTION_HOLD, false, &s, Some(&idle))
+            .clone();
+        assert_eq!((p.text.as_str(), p.source), ("app", PreviewSource::Title));
+    }
+
+    /// Finalization's re-resolve includes the anchor tier: a completion row
+    /// present on the final primary screen freezes as an Anchor preview.
+    #[test]
+    fn finalize_freezes_the_final_anchor() {
+        let t0 = Instant::now();
+        let mut st = PreviewState::new();
+        let mut s = FakeScreen::primary("building");
+        let adapter = StubAdapter {
+            live: Some(("Ran echo ok", "stub:ran")),
+            label: None,
+        };
+        st.resolve(t0, false, &s, None);
+
+        s.advance();
+        st.finalize(&s, Some(&adapter), None);
+        let p = st.resolve(t0, true, &s, Some(&adapter)).clone();
+        assert_eq!(
+            (p.text.as_str(), p.source, p.rule, p.frozen),
+            ("Ran echo ok", PreviewSource::Anchor, Some("stub:ran"), true)
+        );
+    }
+
+    /// An adapter exit line outranks the final screen and freezes verbatim.
+    /// No v1 adapter produces one; the slot's plumbing is pinned here.
+    #[test]
+    fn finalize_prefers_an_adapter_exit_line() {
+        let t0 = Instant::now();
+        let mut st = PreviewState::new();
+        let s = FakeScreen::primary("junk floor");
+        st.resolve(t0, false, &s, None);
+        st.finalize(&s, None, Some("session done".to_string()));
+        let p = st.resolve(t0, true, &s, None).clone();
+        assert_eq!(
+            (p.text.as_str(), p.source, p.frozen),
+            ("session done", PreviewSource::Anchor, true)
+        );
     }
 
     /// Each cascade tier maps one emulator fact to one source.
@@ -408,7 +618,7 @@ mod tests {
 
         let mut st = PreviewState::new();
         let s = FakeScreen::primary("last row");
-        let p = st.resolve(now, false, &s).clone();
+        let p = st.resolve(now, false, &s, None).clone();
         assert_eq!(
             (p.text.as_str(), p.source, p.frozen),
             ("last row", PreviewSource::Floor, false)
@@ -418,18 +628,18 @@ mod tests {
         let mut s = FakeScreen::primary("shell");
         s.enter_alt();
         s.set_title("app");
-        let p = st.resolve(now, false, &s).clone();
+        let p = st.resolve(now, false, &s, None).clone();
         assert_eq!((p.text.as_str(), p.source), ("app", PreviewSource::Title));
 
         let mut st = PreviewState::new();
         let mut s = FakeScreen::primary("shell");
         s.enter_alt();
-        let p = st.resolve(now, false, &s).clone();
+        let p = st.resolve(now, false, &s, None).clone();
         assert_eq!((p.text.as_str(), p.source), (MARKER, PreviewSource::Marker));
 
         let mut st = PreviewState::new();
         let s = FakeScreen::primary("");
-        let p = st.resolve(now, false, &s).clone();
+        let p = st.resolve(now, false, &s, None).clone();
         assert_eq!((p.text.as_str(), p.source), ("", PreviewSource::Floor));
     }
 
@@ -439,14 +649,17 @@ mod tests {
         let now = Instant::now();
         let mut st = PreviewState::new();
         let mut s = FakeScreen::primary("building");
-        assert_eq!(st.resolve(now, false, &s).source, PreviewSource::Floor);
+        assert_eq!(
+            st.resolve(now, false, &s, None).source,
+            PreviewSource::Floor
+        );
 
         s.enter_alt();
-        let p = st.resolve(now, false, &s).clone();
+        let p = st.resolve(now, false, &s, None).clone();
         assert_eq!((p.text.as_str(), p.source), (MARKER, PreviewSource::Marker));
 
         s.set_title("app");
-        let p = st.resolve(now, false, &s).clone();
+        let p = st.resolve(now, false, &s, None).clone();
         assert_eq!((p.text.as_str(), p.source), ("app", PreviewSource::Title));
     }
 
@@ -459,17 +672,20 @@ mod tests {
         let mut s = FakeScreen::primary("shell");
         s.enter_alt();
         s.set_title("app");
-        st.resolve(t0, false, &s);
+        st.resolve(t0, false, &s, None);
 
         s.clear_title();
         assert_eq!(
-            st.resolve(t0, false, &s).source,
+            st.resolve(t0, false, &s, None).source,
             PreviewSource::Title,
             "a demotion must not render instantly"
         );
         let inside = t0 + DEMOTION_HOLD - Duration::from_millis(1);
-        assert_eq!(st.resolve(inside, false, &s).source, PreviewSource::Title);
-        let p = st.resolve(t0 + DEMOTION_HOLD, false, &s).clone();
+        assert_eq!(
+            st.resolve(inside, false, &s, None).source,
+            PreviewSource::Title
+        );
+        let p = st.resolve(t0 + DEMOTION_HOLD, false, &s, None).clone();
         assert_eq!((p.text.as_str(), p.source), (MARKER, PreviewSource::Marker));
     }
 
@@ -483,25 +699,25 @@ mod tests {
         let mut s = FakeScreen::primary("shell");
         s.enter_alt();
         s.set_title("app");
-        st.resolve(t0, false, &s);
+        st.resolve(t0, false, &s, None);
 
         s.clear_title();
-        st.resolve(t0, false, &s);
+        st.resolve(t0, false, &s, None);
         // The title returns inside the hold: cancel, no visible change.
         s.set_title("app");
-        let p = st.resolve(t0 + ms(300), false, &s).clone();
+        let p = st.resolve(t0 + ms(300), false, &s, None).clone();
         assert_eq!((p.text.as_str(), p.source), ("app", PreviewSource::Title));
 
         // The next demotion measures from its own start, not the old stamp.
         s.clear_title();
-        st.resolve(t0 + ms(400), false, &s);
+        st.resolve(t0 + ms(400), false, &s, None);
         assert_eq!(
-            st.resolve(t0 + ms(900), false, &s).source,
+            st.resolve(t0 + ms(900), false, &s, None).source,
             PreviewSource::Title,
             "the canceled hold must not shorten the fresh one"
         );
         assert_eq!(
-            st.resolve(t0 + ms(1_000), false, &s).source,
+            st.resolve(t0 + ms(1_000), false, &s, None).source,
             PreviewSource::Marker
         );
     }
@@ -515,19 +731,20 @@ mod tests {
         let mut s = FakeScreen::primary("shell");
         s.enter_alt();
         s.set_title("app");
-        st.resolve(t0, false, &s);
+        st.resolve(t0, false, &s, None);
 
         // First demoted candidate: the marker.
         s.clear_title();
-        st.resolve(t0, false, &s);
+        st.resolve(t0, false, &s, None);
         // The pending candidate flaps to a floor; the timer keeps t0.
         s.leave_alt();
         s.set_floor("done 3 tests");
         assert_eq!(
-            st.resolve(t0 + Duration::from_millis(300), false, &s).source,
+            st.resolve(t0 + Duration::from_millis(300), false, &s, None)
+                .source,
             PreviewSource::Title
         );
-        let p = st.resolve(t0 + DEMOTION_HOLD, false, &s).clone();
+        let p = st.resolve(t0 + DEMOTION_HOLD, false, &s, None).clone();
         assert_eq!(
             (p.text.as_str(), p.source),
             ("done 3 tests", PreviewSource::Floor),
@@ -545,14 +762,14 @@ mod tests {
         let mut s = FakeScreen::primary("shell");
         s.enter_alt();
         s.set_title("one");
-        assert_eq!(st.resolve(t0, false, &s).text, "one");
+        assert_eq!(st.resolve(t0, false, &s, None).text, "one");
 
         s.set_title("two");
-        assert_eq!(st.resolve(t0 + ms(200), false, &s).text, "one");
+        assert_eq!(st.resolve(t0 + ms(200), false, &s, None).text, "one");
         s.set_title("three");
-        assert_eq!(st.resolve(t0 + ms(300), false, &s).text, "one");
+        assert_eq!(st.resolve(t0 + ms(300), false, &s, None).text, "one");
         assert_eq!(
-            st.resolve(t0 + TITLE_MIN_HOLD, false, &s).text,
+            st.resolve(t0 + TITLE_MIN_HOLD, false, &s, None).text,
             "three",
             "the newest candidate wins at the deadline"
         );
@@ -564,9 +781,9 @@ mod tests {
         let t0 = Instant::now();
         let mut st = PreviewState::new();
         let mut s = FakeScreen::primary("compiling foo");
-        assert_eq!(st.resolve(t0, false, &s).text, "compiling foo");
+        assert_eq!(st.resolve(t0, false, &s, None).text, "compiling foo");
         s.set_floor("compiling bar");
-        assert_eq!(st.resolve(t0, false, &s).text, "compiling bar");
+        assert_eq!(st.resolve(t0, false, &s, None).text, "compiling bar");
     }
 
     /// An unchanged resolution key carries the candidate without re-reading
@@ -577,15 +794,34 @@ mod tests {
         let ms = Duration::from_millis;
         let mut st = PreviewState::new();
         let mut s = FakeScreen::primary("steady");
-        st.resolve(t0, false, &s);
+        st.resolve(t0, false, &s, None);
         assert_eq!(s.floor_calls.get(), 1);
 
-        st.resolve(t0 + ms(200), false, &s);
+        st.resolve(t0 + ms(200), false, &s, None);
         assert_eq!(s.floor_calls.get(), 1, "unchanged key must not re-read");
 
         s.advance();
-        st.resolve(t0 + ms(400), false, &s);
+        st.resolve(t0 + ms(400), false, &s, None);
         assert_eq!(s.floor_calls.get(), 2, "a revision bump must recompute");
+    }
+
+    /// A resize-shaped change — revision bumped, floor reflowed, alt bit,
+    /// epoch, and title untouched — invalidates the key and recomputes the
+    /// candidate (the emulator bumps its revision on resize for exactly
+    /// this).
+    #[test]
+    fn a_resize_shaped_revision_bump_recomputes_the_candidate() {
+        let t0 = Instant::now();
+        let mut st = PreviewState::new();
+        let mut s = FakeScreen::primary("a long row that fit");
+        assert_eq!(st.resolve(t0, false, &s, None).text, "a long row that fit");
+
+        s.set_floor("a long row");
+        assert_eq!(
+            st.resolve(t0, false, &s, None).text,
+            "a long row",
+            "the reflowed floor must render, not the carried candidate"
+        );
     }
 
     /// Primary-at-exit finalization re-resolves: output that landed after
@@ -595,11 +831,11 @@ mod tests {
         let t0 = Instant::now();
         let mut st = PreviewState::new();
         let mut s = FakeScreen::primary("running");
-        st.resolve(t0, false, &s);
+        st.resolve(t0, false, &s, None);
 
         s.set_floor("test result: ok");
-        st.finalize(&s);
-        let p = st.resolve(t0, true, &s).clone();
+        st.finalize(&s, None, None);
+        let p = st.resolve(t0, true, &s, None).clone();
         assert_eq!(
             (p.text.as_str(), p.source, p.frozen),
             ("test result: ok", PreviewSource::Floor, true)
@@ -615,12 +851,12 @@ mod tests {
         let mut s = FakeScreen::primary("prelaunch junk");
         s.enter_alt();
         s.set_title("agent: working");
-        st.resolve(t0, false, &s);
+        st.resolve(t0, false, &s, None);
 
         // The exit's 1049l lands with no live resolution in between.
         s.leave_alt();
-        st.finalize(&s);
-        let p = st.resolve(t0, true, &s).clone();
+        st.finalize(&s, None, None);
+        let p = st.resolve(t0, true, &s, None).clone();
         assert_eq!(
             (p.text.as_str(), p.source, p.frozen),
             ("agent: working", PreviewSource::Title, true)
@@ -628,9 +864,229 @@ mod tests {
 
         s.set_floor("stray");
         assert_eq!(
-            st.resolve(t0 + Duration::from_secs(5), true, &s).text,
+            st.resolve(t0 + Duration::from_secs(5), true, &s, None).text,
             "agent: working",
             "resolution must short-circuit to the frozen value"
+        );
+    }
+
+    /// The likely interleaving, not the lucky one: the 1049l output itself
+    /// wakes the core, so a resolve routinely runs between alt teardown and
+    /// reader EOF. The teardown stamp travels with the rendered preview —
+    /// the demotion hold keeps the alt-committed title rendered through
+    /// that tick — so finalization must still keep it over the restored
+    /// primary junk.
+    #[test]
+    fn finalize_keeps_the_render_when_a_resolve_saw_the_teardown() {
+        let t0 = Instant::now();
+        let mut st = PreviewState::new();
+        let mut s = FakeScreen::primary("prelaunch junk");
+        s.enter_alt();
+        s.set_title("agent: working");
+        st.resolve(t0, false, &s, None);
+
+        // Teardown lands and a tick resolves before output completes.
+        s.leave_alt();
+        let p = st.resolve(t0, false, &s, None).clone();
+        assert_eq!(
+            p.source,
+            PreviewSource::Title,
+            "premise: the demotion hold keeps the title rendered"
+        );
+
+        st.finalize(&s, None, None);
+        let p = st.resolve(t0, true, &s, None).clone();
+        assert_eq!(
+            (p.text.as_str(), p.source, p.frozen),
+            ("agent: working", PreviewSource::Title, true)
+        );
+    }
+
+    /// The stamp is per-render, not a latched ever-entered-alt bit: a child
+    /// that leaves the alt screen and lives on the primary screen long
+    /// enough for the demotion hold to commit gets a primary-stamped floor,
+    /// and finalization trusts the final screen — the floor is the honest
+    /// final value there.
+    #[test]
+    fn finalize_trusts_the_screen_after_a_primary_commit() {
+        let t0 = Instant::now();
+        let mut st = PreviewState::new();
+        let mut s = FakeScreen::primary("prelaunch junk");
+        s.enter_alt();
+        s.set_title("agent: working");
+        st.resolve(t0, false, &s, None);
+
+        // The child returns to the primary screen and keeps printing; the
+        // hold expires and commits the floor, stamped primary.
+        s.leave_alt();
+        s.set_floor("wrote 12 files");
+        st.resolve(t0, false, &s, None);
+        let p = st.resolve(t0 + DEMOTION_HOLD, false, &s, None).clone();
+        assert_eq!(
+            (p.text.as_str(), p.source),
+            ("wrote 12 files", PreviewSource::Floor),
+            "premise: the hold committed the primary floor"
+        );
+
+        s.set_floor("exit summary");
+        st.finalize(&s, None, None);
+        let p = st.resolve(t0 + DEMOTION_HOLD, true, &s, None).clone();
+        assert_eq!(
+            (p.text.as_str(), p.source, p.frozen),
+            ("exit summary", PreviewSource::Floor, true),
+            "the primary-stamped render must not resurrect the title"
+        );
+    }
+
+    /// `tui; echo done`: the child leaves the alt screen, prints a real
+    /// final line, and exits inside the demotion hold. The changed floor
+    /// defeats the teardown carve-out — the fresh cascade freezes the line
+    /// instead of a stale title discarding it.
+    #[test]
+    fn finalize_freezes_primary_output_written_after_teardown() {
+        let t0 = Instant::now();
+        let mut st = PreviewState::new();
+        let mut s = FakeScreen::primary("prelaunch junk");
+        s.enter_alt();
+        s.set_title("agent: working");
+        st.resolve(t0, false, &s, None);
+
+        // Teardown observed (snapshot: "prelaunch junk"), title still held.
+        s.leave_alt();
+        assert_eq!(st.resolve(t0, false, &s, None).source, PreviewSource::Title);
+
+        // A real final line lands before exit, inside the hold.
+        s.set_floor("done");
+        st.finalize(&s, None, None);
+        let p = st.resolve(t0, true, &s, None).clone();
+        assert_eq!(
+            (p.text.as_str(), p.source, p.frozen),
+            ("done", PreviewSource::Floor, true),
+            "legitimate primary output must not be discarded"
+        );
+    }
+
+    /// Control-only chunks after teardown — claude's exit emits title
+    /// resets that can land after the 1049l — advance the revision without
+    /// moving the floor. The carve-out compares visible content, not byte
+    /// arrival, so the held preview still freezes.
+    #[test]
+    fn finalize_holds_through_control_only_output_after_teardown() {
+        let t0 = Instant::now();
+        let mut st = PreviewState::new();
+        let mut s = FakeScreen::primary("prelaunch junk");
+        s.enter_alt();
+        s.set_title("agent: working");
+        st.resolve(t0, false, &s, None);
+
+        s.leave_alt();
+        assert_eq!(st.resolve(t0, false, &s, None).source, PreviewSource::Title);
+
+        // A later advance changes the revision (and drops the title) but
+        // leaves the floor untouched: nothing visible moved.
+        s.clear_title();
+        assert_eq!(st.resolve(t0, false, &s, None).source, PreviewSource::Title);
+
+        st.finalize(&s, None, None);
+        let p = st.resolve(t0, true, &s, None).clone();
+        assert_eq!(
+            (p.text.as_str(), p.source, p.frozen),
+            ("agent: working", PreviewSource::Title, true),
+            "control-only chunks must not defeat the carve-out"
+        );
+    }
+
+    /// One read coalescing the 1049l with the successor's line — routine
+    /// on a loaded machine, since PTY reads do not preserve write
+    /// boundaries. The alt-exit observer snapshots at the mode event,
+    /// before the same read's successor bytes parse, so the finalize
+    /// comparison sees the line as new output and freezes it:
+    /// deterministic in read boundaries.
+    #[test]
+    fn finalize_freezes_coalesced_output_after_teardown() {
+        let t0 = Instant::now();
+        let mut st = PreviewState::new();
+        let mut emu = Emulator::new(24, 80, 100);
+        emu.process(b"prelaunch junk\r\n");
+        emu.process(b"\x1b[?1049h\x1b]0;working\x07app body");
+        assert_eq!(
+            st.resolve(t0, false, &emu, None).source,
+            PreviewSource::Title,
+            "premise: the title rendered under the alt screen"
+        );
+
+        // Teardown and the real final line arrive in ONE read.
+        emu.process(b"\x1b[?1049ldone\r\n");
+        assert_eq!(
+            emu.alt_leave_floor(),
+            Some("prelaunch junk"),
+            "premise: the snapshot is the restore, not the successor line"
+        );
+        st.finalize(&emu, None, None);
+        let p = st.resolve(t0, true, &emu, None).clone();
+        assert_eq!(
+            (p.text.as_str(), p.source, p.frozen),
+            ("done", PreviewSource::Floor, true)
+        );
+    }
+
+    /// A resize between teardown and finalize reflows the restored junk.
+    /// The emulator re-snapshots the reflowed floor (both comparison sides
+    /// move together), so the reflow does not read as post-teardown output
+    /// and the held title still freezes.
+    #[test]
+    fn finalize_holds_across_a_resize_after_teardown() {
+        let t0 = Instant::now();
+        let mut st = PreviewState::new();
+        let mut emu = Emulator::new(24, 40, 100);
+        emu.process(b"prelaunch junk that will wrap\r\n");
+        emu.process(b"\x1b[?1049h\x1b]0;working\x07app body");
+        assert_eq!(
+            st.resolve(t0, false, &emu, None).source,
+            PreviewSource::Title
+        );
+
+        emu.process(b"\x1b[?1049l");
+        let before = emu.live_floor();
+        emu.resize(24, 20);
+        assert_ne!(
+            emu.live_floor(),
+            before,
+            "premise: the reflow moved the floor"
+        );
+        st.finalize(&emu, None, None);
+        let p = st.resolve(t0, true, &emu, None).clone();
+        assert_eq!(
+            (p.text.as_str(), p.source, p.frozen),
+            ("working", PreviewSource::Title, true),
+            "a reflow is not post-teardown output"
+        );
+    }
+
+    /// The dirty variant: real output after teardown, then a resize. The
+    /// pre-resize floor already differs from the snapshot, the mismatch is
+    /// evidence and stands, and finalize freezes the output floor.
+    #[test]
+    fn finalize_freezes_output_across_a_resize_after_teardown() {
+        let t0 = Instant::now();
+        let mut st = PreviewState::new();
+        let mut emu = Emulator::new(24, 40, 100);
+        emu.process(b"prelaunch junk that will wrap\r\n");
+        emu.process(b"\x1b[?1049h\x1b]0;working\x07app body");
+        assert_eq!(
+            st.resolve(t0, false, &emu, None).source,
+            PreviewSource::Title
+        );
+
+        emu.process(b"\x1b[?1049l");
+        emu.process(b"done\r\n");
+        emu.resize(24, 20);
+        st.finalize(&emu, None, None);
+        let p = st.resolve(t0, true, &emu, None).clone();
+        assert_eq!(
+            (p.text.as_str(), p.source, p.frozen),
+            ("done", PreviewSource::Floor, true),
+            "real post-teardown output must survive the resize"
         );
     }
 
@@ -643,11 +1099,11 @@ mod tests {
         let mut s = FakeScreen::primary("shell");
         s.enter_alt();
         s.set_title("step 1");
-        st.resolve(t0, false, &s);
+        st.resolve(t0, false, &s, None);
 
         s.set_title("step 2: done");
-        st.finalize(&s);
-        let p = st.resolve(t0, true, &s).clone();
+        st.finalize(&s, None, None);
+        let p = st.resolve(t0, true, &s, None).clone();
         assert_eq!(
             (p.text.as_str(), p.source, p.frozen),
             ("step 2: done", PreviewSource::Title, true)

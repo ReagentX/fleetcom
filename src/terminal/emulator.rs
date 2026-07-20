@@ -15,7 +15,7 @@ use alacritty_terminal::{
         Config, TermMode,
         cell::{Cell, Flags},
     },
-    vte::ansi::Processor,
+    vte::ansi::{self as vt, Handler, Processor},
 };
 
 /// Mouse event classes requested by the child through DECSET 1000/1002/1003.
@@ -35,47 +35,26 @@ pub enum MouseProtocolEncoding {
     Sgr,
 }
 
-/// The last title event of an advance, if any: `Some(text)` for a set,
-/// `None` for a reset (RIS or a title-stack pop). One slot, not a queue —
-/// only the final title of a chunk can be displayed, so earlier ones carry
-/// no information. Chunk-granular observation is the documented contract.
-type PendingTitle = Option<Option<String>>;
-
-/// Routes the backend's `Event::PtyWrite` probe responses into a buffer and
-/// records the advance's last title event. The listener fires inside
-/// `Processor::advance`, while the caller holds the emulator lock, so it only
-/// stores, never blocks; the caller drains, filters, and sanitizes after
-/// `advance` returns. Every other backend event (clipboard, color requests,
-/// bell) is discarded here: the default-deny probe policy starts with what
-/// never gets buffered.
+/// Routes the backend's `Event::PtyWrite` probe responses into a buffer.
+/// The listener fires inside `Processor::advance`, while the caller holds
+/// the emulator lock, so it only stores, never blocks; the caller drains,
+/// filters, and sanitizes after `advance` returns. Every other backend
+/// event (titles, clipboard, color requests, bell) is discarded here: the
+/// default-deny probe policy starts with what never gets buffered, and
+/// titles are observed at their handler event by [`ObservedTerm`], not
+/// through this listener.
 pub struct ProbeSink {
     responses: Arc<Mutex<Vec<String>>>,
-    title_event: Arc<Mutex<PendingTitle>>,
 }
 
 impl EventListener for ProbeSink {
     fn send_event(&self, event: Event) {
-        match event {
-            Event::PtyWrite(text) => {
-                let mut buf = self
-                    .responses
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                buf.push(text);
-            }
-            Event::Title(title) => {
-                *self
-                    .title_event
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Some(title));
-            }
-            Event::ResetTitle => {
-                *self
-                    .title_event
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(None);
-            }
-            _ => {}
+        if let Event::PtyWrite(text) = event {
+            let mut buf = self
+                .responses
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            buf.push(text);
         }
     }
 }
@@ -182,10 +161,11 @@ fn sanitize_title(raw: &str) -> String {
     out
 }
 
-/// A sanitized title plus the alt-screen epoch it was captured in. The title
-/// is honored only while its epoch is current: each alt-screen entry starts a
-/// new epoch, so a title from the shell (or a previous full-screen app) never
-/// labels the app that replaced it.
+/// A sanitized title plus the alt-screen epoch it was captured in — at the
+/// title event itself, or by promotion from staging at the entry event (see
+/// [`ObservedTerm::observe_title`]). The title is honored only while its
+/// epoch is current: each alt-screen entry starts a new epoch, so a title
+/// from a previous full-screen app never labels the app that replaced it.
 struct CapturedTitle {
     text: String,
     alt_epoch: u64,
@@ -205,16 +185,9 @@ pub struct Emulator {
     term: Term<ProbeSink>,
     parser: Processor,
     responses: Arc<Mutex<Vec<String>>>,
-    /// Written by the listener during an advance, consumed by
-    /// `observe_advance` afterwards.
-    title_event: Arc<Mutex<PendingTitle>>,
-    captured_title: Option<CapturedTitle>,
-    /// Count of alt-screen entries. Compared against
-    /// `CapturedTitle::alt_epoch` to expire titles at app boundaries.
-    alt_epoch: u64,
-    /// Alt bit as of the last bookkeeping step: entry detection needs the
-    /// previous value, and the mode register only holds the current one.
-    last_alt_screen: bool,
+    /// Alt-screen and title facts, advanced at parser-event granularity by
+    /// [`ObservedTerm`] during the parse itself.
+    alt: AltScreen,
     /// Bumped once per grid advance; cheap change detection for consumers
     /// that poll the grid.
     revision: u64,
@@ -277,7 +250,6 @@ impl Emulator {
     /// A fresh `rows`×`cols` grid retaining `scrollback` rows of history.
     pub fn new(rows: u16, cols: u16, scrollback: usize) -> Self {
         let responses = Arc::new(Mutex::new(Vec::new()));
-        let title_event = Arc::new(Mutex::new(None));
         let config = Config {
             // Use fleetcom's per-task history limit instead of the backend
             // default.
@@ -292,59 +264,36 @@ impl Emulator {
             },
             ProbeSink {
                 responses: Arc::clone(&responses),
-                title_event: Arc::clone(&title_event),
             },
         );
         Self {
             term,
             parser: Processor::new(),
             responses,
-            title_event,
-            captured_title: None,
-            alt_epoch: 0,
-            last_alt_screen: false,
+            alt: AltScreen::default(),
             revision: 0,
             bytes_since_sweep: 0,
         }
     }
 
     /// The shared bookkeeping step behind every grid advance — `process` and
-    /// both sync-frame landings — so all three paths observe identical state
-    /// transitions. Ordering is load-bearing: the epoch compare precedes
-    /// title stamping, so a title anywhere in a chunk that also enters the
-    /// alt screen lands in the new epoch (children emit the title bytes just
-    /// before DECSET 1049).
+    /// both sync-frame landings. Nothing but the revision bump remains:
+    /// epochs, teardown snapshots, and title ownership are all observed at
+    /// their parser events by [`ObservedTerm`], so no preview semantics
+    /// depend on where PTY reads split.
     fn observe_advance(&mut self) {
         self.revision += 1;
-        let alt = self.alternate_screen();
-        if alt && !self.last_alt_screen {
-            self.alt_epoch += 1;
-        }
-        self.last_alt_screen = alt;
-        let pending = self
-            .title_event
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take();
-        if let Some(event) = pending {
-            // A reset and a title that sanitizes to nothing both unset the
-            // capture: `printf '\x1b]0;\x07'` clears a title, it does not
-            // freeze a stale one.
-            self.captured_title = event
-                .map(|raw| sanitize_title(&raw))
-                .filter(|text| !text.is_empty())
-                .map(|text| CapturedTitle {
-                    text,
-                    alt_epoch: self.alt_epoch,
-                });
-        }
     }
 
     /// Parse raw child output into the grid. Returns the probe replies the
     /// backend generated that pass the allowlist, in generation order; the
     /// caller owns delivering them to the child.
     pub fn process(&mut self, bytes: &[u8]) -> Vec<String> {
-        self.parser.advance(&mut self.term, bytes);
+        let mut observed = ObservedTerm {
+            term: &mut self.term,
+            alt: &mut self.alt,
+        };
+        self.parser.advance(&mut observed, bytes);
         self.observe_advance();
         self.bytes_since_sweep = self.bytes_since_sweep.saturating_add(bytes.len());
         if self.bytes_since_sweep >= SWEEP_INTERVAL_BYTES {
@@ -370,7 +319,11 @@ impl Emulator {
         if !expired {
             return Vec::new();
         }
-        self.parser.stop_sync(&mut self.term);
+        let mut observed = ObservedTerm {
+            term: &mut self.term,
+            alt: &mut self.alt,
+        };
+        self.parser.stop_sync(&mut observed);
         self.observe_advance();
         self.drain_allowed()
     }
@@ -385,7 +338,11 @@ impl Emulator {
         if self.parser.sync_timeout().sync_timeout().is_none() {
             return Vec::new();
         }
-        self.parser.stop_sync(&mut self.term);
+        let mut observed = ObservedTerm {
+            term: &mut self.term,
+            alt: &mut self.alt,
+        };
+        self.parser.stop_sync(&mut observed);
         self.observe_advance();
         self.drain_allowed()
     }
@@ -512,10 +469,32 @@ impl Emulator {
 
     /// Resize the grid to `rows`×`cols`.
     pub fn resize(&mut self, rows: u16, cols: u16) {
+        // The teardown snapshot must survive the reflow: when the floor
+        // still equals it (nothing written since the alt exit), the resize
+        // rewraps one side of the finalize comparison, so re-snapshot the
+        // reflowed floor afterwards to keep both sides equal. When they
+        // already differ, real output arrived and the mismatch is evidence
+        // — leave it standing. Never simply clear: a cleared snapshot
+        // fails the teardown carve-out and freezes restored junk, the
+        // wrong direction. Exact equality in both branches; no heuristic.
+        let untouched = self
+            .alt
+            .leave_floor
+            .as_deref()
+            .is_some_and(|snapshot| live_floor_of(&self.term) == snapshot);
         self.term.resize(GridSize {
             lines: rows as usize,
             columns: cols as usize,
         });
+        if untouched {
+            self.alt.leave_floor = Some(live_floor_of(&self.term));
+        }
+        // A resize reflows the grid — wrapping, row positions — without any
+        // bytes arriving, so revision-keyed pollers must re-read. A bare
+        // bump, not `observe_advance`: that step consumes byte-driven state
+        // (a pending title event) that a resize never produces, and
+        // consuming it here would misattribute it.
+        self.revision += 1;
     }
 
     /// Grid size as `(rows, cols)`.
@@ -540,16 +519,33 @@ impl Emulator {
 
     /// Count of alt-screen entries observed so far.
     pub fn alt_epoch(&self) -> u64 {
-        self.alt_epoch
+        self.alt.epoch
     }
 
-    /// The captured window title, honored only while its alt-screen epoch is
-    /// current: a title set before the child entered the alt screen, or
-    /// during a previous alt session, reads as `None`.
+    /// The floor snapshotted at the most recent alt-screen exit (see the
+    /// field docs); `None` until the child first leaves the alt screen.
+    pub fn alt_leave_floor(&self) -> Option<&str> {
+        self.alt.leave_floor.as_deref()
+    }
+
+    /// The window title. On the alternate screen: the captured title,
+    /// honored only while its alt-screen epoch is current — a title from a
+    /// previous alt session reads as `None`. On the primary screen: a live
+    /// staged announce (a title not yet disclaimed by printed output)
+    /// surfaces first, then a still-current captured title.
     pub fn title(&self) -> Option<&str> {
-        self.captured_title
+        // On the primary screen a live staged announce surfaces, so shell
+        // titles read as before; the preview cascade never consults titles
+        // there. The captured title keeps its epoch gate unchanged.
+        if !self.alternate_screen()
+            && let Some(staged) = self.alt.staged_title.as_deref()
+        {
+            return Some(staged);
+        }
+        self.alt
+            .title
             .as_ref()
-            .filter(|t| t.alt_epoch == self.alt_epoch)
+            .filter(|t| t.alt_epoch == self.alt.epoch)
             .map(|t| t.text.as_str())
     }
 
@@ -558,34 +554,443 @@ impl Emulator {
     /// `contents` follows `display_offset`, which would make a scrolled-back
     /// task preview historical rows instead of live output.
     pub fn live_floor(&self) -> String {
-        let grid = self.term.grid();
-        // Rows 0..screen_lines address the live viewport regardless of the
-        // display offset; only display iteration follows the offset.
-        for row in (0..grid.screen_lines() as i32).rev() {
-            let line = &grid[Line(row)];
-            let mut text = String::new();
-            for col in 0..grid.columns() {
-                let cell = &line[Column(col)];
-                // Spacers have no glyph; terminal tabs occupy visible spaces.
-                if cell
-                    .flags
-                    .intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER)
-                {
-                    continue;
-                }
-                text.push(if cell.c == '\t' { ' ' } else { cell.c });
-                if let Some(zerowidth) = cell.zerowidth() {
-                    text.extend(zerowidth.iter());
-                }
-            }
-            while text.ends_with(' ') {
-                text.pop();
-            }
-            if !text.is_empty() {
-                return text;
+        live_floor_of(&self.term)
+    }
+
+    /// Every live-viewport row, top to bottom, trailing padding trimmed: the
+    /// summary adapters' structural scan input. Ignores the scrollback view
+    /// offset for the same reason as [`Emulator::live_floor`].
+    pub fn live_rows(&self) -> Vec<String> {
+        (0..self.term.grid().screen_lines() as i32)
+            .map(|row| live_row_text_of(&self.term, row))
+            .collect()
+    }
+}
+
+/// The last non-blank row of `term`'s live screen, trailing padding
+/// trimmed; empty when the screen is blank (see [`Emulator::live_floor`]).
+/// Free over the term so the alt-exit observer can snapshot mid-advance,
+/// while the `&mut Term` is borrowed as a handler.
+fn live_floor_of(term: &Term<ProbeSink>) -> String {
+    for row in (0..term.grid().screen_lines() as i32).rev() {
+        let text = live_row_text_of(term, row);
+        if !text.is_empty() {
+            return text;
+        }
+    }
+    String::new()
+}
+
+/// Plain text of one live-viewport row, trailing padding trimmed. Rows
+/// `0..screen_lines` address live output regardless of the display
+/// offset; only display iteration follows the offset.
+fn live_row_text_of(term: &Term<ProbeSink>, row: i32) -> String {
+    let grid = term.grid();
+    let line = &grid[Line(row)];
+    let mut text = String::new();
+    for col in 0..grid.columns() {
+        let cell = &line[Column(col)];
+        // Spacers have no glyph; terminal tabs occupy visible spaces.
+        if cell
+            .flags
+            .intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER)
+        {
+            continue;
+        }
+        text.push(if cell.c == '\t' { ' ' } else { cell.c });
+        if let Some(zerowidth) = cell.zerowidth() {
+            text.extend(zerowidth.iter());
+        }
+    }
+    while text.ends_with(' ') {
+        text.pop();
+    }
+    text
+}
+
+/// Alt-screen and title facts observed at parser-event granularity: every
+/// field moves at its exact event, never at read boundaries, so no preview
+/// semantics depend on where PTY reads split — a read that coalesces a
+/// teardown with successor output, a leave and re-enter, or a title with a
+/// following mode flip all observe identically however the reads land.
+///
+/// The one accepted residual: a title emitted between two apps (after A's
+/// 1049l, before B's 1049h) with no intervening glyphs stages into B —
+/// indistinguishable from grok's legitimate pre-entry announce by any fact
+/// held here.
+#[derive(Default)]
+struct AltScreen {
+    /// Count of alt-screen entries. Compared against
+    /// `CapturedTitle::alt_epoch` to expire titles at app boundaries.
+    epoch: u64,
+    /// Alt bit after the last observed mode event: transition detection
+    /// needs the previous value, and the mode register only holds the
+    /// current one.
+    last_alt: bool,
+    /// The live floor captured at each alt-screen exit, at the mode event
+    /// itself: successor bytes in the same read have not parsed yet, so
+    /// this is exactly what the restore left visible. Preview finalization
+    /// compares the final floor against it to tell restored pre-launch
+    /// junk from real primary output written after teardown.
+    leave_floor: Option<String>,
+    /// Sanitized title owned by an alt session, epoch-stamped at its event.
+    title: Option<CapturedTitle>,
+    /// Sanitized title announced on the primary screen, awaiting the next
+    /// alt entry: grok titles the window just before its 1049h, and the
+    /// entry event promotes this into the new epoch. Printable output
+    /// disclaims it (see the `input` forward); a reset clears it.
+    staged_title: Option<String>,
+    /// Mirror of the backend's raw (unsanitized) current title, kept only
+    /// so the title-stack shadow pushes what the backend pushes.
+    raw_title: Option<String>,
+    /// Mirror of the backend's title stack. A pop restores through the
+    /// backend's own internal `set_title`, which never re-enters the
+    /// wrapper, so the pop is replayed against this shadow instead. Same
+    /// bound and eviction as the backend (`TITLE_STACK_MAX_DEPTH`, pinned
+    /// `=0.26.0`).
+    title_stack: Vec<Option<String>>,
+}
+
+/// The backend's `TITLE_STACK_MAX_DEPTH` (term/mod.rs, pinned `=0.26.0`):
+/// the shadow stack must evict exactly when the backend does or a deep
+/// stack would desynchronize pops.
+const TITLE_STACK_SHADOW_MAX: usize = 4096;
+
+/// Delegating [`Handler`] that forwards every parser event to the wrapped
+/// [`Term`] and observes alt-screen transitions the moment they happen.
+///
+/// # Missed-forward hazard
+///
+/// Every `Handler` method has an empty `{}` default, so a missing forward
+/// compiles silently and swallows that escape. Two fences hold: the
+/// backend is pinned `=0.26.0` in Cargo.toml, and
+/// `golden::emulator_wrapper_matches_the_raw_backend_on_every_fixture`
+/// replays every corpus fixture through this wrapper and diffs the full
+/// screen, cursor, and mode against a raw backend replay — a swallowed
+/// method breaks it loudly (the classic goldens alone cannot serve: they
+/// drive the raw backend and never touch this path). The forwards below
+/// are mechanically generated from the vte 0.15 trait: 71 methods,
+/// count-verified against the trait definition.
+///
+/// # Why this is sound under `?2026`
+///
+/// The parser buffers a synchronized-update frame and drives the handler
+/// only when the frame lands (in `advance` or `stop_sync` — both routed
+/// through this wrapper), so these events fire exactly when the grid
+/// moves: the observer can never see a transition the grid has not
+/// performed, which no byte-scanner could guarantee.
+struct ObservedTerm<'a> {
+    term: &'a mut Term<ProbeSink>,
+    alt: &'a mut AltScreen,
+}
+
+impl ObservedTerm<'_> {
+    /// Compare the wrapped term's alt bit against the last observed value
+    /// after a delegated mode-touching event. Mode-number-agnostic by
+    /// design — no 1049/1047/47 literals: the bit compare tracks whatever
+    /// modes the backend maps to the alt screen, surviving backend
+    /// changes.
+    fn observe_alt(&mut self) {
+        let alt = self.term.mode().contains(TermMode::ALT_SCREEN);
+        if alt && !self.alt.last_alt {
+            self.alt.epoch += 1;
+            // Promote a staged primary-screen announce into the new epoch:
+            // the announce belongs to exactly this entry, so promotion
+            // consumes it.
+            if let Some(text) = self.alt.staged_title.take() {
+                self.alt.title = Some(CapturedTitle {
+                    text,
+                    alt_epoch: self.alt.epoch,
+                });
             }
         }
-        String::new()
+        if !alt && self.alt.last_alt {
+            self.alt.leave_floor = Some(live_floor_of(self.term));
+        }
+        self.alt.last_alt = alt;
+    }
+
+    /// Title ownership at the event. A title set ON the alt screen labels
+    /// the current epoch, where it was spoken. A title set on the primary
+    /// screen is STAGED for the next alt entry — grok announces its title
+    /// just before its 1049h — and promoted at the entry event. A reset,
+    /// or a title that sanitizes to nothing, clears both: `printf
+    /// '\x1b]0;\x07'` un-titles the window, it does not freeze a stale
+    /// one. Staging is disclaimed by printable output (`input`), never by
+    /// control traffic: grok's gap between its title and 1049h is clears
+    /// and cursor moves, which must not disclaim, while a shell prompt
+    /// always prints glyphs, so a prompt-titling shell cannot leak its
+    /// title into the next app. Input-only is the deliberate, minimal
+    /// rule.
+    fn observe_title(&mut self, title: Option<String>) {
+        self.alt.raw_title.clone_from(&title);
+        let text = title
+            .map(|raw| sanitize_title(&raw))
+            .filter(|text| !text.is_empty());
+        let Some(text) = text else {
+            self.alt.title = None;
+            self.alt.staged_title = None;
+            return;
+        };
+        if self.term.mode().contains(TermMode::ALT_SCREEN) {
+            self.alt.title = Some(CapturedTitle {
+                text,
+                alt_epoch: self.alt.epoch,
+            });
+        } else {
+            self.alt.staged_title = Some(text);
+        }
+    }
+}
+
+/// Mechanical forwards. Five carry observations after delegating:
+/// `set_private_mode`, `unset_private_mode`, and `reset_state` observe the
+/// alt bit (RIS exits the alt screen too); `set_title` observes title
+/// ownership; `input` disclaims a staged title. `push_title`/`pop_title`
+/// maintain the shadow stack because the backend's pop restores through
+/// its own internal `set_title`, which never re-enters this wrapper.
+impl Handler for ObservedTerm<'_> {
+    fn set_title(&mut self, a0: Option<String>) {
+        self.term.set_title(a0.clone());
+        self.observe_title(a0);
+    }
+    fn set_cursor_style(&mut self, a0: Option<vt::CursorStyle>) {
+        self.term.set_cursor_style(a0);
+    }
+    fn set_cursor_shape(&mut self, a0: vt::CursorShape) {
+        self.term.set_cursor_shape(a0);
+    }
+    fn input(&mut self, a0: char) {
+        self.term.input(a0);
+        // Printable output disclaims a staged title (rationale on
+        // `observe_title`). One branch, predictably not-taken: staging is
+        // only ever live between a primary-screen title and the next alt
+        // entry.
+        if self.alt.staged_title.is_some() {
+            self.alt.staged_title = None;
+        }
+    }
+    fn goto(&mut self, a0: i32, a1: usize) {
+        self.term.goto(a0, a1);
+    }
+    fn goto_line(&mut self, a0: i32) {
+        self.term.goto_line(a0);
+    }
+    fn goto_col(&mut self, a0: usize) {
+        self.term.goto_col(a0);
+    }
+    fn insert_blank(&mut self, a0: usize) {
+        self.term.insert_blank(a0);
+    }
+    fn move_up(&mut self, a0: usize) {
+        self.term.move_up(a0);
+    }
+    fn move_down(&mut self, a0: usize) {
+        self.term.move_down(a0);
+    }
+    fn identify_terminal(&mut self, a0: Option<char>) {
+        self.term.identify_terminal(a0);
+    }
+    fn device_status(&mut self, a0: usize) {
+        self.term.device_status(a0);
+    }
+    fn move_forward(&mut self, a0: usize) {
+        self.term.move_forward(a0);
+    }
+    fn move_backward(&mut self, a0: usize) {
+        self.term.move_backward(a0);
+    }
+    fn move_down_and_cr(&mut self, a0: usize) {
+        self.term.move_down_and_cr(a0);
+    }
+    fn move_up_and_cr(&mut self, a0: usize) {
+        self.term.move_up_and_cr(a0);
+    }
+    fn put_tab(&mut self, a0: u16) {
+        self.term.put_tab(a0);
+    }
+    fn backspace(&mut self) {
+        self.term.backspace();
+    }
+    fn carriage_return(&mut self) {
+        self.term.carriage_return();
+    }
+    fn linefeed(&mut self) {
+        self.term.linefeed();
+    }
+    fn bell(&mut self) {
+        self.term.bell();
+    }
+    fn substitute(&mut self) {
+        self.term.substitute();
+    }
+    fn newline(&mut self) {
+        self.term.newline();
+    }
+    fn set_horizontal_tabstop(&mut self) {
+        self.term.set_horizontal_tabstop();
+    }
+    fn scroll_up(&mut self, a0: usize) {
+        self.term.scroll_up(a0);
+    }
+    fn scroll_down(&mut self, a0: usize) {
+        self.term.scroll_down(a0);
+    }
+    fn insert_blank_lines(&mut self, a0: usize) {
+        self.term.insert_blank_lines(a0);
+    }
+    fn delete_lines(&mut self, a0: usize) {
+        self.term.delete_lines(a0);
+    }
+    fn erase_chars(&mut self, a0: usize) {
+        self.term.erase_chars(a0);
+    }
+    fn delete_chars(&mut self, a0: usize) {
+        self.term.delete_chars(a0);
+    }
+    fn move_backward_tabs(&mut self, a0: u16) {
+        self.term.move_backward_tabs(a0);
+    }
+    fn move_forward_tabs(&mut self, a0: u16) {
+        self.term.move_forward_tabs(a0);
+    }
+    fn save_cursor_position(&mut self) {
+        self.term.save_cursor_position();
+    }
+    fn restore_cursor_position(&mut self) {
+        self.term.restore_cursor_position();
+    }
+    fn clear_line(&mut self, a0: vt::LineClearMode) {
+        self.term.clear_line(a0);
+    }
+    fn clear_screen(&mut self, a0: vt::ClearMode) {
+        self.term.clear_screen(a0);
+    }
+    fn clear_tabs(&mut self, a0: vt::TabulationClearMode) {
+        self.term.clear_tabs(a0);
+    }
+    fn set_tabs(&mut self, a0: u16) {
+        self.term.set_tabs(a0);
+    }
+    fn reset_state(&mut self) {
+        self.term.reset_state();
+        self.observe_alt();
+        // RIS clears the backend's title and title stack directly, without
+        // a handler event (term/mod.rs `reset_state`): mirror both, and
+        // drop any staged announce with the rest of the pre-reset world.
+        // The captured title stays — it is epoch-gated and expires at the
+        // next entry, matching the pre-observer behavior.
+        self.alt.raw_title = None;
+        self.alt.title_stack.clear();
+        self.alt.staged_title = None;
+    }
+    fn reverse_index(&mut self) {
+        self.term.reverse_index();
+    }
+    fn terminal_attribute(&mut self, a0: vt::Attr) {
+        self.term.terminal_attribute(a0);
+    }
+    fn set_mode(&mut self, a0: vt::Mode) {
+        self.term.set_mode(a0);
+    }
+    fn unset_mode(&mut self, a0: vt::Mode) {
+        self.term.unset_mode(a0);
+    }
+    fn report_mode(&mut self, a0: vt::Mode) {
+        self.term.report_mode(a0);
+    }
+    fn set_private_mode(&mut self, a0: vt::PrivateMode) {
+        self.term.set_private_mode(a0);
+        self.observe_alt();
+    }
+    fn unset_private_mode(&mut self, a0: vt::PrivateMode) {
+        self.term.unset_private_mode(a0);
+        self.observe_alt();
+    }
+    fn report_private_mode(&mut self, a0: vt::PrivateMode) {
+        self.term.report_private_mode(a0);
+    }
+    fn set_scrolling_region(&mut self, a0: usize, a1: Option<usize>) {
+        self.term.set_scrolling_region(a0, a1);
+    }
+    fn set_keypad_application_mode(&mut self) {
+        self.term.set_keypad_application_mode();
+    }
+    fn unset_keypad_application_mode(&mut self) {
+        self.term.unset_keypad_application_mode();
+    }
+    fn set_active_charset(&mut self, a0: vt::CharsetIndex) {
+        self.term.set_active_charset(a0);
+    }
+    fn configure_charset(&mut self, a0: vt::CharsetIndex, a1: vt::StandardCharset) {
+        self.term.configure_charset(a0, a1);
+    }
+    fn set_color(&mut self, a0: usize, a1: vt::Rgb) {
+        self.term.set_color(a0, a1);
+    }
+    fn dynamic_color_sequence(&mut self, a0: String, a1: usize, a2: &str) {
+        self.term.dynamic_color_sequence(a0, a1, a2);
+    }
+    fn reset_color(&mut self, a0: usize) {
+        self.term.reset_color(a0);
+    }
+    fn clipboard_store(&mut self, a0: u8, a1: &[u8]) {
+        self.term.clipboard_store(a0, a1);
+    }
+    fn clipboard_load(&mut self, a0: u8, a1: &str) {
+        self.term.clipboard_load(a0, a1);
+    }
+    fn decaln(&mut self) {
+        self.term.decaln();
+    }
+    fn push_title(&mut self) {
+        self.term.push_title();
+        // Mirror the backend's bounded push of its current raw title.
+        if self.alt.title_stack.len() >= TITLE_STACK_SHADOW_MAX {
+            self.alt.title_stack.remove(0);
+        }
+        self.alt.title_stack.push(self.alt.raw_title.clone());
+    }
+    fn pop_title(&mut self) {
+        self.term.pop_title();
+        // Replay the pop against the shadow: the restored value is a title
+        // event in every sense (a popped `None` is a reset).
+        if let Some(popped) = self.alt.title_stack.pop() {
+            self.observe_title(popped);
+        }
+    }
+    fn text_area_size_pixels(&mut self) {
+        self.term.text_area_size_pixels();
+    }
+    fn text_area_size_chars(&mut self) {
+        self.term.text_area_size_chars();
+    }
+    fn set_hyperlink(&mut self, a0: Option<vt::Hyperlink>) {
+        self.term.set_hyperlink(a0);
+    }
+    fn set_mouse_cursor_icon(&mut self, a0: vt::cursor_icon::CursorIcon) {
+        self.term.set_mouse_cursor_icon(a0);
+    }
+    fn report_keyboard_mode(&mut self) {
+        self.term.report_keyboard_mode();
+    }
+    fn push_keyboard_mode(&mut self, a0: vt::KeyboardModes) {
+        self.term.push_keyboard_mode(a0);
+    }
+    fn pop_keyboard_modes(&mut self, a0: u16) {
+        self.term.pop_keyboard_modes(a0);
+    }
+    fn set_keyboard_mode(&mut self, a0: vt::KeyboardModes, a1: vt::KeyboardModesApplyBehavior) {
+        self.term.set_keyboard_mode(a0, a1);
+    }
+    fn set_modify_other_keys(&mut self, a0: vt::ModifyOtherKeys) {
+        self.term.set_modify_other_keys(a0);
+    }
+    fn report_modify_other_keys(&mut self) {
+        self.term.report_modify_other_keys();
+    }
+    fn set_scp(&mut self, a0: vt::ScpCharPath, a1: vt::ScpUpdateMode) {
+        self.term.set_scp(a0, a1);
     }
 }
 
@@ -1091,7 +1496,12 @@ mod tests {
             '\u{202E}', '\u{2066}', '\u{2067}', '\u{2068}', '\u{2069}',
         ];
         for c in bidi {
-            assert_eq!(sanitize_title(&format!("a{c}b")), "ab", "U+{:04X}", c as u32);
+            assert_eq!(
+                sanitize_title(&format!("a{c}b")),
+                "ab",
+                "U+{:04X}",
+                c as u32
+            );
         }
     }
 
@@ -1143,9 +1553,9 @@ mod tests {
         assert_eq!(emu.title(), None, "ResetTitle must unset the capture");
     }
 
-    /// A title in the same chunk that enters the alt screen stamps into the
-    /// new epoch: the epoch compare runs before title consumption, because
-    /// children emit the title bytes just before DECSET 1049.
+    /// A title just before the alt entry stages and is promoted into the
+    /// new epoch at the entry event — children emit the title bytes just
+    /// before DECSET 1049, and no glyphs intervene to disclaim it.
     #[test]
     fn title_entering_alt_in_one_chunk_is_honored() {
         let mut emu = Emulator::new(4, 20, 0);
@@ -1154,15 +1564,90 @@ mod tests {
         assert_eq!(emu.title(), Some("app"));
     }
 
-    /// A title captured in an earlier chunk predates the alt entry and is
-    /// not honored once the child enters the alt screen.
+    /// A primary-screen title followed by printed output is the shell
+    /// titling itself: the glyphs are what disclaim it now — a bare title
+    /// with only control traffic until the entry stays valid by the
+    /// staging rule, deliberately (that is grok's announce shape).
     #[test]
     fn title_before_alt_entry_in_a_prior_chunk_expires() {
         let mut emu = Emulator::new(4, 20, 0);
         emu.process(b"\x1b]0;shell\x07");
         assert_eq!(emu.title(), Some("shell"));
+        emu.process(b"$ make\r\n");
         emu.process(b"\x1b[?1049h");
-        assert_eq!(emu.title(), None, "an epoch-0 title cannot label the app");
+        assert_eq!(
+            emu.title(),
+            None,
+            "printed output disclaimed the staged title"
+        );
+    }
+
+    /// The maintainer's counterexample: app A titles itself inside alt
+    /// epoch 1, then bounces to app B. Whether the title, the 1049l, and
+    /// the 1049h share one read or split before the 1049l, the outcome is
+    /// identical — the title event stamped epoch 1 at the event, and the
+    /// bounce advanced to 2.
+    #[test]
+    fn in_alt_title_expires_across_a_bounce_on_any_read_boundary() {
+        for split in [false, true] {
+            let mut emu = Emulator::new(4, 20, 0);
+            emu.process(b"\x1b[?1049hui");
+            assert_eq!(emu.alt_epoch(), 1);
+            if split {
+                emu.process(b"\x1b]0;first\x07");
+                emu.process(b"\x1b[?1049l\x1b[?1049h");
+            } else {
+                emu.process(b"\x1b]0;first\x07\x1b[?1049l\x1b[?1049h");
+            }
+            assert_eq!(emu.alt_epoch(), 2, "split={split}");
+            assert_eq!(
+                emu.title(),
+                None,
+                "split={split}: A's title must not label B"
+            );
+        }
+    }
+
+    /// grok's announce shape: a primary-screen title, a control-only gap
+    /// (clears and cursor moves), then the alt entry — honored on either
+    /// read boundary, because control traffic never disclaims staging.
+    #[test]
+    fn staged_title_survives_a_control_only_gap_into_the_entry() {
+        for split in [false, true] {
+            let mut emu = Emulator::new(4, 20, 0);
+            if split {
+                emu.process(b"\x1b]0;grok\x07\x1b[2J\x1b[H");
+                emu.process(b"\x1b[?1049h");
+            } else {
+                emu.process(b"\x1b]0;grok\x07\x1b[2J\x1b[H\x1b[?1049h");
+            }
+            assert_eq!(emu.alt_epoch(), 1, "split={split}");
+            assert_eq!(emu.title(), Some("grok"), "split={split}");
+        }
+    }
+
+    /// One printed glyph between a primary-screen title and the entry
+    /// disclaims the staging: a prompt-titling shell never leaks its title
+    /// into the next app.
+    #[test]
+    fn staged_title_is_disclaimed_by_a_single_glyph() {
+        let mut emu = Emulator::new(4, 20, 0);
+        emu.process(b"\x1b]0;shell\x07x\x1b[?1049h");
+        assert_eq!(emu.alt_epoch(), 1);
+        assert_eq!(emu.title(), None);
+    }
+
+    /// The accepted residual, pinned as documented behavior: a title
+    /// emitted between two apps — after A's 1049l, before B's 1049h — with
+    /// no intervening glyphs stages into B. No fact held here can tell it
+    /// from grok's legitimate pre-entry announce (`AltScreen` docs).
+    #[test]
+    fn inter_app_title_with_no_glyphs_stages_into_the_next_app() {
+        let mut emu = Emulator::new(4, 20, 0);
+        emu.process(b"\x1b[?1049hui A");
+        emu.process(b"\x1b[?1049l\x1b]0;handoff\x07\x1b[?1049h");
+        assert_eq!(emu.alt_epoch(), 2);
+        assert_eq!(emu.title(), Some("handoff"));
     }
 
     /// Each alt entry advances the epoch and expires prior titles; leaving
@@ -1180,10 +1665,11 @@ mod tests {
         assert_eq!(emu.title(), None, "re-entry expires the previous title");
     }
 
-    /// A title followed by leaving the alt screen in the same chunk reads as
-    /// primary: the exit keeps the epoch, so the title stamps as current.
+    /// A title followed by leaving the alt screen: the title event fires
+    /// while the alt screen is still active, capturing into the current
+    /// epoch, and the exit keeps the epoch — so it stays honored.
     #[test]
-    fn title_leaving_alt_in_one_chunk_reads_as_primary() {
+    fn title_just_before_alt_exit_stays_honored() {
         let mut emu = Emulator::new(4, 20, 0);
         emu.process(b"\x1b[?1049h");
         assert_eq!(emu.alt_epoch(), 1);
@@ -1239,6 +1725,69 @@ mod tests {
         assert_eq!(emu.revision(), 2, "no open frame: nothing advanced");
     }
 
+    /// A resize reflows the grid with no bytes arriving: revision-keyed
+    /// pollers would otherwise carry a pre-resize snapshot indefinitely on
+    /// a quiet task.
+    #[test]
+    fn resize_bumps_the_revision_without_bytes() {
+        let mut emu = Emulator::new(4, 20, 0);
+        emu.process(b"hello\r\nworld");
+        let before = emu.revision();
+        emu.resize(6, 30);
+        assert_eq!(emu.revision(), before + 1);
+    }
+
+    /// The alt-exit snapshot captures what the 1049l restore left visible,
+    /// at the mode event itself: text after the 1049l — in a later read OR
+    /// coalesced into the same one — moves the floor without touching the
+    /// snapshot. PTY reads do not preserve write boundaries, so the
+    /// coalesced case is routine on a loaded machine, not rare.
+    #[test]
+    fn alt_leave_floor_snapshots_the_restore() {
+        let mut emu = Emulator::new(4, 20, 0);
+        emu.process(b"junk\r\n");
+        assert_eq!(emu.alt_leave_floor(), None, "no exit yet");
+        emu.process(b"\x1b[?1049halt body");
+        emu.process(b"\x1b[?1049l");
+        assert_eq!(emu.alt_leave_floor(), Some("junk"));
+
+        emu.process(b"done\r\n");
+        assert_eq!(
+            emu.alt_leave_floor(),
+            Some("junk"),
+            "later chunks leave the snapshot alone"
+        );
+        assert_eq!(emu.live_floor(), "done");
+
+        emu.process(b"\x1b[?1049halt again");
+        emu.process(b"\x1b[?1049lcoalesced\r\n");
+        assert_eq!(
+            emu.alt_leave_floor(),
+            Some("done"),
+            "a coalesced read still snapshots at the mode event"
+        );
+        assert_eq!(emu.live_floor(), "coalesced");
+    }
+
+    /// The maintainer's epoch regression: a leave and re-enter inside one
+    /// read must advance the epoch and expire the previous app's title —
+    /// read boundaries are not allowed to decide title expiry.
+    #[test]
+    fn same_read_alt_bounce_advances_the_epoch_and_expires_the_title() {
+        let mut emu = Emulator::new(4, 20, 0);
+        emu.process(b"\x1b[?1049h\x1b]0;first app\x07ui");
+        assert_eq!(emu.alt_epoch(), 1);
+        assert_eq!(emu.title(), Some("first app"), "premise: title honored");
+
+        emu.process(b"\x1b[?1049l\x1b[?1049h");
+        assert_eq!(emu.alt_epoch(), 2, "the bounce is two transitions");
+        assert_eq!(
+            emu.title(),
+            None,
+            "the old app's title must not survive the swap"
+        );
+    }
+
     /// `live_floor` reads the live grid's last non-blank row even while the
     /// viewport is scrolled back; `contents` follows the offset instead.
     #[test]
@@ -1255,7 +1804,11 @@ mod tests {
             "premise: the view shows history"
         );
         assert!(!emu.contents().contains("latest"));
-        assert_eq!(emu.live_floor(), "latest", "the floor must not follow the view");
+        assert_eq!(
+            emu.live_floor(),
+            "latest",
+            "the floor must not follow the view"
+        );
     }
 
     /// A blank screen has no floor.

@@ -2718,9 +2718,15 @@ fn config_toml_notify_chains_through_the_injected_script() {
         argv.iter().any(|a| a.starts_with("notify=[")),
         "a chained spawn must still inject the override; argv: {argv:?}"
     );
+    // Existence is not completion: the stub's `>` creates the record when
+    // the shell opens it, before printf writes a byte, so a reader in that
+    // gap sees an empty file. Gate on the full expected content instead.
+    let expected = format!("turn-ended\n{payload}\n");
     assert!(
-        reap_until(&mut s, Duration::from_secs(5), |_| record.exists()),
-        "the chained notifier never ran"
+        reap_until(&mut s, Duration::from_secs(5), |_| {
+            std::fs::read_to_string(&record).is_ok_and(|r| r == expected)
+        }),
+        "the chained notifier never wrote its complete record"
     );
     assert_eq!(
         std::fs::read_to_string(dir.join("chainenv")).unwrap(),
