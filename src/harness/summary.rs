@@ -14,7 +14,7 @@
 //!
 //! 1. locates the chrome region structurally (claude's separator-pair input
 //!    box, codex's status bar and composer, grok's bordered input box) and
-//!    scans only rows pinned to it, never the whole grid;
+//!    limits status candidates relative to it;
 //! 2. returns `None` when the expected structure is absent or inconsistent;
 //! 3. matches row prefixes so status rows truncated with an ellipsis at narrow
 //!    widths remain recognizable. A wrapped row fails the structural check.
@@ -86,12 +86,13 @@ fn is_rule_row(row: &str) -> bool {
 /// space and an `…`-terminated status phrase.
 const CLAUDE_SPINNER: &[char] = &['·', '✢', '✳', '✶', '✻', '✽'];
 
-/// Maximum rows scanned above the input box for a status row. This covers an
-/// indented task-list block while keeping the scan pinned to nearby chrome.
+/// Maximum nonblank rows inspected above the input box. Blank rows do not
+/// consume the limit; indented hint and task-list rows do.
 const CLAUDE_STATUS_WINDOW: usize = 16;
 
 /// claude (alt screen). Working state: a column-0 spinner row above the
-/// input box's top separator, within [`CLAUDE_STATUS_WINDOW`] rows of it.
+/// input box's top separator, within [`CLAUDE_STATUS_WINDOW`] nonblank rows
+/// of it.
 /// Approval state: the dialog replaces the input box entirely; the menu
 /// match fires only when that box is gone.
 pub struct ClaudeSummary;
@@ -137,13 +138,21 @@ fn claude_box_top(rows: &[String]) -> Option<usize> {
         .then_some(top)
 }
 
-/// Scan above the input box for a spinner or waiting row. Empty and indented
-/// hint/task-list rows may separate it from the box. Any other column-0 row,
+/// Scan upward from the input box for a spinner or waiting row. Blank rows do
+/// not consume the window; indented rows do. The first other column-0 row,
 /// including body prose or a wrapped status tail, invalidates the structure.
 fn claude_spinner_status(rows: &[String], top: usize) -> Option<(String, &'static str)> {
-    for i in (top.saturating_sub(CLAUDE_STATUS_WINDOW)..top).rev() {
+    let mut content = 0usize;
+    for i in (0..top).rev() {
         let row = &rows[i];
-        if row.is_empty() || row.starts_with(' ') {
+        if row.is_empty() {
+            continue;
+        }
+        content += 1;
+        if content > CLAUDE_STATUS_WINDOW {
+            return None;
+        }
+        if row.starts_with(' ') {
             continue;
         }
         if let Some(verb) = claude_spinner_text(row) {
@@ -157,10 +166,9 @@ fn claude_spinner_status(rows: &[String], top: usize) -> Option<(String, &'stati
             }
             return Some((format!("{verb}{tail}"), "claude:spinner"));
         }
-        // Waiting rows need no action-row probe: col-0 `⏺` rows above are
-        // body prose, and probing them only widens false positives.
+        // Action-row lookup applies only to ellipsis-terminated spinner rows.
         if let Some(waiting) = claude_waiting_text(row) {
-            return Some((waiting, "claude:waiting-agents"));
+            return Some((waiting, "claude:waiting"));
         }
         // Foreign column-0 row: abort (see above).
         return None;
@@ -168,20 +176,24 @@ fn claude_spinner_status(rows: &[String], top: usize) -> Option<(String, &'stati
     None
 }
 
-/// Match `Waiting for {n} background agent(s) to finish` after a recognized
-/// spinner frame. Keeping this separate from ellipsis-terminated spinner rows
-/// prevents `·` body bullets from matching.
+/// Match a spinner-framed `Waiting for {digits} {subject} to finish` row and
+/// return its text verbatim. The subject must contain one to three words.
 fn claude_waiting_text(row: &str) -> Option<String> {
     let mut chars = row.chars();
     if !CLAUDE_SPINNER.contains(&chars.next()?) || chars.next()? != ' ' {
         return None;
     }
     let text = chars.as_str();
-    let n = text.strip_prefix("Waiting for ")?;
-    let digits = n.chars().take_while(char::is_ascii_digit).count();
-    let tail = &n[digits..];
-    (digits >= 1
-        && (tail == " background agent to finish" || tail == " background agents to finish"))
+    let rest = text.strip_prefix("Waiting for ")?;
+    let digits = rest.chars().take_while(char::is_ascii_digit).count();
+    if digits == 0 {
+        return None;
+    }
+    let middle = rest[digits..]
+        .strip_prefix(' ')?
+        .strip_suffix(" to finish")?;
+    (1..=3)
+        .contains(&middle.split_whitespace().count())
         .then(|| text.to_string())
 }
 
@@ -787,10 +799,10 @@ mod tests {
         );
     }
 
-    /// The ellipsis-less waiting row extracts verbatim for singular and plural
-    /// counts; near-miss shapes remain foreign and abort.
+    /// Waiting rows return verbatim; malformed skeletons fail and do not
+    /// trigger an action-row lookup.
     #[test]
-    fn claude_waiting_row_matches_exactly_and_never_probes() {
+    fn claude_waiting_family_matches_the_skeleton_and_never_probes() {
         let sep = "─".repeat(120);
         let spin = |row: &str| {
             let rows = [row, &sep, "❯", &sep];
@@ -799,31 +811,29 @@ mod tests {
         for row in [
             "✻ Waiting for 1 background agent to finish",
             "· Waiting for 1 background agent to finish",
+            "✻ Waiting for 3 background agents to finish",
+            "✻ Waiting for 1 dynamic workflow to finish",
+            "✽ Waiting for 3 dynamic workflows to finish",
+            "✻ Waiting for 2 tasks to finish",
         ] {
-            assert_eq!(
-                spin(row),
-                Some((
-                    "Waiting for 1 background agent to finish".to_string(),
-                    "claude:waiting-agents"
-                )),
-                "{row:?}"
-            );
+            let want = row.chars().skip(2).collect::<String>();
+            assert_eq!(spin(row), Some((want, "claude:waiting")), "{row:?}");
         }
-        assert_eq!(
-            spin("✻ Waiting for 3 background agents to finish"),
-            Some((
-                "Waiting for 3 background agents to finish".to_string(),
-                "claude:waiting-agents"
-            ))
-        );
 
-        // Wrong shapes abort to fall-through, glyph or not: the pattern
-        // carries the specificity, not the frame.
-        assert_eq!(spin("✻ Waiting patiently"), None);
-        assert_eq!(spin("· Waiting for review comments to land"), None);
+        // Reject missing digits, more than three subject words, a foreign
+        // suffix, or a missing subject.
+        for row in [
+            "✻ Waiting patiently",
+            "· Waiting for review comments to land",
+            "✻ Waiting for some agents to finish",
+            "✻ Waiting for 2 very long noun phrases here to finish",
+            "✻ Waiting for 2 agents to start",
+            "✻ Waiting for 3 to finish",
+        ] {
+            assert_eq!(spin(row), None, "{row:?}");
+        }
 
-        // An action row above the waiting row is body prose in this state
-        // and must not win the head.
+        // Waiting rows return without probing the action row above them.
         let rows = [
             "⏺ Running 1 shell command…",
             "",
@@ -836,7 +846,7 @@ mod tests {
             ClaudeSummary.live_preview(&rs(&rows)),
             Some((
                 "Waiting for 1 background agent to finish".to_string(),
-                "claude:waiting-agents"
+                "claude:waiting"
             ))
         );
     }
@@ -950,7 +960,7 @@ mod tests {
             behind_gap("✻ Waiting for 2 background agents to finish", 5),
             Some((
                 "Waiting for 2 background agents to finish".to_string(),
-                "claude:waiting-agents"
+                "claude:waiting"
             ))
         );
 
@@ -962,6 +972,68 @@ mod tests {
             "     ◼ Phase 1: dashboard polish",
             &sep,
             "❯",
+            &sep,
+        ]);
+        assert_eq!(ClaudeSummary.live_preview(&prose), None);
+    }
+
+    /// Blank rows do not consume the nonblank-row window.
+    #[test]
+    fn claude_blank_rows_do_not_consume_the_window() {
+        let sep = "─".repeat(120);
+        let resolve = |rows: Vec<String>| {
+            let refs: Vec<&str> = rows.iter().map(String::as_str).collect();
+            ClaudeSummary.live_preview(&rs(&refs))
+        };
+        let boxed = |sep: &str| [sep.to_string(), "❯ /workflows".to_string(), sep.to_string()];
+
+        // Nineteen blank rows separate the waiting row from the input box.
+        let mut rows = vec!["✻ Waiting for 1 dynamic workflow to finish".to_string()];
+        rows.extend(std::iter::repeat_n(String::new(), 19));
+        rows.extend(boxed(&sep));
+        assert_eq!(
+            resolve(rows),
+            Some((
+                "Waiting for 1 dynamic workflow to finish".to_string(),
+                "claude:waiting"
+            ))
+        );
+
+        // Fifteen indented rows plus the spinner fill the 16-row window;
+        // interleaved blank rows do not affect the count.
+        let mut rows = vec!["✢ Running phase 1 (dashboard UI)… (4m 20s)".to_string()];
+        for i in 0..15 {
+            rows.push(String::new());
+            rows.push(format!("     ◼ Phase {i}: generic step"));
+        }
+        rows.extend(boxed(&sep));
+        assert_eq!(
+            resolve(rows),
+            Some((
+                "Running phase 1 (dashboard UI)…".to_string(),
+                "claude:spinner"
+            ))
+        );
+
+        // Sixteen indented rows plus the spinner exceed the window.
+        let mut rows = vec!["✢ Running phase 1 (dashboard UI)… (4m 20s)".to_string()];
+        for i in 0..16 {
+            rows.push(String::new());
+            rows.push(format!("     ◼ Phase {i}: generic step"));
+        }
+        rows.extend(boxed(&sep));
+        assert_eq!(resolve(rows), None);
+
+        // An intervening column-0 prose row still aborts the scan.
+        let prose = rs(&[
+            "✻ Hashing… (6s · ↓ 87 tokens)",
+            "",
+            "",
+            "⏺ The workflow report lands below.",
+            "",
+            "",
+            &sep,
+            "❯ /workflows",
             &sep,
         ]);
         assert_eq!(ClaudeSummary.live_preview(&prose), None);
@@ -1279,7 +1351,15 @@ mod tests {
                 &ClaudeSummary,
                 // The welcome box is absent, so there is no model prefix.
                 "Waiting for 1 background agent to finish",
-                "claude:waiting-agents",
+                "claude:waiting",
+            ),
+            Case(
+                "preview_claude_workflow_wait",
+                include_bytes!("../../tests/corpus/preview_claude_workflow_wait.bin"),
+                &ClaudeSummary,
+                // The roster below the input box is excluded from the status.
+                "Waiting for 1 dynamic workflow to finish",
+                "claude:waiting",
             ),
             Case(
                 "preview_codex_hint_row",

@@ -1,0 +1,31 @@
+[?1049h[2J[H⏺ I queued the workflow and will report when it completes.
+
+⏺ Waiting on the remaining workflow agents now.
+
+✻ Waiting for 1 dynamic workflow to finish
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ /workflows
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  (statusline scrubbed: user-configured row)
+  ⏵⏵ auto mode on (shift+tab to cycle)
+
+◯ some-workflow  Generic audit description   4/7 agents done · 5m 27s · ↓ 1.2m tokens
