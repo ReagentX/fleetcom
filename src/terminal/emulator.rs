@@ -528,9 +528,8 @@ impl Emulator {
     }
 }
 
-/// Capture accessors for the dashboard-preview resolution layer, which lands
-/// in a later phase; the allow comes off with its first caller.
-#[allow(dead_code)]
+/// Capture accessors for the dashboard-preview resolution layer
+/// (`crate::preview`).
 impl Emulator {
     /// Monotonic count of grid advances. Bumps on every `process` call and
     /// on each sync-frame landing; equal reads mean the grid did not advance

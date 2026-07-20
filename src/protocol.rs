@@ -9,7 +9,10 @@ use std::{
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
 
-use crate::frame::{KIND_CONTROL, KIND_HELLO, KIND_SCREEN};
+use crate::{
+    frame::{KIND_CONTROL, KIND_HELLO, KIND_SCREEN},
+    preview::PreviewSource,
+};
 
 /// Wire-protocol version; the handshake rejects mismatched peers.
 pub const PROTOCOL_VERSION: u32 = 8;
@@ -221,6 +224,14 @@ pub struct TaskView {
     /// idle threshold; `false` once finished.
     pub parked: bool,
     pub preview: String,
+    /// Provenance of `preview` (see [`PreviewSource`]).
+    pub source: PreviewSource,
+    /// Whether the preview froze at output-complete and can no longer change.
+    pub frozen: bool,
+    /// Fine-grained matcher id behind an adapter-produced preview. Never
+    /// encoded: an in-process core hands it to the peek footer directly, and
+    /// a socket frame decodes it as `None`.
+    pub rule: Option<&'static str>,
     pub started_ago: Duration,
     /// Time since the last PTY output; `Some` only while the task is live.
     pub quiet_ago: Option<Duration>,
@@ -352,6 +363,17 @@ fn lifecycle_from(s: &str) -> Option<Lifecycle> {
         "idle" => Some(Lifecycle::Idle),
         "ok" => Some(Lifecycle::Ok),
         "failed" => Some(Lifecycle::Failed),
+        _ => None,
+    }
+}
+
+// Encoding uses `PreviewSource::label`; only the decode direction lives here.
+fn source_from(s: &str) -> Option<PreviewSource> {
+    match s {
+        "floor" => Some(PreviewSource::Floor),
+        "marker" => Some(PreviewSource::Marker),
+        "title" => Some(PreviewSource::Title),
+        "anchor" => Some(PreviewSource::Anchor),
         _ => None,
     }
 }
@@ -731,6 +753,9 @@ pub fn encode_event(ev: &Event) -> (u8, Vec<u8>) {
                 insert_opt_str(&mut o, "name", &tv.name);
                 let _ = o.insert("life", lifecycle_str(tv.lifecycle));
                 let _ = o.insert("preview", tv.preview.as_str());
+                // `rule` deliberately stays off the wire (see `TaskView`).
+                let _ = o.insert("src", tv.source.label());
+                let _ = o.insert("frozen", tv.frozen);
                 let _ = o.insert("started_ms", tv.started_ago.as_millis() as u64);
                 let _ = o.insert("parked", tv.parked);
                 // Each age exists in exactly one phase: `quiet_ms` while
@@ -808,6 +833,19 @@ pub fn decode_event(kind: u8, payload: &[u8]) -> Option<Event> {
                         } else {
                             tv["parked"].as_bool()?
                         };
+                        // Pre-preview daemons omit both keys: fall back to
+                        // the floor default, never to a dropped frame,
+                        // exactly like `parked` above.
+                        let source = if tv["src"].is_null() {
+                            PreviewSource::Floor
+                        } else {
+                            source_from(tv["src"].as_str()?)?
+                        };
+                        let frozen = if tv["frozen"].is_null() {
+                            false
+                        } else {
+                            tv["frozen"].as_bool()?
+                        };
                         views.push(TaskView {
                             id: tv["id"].as_u64()?,
                             command: tv["command"].as_str()?.to_string(),
@@ -819,6 +857,9 @@ pub fn decode_event(kind: u8, payload: &[u8]) -> Option<Event> {
                             lifecycle,
                             parked,
                             preview: tv["preview"].as_str()?.to_string(),
+                            source,
+                            frozen,
+                            rule: None,
                             started_ago: Duration::from_millis(tv["started_ms"].as_u64()?),
                             // Absent from pre-`parked` daemons: unknown, not zero.
                             quiet_ago: opt_ms(&tv["quiet_ms"])?,
@@ -1168,6 +1209,9 @@ mod tests {
                 lifecycle: Lifecycle::Idle,
                 parked: false,
                 preview: "~ line".into(),
+                source: PreviewSource::Title,
+                frozen: false,
+                rule: None,
                 started_ago: Duration::from_millis(4200),
                 quiet_ago: Some(Duration::from_millis(700)),
                 finished_ago: None,
@@ -1183,6 +1227,9 @@ mod tests {
                 lifecycle: Lifecycle::Active,
                 parked: false,
                 preview: String::new(),
+                source: PreviewSource::Floor,
+                frozen: false,
+                rule: None,
                 started_ago: Duration::from_millis(10),
                 quiet_ago: None,
                 finished_ago: None,
@@ -1256,7 +1303,7 @@ mod tests {
     #[test]
     fn tasks_frame_group_key_is_optional() {
         // "Lw==" is the base64 encoding of "/".
-        let ungrouped = r#"{"t":"tasks","tasks":[{"id":1,"command":"x","cwd":"Lw==","tagged":false,"life":"ok","preview":"","started_ms":0,"parked":false}]}"#;
+        let ungrouped = r#"{"t":"tasks","tasks":[{"id":1,"command":"x","cwd":"Lw==","tagged":false,"life":"ok","preview":"","src":"floor","frozen":false,"started_ms":0,"parked":false}]}"#;
         match decode_event(KIND_CONTROL, ungrouped.as_bytes()) {
             Some(Event::Tasks(v)) => assert_eq!(v[0].group, None),
             other => panic!("expected tasks event, got {other:?}"),
@@ -1272,6 +1319,9 @@ mod tests {
             lifecycle: Lifecycle::Ok,
             parked: false,
             preview: String::new(),
+            source: PreviewSource::Floor,
+            frozen: false,
+            rule: None,
             started_ago: Duration::from_millis(0),
             quiet_ago: None,
             finished_ago: None,
@@ -1290,7 +1340,7 @@ mod tests {
     #[test]
     fn tasks_frame_name_key_is_optional() {
         // "Lw==" is the base64 encoding of "/".
-        let unnamed = r#"{"t":"tasks","tasks":[{"id":1,"command":"x","cwd":"Lw==","tagged":false,"life":"ok","preview":"","started_ms":0,"parked":false}]}"#;
+        let unnamed = r#"{"t":"tasks","tasks":[{"id":1,"command":"x","cwd":"Lw==","tagged":false,"life":"ok","preview":"","src":"floor","frozen":false,"started_ms":0,"parked":false}]}"#;
         match decode_event(KIND_CONTROL, unnamed.as_bytes()) {
             Some(Event::Tasks(v)) => assert_eq!(v[0].name, None),
             other => panic!("expected tasks event, got {other:?}"),
@@ -1306,6 +1356,9 @@ mod tests {
             lifecycle: Lifecycle::Ok,
             parked: false,
             preview: String::new(),
+            source: PreviewSource::Floor,
+            frozen: false,
+            rule: None,
             started_ago: Duration::from_millis(0),
             quiet_ago: None,
             finished_ago: None,
@@ -1335,6 +1388,9 @@ mod tests {
                 lifecycle: Lifecycle::Idle,
                 parked: true,
                 preview: String::new(),
+                source: PreviewSource::Floor,
+                frozen: false,
+                rule: None,
                 started_ago: Duration::from_millis(60_000),
                 quiet_ago: Some(Duration::from_millis(12_000)),
                 finished_ago: None,
@@ -1349,6 +1405,9 @@ mod tests {
                 lifecycle: Lifecycle::Ok,
                 parked: false,
                 preview: String::new(),
+                source: PreviewSource::Floor,
+                frozen: false,
+                rule: None,
                 started_ago: Duration::from_millis(60_000),
                 quiet_ago: None,
                 finished_ago: Some(Duration::from_millis(3_000)),
@@ -1377,6 +1436,85 @@ mod tests {
             }
             other => panic!("expected tasks event, got {other:?}"),
         }
+    }
+
+    /// Every preview source round-trips with its frozen flag, and `rule`
+    /// never crosses the wire: an encoded `Some` decodes as `None`.
+    #[test]
+    fn preview_source_and_frozen_round_trip() {
+        let base = TaskView {
+            id: 1,
+            command: "x".into(),
+            cwd: PathBuf::from("/"),
+            tagged: false,
+            group: None,
+            name: None,
+            lifecycle: Lifecycle::Active,
+            parked: false,
+            preview: "p".into(),
+            source: PreviewSource::Floor,
+            frozen: false,
+            rule: None,
+            started_ago: Duration::from_millis(0),
+            quiet_ago: Some(Duration::from_millis(1)),
+            finished_ago: None,
+        };
+        let tasks = Event::Tasks(vec![
+            base.clone(),
+            TaskView {
+                id: 2,
+                source: PreviewSource::Marker,
+                ..base.clone()
+            },
+            TaskView {
+                id: 3,
+                source: PreviewSource::Title,
+                frozen: true,
+                ..base.clone()
+            },
+            TaskView {
+                id: 4,
+                source: PreviewSource::Anchor,
+                ..base.clone()
+            },
+        ]);
+        let (k, p) = encode_event(&tasks);
+        assert_eq!(decode_event(k, &p), Some(tasks));
+
+        // A daemon-side rule is dropped by encoding, not carried.
+        let ruled = Event::Tasks(vec![TaskView {
+            source: PreviewSource::Anchor,
+            rule: Some("claude-status"),
+            ..base.clone()
+        }]);
+        let (k, p) = encode_event(&ruled);
+        assert!(!String::from_utf8(p.clone()).unwrap().contains("claude-status"));
+        match decode_event(k, &p) {
+            Some(Event::Tasks(v)) => {
+                assert_eq!(v[0].source, PreviewSource::Anchor);
+                assert_eq!(v[0].rule, None, "rule must stay daemon-side");
+            }
+            other => panic!("expected tasks event, got {other:?}"),
+        }
+    }
+
+    /// A frame from a daemon predating the preview fields decodes with the
+    /// floor default, exactly like the `parked` fallback: skew degrades the
+    /// provenance, never the frame.
+    #[test]
+    fn tasks_frame_without_preview_keys_decodes_with_floor_defaults() {
+        let old = r#"{"t":"tasks","tasks":[{"id":1,"command":"x","cwd":"Lw==","tagged":false,"life":"active","preview":"p","started_ms":0,"parked":false}]}"#;
+        match decode_event(KIND_CONTROL, old.as_bytes()) {
+            Some(Event::Tasks(v)) => {
+                assert_eq!(v[0].source, PreviewSource::Floor);
+                assert!(!v[0].frozen);
+                assert_eq!(v[0].rule, None);
+            }
+            other => panic!("expected tasks event, got {other:?}"),
+        }
+        // A present source must be a known label.
+        let bad = r#"{"t":"tasks","tasks":[{"id":1,"command":"x","cwd":"Lw==","tagged":false,"life":"active","preview":"p","src":"vibes","frozen":false,"started_ms":0,"parked":false}]}"#;
+        assert_eq!(decode_event(KIND_CONTROL, bad.as_bytes()), None);
     }
 
     /// `Sessions` carries the picker's names verbatim: several names, an empty

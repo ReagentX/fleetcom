@@ -17,6 +17,8 @@ mod golden;
 // Agent-CLI session capture: the supervisor instruments spawns through it.
 mod harness;
 mod path;
+// Dashboard-preview resolution: the provenance cascade over emulator facts.
+mod preview;
 mod protocol;
 mod session;
 mod supervisor;

@@ -24,6 +24,7 @@ use rustix::process::{WaitId, WaitIdOptions, waitid};
 use crate::{
     core::{Wake, Waker},
     emulator::Emulator,
+    preview::{Preview, PreviewState},
     protocol::{Key, Lifecycle, Mods, MouseKind, ScrollAction, env_get},
 };
 
@@ -350,6 +351,9 @@ pub struct Task {
     pub scraped_id: Option<String>,
     /// Whether the one-shot full-history exit scrape has run.
     scraped: bool,
+    /// Dashboard-preview resolution state; resets with the task on rerun
+    /// because a rerun replaces the whole `Task`.
+    preview: PreviewState,
     /// Wall-clock spawn time used for filesystem correlation.
     pub spawned_at: SystemTime,
     exit_code: Option<i32>,
@@ -579,6 +583,7 @@ impl Task {
             capture_file: None,
             scraped_id: None,
             scraped: false,
+            preview: PreviewState::new(),
             spawned_at: SystemTime::now(),
             exit_code: None,
             started: Instant::now(),
@@ -613,14 +618,20 @@ impl Task {
         Ok(())
     }
 
+    /// Whether the child exited and the PTY reader reached EOF, so no more
+    /// bytes can ever reach the grid. A missing reader handle counts as
+    /// complete. The reader ends on `Ok(0) | Err(_)` without distinguishing
+    /// clean EOF from a read error, so the name claims completeness, not
+    /// cleanliness.
+    pub(crate) fn output_complete(&self) -> bool {
+        self.finished.is_some() && self.handle.as_ref().is_none_or(JoinHandle::is_finished)
+    }
+
     /// Scrape at most one exit hint after the process exits and the PTY reader
-    /// reaches EOF. A missing reader handle counts as complete.
+    /// reaches EOF (see [`Task::output_complete`]).
     pub(crate) fn scrape_exit_hint(&mut self) {
         let Some(h) = self.harness else { return };
-        if self.scraped
-            || self.finished.is_none()
-            || self.handle.as_ref().is_some_and(|jh| !jh.is_finished())
-        {
+        if self.scraped || !self.output_complete() {
             return;
         }
         self.scraped = true;
@@ -730,15 +741,26 @@ impl Task {
         }
     }
 
-    /// The dashboard preview line: the last non-blank row of the live screen.
-    pub fn preview(&self) -> String {
-        grid(&self.parser)
-            .contents()
-            .lines()
-            .rev()
-            .find(|l| !l.trim().is_empty())
-            .unwrap_or("")
-            .to_string()
+    /// The dashboard preview, resolved through the provenance cascade under
+    /// the grid lock (see [`crate::preview`]). `now` is the caller's tick
+    /// instant so every task in one snapshot resolves against the same clock.
+    pub fn resolve_preview(&mut self, now: Instant) -> Preview {
+        let finished = self.finished.is_some();
+        let emu = grid(&self.parser);
+        self.preview.resolve(now, finished, &*emu).clone()
+    }
+
+    /// Freeze the preview once per task life at `output_complete`. Lands any
+    /// open `?2026` frame first so the final resolve sees every byte;
+    /// `scrape_exit_hint` does the same for its own read, and whichever runs
+    /// second no-ops.
+    pub(crate) fn finalize_preview(&mut self) {
+        if self.preview.finalized() || !self.output_complete() {
+            return;
+        }
+        let mut emu = grid(&self.parser);
+        let _ = emu.finish_output();
+        self.preview.finalize(&*emu);
     }
 
     /// Full screen as ANSI bytes for attached mode, plus cursor state so we can
@@ -1028,7 +1050,7 @@ mod tests {
         let mut preview = String::new();
         wait_until(Duration::from_secs(5), || {
             t.poll_exit().unwrap();
-            preview = t.preview();
+            preview = t.resolve_preview(Instant::now()).text;
             t.finished.is_some() && preview.contains("omega")
         });
         assert_eq!(t.exit_code, Some(0));
@@ -1871,6 +1893,84 @@ mod tests {
         );
         t.scrape_exit_hint();
         assert_eq!(t.scraped_id.as_deref(), Some(ID));
+    }
+
+    /// Primary-screen finalization re-resolves: a final line that lands
+    /// after the last resolution tick (here: after the only pre-exit
+    /// resolve) still reaches the frozen floor.
+    #[test]
+    fn finalize_preview_freezes_the_final_primary_line() {
+        use crate::preview::PreviewSource;
+        let dir = temp("task_final_primary");
+        let flag = dir.join("flag");
+        let cmd = format!(
+            "until [ -e '{}' ]; do sleep 0.05; done; printf 'test result: ok\\n'",
+            flag.display()
+        );
+        let mut t = Task::spawn(40, &cmd, &cmd, &here(), 24, 80, &sh_env(), no_waker()).unwrap();
+        // The last live resolution predates every byte of output.
+        let early = t.resolve_preview(Instant::now());
+        assert!(!early.frozen);
+        std::fs::write(&flag, b"").unwrap();
+        assert!(
+            wait_until(Duration::from_secs(60), || {
+                t.poll_exit().unwrap();
+                t.output_complete()
+            }),
+            "child never completed"
+        );
+        t.finalize_preview();
+        let p = t.resolve_preview(Instant::now());
+        assert_eq!(
+            (p.text.as_str(), p.source, p.frozen),
+            ("test result: ok", PreviewSource::Floor, true)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Alt teardown at exit: the child enters the alt screen, titles it, and
+    /// exits through 1049l. The restored primary junk must not replace the
+    /// last rendered preview; it freezes with its source preserved.
+    #[test]
+    fn finalize_preview_keeps_the_last_render_across_alt_teardown() {
+        use crate::preview::PreviewSource;
+        let dir = temp("task_final_alt");
+        let flag = dir.join("flag");
+        let cmd = format!(
+            "printf 'prelaunch junk\\n'; \
+             printf '\\033[?1049h\\033]0;working\\007app body'; \
+             until [ -e '{}' ]; do sleep 0.05; done; printf '\\033[?1049l'",
+            flag.display()
+        );
+        let mut t = Task::spawn(41, &cmd, &cmd, &here(), 24, 80, &sh_env(), no_waker()).unwrap();
+        // Resolve until the title renders, so the last live resolution sees
+        // the alt screen; no resolves run between the flag and EOF.
+        assert!(
+            wait_until(Duration::from_secs(5), || {
+                t.resolve_preview(Instant::now()).source == PreviewSource::Title
+            }),
+            "title never rendered"
+        );
+        std::fs::write(&flag, b"").unwrap();
+        assert!(
+            wait_until(Duration::from_secs(60), || {
+                t.poll_exit().unwrap();
+                t.output_complete()
+            }),
+            "child never completed"
+        );
+        t.finalize_preview();
+        assert_eq!(
+            grid(&t.parser).live_floor(),
+            "prelaunch junk",
+            "premise: 1049l restored the pre-launch primary screen"
+        );
+        let p = t.resolve_preview(Instant::now());
+        assert_eq!(
+            (p.text.as_str(), p.source, p.frozen),
+            ("working", PreviewSource::Title, true)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A child's cursor-position probe is answered on the wire: the reply
