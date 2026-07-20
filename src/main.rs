@@ -8,13 +8,9 @@
 #[cfg(not(unix))]
 compile_error!("fleetcom supports Unix platforms only.");
 
-mod ansi;
 mod app;
 mod core;
 mod daemon;
-mod emulator;
-mod format;
-mod frame;
 // Differential emulator tests over recorded PTY output.
 #[cfg(test)]
 mod golden;
@@ -25,11 +21,15 @@ mod protocol;
 mod session;
 mod supervisor;
 mod task;
+mod terminal;
 // Shared test scaffolds: scratch dirs, deadline polling, corpus fixtures.
 #[cfg(test)]
 mod testutil;
 mod transport;
 mod ui;
+
+// Re-exported at the root so call sites keep their short `crate::ansi`-style paths.
+pub(crate) use terminal::{ansi, emulator, format, frame};
 
 use std::{
     io,

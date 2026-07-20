@@ -561,7 +561,7 @@ mod tests {
             #[test]
             fn $name() {
                 let source = parse(
-                    include_bytes!(concat!("../tests/corpus/", $file)),
+                    include_bytes!(concat!("../../tests/corpus/", $file)),
                     CORPUS_LINES,
                     CORPUS_COLS,
                 );
@@ -585,7 +585,7 @@ mod tests {
     #[test]
     fn corpus_scrolled_viewport() {
         let mut source = parse(
-            include_bytes!("../tests/corpus/codex_resume.bin"),
+            include_bytes!("../../tests/corpus/codex_resume.bin"),
             CORPUS_LINES,
             CORPUS_COLS,
         );
