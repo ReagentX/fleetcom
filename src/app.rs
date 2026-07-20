@@ -529,6 +529,47 @@ impl App {
         self.selected_id = Some(self.views[order[next]].id);
     }
 
+    /// Index within `sections` of the section holding the selected task.
+    fn selected_section(&self, sections: &[(String, Vec<usize>)]) -> Option<usize> {
+        let id = self.selected_id?;
+        sections
+            .iter()
+            .position(|(_, idxs)| idxs.iter().any(|&i| self.views[i].id == id))
+    }
+
+    /// Move the selection to the first task of the next section; from the
+    /// last section wraps to the first. No selection lands on the first
+    /// section.
+    fn select_next_section(&mut self) {
+        let sections = self.sections();
+        if sections.is_empty() {
+            self.selected_id = None;
+            return;
+        }
+        let next = match self.selected_section(&sections) {
+            Some(cur) => (cur + 1) % sections.len(),
+            None => 0,
+        };
+        self.selected_id = Some(self.views[sections[next].1[0]].id);
+    }
+
+    /// Move the selection to the first task of the previous section; from the
+    /// first section wraps to the last. Sections move as units: mid-section
+    /// this jumps to the previous section's first task, not the current
+    /// section's. No selection lands on the last section.
+    fn select_prev_section(&mut self) {
+        let sections = self.sections();
+        if sections.is_empty() {
+            self.selected_id = None;
+            return;
+        }
+        let prev = match self.selected_section(&sections) {
+            Some(cur) => (cur + sections.len() - 1) % sections.len(),
+            None => sections.len() - 1,
+        };
+        self.selected_id = Some(self.views[sections[prev].1[0]].id);
+    }
+
     /// Tell the core which task's screen we need (attach/peek), sending `Watch`
     /// only when the target actually changes.
     fn set_watch(&mut self, want: Option<u64>) {
@@ -893,6 +934,8 @@ impl App {
             }
             KeyCode::Up | KeyCode::Char('k') => self.select_up(),
             KeyCode::Down | KeyCode::Char('j') => self.select_down(),
+            KeyCode::Tab => self.select_next_section(),
+            KeyCode::BackTab => self.select_prev_section(),
             KeyCode::Char(' ') => {
                 if self.selected_task().is_some() {
                     self.mode = Mode::Peek;
@@ -2090,6 +2133,125 @@ mod tests {
         assert_eq!(app.selected_id, Some(1));
         app.select_down();
         assert_eq!(app.selected_id, Some(1));
+    }
+
+    /// Two sections, two tasks each: tag ids 3 and 4 so they sort into a
+    /// leading "In use" section ahead of "Running" [1, 2].
+    fn app_with_two_sections() -> App {
+        let mut app = App::new_local(30, 100);
+        let inv = app.invocation_dir.clone();
+        for _ in 0..4 {
+            app.spawn_in("sleep 5", inv.clone());
+        }
+        app.pump();
+        app.transport.send(Command::Tag { id: 3, on: true });
+        app.transport.send(Command::Tag { id: 4, on: true });
+        app.pump();
+        assert_eq!(
+            app.section_ids(),
+            vec![
+                ("In use".to_string(), vec![3, 4]),
+                ("Running".to_string(), vec![1, 2]),
+            ],
+            "tags split the list into two two-task sections"
+        );
+        app
+    }
+
+    /// Tab targets the next section's first task — from mid-section it does
+    /// not preserve the within-section offset — and wraps from the last
+    /// section to the first.
+    #[test]
+    fn tab_jumps_to_next_section_first_task() {
+        let mut app = app_with_two_sections();
+
+        // Mid "In use" (offset 1): lands on Running's first (1), not its
+        // offset-1 task (2).
+        app.selected_id = Some(4);
+        app.select_next_section();
+        assert_eq!(
+            app.selected_id,
+            Some(1),
+            "next section's first, not same offset"
+        );
+
+        // Mid the last section: wraps to the first section's first task.
+        app.selected_id = Some(2);
+        app.select_next_section();
+        assert_eq!(app.selected_id, Some(3), "forward from last section wraps");
+    }
+
+    /// Sections move as units: BackTab from mid-section goes to the PREVIOUS
+    /// section's first task, not the current section's first. From the first
+    /// section it wraps to the last section's first task.
+    #[test]
+    fn backtab_jumps_to_previous_section_first_task() {
+        let mut app = app_with_two_sections();
+
+        // Deep in "Running": previous section's first (3), not Running's own
+        // first (1).
+        app.selected_id = Some(2);
+        app.select_prev_section();
+        assert_eq!(
+            app.selected_id,
+            Some(3),
+            "previous section's first, not current's"
+        );
+
+        // From the first section: wraps to the last section's first task.
+        app.selected_id = Some(3);
+        app.select_prev_section();
+        assert_eq!(
+            app.selected_id,
+            Some(1),
+            "backward from first section wraps"
+        );
+    }
+
+    /// With a single task there is one single-task section: both directions
+    /// land on it, matching the arrow keys' single-task no-op.
+    #[test]
+    fn section_nav_is_noop_with_one_task() {
+        let mut app = App::new_local(30, 100);
+        let inv = app.invocation_dir.clone();
+        app.spawn_in("sleep 5", inv);
+        app.pump();
+        app.resolve_selection();
+        assert_eq!(app.selected_id, Some(1));
+
+        app.select_next_section();
+        assert_eq!(app.selected_id, Some(1));
+        app.select_prev_section();
+        assert_eq!(app.selected_id, Some(1));
+    }
+
+    /// No selection: Tab picks the first section's first task, BackTab the
+    /// last section's. An empty list stays a no-op with no selection.
+    #[test]
+    fn section_nav_defaults_without_selection() {
+        let mut app = app_with_two_sections();
+
+        app.selected_id = None;
+        app.select_next_section();
+        assert_eq!(
+            app.selected_id,
+            Some(3),
+            "no selection: first section's first"
+        );
+
+        app.selected_id = None;
+        app.select_prev_section();
+        assert_eq!(
+            app.selected_id,
+            Some(1),
+            "no selection: last section's first"
+        );
+
+        let mut empty = App::new_local(30, 100);
+        empty.select_next_section();
+        assert_eq!(empty.selected_id, None);
+        empty.select_prev_section();
+        assert_eq!(empty.selected_id, None);
     }
 
     /// Supported crossterm keys and modifiers map to their wire representation.

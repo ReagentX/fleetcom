@@ -208,7 +208,7 @@ fn render_dashboard(out: &mut impl Write, app: &App) -> io::Result<()> {
         out,
         rows.saturating_sub(1),
         &format!(
-            "  ↑↓ select · enter attach · space peek · n/@ new · s sort · m tag · g group · R rename · r rerun · X kill · {exit_hint}"
+            "  ↑↓ select · enter attach · space peek · m tag · g group · R rename · r rerun · X kill · {exit_hint}"
         ),
         cols,
     )?;
