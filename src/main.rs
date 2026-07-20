@@ -179,13 +179,7 @@ fn main() -> io::Result<()> {
         }
     };
 
-    // Installed before App construction because tasks are spawned by whichever
-    // process owns the Supervisor: this process under `--foreground`, or a
-    // daemon that `App::connect` autostarts as a child. The in-process
-    // supervisor reads the flag through `resolve_scrollback`; `spawn_daemon`
-    // forwards it to the daemon child as `FLEETCOM_SCROLLBACK`. The inherited
-    // environment is the one channel that reaches an autostarted daemon
-    // without a wire-protocol change.
+    // Install the value before constructing or autostarting a supervisor.
     if let Some(lines) = scrollback {
         supervisor::set_scrollback_flag(lines);
     }
@@ -358,8 +352,7 @@ mod tests {
         );
     }
 
-    /// `--scrollback` takes a number and refuses anything else: the flag user
-    /// is present to see the error, unlike the tolerated env-var path.
+    /// `--scrollback` accepts a nonnegative integer and rejects invalid input.
     #[test]
     fn scrollback_flag_parses_and_rejects() {
         assert_eq!(

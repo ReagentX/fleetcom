@@ -1,9 +1,4 @@
-//! Single-line edit buffer for the text prompts: text plus a caret.
-//!
-//! The caret is a byte offset that is always a `char` boundary, and every
-//! mutation goes through the ops here: no call site does its own boundary
-//! arithmetic. Ops are insert, backspace, left, right, home, end: the prompts
-//! are one-line command fields, not a text editor.
+//! Single-line text-prompt buffer with a caret maintained on UTF-8 boundaries.
 
 use std::ops::Deref;
 
@@ -16,8 +11,7 @@ pub struct EditBuffer {
 }
 
 impl EditBuffer {
-    /// A buffer holding `text` with the caret at the end: the rename prefill
-    /// and the `@` picker's descend both reopen an existing value for editing.
+    /// Create a buffer containing `text` with the caret at the end.
     pub fn seeded(text: String) -> Self {
         let caret = text.len();
         Self { text, caret }
@@ -27,25 +21,23 @@ impl EditBuffer {
         &self.text
     }
 
-    /// The text before the caret: what the renderer measures to place the
-    /// hardware cursor.
+    /// Text before the caret, used to calculate the cursor column.
     pub fn before_caret(&self) -> &str {
         &self.text[..self.caret]
     }
 
-    /// Whether the caret sits after the last character. The `@` picker keys
-    /// Right's meaning off this: descend at the end, caret motion elsewhere.
+    /// Whether the caret is at the end of the buffer.
     pub fn at_end(&self) -> bool {
         self.caret == self.text.len()
     }
 
-    /// Reset to empty, caret included.
+    /// Clear the text and reset the caret.
     pub fn clear(&mut self) {
         self.text.clear();
         self.caret = 0;
     }
 
-    /// Take the text out, leaving the buffer reset (caret included).
+    /// Take the text and reset the caret.
     pub fn take(&mut self) -> String {
         self.caret = 0;
         std::mem::take(&mut self.text)

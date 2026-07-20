@@ -86,13 +86,8 @@ fn is_rule_row(row: &str) -> bool {
 /// space and an `…`-terminated status phrase.
 const CLAUDE_SPINNER: &[char] = &['·', '✢', '✳', '✶', '✻', '✽'];
 
-/// Rows scanned above the input box for the status row. The original
-/// three-row window was calibrated on captures that predate the harness's
-/// task-list rendering: a `⎿`-headed attachment row plus one indented row
-/// per task between the spinner and the box (the same indented class the
-/// scan already skips, only longer). Sixteen rows covers realistic task
-/// lists with margin; the bound stays finite because the tier discipline
-/// pins scans to chrome, never the whole grid.
+/// Maximum rows scanned above the input box for a status row. This covers an
+/// indented task-list block while keeping the scan pinned to nearby chrome.
 const CLAUDE_STATUS_WINDOW: usize = 16;
 
 /// claude (alt screen). Working state: a column-0 spinner row above the
@@ -142,17 +137,9 @@ fn claude_box_top(rows: &[String]) -> Option<usize> {
         .then_some(top)
 }
 
-/// Scan the [`CLAUDE_STATUS_WINDOW`] rows above the input box for the
-/// spinner row. Hint rows (the tmux focus-events notice, the right-aligned
-/// `● high · /effort`) and the task-list block are indented while the
-/// spinner paints at column 0; a column-0 row that is not spinner-shaped
-/// aborts the scan: body text reaching the chrome, or the wrapped tail of a
-/// status row too wide for the window. Both fail the structural check
-/// instead of matching status-shaped body text. The wide window's accepted
-/// residual: a spinner-shaped column-0 row up to sixteen rows above the box
-/// over an indented-only gap matches where the three-row window refused.
-/// Body prose is `⏺`-headed at column 0, so a real conversation between
-/// such a row and the box still aborts.
+/// Scan above the input box for a spinner or waiting row. Empty and indented
+/// hint/task-list rows may separate it from the box. Any other column-0 row,
+/// including body prose or a wrapped status tail, invalidates the structure.
 fn claude_spinner_status(rows: &[String], top: usize) -> Option<(String, &'static str)> {
     for i in (top.saturating_sub(CLAUDE_STATUS_WINDOW)..top).rev() {
         let row = &rows[i];
@@ -268,7 +255,7 @@ fn claude_ticker_segment(seg: &str) -> bool {
 /// the spinner phrase rotates per request, so it wins when both are
 /// present. The probe requires the `⏺` head and a single trailing `…`
 /// (`⏺ ok`-style reply rows fail it); anything else keeps the spinner
-/// phrase: scanning further up would be a body hunt.
+/// phrase; scanning further up could match conversation content.
 fn claude_action_row(rows: &[String], spinner: usize) -> Option<String> {
     let row = rows[..spinner].iter().rev().find(|r| !r.is_empty())?;
     let text = row.strip_prefix("⏺ ")?.trim();
@@ -922,9 +909,7 @@ mod tests {
         assert_eq!(ClaudeSummary.live_preview(&menu), None);
     }
 
-    /// The scan crosses a task-list block: the status row is found behind
-    /// gaps of indented rows up to fifteen, the window bound refuses beyond
-    /// it, and a column-0 `⏺` prose row anywhere in the gap still aborts.
+    /// The status scan crosses bounded indented gaps but stops at body prose.
     #[test]
     fn claude_scan_crosses_task_list_gaps_within_the_window() {
         let sep = "─".repeat(120);
@@ -960,8 +945,7 @@ mod tests {
             );
         }
 
-        // Both pinned matchers read the same scan: the waiting row extracts
-        // behind the same task-list gap.
+        // Waiting rows use the same bounded scan.
         assert_eq!(
             behind_gap("✻ Waiting for 2 background agents to finish", 5),
             Some((
@@ -970,8 +954,7 @@ mod tests {
             ))
         );
 
-        // A column-0 `⏺` prose row inside the gap is foreign and aborts:
-        // the widened window is not a body hunt.
+        // Column-0 body prose invalidates the status structure.
         let prose = rs(&[
             "✢ Running phase 1 (dashboard UI)… (4m 20s · ↓ 17.1k tokens)",
             "⏺ The phase list below is queued, not running.",
@@ -1272,8 +1255,7 @@ mod tests {
                 "preview_claude_tasklist",
                 include_bytes!("../../tests/corpus/preview_claude_tasklist.bin"),
                 &ClaudeSummary,
-                // The welcome box is absent, so there is no model prefix;
-                // the roster rows below the box do not disturb its pin.
+                // Without the welcome box, the preview has no model prefix.
                 "Running phase 1 (dashboard UI)…",
                 "claude:spinner",
             ),
@@ -1397,9 +1379,7 @@ mod tests {
         );
         assert_eq!(parts(&p), (MARKER.to_string(), PreviewSource::Marker, None));
 
-        // A spinner-shaped body row above a `⏺` prose row and the task list:
-        // the prose row aborts inside the widened window, and the marker
-        // tier reports. The anchor never fires on body text.
+        // Body prose between spinner-shaped text and the task list yields the marker.
         let p = resolve_corpus(
             include_bytes!("../../tests/corpus/preview_claude_body_above_tasklist.bin"),
             &ClaudeSummary,

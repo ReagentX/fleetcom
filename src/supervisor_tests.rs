@@ -16,10 +16,7 @@ fn sup(rows: u16, cols: u16) -> Supervisor {
     s
 }
 
-/// Scrollback resolution over explicit inputs (the pure core, so no
-/// process-global env mutation): flag over env over default, both overrides
-/// clamped, env garbage tolerated because a daemon must never fail to start
-/// over a typo'd variable.
+/// Scrollback resolution applies precedence, clamping, and environment fallback.
 #[test]
 fn scrollback_resolution_precedence_clamp_and_fallback() {
     assert_eq!(effective_scrollback(None, None), 2000);

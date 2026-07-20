@@ -319,11 +319,7 @@ fn spawn_daemon() -> io::Result<()> {
         .stdout(Stdio::null())
         .stderr(log.map(Stdio::from).unwrap_or_else(Stdio::null))
         .process_group(0);
-    // `--scrollback` lives in this process as typed state (`scrollback_flag`;
-    // the crate's `forbid(unsafe_code)` rules out `env::set_var`), which dies
-    // at this process boundary. The inherited environment is the one channel
-    // that reaches an autostarted daemon without a wire-protocol change, so
-    // forward the flag as the env var it stands in for.
+    // Pass the client's scrollback flag to the daemon through its environment.
     if let Some(lines) = supervisor::scrollback_flag() {
         cmd.env(supervisor::FLEETCOM_SCROLLBACK, lines.to_string());
     }
@@ -453,9 +449,7 @@ pub fn run_daemon() -> io::Result<()> {
 
     // 24x80 until the first client's Resize, which arrives before any Spawn.
     // Each connection supplies its launch context in the hello frame.
-    // Scrollback resolves from this process's env, which an autostarted
-    // daemon inherited from its first client: the value is fixed for this
-    // daemon's lifetime, so changing it takes a `--kill` and a fresh start.
+    // Use one scrollback depth for every task owned by this daemon.
     let mut sup = Supervisor::new(24, 80, supervisor::resolve_scrollback());
 
     // A signalled daemon shuts down *cleanly*: TERM each job's group with a

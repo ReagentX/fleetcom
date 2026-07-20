@@ -541,9 +541,8 @@ impl App {
             .position(|(_, idxs)| idxs.iter().any(|&i| self.views[i].id == id))
     }
 
-    /// Move the selection to the first task of the next section; from the
-    /// last section wraps to the first. No selection lands on the first
-    /// section.
+    /// Select the first task in the next section, wrapping to the first.
+    /// With no current selection, select the first section.
     fn select_next_section(&mut self) {
         let sections = self.sections();
         if sections.is_empty() {
@@ -557,10 +556,8 @@ impl App {
         self.selected_id = Some(self.views[sections[next].1[0]].id);
     }
 
-    /// Move the selection to the first task of the previous section; from the
-    /// first section wraps to the last. Sections move as units: mid-section
-    /// this jumps to the previous section's first task, not the current
-    /// section's. No selection lands on the last section.
+    /// Select the first task in the previous section, wrapping to the last.
+    /// With no current selection, select the last section.
     fn select_prev_section(&mut self) {
         let sections = self.sections();
         if sections.is_empty() {
@@ -996,7 +993,7 @@ impl App {
     fn on_key_textinput(&mut self, k: KeyEvent, submit: fn(&mut App, &str)) {
         match k.code {
             KeyCode::Enter => {
-                // Submission reads the full text regardless of caret position.
+                // Submit the text on both sides of the caret.
                 let text = self.input.take();
                 submit(self, text.trim());
                 self.close_prompt();
@@ -1045,10 +1042,7 @@ impl App {
     }
 
     fn on_key_pickdir(&mut self, k: KeyEvent) {
-        // Tab always descends. Right descends only from the end of the buffer:
-        // the caret opens there, so the historical Right-descend muscle memory
-        // is untouched, and Right means caret motion only after a deliberate
-        // move left (the fish-shell convention).
+        // Tab descends; Right descends at the end and moves the caret elsewhere.
         if k.code == KeyCode::Tab || (k.code == KeyCode::Right && self.dir_input.at_end()) {
             // Descend into the highlighted dir; a no-op on the current-dir row.
             if let Some(c) = self.dir_candidates.get(self.dir_sel)
@@ -1078,8 +1072,7 @@ impl App {
                     }
                 }
             }
-            // Refresh only on content edits: caret motion changes nothing the
-            // candidate list depends on.
+            // Caret motion does not affect directory candidates.
             _ => {
                 if on_key_edit(&mut self.dir_input, k) == Some(true) {
                     self.refresh_dir_candidates();
@@ -1110,8 +1103,7 @@ impl App {
                 }
                 self.close_group_picker();
             }
-            // Refresh only on content edits: caret motion changes nothing the
-            // candidate list depends on.
+            // Caret motion does not affect group candidates.
             _ => {
                 if on_key_edit(&mut self.group_input, k) == Some(true) {
                     self.refresh_group_candidates();
@@ -1408,14 +1400,9 @@ fn key_event_to_key(ev: KeyEvent) -> Option<(Key, Mods)> {
     Some((code, mods))
 }
 
-/// Shared caret/edit key handling for the prompt buffers. `Some(true)` means
-/// the text changed, `Some(false)` pure caret motion (or a swallowed chord),
-/// `None` a key this vocabulary does not handle. Pickers refresh candidates
-/// only on `Some(true)`.
-///
-/// The plain-insert arm requires no Ctrl: before the caret existed, any
-/// unhandled Ctrl-chord inserted its literal letter. Ctrl-A/Ctrl-E arrive as
-/// `Char('a')`/`Char('e')` with `CONTROL` set, aliasing Home/End.
+/// Apply prompt editing keys. Returns `Some(true)` for text changes,
+/// `Some(false)` for caret motion or ignored Ctrl chords, and `None` for
+/// unsupported keys. Ctrl-A and Ctrl-E move to the start and end.
 fn on_key_edit(buf: &mut EditBuffer, k: KeyEvent) -> Option<bool> {
     let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
     match k.code {
@@ -1451,15 +1438,13 @@ fn on_key_edit(buf: &mut EditBuffer, k: KeyEvent) -> Option<bool> {
             buf.insert(c);
             Some(true)
         }
-        // Any other Ctrl-chord: handled-but-inert, so it can't leak a literal.
+        // Ignore unbound Ctrl chords without inserting their character.
         KeyCode::Char(_) => Some(false),
         _ => None,
     }
 }
 
-/// Insert a pasted string at the caret, control characters stripped: a
-/// multi-line clipboard must not fake the Enter press that would submit a
-/// half-pasted value.
+/// Insert pasted text at the caret after removing control characters.
 fn paste_into(buf: &mut EditBuffer, s: &str) {
     for c in s.chars().filter(|c| !c.is_control()) {
         buf.insert(c);
@@ -2196,8 +2181,7 @@ mod tests {
         assert_eq!(app.selected_id, Some(1));
     }
 
-    /// Two sections, two tasks each: tag ids 3 and 4 so they sort into a
-    /// leading "In use" section ahead of "Running" [1, 2].
+    /// Build two two-task sections: In use [3, 4] and Running [1, 2].
     fn app_with_two_sections() -> App {
         let mut app = App::new_local(30, 100);
         let inv = app.invocation_dir.clone();
@@ -2219,15 +2203,12 @@ mod tests {
         app
     }
 
-    /// Tab targets the next section's first task (from mid-section it does
-    /// not preserve the within-section offset) and wraps from the last
-    /// section to the first.
+    /// Next-section navigation selects its first task and wraps forward.
     #[test]
     fn tab_jumps_to_next_section_first_task() {
         let mut app = app_with_two_sections();
 
-        // Mid "In use" (offset 1): lands on Running's first (1), not its
-        // offset-1 task (2).
+        // From In use, select Running's first task.
         app.selected_id = Some(4);
         app.select_next_section();
         assert_eq!(
@@ -2236,21 +2217,18 @@ mod tests {
             "next section's first, not same offset"
         );
 
-        // Mid the last section: wraps to the first section's first task.
+        // From the last section, wrap to the first task in In use.
         app.selected_id = Some(2);
         app.select_next_section();
         assert_eq!(app.selected_id, Some(3), "forward from last section wraps");
     }
 
-    /// Sections move as units: BackTab from mid-section goes to the PREVIOUS
-    /// section's first task, not the current section's first. From the first
-    /// section it wraps to the last section's first task.
+    /// Previous-section navigation selects its first task and wraps backward.
     #[test]
     fn backtab_jumps_to_previous_section_first_task() {
         let mut app = app_with_two_sections();
 
-        // Deep in "Running": previous section's first (3), not Running's own
-        // first (1).
+        // From Running, select In use's first task.
         app.selected_id = Some(2);
         app.select_prev_section();
         assert_eq!(
@@ -2259,7 +2237,7 @@ mod tests {
             "previous section's first, not current's"
         );
 
-        // From the first section: wraps to the last section's first task.
+        // From the first section, wrap to Running's first task.
         app.selected_id = Some(3);
         app.select_prev_section();
         assert_eq!(
@@ -2269,8 +2247,7 @@ mod tests {
         );
     }
 
-    /// With a single task there is one single-task section: both directions
-    /// land on it, matching the arrow keys' single-task no-op.
+    /// Section navigation keeps a single task selected.
     #[test]
     fn section_nav_is_noop_with_one_task() {
         let mut app = App::new_local(30, 100);
@@ -2286,8 +2263,7 @@ mod tests {
         assert_eq!(app.selected_id, Some(1));
     }
 
-    /// No selection: Tab picks the first section's first task, BackTab the
-    /// last section's. An empty list stays a no-op with no selection.
+    /// Without a selection, navigation chooses the boundary section.
     #[test]
     fn section_nav_defaults_without_selection() {
         let mut app = app_with_two_sections();
@@ -2917,8 +2893,7 @@ mod tests {
         app.on_key_dashboard(key(KeyCode::Char('R')));
         assert_eq!(app.input.as_str(), "api");
 
-        // The prefill opens with the caret at the end; two lefts put it after
-        // 'a', so typing inserts mid-name.
+        // Move after "a" and insert within the name.
         app.on_key_rename(key(KeyCode::Left));
         app.on_key_rename(key(KeyCode::Left));
         app.on_key_rename(key(KeyCode::Char('x')));
@@ -2947,8 +2922,7 @@ mod tests {
         assert_eq!(app.input.as_str(), "0zaxp!9");
     }
 
-    /// A Ctrl-chord must never insert its literal letter: before the caret
-    /// existed, an unbound chord fell into the plain-char arm.
+    /// Unbound Ctrl chords do not insert their literal letters.
     #[test]
     fn ctrl_chords_never_insert_their_letter() {
         let mut app = App::new_local(30, 100);

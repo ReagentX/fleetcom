@@ -40,9 +40,8 @@ values. Geometry is 40×120 unless noted.
 The Codex hint-row and approval fixtures use approximate indentation, so their
 tests match trimmed heads and column-0 structure. The Claude waiting fixture
 omits the welcome box and includes agent-roster rows below the input box. The
-Claude task-list fixtures reproduce a maintainer live sighting (2026-07-20,
-claude 2.1.215): the layout is faithful, all wording is paraphrased to generic
-phase names, and both omit the welcome box.
+Claude task-list fixtures use generic phase names in a task-list layout; both
+omit the welcome box.
 
 | Fixture | Scenario | Coverage |
 | --- | --- | --- |
@@ -54,8 +53,8 @@ phase names, and both omit the welcome box.
 | `preview_claude_done.bin` | claude after a finished turn (`✻ Crunched for 4s` in the body) | fall-through; body completion rows are out of the pinned window |
 | `preview_claude_body_menu.bin` | approval-menu text quoted in the body while the spinner runs | the pinned spinner wins; body menu text is ignored |
 | `preview_claude_body_menu_idle.bin` | approval-menu text touching the chrome window, input box intact | a foreign column-0 row aborts extraction and resolves to the marker |
-| `preview_claude_tasklist.bin` | claude spinner above a six-row task-list block, agent roster below the box | `claude:spinner` through an indented block longer than the old three-row window |
-| `preview_claude_body_above_tasklist.bin` | spinner-shaped body row above `⏺` prose and the task list | negative: the column-0 prose row aborts; the widened window is not a body hunt |
+| `preview_claude_tasklist.bin` | claude spinner above a six-row task-list block, agent roster below the box | `claude:spinner` through a bounded indented block |
+| `preview_claude_body_above_tasklist.bin` | spinner-shaped body row above `⏺` prose and the task list | negative: column-0 prose invalidates the status structure |
 | `preview_codex_working.bin` | codex `• Working (7s • esc to interrupt) · 1 background terminal running · /ps to view · /stop to close` | `codex:working` normalization: affordances stripped, slow suffix kept |
 | `preview_codex_working_over_ran.bin` | codex working with a `• Ran` row higher in the same turn | `codex:working` wins at the pin; the stale row never surfaces |
 | `preview_codex_scrollback.bin` | codex finished turn, `• Ran` from the prior turn in scrollback | the scan stops at the reply bullet and resolves to the floor tier |

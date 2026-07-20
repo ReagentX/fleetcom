@@ -720,10 +720,7 @@ impl Task {
             .unwrap_or(Duration::ZERO)
     }
 
-    /// Idle for *placement*: live and quiet past `window`. The same signal
-    /// `lifecycle` reads, and the supervisor passes both the same window, so
-    /// glyph and placement flip at one edge; a finished task is never parked
-    /// because its exit state already places it.
+    /// Whether a live task has been quiet beyond the placement window.
     pub fn parked(&self, now: Instant, window: Duration) -> bool {
         self.finished.is_none() && self.quiet_for(now) > window
     }
@@ -1077,9 +1074,7 @@ mod tests {
         t.terminate();
     }
 
-    /// `lifecycle` and `parked` read the same quiet signal under the same
-    /// window, so they flip together at one edge: 9 s of quiet is inside a
-    /// 10 s window (active, unparked), 11 s is past it (idle, parked).
+    /// Lifecycle and placement cross the shared quiet threshold together.
     #[test]
     fn lifecycle_and_parked_agree_across_the_window_edge() {
         let mut t = spawn(5, "sleep 5");
@@ -1098,11 +1093,7 @@ mod tests {
         t.terminate();
     }
 
-    /// The window is the debounce: quiet gaps shorter than the window never
-    /// show `Idle`, no matter how many accumulate. Each simulated output
-    /// burst resets `last_activity`, so a sub-window cadence (`top` every
-    /// 1–2 s, here 9 s to hug the edge) cannot produce an idle edge even
-    /// though the gaps sum to several windows.
+    /// Repeated output before the quiet threshold keeps a task active.
     #[test]
     fn sub_window_quiet_gaps_never_read_as_idle() {
         let mut t = spawn(7, "sleep 5");
@@ -1112,8 +1103,7 @@ mod tests {
             let probe = start + Duration::from_secs(9) * gaps;
             assert_eq!(t.lifecycle(probe, window), Lifecycle::Active);
             assert!(!t.parked(probe, window));
-            // The burst that ends this gap: the reader thread would stamp
-            // `last_activity` on output; the test stamps it directly.
+            // Simulate output at the end of each quiet gap.
             *t.last_activity.lock().unwrap() = probe;
         }
         t.terminate();

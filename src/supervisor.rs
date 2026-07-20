@@ -22,13 +22,8 @@ use crate::{
     task::Task,
 };
 
-/// No output for this long ⇒ idle: one window over `last_activity` drives
-/// `Lifecycle::Idle`, `parked`, and every UI reading of "idle" (glyph, header
-/// tallies, sort placement), so they agree at a single edge. Owned here
-/// because the core, not the client, computes lifecycle: it holds the clock
-/// and the live parser. The width is the debounce: a cadence shorter than the
-/// window (`top` bursts every 1–2 s) resets the signal before it can expire
-/// and never produces an idle edge.
+/// Quiet period after which a live task becomes idle. Lifecycle and placement
+/// use this same threshold.
 const IDLE_AFTER: Duration = Duration::from_secs(10);
 
 /// Send-on-change fingerprint for the watched screen and scrollback offset.
@@ -55,31 +50,19 @@ const MAX_TASKS: usize = 256;
 /// this limit to bound shell arguments and serialized task snapshots.
 const MAX_COMMAND_LEN: usize = 64 * 1024;
 
-/// Env var overriding per-task terminal scrollback (history rows). Read once,
-/// when a supervisor is constructed, so a change reaches the tasks of the
-/// *next* daemon: an already-running daemon keeps its value until
-/// `fleetcom --kill`.
+/// Environment variable overriding per-task terminal history depth.
 pub const FLEETCOM_SCROLLBACK: &str = "FLEETCOM_SCROLLBACK";
 
-/// History rows retained by each task's terminal grid absent any override.
+/// Default history rows retained by each task's terminal grid.
 pub const DEFAULT_SCROLLBACK: usize = 2000;
 
-/// Ceiling on the scrollback override: alacritty's own config cap. History
-/// rows are lazily allocated, so a large limit costs memory only when a task
-/// actually scrolls, but a stray huge value must not be able to balloon the
-/// daemon.
+/// Maximum configured history rows per task.
 const MAX_SCROLLBACK: usize = 100_000;
 
-/// The validated `--scrollback` value, installed at most once, at startup, by
-/// `main`. A typed stand-in for writing [`FLEETCOM_SCROLLBACK`] into this
-/// process's environment: `std::env::set_var` is unsafe in edition 2024 and
-/// the crate forbids unsafe code. `spawn_daemon` forwards it across the
-/// process boundary as the real env var.
+/// Process-local value supplied by `--scrollback`.
 static SCROLLBACK_FLAG: OnceLock<usize> = OnceLock::new();
 
-/// Install the `--scrollback` flag value; the first write wins. `main` calls
-/// this before any supervisor construction or daemon autostart, so every
-/// spawner observes it.
+/// Install the `--scrollback` flag value. The first call wins.
 pub fn set_scrollback_flag(lines: usize) {
     let _ = SCROLLBACK_FLAG.set(lines);
 }
@@ -89,9 +72,7 @@ pub fn scrollback_flag() -> Option<usize> {
     SCROLLBACK_FLAG.get().copied()
 }
 
-/// Effective per-task scrollback for a supervisor constructed now: the
-/// `--scrollback` flag, else [`FLEETCOM_SCROLLBACK`], else
-/// [`DEFAULT_SCROLLBACK`].
+/// Resolve per-task scrollback from the flag, environment, or default.
 pub fn resolve_scrollback() -> usize {
     effective_scrollback(
         scrollback_flag(),
@@ -99,12 +80,9 @@ pub fn resolve_scrollback() -> usize {
     )
 }
 
-/// Pure core of [`resolve_scrollback`]. The two sources fail differently by
-/// design: the flag was already validated by `parse_args` (its user is
-/// present to see a refusal), while an unparseable env value falls back to
-/// the default because a daemon must never fail to start over a typo'd,
-/// set-and-forgotten variable. Both are clamped to [`MAX_SCROLLBACK`]; zero
-/// is legal and means no scrollback.
+/// Resolve explicit scrollback sources. The flag takes precedence; invalid
+/// environment values use the default; overrides are clamped; zero disables
+/// history.
 fn effective_scrollback(flag: Option<usize>, env: Option<&str>) -> usize {
     flag.or_else(|| env.and_then(|v| v.parse().ok()))
         .map_or(DEFAULT_SCROLLBACK, |lines| lines.min(MAX_SCROLLBACK))
@@ -200,9 +178,7 @@ pub struct Supervisor {
     /// runs at this size, so attach never reflows.
     rows: u16,
     cols: u16,
-    /// History rows per task terminal grid, fixed at construction: the owning
-    /// process resolves it once (flag, env var, default) and every task this
-    /// supervisor spawns gets the same depth.
+    /// History rows used by every task this supervisor spawns.
     scrollback: usize,
     /// The task whose screen the client is watching (attach/peek), or `None`.
     watched: Option<u64>,

@@ -46,7 +46,7 @@
 | `✗` | Completed, non-zero exit |
 | `◆` | Tagged "in use" |
 
-The `∙` glyph flips after ≈600 ms of quiet; the Idle *section* in the by-state sort uses a 10 s window. A task can therefore show `∙` while still filed under Running.
+The `∙` glyph and the Idle section both apply after 10 seconds without output.
 
 ### Input and lifecycle mechanics
 
