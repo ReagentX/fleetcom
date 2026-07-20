@@ -14,7 +14,7 @@
 //!
 //! 1. locates the chrome region structurally (claude's separator-pair input
 //!    box, codex's status bar and composer, grok's bordered input box) and
-//!    scans only rows pinned to it, never the whole grid;
+//!    limits status candidates relative to it;
 //! 2. returns `None` when the expected structure is absent or inconsistent;
 //! 3. matches row prefixes so status rows truncated with an ellipsis at narrow
 //!    widths remain recognizable. A wrapped row fails the structural check.
@@ -86,16 +86,12 @@ fn is_rule_row(row: &str) -> bool {
 /// space and an `…`-terminated status phrase.
 const CLAUDE_SPINNER: &[char] = &['·', '✢', '✳', '✶', '✻', '✽'];
 
-/// Maximum content rows scanned above the input box for a status row. The
-/// window exists to stop body-wandering, so only rows that could carry text
-/// consume it: the indented class and the deciding column-0 row. Blank rows
-/// skip free — the workflows view pads with tall blank runs by design, and a
-/// blank carries no false-positive risk. This covers an indented task-list
-/// block while keeping the scan pinned to nearby chrome.
+/// Maximum nonblank rows inspected above the input box. Blank rows do not
+/// consume the limit; indented hint and task-list rows do.
 const CLAUDE_STATUS_WINDOW: usize = 16;
 
 /// claude (alt screen). Working state: a column-0 spinner row above the
-/// input box's top separator, within [`CLAUDE_STATUS_WINDOW`] content rows
+/// input box's top separator, within [`CLAUDE_STATUS_WINDOW`] nonblank rows
 /// of it.
 /// Approval state: the dialog replaces the input box entirely; the menu
 /// match fires only when that box is gone.
@@ -142,11 +138,9 @@ fn claude_box_top(rows: &[String]) -> Option<usize> {
         .then_some(top)
 }
 
-/// Scan above the input box for a spinner or waiting row. Blank rows skip
-/// without consuming the window; indented hint/task-list rows consume it and
-/// skip. Any other column-0 row, including body prose or a wrapped status
-/// tail, invalidates the structure — that abort is the only false-positive
-/// fence, and the grid above the box bounds the iteration itself.
+/// Scan upward from the input box for a spinner or waiting row. Blank rows do
+/// not consume the window; indented rows do. The first other column-0 row,
+/// including body prose or a wrapped status tail, invalidates the structure.
 fn claude_spinner_status(rows: &[String], top: usize) -> Option<(String, &'static str)> {
     let mut content = 0usize;
     for i in (0..top).rev() {
@@ -172,8 +166,7 @@ fn claude_spinner_status(rows: &[String], top: usize) -> Option<(String, &'stati
             }
             return Some((format!("{verb}{tail}"), "claude:spinner"));
         }
-        // Waiting rows need no action-row probe: col-0 `⏺` rows above are
-        // body prose, and probing them only widens false positives.
+        // Action-row lookup applies only to ellipsis-terminated spinner rows.
         if let Some(waiting) = claude_waiting_text(row) {
             return Some((waiting, "claude:waiting"));
         }
@@ -183,12 +176,8 @@ fn claude_spinner_status(rows: &[String], top: usize) -> Option<(String, &'stati
     None
 }
 
-/// Match the waiting-row family after a recognized spinner frame:
-/// `Waiting for {n} {noun} to finish`, kept verbatim. The specificity lives
-/// in the head+digits+tail skeleton, not an exact noun — the harness varies
-/// the noun (observed so far: `background agent(s)`, `dynamic workflow(s)`)
-/// and enumerating them is a treadmill. The one-to-three-word middle keeps
-/// `·`-bullet body sentences from matching.
+/// Match a spinner-framed `Waiting for {digits} {subject} to finish` row and
+/// return its text verbatim. The subject must contain one to three words.
 fn claude_waiting_text(row: &str) -> Option<String> {
     let mut chars = row.chars();
     if !CLAUDE_SPINNER.contains(&chars.next()?) || chars.next()? != ' ' {
@@ -810,9 +799,8 @@ mod tests {
         );
     }
 
-    /// The ellipsis-less waiting family extracts verbatim across its nouns;
-    /// shapes outside the head+digits+middle+tail skeleton remain foreign
-    /// and abort.
+    /// Waiting rows return verbatim; malformed skeletons fail and do not
+    /// trigger an action-row lookup.
     #[test]
     fn claude_waiting_family_matches_the_skeleton_and_never_probes() {
         let sep = "─".repeat(120);
@@ -832,9 +820,8 @@ mod tests {
             assert_eq!(spin(row), Some((want, "claude:waiting")), "{row:?}");
         }
 
-        // Outside the skeleton: no digits, a middle wider than three words,
-        // a foreign tail, or no middle at all. Each aborts to fall-through,
-        // glyph or not — the pattern carries the specificity, not the frame.
+        // Reject missing digits, more than three subject words, a foreign
+        // suffix, or a missing subject.
         for row in [
             "✻ Waiting patiently",
             "· Waiting for review comments to land",
@@ -846,8 +833,7 @@ mod tests {
             assert_eq!(spin(row), None, "{row:?}");
         }
 
-        // An action row above the waiting row is body prose in this state
-        // and must not win the head.
+        // Waiting rows return without probing the action row above them.
         let rows = [
             "⏺ Running 1 shell command…",
             "",
@@ -991,8 +977,7 @@ mod tests {
         assert_eq!(ClaudeSummary.live_preview(&prose), None);
     }
 
-    /// Blank rows do not consume the window: the workflows view pads with
-    /// tall blank runs, and only content rows carry false-positive risk.
+    /// Blank rows do not consume the nonblank-row window.
     #[test]
     fn claude_blank_rows_do_not_consume_the_window() {
         let sep = "─".repeat(120);
@@ -1002,7 +987,7 @@ mod tests {
         };
         let boxed = |sep: &str| [sep.to_string(), "❯ /workflows".to_string(), sep.to_string()];
 
-        // The sighted layout: the waiting row above a 19-blank run.
+        // Nineteen blank rows separate the waiting row from the input box.
         let mut rows = vec!["✻ Waiting for 1 dynamic workflow to finish".to_string()];
         rows.extend(std::iter::repeat_n(String::new(), 19));
         rows.extend(boxed(&sep));
@@ -1014,8 +999,8 @@ mod tests {
             ))
         );
 
-        // A mixed gap: blanks interleave the indented rows and only the
-        // indented rows spend budget, so fifteen still reach the spinner.
+        // Fifteen indented rows plus the spinner fill the 16-row window;
+        // interleaved blank rows do not affect the count.
         let mut rows = vec!["✢ Running phase 1 (dashboard UI)… (4m 20s)".to_string()];
         for i in 0..15 {
             rows.push(String::new());
@@ -1030,7 +1015,7 @@ mod tests {
             ))
         );
 
-        // Sixteen indented rows exhaust the budget, blanks or not.
+        // Sixteen indented rows plus the spinner exceed the window.
         let mut rows = vec!["✢ Running phase 1 (dashboard UI)… (4m 20s)".to_string()];
         for i in 0..16 {
             rows.push(String::new());
@@ -1039,8 +1024,7 @@ mod tests {
         rows.extend(boxed(&sep));
         assert_eq!(resolve(rows), None);
 
-        // A column-0 prose row inside a blank run still aborts: blanks
-        // relax the budget, never the fence.
+        // An intervening column-0 prose row still aborts the scan.
         let prose = rs(&[
             "✻ Hashing… (6s · ↓ 87 tokens)",
             "",
@@ -1373,8 +1357,7 @@ mod tests {
                 "preview_claude_workflow_wait",
                 include_bytes!("../../tests/corpus/preview_claude_workflow_wait.bin"),
                 &ClaudeSummary,
-                // Exact-text equality also proves the `4/7 agents done`
-                // roster row below the box never entered the extraction.
+                // The roster below the input box is excluded from the status.
                 "Waiting for 1 dynamic workflow to finish",
                 "claude:waiting",
             ),
