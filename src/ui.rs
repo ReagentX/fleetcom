@@ -16,8 +16,7 @@ use crate::{
     app::{App, DirKind, GroupMode, Mode, Row},
     editbuf::EditBuffer,
     format::{pad, rel_time, truncate},
-    preview::PreviewSource,
-    protocol::{Lifecycle, TaskView},
+    protocol::{Lifecycle, Preview, PreviewSource, TaskView},
 };
 
 pub fn render(out: &mut Stdout, app: &mut App) -> io::Result<()> {
@@ -166,7 +165,7 @@ fn render_dashboard(out: &mut impl Write, app: &App) -> io::Result<()> {
                 let v = &app.views[*ti];
                 if app.selected_id == Some(v.id) {
                     rev(out, y, &task_row(v, cols), cols)?;
-                } else if v.source == PreviewSource::Marker {
+                } else if v.preview.source == PreviewSource::Marker {
                     // The marker is a placeholder, not output: dim the
                     // preview cell so it reads as metadata.
                     dim_preview_row(out, y, v, cols)?;
@@ -341,7 +340,7 @@ fn task_row_parts(v: &TaskView, cols: usize) -> (String, String, String) {
     // prefix(2) glyph+sp(2) tag+sp(2) title(title_w) sp(1) preview(prev_w) sp(1) time
     let used = 2 + 2 + 2 + title_w + 1 + 1 + time.chars().count();
     let prev_w = cols.saturating_sub(used);
-    let preview = truncate(&v.preview, prev_w);
+    let preview = truncate(&v.preview.text, prev_w);
     (
         format!("  {glyph} {tag}{title:<title_w$} "),
         format!("{preview:<prev_w$}"),
@@ -428,7 +427,7 @@ fn render_peek(out: &mut impl Write, app: &App) -> io::Result<()> {
     // The peek footer identifies the preview source and in-process matcher.
     let footer = format!(
         " space/esc close · enter attach · preview: {} ",
-        preview_provenance(v)
+        preview_provenance(&v.preview)
     );
     queue!(
         out,
@@ -442,13 +441,13 @@ fn render_peek(out: &mut impl Write, app: &App) -> io::Result<()> {
 
 /// The peek footer's provenance label: source, then the matcher rule when
 /// one produced it, then the frozen flag. Examples: `title`, `floor (frozen)`.
-fn preview_provenance(v: &TaskView) -> String {
-    let mut s = v.source.label().to_string();
-    if let Some(rule) = v.rule {
+fn preview_provenance(p: &Preview) -> String {
+    let mut s = p.source.label().to_string();
+    if let Some(rule) = p.rule {
         s.push('/');
         s.push_str(rule);
     }
-    if v.frozen {
+    if p.frozen {
         s.push_str(" (frozen)");
     }
     s
@@ -738,10 +737,7 @@ mod tests {
             name: name.map(str::to_string),
             lifecycle: Lifecycle::Active,
             parked: false,
-            preview: String::new(),
-            source: PreviewSource::Floor,
-            frozen: false,
-            rule: None,
+            preview: Preview::floor(String::new()),
             started_ago: std::time::Duration::from_secs(5),
             quiet_ago: None,
             finished_ago: None,
@@ -805,15 +801,15 @@ mod tests {
     /// The peek footer's provenance label composes source, rule, and frozen.
     #[test]
     fn preview_provenance_label_shapes() {
-        let mut v = view(None);
-        assert_eq!(preview_provenance(&v), "floor");
-        v.source = PreviewSource::Title;
-        v.frozen = true;
-        assert_eq!(preview_provenance(&v), "title (frozen)");
-        v.source = PreviewSource::Anchor;
-        v.rule = Some("claude-status");
-        v.frozen = false;
-        assert_eq!(preview_provenance(&v), "anchor/claude-status");
+        let mut p = Preview::floor(String::new());
+        assert_eq!(preview_provenance(&p), "floor");
+        p.source = PreviewSource::Title;
+        p.frozen = true;
+        assert_eq!(preview_provenance(&p), "title (frozen)");
+        p.source = PreviewSource::Anchor;
+        p.rule = Some("claude-status");
+        p.frozen = false;
+        assert_eq!(preview_provenance(&p), "anchor/claude-status");
     }
 
     /// The attached bar shows both the name and the command for a named task.

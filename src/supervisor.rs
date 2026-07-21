@@ -455,7 +455,6 @@ impl Supervisor {
             .iter_mut()
             .map(|t| {
                 t.flush_expired_sync();
-                let preview = t.resolve_preview(now);
                 TaskView {
                     id: t.id,
                     command: t.command.clone(),
@@ -465,10 +464,7 @@ impl Supervisor {
                     name: t.name.clone(),
                     lifecycle: t.lifecycle(now, IDLE_AFTER),
                     parked: t.parked(now, IDLE_AFTER),
-                    preview: preview.text,
-                    source: preview.source,
-                    frozen: preview.frozen,
-                    rule: preview.rule,
+                    preview: t.resolve_preview(now),
                     started_ago: now.duration_since(t.started),
                     quiet_ago: t.finished.is_none().then(|| t.quiet_for(now)),
                     finished_ago: t.finished.map(|f| now.duration_since(f)),

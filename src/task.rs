@@ -24,8 +24,8 @@ use rustix::process::{WaitId, WaitIdOptions, waitid};
 use crate::{
     core::{Wake, Waker},
     emulator::Emulator,
-    preview::{Preview, PreviewState},
-    protocol::{Key, Lifecycle, Mods, MouseKind, ScrollAction, env_get},
+    preview::PreviewState,
+    protocol::{Key, Lifecycle, Mods, MouseKind, Preview, ScrollAction, env_get},
 };
 
 /// Maximum bytes admitted to one task's writer queue but not yet written to the
@@ -1915,7 +1915,7 @@ mod tests {
     /// resolve) still reaches the frozen floor.
     #[test]
     fn finalize_preview_freezes_the_final_primary_line() {
-        use crate::preview::PreviewSource;
+        use crate::protocol::PreviewSource;
         let dir = temp("task_final_primary");
         let flag = dir.join("flag");
         let cmd = format!(
@@ -1948,7 +1948,7 @@ mod tests {
     /// alternate-screen title when the restored primary floor is unchanged.
     #[test]
     fn finalize_preview_keeps_the_last_render_across_alt_teardown() {
-        use crate::preview::PreviewSource;
+        use crate::protocol::PreviewSource;
         let dir = temp("task_final_alt");
         let teardown = dir.join("teardown");
         let exit = dir.join("exit");
@@ -2009,7 +2009,7 @@ mod tests {
     /// hold.
     #[test]
     fn finalize_preview_freezes_primary_output_after_alt_teardown() {
-        use crate::preview::PreviewSource;
+        use crate::protocol::PreviewSource;
         let dir = temp("task_final_alt_output");
         let flag = dir.join("flag");
         let cmd = format!(
@@ -2050,7 +2050,7 @@ mod tests {
     /// child command is `printf`.
     #[test]
     fn summary_adapter_anchors_live_and_freezes_completion_at_exit() {
-        use crate::preview::PreviewSource;
+        use crate::protocol::PreviewSource;
         let dir = temp("task_anchor_e2e");
         let flag = dir.join("flag");
         let cmd = format!(

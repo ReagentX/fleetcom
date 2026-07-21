@@ -9,10 +9,7 @@ use std::{
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
 
-use crate::{
-    frame::{KIND_CONTROL, KIND_HELLO, KIND_SCREEN},
-    preview::PreviewSource,
-};
+use crate::frame::{KIND_CONTROL, KIND_HELLO, KIND_SCREEN};
 
 /// Wire-protocol version; the handshake rejects mismatched peers.
 pub const PROTOCOL_VERSION: u32 = 8;
@@ -204,6 +201,59 @@ pub enum Lifecycle {
     Failed,
 }
 
+/// Where a preview's text came from. Declared in ascending authority so the
+/// derived `Ord` ranks provenance directly: `Anchor > Title > Marker >
+/// Floor`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum PreviewSource {
+    /// The last non-blank row of the live screen: unshadowable for
+    /// primary-screen programs, so a title never replaces live stream output.
+    Floor,
+    /// The alternate screen is active with no usable title.
+    Marker,
+    /// The child's window title, honored only on the alternate screen.
+    Title,
+    /// Normalized adapter output: the cascade's top tier.
+    Anchor,
+}
+
+impl PreviewSource {
+    /// Lowercase label shared by the wire encoding and the peek footer.
+    pub fn label(self) -> &'static str {
+        match self {
+            PreviewSource::Floor => "floor",
+            PreviewSource::Marker => "marker",
+            PreviewSource::Title => "title",
+            PreviewSource::Anchor => "anchor",
+        }
+    }
+}
+
+/// One resolved preview. Resolution lives in [`crate::preview`]; the type
+/// sits here because it rides the wire inside [`TaskView`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct Preview {
+    pub text: String,
+    pub source: PreviewSource,
+    /// Summary-adapter matcher ID for an Anchor preview; `None` for other
+    /// sources. Never encoded, so a wire-decoded view always carries `None`.
+    pub rule: Option<&'static str>,
+    /// Whether the preview froze at output-complete and can no longer change.
+    pub frozen: bool,
+}
+
+impl Preview {
+    /// An unfrozen `Floor` preview of `text`.
+    pub(crate) fn floor(text: String) -> Preview {
+        Preview {
+            text,
+            source: PreviewSource::Floor,
+            rule: None,
+            frozen: false,
+        }
+    }
+}
+
 /// A read-only snapshot of one task: everything a dashboard row needs, with no
 /// handle into the live process. Time is pre-reduced to the `*_ago` durations
 /// and `lifecycle`/`parked` are pre-computed by the core (it owns the clock
@@ -223,14 +273,8 @@ pub struct TaskView {
     /// Quiet past the placement window, a much longer edge than `lifecycle`'s
     /// idle threshold; `false` once finished.
     pub parked: bool,
-    pub preview: String,
-    /// Provenance of `preview`.
-    pub source: PreviewSource,
-    /// Whether the preview froze at output-complete and can no longer change.
-    pub frozen: bool,
-    /// Matcher ID for an adapter-produced preview. It is available only
-    /// in-process and is not encoded on the wire.
-    pub rule: Option<&'static str>,
+    /// The dashboard preview, resolved by the core at snapshot time.
+    pub preview: Preview,
     pub started_ago: Duration,
     /// Time since the last PTY output; `Some` only while the task is live.
     pub quiet_ago: Option<Duration>,
@@ -366,7 +410,6 @@ fn lifecycle_from(s: &str) -> Option<Lifecycle> {
     }
 }
 
-// Encoding uses `PreviewSource::label`; only the decode direction lives here.
 fn source_from(s: &str) -> Option<PreviewSource> {
     match s {
         "floor" => Some(PreviewSource::Floor),
@@ -751,10 +794,10 @@ pub fn encode_event(ev: &Event) -> (u8, Vec<u8>) {
                 insert_opt_str(&mut o, "group", &tv.group);
                 insert_opt_str(&mut o, "name", &tv.name);
                 let _ = o.insert("life", lifecycle_str(tv.lifecycle));
-                let _ = o.insert("preview", tv.preview.as_str());
+                let _ = o.insert("preview", tv.preview.text.as_str());
                 // Matcher rules are process-local and omitted from the wire.
-                let _ = o.insert("src", tv.source.label());
-                let _ = o.insert("frozen", tv.frozen);
+                let _ = o.insert("src", tv.preview.source.label());
+                let _ = o.insert("frozen", tv.preview.frozen);
                 let _ = o.insert("started_ms", tv.started_ago.as_millis() as u64);
                 let _ = o.insert("parked", tv.parked);
                 // Each age exists in exactly one phase: `quiet_ms` while
@@ -839,11 +882,6 @@ pub fn decode_event(kind: u8, payload: &[u8]) -> Option<Event> {
                         } else {
                             source_from(tv["src"].as_str()?)?
                         };
-                        let frozen = if tv["frozen"].is_null() {
-                            false
-                        } else {
-                            tv["frozen"].as_bool()?
-                        };
                         views.push(TaskView {
                             id: tv["id"].as_u64()?,
                             command: tv["command"].as_str()?.to_string(),
@@ -854,10 +892,12 @@ pub fn decode_event(kind: u8, payload: &[u8]) -> Option<Event> {
                             name: opt_str(&tv["name"])?,
                             lifecycle,
                             parked,
-                            preview: tv["preview"].as_str()?.to_string(),
-                            source,
-                            frozen,
-                            rule: None,
+                            preview: Preview {
+                                text: tv["preview"].as_str()?.to_string(),
+                                source,
+                                rule: None,
+                                frozen: bool_flag(&tv["frozen"])?,
+                            },
                             started_ago: Duration::from_millis(tv["started_ms"].as_u64()?),
                             // Absent from pre-`parked` daemons: unknown, not zero.
                             quiet_ago: opt_ms(&tv["quiet_ms"])?,
@@ -1150,6 +1190,25 @@ mod tests {
         p
     }
 
+    /// The neutral task view the exact-wire-string assertions pin: every
+    /// optional key absent, every flag false, an empty unfrozen floor preview.
+    fn tv(id: u64) -> TaskView {
+        TaskView {
+            id,
+            command: "x".into(),
+            cwd: PathBuf::from("/"),
+            tagged: false,
+            group: None,
+            name: None,
+            lifecycle: Lifecycle::Ok,
+            parked: false,
+            preview: Preview::floor(String::new()),
+            started_ago: Duration::from_millis(0),
+            quiet_ago: None,
+            finished_ago: None,
+        }
+    }
+
     /// A mistyped member in `lines`, `tasks`, or `names` rejects the whole
     /// event, keeping decoded rows aligned with their encoded positions.
     #[test]
@@ -1206,31 +1265,23 @@ mod tests {
                 name: Some("editor".into()),
                 lifecycle: Lifecycle::Idle,
                 parked: false,
-                preview: "~ line".into(),
-                source: PreviewSource::Title,
-                frozen: false,
-                rule: None,
+                preview: Preview {
+                    text: "~ line".into(),
+                    source: PreviewSource::Title,
+                    rule: None,
+                    frozen: false,
+                },
                 started_ago: Duration::from_millis(4200),
                 quiet_ago: Some(Duration::from_millis(700)),
                 finished_ago: None,
             },
             TaskView {
-                id: 2,
                 command: "make".into(),
                 // Exercise byte-preserving task-path serialization.
                 cwd: PathBuf::from(OsString::from_vec(b"/srv/\xff\xfe".to_vec())),
-                tagged: false,
-                group: None,
-                name: None,
                 lifecycle: Lifecycle::Active,
-                parked: false,
-                preview: String::new(),
-                source: PreviewSource::Floor,
-                frozen: false,
-                rule: None,
                 started_ago: Duration::from_millis(10),
-                quiet_ago: None,
-                finished_ago: None,
+                ..tv(2)
             },
         ]);
         let (k, p) = encode_event(&tasks);
@@ -1307,23 +1358,7 @@ mod tests {
             other => panic!("expected tasks event, got {other:?}"),
         }
         // Encoding an unassigned task omits the group key.
-        let (_, p) = encode_event(&Event::Tasks(vec![TaskView {
-            id: 1,
-            command: "x".into(),
-            cwd: PathBuf::from("/"),
-            tagged: false,
-            group: None,
-            name: None,
-            lifecycle: Lifecycle::Ok,
-            parked: false,
-            preview: String::new(),
-            source: PreviewSource::Floor,
-            frozen: false,
-            rule: None,
-            started_ago: Duration::from_millis(0),
-            quiet_ago: None,
-            finished_ago: None,
-        }]));
+        let (_, p) = encode_event(&Event::Tasks(vec![tv(1)]));
         assert_eq!(std::str::from_utf8(&p).unwrap(), ungrouped);
 
         let grouped = r#"{"t":"tasks","tasks":[{"id":1,"command":"x","cwd":"Lw==","tagged":false,"group":"infra","life":"ok","preview":"","started_ms":0}]}"#;
@@ -1344,23 +1379,7 @@ mod tests {
             other => panic!("expected tasks event, got {other:?}"),
         }
         // Encoding an unnamed task omits the name key.
-        let (_, p) = encode_event(&Event::Tasks(vec![TaskView {
-            id: 1,
-            command: "x".into(),
-            cwd: PathBuf::from("/"),
-            tagged: false,
-            group: None,
-            name: None,
-            lifecycle: Lifecycle::Ok,
-            parked: false,
-            preview: String::new(),
-            source: PreviewSource::Floor,
-            frozen: false,
-            rule: None,
-            started_ago: Duration::from_millis(0),
-            quiet_ago: None,
-            finished_ago: None,
-        }]));
+        let (_, p) = encode_event(&Event::Tasks(vec![tv(1)]));
         assert_eq!(std::str::from_utf8(&p).unwrap(), unnamed);
 
         let named = r#"{"t":"tasks","tasks":[{"id":1,"command":"x","cwd":"Lw==","tagged":false,"name":"build","life":"ok","preview":"","started_ms":0}]}"#;
@@ -1377,38 +1396,18 @@ mod tests {
     fn parked_and_age_fields_round_trip() {
         let tasks = Event::Tasks(vec![
             TaskView {
-                id: 1,
                 command: "top".into(),
-                cwd: PathBuf::from("/"),
-                tagged: false,
-                group: None,
-                name: None,
                 lifecycle: Lifecycle::Idle,
                 parked: true,
-                preview: String::new(),
-                source: PreviewSource::Floor,
-                frozen: false,
-                rule: None,
                 started_ago: Duration::from_millis(60_000),
                 quiet_ago: Some(Duration::from_millis(12_000)),
-                finished_ago: None,
+                ..tv(1)
             },
             TaskView {
-                id: 2,
                 command: "make".into(),
-                cwd: PathBuf::from("/"),
-                tagged: false,
-                group: None,
-                name: None,
-                lifecycle: Lifecycle::Ok,
-                parked: false,
-                preview: String::new(),
-                source: PreviewSource::Floor,
-                frozen: false,
-                rule: None,
                 started_ago: Duration::from_millis(60_000),
-                quiet_ago: None,
                 finished_ago: Some(Duration::from_millis(3_000)),
+                ..tv(2)
             },
         ]);
         let (k, p) = encode_event(&tasks);
@@ -1441,38 +1440,36 @@ mod tests {
     #[test]
     fn preview_source_and_frozen_round_trip() {
         let base = TaskView {
-            id: 1,
-            command: "x".into(),
-            cwd: PathBuf::from("/"),
-            tagged: false,
-            group: None,
-            name: None,
             lifecycle: Lifecycle::Active,
-            parked: false,
-            preview: "p".into(),
-            source: PreviewSource::Floor,
-            frozen: false,
-            rule: None,
-            started_ago: Duration::from_millis(0),
+            preview: Preview::floor("p".into()),
             quiet_ago: Some(Duration::from_millis(1)),
-            finished_ago: None,
+            ..tv(1)
         };
         let tasks = Event::Tasks(vec![
             base.clone(),
             TaskView {
                 id: 2,
-                source: PreviewSource::Marker,
+                preview: Preview {
+                    source: PreviewSource::Marker,
+                    ..base.preview.clone()
+                },
                 ..base.clone()
             },
             TaskView {
                 id: 3,
-                source: PreviewSource::Title,
-                frozen: true,
+                preview: Preview {
+                    source: PreviewSource::Title,
+                    frozen: true,
+                    ..base.preview.clone()
+                },
                 ..base.clone()
             },
             TaskView {
                 id: 4,
-                source: PreviewSource::Anchor,
+                preview: Preview {
+                    source: PreviewSource::Anchor,
+                    ..base.preview.clone()
+                },
                 ..base.clone()
             },
         ]);
@@ -1481,8 +1478,11 @@ mod tests {
 
         // Encoding omits the process-local matcher rule.
         let ruled = Event::Tasks(vec![TaskView {
-            source: PreviewSource::Anchor,
-            rule: Some("claude-status"),
+            preview: Preview {
+                source: PreviewSource::Anchor,
+                rule: Some("claude-status"),
+                ..base.preview.clone()
+            },
             ..base.clone()
         }]);
         let (k, p) = encode_event(&ruled);
@@ -1493,8 +1493,8 @@ mod tests {
         );
         match decode_event(k, &p) {
             Some(Event::Tasks(v)) => {
-                assert_eq!(v[0].source, PreviewSource::Anchor);
-                assert_eq!(v[0].rule, None, "rule must stay daemon-side");
+                assert_eq!(v[0].preview.source, PreviewSource::Anchor);
+                assert_eq!(v[0].preview.rule, None, "rule must stay daemon-side");
             }
             other => panic!("expected tasks event, got {other:?}"),
         }
@@ -1506,9 +1506,9 @@ mod tests {
         let old = r#"{"t":"tasks","tasks":[{"id":1,"command":"x","cwd":"Lw==","tagged":false,"life":"active","preview":"p","started_ms":0,"parked":false}]}"#;
         match decode_event(KIND_CONTROL, old.as_bytes()) {
             Some(Event::Tasks(v)) => {
-                assert_eq!(v[0].source, PreviewSource::Floor);
-                assert!(!v[0].frozen);
-                assert_eq!(v[0].rule, None);
+                assert_eq!(v[0].preview.source, PreviewSource::Floor);
+                assert!(!v[0].preview.frozen);
+                assert_eq!(v[0].preview.rule, None);
             }
             other => panic!("expected tasks event, got {other:?}"),
         }

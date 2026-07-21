@@ -204,7 +204,7 @@ fn tick_flushes_a_stalled_sync_update() {
             if let Event::Tasks(v) = e
                 && let Some(t) = v.first()
             {
-                preview = t.preview.clone();
+                preview = t.preview.text.clone();
             }
         }
         preview.contains("stalled")

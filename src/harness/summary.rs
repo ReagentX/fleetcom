@@ -523,7 +523,8 @@ mod tests {
     use super::*;
     use crate::{
         emulator::Emulator,
-        preview::{MARKER, Preview, PreviewSource, PreviewState},
+        preview::{MARKER, PreviewState},
+        protocol::{Preview, PreviewSource},
     };
 
     /// Synthetic screen: adapters read only `live_rows`, so the other facts

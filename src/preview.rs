@@ -4,7 +4,11 @@
 
 use std::time::{Duration, Instant};
 
-use crate::{emulator::Emulator, harness::summary::SummaryAdapter};
+use crate::{
+    emulator::Emulator,
+    harness::summary::SummaryAdapter,
+    protocol::{Preview, PreviewSource},
+};
 
 // Holds use elapsed time because tick intervals range from the 8 ms frame
 // minimum to the 200 ms idle backstop.
@@ -18,56 +22,6 @@ pub const DEMOTION_HOLD: Duration = Duration::from_millis(600);
 
 /// Preview text for an alternate-screen child with no usable title.
 pub const MARKER: &str = "full-screen";
-
-/// Where a preview's text came from. Declared in ascending authority so the
-/// derived `Ord` ranks provenance directly: `Anchor > Title > Marker >
-/// Floor`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub enum PreviewSource {
-    /// The last non-blank row of the live screen: unshadowable for
-    /// primary-screen programs, so a title never replaces live stream output.
-    Floor,
-    /// The alternate screen is active with no usable title.
-    Marker,
-    /// The child's window title, honored only on the alternate screen.
-    Title,
-    /// Normalized adapter output: the cascade's top tier.
-    Anchor,
-}
-
-impl PreviewSource {
-    /// Lowercase label shared by the wire encoding and the peek footer.
-    pub fn label(self) -> &'static str {
-        match self {
-            PreviewSource::Floor => "floor",
-            PreviewSource::Marker => "marker",
-            PreviewSource::Title => "title",
-            PreviewSource::Anchor => "anchor",
-        }
-    }
-}
-
-/// One resolved preview. `frozen` marks an immutable final value. `rule` is
-/// the summary-adapter matcher ID for an Anchor preview and is `None` for
-/// other sources.
-#[derive(Debug, Clone, PartialEq)]
-pub struct Preview {
-    pub text: String,
-    pub source: PreviewSource,
-    pub rule: Option<&'static str>,
-    pub frozen: bool,
-}
-
-impl Preview {
-    fn floor(text: String) -> Preview {
-        Preview {
-            text,
-            source: PreviewSource::Floor,
-            rule: None,
-            frozen: false,
-        }
-    }
-}
 
 /// The emulator facts one resolution step reads. A trait so unit tests
 /// resolve against synthetic screens without a PTY.
