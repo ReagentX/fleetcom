@@ -36,7 +36,7 @@ mod testutil;
 pub(crate) use terminal::{ansi, emulator, format, frame, input};
 
 use std::{
-    io,
+    io::{self, IsTerminal},
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -153,7 +153,30 @@ fn parse_args(args: &[String]) -> Result<Invocation, String> {
     }
 }
 
-fn main() -> io::Result<()> {
+/// The single stderr shape for a fatal error: the `fleetcom: ` prefix plus
+/// the error's `Display` form. Every terminal error goes through this or
+/// prints the same prefix by hand with added context (the daemon-connect
+/// failure); nothing reaches the runtime's `Debug` handler.
+fn error_line(e: impl std::fmt::Display) -> String {
+    format!("fleetcom: {e}")
+}
+
+fn main() {
+    // Matching here instead of returning `io::Result` from `main` is the whole
+    // point: the runtime's default handler `Debug`-prints an `Err` — raw
+    // struct noise, no prefix. Every error that propagates this far becomes
+    // one prefixed, human-readable stderr line with a deliberate exit code.
+    if let Err(e) = run() {
+        eprintln!("{}", error_line(&e));
+        std::process::exit(1);
+    }
+}
+
+/// The whole program, minus error presentation: `main` owns how an `Err`
+/// prints and exits. Paths with a more specific report or exit code
+/// (usage errors, the daemon-connect failure, the tty guard) print and
+/// `exit` directly rather than flattening into the generic exit-1 line.
+fn run() -> io::Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let (foreground, session, scrollback) = match parse_args(&args) {
         Ok(Invocation::Help) => {
@@ -174,11 +197,22 @@ fn main() -> io::Result<()> {
             scrollback,
         }) => (foreground, session, scrollback),
         Err(e) => {
-            eprintln!("fleetcom: {e}");
+            eprintln!("{}", error_line(e));
             eprintln!("try 'fleetcom --help'");
             std::process::exit(2);
         }
     };
+
+    // Refuse a redirected stdout before any terminal setup: crossterm falls
+    // back to /dev/tty for the control sequences, so `fleetcom > file` would
+    // leave the user's real terminal raw and blank while frames stream into
+    // the file. Client path only — `--daemon` is deliberately headless, and
+    // help/version/`--kill` never touch the terminal. No degraded mode:
+    // refusing loudly beats rendering into a pipe.
+    if !io::stdout().is_terminal() {
+        eprintln!("{}", error_line("stdout is not a terminal"));
+        std::process::exit(1);
+    }
 
     // Install the value before constructing or autostarting a supervisor.
     if let Some(lines) = scrollback {
@@ -417,6 +451,21 @@ mod tests {
     #[test]
     fn second_session_name_is_rejected() {
         assert!(parse(&["one", "two"]).is_err());
+    }
+
+    /// The boundary contract: fatal errors print the `Display` form behind
+    /// the `fleetcom: ` prefix — never `Debug`'s struct noise.
+    #[test]
+    fn error_line_prefixes_display_form() {
+        let e = io::Error::new(io::ErrorKind::TimedOut, "daemon did not exit after SIGTERM");
+        assert_eq!(
+            error_line(&e),
+            "fleetcom: daemon did not exit after SIGTERM"
+        );
+        assert_eq!(
+            error_line("stdout is not a terminal"),
+            "fleetcom: stdout is not a terminal"
+        );
     }
 
     fn contains(haystack: &[u8], needle: &[u8]) -> bool {
