@@ -159,7 +159,7 @@ mod tests {
     use super::super::testutil::ID;
     use super::super::{CAPTURE_ENV, NOTIFY_CHAIN_ENV};
     use super::*;
-    use crate::testutil::temp;
+    use crate::testutil::{install_fake_notifier, temp, write_executable};
 
     fn mode(p: &Path) -> u32 {
         fs::metadata(p).unwrap().permissions().mode() & 0o777
@@ -365,21 +365,6 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
-    /// Install a fake notifier at `path` that records its argv, one token
-    /// per line, into `record`.
-    fn install_fake_notifier(path: &Path, record: &Path) {
-        fs::create_dir_all(path.parent().unwrap()).unwrap();
-        fs::write(
-            path,
-            format!(
-                "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\n",
-                record.display()
-            ),
-        )
-        .unwrap();
-        fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
-    }
-
     /// A configured chain runs after capture and receives its original argv
     /// followed by the payload. Spaces within an argument remain intact.
     #[test]
@@ -419,8 +404,7 @@ mod tests {
         let assets = CaptureAssets::install(&root, std::process::id()).unwrap();
         let cap = assets.paths_for(4, 0).capture_file;
         let notifier = root.join("failing");
-        fs::write(&notifier, "#!/bin/sh\nexit 1\n").unwrap();
-        fs::set_permissions(&notifier, fs::Permissions::from_mode(0o700)).unwrap();
+        write_executable(&notifier, "exit 1");
 
         let payload = r#"{"type":"agent-turn-complete","turn-id":"t4"}"#;
         let out = Command::new(&assets.codex_notify)

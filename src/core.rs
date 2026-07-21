@@ -41,7 +41,7 @@ pub enum Wake {
     /// has already fed the parser), so the loop should tick to ship it.
     Output,
     /// The command source ended: the client's socket hit EOF. Distinct from a
-    /// `Shutdown` command: the jobs keep running, only this connection is done.
+    /// `Shutdown` command: the tasks keep running, only this connection is done.
     Hangup,
 }
 
@@ -52,9 +52,9 @@ pub type Waker = Arc<Mutex<Option<Sender<Wake>>>>;
 
 /// Why the loop returned.
 pub enum LoopExit {
-    /// A `Shutdown` command: jobs killed, the caller stops the core.
+    /// A `Shutdown` command: tasks killed, the caller stops the core.
     Shutdown,
-    /// The client is gone (socket EOF, or a write failed). Keep the jobs; the
+    /// The client is gone (socket EOF, or a write failed). Keep the tasks; the
     /// daemon loops back to accept the next client.
     ClientGone,
 }
@@ -91,7 +91,7 @@ fn ready_to_tick(dirty: bool, since_last_tick: Duration) -> bool {
 /// `stop` is an external stop request (the daemon's signal flag): checked once
 /// per wake/timeout, so a raised flag ends the loop within one `FALLBACK` even
 /// when nothing else is happening. It shuts down exactly like a `Shutdown`
-/// command: jobs killed, `LoopExit::Shutdown` returned.
+/// command: tasks killed, `LoopExit::Shutdown` returned.
 pub fn run_loop(
     sup: &mut Supervisor,
     wake_rx: &Receiver<Wake>,
@@ -259,7 +259,7 @@ mod tests {
         core.join().unwrap();
     }
 
-    /// A raised stop flag ends the loop as `Shutdown` (killing the jobs) without
+    /// A raised stop flag ends the loop as `Shutdown` (killing the tasks) without
     /// any command arriving: the path a signalled daemon takes.
     #[test]
     fn stop_flag_ends_loop_with_shutdown() {

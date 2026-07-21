@@ -102,7 +102,7 @@ fn assert_grid_unstyled(fixture: &str, al: &Term<VoidListener>) {
 /// the following row. The first cell pins the message's default styling.
 #[test]
 fn compat_tmux_split() {
-    let al = alacritty(include_bytes!("../tests/corpus/tmux_split.bin"));
+    let al = alacritty(include_bytes!("../../tests/corpus/tmux_split.bin"));
     assert_screen(
         "tmux_split.bin",
         &al,
@@ -124,7 +124,7 @@ fn compat_tmux_split() {
 /// grid with default colors and flags and the cursor at the origin.
 #[test]
 fn compat_vim_session() {
-    let al = alacritty(include_bytes!("../tests/corpus/vim_session.bin"));
+    let al = alacritty(include_bytes!("../../tests/corpus/vim_session.bin"));
     assert_screen("vim_session.bin", &al, &[], (0, 0));
     assert_grid_unstyled("vim_session.bin", &al);
 }
@@ -133,7 +133,7 @@ fn compat_vim_session() {
 /// with default colors and flags and the cursor at the origin.
 #[test]
 fn compat_less_altscreen() {
-    let al = alacritty(include_bytes!("../tests/corpus/less_altscreen.bin"));
+    let al = alacritty(include_bytes!("../../tests/corpus/less_altscreen.bin"));
     assert_screen("less_altscreen.bin", &al, &[], (0, 0));
     assert_grid_unstyled("less_altscreen.bin", &al);
 }
@@ -142,7 +142,7 @@ fn compat_less_altscreen() {
 /// grid with default colors and flags.
 #[test]
 fn compat_top_live() {
-    let al = alacritty(include_bytes!("../tests/corpus/top_live.bin"));
+    let al = alacritty(include_bytes!("../../tests/corpus/top_live.bin"));
     assert_screen("top_live.bin", &al, &[], (0, 0));
     assert_grid_unstyled("top_live.bin", &al);
 }
@@ -153,7 +153,7 @@ fn compat_top_live() {
 #[test]
 fn compat_shell_colors() {
     const F: &str = "shell_colors.bin";
-    let al = alacritty(include_bytes!("../tests/corpus/shell_colors.bin"));
+    let al = alacritty(include_bytes!("../../tests/corpus/shell_colors.bin"));
     assert_screen(
         F,
         &al,
@@ -387,7 +387,7 @@ fn compat_shell_colors() {
 #[test]
 fn compat_build_log() {
     const F: &str = "build_log.bin";
-    let al = alacritty(include_bytes!("../tests/corpus/build_log.bin"));
+    let al = alacritty(include_bytes!("../../tests/corpus/build_log.bin"));
     assert_screen(
         F,
         &al,
@@ -476,7 +476,7 @@ fn compat_build_log() {
 /// dim and no intervening SGR 22: both intensity flags stack on the cells.
 #[test]
 fn semantic_codex_resume_scrollback_retention() {
-    let al = alacritty(include_bytes!("../tests/corpus/codex_resume.bin"));
+    let al = alacritty(include_bytes!("../../tests/corpus/codex_resume.bin"));
     assert_eq!(al.grid().history_size(), 85, "codex chat history retention");
 
     let marker = &al.grid()[Line(7)][Column(0)];
@@ -497,7 +497,7 @@ fn semantic_codex_resume_scrollback_retention() {
 /// scrolls plus the initial row that `ESC[2J` moves into history.
 #[test]
 fn semantic_topregion_scroll_retention() {
-    let al = alacritty(include_bytes!("../tests/corpus/topregion_scroll.bin"));
+    let al = alacritty(include_bytes!("../../tests/corpus/topregion_scroll.bin"));
     assert_eq!(
         al.grid().history_size(),
         35,
@@ -509,7 +509,7 @@ fn semantic_topregion_scroll_retention() {
 /// VS16 remains a zero-width attachment; default-emoji codepoints remain wide.
 #[test]
 fn semantic_wide_emoji_vs16_width() {
-    let al = alacritty(include_bytes!("../tests/corpus/wide_emoji.bin"));
+    let al = alacritty(include_bytes!("../../tests/corpus/wide_emoji.bin"));
     let grid = al.grid();
 
     // U+2705 has emoji presentation by default: two cells.
@@ -540,7 +540,7 @@ fn semantic_wide_emoji_vs16_width() {
 /// is a full-screen `\r\n` after the region resets, retained as one row.
 #[test]
 fn semantic_dec_scrollregion_charset_translation() {
-    let al = alacritty(include_bytes!("../tests/corpus/dec_scrollregion.bin"));
+    let al = alacritty(include_bytes!("../../tests/corpus/dec_scrollregion.bin"));
 
     assert_eq!(
         al.grid().history_size(),
@@ -584,45 +584,51 @@ fn emulator_wrapper_matches_the_raw_backend_on_every_fixture() {
     let fixtures: [(&str, &[u8]); 12] = [
         (
             "tmux_split",
-            include_bytes!("../tests/corpus/tmux_split.bin"),
+            include_bytes!("../../tests/corpus/tmux_split.bin"),
         ),
         (
             "vim_session",
-            include_bytes!("../tests/corpus/vim_session.bin"),
+            include_bytes!("../../tests/corpus/vim_session.bin"),
         ),
         (
             "less_altscreen",
-            include_bytes!("../tests/corpus/less_altscreen.bin"),
+            include_bytes!("../../tests/corpus/less_altscreen.bin"),
         ),
-        ("top_live", include_bytes!("../tests/corpus/top_live.bin")),
+        (
+            "top_live",
+            include_bytes!("../../tests/corpus/top_live.bin"),
+        ),
         (
             "shell_colors",
-            include_bytes!("../tests/corpus/shell_colors.bin"),
+            include_bytes!("../../tests/corpus/shell_colors.bin"),
         ),
-        ("build_log", include_bytes!("../tests/corpus/build_log.bin")),
+        (
+            "build_log",
+            include_bytes!("../../tests/corpus/build_log.bin"),
+        ),
         (
             "claude_resume",
-            include_bytes!("../tests/corpus/claude_resume.bin"),
+            include_bytes!("../../tests/corpus/claude_resume.bin"),
         ),
         (
             "codex_resume",
-            include_bytes!("../tests/corpus/codex_resume.bin"),
+            include_bytes!("../../tests/corpus/codex_resume.bin"),
         ),
         (
             "grok_resume",
-            include_bytes!("../tests/corpus/grok_resume.bin"),
+            include_bytes!("../../tests/corpus/grok_resume.bin"),
         ),
         (
             "wide_emoji",
-            include_bytes!("../tests/corpus/wide_emoji.bin"),
+            include_bytes!("../../tests/corpus/wide_emoji.bin"),
         ),
         (
             "dec_scrollregion",
-            include_bytes!("../tests/corpus/dec_scrollregion.bin"),
+            include_bytes!("../../tests/corpus/dec_scrollregion.bin"),
         ),
         (
             "topregion_scroll",
-            include_bytes!("../tests/corpus/topregion_scroll.bin"),
+            include_bytes!("../../tests/corpus/topregion_scroll.bin"),
         ),
     ];
     for (name, bytes) in fixtures {

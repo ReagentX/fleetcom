@@ -86,9 +86,9 @@ mod tests {
     use std::fs;
 
     use super::super::is_uuid;
-    use super::super::testutil::{ID, OTHER, paths};
+    use super::super::testutil::{ID, OTHER, assert_all_opaque, assert_corpus_scrape, paths};
     use super::*;
-    use crate::testutil::{corpus_emulator, temp};
+    use crate::testutil::temp;
 
     /// Grok-specific opaque shapes: flags, the `-r`/`-s`/`=` spellings the
     /// tool prints but detection refuses, and subcommands. The syntax shared
@@ -111,14 +111,7 @@ mod tests {
             format!("grok --resume {ID} --debug"),
         ])
         .collect();
-        for cmd in opaque {
-            assert_eq!(Grok.detect(&cmd), None, "{cmd:?} must be opaque");
-            assert_eq!(
-                Grok.resume_command(&cmd, ID),
-                cmd,
-                "an opaque command must never be rewritten"
-            );
-        }
+        assert_all_opaque(&Grok, ID, &opaque);
     }
 
     /// A bare launch gains only the pinned ID because Grok exposes no live
@@ -226,11 +219,10 @@ mod tests {
     /// The scraper recovers the exit-hint ID from the corpus terminal bytes.
     #[test]
     fn corpus_scrape_recovers_the_exit_hint_id() {
-        let mut emu = corpus_emulator();
-        emu.process(include_bytes!("../../tests/corpus/grok_resume.bin"));
-        assert_eq!(
-            Grok.scrape_exit(&emu.text_with_history()).as_deref(),
-            Some("17ac97af-8cfc-46a7-9599-8cea45a687a6")
+        assert_corpus_scrape(
+            &Grok,
+            include_bytes!("../../tests/corpus/grok_resume.bin"),
+            "17ac97af-8cfc-46a7-9599-8cea45a687a6",
         );
     }
 }

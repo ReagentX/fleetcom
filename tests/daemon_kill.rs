@@ -1,4 +1,4 @@
-//! `fleetcom --kill` must stop the daemon and its jobs while another client is
+//! `fleetcom --kill` must stop the daemon and its tasks while another client is
 //! attached.
 
 mod common;
@@ -10,16 +10,16 @@ use std::{
 
 use nix::sys::signal::kill;
 
-use common::{spawn_job, start_daemon, wait_until};
+use common::{spawn_task, start_daemon, wait_until};
 
 #[test]
 fn kill_works_while_a_client_is_attached() {
     let (dir, mut daemon, mut stream) = start_daemon("kill", |_| {});
     let sock = dir.join("default.sock");
 
-    // A long-lived job that records its pid (== its pgid, via setsid).
-    let pidfile = dir.join("job.pid");
-    let job = spawn_job(
+    // A long-lived task that records its pid (== its pgid, via setsid).
+    let pidfile = dir.join("task.pid");
+    let task = spawn_task(
         &mut stream,
         &dir,
         &pidfile,
@@ -47,7 +47,7 @@ fn kill_works_while_a_client_is_attached() {
         "--kill exited with an error"
     );
 
-    // --kill returning means the teardown is complete: daemon exited, job
+    // --kill returning means the teardown is complete: daemon exited, task
     // group-killed, socket removed.
     assert!(
         wait_until(Duration::from_secs(5), || {
@@ -56,8 +56,8 @@ fn kill_works_while_a_client_is_attached() {
         "daemon still running after --kill returned"
     );
     assert!(
-        wait_until(Duration::from_secs(5), || kill(job, None).is_err()),
-        "job survived --kill"
+        wait_until(Duration::from_secs(5), || kill(task, None).is_err()),
+        "task survived --kill"
     );
     assert!(!sock.exists(), "socket file left behind");
 

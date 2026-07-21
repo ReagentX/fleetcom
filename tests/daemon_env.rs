@@ -6,20 +6,17 @@ mod common;
 
 use std::{io::Write, time::Duration};
 
-use common::{
-    PROTOCOL_VERSION, hello_frame, read_frame, spawn_frame, start_daemon_raw, stop_daemon,
-    wait_until,
-};
+use common::{shake_hands_env, spawn_frame, start_daemon_raw, stop_daemon, wait_until};
 
 #[test]
 fn spawn_runs_under_the_hello_env() {
-    // The daemon gets a var of its own; it must NOT reach the job.
+    // The daemon gets a var of its own; it must NOT reach the task.
     let (dir, mut daemon, mut stream) = start_daemon_raw("cliexenv", |cmd| {
         cmd.env("FLEETCOM_DAEMON_ONLY", "leaked");
     });
     let cwd = dir.display().to_string();
 
-    // Hand-rolled hello: PATH + /bin/sh (so the job runs), a marker, and a
+    // Hand-rolled hello: PATH + /bin/sh (so the task runs), a marker, and a
     // non-UTF-8 var (0xFF/0xFE are invalid anywhere in a UTF-8 sequence) that
     // must not break the spawn.
     let path = std::env::var("PATH").unwrap_or_default();
@@ -29,15 +26,7 @@ fn spawn_runs_under_the_hello_env() {
         (b"FLEETCOM_MARKER".as_slice(), b"from-client".as_slice()),
         (b"FLEETCOM_BAD".as_slice(), b"ok\xff\xfe".as_slice()),
     ];
-    stream
-        .write_all(&hello_frame(PROTOCOL_VERSION, &env, &cwd))
-        .unwrap();
-    let (_, payload) = read_frame(&mut stream).expect("no reply to hello");
-    assert!(
-        String::from_utf8_lossy(&payload).contains("hello_ok"),
-        "hello was refused: {}",
-        String::from_utf8_lossy(&payload)
-    );
+    shake_hands_env(&mut stream, &cwd, &env);
 
     let out = dir.join("out");
     let command = format!(
@@ -51,14 +40,14 @@ fn spawn_runs_under_the_hello_env() {
     let wrote = wait_until(Duration::from_secs(5), || {
         std::fs::read_to_string(&out).is_ok_and(|c| !c.is_empty())
     });
-    assert!(wrote, "the spawned job never wrote its output");
+    assert!(wrote, "the spawned task never wrote its output");
     assert_eq!(
         std::fs::read_to_string(&out).unwrap(),
         "from-client:absent",
-        "job must see the client's env and not the daemon's"
+        "task must see the client's env and not the daemon's"
     );
 
-    // Clean shutdown; the job already exited on its own.
+    // Clean shutdown; the task already exited on its own.
     stop_daemon(&mut daemon);
     let _ = std::fs::remove_dir_all(&dir);
 }

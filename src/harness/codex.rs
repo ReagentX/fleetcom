@@ -368,9 +368,9 @@ pub(crate) fn civil_from_days(days: i64) -> (i64, u32, u32) {
 mod tests {
     use std::path::PathBuf;
 
-    use super::super::testutil::{OTHER, paths};
+    use super::super::testutil::{OTHER, assert_all_opaque, assert_corpus_scrape, paths};
     use super::*;
-    use crate::testutil::{corpus_emulator, temp, v7_at, write_rollout};
+    use crate::testutil::{temp, v7_at, write_rollout};
 
     /// Codex's own launch and resume commands carry v7 IDs; the shared v4
     /// fixture stays valid for detection, which is version-agnostic.
@@ -404,14 +404,7 @@ mod tests {
             format!("codex --resume {ID}"),
         ])
         .collect();
-        for cmd in opaque {
-            assert_eq!(Codex.detect(&cmd), None, "{cmd:?} must be opaque");
-            assert_eq!(
-                Codex.resume_command(&cmd, ID),
-                cmd,
-                "an opaque command must never be rewritten"
-            );
-        }
+        assert_all_opaque(&Codex, ID, &opaque);
     }
 
     /// Scratch home without a `config.toml`.
@@ -808,11 +801,10 @@ mod tests {
     /// terminal emulation removes the styling.
     #[test]
     fn corpus_scrape_recovers_the_exit_hint_id() {
-        let mut emu = corpus_emulator();
-        emu.process(include_bytes!("../../tests/corpus/codex_resume.bin"));
-        assert_eq!(
-            Codex.scrape_exit(&emu.text_with_history()).as_deref(),
-            Some("019f5453-de22-7240-b2e5-0d32692aa6d9")
+        assert_corpus_scrape(
+            &Codex,
+            include_bytes!("../../tests/corpus/codex_resume.bin"),
+            "019f5453-de22-7240-b2e5-0d32692aa6d9",
         );
     }
 }

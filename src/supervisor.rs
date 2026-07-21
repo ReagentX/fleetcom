@@ -26,9 +26,6 @@ use crate::{
 /// use this same threshold.
 const IDLE_AFTER: Duration = Duration::from_secs(10);
 
-/// Send-on-change fingerprint for the watched screen and scrollback offset.
-type LastScreen = (u64, Vec<u8>, (u16, u16), bool, (bool, bool, bool), usize);
-
 /// Per-dimension PTY size limit. Resizes are clamped to `[1, MAX_DIM]` to keep
 /// grid dimensions valid and memory bounded.
 const MAX_DIM: u16 = 1000;
@@ -88,10 +85,8 @@ fn effective_scrollback(flag: Option<usize>, env: Option<&str>) -> usize {
         .map_or(DEFAULT_SCROLLBACK, |lines| lines.min(MAX_SCROLLBACK))
 }
 
-/// How long a SIGTERMed job gets to exit before SIGKILL. TERM-respecting
-/// processes exit in milliseconds, so this is the *ceiling* on quit latency,
-/// not the norm; 2 s is enough for any real flush handler while keeping a
-/// wedged job from making `Q` feel broken.
+/// Grace period between SIGTERM and SIGKILL, bounding shutdown delay for tasks
+/// that do not exit after SIGTERM.
 const KILL_GRACE: Duration = Duration::from_secs(2);
 
 /// Maximum stored label length in Unicode scalar values after normalization,
@@ -182,11 +177,10 @@ pub struct Supervisor {
     scrollback: usize,
     /// The task whose screen the client is watching (attach/peek), or `None`.
     watched: Option<u64>,
-    /// The last `Screen` we emitted (`(id, formatted, cursor, hide)`), so an
-    /// unchanged screen isn't re-serialized and re-sent every tick. Reset to
-    /// `None` whenever `watched` changes, so re-attaching always gets a fresh
-    /// full screen (the client cleared its copy on detach).
-    last_screen: Option<LastScreen>,
+    /// The last emitted screen fingerprint. `lines` stays empty because only
+    /// emitted copies carry them. Cleared when `watched` changes to force a
+    /// fresh screen after attachment.
+    last_screen: Option<ScreenView>,
     /// The current client's launch context, used for spawns and session paths.
     /// Spawning is refused until one is installed.
     launch: Option<LaunchContext>,
@@ -457,7 +451,6 @@ impl Supervisor {
             .iter_mut()
             .map(|t| {
                 t.flush_expired_sync();
-                let preview = t.resolve_preview(now);
                 TaskView {
                     id: t.id,
                     command: t.command.clone(),
@@ -467,10 +460,7 @@ impl Supervisor {
                     name: t.name.clone(),
                     lifecycle: t.lifecycle(now, IDLE_AFTER),
                     parked: t.parked(now, IDLE_AFTER),
-                    preview: preview.text,
-                    source: preview.source,
-                    frozen: preview.frozen,
-                    rule: preview.rule,
+                    preview: t.resolve_preview(now),
                     started_ago: now.duration_since(t.started),
                     quiet_ago: t.finished.is_none().then(|| t.quiet_for(now)),
                     finished_ago: t.finished.map(|f| now.duration_since(f)),
@@ -482,30 +472,29 @@ impl Supervisor {
         if let Some(id) = self.watched
             && let Some(t) = self.tasks.iter().find(|t| t.id == id)
         {
-            let (formatted, cursor, hide_cursor) = t.formatted();
-            let hints = t.input_hints();
+            let (formatted, cursor, hide) = t.formatted();
+            let (wants_mouse, alt_screen, alt_scroll) = t.input_hints();
             let sb = t.scroll_offset();
+            let mut view = ScreenView {
+                id,
+                // `lines` stays empty on both the stored and candidate copies
+                // so it never affects equality; it is filled only on the
+                // emitted copy.
+                lines: Vec::new(),
+                formatted,
+                cursor,
+                // Hide the live cursor while displaying scrollback.
+                hide_cursor: hide || sb > 0,
+                wants_mouse,
+                alt_screen,
+                alt_scroll,
+                scrollback: sb,
+            };
             // Send only when rendering or input-policy state changes.
-            let unchanged = matches!(
-                &self.last_screen,
-                Some((lid, lf, lc, lh, lhints, lsb))
-                    if *lid == id && *lf == formatted && *lc == cursor
-                        && *lh == hide_cursor && *lhints == hints && *lsb == sb
-            );
-            if !unchanged {
-                self.last_screen = Some((id, formatted.clone(), cursor, hide_cursor, hints, sb));
-                self.events.push(Event::Screen(ScreenView {
-                    id,
-                    lines: t.screen_lines(),
-                    formatted,
-                    cursor,
-                    // Hide the live cursor while displaying scrollback.
-                    hide_cursor: hide_cursor || sb > 0,
-                    wants_mouse: hints.0,
-                    alt_screen: hints.1,
-                    alt_scroll: hints.2,
-                    scrollback: sb,
-                }));
+            if self.last_screen.as_ref() != Some(&view) {
+                self.last_screen = Some(view.clone());
+                view.lines = t.screen_lines();
+                self.events.push(Event::Screen(view));
             }
         }
     }
@@ -705,7 +694,7 @@ impl Supervisor {
                 fresh.tagged = self.tasks[i].tagged;
                 fresh.group = self.tasks[i].group.clone();
                 fresh.name = self.tasks[i].name.clone();
-                // The displaced job exits like a Remove: TERM now, the
+                // The displaced task exits like a Remove: TERM now, the
                 // graveyard's grace-then-KILL behind it. Dropping it here
                 // would straight-SIGKILL stragglers of the old run.
                 let mut old = std::mem::replace(&mut self.tasks[i], fresh);
@@ -867,7 +856,6 @@ impl Supervisor {
     }
 }
 
-// Tests live in supervisor_tests.rs: at ≈2,800 lines they dwarf the module itself.
 #[cfg(test)]
 #[path = "supervisor_tests.rs"]
 mod tests;

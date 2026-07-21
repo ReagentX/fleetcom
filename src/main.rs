@@ -8,31 +8,32 @@
 #[cfg(not(unix))]
 compile_error!("fleetcom supports Unix platforms only.");
 
+// Terminal-attached client.
 mod app;
-mod core;
-mod daemon;
-// Caret-addressed single-line buffer backing the text prompts.
 mod editbuf;
-// Differential emulator tests over recorded PTY output.
-#[cfg(test)]
-mod golden;
-// Agent-CLI session capture: the supervisor instruments spawns through it.
-mod harness;
-mod path;
-// Dashboard-preview resolution: the provenance cascade over emulator facts.
-mod preview;
-mod protocol;
-mod session;
-mod supervisor;
-mod task;
-mod terminal;
-// Shared test scaffolds: scratch dirs, deadline polling, corpus fixtures.
-#[cfg(test)]
-mod testutil;
-mod transport;
 mod ui;
 
-pub(crate) use terminal::{ansi, emulator, format, frame};
+// Task lifecycle and dashboard-preview core.
+mod core;
+mod preview;
+mod supervisor;
+mod task;
+
+// Daemon transport, sessions, and wire protocol.
+mod daemon;
+mod protocol;
+mod session;
+mod transport;
+
+mod harness;
+mod path;
+mod terminal;
+
+// Shared test scaffolding.
+#[cfg(test)]
+mod testutil;
+
+pub(crate) use terminal::{ansi, emulator, format, frame, input};
 
 use std::{
     io,
@@ -292,7 +293,7 @@ fn emit_restore_sequences(out: &mut impl io::Write, kitty_pushed: bool) -> io::R
 
 /// Route external termination signals (SIGTERM/SIGHUP/SIGINT) into a quit
 /// flag so the observing loop runs its normal teardown: the client restores
-/// the terminal instead of dying in raw mode, and the daemon kills its jobs
+/// the terminal instead of dying in raw mode, and the daemon kills its tasks
 /// cleanly. `flag::register` only stores into an atomic, so it stays within
 /// `#![forbid(unsafe_code)]`.
 pub(crate) fn install_signal_handlers(flag: Arc<AtomicBool>) -> io::Result<()> {

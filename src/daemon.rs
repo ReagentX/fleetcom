@@ -2,7 +2,7 @@
 //! per-user Unix socket, and serves a client at a time: a hello handshake
 //! (protocol version + the client's launch context), then framed `Command`s in,
 //! framed `Event`s back. It runs the shared event-driven `core::run_loop`. The
-//! supervisor **outlives each client connection**: `q` disconnects, the jobs
+//! supervisor **outlives each client connection**: `q` disconnects, the tasks
 //! keep running, and the next `fleetcom` reattaches.
 //!
 //! It also autostarts a detached daemon when no socket is available.
@@ -10,10 +10,10 @@
 //! The fleet's lifetime is bounded by the daemon's. The daemon holds every
 //! task's PTY master, so daemon death of any kind closes them, and the kernel
 //! hangs up each task's controlling terminal: SIGHUP to its foreground process
-//! group, which (job control being off under `$SHELL -c`) is the whole job.
-//! A normal shutdown sends SIGTERM to each job group, then SIGKILL after a
+//! group, which (job control being off under `$SHELL -c`) is the whole task.
+//! A normal shutdown sends SIGTERM to each task group, then SIGKILL after a
 //! grace period, and removes the socket and lock. A crash or SIGKILL only
-//! closes the PTYs; HUP-immune jobs can survive without a supervisor.
+//! closes the PTYs; HUP-immune tasks can survive without a supervisor.
 
 use std::{
     fs,
@@ -330,7 +330,7 @@ fn spawn_daemon() -> io::Result<()> {
     Ok(())
 }
 
-/// `fleetcom --kill`: stop the daemon and every job it owns. Signal path, not
+/// `fleetcom --kill`: stop the daemon and every task it owns. Signal path, not
 /// socket: the daemon serves one client at a time, so a `Shutdown` *frame*
 /// would sit in the accept backlog until an attached client detached.
 /// `--kill` must work while someone else is attached. The pid comes from the
@@ -375,9 +375,9 @@ pub fn run_kill() -> io::Result<()> {
         Err(e) => return Err(io::Error::other(e)),
     }
 
-    // The daemon notices the flag within ~200 ms, then tears down its jobs.
+    // The daemon notices the flag within ~200 ms, then tears down its tasks.
     // Its exit releases the flock, so acquiring it is the completion signal:
-    // jobs dead, socket removed. 10 s covers the teardown with slack.
+    // tasks dead, socket removed. 10 s covers the teardown with slack.
     for _ in 0..200 {
         match Flock::lock(file, FlockArg::LockExclusiveNonblock) {
             Ok(_held) => return Ok(()),
@@ -392,7 +392,7 @@ pub fn run_kill() -> io::Result<()> {
 }
 
 /// Send `Shutdown` when the lock file has no usable pid. Complete the handshake
-/// first, then wait for the daemon to close the socket after stopping its jobs.
+/// first, then wait for the daemon to close the socket after stopping its tasks.
 fn kill_via_socket() -> io::Result<()> {
     let path = socket_path();
     match UnixStream::connect(&path) {
@@ -416,7 +416,7 @@ fn kill_via_socket() -> io::Result<()> {
 
 /// The daemon entry point (`fleetcom --daemon`). Binds the socket and serves clients
 /// until an explicit shutdown. The supervisor is created once and persists across
-/// reconnects: jobs outlive any single client.
+/// reconnects: tasks outlive any single client.
 pub fn run_daemon() -> io::Result<()> {
     let dir = runtime_dir();
     ensure_runtime_dir(&dir)?; // private 0700 directory
@@ -455,11 +455,11 @@ pub fn run_daemon() -> io::Result<()> {
     // Use one scrollback depth for every task owned by this daemon.
     let mut sup = Supervisor::new(24, 80, supervisor::resolve_scrollback());
 
-    // A signalled daemon shuts down *cleanly*: TERM each job's group with a
+    // A signalled daemon shuts down *cleanly*: TERM each task's group with a
     // KILL after the grace, remove the socket. Dying without that cleanup
     // would still kill the fleet (closing the PTY masters hangs up every
-    // job's terminal; see the module docs), but rudely: no TERM, no grace,
-    // and HUP-immune jobs would leak unowned. The flag is checked in the idle
+    // task's terminal; see the module docs), but rudely: no TERM, no grace,
+    // and HUP-immune tasks would leak unowned. The flag is checked in the idle
     // branch below and inside `run_loop` while a client is being served; both
     // observe it within ~200 ms.
     let term = Arc::new(AtomicBool::new(false));
@@ -468,15 +468,15 @@ pub fn run_daemon() -> io::Result<()> {
     // as shutdown like the rest.
     crate::install_signal_handlers(Arc::clone(&term))?;
 
-    // Non-blocking accept lets the daemon reap exited jobs while idle:
+    // Non-blocking accept lets the daemon reap exited tasks while idle:
     // between clients it would otherwise block in accept() and never call
-    // poll_exit, so a job that finished after `q` would linger as a zombie until
+    // poll_exit, so a task that finished after `q` would linger as a zombie until
     // a reconnect.
     listener.set_nonblocking(true)?;
     const IDLE_REAP: Duration = Duration::from_millis(100);
     loop {
         if term.load(Ordering::Relaxed) {
-            // Kill the jobs now, not via drop at the end of `main`: explicit at
+            // Kill the tasks now, not via drop at the end of `main`: explicit at
             // the one place the loop decides to stop.
             sup.apply(Command::Shutdown);
             break;
@@ -532,7 +532,7 @@ fn transient_accept_error(e: &io::Error) -> bool {
 
 #[derive(PartialEq)]
 enum ServeOutcome {
-    /// Client left; daemon keeps running and the jobs survive.
+    /// Client left; daemon keeps running and the tasks survive.
     Disconnected,
     /// Client asked to kill everything and stop the daemon.
     Shutdown,

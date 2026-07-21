@@ -162,7 +162,7 @@ const PROGRAM_WORD_REFUSALS: &[char] = &[
 /// program matches by basename, and the strict UUID may be bare or wrapped in
 /// the single quote pair emitted by `resume_command`. Extra arguments, prompts,
 /// alternate selectors, and shell syntax do not match.
-pub(crate) fn detect_shape(cmd: &str, program: &str, selector: &str) -> Option<Invocation> {
+fn detect_shape(cmd: &str, program: &str, selector: &str) -> Option<Invocation> {
     let mut words = cmd.split([' ', '\t']).filter(|w| !w.is_empty());
     let first = words.next()?;
     if first.contains(PROGRAM_WORD_REFUSALS) || Path::new(first).file_name()?.to_str()? != program {
@@ -187,7 +187,7 @@ fn unquote(token: &str) -> &str {
 /// Rewrite an accepted command as
 /// `<program word as typed> <selector> '<id>'`. Invalid IDs and unsupported
 /// command shapes pass through unchanged.
-pub(crate) fn resume_shape(cmd: &str, program: &str, selector: &str, id: &str) -> String {
+fn resume_shape(cmd: &str, program: &str, selector: &str, id: &str) -> String {
     if !is_uuid(id) || detect_shape(cmd, program, selector).is_none() {
         return cmd.to_string();
     }
@@ -210,7 +210,7 @@ pub fn is_uuid(s: &str) -> bool {
 
 /// Return the strict UUID at the start of `s`. The next byte must end the token;
 /// an alphanumeric character, `-`, or `_` extends the token and rejects it.
-pub(crate) fn leading_uuid(s: &str) -> Option<&str> {
+fn leading_uuid(s: &str) -> Option<&str> {
     let head = s.get(..36).filter(|h| is_uuid(h))?;
     match s.as_bytes().get(36) {
         Some(&c) if c.is_ascii_alphanumeric() || c == b'-' || c == b'_' => None,
@@ -221,7 +221,7 @@ pub(crate) fn leading_uuid(s: &str) -> Option<&str> {
 /// Extract the ID after the last valid resume hint in `text`. Every
 /// occurrence of every `hints` prefix competes when a strict UUID follows it,
 /// and the largest byte offset wins across prefixes.
-pub(crate) fn last_hint(text: &str, hints: &[&str]) -> Option<String> {
+fn last_hint(text: &str, hints: &[&str]) -> Option<String> {
     let mut last: Option<(usize, String)> = None;
     for hint in hints {
         for (i, _) in text.match_indices(hint) {
@@ -237,7 +237,7 @@ pub(crate) fn last_hint(text: &str, hints: &[&str]) -> Option<String> {
 
 /// Generate a v4 UUID from `/dev/urandom`. A read failure returns `None`, which
 /// lets the caller launch without pinning an ID.
-pub(crate) fn uuid_v4() -> Option<String> {
+fn uuid_v4() -> Option<String> {
     use std::fmt::Write;
     let mut bytes = [0u8; 16];
     File::open("/dev/urandom")
@@ -259,7 +259,7 @@ pub(crate) fn uuid_v4() -> Option<String> {
 /// Spawn plan for the launch-time ID pin: a bare launch pins a fresh v4 UUID
 /// through `--session-id`, the resume form already targets its conversation,
 /// and a `uuid_v4` failure launches without pinning.
-pub(crate) fn pin_plan(inv: &Invocation) -> SpawnPlan {
+fn pin_plan(inv: &Invocation) -> SpawnPlan {
     let mut plan = SpawnPlan::default();
     if *inv == Invocation::Bare
         && let Some(id) = uuid_v4()
@@ -271,7 +271,7 @@ pub(crate) fn pin_plan(inv: &Invocation) -> SpawnPlan {
 }
 
 /// Whether `a` and `b` differ by at most [`CORRELATE_WINDOW`].
-pub(crate) fn within_window(a: SystemTime, b: SystemTime) -> bool {
+fn within_window(a: SystemTime, b: SystemTime) -> bool {
     match a.duration_since(b) {
         Ok(d) => d <= CORRELATE_WINDOW,
         Err(e) => e.duration() <= CORRELATE_WINDOW,
@@ -279,7 +279,7 @@ pub(crate) fn within_window(a: SystemTime, b: SystemTime) -> bool {
 }
 
 /// Millisecond form of [`within_window`] for UUID-embedded timestamps.
-pub(crate) fn within_window_ms(a: u128, b: u128) -> bool {
+fn within_window_ms(a: u128, b: u128) -> bool {
     a.abs_diff(b) <= CORRELATE_WINDOW.as_millis()
 }
 
@@ -288,7 +288,7 @@ pub(crate) fn within_window_ms(a: u128, b: u128) -> bool {
 /// creation times cannot be correlated by window and are skipped too. Several
 /// in-window candidates cannot be told apart, and a stray non-uuid candidate
 /// still counts against uniqueness: both return `None`.
-pub(crate) fn unique_in_window(
+fn unique_in_window(
     dir: PathBuf,
     spawned: SystemTime,
     candidate: impl Fn(&fs::DirEntry) -> Option<String>,
@@ -313,17 +313,17 @@ pub(crate) fn unique_in_window(
 }
 
 /// Single-quote `s` for `$SHELL -c`, encoding embedded `'` as `'\''`.
-pub(crate) fn shell_quote(s: &str) -> String {
+fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
-/// Fixtures shared by the per-harness test modules and the supervisor's
-/// capture suite.
+/// Fixtures and assertions for harness detection and exit scraping.
 #[cfg(test)]
 pub(crate) mod testutil {
     use std::path::PathBuf;
 
-    use super::CapturePaths;
+    use super::{CapturePaths, Harness};
+    use crate::testutil::corpus_emulator;
 
     /// Strict v4 UUID used wherever a valid session ID is needed.
     pub(crate) const ID: &str = "c8c4a5cc-0b32-4ba0-a6b4-6ed08c218e0d";
@@ -332,12 +332,30 @@ pub(crate) mod testutil {
 
     /// Capture-path fixture. The spaced `claude_settings` and `codex_notify`
     /// paths keep the shell- and TOML-quoting assertions honest.
-    pub(crate) fn paths() -> CapturePaths {
+    pub(super) fn paths() -> CapturePaths {
         CapturePaths {
             capture_file: PathBuf::from("/tmp/cap/session.json"),
             claude_settings: PathBuf::from("/tmp/Application Support/fleetcom.json"),
             codex_notify: PathBuf::from("/tmp/Application Support/notify.sh"),
         }
+    }
+
+    /// Assert that every command is opaque to `h`: detection fails and resume
+    /// leaves the command unchanged.
+    pub(super) fn assert_all_opaque(h: &dyn Harness, id: &str, cmds: &[String]) {
+        for cmd in cmds {
+            assert_eq!(h.detect(cmd), None, "{cmd:?} must be opaque");
+            let resumed = h.resume_command(cmd, id);
+            assert_eq!(resumed, *cmd, "an opaque command must never be rewritten");
+        }
+    }
+
+    /// Replay `bytes` at corpus geometry and assert the scraped exit ID.
+    pub(super) fn assert_corpus_scrape(h: &dyn Harness, bytes: &[u8], expected: &str) {
+        let mut emu = corpus_emulator();
+        emu.process(bytes);
+        let text = emu.text_with_history();
+        assert_eq!(h.scrape_exit(&text).as_deref(), Some(expected));
     }
 }
 
