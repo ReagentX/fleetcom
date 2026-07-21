@@ -78,7 +78,7 @@ pub fn sessions_dir(root: Option<PathBuf>) -> Option<PathBuf> {
 /// Missing versions are interpreted as version 1; unsupported versions fail.
 const FORMAT_VERSION: u64 = 1;
 
-/// Build the `dirs` object alone: the recipe body without the wrapper.
+/// Build the recipe's `dirs` object.
 fn dirs_json(cfg: &SessionConfig) -> jzon::JsonValue {
     let mut dirs = jzon::JsonValue::new_object();
     for (dir, entries) in cfg {
@@ -115,9 +115,7 @@ fn to_json(name: &str, cfg: &SessionConfig) -> String {
     obj.pretty(2)
 }
 
-/// Serialize only the recipe body, for change detection. Excludes the wrapper
-/// because its `name` field is volatile in recovery snapshots (the label
-/// carries the write time): equal recipes must fingerprint equal.
+/// Serialize the recipe body for content-based change detection.
 pub fn fingerprint_json(cfg: &SessionConfig) -> String {
     dirs_json(cfg).dump()
 }
@@ -198,8 +196,8 @@ fn from_json(text: &str) -> io::Result<(Option<String>, SessionConfig)> {
 /// Distinguishes concurrent savers' temp files within one process.
 static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
-/// Create missing directories with 0700 and restrict `dir` itself to 0700.
-/// Existing parent directories remain unchanged.
+/// Create missing directories with mode 0700 and remove group and other
+/// permissions from `dir`. Existing parent permissions remain unchanged.
 fn ensure_private_dir(dir: &Path) -> io::Result<()> {
     fs::DirBuilder::new()
         .recursive(true)
@@ -304,24 +302,17 @@ pub fn list_in(dir: &Path) -> Vec<String> {
     names
 }
 
-// --- recovery snapshots: the supervisor's automatic fleet backups, written
-// under `<sessions root>/recovery` in the ordinary wrapped format, and listed
-// and loaded by stem for the wire (`list_recovery_in`/`load_recovery_in`). ----
+// --- automatic recovery snapshots -------------------------------------------
 
-/// Snapshots kept per recovery directory; older ones are pruned after each
-/// write.
+/// Maximum snapshots retained after each recovery write.
 const RECOVERY_KEEP: usize = 10;
 
-/// Recovery-snapshot directory under a session root. Created 0700 on first
-/// write; `list_in` never descends into it (directories fail its `.json`
-/// extension filter), so snapshots stay out of the session picker.
+/// Recovery-snapshot directory under a session root.
 pub fn recovery_dir(sessions_root: &Path) -> PathBuf {
     sessions_root.join("recovery")
 }
 
-/// UTC civil time for `t`: (year, month, day, hour, minute, second).
-/// UTC because the recovery stems must sort lexically by age: local time
-/// repeats an hour at DST fall-back.
+/// UTC civil time as `(year, month, day, hour, minute, second)`.
 fn civil_utc(t: SystemTime) -> (i64, u32, u32, u64, u64, u64) {
     let secs = t
         .duration_since(SystemTime::UNIX_EPOCH)
@@ -332,30 +323,20 @@ fn civil_utc(t: SystemTime) -> (i64, u32, u32, u64, u64, u64) {
     (y, m, d, tod / 3600, (tod % 3600) / 60, tod % 60)
 }
 
-/// Incarnation filename stem `<YYYYMMDD-HHMMSS>-<pid>` from the supervisor's
-/// start time and process id. The pid separates a daemon from a concurrent
-/// `--foreground` client sharing one config root; the leading UTC stamp makes
-/// lexical order age order, which pruning relies on. Digits and dashes only,
-/// so the stem needs no `sanitize` pass.
+/// Build a `<YYYYMMDD-HHMMSS>-<pid>` recovery filename stem in UTC.
 pub fn recovery_stem(start: SystemTime, pid: u32) -> String {
     let (y, m, d, hh, mm, ss) = civil_utc(start);
     format!("{y:04}{m:02}{d:02}-{hh:02}{mm:02}{ss:02}-{pid}")
 }
 
-/// Human label stored in a snapshot's `name` field: `autosaved <YYYY-MM-DD
-/// HH:MM>` (UTC) from the write time. The label exists so a recovery file
-/// copied by hand into `sessions/` becomes an ordinary, sensibly-named
-/// session with no tooling: `list_in` shows the stored name, and loading it
-/// needs nothing new.
+/// Build the snapshot label `autosaved <YYYY-MM-DD HH:MM>` in UTC.
 pub fn recovery_label(now: SystemTime) -> String {
     let (y, m, d, hh, mm, _) = civil_utc(now);
     format!("autosaved {y:04}-{m:02}-{d:02} {hh:02}:{mm:02}")
 }
 
-/// Write one recovery snapshot through the same atomic temp-rename, 0600, and
-/// version-1 path as `save_in`, then prune. `save_in`'s stored-name collision
-/// check does not apply: the incarnation owns `<file_stem>.json` outright and
-/// always overwrites it.
+/// Atomically write a recovery snapshot with mode 0600, then prune old files.
+/// Reusing `file_stem` replaces that snapshot without a stored-name check.
 pub fn save_recovery_in(
     dir: &Path,
     file_stem: &str,
@@ -368,11 +349,8 @@ pub fn save_recovery_in(
     Ok(file)
 }
 
-/// List recovery snapshots under `dir` as wire entries, newest first (stems
-/// lead with a UTC stamp, so descending lexical order is ascending age).
-/// Unreadable and unparseable files are skipped silently: one corrupt
-/// snapshot must not empty the picker of the intact ones beside it. A file
-/// without a stored name labels as its stem, matching `list_in`.
+/// List readable recovery snapshots in descending stem order. Invalid files
+/// are skipped, and files without a stored name use their stem as the label.
 pub fn list_recovery_in(dir: &Path) -> Vec<RecoveryEntry> {
     let mut out = Vec::new();
     if let Ok(entries) = fs::read_dir(dir) {
@@ -387,8 +365,7 @@ pub fn list_recovery_in(dir: &Path) -> Vec<RecoveryEntry> {
             let Ok((stored, cfg)) = fs::read_to_string(&p).and_then(|t| from_json(&t)) else {
                 continue;
             };
-            // Saturate both derived numbers: a count past `u32` pins to the
-            // maximum, and an unreadable or future mtime reads as age 0.
+            // Saturate task counts; use age zero for unavailable or future mtimes.
             let tasks =
                 u32::try_from(cfg.values().map(Vec::len).sum::<usize>()).unwrap_or(u32::MAX);
             let age_secs = fs::metadata(&p)
@@ -408,21 +385,12 @@ pub fn list_recovery_in(dir: &Path) -> Vec<RecoveryEntry> {
     out
 }
 
-/// Whether a wire-supplied stem may be joined into a recovery directory.
-/// Separators cover traversal (`../x`, `a/b`); rejecting `.` outright also
-/// covers extension smuggling and dot-files. Stems the writer generates are
-/// digits and dashes only (see [`recovery_stem`]), so a legitimate stem never
-/// trips this.
+/// Accept a nonempty stem without path separators, extensions, or dot-files.
 fn valid_recovery_stem(stem: &str) -> bool {
     !stem.is_empty() && !stem.contains(['/', '\\', '.'])
 }
 
-/// Load one recovery snapshot by filename stem. `load_in` does not fit here:
-/// it maps a user-typed session *name* through `sanitize` into a filename,
-/// while this addresses a file by the exact stem the daemon listed -- and the
-/// stem arrives over the wire, so it is validated, never rewritten. A stem
-/// this module would not have written fails as `InvalidInput` before any
-/// path is built from it.
+/// Load a recovery snapshot by exact filename stem after path validation.
 pub fn load_recovery_in(dir: &Path, stem: &str) -> io::Result<SessionConfig> {
     if !valid_recovery_stem(stem) {
         return Err(io::Error::new(
@@ -433,10 +401,8 @@ pub fn load_recovery_in(dir: &Path, stem: &str) -> io::Result<SessionConfig> {
     from_json(&fs::read_to_string(dir.join(format!("{stem}.json")))?).map(|(_, cfg)| cfg)
 }
 
-/// Best-effort prune: keep the newest [`RECOVERY_KEEP`] snapshots by filename
-/// (stems are UTC timestamps, so lexical order is age order) and ignore every
-/// error -- a snapshot that cannot be removed must not fail the write that
-/// just succeeded.
+/// Best-effort pruning by filename, retaining the last [`RECOVERY_KEEP`]
+/// entries in lexical order.
 fn prune_recovery(dir: &Path) {
     let Ok(entries) = fs::read_dir(dir) else {
         return;
@@ -848,7 +814,7 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
-    /// 2026-07-14 09:30:15 UTC, matching `civil_from_days`'s test vector.
+    /// Fixed instant at 2026-07-14 09:30:15 UTC.
     fn recovery_instant() -> SystemTime {
         SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_784_021_415)
     }
@@ -866,8 +832,7 @@ mod tests {
         );
     }
 
-    /// A snapshot round-trips through `load_in` with version 1, the human
-    /// label, and the private-permission idiom of ordinary saves.
+    /// Snapshots preserve their schema, label, contents, and permissions.
     #[test]
     fn recovery_snapshot_round_trips_with_version_and_label() {
         let base = temp("session_recovery_roundtrip");
@@ -892,7 +857,7 @@ mod tests {
         let _ = fs::remove_dir_all(&base);
     }
 
-    /// Prune keeps exactly the newest [`RECOVERY_KEEP`] snapshots by filename.
+    /// Pruning keeps the lexically greatest [`RECOVERY_KEEP`] filenames.
     #[test]
     fn recovery_prune_keeps_the_newest_ten() {
         let base = temp("session_recovery_prune");
@@ -917,8 +882,7 @@ mod tests {
         let _ = fs::remove_dir_all(&base);
     }
 
-    /// The `recovery/` subdirectory never appears in a session listing:
-    /// directories fail `list_in`'s `.json` extension filter.
+    /// The recovery directory is excluded from named-session listings.
     #[test]
     fn list_ignores_the_recovery_subdirectory() {
         let dir = temp("session_list_recovery");
@@ -937,9 +901,7 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
-    /// Listing returns newest-first entries with labels and task counts; a
-    /// corrupt snapshot is skipped, not fatal; a missing directory lists as
-    /// empty.
+    /// Listing sorts by descending stem and skips corrupt files.
     #[test]
     fn recovery_listing_is_newest_first_and_skips_corrupt_files() {
         let base = temp("session_recovery_list");
@@ -989,9 +951,7 @@ mod tests {
         let _ = fs::remove_dir_all(&base);
     }
 
-    /// `load_recovery_in` loads by exact stem; a stem carrying a separator or
-    /// dot -- or nothing at all -- fails as `InvalidInput` before any path is
-    /// built, and an unknown stem reads as `NotFound`.
+    /// Recovery loads reject empty, dotted, or path-shaped stems.
     #[test]
     fn load_recovery_in_loads_by_stem_and_rejects_traversal() {
         let base = temp("session_recovery_load");

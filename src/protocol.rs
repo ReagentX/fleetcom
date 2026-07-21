@@ -12,7 +12,7 @@ use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
 use crate::frame::{KIND_CONTROL, KIND_HELLO, KIND_SCREEN};
 
 /// Wire-protocol version; the handshake rejects mismatched peers.
-/// v9 added recovery entries to the `sessions` event and `Command::LoadRecovery`.
+/// Version 9 includes recovery entries and recovery-load commands.
 pub const PROTOCOL_VERSION: u32 = 9;
 
 /// Environment and working directory supplied by the launching client.
@@ -100,9 +100,8 @@ pub enum Command {
     SaveSession { name: String },
     /// Spawn every command in a named recipe, each in its (existing) dir.
     LoadSession { name: String },
-    /// Spawn every command in a recovery snapshot, addressed by the filename
-    /// stem from [`Event::Sessions`]. The daemon validates the stem before it
-    /// touches the filesystem: the stem is a wire string, not a trusted path.
+    /// Spawn every command in the recovery snapshot identified by a listed
+    /// filename stem.
     LoadRecovery { stem: String },
     /// Ask for the saved recipe names; answered with `Event::Sessions`. Listing
     /// is core-side like save/load, so the picker shows the same dir they use.
@@ -200,14 +199,12 @@ pub enum Event {
     },
 }
 
-/// One recovery snapshot in [`Event::Sessions`]: the wire's view of a file
-/// under the session root's `recovery/` directory. `stem` is the load key a
-/// [`Command::LoadRecovery`] sends back; the rest is picker display state.
+/// Recovery-snapshot metadata sent to the session picker.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RecoveryEntry {
-    /// Incarnation filename stem, `<YYYYMMDD-HHMMSS>-<pid>`.
+    /// Filename stem used by `LoadRecovery`.
     pub stem: String,
-    /// The snapshot's stored human label, `autosaved <YYYY-MM-DD HH:MM>`.
+    /// Stored session name, or the filename stem when no name is stored.
     pub label: String,
     /// Command count across the snapshot's directories.
     pub tasks: u32,
@@ -415,12 +412,8 @@ fn str_vec(v: &jzon::JsonValue) -> Option<Vec<String>> {
     Some(out)
 }
 
-/// Decode the `recovery` array of a `sessions` event, total by construction:
-/// a missing key or non-array value reads as no entries, and a malformed
-/// member (non-string stem or label, missing field, count past `u32`) drops
-/// that member alone. Unlike [`str_vec`], positions carry no meaning here --
-/// each entry names its own file by stem -- so one junk member from a
-/// malformed peer costs itself, not the event.
+/// Decode valid recovery entries, treating a missing or non-array value as
+/// empty and skipping malformed members independently.
 fn recovery_vec(v: &jzon::JsonValue) -> Vec<RecoveryEntry> {
     let mut out = Vec::new();
     for m in v.members() {
@@ -1607,8 +1600,7 @@ mod tests {
         }
     }
 
-    /// Recovery entries round-trip beside the names, and the encoded object
-    /// carries exactly the `{stem, label, tasks, age}` members.
+    /// Recovery entries round-trip with their exact wire fields.
     #[test]
     fn sessions_recovery_entries_round_trip_and_pin_the_wire_shape() {
         let ev = Event::Sessions {
@@ -1637,8 +1629,7 @@ mod tests {
         assert_eq!(decode_event(k, &p), Some(ev));
     }
 
-    /// A `sessions` frame without a `recovery` key -- or with a non-array
-    /// value there -- decodes to an empty entry list, never a dropped event.
+    /// A missing or non-array `recovery` value decodes as an empty list.
     #[test]
     fn sessions_frame_without_recovery_key_decodes_empty() {
         for json in [
@@ -1657,9 +1648,7 @@ mod tests {
         }
     }
 
-    /// A malformed recovery member drops alone: non-string stems and labels,
-    /// missing fields, counts past `u32`, negative numbers, and flat strings
-    /// all cost their member, while well-formed neighbors survive.
+    /// Malformed recovery members are skipped without dropping valid entries.
     #[test]
     fn malformed_recovery_members_drop_without_rejecting_the_event() {
         let json = r#"{"t":"sessions","names":[],"recovery":[
@@ -1689,8 +1678,7 @@ mod tests {
         );
     }
 
-    /// `LoadRecovery` pins its wire form, and a missing or non-string stem
-    /// rejects the command: the daemon never sees an unvalidatable stem.
+    /// `LoadRecovery` requires a string stem in its wire representation.
     #[test]
     fn load_recovery_wire_form() {
         let (k, p) = encode_command(&Command::LoadRecovery {

@@ -1610,8 +1610,7 @@ fn key_command_encodes_against_live_cursor_mode() {
 
 // --- recovery-snapshot writer -------------------------------------------
 
-/// Supervisor wired to `config` with the recovery writer armed at short
-/// timings (test builds start disarmed; see `Recovery::enabled`).
+/// Build a supervisor with recovery enabled at test-specific intervals.
 fn recovery_sup(config: &Path, cwd: PathBuf, debounce: Duration, cadence: Duration) -> Supervisor {
     let mut s = Supervisor::new(24, 80, 2000);
     s.set_launch_context(config_ctx(config, cwd, &[]));
@@ -1637,9 +1636,7 @@ fn take_dirty(s: &mut Supervisor) -> bool {
     std::mem::replace(&mut s.recovery.dirty, false)
 }
 
-/// The seven structural recipe mutations arm the writer; `Tag` does not (tags
-/// are not recipe state). Arming keys on the command, not its outcome, so a
-/// refused `Restart` and a missing `LoadSession` recipe still arm.
+/// Recipe-changing commands arm recovery even when rejected; tags do not.
 #[test]
 fn recovery_arms_on_structural_mutations_not_tag() {
     let mut s = sup(24, 80);
@@ -1685,8 +1682,7 @@ fn recovery_arms_on_structural_mutations_not_tag() {
     assert!(take_dirty(&mut s), "Remove must arm");
 }
 
-/// `ListSessions` answers with the recovery snapshots newest first beside the
-/// recipe names, both from the connection's session root.
+/// Session listings include recovery metadata in descending stem order.
 #[test]
 fn list_sessions_includes_recovery_snapshots_newest_first() {
     let dir = scratch("recovery_list_wire");
@@ -1744,9 +1740,7 @@ fn list_sessions_includes_recovery_snapshots_newest_first() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// `LoadRecovery` materializes the snapshot through the session-load path --
-/// groups and names included -- and reports the fixed notice steering the
-/// user toward `SaveSession`.
+/// Recovery loading restores commands, groups, and names and reports success.
 #[test]
 fn load_recovery_materializes_the_fleet_and_notices() {
     let dir = scratch("recovery_load_wire");
@@ -1803,8 +1797,7 @@ fn load_recovery_materializes_the_fleet_and_notices() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// An unknown stem reads as not-found and a traversal-shaped stem is refused
-/// before any path is built; neither panics or spawns anything.
+/// Unknown and path-shaped recovery stems fail without spawning tasks.
 #[test]
 fn load_recovery_refuses_unknown_and_traversal_stems() {
     let dir = scratch("recovery_load_refuse");
@@ -1837,9 +1830,7 @@ fn load_recovery_refuses_unknown_and_traversal_stems() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// A burst of mutations coalesces behind the debounce into one snapshot
-/// carrying the whole burst: no write lands inside the quiet period, and one
-/// file holds all three commands afterward.
+/// Debouncing coalesces a mutation burst into one complete snapshot.
 #[test]
 fn recovery_debounce_coalesces_a_mutation_burst() {
     let dir = scratch("recovery_debounce");
@@ -1881,9 +1872,7 @@ fn recovery_debounce_coalesces_a_mutation_burst() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// An empty fleet never writes -- idle from birth, and after a remove-all
-/// that empties the fleet inside the debounce window. Quitting with zero
-/// tasks must not clobber the snapshot a user would want back.
+/// Empty fleets do not create or replace recovery snapshots.
 #[test]
 fn recovery_empty_fleet_never_writes() {
     let dir = scratch("recovery_empty");
@@ -1894,7 +1883,7 @@ fn recovery_empty_fleet_never_writes() {
         Duration::from_millis(100),
         Duration::from_millis(200),
     );
-    // Idle and empty: both schedules cross without writing.
+    // Cadence passes do not snapshot an initially empty fleet.
     assert!(
         !wait_until(Duration::from_millis(600), || {
             s.tick();
@@ -1903,8 +1892,7 @@ fn recovery_empty_fleet_never_writes() {
         "an idle empty fleet must never write"
     );
 
-    // Remove-all before any pass runs: writes happen only in `tick`, so
-    // reading the id from the task set directly keeps this deterministic.
+    // Remove the only task before the debounced pass runs.
     spawn(&mut s, "sleep 30", dir.clone());
     let id = s.tasks[0].id;
     s.apply(Command::Remove { id });
@@ -1918,8 +1906,7 @@ fn recovery_empty_fleet_never_writes() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// A persistently unwritable root degrades silently after ONE status notice,
-/// and the fleet stays supervised throughout.
+/// Persistent write failures emit one notice and do not interrupt supervision.
 #[test]
 fn recovery_write_failure_notices_once_and_keeps_supervising() {
     let dir = scratch("recovery_fail");
@@ -1935,7 +1922,7 @@ fn recovery_write_failure_notices_once_and_keeps_supervising() {
     );
     spawn(&mut s, "sleep 30", dir.clone());
 
-    // Cross many debounce and cadence intervals, counting notices.
+    // Count notices across several debounce and cadence intervals.
     let mut notices = 0usize;
     let deadline = Instant::now() + Duration::from_millis(500);
     while Instant::now() < deadline {

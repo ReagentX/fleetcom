@@ -94,9 +94,7 @@ impl GroupMode {
     }
 }
 
-/// Which page the `o` session picker shows. The recovery page is a second
-/// page of the same surface, not a new surface: it exists only while the core
-/// reports recovery snapshots, and every other picker behavior carries over.
+/// The list displayed by the session picker.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum SessionPage {
     Saved,
@@ -188,9 +186,9 @@ pub struct App {
     // Load-session picker state.
     pub session_names: Vec<String>,
     pub session_sel: usize,
-    /// Recovery snapshots from the latest `Sessions` reply, newest first.
+    /// Recovery snapshots from the latest `Sessions` event, newest first.
     pub session_recovery: Vec<RecoveryEntry>,
-    /// Which list the open picker shows; `o` resets it to `Saved`.
+    /// The displayed session-picker list; `o` resets it to `Saved`.
     pub session_page: SessionPage,
     /// Selection in the recovery list, clamped independently of `session_sel`.
     pub recovery_sel: usize,
@@ -620,12 +618,10 @@ impl App {
                 }
                 Event::Status(s) => self.status = Some(s),
                 Event::Sessions { names, recovery } => {
-                    // A shorter list can land while the picker is open; clamp
-                    // both selections before either can index past its end.
+                    // Clamp each selection to the refreshed list.
                     self.session_sel = self.session_sel.min(names.len().saturating_sub(1));
                     self.recovery_sel = self.recovery_sel.min(recovery.len().saturating_sub(1));
-                    // An empty recovery list makes its page unreachable; a
-                    // refresh that empties it mid-view must also leave it.
+                    // The recovery page is unavailable when its list is empty.
                     if recovery.is_empty() {
                         self.session_page = SessionPage::Saved;
                     }
@@ -1052,9 +1048,7 @@ impl App {
     }
 
     fn on_key_loadsession(&mut self, k: KeyEvent) {
-        // Tab flips between the saved and recovery pages. With no recovery
-        // entries the second page does not exist, so Tab does nothing — the
-        // hint hides it too (an unreachable page must be invisible).
+        // Recovery is a Tab target only while snapshots are available.
         if matches!(k.code, KeyCode::Tab | KeyCode::BackTab) {
             if !self.session_recovery.is_empty() {
                 self.session_page = match self.session_page {
@@ -1064,8 +1058,7 @@ impl App {
             }
             return;
         }
-        // The pages differ only in which list the keys address and what Enter
-        // sends; each keeps its own selection.
+        // Each page keeps an independent selection.
         match self.session_page {
             SessionPage::Saved => match k.code {
                 KeyCode::Esc => self.mode = Mode::Dashboard,
@@ -1088,8 +1081,7 @@ impl App {
                     self.recovery_sel = step_down(self.recovery_sel, self.session_recovery.len())
                 }
                 KeyCode::Enter => {
-                    // The stem is the load key; the daemon reports the outcome
-                    // as a `Status` event ("loaded recovery snapshot; …").
+                    // Load the file identified by the selected wire stem.
                     if let Some(e) = self.session_recovery.get(self.recovery_sel) {
                         let stem = e.stem.clone();
                         self.transport.send(Command::LoadRecovery { stem });

@@ -1104,10 +1104,7 @@ fn non_agent_entries_survive_save_as_plain_strings() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// The cadence pass picks up conversation-ID drift that no structural
-/// mutation announces: resume IDs resolve pull-style at serialization time,
-/// so only re-serializing on the interval can see a capture file change. A
-/// settled recipe then stops writing (the snapshot's mtime holds still).
+/// Cadence passes persist changed capture IDs without rewriting stable recipes.
 #[test]
 fn recovery_cadence_rewrites_on_capture_drift_and_skips_when_static() {
     let dir = scratch("cap_recovery_cadence");
@@ -1130,7 +1127,7 @@ fn recovery_cadence_rewrites_on_capture_drift_and_skips_when_static() {
         let text = std::fs::read_to_string(&p).ok()?;
         Some((p, text))
     };
-    // The debounced spawn write lands first, carrying the pinned ID only.
+    // The initial debounced snapshot contains only the spawn-time ID.
     assert!(
         wait_until(Duration::from_secs(5), || {
             s.tick();
@@ -1140,8 +1137,7 @@ fn recovery_cadence_rewrites_on_capture_drift_and_skips_when_static() {
     );
     assert!(!snapshot(&rec).unwrap().1.contains(CAP_OTHER));
 
-    // Drift the conversation: the capture file now reports a different ID.
-    // No structural mutation follows, so only the cadence pass can see it.
+    // Change the capture ID without a recipe mutation.
     let cap = s.tasks[0].capture_file.clone().expect("capture file set");
     std::fs::write(
         &cap,
@@ -1158,7 +1154,7 @@ fn recovery_cadence_rewrites_on_capture_drift_and_skips_when_static() {
         "the cadence pass never picked up the drifted ID"
     );
 
-    // A settled recipe writes nothing more across several intervals.
+    // Stable recipe content leaves the snapshot unchanged.
     let (path, _) = snapshot(&rec).unwrap();
     let mtime = std::fs::metadata(&path).unwrap().modified().unwrap();
     let rewritten = wait_until(Duration::from_millis(600), || {

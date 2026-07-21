@@ -597,9 +597,7 @@ fn render_pickgroup(out: &mut impl Write, app: &App) -> io::Result<()> {
     )
 }
 
-/// One recovery-picker row: age, task count, stored label. The label is a
-/// stored-name string from disk, so it rides at the end where the panel's
-/// column-exact clipping (`pad`, not fmt width) bounds it.
+/// Format a recovery row with its variable-length label last for clipping.
 fn recovery_row(e: &RecoveryEntry) -> String {
     let unit = if e.tasks == 1 { "task" } else { "tasks" };
     format!(
@@ -610,8 +608,7 @@ fn recovery_row(e: &RecoveryEntry) -> String {
     )
 }
 
-/// Saved-page hint: names the recovery page only while entries exist, so an
-/// unreachable Tab target is never advertised.
+/// Include the recovery Tab hint only when snapshots exist.
 fn saved_page_hint(recovery: usize) -> String {
     if recovery > 0 {
         format!("↑↓ pick · enter load · tab recovery ({recovery}) · esc")
@@ -620,9 +617,7 @@ fn saved_page_hint(recovery: usize) -> String {
     }
 }
 
-/// The `o` load-session picker: a bottom panel with two pages. The saved page
-/// lists recipe names; Tab flips to the recovery page while the core reports
-/// snapshots, and each hint names the other page only when it is reachable.
+/// Render the saved-session or recovery page of the session picker.
 fn render_session_picker(out: &mut impl Write, app: &App) -> io::Result<()> {
     match app.session_page {
         SessionPage::Saved => {
@@ -652,8 +647,7 @@ fn render_session_picker(out: &mut impl Write, app: &App) -> io::Result<()> {
                     sel: app.recovery_sel,
                     max_rows: 10,
                     hint: "↑↓ pick · enter load · tab saved · esc".to_string(),
-                    // This page is unreachable with zero entries, so the
-                    // empty placeholder has no state to describe.
+                    // The recovery page is available only when entries exist.
                     empty: None,
                     cursor: None,
                 },
@@ -756,7 +750,7 @@ mod tests {
         }
     }
 
-    /// A recovery entry for row-shape tests.
+    /// Build recovery metadata for row-formatting tests.
     fn recovery_entry(age_secs: u64, tasks: u32, label: &str) -> RecoveryEntry {
         RecoveryEntry {
             stem: "20260101-000000-1".into(),
@@ -766,8 +760,7 @@ mod tests {
         }
     }
 
-    /// The recovery row composes age, a correctly-pluralized task count, and
-    /// the stored label.
+    /// Recovery rows format age, task count, and label.
     #[test]
     fn recovery_row_shapes() {
         assert_eq!(
@@ -784,8 +777,7 @@ mod tests {
         );
     }
 
-    /// The label is a stored-name string from disk: the panel's clip must
-    /// keep a row with wide glyphs column-exact instead of overflowing.
+    /// Wide labels clip to the panel's exact column width.
     #[test]
     fn recovery_row_clips_column_exact_for_wide_labels() {
         let long = "日本語のラベルがここに延々と続いています";

@@ -530,9 +530,7 @@ fn session_selection_clamps_when_a_shorter_list_arrives() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Write one recovery snapshot under `<dir>/sessions/recovery/` in the real
-/// on-disk format, so the core's lister and loader both accept it. The `"."`
-/// directory key resolves against the launch cwd (`dir`), which exists.
+/// Write a recovery fixture whose commands run in `dir`.
 fn write_recovery(dir: &Path, stem: &str, label: &str, cmds: &[&str]) {
     let rec = dir.join("sessions").join("recovery");
     std::fs::create_dir_all(&rec).unwrap();
@@ -547,8 +545,7 @@ fn write_recovery(dir: &Path, stem: &str, label: &str, cmds: &[&str]) {
     .unwrap();
 }
 
-/// The `Sessions` reply fills both picker lists (recovery newest first) and
-/// clamps each selection against its own list, not the other's.
+/// Session events populate and independently clamp both picker lists.
 #[test]
 fn sessions_reply_populates_and_clamps_both_lists() {
     let dir = session_scratch("rec_lists", &["a"]);
@@ -578,7 +575,7 @@ fn sessions_reply_populates_and_clamps_both_lists() {
         "recovery entries list newest first"
     );
 
-    // One snapshot vanishes; the refresh clamps only the recovery selection.
+    // Refresh after removing the selected recovery entry.
     app.recovery_sel = 1;
     std::fs::remove_file(
         dir.join("sessions")
@@ -594,8 +591,7 @@ fn sessions_reply_populates_and_clamps_both_lists() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// `o` always reopens on the saved page with the recovery list cleared, so a
-/// stale page or selection from the last visit cannot leak through.
+/// Reopening the picker resets its page and recovery state.
 #[test]
 fn o_key_resets_the_picker_to_the_saved_page() {
     let dir = session_scratch("rec_reset", &["a"]);
@@ -623,8 +619,7 @@ fn o_key_resets_the_picker_to_the_saved_page() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// With no recovery entries the second page does not exist: Tab and BackTab
-/// leave the picker on the saved page.
+/// Tab does not leave the saved page when no recovery entries exist.
 #[test]
 fn tab_is_a_no_op_without_recovery_entries() {
     let dir = session_scratch("rec_notab", &["a"]);
@@ -640,8 +635,7 @@ fn tab_is_a_no_op_without_recovery_entries() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Tab and BackTab flip pages when recovery entries exist, and each page
-/// keeps its own selection across the flip.
+/// Tab switches available pages without resetting either selection.
 #[test]
 fn tab_toggles_pages_and_selections_stay_independent() {
     let dir = session_scratch("rec_tab", &["a", "b"]);
@@ -676,8 +670,7 @@ fn tab_toggles_pages_and_selections_stay_independent() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// A refresh that empties the recovery list while its page is showing must
-/// also leave the page: the picker cannot linger on an unreachable page.
+/// An empty recovery refresh returns the picker to the saved page.
 #[test]
 fn emptied_recovery_list_returns_to_the_saved_page() {
     let dir = session_scratch("rec_empty", &["a"]);
@@ -706,9 +699,7 @@ fn emptied_recovery_list_returns_to_the_saved_page() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Enter on the recovery page loads the *selected* snapshot: the highlighted
-/// entry's stem goes out as `LoadRecovery`, the daemon materializes that
-/// file's commands, and its fixed notice comes back as the status line.
+/// Enter loads the selected recovery stem and displays the resulting status.
 #[test]
 fn enter_on_the_recovery_page_loads_the_selected_stem() {
     let dir = session_scratch("rec_load", &[]);
@@ -729,8 +720,7 @@ fn enter_on_the_recovery_page_loads_the_selected_stem() {
     app.pump();
     app.on_key_loadsession(key(KeyCode::Tab));
 
-    // Row 1 is the older snapshot; loading it proves the stem was the
-    // selected one, not the newest.
+    // Select the older snapshot.
     app.on_key_loadsession(key(KeyCode::Down));
     app.on_key_loadsession(key(KeyCode::Enter));
     assert!(
@@ -748,8 +738,7 @@ fn enter_on_the_recovery_page_loads_the_selected_stem() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Esc closes the picker from the recovery page, exactly as from the saved
-/// page.
+/// Esc closes the recovery page.
 #[test]
 fn esc_closes_the_picker_from_the_recovery_page() {
     let dir = session_scratch("rec_esc", &[]);

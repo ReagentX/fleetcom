@@ -31,8 +31,7 @@ use std::{
 
 pub use claude::Claude;
 pub use codex::Codex;
-// `session`'s recovery stems and labels derive their UTC dates from it, as
-// does the shared rollout fixture in `testutil`.
+// Shared UTC civil-date conversion.
 pub(crate) use codex::civil_from_days;
 pub use grok::Grok;
 
