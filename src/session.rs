@@ -304,7 +304,8 @@ pub fn list_in(dir: &Path) -> Vec<String> {
 
 // --- automatic recovery snapshots -------------------------------------------
 
-/// Maximum snapshots retained after each recovery write.
+/// Retention bound applied after each recovery write. Live-writer
+/// exemptions can hold a shared directory above it; see [`prune_recovery`].
 const RECOVERY_KEEP: usize = 10;
 
 /// Recovery-snapshot directory under a session root.
@@ -402,18 +403,47 @@ pub fn load_recovery_in(dir: &Path, stem: &str) -> io::Result<SessionConfig> {
     from_json(&fs::read_to_string(dir.join(format!("{stem}.json")))?).map(|(_, cfg)| cfg)
 }
 
+/// Parse the trailing `-<pid>` of a recovery stem: nonempty, digits only,
+/// parses as a positive `i32`. Mirrors the pid shape check in
+/// `harness::assets::namespace_owner`; the modules parse different name
+/// shapes (`<timestamp>-<pid>` here, `<pid>-<nonce>` there), so the parse
+/// stays local.
+fn stem_pid(stem: &str) -> Option<i32> {
+    let (_, pid) = stem.rsplit_once('-')?;
+    if pid.is_empty() || !pid.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    pid.parse::<i32>().ok().filter(|p| *p > 0)
+}
+
+/// True when `stem` names a pid that still exists. Only ESRCH reads dead;
+/// Ok, EPERM, and every other errno read alive — the one-sidedness mirrors
+/// `harness::assets::owner_is_dead`: a recycled pid misreads only as alive,
+/// so a liveness-gated prune can under-delete but never delete a live
+/// writer's snapshot. A stem without a valid pid suffix — a name no writer
+/// would produce — gets no liveness protection.
+fn stem_names_live_writer(stem: &str) -> bool {
+    use nix::{errno::Errno, sys::signal::kill, unistd::Pid};
+    stem_pid(stem).is_some_and(|pid| !matches!(kill(Pid::from_raw(pid), None), Err(Errno::ESRCH)))
+}
+
 /// Best-effort pruning by filename: every error is ignored, and a failed
 /// prune never fails the write.
 ///
 /// `<keep_stem>.json` is exempt unconditionally: retention exists to bound
 /// disk use, never to undo a write that just succeeded. A long-running
 /// incarnation whose start-time stem has aged below ten newer stems would
-/// otherwise delete its own snapshot on every rewrite — and report `Ok`. The
-/// other files keep the lexically greatest [`RECOVERY_KEEP`] - 1, so the
-/// directory holds at most [`RECOVERY_KEEP`] files including the active one.
-/// Concurrent incarnations each protect only their own stem, so N live
-/// writers can briefly hold up to [`RECOVERY_KEEP`] + N - 1 files; the bound
-/// matters, not the exact count.
+/// otherwise delete its own snapshot on every rewrite — and report `Ok`.
+///
+/// Files whose stems name a live pid are also exempt: a writer sharing this
+/// root protects only its own stem, so without the probe its prune would
+/// delete a long-lived sibling's older-stem snapshot — permanently, because
+/// the sibling's write-skip state still matches and suppresses every
+/// rewrite. Retention may only delete what provably belongs to no live
+/// fleetcom; when liveness is in doubt, keep. The remaining candidates keep
+/// the lexically greatest [`RECOVERY_KEEP`] - 1, so N live writers hold up
+/// to [`RECOVERY_KEEP`] + N - 1 files — guaranteed, not transient — and
+/// dead-stem files beyond the bound age out as writes continue.
 fn prune_recovery(dir: &Path, keep_stem: &str) {
     let Ok(entries) = fs::read_dir(dir) else {
         return;
@@ -424,6 +454,11 @@ fn prune_recovery(dir: &Path, keep_stem: &str) {
         .map(|e| e.path())
         .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("json"))
         .filter(|p| p.file_name().and_then(|n| n.to_str()) != Some(keep_name.as_str()))
+        .filter(|p| {
+            !p.file_stem()
+                .and_then(|s| s.to_str())
+                .is_some_and(stem_names_live_writer)
+        })
         .collect();
     if snapshots.len() < RECOVERY_KEEP {
         return;
@@ -832,6 +867,24 @@ mod tests {
         SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_784_021_415)
     }
 
+    /// A pid no process can hold: above Linux's pid ceiling (`pid_max` caps
+    /// at 2^22) and macOS's (99998), so the liveness probe reads ESRCH
+    /// deterministically on both. Prunable fixtures use this — small
+    /// literals like 77 can name a real launchd-adjacent process.
+    const DEAD_FIXTURE_PID: u32 = 9_999_999;
+
+    /// Spawn and reap a child, then return its inactive PID.
+    fn dead_child_pid() -> u32 {
+        let mut child = std::process::Command::new("sh")
+            .arg("-c")
+            .arg("exit 0")
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        child.wait().unwrap();
+        pid
+    }
+
     /// The stem is `<YYYYMMDD-HHMMSS>-<pid>`; the label is the write minute.
     #[test]
     fn recovery_stem_and_label_render_utc() {
@@ -878,7 +931,7 @@ mod tests {
         let mut cfg = SessionConfig::new();
         cfg.insert("~/p".into(), vec![e("vim")]);
         for i in 1..=12u32 {
-            let stem = format!("20260714-0930{i:02}-77");
+            let stem = format!("20260714-0930{i:02}-{DEAD_FIXTURE_PID}");
             save_recovery_in(&rec, &stem, "autosaved 2026-07-14 09:30", &cfg).unwrap();
         }
 
@@ -889,7 +942,7 @@ mod tests {
             .collect();
         names.sort();
         let expected: Vec<String> = (3..=12u32)
-            .map(|i| format!("20260714-0930{i:02}-77.json"))
+            .map(|i| format!("20260714-0930{i:02}-{DEAD_FIXTURE_PID}.json"))
             .collect();
         assert_eq!(names, expected, "prune must drop exactly the oldest two");
         let _ = fs::remove_dir_all(&base);
@@ -905,18 +958,15 @@ mod tests {
         let mut cfg = SessionConfig::new();
         cfg.insert("~/p".into(), vec![e("vim")]);
         for i in 1..=10u32 {
-            let stem = format!("20260715-0930{i:02}-77");
+            let stem = format!("20260715-0930{i:02}-{DEAD_FIXTURE_PID}");
             save_recovery_in(&rec, &stem, "autosaved 2026-07-15 09:30", &cfg).unwrap();
         }
 
-        // Day-old start-time stem: lexically below every file on disk.
-        let active = save_recovery_in(
-            &rec,
-            "20260714-093000-42",
-            "autosaved 2026-07-15 09:30",
-            &cfg,
-        )
-        .unwrap();
+        // Day-old start-time stem: lexically below every file on disk. Its
+        // pid is dead, so only the keep_stem rule can protect it here.
+        let active_stem = format!("20260714-093000-{DEAD_FIXTURE_PID}");
+        let active =
+            save_recovery_in(&rec, &active_stem, "autosaved 2026-07-15 09:30", &cfg).unwrap();
         assert!(active.exists(), "the just-written snapshot must survive");
 
         let mut names: Vec<String> = fs::read_dir(&rec)
@@ -925,8 +975,9 @@ mod tests {
             .map(|e| e.file_name().into_string().unwrap())
             .collect();
         names.sort();
-        let mut expected = vec!["20260714-093000-42.json".to_string()];
-        expected.extend((2..=10u32).map(|i| format!("20260715-0930{i:02}-77.json")));
+        let mut expected = vec![format!("{active_stem}.json")];
+        expected
+            .extend((2..=10u32).map(|i| format!("20260715-0930{i:02}-{DEAD_FIXTURE_PID}.json")));
         assert_eq!(
             names, expected,
             "the active file plus the nine newest others must remain"
@@ -942,7 +993,7 @@ mod tests {
         let mut cfg = SessionConfig::new();
         cfg.insert("~/p".into(), vec![e("vim")]);
         for i in 1..=5u32 {
-            let stem = format!("20260714-0930{i:02}-77");
+            let stem = format!("20260714-0930{i:02}-{DEAD_FIXTURE_PID}");
             save_recovery_in(&rec, &stem, "autosaved 2026-07-14 09:30", &cfg).unwrap();
         }
 
@@ -950,6 +1001,103 @@ mod tests {
             fs::read_dir(&rec).unwrap().flatten().count(),
             5,
             "no file may be pruned below the retention limit"
+        );
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    /// Another writer's prune must not delete a live writer's snapshot, even
+    /// when it is the oldest file on disk. The final file set is the
+    /// [`RECOVERY_KEEP`] + N - 1 arithmetic with N = 2: the live exempt file
+    /// plus the writer's own plus the nine newest dead.
+    #[test]
+    fn recovery_prune_exempts_live_pid_stems() {
+        let base = temp("session_recovery_prune_live");
+        let rec = recovery_dir(&base);
+        let mut cfg = SessionConfig::new();
+        cfg.insert("~/p".into(), vec![e("vim")]);
+        // The oldest candidate names this test process: provably live.
+        let live_stem = format!("20260101-000000-{}", std::process::id());
+        save_recovery_in(&rec, &live_stem, "autosaved 2026-01-01 00:00", &cfg).unwrap();
+        for i in 1..=11u32 {
+            let stem = format!("20260714-0930{i:02}-{DEAD_FIXTURE_PID}");
+            save_recovery_in(&rec, &stem, "autosaved 2026-07-14 09:30", &cfg).unwrap();
+        }
+
+        let mut names: Vec<String> = fs::read_dir(&rec)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().into_string().unwrap())
+            .collect();
+        names.sort();
+        let mut expected = vec![format!("{live_stem}.json")];
+        expected
+            .extend((2..=11u32).map(|i| format!("20260714-0930{i:02}-{DEAD_FIXTURE_PID}.json")));
+        assert_eq!(
+            names, expected,
+            "the live writer's file must survive; the oldest dead file must not"
+        );
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    /// A stem naming an exited process gets no exemption, so the ten-file
+    /// bound converges once writers exit.
+    #[test]
+    fn recovery_prune_removes_dead_pid_stems() {
+        let base = temp("session_recovery_prune_dead");
+        let rec = recovery_dir(&base);
+        let mut cfg = SessionConfig::new();
+        cfg.insert("~/p".into(), vec![e("vim")]);
+        let oldest = format!("20260101-000000-{}", dead_child_pid());
+        save_recovery_in(&rec, &oldest, "autosaved 2026-01-01 00:00", &cfg).unwrap();
+        for i in 1..=10u32 {
+            let stem = format!("20260714-0930{i:02}-{DEAD_FIXTURE_PID}");
+            save_recovery_in(&rec, &stem, "autosaved 2026-07-14 09:30", &cfg).unwrap();
+        }
+
+        assert!(
+            !rec.join(format!("{oldest}.json")).exists(),
+            "a dead writer's snapshot is an ordinary prune candidate"
+        );
+        assert_eq!(
+            fs::read_dir(&rec).unwrap().flatten().count(),
+            RECOVERY_KEEP,
+            "dead-stem retention must converge to the bound"
+        );
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    /// Stems without a positive all-digit pid suffix get no liveness
+    /// protection: a file the writer would not have named.
+    #[test]
+    fn recovery_prune_ignores_malformed_pid_suffixes() {
+        let base = temp("session_recovery_prune_malformed");
+        let rec = recovery_dir(&base);
+        let mut cfg = SessionConfig::new();
+        cfg.insert("~/p".into(), vec![e("vim")]);
+        let malformed = [
+            "20260101-000000-x42",         // non-numeric pid
+            "20260101-000001-99999999999", // past i32::MAX
+            "20260101-000002-",            // empty pid
+            "20260101-000003-0",           // zero is not a positive pid
+        ];
+        for stem in malformed {
+            save_recovery_in(&rec, stem, "autosaved 2026-01-01 00:00", &cfg).unwrap();
+        }
+        for i in 1..=10u32 {
+            let stem = format!("20260714-0930{i:02}-{DEAD_FIXTURE_PID}");
+            save_recovery_in(&rec, &stem, "autosaved 2026-07-14 09:30", &cfg).unwrap();
+        }
+
+        for stem in malformed {
+            assert!(
+                !rec.join(format!("{stem}.json")).exists(),
+                "malformed stem {stem:?} must be pruned like any candidate"
+            );
+        }
+        assert_eq!(
+            fs::read_dir(&rec).unwrap().flatten().count(),
+            RECOVERY_KEEP,
+            "only the well-formed newest files may remain"
         );
         let _ = fs::remove_dir_all(&base);
     }

@@ -2059,5 +2059,47 @@ fn recovery_failed_write_retries_until_success() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// The multi-writer finding, composed: writer X snapshots; a sibling
+/// writer's prune deletes X's file; X's next due pass with UNCHANGED
+/// content must rewrite it. `last_written` still matches `(root, hash)`
+/// throughout, so only the existence check can force the write — without
+/// it the deletion is permanent until the recipe changes.
+#[test]
+fn recovery_rewrites_after_a_sibling_prune_deletes_the_snapshot() {
+    let dir = scratch("recovery_sibling_prune");
+    let config = dir.join("config");
+    let mut s = recovery_sup(
+        &config,
+        dir.clone(),
+        Duration::from_millis(50),
+        Duration::from_millis(100),
+    );
+    spawn(&mut s, "sleep 30", dir.clone());
+    assert!(
+        wait_until(Duration::from_secs(5), || {
+            s.recovery_maintenance();
+            !recovery_files(&config).is_empty()
+        }),
+        "the first snapshot never landed"
+    );
+
+    // Writer Y's prune, distilled: X's file disappears while X's dedup
+    // state and recipe stay unchanged.
+    let rec = config.join("sessions").join("recovery");
+    for name in recovery_files(&config) {
+        std::fs::remove_file(rec.join(name)).unwrap();
+    }
+
+    // Nothing arms the debounce; the cadence pass alone must repair.
+    assert!(
+        wait_until(Duration::from_secs(5), || {
+            s.recovery_maintenance();
+            !recovery_files(&config).is_empty()
+        }),
+        "an unchanged recipe must rewrite an externally deleted snapshot"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[path = "supervisor_capture_tests.rs"]
 mod capture;

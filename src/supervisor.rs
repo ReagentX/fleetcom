@@ -179,6 +179,9 @@ struct Recovery {
     /// per-connection (`sessions_root` reads the connecting client's
     /// `FLEETCOM_CONFIG_DIR`): an unchanged recipe must still write after a
     /// reconnect moves the root, or the new destination never gets a snapshot.
+    /// The pair is a hint, not a proof: a sibling writer's prune or a manual
+    /// delete removes the file without touching this state, so the skip also
+    /// stats the destination — the filesystem is the authority on existence.
     last_written: Option<(PathBuf, String)>,
     /// Filename stem reused for this supervisor's recovery writes.
     stem: String,
@@ -615,13 +618,19 @@ impl Supervisor {
         let cfg = self.session_config();
         // Exclude the timestamped label from content comparison.
         let hash = fnv1a_hex(session::fingerprint_json(&cfg).as_bytes());
-        // Skip only when this destination already holds this content; see
-        // `Recovery::last_written` for why the root is part of the compare.
+        // Skip only when this destination already holds this content AND the
+        // file is still on disk; see `Recovery::last_written` for why the
+        // root is part of the compare and why the pair alone cannot be
+        // trusted. The stat runs at most once per due pass — the pass is
+        // debounce/cadence-gated — and a missing file falls through to the
+        // write, repairing any external deletion within one pass.
+        let dest = session::recovery_dir(&root).join(format!("{}.json", self.recovery.stem));
         if self
             .recovery
             .last_written
             .as_ref()
             .is_some_and(|(r, h)| *r == root && *h == hash)
+            && std::fs::metadata(&dest).is_ok()
         {
             self.recovery.dirty = false;
             return;
