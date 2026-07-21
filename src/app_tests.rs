@@ -1882,3 +1882,109 @@ fn state_and_dir_mode_spawns_stay_unassigned() {
     let v = app.views.iter().find(|v| v.id == 2).unwrap();
     assert_eq!(v.group, None);
 }
+
+// --- OSC 52 clipboard emission ------------------------------------------
+
+/// An attached clipboard store re-emits as exactly one OSC 52 envelope:
+/// kind byte `c`, padded standard base64, BEL-terminated.
+#[test]
+fn attached_clipboard_store_emits_the_osc52_envelope() {
+    let mut app = App::new_local(30, 100);
+    app.mode = Mode::Attached;
+    app.on_clipboard_copy(ClipboardKind::Clipboard, "hello".to_string());
+    let mut out = Vec::new();
+    app.flush_clipboard(&mut out).unwrap();
+    assert_eq!(out, b"\x1b]52;c;aGVsbG8=\x07");
+    assert_eq!(app.status.as_deref(), Some("copied 5 chars"));
+}
+
+/// A `Selection` store collapses to kind byte `c`: the host-terminal chain
+/// is verified for `c` and unverified for `s`.
+#[test]
+fn selection_store_collapses_to_the_clipboard_kind() {
+    let mut app = App::new_local(30, 100);
+    app.mode = Mode::Attached;
+    app.on_clipboard_copy(ClipboardKind::Selection, "hello".to_string());
+    let mut out = Vec::new();
+    app.flush_clipboard(&mut out).unwrap();
+    assert_eq!(out, b"\x1b]52;c;aGVsbG8=\x07");
+}
+
+/// Nothing from the payload reaches the terminal raw: ESC/CSI sequences and
+/// newlines cross only as base64 between the envelope prefix and the BEL.
+#[test]
+fn clipboard_payload_bytes_never_reach_the_terminal_raw() {
+    let payload = "line1\nline2\x1b[31mred\x1b]52;c;evil\x07";
+    let mut app = App::new_local(30, 100);
+    app.mode = Mode::Attached;
+    app.on_clipboard_copy(ClipboardKind::Clipboard, payload.to_string());
+    let mut out = Vec::new();
+    app.flush_clipboard(&mut out).unwrap();
+
+    assert!(out.starts_with(b"\x1b]52;c;"));
+    assert!(out.ends_with(b"\x07"));
+    let body = &out[b"\x1b]52;c;".len()..out.len() - 1];
+    assert!(
+        body.iter()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'/' | b'=')),
+        "only base64 may sit between the prefix and the BEL"
+    );
+    assert_eq!(B64.decode(body).unwrap(), payload.as_bytes());
+    assert!(
+        !out.windows(payload.len()).any(|w| w == payload.as_bytes()),
+        "the raw payload must not appear in the output"
+    );
+}
+
+/// Stores arriving outside attached mode buffer nothing and emit nothing:
+/// only an attached user plausibly caused the copy.
+#[test]
+fn clipboard_stores_outside_attached_mode_are_dropped() {
+    for mode in [Mode::Peek, Mode::Dashboard] {
+        let mut app = App::new_local(30, 100);
+        app.mode = mode;
+        app.on_clipboard_copy(ClipboardKind::Clipboard, "hello".to_string());
+        assert!(app.pending_clipboard.is_empty(), "nothing may buffer");
+        let mut out = Vec::new();
+        app.flush_clipboard(&mut out).unwrap();
+        assert!(out.is_empty(), "nothing may emit");
+        assert!(app.status.is_none(), "no notice without an emission");
+    }
+}
+
+/// Multiple pending stores emit in receipt order (the host clipboard ends
+/// at the last: last-writer-wins), and the notice counts the last entry's
+/// chars, not its bytes.
+#[test]
+fn pending_stores_emit_in_order_and_status_counts_last_entry_chars() {
+    let mut app = App::new_local(30, 100);
+    app.mode = Mode::Attached;
+    app.on_clipboard_copy(ClipboardKind::Clipboard, "first".to_string());
+    app.on_clipboard_copy(ClipboardKind::Clipboard, "héllo日".to_string());
+    let mut out = Vec::new();
+    app.flush_clipboard(&mut out).unwrap();
+
+    let expected = format!(
+        "\x1b]52;c;{}\x07\x1b]52;c;{}\x07",
+        B64.encode("first"),
+        B64.encode("héllo日")
+    );
+    assert_eq!(out, expected.as_bytes());
+    // "héllo日" is 6 chars but 9 bytes: the notice must report chars.
+    assert_eq!(app.status.as_deref(), Some("copied 6 chars"));
+    assert!(
+        app.pending_clipboard.is_empty(),
+        "the flush drains the buffer"
+    );
+}
+
+/// The common per-iteration case, an empty buffer, writes zero bytes.
+#[test]
+fn empty_clipboard_flush_writes_nothing() {
+    let mut app = App::new_local(30, 100);
+    app.mode = Mode::Attached;
+    let mut out = Vec::new();
+    app.flush_clipboard(&mut out).unwrap();
+    assert!(out.is_empty());
+    assert!(app.status.is_none());
+}

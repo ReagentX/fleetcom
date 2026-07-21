@@ -2,7 +2,7 @@
 //! here through `Command`s and `Event` snapshots over a `Transport`.
 
 use std::{
-    io::{self, Stdout},
+    io::{self, Stdout, Write},
     path::{Path, PathBuf},
     sync::{
         Arc,
@@ -13,6 +13,7 @@ use std::{
     time::Duration,
 };
 
+use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
 use crossterm::{
     cursor::MoveTo,
     event::{
@@ -27,8 +28,8 @@ use crate::{
     editbuf::EditBuffer,
     path,
     protocol::{
-        Command, Event, Key, Lifecycle, Mods, MouseBtn, MouseKind, RecoveryEntry, ScreenView,
-        ScrollAction, TaskView,
+        ClipboardKind, Command, Event, Key, Lifecycle, Mods, MouseBtn, MouseKind, RecoveryEntry,
+        ScreenView, ScrollAction, TaskView,
     },
     transport::{ExitIntent, SocketTransport, ThreadTransport, Transport},
     ui,
@@ -194,6 +195,9 @@ pub struct App {
     pub recovery_sel: usize,
     /// Transient one-line notice (save/load result), dismissed on the next key.
     pub status: Option<String>,
+    /// OSC 52 stores accepted while attached, awaiting re-emission to the host
+    /// terminal by `flush_clipboard` later in the same run-loop iteration.
+    pending_clipboard: Vec<(ClipboardKind, String)>,
     /// Parsed terminal events from the stdin reader thread. crossterm owns the
     /// tty, so a dedicated thread blocks on `event::read()` and forwards here; the
     /// run loop drains this instead of polling stdin itself.
@@ -371,6 +375,7 @@ impl App {
             session_page: SessionPage::Saved,
             recovery_sel: 0,
             status: None,
+            pending_clipboard: Vec::new(),
             input_rx,
             input_tx: Some(input_tx),
             wait_rx,
@@ -617,9 +622,7 @@ impl App {
                     self.focused_screen = Some(s);
                 }
                 Event::Status(s) => self.status = Some(s),
-                // Dropped here until the client-side clipboard write lands
-                // in a later phase.
-                Event::ClipboardCopy { .. } => {}
+                Event::ClipboardCopy { kind, text } => self.on_clipboard_copy(kind, text),
                 Event::Sessions { names, recovery } => {
                     // Clamp both page selections to the refreshed lists.
                     self.session_sel = self.session_sel.min(names.len().saturating_sub(1));
@@ -632,6 +635,39 @@ impl App {
                 }
             }
         }
+    }
+
+    /// Accept or drop one forwarded OSC 52 store. A clipboard write is an
+    /// outward-facing side effect; only an attached user plausibly caused it,
+    /// so every other mode drops the store silently — peek-mode stores and
+    /// copies still in flight when the user detaches both land here.
+    fn on_clipboard_copy(&mut self, kind: ClipboardKind, text: String) {
+        if self.mode == Mode::Attached {
+            self.pending_clipboard.push((kind, text));
+        }
+    }
+
+    /// Re-emit buffered clipboard stores to the host terminal, oldest first:
+    /// with multiple entries the host's clipboard ends at the last one,
+    /// matching last-writer-wins clipboard semantics. The payload is data,
+    /// the envelope is protocol: nothing from the stored text reaches `out`
+    /// except through base64, because raw payload bytes on the terminal are
+    /// an escape-sequence injection vector.
+    fn flush_clipboard(&mut self, out: &mut impl Write) -> io::Result<()> {
+        if self.pending_clipboard.is_empty() {
+            return Ok(());
+        }
+        let mut last = 0;
+        for (_kind, text) in self.pending_clipboard.drain(..) {
+            // Selection also emits kind byte `c`: the host-terminal chain is
+            // verified working for `c` and unverified for `s`, and a selection
+            // copy that lands in the system clipboard beats one that vanishes.
+            write!(out, "\x1b]52;c;{}\x07", B64.encode(&text))?;
+            last = copied_chars(&text);
+        }
+        out.flush()?;
+        self.status = Some(format!("copied {last} chars"));
+        Ok(())
     }
 
     pub fn run(&mut self, out: &mut Stdout) -> io::Result<()> {
@@ -683,6 +719,11 @@ impl App {
                 self.focused_id = None;
             }
 
+            // After the `should_quit` break, so a final partial iteration's
+            // pending stores drop with the session instead of landing on a
+            // torn-down terminal; before `ui::render`, whose sequential turn
+            // keeps these bytes from interleaving with a frame.
+            self.flush_clipboard(out)?;
             self.sync_input_modes(out)?;
             ui::render(out, self)?;
 
@@ -1493,6 +1534,12 @@ fn on_key_edit(buf: &mut EditBuffer, k: KeyEvent) -> Option<bool> {
         KeyCode::Char(_) => Some(false),
         _ => None,
     }
+}
+
+/// Size of an emitted clipboard payload as the "copied {n} chars" notice
+/// reports it: chars, not bytes, matching what the user sees when pasting.
+fn copied_chars(text: &str) -> usize {
+    text.chars().count()
 }
 
 /// Insert pasted text at the caret after removing control characters.
