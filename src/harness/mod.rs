@@ -317,13 +317,14 @@ pub(crate) fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
-/// Fixtures shared by the per-harness test modules and the supervisor's
-/// capture suite.
+/// Fixtures and assertion helpers shared by the per-harness test modules and
+/// the supervisor's capture suite.
 #[cfg(test)]
 pub(crate) mod testutil {
     use std::path::PathBuf;
 
-    use super::CapturePaths;
+    use super::{CapturePaths, Harness};
+    use crate::testutil::corpus_emulator;
 
     /// Strict v4 UUID used wherever a valid session ID is needed.
     pub(crate) const ID: &str = "c8c4a5cc-0b32-4ba0-a6b4-6ed08c218e0d";
@@ -338,6 +339,23 @@ pub(crate) mod testutil {
             claude_settings: PathBuf::from("/tmp/Application Support/fleetcom.json"),
             codex_notify: PathBuf::from("/tmp/Application Support/notify.sh"),
         }
+    }
+
+    /// Every command is opaque to `h`: `detect` refuses it and `resume_command` never rewrites it.
+    pub(crate) fn assert_all_opaque(h: &dyn Harness, id: &str, cmds: &[String]) {
+        for cmd in cmds {
+            assert_eq!(h.detect(cmd), None, "{cmd:?} must be opaque");
+            let resumed = h.resume_command(cmd, id);
+            assert_eq!(resumed, *cmd, "an opaque command must never be rewritten");
+        }
+    }
+
+    /// Replays `bytes` through a corpus-geometry emulator and asserts `h` scrapes `expected`.
+    pub(crate) fn assert_corpus_scrape(h: &dyn Harness, bytes: &[u8], expected: &str) {
+        let mut emu = corpus_emulator();
+        emu.process(bytes);
+        let text = emu.text_with_history();
+        assert_eq!(h.scrape_exit(&text).as_deref(), Some(expected));
     }
 }
 

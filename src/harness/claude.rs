@@ -88,9 +88,9 @@ fn slug(cwd: &Path) -> Option<String> {
 mod tests {
     use std::{fs, path::PathBuf};
 
-    use super::super::testutil::{ID, OTHER, paths};
+    use super::super::testutil::{ID, OTHER, assert_all_opaque, assert_corpus_scrape, paths};
     use super::*;
-    use crate::testutil::{corpus_emulator, temp};
+    use crate::testutil::temp;
 
     /// Claude-specific opaque shapes: flags, `--continue`/`-c`, subcommands,
     /// the short/`=` resume spellings, and `--session-id`. The syntax shared
@@ -112,14 +112,7 @@ mod tests {
             format!("claude --session-id {ID}"),
         ])
         .collect();
-        for cmd in opaque {
-            assert_eq!(Claude.detect(&cmd), None, "{cmd:?} must be opaque");
-            assert_eq!(
-                Claude.resume_command(&cmd, ID),
-                cmd,
-                "an opaque command must never be rewritten"
-            );
-        }
+        assert_all_opaque(&Claude, ID, &opaque);
     }
 
     #[test]
@@ -232,11 +225,10 @@ mod tests {
     /// The scraper recovers the exit-hint ID from the corpus terminal bytes.
     #[test]
     fn corpus_scrape_recovers_the_exit_hint_id() {
-        let mut emu = corpus_emulator();
-        emu.process(include_bytes!("../../tests/corpus/claude_resume.bin"));
-        assert_eq!(
-            Claude.scrape_exit(&emu.text_with_history()).as_deref(),
-            Some("c8c4a5cc-0b32-4ba0-a6b4-6ed08c218e0d")
+        assert_corpus_scrape(
+            &Claude,
+            include_bytes!("../../tests/corpus/claude_resume.bin"),
+            "c8c4a5cc-0b32-4ba0-a6b4-6ed08c218e0d",
         );
     }
 }
