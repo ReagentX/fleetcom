@@ -989,26 +989,7 @@ impl Drop for Task {
 mod tests {
     use super::*;
     use crate::protocol::MouseBtn;
-    use crate::testutil::{read_pid, temp, wait_until};
-
-    fn here() -> PathBuf {
-        std::env::current_dir().unwrap()
-    }
-
-    /// Tests launch under this process's own env, the same fallback the
-    /// supervisor uses when no client context has arrived.
-    fn env_here() -> Vec<(OsString, OsString)> {
-        std::env::vars_os().collect()
-    }
-
-    /// `env_here` with `SHELL` pinned to `/bin/sh` for portable background-job
-    /// behavior in process-group tests.
-    fn sh_env() -> Vec<(OsString, OsString)> {
-        let mut env = env_here();
-        env.retain(|(k, _)| k != "SHELL");
-        env.push(("SHELL".into(), "/bin/sh".into()));
-        env
-    }
+    use crate::testutil::{env_here, here, read_pid, sh_env, temp, wait_until};
 
     /// Tests drive the reader directly, so there is no core loop to wake.
     fn no_waker() -> Waker {

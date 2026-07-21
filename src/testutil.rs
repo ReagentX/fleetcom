@@ -3,7 +3,9 @@
 //! at the declaration in `main.rs`), so nothing here ships.
 
 use std::{
+    ffi::OsString,
     fs,
+    os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
     time::{Duration, Instant, SystemTime},
 };
@@ -52,6 +54,45 @@ pub(crate) fn read_pid(path: &Path) -> nix::unistd::Pid {
         pid.is_some()
     });
     nix::unistd::Pid::from_raw(pid.expect("pid file never appeared"))
+}
+
+/// This process's own working directory: the cwd for spawns that need no
+/// scratch isolation.
+pub(crate) fn here() -> PathBuf {
+    std::env::current_dir().unwrap()
+}
+
+/// Tests launch under this process's own env, the same fallback the
+/// supervisor uses when no client context has arrived.
+pub(crate) fn env_here() -> Vec<(OsString, OsString)> {
+    std::env::vars_os().collect()
+}
+
+/// `env_here` with `SHELL` pinned to `/bin/sh` for portable background-job
+/// behavior in process-group tests.
+pub(crate) fn sh_env() -> Vec<(OsString, OsString)> {
+    let mut env = env_here();
+    env.retain(|(k, _)| k != "SHELL");
+    env.push(("SHELL".into(), "/bin/sh".into()));
+    env
+}
+
+/// Write `body` to `path` as a `#!/bin/sh` script, mode 0o700 — every
+/// caller's script is exec'd, so the executable bit is load-bearing.
+/// Creating parent directories stays with the caller.
+pub(crate) fn write_executable(path: &Path, body: &str) {
+    fs::write(path, format!("#!/bin/sh\n{body}\n")).unwrap();
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+}
+
+/// Install a fake notifier at `path` that records its argv, one token
+/// per line, into `record`.
+pub(crate) fn install_fake_notifier(path: &Path, record: &Path) {
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    write_executable(
+        path,
+        &format!("printf '%s\\n' \"$@\" > '{}'", record.display()),
+    );
 }
 
 /// Corpus geometry: the fixture recordings in `tests/corpus/` were captured

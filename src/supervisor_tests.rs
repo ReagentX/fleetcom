@@ -3,11 +3,10 @@ use std::path::Path;
 use super::*;
 use crate::harness::testutil::{ID as CAP_ID, OTHER as CAP_OTHER};
 use crate::protocol::{Key, Mods};
-use crate::testutil::{now_ms, read_pid, wait_until, write_rollout};
-
-fn here() -> PathBuf {
-    std::env::current_dir().unwrap()
-}
+use crate::testutil::{
+    here, install_fake_notifier, now_ms, read_pid, sh_env, wait_until, write_executable,
+    write_rollout,
+};
 
 /// Build a supervisor with this process's launch context.
 fn sup(rows: u16, cols: u16) -> Supervisor {
@@ -904,10 +903,7 @@ fn reap_until(
 
 /// Use `/bin/sh` so background-process tests have consistent semantics.
 fn hello_with_sh(s: &mut Supervisor, cwd: PathBuf) {
-    let mut env: Vec<(std::ffi::OsString, std::ffi::OsString)> = std::env::vars_os().collect();
-    env.retain(|(k, _)| k != "SHELL");
-    env.push(("SHELL".into(), "/bin/sh".into()));
-    s.set_launch_context(LaunchContext { env, cwd });
+    s.set_launch_context(LaunchContext { env: sh_env(), cwd });
 }
 
 /// `Remove` must sweep group members the exited leader left behind (a
@@ -1608,11 +1604,8 @@ fn agent_ctx_plus(
 
 /// Install an executable stub with caller-supplied shell behavior.
 fn install_script(bin: &Path, name: &str, body: &str) {
-    use std::os::unix::fs::PermissionsExt;
     std::fs::create_dir_all(bin).unwrap();
-    let path = bin.join(name);
-    std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+    write_executable(&bin.join(name), body);
 }
 
 /// Save a recipe and return its persisted JSON.
@@ -2414,15 +2407,13 @@ fn home_only_launch_env_targets_the_clients_dot_codex() {
 /// `FLEETCOM_NOTIFY_CHAIN` so the capture script cannot execute it.
 #[test]
 fn stale_inherited_notify_chain_is_never_executed() {
-    use std::os::unix::fs::PermissionsExt;
     let dir = scratch("stale_chain");
     let (bin, runtime) = (dir.join("bin"), dir.join("run"));
     // No config.toml exists: nothing routed, so nothing may be chained.
     let codex_home = dir.join("codex_home");
     let stale = dir.join("stale");
     let record = dir.join("stale-record");
-    std::fs::write(&stale, format!("#!/bin/sh\ntouch '{}'\n", record.display())).unwrap();
-    std::fs::set_permissions(&stale, std::fs::Permissions::from_mode(0o700)).unwrap();
+    write_executable(&stale, &format!("touch '{}'", record.display()));
 
     // The stub invokes the injected notify script the way codex would.
     let payload = format!(r#"{{"type":"agent-turn-complete","thread-id":"{CAP_ID}"}}"#);
@@ -2499,7 +2490,6 @@ fn agent_save_without_any_id_keeps_the_plain_command() {
 #[test]
 fn config_toml_notify_chains_through_the_injected_script() {
     use crate::harness::NOTIFY_CHAIN_ENV;
-    use std::os::unix::fs::PermissionsExt;
     let dir = scratch("cfg_chain");
     let (bin, runtime) = (dir.join("bin"), dir.join("run"));
     let codex_home = dir.join("codex_home");
@@ -2507,16 +2497,7 @@ fn config_toml_notify_chains_through_the_injected_script() {
     // The notifier path contains spaces and carries a fixed argument.
     let notifier = dir.join("Fake App.app").join("Sky Client");
     let record = dir.join("notifier-record");
-    std::fs::create_dir_all(notifier.parent().unwrap()).unwrap();
-    std::fs::write(
-        &notifier,
-        format!(
-            "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\n",
-            record.display()
-        ),
-    )
-    .unwrap();
-    std::fs::set_permissions(&notifier, std::fs::Permissions::from_mode(0o700)).unwrap();
+    install_fake_notifier(&notifier, &record);
     std::fs::write(
         codex_home.join("config.toml"),
         format!("notify = [\"{}\", \"turn-ended\"]\n", notifier.display()),
