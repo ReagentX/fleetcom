@@ -8,31 +8,37 @@
 #[cfg(not(unix))]
 compile_error!("fleetcom supports Unix platforms only.");
 
+// Client: the terminal-attached UI process.
 mod app;
-mod core;
-mod daemon;
 // Caret-addressed single-line buffer backing the text prompts.
 mod editbuf;
-// Differential emulator tests over recorded PTY output.
-#[cfg(test)]
-mod golden;
+mod ui;
+
+// Core: task ownership shared by the daemon and the foreground.
+mod core;
+// Dashboard-preview resolution: the provenance cascade over emulator facts.
+mod preview;
+mod supervisor;
+mod task;
+
+// Wire: the client<->core boundary.
+mod daemon;
+mod protocol;
+mod session;
+mod transport;
+
+// Subsystems.
 // Agent-CLI session capture: the supervisor instruments spawns through it.
 mod harness;
 mod path;
-// Dashboard-preview resolution: the provenance cascade over emulator facts.
-mod preview;
-mod protocol;
-mod session;
-mod supervisor;
-mod task;
 mod terminal;
+
+// Test support.
 // Shared test scaffolds: scratch dirs, deadline polling, corpus fixtures.
 #[cfg(test)]
 mod testutil;
-mod transport;
-mod ui;
 
-pub(crate) use terminal::{ansi, emulator, format, frame};
+pub(crate) use terminal::{ansi, emulator, format, frame, input};
 
 use std::{
     io,
