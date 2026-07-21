@@ -419,7 +419,7 @@ pub fn run_kill() -> io::Result<()> {
     ))
 }
 
-/// Overall budget for the socket-fallback kill exchange.
+/// Timeout applied to blocking socket-fallback kill operations.
 const KILL_SOCKET_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Timeout reported when the socket-fallback kill exchange does not finish.
@@ -441,13 +441,23 @@ fn arm_read_deadline(s: &UnixStream, deadline: Instant) -> io::Result<()> {
     s.set_read_timeout(Some(left))
 }
 
+/// Convert either platform representation of a socket timeout into the
+/// kill-handshake timeout.
+fn deadline_mapped(e: io::Error) -> io::Error {
+    if is_timeout(&e) {
+        kill_handshake_timeout()
+    } else {
+        e
+    }
+}
+
 /// Send `Shutdown` when the lock file has no usable pid. Complete the handshake
 /// first, then wait for the daemon to close the socket after stopping its tasks.
 fn kill_via_socket() -> io::Result<()> {
     kill_via_socket_at(&socket_path(), KILL_SOCKET_TIMEOUT)
 }
 
-/// Run the socket-fallback kill exchange at `path` within `budget`.
+/// Run the socket-fallback kill exchange at `path` using `budget` for I/O.
 fn kill_via_socket_at(path: &Path, budget: Duration) -> io::Result<()> {
     match UnixStream::connect(path) {
         Ok(mut s) => kill_over_stream(&mut s, budget),
@@ -458,25 +468,29 @@ fn kill_via_socket_at(path: &Path, budget: Duration) -> io::Result<()> {
     }
 }
 
-/// Drive the Shutdown exchange with one deadline for all blocking I/O.
+/// Drive the Shutdown exchange with bounded writes and a shared read deadline.
 fn kill_over_stream(s: &mut UnixStream, budget: Duration) -> io::Result<()> {
+    let (kind, payload) = encode_hello(&LaunchContext::here());
+    kill_exchange(s, budget, kind, &payload)
+}
+
+/// Drive the bounded Shutdown exchange with a pre-encoded hello frame.
+fn kill_exchange(
+    s: &mut UnixStream,
+    budget: Duration,
+    hello_kind: u8,
+    hello_payload: &[u8],
+) -> io::Result<()> {
     let deadline = Instant::now() + budget;
     s.set_write_timeout(Some(budget))?;
 
-    let (kind, payload) = encode_hello(&LaunchContext::here());
-    write_frame(s, kind, &payload)?;
+    write_frame(s, hello_kind, hello_payload).map_err(deadline_mapped)?;
     arm_read_deadline(s, deadline)?;
-    let (kind, payload) = read_frame(s).map_err(|e| {
-        if is_timeout(&e) {
-            kill_handshake_timeout()
-        } else {
-            e
-        }
-    })?;
+    let (kind, payload) = read_frame(s).map_err(deadline_mapped)?;
     check_hello_ack(kind, &payload)?;
 
     let (kind, payload) = encode_command(&Command::Shutdown);
-    write_frame(s, kind, &payload)?;
+    write_frame(s, kind, &payload).map_err(deadline_mapped)?;
     // Socket closure signals completion. Re-arm each read with the remaining
     // budget so the loop cannot outlive the deadline.
     let mut buf = [0u8; 256];
@@ -486,7 +500,19 @@ fn kill_over_stream(s: &mut UnixStream, budget: Duration) -> io::Result<()> {
             Ok(0) => return Ok(()),
             Ok(_) => {}
             Err(e) if is_timeout(&e) => return Err(kill_handshake_timeout()),
-            Err(_) => return Ok(()),
+            // Retry interrupted reads; the deadline still bounds the loop.
+            Err(e) if e.kind() == ErrorKind::Interrupted => {}
+            // The daemon closing mid-drain is completion, same as `Ok(0)`.
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    ErrorKind::ConnectionReset | ErrorKind::BrokenPipe | ErrorKind::UnexpectedEof
+                ) =>
+            {
+                return Ok(());
+            }
+            // Propagate other errors because they do not confirm daemon exit.
+            Err(e) => return Err(e),
         }
     }
 }
@@ -930,6 +956,22 @@ mod tests {
             start.elapsed() < Duration::from_secs(5),
             "the deadline must fire, not the test's timeout"
         );
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    /// A blocked hello write reports the kill-handshake timeout.
+    #[test]
+    fn kill_exchange_maps_a_write_timeout() {
+        let base = temp("kill_socket_bigenv");
+        fs::create_dir_all(&base).unwrap();
+        let sock = base.join("mute.sock");
+        let _listener = UnixListener::bind(&sock).unwrap();
+        let mut s = UnixStream::connect(&sock).unwrap();
+        // The listener never accepts, so this payload fills the send buffer.
+        let oversized = vec![0u8; 8 * 1024 * 1024];
+        let err = kill_exchange(&mut s, Duration::from_millis(200), 0, &oversized).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::TimedOut);
+        assert!(err.to_string().contains("kill handshake"), "{err}");
         let _ = fs::remove_dir_all(&base);
     }
 
