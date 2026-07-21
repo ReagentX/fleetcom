@@ -8,33 +8,28 @@
 #[cfg(not(unix))]
 compile_error!("fleetcom supports Unix platforms only.");
 
-// Client: the terminal-attached UI process.
+// Terminal-attached client.
 mod app;
-// Caret-addressed single-line buffer backing the text prompts.
 mod editbuf;
 mod ui;
 
-// Core: task ownership shared by the daemon and the foreground.
+// Task lifecycle and dashboard-preview core.
 mod core;
-// Dashboard-preview resolution: the provenance cascade over emulator facts.
 mod preview;
 mod supervisor;
 mod task;
 
-// Wire: the client<->core boundary.
+// Daemon transport, sessions, and wire protocol.
 mod daemon;
 mod protocol;
 mod session;
 mod transport;
 
-// Subsystems.
-// Agent-CLI session capture: the supervisor instruments spawns through it.
 mod harness;
 mod path;
 mod terminal;
 
-// Test support.
-// Shared test scaffolds: scratch dirs, deadline polling, corpus fixtures.
+// Shared test scaffolding.
 #[cfg(test)]
 mod testutil;
 

@@ -56,14 +56,12 @@ pub(crate) fn read_pid(path: &Path) -> nix::unistd::Pid {
     nix::unistd::Pid::from_raw(pid.expect("pid file never appeared"))
 }
 
-/// This process's own working directory: the cwd for spawns that need no
-/// scratch isolation.
+/// Return this process's working directory.
 pub(crate) fn here() -> PathBuf {
     std::env::current_dir().unwrap()
 }
 
-/// Tests launch under this process's own env, the same fallback the
-/// supervisor uses when no client context has arrived.
+/// Snapshot this process's environment for a launch context.
 pub(crate) fn env_here() -> Vec<(OsString, OsString)> {
     std::env::vars_os().collect()
 }
@@ -77,9 +75,7 @@ pub(crate) fn sh_env() -> Vec<(OsString, OsString)> {
     env
 }
 
-/// Write `body` to `path` as a `#!/bin/sh` script, mode 0o700 — every
-/// caller's script is exec'd, so the executable bit is load-bearing.
-/// Creating parent directories stays with the caller.
+/// Write an executable `#!/bin/sh` script at `path`. The parent must exist.
 pub(crate) fn write_executable(path: &Path, body: &str) {
     fs::write(path, format!("#!/bin/sh\n{body}\n")).unwrap();
     fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();

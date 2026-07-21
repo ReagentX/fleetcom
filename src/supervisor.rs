@@ -85,10 +85,8 @@ fn effective_scrollback(flag: Option<usize>, env: Option<&str>) -> usize {
         .map_or(DEFAULT_SCROLLBACK, |lines| lines.min(MAX_SCROLLBACK))
 }
 
-/// How long a SIGTERMed task gets to exit before SIGKILL. TERM-respecting
-/// processes exit in milliseconds, so this is the *ceiling* on quit latency,
-/// not the norm; 2 s is enough for any real flush handler while keeping a
-/// wedged task from making `Q` feel broken.
+/// Grace period between SIGTERM and SIGKILL, bounding shutdown delay for tasks
+/// that do not exit after SIGTERM.
 const KILL_GRACE: Duration = Duration::from_secs(2);
 
 /// Maximum stored label length in Unicode scalar values after normalization,
@@ -179,11 +177,9 @@ pub struct Supervisor {
     scrollback: usize,
     /// The task whose screen the client is watching (attach/peek), or `None`.
     watched: Option<u64>,
-    /// The last `Screen` we emitted, stored with `lines` empty: candidates are
-    /// built the same way, so `ScreenView` equality is the send-on-change
-    /// fingerprint and an unchanged screen isn't re-serialized and re-sent
-    /// every tick. Reset to `None` whenever `watched` changes, so re-attaching
-    /// always gets a fresh full screen (the client cleared its copy on detach).
+    /// The last emitted screen fingerprint. `lines` stays empty because only
+    /// emitted copies carry them. Cleared when `watched` changes to force a
+    /// fresh screen after attachment.
     last_screen: Option<ScreenView>,
     /// The current client's launch context, used for spawns and session paths.
     /// Spawning is refused until one is installed.
@@ -860,7 +856,6 @@ impl Supervisor {
     }
 }
 
-// Tests live in supervisor_tests.rs: at ≈2,800 lines they dwarf the module itself.
 #[cfg(test)]
 #[path = "supervisor_tests.rs"]
 mod tests;

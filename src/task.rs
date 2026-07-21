@@ -576,10 +576,8 @@ impl Task {
         grid(&self.parser).scrollback()
     }
 
-    /// Forward a clipboard paste in whichever shape the child negotiated; see
-    /// [`input::paste_bytes`]. Encoded under the grid lock (the DECSET 2004 read stays
-    /// on this thread), then queued whole: the PTY write itself happens on the
-    /// writer worker.
+    /// Encode a paste using the child's bracketed-paste mode, read under the
+    /// grid lock, then queue it as one PTY write.
     pub fn send_paste(&mut self, content: &[u8]) -> Result<(), WriteRefused> {
         let bracketed = grid(&self.parser).bracketed_paste();
         let msg = input::paste_bytes(bracketed, content);
@@ -587,8 +585,8 @@ impl Task {
         self.queue_write(msg)
     }
 
-    /// Forward one mouse action, routed by the child's own screen state; see
-    /// [`input::mouse_bytes`]. A child that gets `None` receives nothing at all.
+    /// Encode and queue one mouse action using the child's screen modes.
+    /// Unsupported actions send nothing.
     pub fn send_mouse(&mut self, kind: MouseKind, col: u16, row: u16) -> Result<(), WriteRefused> {
         let bytes = {
             let p = grid(&self.parser);
@@ -600,10 +598,8 @@ impl Task {
         }
     }
 
-    /// Forward one key press, encoded under the child's cursor-key mode; see
-    /// [`input::key_bytes`]. The DECCKM read stays on this thread under the grid lock,
-    /// like [`Task::send_paste`]/[`Task::send_mouse`]. A key that encodes to
-    /// nothing sends nothing.
+    /// Encode and queue one key using the child's cursor-key mode, read under
+    /// the grid lock. Unsupported combinations send nothing.
     pub fn send_key(&mut self, code: Key, mods: Mods) -> Result<(), WriteRefused> {
         let bytes = {
             let p = grid(&self.parser);
@@ -731,7 +727,6 @@ impl Drop for Task {
     }
 }
 
-// Tests live in task_tests.rs: at ≈650 lines they rival the module itself.
 #[cfg(test)]
 #[path = "task_tests.rs"]
 mod tests;

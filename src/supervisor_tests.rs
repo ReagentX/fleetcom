@@ -1608,7 +1608,5 @@ fn key_command_encodes_against_live_cursor_mode() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-// The session-capture suite lives in supervisor_capture_tests.rs: at ≈1,100
-// lines it earns its own file, and as a child module it shares every helper above.
 #[path = "supervisor_capture_tests.rs"]
 mod capture;

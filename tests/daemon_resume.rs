@@ -203,9 +203,7 @@ fn value_after<'a>(argv: &'a [String], flag: &str) -> &'a str {
         .unwrap_or_else(|| panic!("{flag} carries no value: {argv:?}"))
 }
 
-/// The namespace layout itself is pinned by the supervisor capture unit tests;
-/// the integration-only facts are the DAEMON's pid in the namespace name (a
-/// cross-process fact) and the asset existing on disk.
+/// Assert that `asset` exists in a namespace prefixed by the daemon's PID.
 fn assert_daemon_namespaced(asset: &Path, daemon_pid: u32, what: &str, argv: &[String]) {
     let ns = asset
         .parent()

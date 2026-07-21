@@ -59,9 +59,8 @@ fn is_rule_row(row: &str) -> bool {
 
 /// The status phrase of a spinner row: a frame char accepted by `is_frame`,
 /// a space, then text through the first `…` inclusive. The phrase must open
-/// alphanumeric; past that it is task-derived and unconstrained (spaces,
-/// parentheses, digits). Everything after the ellipsis — tickers,
-/// parentheticals — is the caller's to interpret.
+/// alphanumeric; past that it is task-derived and unconstrained. Trailing
+/// text is left for the caller to interpret.
 fn spinner_text(row: &str, is_frame: impl Fn(char) -> bool) -> Option<String> {
     let mut chars = row.chars();
     if !is_frame(chars.next()?) || chars.next()? != ' ' {
@@ -75,10 +74,8 @@ fn spinner_text(row: &str, is_frame: impl Fn(char) -> bool) -> Option<String> {
         .then(|| text.to_string())
 }
 
-/// Filter a ` · `-separated tail down to its slow-moving segments: each
-/// segment is trimmed, dropped when empty or when `drop` says so, and the
-/// survivors re-join in order, each prefixed ` · `. No survivors yields the
-/// empty string, so callers append the result unconditionally.
+/// Keep nonempty ` · `-separated segments not matched by `drop`, preserving
+/// their order and separator prefixes.
 fn slow_segments(tail: &str, drop: impl Fn(&str) -> bool) -> String {
     let mut out = String::new();
     for seg in tail.split(" · ") {
@@ -439,10 +436,8 @@ impl SummaryAdapter for GrokSummary {
         // states and match neither shape.
         let probe = rows[..top].iter().rev().find(|r| !r.is_empty())?;
         let t = probe.trim_start();
-        // `⠼ Sleep 5 seconds then echo ok… 1.5s 2.8s ⇣14.2k [↓][stop]` → the
-        // label through its `…`; everything after it is elapsed/throughput
-        // ticker. A wrapped status row leaves its `…` tail here with no
-        // spinner head, which fails the frame check and falls through.
+        // Keep the label through its first ellipsis. Wrapped tail rows have no
+        // spinner prefix, so they fail the frame check and fall through.
         if let Some(text) = spinner_text(t, |c| ('\u{2800}'..='\u{28FF}').contains(&c)) {
             return Some((text, "grok:spinner"));
         }
@@ -499,7 +494,6 @@ fn grok_border_label(row: &str) -> Option<String> {
     (!label.is_empty()).then(|| label.to_string())
 }
 
-// Tests live in summary_tests.rs: at ≈1,100 lines they dwarf the module itself.
 #[cfg(test)]
 #[path = "summary_tests.rs"]
 mod tests;

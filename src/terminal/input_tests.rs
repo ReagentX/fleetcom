@@ -33,8 +33,8 @@ fn paste_strips_embedded_terminator() {
     );
 }
 
-/// Legacy paste converts both `\r\n` and bare `\n` to the `\r` Enter sends,
-/// without doubling a CRLF into two returns.
+/// Unbracketed paste converts both `\r\n` and bare `\n` to the `\r` Enter
+/// sends, without doubling a CRLF into two returns.
 #[test]
 fn legacy_paste_converts_line_endings() {
     assert_eq!(paste_bytes(false, b"a\r\nb\nc\r"), b"a\rb\rc\r".to_vec());

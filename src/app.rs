@@ -1480,7 +1480,6 @@ fn list_dirs(base: &Path, partial: &str) -> Vec<String> {
     out
 }
 
-// Tests live in app_tests.rs: at ≈1,700 lines they outweigh the module itself.
 #[cfg(test)]
 #[path = "app_tests.rs"]
 mod tests;

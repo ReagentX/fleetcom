@@ -1,5 +1,5 @@
 //! The input-direction mirror of `ansi`: protocol events in, VT byte
-//! sequences out. Encoding only — no PTY writes and no `Task` state;
+//! sequences out. Encoding only: no PTY writes and no `Task` state;
 //! callers read the child's negotiated modes under their own locks and
 //! pass them in.
 
@@ -13,11 +13,9 @@ use crate::{
 /// paste early and smuggle the remainder in as live keystrokes.
 const PASTE_END: &[u8] = b"\x1b[201~";
 
-/// Encode a clipboard paste for a child whose DECSET 2004 state is
-/// `bracketed`. Opted in: wrap in `200~`/`201~` markers with embedded
-/// terminators stripped, content otherwise verbatim. Legacy: no markers, and
-/// line endings (`\r\n` and bare `\n`) become `\r` (the byte Enter sends),
-/// because a legacy line editor reads `\n` as ^J, not as end-of-line.
+/// Encode a clipboard paste using the child's DECSET 2004 state. Bracketed
+/// mode wraps content and strips embedded terminators; unbracketed mode omits
+/// the markers and converts CRLF and LF line endings to CR.
 pub fn paste_bytes(bracketed: bool, content: &[u8]) -> Vec<u8> {
     if bracketed {
         let mut out = Vec::with_capacity(content.len() + 2 * PASTE_END.len() + 6);
@@ -263,7 +261,6 @@ pub fn key_bytes(app_cursor: bool, code: Key, mods: Mods) -> Option<Vec<u8>> {
     }
 }
 
-// Tests live in input_tests.rs: at ≈470 lines they outweigh the module itself.
 #[cfg(test)]
 #[path = "input_tests.rs"]
 mod tests;

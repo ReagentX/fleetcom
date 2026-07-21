@@ -212,8 +212,8 @@ fn group_gone_holds_while_a_member_survives() {
     use nix::sys::signal::kill;
     let dir = temp("task_gone");
     let spid = dir.join("spid");
-    // `trap '' HUP` first: the `&` child must survive its session
-    // leader's exit to be a straggler (see the terminate test above).
+    // `trap '' HUP` first so the background child survives its session
+    // leader's exit and remains available for the group probe.
     let cmd = format!("trap '' HUP; sleep 300 & echo $! > {}", spid.display());
     let mut t = Task::spawn(31, &cmd, &cmd, &here(), 24, 80, 2000, &sh_env(), no_waker()).unwrap();
     wait_finished(&mut t);

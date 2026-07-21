@@ -317,8 +317,7 @@ fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
-/// Fixtures and assertion helpers shared by the per-harness test modules and
-/// the supervisor's capture suite.
+/// Fixtures and assertions for harness detection and exit scraping.
 #[cfg(test)]
 pub(crate) mod testutil {
     use std::path::PathBuf;
@@ -341,7 +340,8 @@ pub(crate) mod testutil {
         }
     }
 
-    /// Every command is opaque to `h`: `detect` refuses it and `resume_command` never rewrites it.
+    /// Assert that every command is opaque to `h`: detection fails and resume
+    /// leaves the command unchanged.
     pub(super) fn assert_all_opaque(h: &dyn Harness, id: &str, cmds: &[String]) {
         for cmd in cmds {
             assert_eq!(h.detect(cmd), None, "{cmd:?} must be opaque");
@@ -350,7 +350,7 @@ pub(crate) mod testutil {
         }
     }
 
-    /// Replays `bytes` through a corpus-geometry emulator and asserts `h` scrapes `expected`.
+    /// Replay `bytes` at corpus geometry and assert the scraped exit ID.
     pub(super) fn assert_corpus_scrape(h: &dyn Harness, bytes: &[u8], expected: &str) {
         let mut emu = corpus_emulator();
         emu.process(bytes);

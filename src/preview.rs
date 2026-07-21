@@ -22,8 +22,7 @@ pub const DEMOTION_HOLD: Duration = Duration::from_millis(600);
 /// Preview text for an alternate-screen child with no usable title.
 pub const MARKER: &str = "full-screen";
 
-/// The emulator facts one resolution step reads. A trait so unit tests
-/// resolve against synthetic screens without a PTY.
+/// Read-only emulator state consumed by one preview-resolution step.
 pub trait ScreenFacts {
     fn revision(&self) -> u64;
     fn alt_epoch(&self) -> u64;

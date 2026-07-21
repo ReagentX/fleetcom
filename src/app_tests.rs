@@ -42,12 +42,8 @@ impl App {
         self.spawn_checked(cmd, cwd, Some(group));
     }
 
-    /// Send a Spawn and confirm the task landed, retrying a transient
-    /// refusal. Under parallel-suite PTY churn, openpty itself can fail
-    /// (observed on macOS as ENXIO); the supervisor answers with a Status
-    /// notice and no task, and every assertion after that fails without
-    /// naming the cause. Ids stay stable across retries: the supervisor
-    /// advances `next_id` only on success.
+    /// Send a spawn and retry transient failures. Failed spawns leave
+    /// `next_id` unchanged, so retries preserve task IDs.
     fn spawn_checked(&mut self, cmd: &str, cwd: PathBuf, group: Option<&str>) {
         self.pump();
         let want = self.views.len() + 1;
@@ -281,10 +277,9 @@ fn tagging_a_finished_task_moves_it_to_in_use() {
 }
 
 /// A parked live task gets its own "Idle" section between "Running" and
-/// "Completed". `parked` is flipped on the local snapshot here (and in the
-/// tests below): the core's 10 s quiet window is exactly what a test must
-/// not wait out, and `sections` is pure over `views`: the flip must come
-/// after the last pump, or a fresh snapshot overwrites it.
+/// "Completed". The test updates the local snapshot after the last pump so a
+/// fresh core snapshot cannot overwrite it; this avoids waiting for the 10 s
+/// quiet window.
 #[test]
 fn parked_task_lands_in_idle_between_running_and_completed() {
     let mut app = App::new_local(30, 100);

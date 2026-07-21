@@ -218,7 +218,7 @@ pub enum PreviewSource {
 }
 
 impl PreviewSource {
-    /// Lowercase label shared by the wire encoding and the peek footer.
+    /// Lowercase provenance identifier.
     pub fn label(self) -> &'static str {
         match self {
             PreviewSource::Floor => "floor",
@@ -229,8 +229,7 @@ impl PreviewSource {
     }
 }
 
-/// One resolved preview. Resolution lives in [`crate::preview`]; the type
-/// sits here because it rides the wire inside [`TaskView`].
+/// A resolved dashboard preview sent as part of [`TaskView`].
 #[derive(Debug, Clone, PartialEq)]
 pub struct Preview {
     pub text: String,
