@@ -72,6 +72,15 @@ pub fn sessions_dir(root: Option<PathBuf>) -> Option<PathBuf> {
         .map(|base| base.join("sessions"))
 }
 
+/// On-disk session format version: written by `to_json`, the newest
+/// `from_json` accepts. The contract: any change an older reader would decode
+/// lossily bumps this number, and a reader refuses versions above its own
+/// rather than dropping what it does not recognize and rewriting the file on
+/// the next save. A missing `version` key means 1 — every file written by
+/// released fleetcom (0.6.0–0.8.0) predates the key and is structurally v1 —
+/// and that absence rule is permanent.
+const FORMAT_VERSION: u64 = 1;
+
 /// Serialize `{"name": <original>, "dirs": {...}}`. The stored name lets
 /// `save_in` distinguish names that sanitize to the same filename.
 fn to_json(name: &str, cfg: &SessionConfig) -> String {
@@ -98,6 +107,7 @@ fn to_json(name: &str, cfg: &SessionConfig) -> String {
         let _ = dirs.insert(dir, arr);
     }
     let mut obj = jzon::JsonValue::new_object();
+    let _ = obj.insert("version", FORMAT_VERSION);
     let _ = obj.insert("name", name);
     let _ = obj.insert("dirs", dirs);
     obj.pretty(2)
@@ -106,15 +116,49 @@ fn to_json(name: &str, cfg: &SessionConfig) -> String {
 /// Parse wrapped and flat schemas, returning the stored name when present.
 /// A wrapped file has an object-valued `dirs`; flat files have entry arrays at
 /// the top level, including when a directory is literally named `dirs`.
+/// A top-level `version` above [`FORMAT_VERSION`] refuses to load: this
+/// build would drop the members it does not recognize, and the next save
+/// would rewrite the file without them.
 fn from_json(text: &str) -> io::Result<(Option<String>, SessionConfig)> {
     let parsed = jzon::parse(text).map_err(|e| io::Error::other(e.to_string()))?;
-    let (name, dirs) = if parsed["dirs"].is_object() {
-        (parsed["name"].as_str().map(str::to_string), &parsed["dirs"])
+    // Gate before schema detection. Absence means version 1: every file
+    // written by released fleetcom (0.6.0–0.8.0) predates the key.
+    let version = &parsed["version"];
+    if !version.is_null() {
+        match version.as_u64() {
+            Some(n) if (1..=FORMAT_VERSION).contains(&n) => {}
+            Some(n) if n > FORMAT_VERSION => {
+                return Err(io::Error::other(format!(
+                    "session format version {n} is newer than this fleetcom \
+                     (supports {FORMAT_VERSION}); load it with a newer build"
+                )));
+            }
+            // Zero, fractional, negative, or non-numeric: an encoding this
+            // build cannot interpret — refuse over guess. Zero lands here,
+            // not in the arm above: "0 is newer" would be a false claim.
+            _ => {
+                return Err(io::Error::other(format!(
+                    "session format version {} is not one this fleetcom reads \
+                     (supports {FORMAT_VERSION}); load it with a newer build",
+                    version.dump()
+                )));
+            }
+        }
+    }
+    let (name, dirs, flat) = if parsed["dirs"].is_object() {
+        let name = parsed["name"].as_str().map(str::to_string);
+        (name, &parsed["dirs"], false)
     } else {
-        (None, &parsed)
+        (None, &parsed, true)
     };
     let mut cfg = SessionConfig::new();
     for (dir, val) in dirs.entries() {
+        // In a flat file the accepted `version` member sits beside directory
+        // keys; it is metadata, not a directory. Wrapped iteration reads only
+        // `dirs`, which never contains it.
+        if flat && dir == "version" {
+            continue;
+        }
         // Ignore members that match neither supported entry form.
         let entries = val
             .members()
@@ -361,8 +405,105 @@ mod tests {
         cfg.insert("~/proj".into(), vec![e("cargo test"), e("vim")]);
         cfg.insert("/tmp".into(), vec![e("top")]);
 
-        let expected = "{\n  \"name\": \"work\",\n  \"dirs\": {\n    \"/tmp\": [\n      \"top\"\n    ],\n    \"~/proj\": [\n      \"cargo test\",\n      \"vim\"\n    ]\n  }\n}";
+        let expected = "{\n  \"version\": 1,\n  \"name\": \"work\",\n  \"dirs\": {\n    \"/tmp\": [\n      \"top\"\n    ],\n    \"~/proj\": [\n      \"cargo test\",\n      \"vim\"\n    ]\n  }\n}";
         assert_eq!(to_json("work", &cfg), expected);
+    }
+
+    /// Saved files carry the format version and load back under the gate.
+    #[test]
+    fn save_writes_version_1_and_load_accepts_it() {
+        let dir = temp("session_version_roundtrip");
+        let mut cfg = SessionConfig::new();
+        cfg.insert("~/p".into(), vec![e("vim")]);
+
+        let file = save_in(&dir, "versioned", &cfg).unwrap();
+        assert!(
+            fs::read_to_string(&file)
+                .unwrap()
+                .contains("\"version\": 1")
+        );
+        assert_eq!(load_in(&dir, "versioned").unwrap(), cfg);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A wrapped file without the key is version 1: every file written by
+    /// released fleetcom (0.6.0–0.8.0) predates it. The rule is permanent.
+    #[test]
+    fn missing_version_means_version_1() {
+        let (name, cfg) = from_json(r#"{"name": "old", "dirs": {"~/proj": ["vim"]}}"#).unwrap();
+        assert_eq!(name, Some("old".to_string()));
+        assert_eq!(cfg["~/proj"], vec![e("vim")]);
+    }
+
+    /// An explicit `"version": 1` passes the gate.
+    #[test]
+    fn explicit_version_1_loads() {
+        let (_, cfg) =
+            from_json(r#"{"version": 1, "name": "v", "dirs": {"~/proj": ["vim"]}}"#).unwrap();
+        assert_eq!(cfg["~/proj"], vec![e("vim")]);
+    }
+
+    /// A newer format refuses with an error naming both versions rather than
+    /// dropping unrecognized members and rewriting the file on the next save.
+    #[test]
+    fn newer_version_refuses_naming_both_versions() {
+        let err = from_json(r#"{"version": 2, "name": "v", "dirs": {}}"#).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "session format version 2 is newer than this fleetcom (supports 1); \
+             load it with a newer build"
+        );
+    }
+
+    /// Version zero is not "newer" — it takes the unreadable-version message,
+    /// never the false "0 is newer than this fleetcom" claim.
+    #[test]
+    fn version_zero_refuses_as_unreadable_not_newer() {
+        let err = from_json(r#"{"version": 0, "name": "v", "dirs": {}}"#).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "session format version 0 is not one this fleetcom reads \
+             (supports 1); load it with a newer build"
+        );
+    }
+
+    /// A non-numeric version is an encoding this build cannot interpret:
+    /// refuse over guess.
+    #[test]
+    fn non_numeric_version_refuses() {
+        let err = from_json(r#"{"version": "2.0", "name": "v", "dirs": {}}"#).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "session format version \"2.0\" is not one this fleetcom reads \
+             (supports 1); load it with a newer build"
+        );
+    }
+
+    /// A refused load is `Err` from `load_in`: no caller holds a config to
+    /// resave, so the gate also blocks the lossy rewrite.
+    #[test]
+    fn refused_load_yields_err_with_nothing_to_resave() {
+        let dir = temp("session_version_refuse");
+        fs::write(
+            dir.join("future.json"),
+            r#"{"version": 3, "name": "future", "dirs": {"~/p": ["vim"]}}"#,
+        )
+        .unwrap();
+
+        let err = load_in(&dir, "future").unwrap_err();
+        assert!(err.to_string().contains("version 3"), "{err}");
+        assert!(err.to_string().contains("supports 1"), "{err}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// In a flat file an accepted numeric `version` member is metadata, not a
+    /// directory: it must not materialize as an empty-entry directory.
+    #[test]
+    fn flat_version_member_does_not_become_a_directory() {
+        let (name, cfg) = from_json(r#"{"version": 1, "~/proj": ["vim"]}"#).unwrap();
+        assert_eq!(name, None);
+        assert!(!cfg.contains_key("version"));
+        assert_eq!(cfg["~/proj"], vec![e("vim")]);
     }
 
     /// Malformed members are omitted rather than decoded into partial entries.

@@ -18,10 +18,11 @@ The filename derives from the session name. `fleetcom` trims leading and trailin
 
 ## Format
 
-A session file is a JSON object with two fields. `name` holds the session name as typed, trimmed but not sanitized. `dirs` maps each working directory to an ordered list of entries. An entry with neither a group nor a name is a command string. An entry carrying either is an object with `cmd` plus the optional `group` and `name` fields:
+A session file is a JSON object with three fields. `version` is the format version, currently 1. `name` holds the session name as typed, trimmed but not sanitized. `dirs` maps each working directory to an ordered list of entries. An entry with neither a group nor a name is a command string. An entry carrying either is an object with `cmd` plus the optional `group` and `name` fields:
 
 ```json
 {
+  "version": 1,
   "name": "work/api",
   "dirs": {
     "~/work/api": [
@@ -40,7 +41,9 @@ A session file is a JSON object with two fields. `name` holds the session name a
 - Values are ordered lists. A string member is a bare shell command; the object form adds the optional group and display name assigned on load. Order is preserved, and each command runs in its own PTY under that directory.
 - Directories serialize alphabetically. Command order remains stable within each directory.
 
-There is no version field; the shape discriminates the schema. An object-valued `dirs` marks the wrapped form shown above. The loader also accepts a flat map whose top-level keys are directories and whose values are entry arrays. In that form, an array-valued key named `dirs` remains a directory entry. Flat-map files list by filename stem because they have no stored name. Saving one writes the wrapped form and permits overwriting it without a stored-name collision check.
+Files carry a format version. A missing `version` means 1: every file written before the key existed (releases 0.6.0–0.8.0) is structurally version 1, and that absence rule is permanent. A version newer than the running `fleetcom` supports refuses to load — the error names both versions — instead of dropping the members this build does not recognize and rewriting the file on the next save; a newer build loads it.
+
+The shape, not the version, discriminates the schema. An object-valued `dirs` marks the wrapped form shown above. The loader also accepts a flat map whose top-level keys are directories and whose values are entry arrays. In that form, an array-valued key named `dirs` remains a directory entry, but a top-level `version` member is always the format version, never a directory. Flat-map files list by filename stem because they have no stored name. Saving one writes the wrapped form and permits overwriting it without a stored-name collision check.
 
 Saves are atomic: `fleetcom` writes and syncs a private temporary file in the session directory, then renames it over the recipe. Recipes persist full command lines, which can embed secrets. New session directories use mode 0700, saves remove group and other permissions from existing session directories, and recipe files use mode 0600.
 
@@ -52,6 +55,7 @@ A bare agent command does not identify its conversation, so saving it verbatim w
 
 ```json
 {
+  "version": 1,
   "name": "agents",
   "dirs": {
     "~/work/api": [
