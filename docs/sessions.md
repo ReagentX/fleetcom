@@ -14,17 +14,18 @@ A session is a launch recipe, not a process snapshot. It records commands, worki
 
 The first save creates the directory. This matches the [configuration path resolution](README.md#config-directory-sessions) used by save, list, and load.
 
-The filename derives from the session name. `fleetcom` trims leading and trailing whitespace, replaces control characters and any of `* " / \ < > : | ? .` with `_`, and caps the result at 255 characters: `my/session` becomes `my_session.json`, and `a.b` becomes `a_b.json`. Replacing `.` prevents the session name from supplying another extension.
+The filename derives from the session name. `fleetcom` trims leading and trailing whitespace, replaces control characters and any of `* " / \ < > : | ? .` with `_`, and limits the sanitized stem to 250 UTF-8 bytes so the `.json` filename fits within 255 bytes. The cap falls on a character boundary. `my/session` becomes `my_session.json`, and `a.b` becomes `a_b.json`. Replacing `.` prevents the session name from supplying another extension.
 
 ## Format
 
-A session file is a JSON object with two fields. `name` holds the session name as typed, trimmed but not sanitized. `dirs` maps each working directory to an ordered list of entries. An entry with neither a group nor a name is a command string. An entry carrying either is an object with `cmd` plus the optional `group` and `name` fields:
+A session file is a JSON object with three fields. `version` is the format version, currently 1. `name` holds the session name as typed, trimmed but not sanitized. `dirs` maps each working directory to an ordered list of entries. An entry with neither a group nor a name is a command string. An entry carrying either is an object with `cmd` plus the optional `group` and `name` fields:
 
 ```json
 {
+  "version": 1,
   "name": "work/api",
   "dirs": {
-    "/home/you/work/api": [
+    "~/work/api": [
       "cargo watch -x test",
       { "cmd": "cargo run", "group": "api", "name": "api server" }
     ],
@@ -36,11 +37,13 @@ A session file is a JSON object with two fields. `name` holds the session name a
 ```
 
 - `name` exists because sanitization collapses distinct session names onto one filename: `a/b` and `a.b` both save to `a_b.json`. Saving compares the stored name against the incoming one and refuses a mismatch with an error naming both sessions. The load picker also displays it, so the list shows `a/b`, not `a_b`.
-- Keys under `dirs` are directory paths: each task's working directory.
+- Keys under `dirs` are directory paths: each task's working directory. Saves write directories under `$HOME` as `~/...`; other paths stay absolute. On load, `~` expands to `$HOME`, and a relative key resolves against the invocation directory of the client loading the session.
 - Values are ordered lists. A string member is a bare shell command; the object form adds the optional group and display name assigned on load. Order is preserved, and each command runs in its own PTY under that directory.
 - Directories serialize alphabetically. Command order remains stable within each directory.
 
-There is no version field; the shape discriminates the schema. An object-valued `dirs` marks the wrapped form shown above. The loader also accepts a flat map whose top-level keys are directories and whose values are entry arrays. In that form, an array-valued key named `dirs` remains a directory entry. Flat-map files list by filename stem because they have no stored name. Saving one writes the wrapped form and permits overwriting it without a stored-name collision check.
+The `version` field must be an integer from 1 through the newest format supported by the running `fleetcom`. A missing field means version 1. Invalid or unsupported versions fail to load, and the error reports the file's value and the supported version.
+
+The shape, not the version, discriminates the schema. An object-valued `dirs` marks the wrapped form shown above. The loader also accepts a flat map whose top-level keys are directories and whose values are entry arrays. In that form, an array-valued key named `dirs` remains a directory entry, but a top-level `version` member is always the format version, never a directory. Flat-map files list by filename stem because they have no stored name. Saving one writes the wrapped form and permits overwriting it without a stored-name collision check.
 
 Saves are atomic: `fleetcom` writes and syncs a private temporary file in the session directory, then renames it over the recipe. Recipes persist full command lines, which can embed secrets. New session directories use mode 0700, saves remove group and other permissions from existing session directories, and recipe files use mode 0600.
 
@@ -52,9 +55,10 @@ A bare agent command does not identify its conversation, so saving it verbatim w
 
 ```json
 {
+  "version": 1,
   "name": "agents",
   "dirs": {
-    "/home/you/work/api": [
+    "~/work/api": [
       "claude --resume 'c8c4a5cc-0b32-4ba0-a6b4-6ed08c218e0d'",
       { "cmd": "codex resume '019f5453-de22-7240-b2e5-0d32692aa6d9'", "name": "reviewer" }
     ]

@@ -33,7 +33,7 @@ use std::{
         mpsc::channel,
     },
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use nix::{
@@ -200,11 +200,37 @@ fn check_hello_ack(kind: u8, payload: &[u8]) -> io::Result<()> {
     }
 }
 
+/// Whether this invocation reused a daemon or autostarted one.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum DaemonOrigin {
+    /// The initial connection attempt succeeded.
+    AlreadyRunning,
+    /// The connection succeeded after autostarting the daemon.
+    Autostarted,
+}
+
+/// Return a notice when a running daemon cannot apply a startup-only
+/// `--scrollback` value.
+fn scrollback_notice(origin: DaemonOrigin, flag: Option<usize>) -> Option<String> {
+    match (origin, flag) {
+        (DaemonOrigin::AlreadyRunning, Some(lines)) => Some(format!(
+            "--scrollback {lines} ignored: the daemon was already running and \
+             keeps its scrollback until 'fleetcom --kill'"
+        )),
+        _ => None,
+    }
+}
+
+/// Return the scrollback notice for this process's parsed flag.
+pub fn ignored_scrollback_notice(origin: DaemonOrigin) -> Option<String> {
+    scrollback_notice(origin, supervisor::scrollback_flag())
+}
+
 /// Connect (autostarting if needed) and complete the hello handshake: send
 /// this process's protocol version and launch context, require the daemon's
-/// ack. Every launch this connection makes then runs under *this* client's
-/// env, and a version mismatch surfaces as one actionable error here instead
-/// of a silently wrong environment later.
+/// ack. Every launch this connection makes runs under *this* client's env.
+/// Returns the daemon origin so callers can report ignored startup-only
+/// options.
 ///
 /// The daemon serves one client at a time, so a slow handshake means "queued
 /// behind another client", not failure: announce it and wait without a
@@ -214,8 +240,8 @@ fn check_hello_ack(kind: u8, payload: &[u8]) -> io::Result<()> {
 /// timed-out partial `write_all` would corrupt the framing. Callers run this
 /// *before* touching terminal state (raw mode, alternate screen), so the
 /// notice prints normally and Ctrl-C aborts cleanly while waiting.
-pub fn connect_ready() -> io::Result<UnixStream> {
-    let mut stream = connect_or_autostart()?;
+pub fn connect_ready() -> io::Result<(UnixStream, DaemonOrigin)> {
+    let (mut stream, origin) = connect_or_autostart()?;
 
     let done = Arc::new(AtomicBool::new(false));
     {
@@ -237,7 +263,7 @@ pub fn connect_ready() -> io::Result<UnixStream> {
     done.store(true, Ordering::Relaxed);
     let (kind, payload) = reply.map_err(hello_read_error)?;
     check_hello_ack(kind, &payload)?;
-    Ok(stream)
+    Ok((stream, origin))
 }
 
 /// Convert handshake timeouts to a busy-daemon error; preserve other errors.
@@ -260,7 +286,8 @@ fn busy_daemon_error(e: io::Error) -> io::Error {
 /// connection) must not wedge the UI either. A timed-out write drops the
 /// connection, so a partial frame is never read.
 pub fn connect_ready_bounded() -> io::Result<UnixStream> {
-    let mut stream = connect_or_autostart()?;
+    // Scrollback notices apply only to the initial connection.
+    let (mut stream, _) = connect_or_autostart()?;
     stream.set_write_timeout(Some(HANDSHAKE_TIMEOUT))?;
     let (kind, payload) = encode_hello(&LaunchContext::here());
     write_frame(&mut stream, kind, &payload).map_err(busy_daemon_error)?;
@@ -273,18 +300,18 @@ pub fn connect_ready_bounded() -> io::Result<UnixStream> {
 }
 
 /// Connect to the daemon or start one, then wait up to one second for its socket.
-fn connect_or_autostart() -> io::Result<UnixStream> {
+fn connect_or_autostart() -> io::Result<(UnixStream, DaemonOrigin)> {
     connect_or_autostart_in(&runtime_dir())
 }
 
-/// Validate `dir` before the first daemon connection attempt.
-fn connect_or_autostart_in(dir: &Path) -> io::Result<UnixStream> {
+/// Validate `dir`, connect or autostart, and report which path succeeded.
+fn connect_or_autostart_in(dir: &Path) -> io::Result<(UnixStream, DaemonOrigin)> {
     // Validate before connecting because the hello sends the client's
     // environment and a successful connection skips daemon-side validation.
     ensure_runtime_dir(dir)?;
     let path = socket_in(dir);
     if let Ok(s) = UnixStream::connect(&path) {
-        return Ok(s);
+        return Ok((s, DaemonOrigin::AlreadyRunning));
     }
     // Never unlink the socket here: `ECONNREFUSED` on AF_UNIX can also mean a
     // live daemon's accept backlog is momentarily full.
@@ -293,7 +320,7 @@ fn connect_or_autostart_in(dir: &Path) -> io::Result<UnixStream> {
     spawn_daemon()?;
     for _ in 0..100 {
         if let Ok(s) = UnixStream::connect(&path) {
-            return Ok(s);
+            return Ok((s, DaemonOrigin::Autostarted));
         }
         thread::sleep(Duration::from_millis(10));
     }
@@ -364,7 +391,8 @@ pub fn run_kill() -> io::Result<()> {
     file.read_to_string(&mut pid_str)?;
     let Some(pid) = pid_str.trim().parse::<i32>().ok().filter(|p| *p > 0) else {
         // Without a usable pid, fall back to a Shutdown frame over the socket.
-        // This path waits until any attached client disconnects.
+        // Bound the fallback because an attached client can keep the daemon
+        // from accepting this connection.
         return kill_via_socket();
     };
 
@@ -391,25 +419,100 @@ pub fn run_kill() -> io::Result<()> {
     ))
 }
 
+/// Timeout applied to blocking socket-fallback kill operations.
+const KILL_SOCKET_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Timeout reported when the socket-fallback kill exchange does not finish.
+fn kill_handshake_timeout() -> io::Error {
+    io::Error::new(
+        ErrorKind::TimedOut,
+        "the daemon is running but did not complete the kill handshake in \
+         time (another client may be attached); retry after it detaches, or \
+         send SIGTERM to the daemon process directly",
+    )
+}
+
+/// Set the read timeout to the remaining deadline budget.
+fn arm_read_deadline(s: &UnixStream, deadline: Instant) -> io::Result<()> {
+    let left = deadline.saturating_duration_since(Instant::now());
+    if left.is_zero() {
+        return Err(kill_handshake_timeout());
+    }
+    s.set_read_timeout(Some(left))
+}
+
+/// Convert either platform representation of a socket timeout into the
+/// kill-handshake timeout.
+fn deadline_mapped(e: io::Error) -> io::Error {
+    if is_timeout(&e) {
+        kill_handshake_timeout()
+    } else {
+        e
+    }
+}
+
 /// Send `Shutdown` when the lock file has no usable pid. Complete the handshake
 /// first, then wait for the daemon to close the socket after stopping its tasks.
 fn kill_via_socket() -> io::Result<()> {
-    let path = socket_path();
-    match UnixStream::connect(&path) {
-        Ok(mut s) => {
-            let (kind, payload) = encode_hello(&LaunchContext::here());
-            write_frame(&mut s, kind, &payload)?;
-            let (kind, payload) = read_frame(&mut s)?;
-            check_hello_ack(kind, &payload)?;
-            let (kind, payload) = encode_command(&Command::Shutdown);
-            write_frame(&mut s, kind, &payload)?;
-            let mut buf = [0u8; 256];
-            while s.read(&mut buf).map(|n| n > 0).unwrap_or(false) {}
-            Ok(())
-        }
+    kill_via_socket_at(&socket_path(), KILL_SOCKET_TIMEOUT)
+}
+
+/// Run the socket-fallback kill exchange at `path` using `budget` for I/O.
+fn kill_via_socket_at(path: &Path, budget: Duration) -> io::Result<()> {
+    match UnixStream::connect(path) {
+        Ok(mut s) => kill_over_stream(&mut s, budget),
         Err(_) => {
             eprintln!("fleetcom: no daemon running");
             Ok(())
+        }
+    }
+}
+
+/// Drive the Shutdown exchange with bounded writes and a shared read deadline.
+fn kill_over_stream(s: &mut UnixStream, budget: Duration) -> io::Result<()> {
+    let (kind, payload) = encode_hello(&LaunchContext::here());
+    kill_exchange(s, budget, kind, &payload)
+}
+
+/// Drive the bounded Shutdown exchange with a pre-encoded hello frame.
+fn kill_exchange(
+    s: &mut UnixStream,
+    budget: Duration,
+    hello_kind: u8,
+    hello_payload: &[u8],
+) -> io::Result<()> {
+    let deadline = Instant::now() + budget;
+    s.set_write_timeout(Some(budget))?;
+
+    write_frame(s, hello_kind, hello_payload).map_err(deadline_mapped)?;
+    arm_read_deadline(s, deadline)?;
+    let (kind, payload) = read_frame(s).map_err(deadline_mapped)?;
+    check_hello_ack(kind, &payload)?;
+
+    let (kind, payload) = encode_command(&Command::Shutdown);
+    write_frame(s, kind, &payload).map_err(deadline_mapped)?;
+    // Socket closure signals completion. Re-arm each read with the remaining
+    // budget so the loop cannot outlive the deadline.
+    let mut buf = [0u8; 256];
+    loop {
+        arm_read_deadline(s, deadline)?;
+        match s.read(&mut buf) {
+            Ok(0) => return Ok(()),
+            Ok(_) => {}
+            Err(e) if is_timeout(&e) => return Err(kill_handshake_timeout()),
+            // Retry interrupted reads; the deadline still bounds the loop.
+            Err(e) if e.kind() == ErrorKind::Interrupted => {}
+            // The daemon closing mid-drain is completion, same as `Ok(0)`.
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    ErrorKind::ConnectionReset | ErrorKind::BrokenPipe | ErrorKind::UnexpectedEof
+                ) =>
+            {
+                return Ok(());
+            }
+            // Propagate other errors because they do not confirm daemon exit.
+            Err(e) => return Err(e),
         }
     }
 }
@@ -820,6 +923,86 @@ mod tests {
                 0o700 | bits
             );
         }
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    /// The notice requires both a flag and an already-running daemon.
+    #[test]
+    fn scrollback_notice_requires_flag_and_preexisting_daemon() {
+        assert_eq!(
+            scrollback_notice(DaemonOrigin::Autostarted, Some(50_000)),
+            None
+        );
+        assert_eq!(scrollback_notice(DaemonOrigin::Autostarted, None), None);
+        assert_eq!(scrollback_notice(DaemonOrigin::AlreadyRunning, None), None);
+        let notice = scrollback_notice(DaemonOrigin::AlreadyRunning, Some(50_000)).unwrap();
+        assert!(notice.contains("--scrollback 50000"), "{notice}");
+        assert!(notice.contains("--kill"), "{notice}");
+    }
+
+    /// A missing hello response times out the kill exchange.
+    #[test]
+    fn kill_via_socket_bounds_the_handshake_wait() {
+        let base = temp("kill_socket_mute");
+        fs::create_dir_all(&base).unwrap();
+        let sock = base.join("mute.sock");
+        // Leave the connection queued in the listener backlog.
+        let _listener = UnixListener::bind(&sock).unwrap();
+        let start = Instant::now();
+        let err = kill_via_socket_at(&sock, Duration::from_millis(200)).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::TimedOut);
+        assert!(err.to_string().contains("kill handshake"), "{err}");
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "the deadline must fire, not the test's timeout"
+        );
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    /// A blocked hello write reports the kill-handshake timeout.
+    #[test]
+    fn kill_exchange_maps_a_write_timeout() {
+        let base = temp("kill_socket_bigenv");
+        fs::create_dir_all(&base).unwrap();
+        let sock = base.join("mute.sock");
+        let _listener = UnixListener::bind(&sock).unwrap();
+        let mut s = UnixStream::connect(&sock).unwrap();
+        // The listener never accepts, so this payload fills the send buffer.
+        let oversized = vec![0u8; 8 * 1024 * 1024];
+        let err = kill_exchange(&mut s, Duration::from_millis(200), 0, &oversized).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::TimedOut);
+        assert!(err.to_string().contains("kill handshake"), "{err}");
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    /// A daemon that keeps the socket open after Shutdown times out the drain.
+    #[test]
+    fn kill_via_socket_bounds_the_drain_wait() {
+        let base = temp("kill_socket_drain");
+        fs::create_dir_all(&base).unwrap();
+        let sock = base.join("stuck.sock");
+        let listener = UnixListener::bind(&sock).unwrap();
+        let server = thread::spawn(move || {
+            let (mut s, _) = listener.accept().unwrap();
+            let _ = read_frame(&mut s); // hello
+            let (kind, payload) = encode_event(&Event::HelloOk);
+            let _ = write_frame(&mut s, kind, &payload);
+            let _ = read_frame(&mut s); // Shutdown, swallowed
+            // Hold the socket open until the client drops its end.
+            let _ = s.read(&mut [0u8; 16]);
+        });
+        let err = kill_via_socket_at(&sock, Duration::from_millis(300)).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::TimedOut);
+        server.join().unwrap();
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    /// A missing socket makes the fallback a no-op.
+    #[test]
+    fn kill_via_socket_without_a_socket_is_a_noop() {
+        let base = temp("kill_socket_absent");
+        fs::create_dir_all(&base).unwrap();
+        assert!(kill_via_socket_at(&base.join("absent.sock"), Duration::from_millis(100)).is_ok());
         let _ = fs::remove_dir_all(&base);
     }
 

@@ -4,6 +4,9 @@
 //! `task-<id>-<run>.json` path per task run. The nonce isolates concurrent
 //! processes and prevents PID reuse from selecting an existing namespace.
 //!
+//! Namespace lifecycle: `Drop` removes this process's namespace, while
+//! `install` reaps sibling namespaces whose owner no longer exists.
+//!
 //! Asset contracts:
 //! - `claude`: `--settings <claude-settings.json>` layers a `SessionStart` hook
 //!   (`cat > "$FLEETCOM_CAPTURE_FILE"`) over the user's settings. The hook
@@ -79,6 +82,49 @@ pub fn runtime_root(override_dir: Option<&Path>) -> Option<PathBuf> {
     dirs::cache_dir().map(|c| c.join("fleetcom").join("run"))
 }
 
+/// Best-effort removal of namespace directories whose owner no longer exists.
+fn reap_dead_namespaces(root: &Path) {
+    let Ok(entries) = fs::read_dir(root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        // `DirEntry::file_type` does not follow symlinks, so a symlink named
+        // like a namespace is not a directory here and stays untouched.
+        if !entry.file_type().is_ok_and(|t| t.is_dir()) {
+            continue;
+        }
+        let name = entry.file_name();
+        let Some(pid) = namespace_owner(name.to_str().unwrap_or("")) else {
+            continue;
+        };
+        if owner_is_dead(pid) {
+            let _ = fs::remove_dir_all(entry.path());
+        }
+    }
+}
+
+/// Parse `<positive decimal pid>-<12 lowercase hex characters>`.
+fn namespace_owner(name: &str) -> Option<i32> {
+    let (pid, nonce) = name.split_once('-')?;
+    if pid.is_empty() || !pid.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    if nonce.len() != 12
+        || !nonce
+            .bytes()
+            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+    {
+        return None;
+    }
+    pid.parse::<i32>().ok().filter(|p| *p > 0)
+}
+
+/// Return true only when signal 0 reports that `pid` does not exist.
+fn owner_is_dead(pid: i32) -> bool {
+    use nix::{errno::Errno, sys::signal::kill, unistd::Pid};
+    matches!(kill(Pid::from_raw(pid), None), Err(Errno::ESRCH))
+}
+
 /// Capture assets owned by one supervisor process.
 #[derive(Debug)]
 pub struct CaptureAssets {
@@ -91,8 +137,8 @@ pub struct CaptureAssets {
 impl CaptureAssets {
     /// Create `root` and a private `<root>/<pid>-<nonce>` namespace. The
     /// namespace uses mode `0700`; its Claude settings use `0600`, and its
-    /// executable Codex notifier uses `0700`. Existing root entries remain
-    /// unchanged.
+    /// executable Codex notifier uses `0700`. Dead-owner namespaces are reaped
+    /// before the new namespace is created; other root entries remain.
     pub fn install(root: &Path, pid: u32) -> io::Result<CaptureAssets> {
         fs::DirBuilder::new()
             .recursive(true)
@@ -100,6 +146,8 @@ impl CaptureAssets {
             .create(root)?;
         // Recursive creation retains a pre-existing directory's permissions.
         fs::set_permissions(root, fs::Permissions::from_mode(0o700))?;
+
+        reap_dead_namespaces(root);
 
         // The first 12 dash-free UUID characters contain 48 random bits; the
         // UUID version and variant occur later in the string.
@@ -244,11 +292,11 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
-    /// Installation leaves every pre-existing root entry unchanged.
+    /// Installation retains live-owner namespaces and non-namespace entries.
     #[test]
-    fn install_never_deletes_foreign_or_legacy_files() {
+    fn install_never_deletes_live_owner_namespaces_or_legacy_files() {
         let root = temp("assets_retain");
-        let foreign = root.join("99999-0123456789ab");
+        let foreign = root.join("1-0123456789ab");
         fs::create_dir_all(&foreign).unwrap();
         fs::write(foreign.join("task-1-0.json"), "{}").unwrap();
         fs::write(root.join("task-1-0.json"), "{}").unwrap();
@@ -258,7 +306,7 @@ mod tests {
         let assets = CaptureAssets::install(&root, std::process::id()).unwrap();
         assert!(
             foreign.join("task-1-0.json").exists(),
-            "another process's capture file must survive"
+            "a live process's capture file must survive"
         );
         assert!(
             root.join("task-1-0.json").exists(),
@@ -278,7 +326,7 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
-    /// A matching PID prefix does not cause an existing namespace to be reused.
+    /// A live matching PID retains its namespace and receives a distinct nonce.
     #[test]
     fn install_after_pid_reuse_leaves_the_predecessor_namespace_alone() {
         let root = temp("assets_reuse");
@@ -314,6 +362,66 @@ mod tests {
             CODEX_NOTIFY_SCRIPT
         );
         assert_eq!(mode(&ns), 0o700);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Spawn and reap a child, then return its inactive PID.
+    fn dead_pid() -> u32 {
+        let mut child = Command::new("sh").arg("-c").arg("exit 0").spawn().unwrap();
+        let pid = child.id();
+        child.wait().unwrap();
+        pid
+    }
+
+    /// Installation removes a dead owner's namespace and its contents.
+    #[test]
+    fn install_reaps_a_dead_owner_namespace() {
+        let root = temp("assets_reap");
+        let dead = root.join(format!("{}-0123456789ab", dead_pid()));
+        fs::create_dir_all(&dead).unwrap();
+        fs::write(dead.join("task-1-0.json"), "{}").unwrap();
+
+        let assets = CaptureAssets::install(&root, std::process::id()).unwrap();
+        assert!(!dead.exists(), "a dead owner's namespace must be reaped");
+        assert!(assets.claude_settings.exists());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A namespace-shaped file is not reaped.
+    #[test]
+    fn install_keeps_a_file_named_like_a_dead_namespace() {
+        let root = temp("assets_reap_file");
+        fs::create_dir_all(&root).unwrap();
+        let decoy = root.join(format!("{}-0123456789ab", dead_pid()));
+        fs::write(&decoy, "not a namespace").unwrap();
+
+        let _assets = CaptureAssets::install(&root, std::process::id()).unwrap();
+        assert!(decoy.exists(), "a file is never a reap candidate");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Malformed namespace names are not reaped.
+    #[test]
+    fn install_keeps_directories_with_malformed_namespace_names() {
+        let root = temp("assets_reap_malformed");
+        let names = [
+            "abc-0123456789ab",         // non-numeric pid
+            "-1-0123456789ab",          // negative pid: empty first field
+            "+42-0123456789ab",         // sign prefix is not a decimal digit
+            "99999999999-0123456789ab", // past i32::MAX
+            "42-0123456789AB",          // uppercase nonce
+            "42-0123456789a",           // 11-char nonce
+            "42-0123456789abc",         // 13-char nonce
+            "42",                       // no dash at all
+        ];
+        for name in names {
+            fs::create_dir_all(root.join(name)).unwrap();
+        }
+
+        let _assets = CaptureAssets::install(&root, std::process::id()).unwrap();
+        for name in names {
+            assert!(root.join(name).exists(), "{name:?} must be kept");
+        }
         let _ = fs::remove_dir_all(&root);
     }
 
@@ -478,7 +586,7 @@ mod tests {
     #[test]
     fn drop_removes_only_the_incarnation_namespace() {
         let root = temp("assets_drop");
-        let sibling = root.join("99999-0123456789ab");
+        let sibling = root.join("1-0123456789ab");
         fs::create_dir_all(&sibling).unwrap();
         fs::write(sibling.join("task-1-0.json"), "{}").unwrap();
 

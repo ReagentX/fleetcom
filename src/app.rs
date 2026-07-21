@@ -257,7 +257,7 @@ impl App {
     /// *this* client's env. The core lives in `fleetcom --daemon`, reached over
     /// the socket.
     pub fn connect(rows: u16, cols: u16) -> io::Result<App> {
-        let stream = crate::daemon::connect_ready()?;
+        let (stream, origin) = crate::daemon::connect_ready()?;
         // Split the stream here (the fallible part) so the transport factory in
         // `assemble` (which owns the wake sender) stays infallible.
         let read = stream.try_clone()?;
@@ -265,6 +265,9 @@ impl App {
             Box::new(SocketTransport::from_halves(stream, read, wait_tx))
         });
         app.daemon_backed = true;
+        // Report when a running daemon could not apply this invocation's
+        // startup-only scrollback setting.
+        app.status = crate::daemon::ignored_scrollback_notice(origin);
         Ok(app)
     }
 

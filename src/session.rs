@@ -28,19 +28,37 @@ pub const FLEETCOM_CONFIG_DIR: &str = "FLEETCOM_CONFIG_DIR";
 /// Characters replaced with `_` in session filenames.
 const DISALLOWED: &[char] = &['*', '"', '/', '\\', '<', '>', ':', '|', '?', '.'];
 
-/// Make `name` safe as a bare filename.
+/// Sanitized-stem cap that reserves 5 bytes for `.json` in a 255-byte
+/// filename component.
+const MAX_STEM_BYTES: usize = 250;
+
+/// Sanitize `name` and limit its UTF-8 encoding without splitting a character.
 fn sanitize(name: &str) -> String {
-    name.trim()
-        .chars()
-        .map(|c| {
-            if c.is_control() || DISALLOWED.contains(&c) {
-                '_'
-            } else {
-                c
-            }
-        })
-        .take(255)
-        .collect()
+    let mut out = String::new();
+    for c in name.trim().chars() {
+        let c = if c.is_control() || DISALLOWED.contains(&c) {
+            '_'
+        } else {
+            c
+        };
+        if out.len() + c.len_utf8() > MAX_STEM_BYTES {
+            break;
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// Longest prefix of `s` at most `max` bytes long, on a char boundary.
+fn prefix_bytes(s: &str, max: usize) -> &str {
+    if s.len() <= max {
+        return s;
+    }
+    let mut end = max;
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
 }
 
 /// Session-recipe directory: `<config root>/sessions`. A caller-supplied
@@ -53,8 +71,12 @@ pub fn sessions_dir(root: Option<PathBuf>) -> Option<PathBuf> {
         .map(|base| base.join("sessions"))
 }
 
-/// Serialize `{"name": <original>, "dirs": {...}}`. The stored name lets
-/// `save_in` distinguish names that sanitize to the same filename.
+/// Session format version written by `to_json` and accepted by `from_json`.
+/// Missing versions are interpreted as version 1; unsupported versions fail.
+const FORMAT_VERSION: u64 = 1;
+
+/// Serialize the versioned wrapped schema. The stored name distinguishes
+/// names that sanitize to the same filename.
 fn to_json(name: &str, cfg: &SessionConfig) -> String {
     let mut dirs = jzon::JsonValue::new_object();
     for (dir, entries) in cfg {
@@ -79,6 +101,7 @@ fn to_json(name: &str, cfg: &SessionConfig) -> String {
         let _ = dirs.insert(dir, arr);
     }
     let mut obj = jzon::JsonValue::new_object();
+    let _ = obj.insert("version", FORMAT_VERSION);
     let _ = obj.insert("name", name);
     let _ = obj.insert("dirs", dirs);
     obj.pretty(2)
@@ -87,15 +110,43 @@ fn to_json(name: &str, cfg: &SessionConfig) -> String {
 /// Parse wrapped and flat schemas, returning the stored name when present.
 /// A wrapped file has an object-valued `dirs`; flat files have entry arrays at
 /// the top level, including when a directory is literally named `dirs`.
+/// A top-level `version` must be an integer from 1 through [`FORMAT_VERSION`];
+/// a missing version is interpreted as 1.
 fn from_json(text: &str) -> io::Result<(Option<String>, SessionConfig)> {
     let parsed = jzon::parse(text).map_err(|e| io::Error::other(e.to_string()))?;
-    let (name, dirs) = if parsed["dirs"].is_object() {
-        (parsed["name"].as_str().map(str::to_string), &parsed["dirs"])
+    // Validate version metadata before detecting the schema shape.
+    let version = &parsed["version"];
+    if !version.is_null() {
+        match version.as_u64() {
+            Some(n) if (1..=FORMAT_VERSION).contains(&n) => {}
+            Some(n) if n > FORMAT_VERSION => {
+                return Err(io::Error::other(format!(
+                    "session format version {n} is newer than this fleetcom \
+                     (supports {FORMAT_VERSION}); load it with a newer build"
+                )));
+            }
+            // Reject zero, fractional, negative, and non-numeric values.
+            _ => {
+                return Err(io::Error::other(format!(
+                    "session format version {} is not one this fleetcom reads \
+                     (supports {FORMAT_VERSION}); load it with a newer build",
+                    version.dump()
+                )));
+            }
+        }
+    }
+    let (name, dirs, flat) = if parsed["dirs"].is_object() {
+        let name = parsed["name"].as_str().map(str::to_string);
+        (name, &parsed["dirs"], false)
     } else {
-        (None, &parsed)
+        (None, &parsed, true)
     };
     let mut cfg = SessionConfig::new();
     for (dir, val) in dirs.entries() {
+        // In a flat file, `version` is metadata beside the directory keys.
+        if flat && dir == "version" {
+            continue;
+        }
         // Ignore members that match neither supported entry form.
         let entries = val
             .members()
@@ -172,7 +223,11 @@ pub fn save_in(dir: &Path, name: &str, cfg: &SessionConfig) -> io::Result<PathBu
     let pid = std::process::id();
     let (mut tmp_file, tmp) = loop {
         let n = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
-        let candidate = dir.join(format!(".{file_name}.{pid}.{n}.tmp"));
+        // Shorten the recipe portion so the decorated temporary filename stays
+        // within the 255-byte component limit.
+        let suffix = format!(".{pid}.{n}.tmp");
+        let stem = prefix_bytes(&file_name, 254 - suffix.len());
+        let candidate = dir.join(format!(".{stem}{suffix}"));
         match fs::OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -337,8 +392,99 @@ mod tests {
         cfg.insert("~/proj".into(), vec![e("cargo test"), e("vim")]);
         cfg.insert("/tmp".into(), vec![e("top")]);
 
-        let expected = "{\n  \"name\": \"work\",\n  \"dirs\": {\n    \"/tmp\": [\n      \"top\"\n    ],\n    \"~/proj\": [\n      \"cargo test\",\n      \"vim\"\n    ]\n  }\n}";
+        let expected = "{\n  \"version\": 1,\n  \"name\": \"work\",\n  \"dirs\": {\n    \"/tmp\": [\n      \"top\"\n    ],\n    \"~/proj\": [\n      \"cargo test\",\n      \"vim\"\n    ]\n  }\n}";
         assert_eq!(to_json("work", &cfg), expected);
+    }
+
+    /// Saved files include the accepted format version.
+    #[test]
+    fn save_writes_version_1_and_load_accepts_it() {
+        let dir = temp("session_version_roundtrip");
+        let mut cfg = SessionConfig::new();
+        cfg.insert("~/p".into(), vec![e("vim")]);
+
+        let file = save_in(&dir, "versioned", &cfg).unwrap();
+        assert!(
+            fs::read_to_string(&file)
+                .unwrap()
+                .contains("\"version\": 1")
+        );
+        assert_eq!(load_in(&dir, "versioned").unwrap(), cfg);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A missing version is interpreted as version 1.
+    #[test]
+    fn missing_version_means_version_1() {
+        let (name, cfg) = from_json(r#"{"name": "old", "dirs": {"~/proj": ["vim"]}}"#).unwrap();
+        assert_eq!(name, Some("old".to_string()));
+        assert_eq!(cfg["~/proj"], vec![e("vim")]);
+    }
+
+    /// An explicit `"version": 1` passes the gate.
+    #[test]
+    fn explicit_version_1_loads() {
+        let (_, cfg) =
+            from_json(r#"{"version": 1, "name": "v", "dirs": {"~/proj": ["vim"]}}"#).unwrap();
+        assert_eq!(cfg["~/proj"], vec![e("vim")]);
+    }
+
+    /// A newer format fails with an error naming both versions.
+    #[test]
+    fn newer_version_refuses_naming_both_versions() {
+        let err = from_json(r#"{"version": 2, "name": "v", "dirs": {}}"#).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "session format version 2 is newer than this fleetcom (supports 1); \
+             load it with a newer build"
+        );
+    }
+
+    /// Version zero uses the unsupported-version error.
+    #[test]
+    fn version_zero_refuses_as_unreadable_not_newer() {
+        let err = from_json(r#"{"version": 0, "name": "v", "dirs": {}}"#).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "session format version 0 is not one this fleetcom reads \
+             (supports 1); load it with a newer build"
+        );
+    }
+
+    /// A non-numeric version uses the unsupported-version error.
+    #[test]
+    fn non_numeric_version_refuses() {
+        let err = from_json(r#"{"version": "2.0", "name": "v", "dirs": {}}"#).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "session format version \"2.0\" is not one this fleetcom reads \
+             (supports 1); load it with a newer build"
+        );
+    }
+
+    /// `load_in` propagates unsupported-version errors.
+    #[test]
+    fn refused_load_yields_err_with_nothing_to_resave() {
+        let dir = temp("session_version_refuse");
+        fs::write(
+            dir.join("future.json"),
+            r#"{"version": 3, "name": "future", "dirs": {"~/p": ["vim"]}}"#,
+        )
+        .unwrap();
+
+        let err = load_in(&dir, "future").unwrap_err();
+        assert!(err.to_string().contains("version 3"), "{err}");
+        assert!(err.to_string().contains("supports 1"), "{err}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A flat schema treats `version` as metadata, not a directory.
+    #[test]
+    fn flat_version_member_does_not_become_a_directory() {
+        let (name, cfg) = from_json(r#"{"version": 1, "~/proj": ["vim"]}"#).unwrap();
+        assert_eq!(name, None);
+        assert!(!cfg.contains_key("version"));
+        assert_eq!(cfg["~/proj"], vec![e("vim")]);
     }
 
     /// Malformed members are omitted rather than decoded into partial entries.
@@ -377,6 +523,37 @@ mod tests {
     fn sanitizes_names() {
         assert_eq!(sanitize("my/session"), "my_session");
         assert_eq!(sanitize("  a.b  "), "a_b");
+    }
+
+    /// The stem cap keeps 250 ASCII bytes and drops the remainder.
+    #[test]
+    fn caps_names_at_250_bytes() {
+        assert_eq!(sanitize(&"a".repeat(250)), "a".repeat(250));
+        let capped = sanitize(&"a".repeat(251));
+        assert_eq!(capped, "a".repeat(250));
+        assert_eq!(format!("{capped}.json").len(), 255);
+    }
+
+    /// The stem cap never splits a multibyte character.
+    #[test]
+    fn cap_drops_a_multibyte_char_whole() {
+        // 249 bytes used; the 2-byte 'é' would reach 251.
+        let capped = sanitize(&format!("{}é", "a".repeat(249)));
+        assert_eq!(capped, "a".repeat(249));
+    }
+
+    /// Long names save and load within the filename component limit.
+    #[test]
+    fn long_names_save_within_name_max() {
+        let dir = temp("session_long_name");
+        let mut cfg = SessionConfig::new();
+        cfg.insert("~/p".into(), vec![e("vim")]);
+        let name = "n".repeat(255);
+
+        let file = save_in(&dir, &name, &cfg).unwrap();
+        assert_eq!(file.file_name().unwrap().len(), 255);
+        assert_eq!(load_in(&dir, &name).unwrap(), cfg);
+        let _ = fs::remove_dir_all(&dir);
     }
 
     /// Recipe files are owner-only, including after replacing a 0644 file.
