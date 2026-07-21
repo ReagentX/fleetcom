@@ -27,8 +27,8 @@ use crate::{
     editbuf::EditBuffer,
     path,
     protocol::{
-        Command, Event, Key, Lifecycle, Mods, MouseBtn, MouseKind, ScreenView, ScrollAction,
-        TaskView,
+        Command, Event, Key, Lifecycle, Mods, MouseBtn, MouseKind, RecoveryEntry, ScreenView,
+        ScrollAction, TaskView,
     },
     transport::{ExitIntent, SocketTransport, ThreadTransport, Transport},
     ui,
@@ -92,6 +92,15 @@ impl GroupMode {
             GroupMode::Custom => GroupMode::State,
         }
     }
+}
+
+/// Which page the `o` session picker shows. The recovery page is a second
+/// page of the same surface, not a new surface: it exists only while the core
+/// reports recovery snapshots, and every other picker behavior carries over.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum SessionPage {
+    Saved,
+    Recovery,
 }
 
 /// What Enter does with a picker row.
@@ -179,6 +188,12 @@ pub struct App {
     // Load-session picker state.
     pub session_names: Vec<String>,
     pub session_sel: usize,
+    /// Recovery snapshots from the latest `Sessions` reply, newest first.
+    pub session_recovery: Vec<RecoveryEntry>,
+    /// Which list the open picker shows; `o` resets it to `Saved`.
+    pub session_page: SessionPage,
+    /// Selection in the recovery list, clamped independently of `session_sel`.
+    pub recovery_sel: usize,
     /// Transient one-line notice (save/load result), dismissed on the next key.
     pub status: Option<String>,
     /// Parsed terminal events from the stdin reader thread. crossterm owns the
@@ -354,6 +369,9 @@ impl App {
             rename_target: None,
             session_names: Vec::new(),
             session_sel: 0,
+            session_recovery: Vec::new(),
+            session_page: SessionPage::Saved,
+            recovery_sel: 0,
             status: None,
             input_rx,
             input_tx: Some(input_tx),
@@ -601,13 +619,18 @@ impl App {
                     self.focused_screen = Some(s);
                 }
                 Event::Status(s) => self.status = Some(s),
-                // Recovery entries are ignored here until the picker learns
-                // to show them (the client work behind this event's v9 shape).
-                Event::Sessions { names, .. } => {
+                Event::Sessions { names, recovery } => {
                     // A shorter list can land while the picker is open; clamp
-                    // the selection before it can index past the end.
+                    // both selections before either can index past its end.
                     self.session_sel = self.session_sel.min(names.len().saturating_sub(1));
+                    self.recovery_sel = self.recovery_sel.min(recovery.len().saturating_sub(1));
+                    // An empty recovery list makes its page unreachable; a
+                    // refresh that empties it mid-view must also leave it.
+                    if recovery.is_empty() {
+                        self.session_page = SessionPage::Saved;
+                    }
                     self.session_names = names;
+                    self.session_recovery = recovery;
                 }
             }
         }
@@ -979,6 +1002,9 @@ impl App {
                 self.transport.send(Command::ListSessions);
                 self.session_names.clear();
                 self.session_sel = 0;
+                self.session_recovery.clear();
+                self.session_page = SessionPage::Saved;
+                self.recovery_sel = 0;
                 self.mode = Mode::LoadSession;
             }
             // Restart only finished tasks.
@@ -1026,19 +1052,52 @@ impl App {
     }
 
     fn on_key_loadsession(&mut self, k: KeyEvent) {
-        match k.code {
-            KeyCode::Esc => self.mode = Mode::Dashboard,
-            KeyCode::Up => self.session_sel = self.session_sel.saturating_sub(1),
-            KeyCode::Down => {
-                self.session_sel = step_down(self.session_sel, self.session_names.len())
+        // Tab flips between the saved and recovery pages. With no recovery
+        // entries the second page does not exist, so Tab does nothing — the
+        // hint hides it too (an unreachable page must be invisible).
+        if matches!(k.code, KeyCode::Tab | KeyCode::BackTab) {
+            if !self.session_recovery.is_empty() {
+                self.session_page = match self.session_page {
+                    SessionPage::Saved => SessionPage::Recovery,
+                    SessionPage::Recovery => SessionPage::Saved,
+                };
             }
-            KeyCode::Enter => {
-                if let Some(name) = self.session_names.get(self.session_sel).cloned() {
-                    self.load_session(&name);
+            return;
+        }
+        // The pages differ only in which list the keys address and what Enter
+        // sends; each keeps its own selection.
+        match self.session_page {
+            SessionPage::Saved => match k.code {
+                KeyCode::Esc => self.mode = Mode::Dashboard,
+                KeyCode::Up => self.session_sel = self.session_sel.saturating_sub(1),
+                KeyCode::Down => {
+                    self.session_sel = step_down(self.session_sel, self.session_names.len())
                 }
-                self.mode = Mode::Dashboard;
-            }
-            _ => {}
+                KeyCode::Enter => {
+                    if let Some(name) = self.session_names.get(self.session_sel).cloned() {
+                        self.load_session(&name);
+                    }
+                    self.mode = Mode::Dashboard;
+                }
+                _ => {}
+            },
+            SessionPage::Recovery => match k.code {
+                KeyCode::Esc => self.mode = Mode::Dashboard,
+                KeyCode::Up => self.recovery_sel = self.recovery_sel.saturating_sub(1),
+                KeyCode::Down => {
+                    self.recovery_sel = step_down(self.recovery_sel, self.session_recovery.len())
+                }
+                KeyCode::Enter => {
+                    // The stem is the load key; the daemon reports the outcome
+                    // as a `Status` event ("loaded recovery snapshot; …").
+                    if let Some(e) = self.session_recovery.get(self.recovery_sel) {
+                        let stem = e.stem.clone();
+                        self.transport.send(Command::LoadRecovery { stem });
+                    }
+                    self.mode = Mode::Dashboard;
+                }
+                _ => {}
+            },
         }
     }
 

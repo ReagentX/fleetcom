@@ -28,7 +28,7 @@ Running several long-lived commands is pesky once they span terminal panes or ne
 
 - Runs each command in its own PTY and groups tasks by state, working directory, or named group.
 - Delegates tasks to a daemon, so a disconnecting client stops nothing.
-- Saves and reloads task recipes: directories, commands, group assignments, and display names.
+- Saves and reloads task recipes: directories, commands, group assignments, and display names — and snapshots the running fleet automatically, so a lost fleet is recoverable.
 - Reruns a completed task in place, keeping its identity, group, and name.
 - Preserves `claude`, `codex`, and `grok` conversations, so saved or rerun tasks resume instead of starting fresh.
 

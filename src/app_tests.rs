@@ -530,6 +530,245 @@ fn session_selection_clamps_when_a_shorter_list_arrives() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Write one recovery snapshot under `<dir>/sessions/recovery/` in the real
+/// on-disk format, so the core's lister and loader both accept it. The `"."`
+/// directory key resolves against the launch cwd (`dir`), which exists.
+fn write_recovery(dir: &Path, stem: &str, label: &str, cmds: &[&str]) {
+    let rec = dir.join("sessions").join("recovery");
+    std::fs::create_dir_all(&rec).unwrap();
+    let list: Vec<String> = cmds.iter().map(|c| format!("{c:?}")).collect();
+    std::fs::write(
+        rec.join(format!("{stem}.json")),
+        format!(
+            r#"{{"version":1,"name":"{label}","dirs":{{".":[{}]}}}}"#,
+            list.join(",")
+        ),
+    )
+    .unwrap();
+}
+
+/// The `Sessions` reply fills both picker lists (recovery newest first) and
+/// clamps each selection against its own list, not the other's.
+#[test]
+fn sessions_reply_populates_and_clamps_both_lists() {
+    let dir = session_scratch("rec_lists", &["a"]);
+    write_recovery(
+        &dir,
+        "20260101-000000-1",
+        "autosaved 2026-01-01 00:00",
+        &["sleep 5"],
+    );
+    write_recovery(
+        &dir,
+        "20260102-000000-1",
+        "autosaved 2026-01-02 00:00",
+        &["sleep 5"],
+    );
+    let mut app = app_with_config_dir(&dir);
+
+    app.on_key_dashboard(key(KeyCode::Char('o')));
+    app.pump();
+    assert_eq!(app.session_names, vec!["a".to_string()]);
+    assert_eq!(
+        app.session_recovery
+            .iter()
+            .map(|e| e.stem.as_str())
+            .collect::<Vec<_>>(),
+        vec!["20260102-000000-1", "20260101-000000-1"],
+        "recovery entries list newest first"
+    );
+
+    // One snapshot vanishes; the refresh clamps only the recovery selection.
+    app.recovery_sel = 1;
+    std::fs::remove_file(
+        dir.join("sessions")
+            .join("recovery")
+            .join("20260101-000000-1.json"),
+    )
+    .unwrap();
+    app.transport.send(Command::ListSessions);
+    app.pump();
+    assert_eq!(app.session_recovery.len(), 1);
+    assert_eq!(app.recovery_sel, 0, "recovery selection must clamp");
+    assert_eq!(app.session_sel, 0);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `o` always reopens on the saved page with the recovery list cleared, so a
+/// stale page or selection from the last visit cannot leak through.
+#[test]
+fn o_key_resets_the_picker_to_the_saved_page() {
+    let dir = session_scratch("rec_reset", &["a"]);
+    write_recovery(
+        &dir,
+        "20260101-000000-1",
+        "autosaved 2026-01-01 00:00",
+        &["sleep 5"],
+    );
+    let mut app = app_with_config_dir(&dir);
+
+    app.on_key_dashboard(key(KeyCode::Char('o')));
+    app.pump();
+    app.on_key_loadsession(key(KeyCode::Tab));
+    assert_eq!(app.session_page, SessionPage::Recovery);
+    app.on_key_loadsession(key(KeyCode::Esc));
+
+    app.on_key_dashboard(key(KeyCode::Char('o')));
+    assert_eq!(app.session_page, SessionPage::Saved);
+    assert_eq!(app.recovery_sel, 0);
+    assert!(
+        app.session_recovery.is_empty(),
+        "the picker opens empty until the reply lands"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// With no recovery entries the second page does not exist: Tab and BackTab
+/// leave the picker on the saved page.
+#[test]
+fn tab_is_a_no_op_without_recovery_entries() {
+    let dir = session_scratch("rec_notab", &["a"]);
+    let mut app = app_with_config_dir(&dir);
+    app.on_key_dashboard(key(KeyCode::Char('o')));
+    app.pump();
+    assert!(app.session_recovery.is_empty());
+
+    app.on_key_loadsession(key(KeyCode::Tab));
+    assert_eq!(app.session_page, SessionPage::Saved);
+    app.on_key_loadsession(key(KeyCode::BackTab));
+    assert_eq!(app.session_page, SessionPage::Saved);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Tab and BackTab flip pages when recovery entries exist, and each page
+/// keeps its own selection across the flip.
+#[test]
+fn tab_toggles_pages_and_selections_stay_independent() {
+    let dir = session_scratch("rec_tab", &["a", "b"]);
+    write_recovery(
+        &dir,
+        "20260101-000000-1",
+        "autosaved 2026-01-01 00:00",
+        &["sleep 5"],
+    );
+    write_recovery(
+        &dir,
+        "20260102-000000-1",
+        "autosaved 2026-01-02 00:00",
+        &["sleep 5"],
+    );
+    let mut app = app_with_config_dir(&dir);
+    app.on_key_dashboard(key(KeyCode::Char('o')));
+    app.pump();
+
+    app.on_key_loadsession(key(KeyCode::Down)); // saved list -> "b"
+    app.on_key_loadsession(key(KeyCode::Tab));
+    assert_eq!(app.session_page, SessionPage::Recovery);
+    app.on_key_loadsession(key(KeyCode::Down)); // recovery list -> older entry
+    assert_eq!(app.recovery_sel, 1);
+
+    app.on_key_loadsession(key(KeyCode::Tab));
+    assert_eq!(app.session_page, SessionPage::Saved);
+    assert_eq!(app.session_sel, 1, "the saved selection survives the flip");
+    app.on_key_loadsession(key(KeyCode::BackTab));
+    assert_eq!(app.session_page, SessionPage::Recovery);
+    assert_eq!(app.recovery_sel, 1, "the recovery selection survives too");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A refresh that empties the recovery list while its page is showing must
+/// also leave the page: the picker cannot linger on an unreachable page.
+#[test]
+fn emptied_recovery_list_returns_to_the_saved_page() {
+    let dir = session_scratch("rec_empty", &["a"]);
+    write_recovery(
+        &dir,
+        "20260101-000000-1",
+        "autosaved 2026-01-01 00:00",
+        &["sleep 5"],
+    );
+    let mut app = app_with_config_dir(&dir);
+    app.on_key_dashboard(key(KeyCode::Char('o')));
+    app.pump();
+    app.on_key_loadsession(key(KeyCode::Tab));
+    assert_eq!(app.session_page, SessionPage::Recovery);
+
+    std::fs::remove_file(
+        dir.join("sessions")
+            .join("recovery")
+            .join("20260101-000000-1.json"),
+    )
+    .unwrap();
+    app.transport.send(Command::ListSessions);
+    app.pump();
+    assert!(app.session_recovery.is_empty());
+    assert_eq!(app.session_page, SessionPage::Saved);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Enter on the recovery page loads the *selected* snapshot: the highlighted
+/// entry's stem goes out as `LoadRecovery`, the daemon materializes that
+/// file's commands, and its fixed notice comes back as the status line.
+#[test]
+fn enter_on_the_recovery_page_loads_the_selected_stem() {
+    let dir = session_scratch("rec_load", &[]);
+    write_recovery(
+        &dir,
+        "20260101-000000-1",
+        "autosaved 2026-01-01 00:00",
+        &["sleep 7"],
+    );
+    write_recovery(
+        &dir,
+        "20260102-000000-1",
+        "autosaved 2026-01-02 00:00",
+        &["sleep 9"],
+    );
+    let mut app = app_with_config_dir(&dir);
+    app.on_key_dashboard(key(KeyCode::Char('o')));
+    app.pump();
+    app.on_key_loadsession(key(KeyCode::Tab));
+
+    // Row 1 is the older snapshot; loading it proves the stem was the
+    // selected one, not the newest.
+    app.on_key_loadsession(key(KeyCode::Down));
+    app.on_key_loadsession(key(KeyCode::Enter));
+    assert!(
+        matches!(app.mode, Mode::Dashboard),
+        "Enter closes the picker"
+    );
+    app.pump();
+    assert_eq!(
+        app.status.as_deref(),
+        Some("loaded recovery snapshot; save to name it"),
+        "the daemon's notice must arrive unedited"
+    );
+    assert_eq!(app.views.len(), 1);
+    assert_eq!(app.views[0].command, "sleep 7");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Esc closes the picker from the recovery page, exactly as from the saved
+/// page.
+#[test]
+fn esc_closes_the_picker_from_the_recovery_page() {
+    let dir = session_scratch("rec_esc", &[]);
+    write_recovery(
+        &dir,
+        "20260101-000000-1",
+        "autosaved 2026-01-01 00:00",
+        &["sleep 5"],
+    );
+    let mut app = app_with_config_dir(&dir);
+    app.on_key_dashboard(key(KeyCode::Char('o')));
+    app.pump();
+    app.on_key_loadsession(key(KeyCode::Tab));
+    assert_eq!(app.session_page, SessionPage::Recovery);
+    app.on_key_loadsession(key(KeyCode::Esc));
+    assert!(matches!(app.mode, Mode::Dashboard));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// The `@` recent list is the distinct task cwds, newest first.
 #[test]
 fn recent_dirs_are_distinct_and_newest_first() {

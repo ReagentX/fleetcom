@@ -13,10 +13,10 @@ use crossterm::{
 use unicode_width::UnicodeWidthStr;
 
 use crate::{
-    app::{App, DirKind, GroupMode, Mode, Row},
+    app::{App, DirKind, GroupMode, Mode, Row, SessionPage},
     editbuf::EditBuffer,
     format::{pad, rel_time, truncate},
-    protocol::{Lifecycle, Preview, PreviewSource, TaskView},
+    protocol::{Lifecycle, Preview, PreviewSource, RecoveryEntry, TaskView},
 };
 
 pub fn render(out: &mut Stdout, app: &mut App) -> io::Result<()> {
@@ -597,21 +597,69 @@ fn render_pickgroup(out: &mut impl Write, app: &App) -> io::Result<()> {
     )
 }
 
-/// The `o` load-session picker: a bottom panel listing saved session names.
-fn render_session_picker(out: &mut impl Write, app: &App) -> io::Result<()> {
-    render_panel(
-        out,
-        app,
-        &Panel {
-            header: "  load session".to_string(),
-            labels: &app.session_names,
-            sel: app.session_sel,
-            max_rows: 10,
-            hint: "↑↓ pick · enter load · esc".to_string(),
-            empty: Some("    (no saved sessions)"),
-            cursor: None,
-        },
+/// One recovery-picker row: age, task count, stored label. The label is a
+/// stored-name string from disk, so it rides at the end where the panel's
+/// column-exact clipping (`pad`, not fmt width) bounds it.
+fn recovery_row(e: &RecoveryEntry) -> String {
+    let unit = if e.tasks == 1 { "task" } else { "tasks" };
+    format!(
+        "{} ago · {} {unit} · {}",
+        rel_time(Duration::from_secs(e.age_secs)),
+        e.tasks,
+        e.label
     )
+}
+
+/// Saved-page hint: names the recovery page only while entries exist, so an
+/// unreachable Tab target is never advertised.
+fn saved_page_hint(recovery: usize) -> String {
+    if recovery > 0 {
+        format!("↑↓ pick · enter load · tab recovery ({recovery}) · esc")
+    } else {
+        "↑↓ pick · enter load · esc".to_string()
+    }
+}
+
+/// The `o` load-session picker: a bottom panel with two pages. The saved page
+/// lists recipe names; Tab flips to the recovery page while the core reports
+/// snapshots, and each hint names the other page only when it is reachable.
+fn render_session_picker(out: &mut impl Write, app: &App) -> io::Result<()> {
+    match app.session_page {
+        SessionPage::Saved => {
+            let hint = saved_page_hint(app.session_recovery.len());
+            render_panel(
+                out,
+                app,
+                &Panel {
+                    header: "  load session".to_string(),
+                    labels: &app.session_names,
+                    sel: app.session_sel,
+                    max_rows: 10,
+                    hint,
+                    empty: Some("    (no saved sessions)"),
+                    cursor: None,
+                },
+            )
+        }
+        SessionPage::Recovery => {
+            let labels: Vec<String> = app.session_recovery.iter().map(recovery_row).collect();
+            render_panel(
+                out,
+                app,
+                &Panel {
+                    header: "  recovery".to_string(),
+                    labels: &labels,
+                    sel: app.recovery_sel,
+                    max_rows: 10,
+                    hint: "↑↓ pick · enter load · tab saved · esc".to_string(),
+                    // This page is unreachable with zero entries, so the
+                    // empty placeholder has no state to describe.
+                    empty: None,
+                    cursor: None,
+                },
+            )
+        }
+    }
 }
 
 /// Center `s` in `width` columns (a full-width string, so it overwrites the row).
@@ -706,6 +754,57 @@ mod tests {
             let (start, count) = scroll_window(sel, 20, 8);
             assert!(sel >= start && sel < start + count, "sel {sel} off-window");
         }
+    }
+
+    /// A recovery entry for row-shape tests.
+    fn recovery_entry(age_secs: u64, tasks: u32, label: &str) -> RecoveryEntry {
+        RecoveryEntry {
+            stem: "20260101-000000-1".into(),
+            label: label.into(),
+            tasks,
+            age_secs,
+        }
+    }
+
+    /// The recovery row composes age, a correctly-pluralized task count, and
+    /// the stored label.
+    #[test]
+    fn recovery_row_shapes() {
+        assert_eq!(
+            recovery_row(&recovery_entry(3, 1, "autosaved 2026-01-01 00:00")),
+            "3s ago · 1 task · autosaved 2026-01-01 00:00"
+        );
+        assert_eq!(
+            recovery_row(&recovery_entry(240, 12, "autosaved 2026-01-02 08:30")),
+            "4m ago · 12 tasks · autosaved 2026-01-02 08:30"
+        );
+        assert_eq!(
+            recovery_row(&recovery_entry(2 * 86_400, 0, "x")),
+            "2d ago · 0 tasks · x"
+        );
+    }
+
+    /// The label is a stored-name string from disk: the panel's clip must
+    /// keep a row with wide glyphs column-exact instead of overflowing.
+    #[test]
+    fn recovery_row_clips_column_exact_for_wide_labels() {
+        let long = "日本語のラベルがここに延々と続いています";
+        let row = recovery_row(&recovery_entry(90, 3, long));
+        assert!(row.starts_with("1m ago · 3 tasks · "));
+        for cols in [24usize, 40, 80] {
+            let clipped = pad(&row, cols);
+            assert_eq!(clipped.width(), cols, "cols {cols}: {clipped:?}");
+        }
+    }
+
+    /// The saved-page hint advertises the recovery page only when it exists.
+    #[test]
+    fn saved_page_hint_shows_the_count_only_when_nonzero() {
+        assert_eq!(saved_page_hint(0), "↑↓ pick · enter load · esc");
+        assert_eq!(
+            saved_page_hint(3),
+            "↑↓ pick · enter load · tab recovery (3) · esc"
+        );
     }
 
     /// Directory and group destinations appear only when present.

@@ -66,6 +66,23 @@ A bare agent command does not identify its conversation, so saving it verbatim w
 }
 ```
 
+## Recovery
+
+`fleetcom` also writes sessions nobody asked for: automatic snapshots of the running fleet, stored under `recovery/` inside the session directory. Each daemon (or `--foreground` core) owns one snapshot file, named by its start time and process id; the ten newest files are kept and older ones are pruned.
+
+A snapshot lands a couple of seconds after the fleet changes — a spawn, a removal, a rename, a regrouping — so a burst of changes writes once. A periodic pass also rewrites the file when a stored command would change, which is how an agent conversation's current resume ID reaches disk between fleet changes.
+
+Two rules make the snapshots safe to rely on:
+
+- An empty fleet never overwrites a snapshot. The state worth recovering is the fleet before it was lost, not the empty dashboard after.
+- Quitting, disconnecting, and `fleetcom --kill` leave snapshots in place.
+
+A snapshot is an ordinary session file in the format above, with an `autosaved <timestamp>` label stored in its `name` field. Loading one spawns its commands like any session load; the status line then suggests saving the result under a real name. Copying a snapshot file into `sessions/` promotes it permanently: it lists and loads as a normal session under its stored label, out of reach of pruning.
+
+In the dashboard, `o` opens the [session picker](commands.md#the-o-session-picker) on the saved list; while snapshots exist, `Tab` flips it to the recovery list.
+
+Recovery files carry the same caveat as saved recipes: they persist full command lines, which can embed secrets. They live in the same directory tree with the same permissions — mode 0700 directories, mode 0600 files.
+
 ## Saving and loading
 
 - Save: `w` in the dashboard, type a name, `Enter`. Writes the session name plus each task's directory, command, and optional group and name to `<name>.json`.
