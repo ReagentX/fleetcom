@@ -68,7 +68,7 @@ A bare agent command does not identify its conversation, so saving it verbatim w
 
 ## Recovery
 
-`fleetcom` automatically snapshots the running fleet under `recovery/` inside the session directory. Each daemon (or `--foreground` core) writes to a file named for its start time and process ID. After each write, older snapshots are pruned to keep the ten filenames with the newest timestamps.
+`fleetcom` automatically snapshots the running fleet under `recovery/` inside the session directory. Each daemon (or `--foreground` core) writes to a file named for its start time and process ID. After each write, older snapshots are pruned to ten files: the writer's own snapshot plus the nine with the newest timestamps.
 
 A snapshot pass runs two seconds after the last command that can change a saved recipe, coalescing a burst of commands. After the first write, the file is rewritten only when the serialized recipe changes. Every 60 seconds, `fleetcom` also checks for stored-command changes such as a newly captured agent resume ID.
 

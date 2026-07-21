@@ -337,6 +337,7 @@ pub fn recovery_label(now: SystemTime) -> String {
 
 /// Atomically write a recovery snapshot with mode 0600, then prune old files.
 /// Reusing `file_stem` replaces that snapshot without a stored-name check.
+/// The just-written snapshot is never pruned, even when ten newer stems exist.
 pub fn save_recovery_in(
     dir: &Path,
     file_stem: &str,
@@ -345,7 +346,7 @@ pub fn save_recovery_in(
 ) -> io::Result<PathBuf> {
     ensure_private_dir(dir)?;
     let file = write_atomic(dir, &format!("{file_stem}.json"), &to_json(name, cfg))?;
-    prune_recovery(dir);
+    prune_recovery(dir, file_stem);
     Ok(file)
 }
 
@@ -401,22 +402,34 @@ pub fn load_recovery_in(dir: &Path, stem: &str) -> io::Result<SessionConfig> {
     from_json(&fs::read_to_string(dir.join(format!("{stem}.json")))?).map(|(_, cfg)| cfg)
 }
 
-/// Best-effort pruning by filename, retaining the last [`RECOVERY_KEEP`]
-/// entries in lexical order.
-fn prune_recovery(dir: &Path) {
+/// Best-effort pruning by filename: every error is ignored, and a failed
+/// prune never fails the write.
+///
+/// `<keep_stem>.json` is exempt unconditionally: retention exists to bound
+/// disk use, never to undo a write that just succeeded. A long-running
+/// incarnation whose start-time stem has aged below ten newer stems would
+/// otherwise delete its own snapshot on every rewrite — and report `Ok`. The
+/// other files keep the lexically greatest [`RECOVERY_KEEP`] - 1, so the
+/// directory holds at most [`RECOVERY_KEEP`] files including the active one.
+/// Concurrent incarnations each protect only their own stem, so N live
+/// writers can briefly hold up to [`RECOVERY_KEEP`] + N - 1 files; the bound
+/// matters, not the exact count.
+fn prune_recovery(dir: &Path, keep_stem: &str) {
     let Ok(entries) = fs::read_dir(dir) else {
         return;
     };
+    let keep_name = format!("{keep_stem}.json");
     let mut snapshots: Vec<PathBuf> = entries
         .flatten()
         .map(|e| e.path())
         .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("json"))
+        .filter(|p| p.file_name().and_then(|n| n.to_str()) != Some(keep_name.as_str()))
         .collect();
-    if snapshots.len() <= RECOVERY_KEEP {
+    if snapshots.len() < RECOVERY_KEEP {
         return;
     }
     snapshots.sort();
-    for old in &snapshots[..snapshots.len() - RECOVERY_KEEP] {
+    for old in &snapshots[..snapshots.len() - (RECOVERY_KEEP - 1)] {
         let _ = fs::remove_file(old);
     }
 }
@@ -879,6 +892,65 @@ mod tests {
             .map(|i| format!("20260714-0930{i:02}-77.json"))
             .collect();
         assert_eq!(names, expected, "prune must drop exactly the oldest two");
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    /// A rewrite under an old stem survives its own prune. Ten newer stems
+    /// exist; the write must keep its file and drop the oldest of the others,
+    /// leaving [`RECOVERY_KEEP`] files total.
+    #[test]
+    fn recovery_prune_exempts_the_active_stem() {
+        let base = temp("session_recovery_prune_active");
+        let rec = recovery_dir(&base);
+        let mut cfg = SessionConfig::new();
+        cfg.insert("~/p".into(), vec![e("vim")]);
+        for i in 1..=10u32 {
+            let stem = format!("20260715-0930{i:02}-77");
+            save_recovery_in(&rec, &stem, "autosaved 2026-07-15 09:30", &cfg).unwrap();
+        }
+
+        // Day-old start-time stem: lexically below every file on disk.
+        let active = save_recovery_in(
+            &rec,
+            "20260714-093000-42",
+            "autosaved 2026-07-15 09:30",
+            &cfg,
+        )
+        .unwrap();
+        assert!(active.exists(), "the just-written snapshot must survive");
+
+        let mut names: Vec<String> = fs::read_dir(&rec)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().into_string().unwrap())
+            .collect();
+        names.sort();
+        let mut expected = vec!["20260714-093000-42.json".to_string()];
+        expected.extend((2..=10u32).map(|i| format!("20260715-0930{i:02}-77.json")));
+        assert_eq!(
+            names, expected,
+            "the active file plus the nine newest others must remain"
+        );
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    /// Below [`RECOVERY_KEEP`] files, pruning removes nothing.
+    #[test]
+    fn recovery_prune_below_limit_removes_nothing() {
+        let base = temp("session_recovery_prune_few");
+        let rec = recovery_dir(&base);
+        let mut cfg = SessionConfig::new();
+        cfg.insert("~/p".into(), vec![e("vim")]);
+        for i in 1..=5u32 {
+            let stem = format!("20260714-0930{i:02}-77");
+            save_recovery_in(&rec, &stem, "autosaved 2026-07-14 09:30", &cfg).unwrap();
+        }
+
+        assert_eq!(
+            fs::read_dir(&rec).unwrap().flatten().count(),
+            5,
+            "no file may be pruned below the retention limit"
+        );
         let _ = fs::remove_dir_all(&base);
     }
 
