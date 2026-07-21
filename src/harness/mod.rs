@@ -31,8 +31,8 @@ use std::{
 
 pub use claude::Claude;
 pub use codex::Codex;
-// Test-only: `testutil::write_rollout` derives day directories from it.
-#[cfg(test)]
+// `session`'s recovery stems and labels derive their UTC dates from it, as
+// does the shared rollout fixture in `testutil`.
 pub(crate) use codex::civil_from_days;
 pub use grok::Grok;
 

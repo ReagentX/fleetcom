@@ -196,6 +196,11 @@ pub fn start_daemon_raw(
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_fleetcom"));
     cmd.arg("--daemon")
         .env("FLEETCOM_RUNTIME_DIR", &dir)
+        // Pin the config root beside the runtime dir: the daemon's automatic
+        // recovery snapshots must never land in the developer's real config
+        // directory. Tests that care set their own value via `configure`
+        // (later `env` calls override this one).
+        .env("FLEETCOM_CONFIG_DIR", dir.join("config"))
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());

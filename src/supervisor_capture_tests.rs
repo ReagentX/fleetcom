@@ -1103,3 +1103,73 @@ fn non_agent_entries_survive_save_as_plain_strings() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// The cadence pass picks up conversation-ID drift that no structural
+/// mutation announces: resume IDs resolve pull-style at serialization time,
+/// so only re-serializing on the interval can see a capture file change. A
+/// settled recipe then stops writing (the snapshot's mtime holds still).
+#[test]
+fn recovery_cadence_rewrites_on_capture_drift_and_skips_when_static() {
+    let dir = scratch("cap_recovery_cadence");
+    let (bin, runtime, config) = (dir.join("bin"), dir.join("run"), dir.join("config"));
+    install_stub(&bin, "claude", &dir);
+    let mut s = Supervisor::new(24, 80, 2000);
+    s.set_launch_context(agent_ctx_plus(
+        &bin,
+        &runtime,
+        dir.clone(),
+        &[("FLEETCOM_CONFIG_DIR", &config)],
+    ));
+    s.set_recovery_timing(Duration::from_millis(20), Duration::from_millis(100));
+    spawn(&mut s, "claude", dir.clone());
+    let _ = wait_argv(&mut s, &dir.join("argv"));
+
+    let rec = config.join("sessions").join("recovery");
+    let snapshot = |rec: &Path| -> Option<(PathBuf, String)> {
+        let p = std::fs::read_dir(rec).ok()?.flatten().next()?.path();
+        let text = std::fs::read_to_string(&p).ok()?;
+        Some((p, text))
+    };
+    // The debounced spawn write lands first, carrying the pinned ID only.
+    assert!(
+        wait_until(Duration::from_secs(5), || {
+            s.tick();
+            snapshot(&rec).is_some()
+        }),
+        "the spawn snapshot never landed"
+    );
+    assert!(!snapshot(&rec).unwrap().1.contains(CAP_OTHER));
+
+    // Drift the conversation: the capture file now reports a different ID.
+    // No structural mutation follows, so only the cadence pass can see it.
+    let cap = s.tasks[0].capture_file.clone().expect("capture file set");
+    std::fs::write(
+        &cap,
+        format!(
+            r#"{{"session_id":"{CAP_OTHER}","hook_event_name":"SessionStart","source":"clear"}}"#
+        ),
+    )
+    .unwrap();
+    assert!(
+        wait_until(Duration::from_secs(5), || {
+            s.tick();
+            snapshot(&rec).is_some_and(|(_, t)| t.contains(CAP_OTHER))
+        }),
+        "the cadence pass never picked up the drifted ID"
+    );
+
+    // A settled recipe writes nothing more across several intervals.
+    let (path, _) = snapshot(&rec).unwrap();
+    let mtime = std::fs::metadata(&path).unwrap().modified().unwrap();
+    let rewritten = wait_until(Duration::from_millis(600), || {
+        s.tick();
+        std::fs::metadata(&path).unwrap().modified().unwrap() != mtime
+    });
+    assert!(
+        !rewritten,
+        "an unchanged recipe must not rewrite the snapshot"
+    );
+    let names: Vec<_> = std::fs::read_dir(&rec).unwrap().flatten().collect();
+    assert_eq!(names.len(), 1, "one incarnation owns one snapshot file");
+    let _ = std::fs::remove_dir_all(&dir);
+}

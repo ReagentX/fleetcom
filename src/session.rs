@@ -8,6 +8,7 @@ use std::{
     os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
+    time::SystemTime,
 };
 
 /// One recipe entry. Entries without a group or name serialize as strings;
@@ -75,9 +76,8 @@ pub fn sessions_dir(root: Option<PathBuf>) -> Option<PathBuf> {
 /// Missing versions are interpreted as version 1; unsupported versions fail.
 const FORMAT_VERSION: u64 = 1;
 
-/// Serialize the versioned wrapped schema. The stored name distinguishes
-/// names that sanitize to the same filename.
-fn to_json(name: &str, cfg: &SessionConfig) -> String {
+/// Build the `dirs` object alone: the recipe body without the wrapper.
+fn dirs_json(cfg: &SessionConfig) -> jzon::JsonValue {
     let mut dirs = jzon::JsonValue::new_object();
     for (dir, entries) in cfg {
         let mut arr = jzon::JsonValue::new_array();
@@ -100,11 +100,24 @@ fn to_json(name: &str, cfg: &SessionConfig) -> String {
         }
         let _ = dirs.insert(dir, arr);
     }
+    dirs
+}
+
+/// Serialize the versioned wrapped schema. The stored name distinguishes
+/// names that sanitize to the same filename.
+fn to_json(name: &str, cfg: &SessionConfig) -> String {
     let mut obj = jzon::JsonValue::new_object();
     let _ = obj.insert("version", FORMAT_VERSION);
     let _ = obj.insert("name", name);
-    let _ = obj.insert("dirs", dirs);
+    let _ = obj.insert("dirs", dirs_json(cfg));
     obj.pretty(2)
+}
+
+/// Serialize only the recipe body, for change detection. Excludes the wrapper
+/// because its `name` field is volatile in recovery snapshots (the label
+/// carries the write time): equal recipes must fingerprint equal.
+pub fn fingerprint_json(cfg: &SessionConfig) -> String {
+    dirs_json(cfg).dump()
 }
 
 /// Parse wrapped and flat schemas, returning the stored name when present.
@@ -183,9 +196,9 @@ fn from_json(text: &str) -> io::Result<(Option<String>, SessionConfig)> {
 /// Distinguishes concurrent savers' temp files within one process.
 static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
-pub fn save_in(dir: &Path, name: &str, cfg: &SessionConfig) -> io::Result<PathBuf> {
-    // Create missing directories with 0700 and restrict the session directory
-    // itself to 0700. Existing parent directories remain unchanged.
+/// Create missing directories with 0700 and restrict `dir` itself to 0700.
+/// Existing parent directories remain unchanged.
+fn ensure_private_dir(dir: &Path) -> io::Result<()> {
     fs::DirBuilder::new()
         .recursive(true)
         .mode(0o700)
@@ -193,6 +206,48 @@ pub fn save_in(dir: &Path, name: &str, cfg: &SessionConfig) -> io::Result<PathBu
     if fs::metadata(dir)?.permissions().mode() & 0o077 != 0 {
         fs::set_permissions(dir, fs::Permissions::from_mode(0o700))?;
     }
+    Ok(())
+}
+
+/// Write `contents` to `<dir>/<file_name>` atomically: a private temp file in
+/// `dir`, synced, then renamed over the target. The `.tmp` suffix keeps the
+/// temp out of `list_in`, and the rename gives the target mode 0600.
+fn write_atomic(dir: &Path, file_name: &str, contents: &str) -> io::Result<PathBuf> {
+    let file = dir.join(file_name);
+    let pid = std::process::id();
+    let (mut tmp_file, tmp) = loop {
+        let n = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+        // Shorten the target portion so the decorated temporary filename stays
+        // within the 255-byte component limit.
+        let suffix = format!(".{pid}.{n}.tmp");
+        let stem = prefix_bytes(file_name, 254 - suffix.len());
+        let candidate = dir.join(format!(".{stem}{suffix}"));
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&candidate)
+        {
+            Ok(f) => break (f, candidate),
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
+    };
+    let written = (|| {
+        tmp_file.write_all(contents.as_bytes())?;
+        // Persist the contents before publishing the temp file as the target.
+        tmp_file.sync_all()?;
+        fs::rename(&tmp, &file)
+    })();
+    if written.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    written?;
+    Ok(file)
+}
+
+pub fn save_in(dir: &Path, name: &str, cfg: &SessionConfig) -> io::Result<PathBuf> {
+    ensure_private_dir(dir)?;
     let trimmed = name.trim();
     let file_name = format!("{}.json", sanitize(name));
     let file = dir.join(&file_name);
@@ -217,39 +272,7 @@ pub fn save_in(dir: &Path, name: &str, cfg: &SessionConfig) -> io::Result<PathBu
         Err(e) => return Err(e),
     }
 
-    // Write a private temp file in the session directory, sync its contents,
-    // then atomically rename it over the recipe. The `.tmp` suffix keeps it
-    // out of `list_in`, and the rename gives the target mode 0600.
-    let pid = std::process::id();
-    let (mut tmp_file, tmp) = loop {
-        let n = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
-        // Shorten the recipe portion so the decorated temporary filename stays
-        // within the 255-byte component limit.
-        let suffix = format!(".{pid}.{n}.tmp");
-        let stem = prefix_bytes(&file_name, 254 - suffix.len());
-        let candidate = dir.join(format!(".{stem}{suffix}"));
-        match fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&candidate)
-        {
-            Ok(f) => break (f, candidate),
-            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
-            Err(e) => return Err(e),
-        }
-    };
-    let written = (|| {
-        tmp_file.write_all(to_json(trimmed, cfg).as_bytes())?;
-        // Persist the contents before publishing the temp file as the recipe.
-        tmp_file.sync_all()?;
-        fs::rename(&tmp, &file)
-    })();
-    if written.is_err() {
-        let _ = fs::remove_file(&tmp);
-    }
-    written?;
-    Ok(file)
+    write_atomic(dir, &file_name, &to_json(trimmed, cfg))
 }
 
 pub fn load_in(dir: &Path, name: &str) -> io::Result<SessionConfig> {
@@ -277,6 +300,92 @@ pub fn list_in(dir: &Path) -> Vec<String> {
     }
     names.sort();
     names
+}
+
+// --- recovery snapshots: the supervisor's automatic fleet backups, written
+// under `<sessions root>/recovery` in the ordinary wrapped format. Phase 1
+// only writes; listing and loading them arrive in later phases. ---------------
+
+/// Snapshots kept per recovery directory; older ones are pruned after each
+/// write.
+const RECOVERY_KEEP: usize = 10;
+
+/// Recovery-snapshot directory under a session root. Created 0700 on first
+/// write; `list_in` never descends into it (directories fail its `.json`
+/// extension filter), so snapshots stay out of the session picker.
+pub fn recovery_dir(sessions_root: &Path) -> PathBuf {
+    sessions_root.join("recovery")
+}
+
+/// UTC civil time for `t`: (year, month, day, hour, minute, second).
+/// UTC because the recovery stems must sort lexically by age: local time
+/// repeats an hour at DST fall-back.
+fn civil_utc(t: SystemTime) -> (i64, u32, u32, u64, u64, u64) {
+    let secs = t
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let (y, m, d) = crate::harness::civil_from_days((secs / 86_400) as i64);
+    let tod = secs % 86_400;
+    (y, m, d, tod / 3600, (tod % 3600) / 60, tod % 60)
+}
+
+/// Incarnation filename stem `<YYYYMMDD-HHMMSS>-<pid>` from the supervisor's
+/// start time and process id. The pid separates a daemon from a concurrent
+/// `--foreground` client sharing one config root; the leading UTC stamp makes
+/// lexical order age order, which pruning relies on. Digits and dashes only,
+/// so the stem needs no `sanitize` pass.
+pub fn recovery_stem(start: SystemTime, pid: u32) -> String {
+    let (y, m, d, hh, mm, ss) = civil_utc(start);
+    format!("{y:04}{m:02}{d:02}-{hh:02}{mm:02}{ss:02}-{pid}")
+}
+
+/// Human label stored in a snapshot's `name` field: `autosaved <YYYY-MM-DD
+/// HH:MM>` (UTC) from the write time. The label exists so a recovery file
+/// copied by hand into `sessions/` becomes an ordinary, sensibly-named
+/// session with no tooling: `list_in` shows the stored name, and loading it
+/// needs nothing new.
+pub fn recovery_label(now: SystemTime) -> String {
+    let (y, m, d, hh, mm, _) = civil_utc(now);
+    format!("autosaved {y:04}-{m:02}-{d:02} {hh:02}:{mm:02}")
+}
+
+/// Write one recovery snapshot through the same atomic temp-rename, 0600, and
+/// version-1 path as `save_in`, then prune. `save_in`'s stored-name collision
+/// check does not apply: the incarnation owns `<file_stem>.json` outright and
+/// always overwrites it.
+pub fn save_recovery_in(
+    dir: &Path,
+    file_stem: &str,
+    name: &str,
+    cfg: &SessionConfig,
+) -> io::Result<PathBuf> {
+    ensure_private_dir(dir)?;
+    let file = write_atomic(dir, &format!("{file_stem}.json"), &to_json(name, cfg))?;
+    prune_recovery(dir);
+    Ok(file)
+}
+
+/// Best-effort prune: keep the newest [`RECOVERY_KEEP`] snapshots by filename
+/// (stems are UTC timestamps, so lexical order is age order) and ignore every
+/// error -- a snapshot that cannot be removed must not fail the write that
+/// just succeeded.
+fn prune_recovery(dir: &Path) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    let mut snapshots: Vec<PathBuf> = entries
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("json"))
+        .collect();
+    if snapshots.len() <= RECOVERY_KEEP {
+        return;
+    }
+    snapshots.sort();
+    for old in &snapshots[..snapshots.len() - RECOVERY_KEEP] {
+        let _ = fs::remove_file(old);
+    }
 }
 
 #[cfg(test)]
@@ -669,6 +778,95 @@ mod tests {
         for n in list_in(&dir) {
             load_in(&dir, &n).unwrap();
         }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// 2026-07-14 09:30:15 UTC, matching `civil_from_days`'s test vector.
+    fn recovery_instant() -> SystemTime {
+        SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_784_021_415)
+    }
+
+    /// The stem is `<YYYYMMDD-HHMMSS>-<pid>`; the label is the write minute.
+    #[test]
+    fn recovery_stem_and_label_render_utc() {
+        assert_eq!(
+            recovery_stem(recovery_instant(), 4242),
+            "20260714-093015-4242"
+        );
+        assert_eq!(
+            recovery_label(recovery_instant()),
+            "autosaved 2026-07-14 09:30"
+        );
+    }
+
+    /// A snapshot round-trips through `load_in` with version 1, the human
+    /// label, and the private-permission idiom of ordinary saves.
+    #[test]
+    fn recovery_snapshot_round_trips_with_version_and_label() {
+        let base = temp("session_recovery_roundtrip");
+        let rec = recovery_dir(&base);
+        let mut cfg = SessionConfig::new();
+        cfg.insert("~/p".into(), vec![gne("cargo run", "api", "server")]);
+        let stem = recovery_stem(recovery_instant(), 4242);
+        let label = recovery_label(recovery_instant());
+
+        let file = save_recovery_in(&rec, &stem, &label, &cfg).unwrap();
+        assert_eq!(file, rec.join("20260714-093015-4242.json"));
+        let text = fs::read_to_string(&file).unwrap();
+        assert!(text.contains("\"version\": 1"), "{text}");
+        let (stored, parsed) = from_json(&text).unwrap();
+        assert_eq!(stored.as_deref(), Some("autosaved 2026-07-14 09:30"));
+        assert_eq!(parsed, cfg);
+        assert_eq!(load_in(&rec, &stem).unwrap(), cfg);
+
+        let mode = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&rec), 0o700);
+        assert_eq!(mode(&file), 0o600);
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    /// Prune keeps exactly the newest [`RECOVERY_KEEP`] snapshots by filename.
+    #[test]
+    fn recovery_prune_keeps_the_newest_ten() {
+        let base = temp("session_recovery_prune");
+        let rec = recovery_dir(&base);
+        let mut cfg = SessionConfig::new();
+        cfg.insert("~/p".into(), vec![e("vim")]);
+        for i in 1..=12u32 {
+            let stem = format!("20260714-0930{i:02}-77");
+            save_recovery_in(&rec, &stem, "autosaved 2026-07-14 09:30", &cfg).unwrap();
+        }
+
+        let mut names: Vec<String> = fs::read_dir(&rec)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().into_string().unwrap())
+            .collect();
+        names.sort();
+        let expected: Vec<String> = (3..=12u32)
+            .map(|i| format!("20260714-0930{i:02}-77.json"))
+            .collect();
+        assert_eq!(names, expected, "prune must drop exactly the oldest two");
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    /// The `recovery/` subdirectory never appears in a session listing:
+    /// directories fail `list_in`'s `.json` extension filter.
+    #[test]
+    fn list_ignores_the_recovery_subdirectory() {
+        let dir = temp("session_list_recovery");
+        let mut cfg = SessionConfig::new();
+        cfg.insert("~/p".into(), vec![e("vim")]);
+        save_in(&dir, "real", &cfg).unwrap();
+        save_recovery_in(
+            &recovery_dir(&dir),
+            &recovery_stem(recovery_instant(), 7),
+            &recovery_label(recovery_instant()),
+            &cfg,
+        )
+        .unwrap();
+
+        assert_eq!(list_in(&dir), vec!["real".to_string()]);
         let _ = fs::remove_dir_all(&dir);
     }
 }

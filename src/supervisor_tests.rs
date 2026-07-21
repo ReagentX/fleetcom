@@ -1608,5 +1608,199 @@ fn key_command_encodes_against_live_cursor_mode() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+// --- recovery-snapshot writer -------------------------------------------
+
+/// Supervisor wired to `config` with the recovery writer armed at short
+/// timings (test builds start disarmed; see `Recovery::enabled`).
+fn recovery_sup(config: &Path, cwd: PathBuf, debounce: Duration, cadence: Duration) -> Supervisor {
+    let mut s = Supervisor::new(24, 80, 2000);
+    s.set_launch_context(config_ctx(config, cwd, &[]));
+    s.set_recovery_timing(debounce, cadence);
+    s
+}
+
+/// Sorted recovery-snapshot filenames under `config`'s session root.
+fn recovery_files(config: &Path) -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(config.join("sessions").join("recovery"))
+        .map(|it| {
+            it.flatten()
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .collect()
+        })
+        .unwrap_or_default();
+    names.sort();
+    names
+}
+
+/// Read and clear the writer's dirty flag.
+fn take_dirty(s: &mut Supervisor) -> bool {
+    std::mem::replace(&mut s.recovery.dirty, false)
+}
+
+/// The six structural recipe mutations arm the writer; `Tag` does not (tags
+/// are not recipe state). Arming keys on the command, not its outcome, so a
+/// refused `Restart` and a missing `LoadSession` recipe still arm.
+#[test]
+fn recovery_arms_on_structural_mutations_not_tag() {
+    let mut s = sup(24, 80);
+    assert!(!s.recovery.dirty, "a fresh supervisor starts clean");
+
+    spawn(&mut s, "sleep 30", here());
+    assert!(take_dirty(&mut s), "Spawn must arm");
+    let id = first_id(&mut s);
+
+    s.recovery.dirty = false; // first_id ticks; reassert a clean baseline
+    s.apply(Command::Tag { id, on: true });
+    assert!(
+        !take_dirty(&mut s),
+        "Tag is not recipe state and must not arm"
+    );
+
+    s.apply(Command::SetGroup {
+        id,
+        group: Some("api".into()),
+    });
+    assert!(take_dirty(&mut s), "SetGroup must arm");
+
+    s.apply(Command::SetName {
+        id,
+        name: Some("server".into()),
+    });
+    assert!(take_dirty(&mut s), "SetName must arm");
+
+    s.apply(Command::Restart { id });
+    assert!(take_dirty(&mut s), "Restart must arm");
+
+    s.apply(Command::LoadSession {
+        name: "ghost".into(),
+    });
+    assert!(take_dirty(&mut s), "LoadSession must arm");
+
+    s.apply(Command::Remove { id });
+    assert!(take_dirty(&mut s), "Remove must arm");
+}
+
+/// A burst of mutations coalesces behind the debounce into one snapshot
+/// carrying the whole burst: no write lands inside the quiet period, and one
+/// file holds all three commands afterward.
+#[test]
+fn recovery_debounce_coalesces_a_mutation_burst() {
+    let dir = scratch("recovery_debounce");
+    let config = dir.join("config");
+    let mut s = recovery_sup(
+        &config,
+        dir.clone(),
+        Duration::from_millis(500),
+        Duration::from_secs(600),
+    );
+    spawn(&mut s, "sleep 30", dir.clone());
+    spawn(&mut s, "sleep 31", dir.clone());
+    spawn(&mut s, "sleep 32", dir.clone());
+    s.tick();
+    assert!(
+        recovery_files(&config).is_empty(),
+        "a write inside the debounce window defeats coalescing"
+    );
+
+    assert!(
+        wait_until(Duration::from_secs(5), || {
+            s.tick();
+            !recovery_files(&config).is_empty()
+        }),
+        "the debounced snapshot never landed"
+    );
+    let files = recovery_files(&config);
+    assert_eq!(
+        files.len(),
+        1,
+        "a burst must produce one snapshot: {files:?}"
+    );
+    let text =
+        std::fs::read_to_string(config.join("sessions").join("recovery").join(&files[0])).unwrap();
+    for cmd in ["sleep 30", "sleep 31", "sleep 32"] {
+        assert!(text.contains(cmd), "snapshot must carry {cmd:?}: {text}");
+    }
+    assert!(!s.recovery.dirty, "a completed pass clears the flag");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// An empty fleet never writes -- idle from birth, and after a remove-all
+/// that empties the fleet inside the debounce window. Quitting with zero
+/// tasks must not clobber the snapshot a user would want back.
+#[test]
+fn recovery_empty_fleet_never_writes() {
+    let dir = scratch("recovery_empty");
+    let config = dir.join("config");
+    let mut s = recovery_sup(
+        &config,
+        dir.clone(),
+        Duration::from_millis(100),
+        Duration::from_millis(200),
+    );
+    // Idle and empty: both schedules cross without writing.
+    assert!(
+        !wait_until(Duration::from_millis(600), || {
+            s.tick();
+            !recovery_files(&config).is_empty()
+        }),
+        "an idle empty fleet must never write"
+    );
+
+    // Remove-all before any pass runs: writes happen only in `tick`, so
+    // reading the id from the task set directly keeps this deterministic.
+    spawn(&mut s, "sleep 30", dir.clone());
+    let id = s.tasks[0].id;
+    s.apply(Command::Remove { id });
+    assert!(
+        !wait_until(Duration::from_millis(600), || {
+            s.tick();
+            !recovery_files(&config).is_empty()
+        }),
+        "a fleet emptied before the pass must never write"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A persistently unwritable root degrades silently after ONE status notice,
+/// and the fleet stays supervised throughout.
+#[test]
+fn recovery_write_failure_notices_once_and_keeps_supervising() {
+    let dir = scratch("recovery_fail");
+    let config = dir.join("config");
+    // A plain file where `recovery/` must go fails every write attempt.
+    std::fs::create_dir_all(config.join("sessions")).unwrap();
+    std::fs::write(config.join("sessions").join("recovery"), "not a dir").unwrap();
+    let mut s = recovery_sup(
+        &config,
+        dir.clone(),
+        Duration::from_millis(10),
+        Duration::from_millis(50),
+    );
+    spawn(&mut s, "sleep 30", dir.clone());
+
+    // Cross many debounce and cadence intervals, counting notices.
+    let mut notices = 0usize;
+    let deadline = Instant::now() + Duration::from_millis(500);
+    while Instant::now() < deadline {
+        s.tick();
+        notices += s
+            .drain()
+            .iter()
+            .filter(|e| matches!(e, Event::Status(m) if m.contains("recovery snapshot failed")))
+            .count();
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(notices, 1, "persistent failure must notice exactly once");
+
+    s.tick();
+    assert!(
+        s.drain()
+            .iter()
+            .any(|e| matches!(e, Event::Tasks(v) if v.len() == 1)),
+        "a failing writer must never disturb supervision"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[path = "supervisor_capture_tests.rs"]
 mod capture;

@@ -89,6 +89,18 @@ fn effective_scrollback(flag: Option<usize>, env: Option<&str>) -> usize {
 /// that do not exit after SIGTERM.
 const KILL_GRACE: Duration = Duration::from_secs(2);
 
+/// Quiet period after a structural recipe mutation before the recovery
+/// snapshot writes, coalescing a burst (a session load spawning many tasks)
+/// into one write.
+const RECOVERY_DEBOUNCE: Duration = Duration::from_secs(2);
+
+/// Interval between recovery content-comparison passes. Resume-ID resolution
+/// is pull-based (`current_resume_id` reads the capture file during
+/// serialization; no event fires when an ID appears), so only re-serializing
+/// on a cadence can observe agent conversation-ID drift between structural
+/// mutations.
+const RECOVERY_CADENCE: Duration = Duration::from_secs(60);
+
 /// Maximum stored label length in Unicode scalar values after normalization,
 /// shared by group and display-name assignments.
 const MAX_LABEL_CHARS: usize = 64;
@@ -155,6 +167,58 @@ fn harness_home(env: &[(OsString, OsString)], h: &dyn harness::Harness) -> Optio
     val(h.home_env_var()).or_else(|| Some(val("HOME")?.join(h.home_dot_dir())))
 }
 
+/// State for the automatic fleet-recovery snapshot writer. Recovery is
+/// insurance bolted beside the supervision path, never in it: every branch
+/// that cannot write resolves toward not disturbing supervision, silently.
+/// Quit, `--kill`, and SIGTERM teardowns deliberately neither write nor
+/// delete snapshots -- files persisting past an "oops" is the point.
+struct Recovery {
+    /// Armed in production. Test builds start disarmed because supervisors
+    /// built with real launch contexts tick inside many unrelated tests,
+    /// which would otherwise land snapshots in the developer's real config
+    /// root; recovery tests arm explicitly via `set_recovery_timing`.
+    enabled: bool,
+    /// Set by the six structural recipe mutations, cleared by the next due
+    /// pass (written, unchanged, empty, or unwritable alike -- see
+    /// `Supervisor::maybe_write_recovery`).
+    dirty: bool,
+    /// The most recent structural mutation: the debounce anchor.
+    last_mutation: Option<Instant>,
+    /// The last cadence pass, due or not.
+    last_cadence: Instant,
+    /// FNV-1a of the last successfully written recipe fingerprint; `None`
+    /// until the first write.
+    last_hash: Option<String>,
+    /// Incarnation filename stem, fixed at construction from the supervisor's
+    /// start time and pid (see `session::recovery_stem`): every write of this
+    /// incarnation replaces its own file.
+    stem: String,
+    /// One-notice latch: a persistently failing root (e.g. an unwritable
+    /// config directory) reports once per failure streak, not per attempt.
+    failing: bool,
+    /// `RECOVERY_DEBOUNCE`/`RECOVERY_CADENCE` in production; fields so tests
+    /// shrink them instead of sleeping through real seconds (the `kill_grace`
+    /// pattern).
+    debounce: Duration,
+    cadence: Duration,
+}
+
+impl Recovery {
+    fn new() -> Recovery {
+        Recovery {
+            enabled: !cfg!(test),
+            dirty: false,
+            last_mutation: None,
+            last_cadence: Instant::now(),
+            last_hash: None,
+            stem: session::recovery_stem(std::time::SystemTime::now(), std::process::id()),
+            failing: false,
+            debounce: RECOVERY_DEBOUNCE,
+            cadence: RECOVERY_CADENCE,
+        }
+    }
+}
+
 pub struct Supervisor {
     tasks: Vec<Task>,
     /// Removed tasks whose process groups may still be winding down: TERMed at
@@ -196,6 +260,8 @@ pub struct Supervisor {
     /// Capture assets keyed by canonicalized root and reused for this
     /// supervisor's lifetime.
     capture: BTreeMap<PathBuf, assets::CaptureAssets>,
+    /// Automatic fleet-recovery snapshot state.
+    recovery: Recovery,
 }
 
 impl Supervisor {
@@ -214,6 +280,7 @@ impl Supervisor {
             waker: Arc::new(Mutex::new(None)),
             kill_grace: KILL_GRACE,
             capture: BTreeMap::new(),
+            recovery: Recovery::new(),
         }
     }
 
@@ -226,6 +293,15 @@ impl Supervisor {
     #[cfg(test)]
     pub fn set_kill_grace(&mut self, grace: Duration) {
         self.kill_grace = grace;
+    }
+
+    /// Arm the recovery writer with short timings so snapshot tests run in
+    /// milliseconds. Test builds start disarmed (see [`Recovery::enabled`]).
+    #[cfg(test)]
+    pub fn set_recovery_timing(&mut self, debounce: Duration, cadence: Duration) {
+        self.recovery.enabled = true;
+        self.recovery.debounce = debounce;
+        self.recovery.cadence = cadence;
     }
 
     /// Install the sender the current serving loop waits on, so task reader
@@ -260,6 +336,25 @@ impl Supervisor {
     /// Apply one client request. Fire-and-forget: any result (a save/load
     /// notice, a spawn failure) is queued as `Event::Status`, never returned.
     pub fn apply(&mut self, cmd: Command) {
+        // The six structural recipe mutations arm the recovery writer; the
+        // burst coalesces behind `RECOVERY_DEBOUNCE` in `tick`. `Tag` is
+        // deliberately absent: tags are not recipe state (a `SessionEntry`
+        // stores cmd, group, and name only), so a tag flip cannot change the
+        // snapshot. Arming keys on the command, not its outcome -- a refused
+        // spawn or unknown-id assignment costs one fingerprint comparison in
+        // the next pass, which then skips the write.
+        if matches!(
+            &cmd,
+            Command::Spawn { .. }
+                | Command::Remove { .. }
+                | Command::Restart { .. }
+                | Command::SetGroup { .. }
+                | Command::SetName { .. }
+                | Command::LoadSession { .. }
+        ) {
+            self.recovery.dirty = true;
+            self.recovery.last_mutation = Some(Instant::now());
+        }
         match cmd {
             Command::Spawn {
                 command,
@@ -497,6 +592,80 @@ impl Supervisor {
                 self.events.push(Event::Screen(view));
             }
         }
+
+        self.maybe_write_recovery(now);
+    }
+
+    /// Write the recovery snapshot when a pass is due. Two schedules share
+    /// the write: a debounce pass follows a structural-mutation burst, and a
+    /// cadence pass re-serializes on an interval to observe pull-resolved
+    /// resume-ID drift (see [`RECOVERY_CADENCE`]). Recovery is insurance
+    /// beside the supervision path: every refusal here is silent by design.
+    fn maybe_write_recovery(&mut self, now: Instant) {
+        if !self.recovery.enabled {
+            return;
+        }
+        let debounce_due = self.recovery.dirty
+            && self
+                .recovery
+                .last_mutation
+                .is_some_and(|t| now.duration_since(t) >= self.recovery.debounce);
+        let cadence_due = now.duration_since(self.recovery.last_cadence) >= self.recovery.cadence;
+        if !(debounce_due || cadence_due) {
+            return;
+        }
+        if cadence_due {
+            self.recovery.last_cadence = now;
+        }
+        // An empty fleet never writes: the snapshot worth recovering is
+        // exactly the one a quit-with-zero-tasks pass would clobber.
+        // Clearing `dirty` is not deferral; the next mutation re-arms.
+        if self.tasks.is_empty() {
+            self.recovery.dirty = false;
+            return;
+        }
+        // No resolvable config root: nothing to write to, nothing to report.
+        let Some(root) = self.sessions_root() else {
+            self.recovery.dirty = false;
+            return;
+        };
+        // Give finished tasks their exit scrape before serialization reads
+        // resume IDs, exactly as `save_session` does.
+        for t in &mut self.tasks {
+            scrape_now(t);
+        }
+        let cfg = self.session_config();
+        // Fingerprint the recipe body, not the wrapped file: the stored
+        // label carries the write time, so hashing the full serialization
+        // would report a change every minute.
+        let hash = fnv1a_hex(session::fingerprint_json(&cfg).as_bytes());
+        if self.recovery.last_hash.as_ref() == Some(&hash) {
+            self.recovery.dirty = false;
+            return;
+        }
+        let label = session::recovery_label(std::time::SystemTime::now());
+        match session::save_recovery_in(
+            &session::recovery_dir(&root),
+            &self.recovery.stem,
+            &label,
+            &cfg,
+        ) {
+            Ok(_) => {
+                self.recovery.last_hash = Some(hash);
+                self.recovery.failing = false;
+            }
+            Err(e) => {
+                // Degrade silently, but say so once per failure streak. The
+                // cadence pass retries because `last_hash` still names the
+                // last *written* state; `dirty` clears below either way, so
+                // a broken root costs one attempt per interval, not per tick.
+                if !self.recovery.failing {
+                    self.recovery.failing = true;
+                    self.status(format!("recovery snapshot failed: {e}"));
+                }
+            }
+        }
+        self.recovery.dirty = false;
     }
 
     /// Hand the client every event queued since the last drain.
