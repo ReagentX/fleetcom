@@ -30,7 +30,6 @@ use crate::{
         Command, Event, Key, Lifecycle, Mods, MouseBtn, MouseKind, ScreenView, ScrollAction,
         TaskView,
     },
-    supervisor::Supervisor,
     transport::{ExitIntent, SocketTransport, ThreadTransport, Transport},
     ui,
 };
@@ -300,10 +299,7 @@ impl App {
     /// non-daemon escape hatch, and the deterministic target the UI harnesses use.
     pub fn new_foreground(rows: u16, cols: u16) -> App {
         App::assemble(rows, cols, |pr, c, wait_tx| {
-            Box::new(ThreadTransport::spawn(
-                Supervisor::new(pr, c, crate::supervisor::resolve_scrollback()),
-                wait_tx,
-            ))
+            Box::new(ThreadTransport::foreground(pr, c, wait_tx))
         })
     }
 

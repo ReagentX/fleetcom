@@ -3,7 +3,7 @@ use std::time::Instant;
 use super::*;
 use crate::{
     emulator::Emulator,
-    preview::{MARKER, PreviewState},
+    preview::{MARKER, PreviewState, SummaryAdapter},
     protocol::{Preview, PreviewSource},
 };
 

@@ -6,7 +6,6 @@ use std::time::{Duration, Instant};
 
 use crate::{
     emulator::Emulator,
-    harness::summary::SummaryAdapter,
     protocol::{Preview, PreviewSource},
 };
 
@@ -66,6 +65,23 @@ impl ScreenFacts for Emulator {
 
     fn alt_leave_floor(&self) -> Option<&str> {
         Emulator::alt_leave_floor(self)
+    }
+}
+
+/// Display-only status and model-label extraction for one agent CLI.
+pub trait SummaryAdapter: Sync {
+    /// Return normalized live status and its matcher ID when the expected
+    /// chrome structure is present.
+    fn live_preview(&self, screen: &dyn ScreenFacts) -> Option<(String, &'static str)>;
+
+    /// Return a model label from stable CLI chrome. The preview cascade
+    /// prepends it to live status as `{label} · `.
+    fn model_label(&self, screen: &dyn ScreenFacts) -> Option<String>;
+
+    /// Optionally normalize a captured title for display. Emulator title
+    /// capture remains program-agnostic; `None` renders the title verbatim.
+    fn normalize_title(&self, _title: &str) -> Option<String> {
+        None
     }
 }
 

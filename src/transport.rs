@@ -14,7 +14,7 @@ use crate::{
     core::{Wake, run_loop},
     frame::{SEND_TIMEOUT, read_frame, write_frame},
     protocol::{Command, Event, decode_event, encode_command},
-    supervisor::Supervisor,
+    supervisor::{Supervisor, resolve_scrollback},
 };
 
 /// How the client is leaving, chosen by the exit key/signal. Only
@@ -75,9 +75,11 @@ pub struct ThreadTransport {
 }
 
 impl ThreadTransport {
-    /// Run `sup` on its own thread. `wait_tx` wakes the *client's* run loop when
-    /// an event is produced, so the loop reacts without polling.
-    pub fn spawn(mut sup: Supervisor, wait_tx: Sender<()>) -> ThreadTransport {
+    /// Build the in-process core at `rows`×`cols` and run it on its own
+    /// thread. `wait_tx` wakes the *client's* run loop when an event is
+    /// produced, so the loop reacts without polling.
+    pub fn foreground(rows: u16, cols: u16, wait_tx: Sender<()>) -> ThreadTransport {
+        let mut sup = Supervisor::new(rows, cols, resolve_scrollback());
         let (wake_tx, wake_rx) = channel::<Wake>();
         let (evt_tx, evt_rx) = channel::<Event>();
         // The in-process core uses this process's launch context.

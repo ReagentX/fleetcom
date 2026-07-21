@@ -1,5 +1,6 @@
 use super::*;
 use crate::{
+    supervisor::Supervisor,
     testutil::{temp, wait_until},
     transport::LocalTransport,
     ui::scroll_window,

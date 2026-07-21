@@ -338,7 +338,7 @@ pub struct Task {
     pub harness_home: Option<PathBuf>,
     /// Display-only summary adapter selected from the requested command,
     /// independently of session-capture instrumentation.
-    pub summary_adapter: Option<&'static dyn crate::harness::summary::SummaryAdapter>,
+    pub summary_adapter: Option<&'static dyn crate::preview::SummaryAdapter>,
     /// Run number used to give each rerun a distinct capture path.
     pub run: u32,
     /// Session ID injected or recognized at spawn. Later capture data or an
@@ -624,13 +624,13 @@ impl Task {
     /// Whether the child exited and the PTY reader stopped, so no more bytes
     /// can reach the grid. A missing reader handle counts as complete; the
     /// reader treats EOF and read errors identically.
-    pub(crate) fn output_complete(&self) -> bool {
+    fn output_complete(&self) -> bool {
         self.finished.is_some() && self.handle.as_ref().is_none_or(JoinHandle::is_finished)
     }
 
     /// Scrape at most one exit hint after the process exits and the PTY reader
     /// reaches EOF (see [`Task::output_complete`]).
-    pub(crate) fn scrape_exit_hint(&mut self) {
+    pub fn scrape_exit_hint(&mut self) {
         let Some(h) = self.harness else { return };
         if self.scraped || !self.output_complete() {
             return;
@@ -751,7 +751,7 @@ impl Task {
 
     /// Freeze the preview once output is complete. Any open `?2026` frame is
     /// landed first.
-    pub(crate) fn finalize_preview(&mut self) {
+    pub fn finalize_preview(&mut self) {
         if self.preview.finalized() || !self.output_complete() {
             return;
         }
@@ -947,7 +947,7 @@ impl Task {
     /// the price of observing emptiness at all; the graveyard declines to
     /// pay it and keeps its zombies until `kill_sent` (see
     /// `Supervisor::reap`).
-    pub(crate) fn group_gone(&mut self) -> bool {
+    pub fn group_gone(&mut self) -> bool {
         let Some(pid) = self.pid else {
             // No pid was ever known: nothing waitable or signalable exists.
             return true;
