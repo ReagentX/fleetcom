@@ -39,7 +39,7 @@ pub enum MouseProtocolEncoding {
 /// bounds forwarding-frame size and per-task memory, not what a host
 /// clipboard could hold; an over-cap store is dropped and its length
 /// recorded so the caller can surface a notice.
-const CLIPBOARD_STORE_MAX_BYTES: usize = 1024 * 1024;
+pub(crate) const CLIPBOARD_STORE_MAX_BYTES: usize = 1024 * 1024;
 
 // A maximum-size store expands to this base64 bound when re-encoded for
 // forwarding. Reserve 64 KiB for the command envelope and keep the result
@@ -230,10 +230,6 @@ pub struct Emulator {
     term: Term<ProbeSink>,
     parser: Processor,
     responses: Arc<Mutex<Vec<String>>>,
-    // Read only by `drain_clipboard`, which has no production caller until
-    // the supervisor's forwarding tick lands; the allow is scoped to the
-    // non-test build because tests do read it.
-    #[cfg_attr(not(test), allow(dead_code))]
     clipboard: Arc<Mutex<ClipboardStores>>,
     /// Alt-screen and title facts, advanced at parser-event granularity by
     /// [`ObservedTerm`] during the parse itself.
@@ -264,10 +260,6 @@ impl Emulator {
     /// whose result is dropped discards the stores. An empty capture costs
     /// one lock and no allocation, so calling every tick for every task is
     /// fine.
-    // No production caller until the supervisor's forwarding tick lands;
-    // tests drain meanwhile, so the allow is scoped to the non-test build
-    // (`expect` would be unfulfilled in the test target).
-    #[cfg_attr(not(test), allow(dead_code))]
     pub fn drain_clipboard(&mut self) -> ClipboardStores {
         let mut buf = self
             .clipboard

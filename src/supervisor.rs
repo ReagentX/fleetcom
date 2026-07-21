@@ -13,11 +13,15 @@ use std::{
     time::{Duration, Instant},
 };
 
+use alacritty_terminal::term::ClipboardType;
+
 use crate::{
     core::{Wake, Waker},
     harness::{self, assets},
     path,
-    protocol::{Command, Event, LaunchContext, ScreenView, ScrollAction, TaskView, env_get},
+    protocol::{
+        ClipboardKind, Command, Event, LaunchContext, ScreenView, ScrollAction, TaskView, env_get,
+    },
     session::{self, SessionConfig, SessionEntry},
     task::Task,
 };
@@ -117,6 +121,15 @@ fn normalize_label(label: Option<String>) -> Option<String> {
 /// `Unassigned` to `None`. Display names do not reserve this label.
 fn normalize_group(name: Option<String>) -> Option<String> {
     normalize_label(name).filter(|g| g != "Unassigned")
+}
+
+/// Map the emulator's clipboard kind to its wire mirror. The boundary where
+/// `alacritty_terminal` types stop: `protocol` deliberately imports none.
+fn clipboard_kind(kind: ClipboardType) -> ClipboardKind {
+    match kind {
+        ClipboardType::Clipboard => ClipboardKind::Clipboard,
+        ClipboardType::Selection => ClipboardKind::Selection,
+    }
 }
 
 /// Return the 64-bit FNV-1a hash used to separate fallback capture roots. The
@@ -519,11 +532,23 @@ impl Supervisor {
         // least every 200 ms), so an expired sync flushes here, before the
         // preview resolution reads the grid, letting the same tick ship it.
         // Resolution mutates per-task hold state; all tasks use one timestamp.
+        let watched = self.watched;
+        let mut clipboard = None;
         let views = self
             .tasks
             .iter_mut()
             .map(|t| {
                 t.flush_expired_sync();
+                // Drain every task's clipboard every tick and forward only the
+                // watched task's. Dropping the others here is the staleness
+                // guarantee: a store captured while backgrounded must never
+                // fire when the task is later watched — a wrong clipboard is
+                // silently harmful, an empty one visibly inert. The two-slot
+                // capture bound makes the constant drain cheap.
+                let stores = t.drain_clipboard();
+                if watched == Some(t.id) {
+                    clipboard = Some(stores);
+                }
                 TaskView {
                     id: t.id,
                     command: t.command.clone(),
@@ -541,6 +566,22 @@ impl Supervisor {
             })
             .collect();
         self.events.push(Event::Tasks(views));
+
+        if let Some(stores) = clipboard {
+            for (kind, text) in stores.stores {
+                self.events.push(Event::ClipboardCopy {
+                    kind: clipboard_kind(kind),
+                    text,
+                });
+            }
+            if let Some(len) = stores.oversized_len {
+                self.status(format!(
+                    "clipboard copy dropped: {} exceeds the {} limit",
+                    crate::format::bytes(len),
+                    crate::format::bytes(crate::emulator::CLIPBOARD_STORE_MAX_BYTES)
+                ));
+            }
+        }
 
         if let Some(id) = self.watched
             && let Some(t) = self.tasks.iter().find(|t| t.id == id)

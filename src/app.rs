@@ -617,6 +617,9 @@ impl App {
                     self.focused_screen = Some(s);
                 }
                 Event::Status(s) => self.status = Some(s),
+                // Dropped here until the client-side clipboard write lands
+                // in a later phase.
+                Event::ClipboardCopy { .. } => {}
                 Event::Sessions { names, recovery } => {
                     // Clamp both page selections to the refreshed lists.
                     self.session_sel = self.session_sel.min(names.len().saturating_sub(1));

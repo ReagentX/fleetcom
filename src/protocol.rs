@@ -196,6 +196,21 @@ pub enum Event {
         names: Vec<String>,
         recovery: Vec<RecoveryEntry>,
     },
+    /// One OSC 52 clipboard store from the watched task, already base64-decoded
+    /// by the terminal backend. Store-only: no load or query path exists, so
+    /// this event never solicits a reply.
+    ClipboardCopy { kind: ClipboardKind, text: String },
+}
+
+/// Which clipboard an OSC 52 store targets. A wire-layer mirror of the
+/// emulator's `ClipboardType`, kept here so `protocol` stays free of
+/// `alacritty_terminal` types; the supervisor maps at its boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClipboardKind {
+    /// The system clipboard (OSC 52 kind byte `c`).
+    Clipboard,
+    /// The primary selection (OSC 52 kind byte `s`).
+    Selection,
 }
 
 /// Recovery-snapshot metadata sent to the session picker.
@@ -884,6 +899,23 @@ pub fn encode_event(ev: &Event) -> (u8, Vec<u8>) {
             let _ = o.insert("recovery", rec);
             (KIND_CONTROL, o.dump().into_bytes())
         }
+        // Base64 like `Command::Input`: clipboard text is arbitrary child
+        // output and must cross the wire unsanitized. The emulator's 1 MiB
+        // store cap keeps the encoded frame far under `frame::MAX_FRAME`
+        // (see `CLIPBOARD_STORE_MAX_BYTES`'s const assertion).
+        Event::ClipboardCopy { kind, text } => {
+            let mut o = jzon::JsonValue::new_object();
+            let _ = o.insert("t", "clip");
+            let _ = o.insert(
+                "k",
+                match kind {
+                    ClipboardKind::Clipboard => "c",
+                    ClipboardKind::Selection => "s",
+                },
+            );
+            let _ = o.insert("text", B64.encode(text.as_bytes()));
+            (KIND_CONTROL, o.dump().into_bytes())
+        }
         Event::Screen(sv) => {
             let mut header = jzon::JsonValue::new_object();
             let _ = header.insert("id", sv.id);
@@ -968,6 +1000,17 @@ pub fn decode_event(kind: u8, payload: &[u8]) -> Option<Event> {
                     names: str_vec(&v["names"])?,
                     recovery: recovery_vec(&v["recovery"]),
                 }),
+                "clip" => {
+                    let kind = match v["k"].as_str()? {
+                        "c" => ClipboardKind::Clipboard,
+                        "s" => ClipboardKind::Selection,
+                        _ => return None,
+                    };
+                    // The store was UTF-8 when the emulator captured it; a
+                    // frame that decodes to anything else is malformed.
+                    let text = String::from_utf8(B64.decode(v["text"].as_str()?).ok()?).ok()?;
+                    Some(Event::ClipboardCopy { kind, text })
+                }
                 _ => None,
             }
         }
@@ -1720,5 +1763,68 @@ mod tests {
         let (k, p) = encode_event(&screen);
         assert_eq!(k, KIND_SCREEN);
         assert_eq!(decode_event(k, &p), Some(screen));
+    }
+
+    /// `ClipboardCopy` round-trips both kinds and carries clipboard text
+    /// unsanitized: unicode, control characters, and embedded markers survive
+    /// the JSON+base64 path byte-for-byte.
+    #[test]
+    fn clipboard_copy_round_trips() {
+        for ev in [
+            Event::ClipboardCopy {
+                kind: ClipboardKind::Clipboard,
+                text: "hello".into(),
+            },
+            Event::ClipboardCopy {
+                kind: ClipboardKind::Selection,
+                text: "sélection λ 🦀".into(),
+            },
+            Event::ClipboardCopy {
+                kind: ClipboardKind::Clipboard,
+                // Clipboard content is arbitrary: newlines, tabs, NUL, ESC,
+                // and paste-marker-shaped text must not be sanitized in
+                // transit.
+                text: "line1\nline2\tcol\u{0}\u{1b}[201~end".into(),
+            },
+        ] {
+            let (k, p) = encode_event(&ev);
+            assert_eq!(k, KIND_CONTROL);
+            assert_eq!(decode_event(k, &p), Some(ev));
+        }
+    }
+
+    /// `ClipboardCopy` pins its wire shape: `t` discriminator, the OSC 52
+    /// kind byte under `k`, and base64 text.
+    #[test]
+    fn clipboard_copy_wire_form() {
+        let (k, p) = encode_event(&Event::ClipboardCopy {
+            kind: ClipboardKind::Selection,
+            text: "hi".into(),
+        });
+        assert_eq!(k, KIND_CONTROL);
+        assert_eq!(
+            std::str::from_utf8(&p).unwrap(),
+            r#"{"t":"clip","k":"s","text":"aGk="}"#
+        );
+    }
+
+    /// A malformed `ClipboardCopy` frame is rejected whole: missing fields,
+    /// an unknown kind string, invalid base64, and non-UTF-8 decoded bytes.
+    #[test]
+    fn malformed_clipboard_copy_is_rejected() {
+        for json in [
+            r#"{"t":"clip","text":"aGk="}"#,           // missing kind
+            r#"{"t":"clip","k":"c"}"#,                 // missing text
+            r#"{"t":"clip","k":"p","text":"aGk="}"#,   // unknown kind string
+            r#"{"t":"clip","k":"c","text":"!!!"}"#,    // invalid base64
+            r#"{"t":"clip","k":"c","text":"/w=="}"#,   // 0xFF: not UTF-8
+            r#"{"t":"clip","k":"c","text":["aGk="]}"#, // text must be a string
+        ] {
+            assert_eq!(
+                decode_event(KIND_CONTROL, json.as_bytes()),
+                None,
+                "should reject {json}"
+            );
+        }
     }
 }

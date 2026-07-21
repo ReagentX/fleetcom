@@ -213,6 +213,149 @@ fn tick_flushes_a_stalled_sync_update() {
     );
 }
 
+/// OSC 52 stores from the watched task reach `drain` as decoded
+/// `ClipboardCopy` events, one per store in arrival order. The emission is
+/// flag-gated so `Watch` is installed before any store can arrive.
+#[test]
+fn watched_task_clipboard_stores_are_forwarded() {
+    let dir = scratch("clip_fwd");
+    let ready = dir.join("ready");
+    let flag = dir.join("flag");
+    let mut s = sup(24, 80);
+    // "aGVsbG8=" is "hello" (clipboard), "d29ybGQ=" is "world" (selection).
+    let cmd = format!(
+        "touch {r}; until [ -e {f} ]; do sleep 0.05; done; \
+         printf '\\033]52;c;aGVsbG8=\\007\\033]52;s;d29ybGQ=\\007'; sleep 30",
+        r = ready.display(),
+        f = flag.display()
+    );
+    let id = spawn_ready(&mut s, cmd, here(), &ready);
+    s.apply(Command::Watch { id: Some(id) });
+    std::fs::write(&flag, b"").unwrap();
+
+    let mut copies = Vec::new();
+    let ok = wait_until(Duration::from_secs(5), || {
+        s.tick();
+        copies.extend(s.drain().into_iter().filter_map(|e| match e {
+            Event::ClipboardCopy { kind, text } => Some((kind, text)),
+            _ => None,
+        }));
+        copies.len() >= 2
+    });
+    assert!(ok, "the clipboard stores never arrived; got {copies:?}");
+    assert_eq!(
+        copies,
+        vec![
+            (ClipboardKind::Clipboard, "hello".to_string()),
+            (ClipboardKind::Selection, "world".to_string()),
+        ]
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A store captured while the task is not watched is discarded by the
+/// per-tick drain, never deferred: watching the task afterwards forwards
+/// nothing. Staleness is worse than loss — a wrong clipboard is silently
+/// harmful, an empty one visibly inert.
+#[test]
+fn backgrounded_clipboard_store_is_discarded_not_deferred() {
+    let mut s = sup(24, 80);
+    // "c3RhbGU=" is "stale". The trailing marker proves the store's bytes
+    // were parsed: it follows them in the output stream.
+    spawn(
+        &mut s,
+        "printf '\\033]52;c;c3RhbGU=\\007COPIED'; sleep 30",
+        here(),
+    );
+    let mut id = 0;
+    let parsed = wait_until(Duration::from_secs(5), || {
+        s.tick();
+        let mut seen = false;
+        for e in s.drain() {
+            match e {
+                Event::Tasks(v) => {
+                    if let Some(t) = v.first() {
+                        id = t.id;
+                        seen = t.preview.text.contains("COPIED");
+                    }
+                }
+                Event::ClipboardCopy { .. } => {
+                    panic!("an unwatched task's store must not be forwarded")
+                }
+                _ => {}
+            }
+        }
+        seen
+    });
+    assert!(parsed, "the marker never reached the grid");
+    // The marker only proves the store was parsed by that tick's preview
+    // resolution, which runs after the drain; one more tick guarantees a
+    // drain after capture.
+    s.tick();
+    let _ = s.drain();
+
+    s.apply(Command::Watch { id: Some(id) });
+    let mut saw_screen = false;
+    for _ in 0..3 {
+        s.tick();
+        for e in s.drain() {
+            match e {
+                Event::ClipboardCopy { .. } => {
+                    panic!("a store buffered while backgrounded must never fire on watch")
+                }
+                Event::Screen(_) => saw_screen = true,
+                _ => {}
+            }
+        }
+    }
+    assert!(saw_screen, "watching the task should stream its screen");
+}
+
+/// An over-cap store on the watched task yields the drop notice and no
+/// `ClipboardCopy`: the copy is lost loudly, not truncated or forwarded.
+#[test]
+fn oversized_watched_store_yields_notice_and_no_copy() {
+    let dir = scratch("clip_oversize");
+    let ready = dir.join("ready");
+    let flag = dir.join("flag");
+    let mut s = sup(24, 80);
+    // 3 MiB decoded exceeds the 1 MiB cap. The child generates the base64
+    // itself because `MAX_COMMAND_LEN` cannot carry the payload inline;
+    // `tr` strips GNU base64's line wrapping (macOS emits none).
+    let cmd = format!(
+        "touch {r}; until [ -e {f} ]; do sleep 0.05; done; \
+         printf '\\033]52;c;'; \
+         dd if=/dev/zero bs=1024 count=3072 2>/dev/null | base64 | tr -d '\\n'; \
+         printf '\\007'; sleep 30",
+        r = ready.display(),
+        f = flag.display()
+    );
+    let id = spawn_ready(&mut s, cmd, here(), &ready);
+    s.apply(Command::Watch { id: Some(id) });
+    std::fs::write(&flag, b"").unwrap();
+
+    let mut notice = None;
+    let ok = wait_until(Duration::from_secs(10), || {
+        s.tick();
+        for e in s.drain() {
+            match e {
+                Event::ClipboardCopy { .. } => {
+                    panic!("an over-cap store must be dropped, not forwarded")
+                }
+                Event::Status(msg) => notice = Some(msg),
+                _ => {}
+            }
+        }
+        notice.is_some()
+    });
+    assert!(ok, "the oversized-store notice never arrived");
+    assert_eq!(
+        notice.as_deref(),
+        Some("clipboard copy dropped: 3 MiB exceeds the 1 MiB limit")
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Scratch dir for tests that sync through marker files.
 fn scratch(tag: &str) -> PathBuf {
     crate::testutil::temp(&format!("sup_{tag}"))
