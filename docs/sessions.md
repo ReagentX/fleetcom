@@ -14,7 +14,7 @@ A session is a launch recipe, not a process snapshot. It records commands, worki
 
 The first save creates the directory. This matches the [configuration path resolution](README.md#config-directory-sessions) used by save, list, and load.
 
-The filename derives from the session name. `fleetcom` trims leading and trailing whitespace, replaces control characters and any of `* " / \ < > : | ? .` with `_`, and caps the result at 255 characters: `my/session` becomes `my_session.json`, and `a.b` becomes `a_b.json`. Replacing `.` prevents the session name from supplying another extension.
+The filename derives from the session name. `fleetcom` trims leading and trailing whitespace, replaces control characters and any of `* " / \ < > : | ? .` with `_`, and caps the result at 250 bytes: `NAME_MAX` is 255 bytes on common Unix filesystems, and the `.json` extension takes the other 5. The cap falls on a character boundary — a multibyte character that would cross it is dropped whole, never split. `my/session` becomes `my_session.json`, and `a.b` becomes `a_b.json`. Replacing `.` prevents the session name from supplying another extension.
 
 ## Format
 
@@ -24,7 +24,7 @@ A session file is a JSON object with two fields. `name` holds the session name a
 {
   "name": "work/api",
   "dirs": {
-    "/home/you/work/api": [
+    "~/work/api": [
       "cargo watch -x test",
       { "cmd": "cargo run", "group": "api", "name": "api server" }
     ],
@@ -36,7 +36,7 @@ A session file is a JSON object with two fields. `name` holds the session name a
 ```
 
 - `name` exists because sanitization collapses distinct session names onto one filename: `a/b` and `a.b` both save to `a_b.json`. Saving compares the stored name against the incoming one and refuses a mismatch with an error naming both sessions. The load picker also displays it, so the list shows `a/b`, not `a_b`.
-- Keys under `dirs` are directory paths: each task's working directory.
+- Keys under `dirs` are directory paths: each task's working directory. Saves write directories under `$HOME` as `~/…`; other paths stay absolute. On load, `~` expands to `$HOME`, and a relative key resolves against the invocation directory of the client loading the session.
 - Values are ordered lists. A string member is a bare shell command; the object form adds the optional group and display name assigned on load. Order is preserved, and each command runs in its own PTY under that directory.
 - Directories serialize alphabetically. Command order remains stable within each directory.
 
@@ -54,7 +54,7 @@ A bare agent command does not identify its conversation, so saving it verbatim w
 {
   "name": "agents",
   "dirs": {
-    "/home/you/work/api": [
+    "~/work/api": [
       "claude --resume 'c8c4a5cc-0b32-4ba0-a6b4-6ed08c218e0d'",
       { "cmd": "codex resume '019f5453-de22-7240-b2e5-0d32692aa6d9'", "name": "reviewer" }
     ]

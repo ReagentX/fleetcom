@@ -28,19 +28,38 @@ pub const FLEETCOM_CONFIG_DIR: &str = "FLEETCOM_CONFIG_DIR";
 /// Characters replaced with `_` in session filenames.
 const DISALLOWED: &[char] = &['*', '"', '/', '\\', '<', '>', ':', '|', '?', '.'];
 
-/// Make `name` safe as a bare filename.
+/// Byte cap for sanitized names: `NAME_MAX` (255 bytes) common to Unix
+/// filesystems minus the 5-byte `.json` extension `save_in` appends.
+const MAX_STEM_BYTES: usize = 250;
+
+/// Make `name` safe as a bare filename. The cap counts encoded bytes, not
+/// chars: a char that would cross [`MAX_STEM_BYTES`] drops whole, never split.
 fn sanitize(name: &str) -> String {
-    name.trim()
-        .chars()
-        .map(|c| {
-            if c.is_control() || DISALLOWED.contains(&c) {
-                '_'
-            } else {
-                c
-            }
-        })
-        .take(255)
-        .collect()
+    let mut out = String::new();
+    for c in name.trim().chars() {
+        let c = if c.is_control() || DISALLOWED.contains(&c) {
+            '_'
+        } else {
+            c
+        };
+        if out.len() + c.len_utf8() > MAX_STEM_BYTES {
+            break;
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// Longest prefix of `s` at most `max` bytes long, on a char boundary.
+fn prefix_bytes(s: &str, max: usize) -> &str {
+    if s.len() <= max {
+        return s;
+    }
+    let mut end = max;
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
 }
 
 /// Session-recipe directory: `<config root>/sessions`. A caller-supplied
@@ -172,7 +191,12 @@ pub fn save_in(dir: &Path, name: &str, cfg: &SessionConfig) -> io::Result<PathBu
     let pid = std::process::id();
     let (mut tmp_file, tmp) = loop {
         let n = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
-        let candidate = dir.join(format!(".{file_name}.{pid}.{n}.tmp"));
+        // A max-length recipe name fills the 255-byte NAME_MAX budget on its
+        // own, so the name portion shrinks to fit this component's leading dot
+        // and pid/seq/tmp decorations. Uniqueness rides on pid and seq alone.
+        let suffix = format!(".{pid}.{n}.tmp");
+        let stem = prefix_bytes(&file_name, 254 - suffix.len());
+        let candidate = dir.join(format!(".{stem}{suffix}"));
         match fs::OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -377,6 +401,39 @@ mod tests {
     fn sanitizes_names() {
         assert_eq!(sanitize("my/session"), "my_session");
         assert_eq!(sanitize("  a.b  "), "a_b");
+    }
+
+    /// The cap keeps exactly 250 ASCII bytes and drops the 251st, so the
+    /// `.json` filename lands on NAME_MAX exactly.
+    #[test]
+    fn caps_names_at_250_bytes() {
+        assert_eq!(sanitize(&"a".repeat(250)), "a".repeat(250));
+        let capped = sanitize(&"a".repeat(251));
+        assert_eq!(capped, "a".repeat(250));
+        assert_eq!(format!("{capped}.json").len(), 255);
+    }
+
+    /// A char that would cross the 250-byte cap drops whole, never split.
+    #[test]
+    fn cap_drops_a_multibyte_char_whole() {
+        // 249 bytes used; the 2-byte 'é' would reach 251.
+        let capped = sanitize(&format!("{}é", "a".repeat(249)));
+        assert_eq!(capped, "a".repeat(249));
+    }
+
+    /// A 255-char name saves and loads: the byte cap keeps every filename
+    /// component, the temp file's included, within NAME_MAX.
+    #[test]
+    fn long_names_save_within_name_max() {
+        let dir = temp("session_long_name");
+        let mut cfg = SessionConfig::new();
+        cfg.insert("~/p".into(), vec![e("vim")]);
+        let name = "n".repeat(255);
+
+        let file = save_in(&dir, &name, &cfg).unwrap();
+        assert_eq!(file.file_name().unwrap().len(), 255);
+        assert_eq!(load_in(&dir, &name).unwrap(), cfg);
+        let _ = fs::remove_dir_all(&dir);
     }
 
     /// Recipe files are owner-only, including after replacing a 0644 file.
