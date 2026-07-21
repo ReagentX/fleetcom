@@ -1895,7 +1895,11 @@ fn attached_clipboard_store_emits_the_osc52_envelope() {
     let mut out = Vec::new();
     app.flush_clipboard(&mut out).unwrap();
     assert_eq!(out, b"\x1b]52;c;aGVsbG8=\x07");
-    assert_eq!(app.status.as_deref(), Some("copied 5 chars"));
+    assert_eq!(app.notice(), Some("copied 5 chars"));
+    assert!(
+        app.status.is_none(),
+        "the copy confirmation is ephemeral; it must not occupy the status"
+    );
 }
 
 /// A `Selection` store collapses to kind byte `c`: the host-terminal chain
@@ -1948,7 +1952,7 @@ fn clipboard_stores_outside_attached_mode_are_dropped() {
         let mut out = Vec::new();
         app.flush_clipboard(&mut out).unwrap();
         assert!(out.is_empty(), "nothing may emit");
-        assert!(app.status.is_none(), "no notice without an emission");
+        assert!(app.notice().is_none(), "no notice without an emission");
     }
 }
 
@@ -1956,7 +1960,7 @@ fn clipboard_stores_outside_attached_mode_are_dropped() {
 /// at the last: last-writer-wins), and the notice counts the last entry's
 /// chars, not its bytes.
 #[test]
-fn pending_stores_emit_in_order_and_status_counts_last_entry_chars() {
+fn pending_stores_emit_in_order_and_notice_counts_last_entry_chars() {
     let mut app = App::new_local(30, 100);
     app.mode = Mode::Attached;
     app.on_clipboard_copy(ClipboardKind::Clipboard, "first".to_string());
@@ -1971,7 +1975,7 @@ fn pending_stores_emit_in_order_and_status_counts_last_entry_chars() {
     );
     assert_eq!(out, expected.as_bytes());
     // "héllo日" is 6 chars but 9 bytes: the notice must report chars.
-    assert_eq!(app.status.as_deref(), Some("copied 6 chars"));
+    assert_eq!(app.notice(), Some("copied 6 chars"));
     assert!(
         app.pending_clipboard.is_empty(),
         "the flush drains the buffer"
@@ -1986,5 +1990,48 @@ fn empty_clipboard_flush_writes_nothing() {
     let mut out = Vec::new();
     app.flush_clipboard(&mut out).unwrap();
     assert!(out.is_empty());
-    assert!(app.status.is_none());
+    assert!(app.notice().is_none());
+}
+
+/// The notice dies of age: the accessor answers `None` once `NOTICE_TTL` has
+/// passed. No clearing pass exists — expiry is the accessor's answer.
+#[test]
+fn notice_expires_lazily_after_the_ttl() {
+    let mut app = App::new_local(30, 100);
+    app.set_notice("copied 5 chars".to_string());
+    assert_eq!(app.notice(), Some("copied 5 chars"));
+
+    let past = Instant::now()
+        .checked_sub(NOTICE_TTL)
+        .expect("system uptime exceeds NOTICE_TTL");
+    app.notice = Some(("copied 5 chars".to_string(), past));
+    assert_eq!(app.notice(), None, "an aged-out notice must not render");
+}
+
+/// A status event arriving while attached mirrors into the notice — the
+/// dashboard row that displays `status` is off screen there — and still sets
+/// the persistent status verbatim.
+#[test]
+fn attached_status_event_mirrors_into_the_notice() {
+    let dir = session_scratch("status_mirror", &[]);
+    let mut app = app_with_config_dir(&dir);
+    app.mode = Mode::Attached;
+    app.save_session("mirror");
+    app.pump();
+    assert_eq!(app.status.as_deref(), Some("saved 'mirror': 0 command(s)"));
+    assert_eq!(app.notice(), Some("saved 'mirror': 0 command(s)"));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A status event on the dashboard stays out of the notice: the command row
+/// already displays `status` there, and the attached bar is off screen.
+#[test]
+fn dashboard_status_event_sets_only_the_status() {
+    let dir = session_scratch("status_dash", &[]);
+    let mut app = app_with_config_dir(&dir);
+    app.save_session("dash");
+    app.pump();
+    assert_eq!(app.status.as_deref(), Some("saved 'dash': 0 command(s)"));
+    assert!(app.notice().is_none(), "no mirror outside attached mode");
+    let _ = std::fs::remove_dir_all(&dir);
 }

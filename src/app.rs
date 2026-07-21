@@ -10,7 +10,7 @@ use std::{
         mpsc::{Receiver, Sender, channel},
     },
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
@@ -44,6 +44,11 @@ const _: () = assert!(
     MAX_PASTE.div_ceil(3) * 4 + 64 * 1024 <= crate::frame::MAX_FRAME as usize,
     "MAX_PASTE must base64-encode to under frame::MAX_FRAME"
 );
+
+/// How long an ephemeral notice stays visible. Expiry is lazy — `notice()`
+/// answers `None` past this age — and the run loop's 100ms receive timeout
+/// bounds how far past the deadline a stale one can stay painted.
+const NOTICE_TTL: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
@@ -195,6 +200,11 @@ pub struct App {
     pub recovery_sel: usize,
     /// Transient one-line notice (save/load result), dismissed on the next key.
     pub status: Option<String>,
+    /// Ephemeral notice and the instant it was set: clipboard-copy
+    /// confirmations, plus attached-mode mirrors of `Event::Status`. A
+    /// separate channel from `status` — that one persists until replaced or
+    /// cleared; this one dies of age through `notice()`.
+    notice: Option<(String, Instant)>,
     /// OSC 52 stores accepted while attached, awaiting re-emission to the host
     /// terminal by `flush_clipboard` later in the same run-loop iteration.
     pending_clipboard: Vec<(ClipboardKind, String)>,
@@ -375,6 +385,7 @@ impl App {
             session_page: SessionPage::Saved,
             recovery_sel: 0,
             status: None,
+            notice: None,
             pending_clipboard: Vec::new(),
             input_rx,
             input_tx: Some(input_tx),
@@ -621,7 +632,16 @@ impl App {
                     }
                     self.focused_screen = Some(s);
                 }
-                Event::Status(s) => self.status = Some(s),
+                Event::Status(s) => {
+                    // While attached, the dashboard row that displays `status`
+                    // is off screen: mirror the message into the notice so
+                    // supervisor warnings (e.g. the clipboard oversize drop)
+                    // are seen when they happen. `status` is set as always.
+                    if self.mode == Mode::Attached {
+                        self.set_notice(s.clone());
+                    }
+                    self.status = Some(s);
+                }
                 Event::ClipboardCopy { kind, text } => self.on_clipboard_copy(kind, text),
                 Event::Sessions { names, recovery } => {
                     // Clamp both page selections to the refreshed lists.
@@ -647,6 +667,21 @@ impl App {
         }
     }
 
+    /// Stage the ephemeral notice, replacing any predecessor: the newest
+    /// message wins, and replacement caps the state at one string.
+    fn set_notice(&mut self, msg: String) {
+        self.notice = Some((msg, Instant::now()));
+    }
+
+    /// The staged notice while it is younger than `NOTICE_TTL`. Expiry is
+    /// lazy — nothing ever clears the field — because every render pass asks
+    /// here and the run loop renders at least every ~100ms, which bounds how
+    /// long an expired notice can stay painted.
+    pub fn notice(&self) -> Option<&str> {
+        let (msg, set_at) = self.notice.as_ref()?;
+        (set_at.elapsed() < NOTICE_TTL).then_some(msg.as_str())
+    }
+
     /// Re-emit buffered clipboard stores to the host terminal, oldest first:
     /// with multiple entries the host's clipboard ends at the last one,
     /// matching last-writer-wins clipboard semantics. The payload is data,
@@ -666,7 +701,10 @@ impl App {
             last = copied_chars(&text);
         }
         out.flush()?;
-        self.status = Some(format!("copied {last} chars"));
+        // The status row is off screen while attached — exactly when copies
+        // happen — so the confirmation goes to the notice, which the attached
+        // bar renders.
+        self.set_notice(format!("copied {last} chars"));
         Ok(())
     }
 
