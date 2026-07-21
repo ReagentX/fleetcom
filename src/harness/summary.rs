@@ -39,12 +39,6 @@ pub trait SummaryAdapter: Sync {
     /// prepends it to live status as `{label} · `.
     fn model_label(&self, screen: &dyn ScreenFacts) -> Option<String>;
 
-    /// Return an optional final summary derived from retained terminal text.
-    /// The default implementation produces no summary.
-    fn exit_preview(&self, _retained_text: &str) -> Option<String> {
-        None
-    }
-
     /// Optionally normalize a captured title for display. Emulator title
     /// capture remains program-agnostic; `None` renders the title verbatim.
     fn normalize_title(&self, _title: &str) -> Option<String> {
@@ -585,8 +579,7 @@ mod tests {
         let mut emu = Emulator::new(rows, cols, 2000);
         emu.process(bytes);
         let mut st = PreviewState::new();
-        st.resolve(Instant::now(), false, &emu, Some(adapter))
-            .clone()
+        st.resolve(Instant::now(), &emu, Some(adapter)).clone()
     }
 
     fn anchor(text: &str, rule: &'static str) -> (String, PreviewSource, Option<&'static str>) {
@@ -874,7 +867,7 @@ mod tests {
         emu.process(b"\x1b[?1049h\x1b]0;\xe2\x9c\xa2 Claude Code\x07conversation body");
         let mut st = PreviewState::new();
         let p = st
-            .resolve(Instant::now(), false, &emu, Some(&ClaudeSummary))
+            .resolve(Instant::now(), &emu, Some(&ClaudeSummary))
             .clone();
         assert_eq!(
             (p.text.as_str(), p.source, p.rule),
@@ -882,7 +875,7 @@ mod tests {
         );
 
         let mut st = PreviewState::new();
-        let p = st.resolve(Instant::now(), false, &emu, None).clone();
+        let p = st.resolve(Instant::now(), &emu, None).clone();
         assert_eq!(
             (p.text.as_str(), p.source),
             ("✢ Claude Code", PreviewSource::Title),
@@ -1584,10 +1577,10 @@ mod tests {
             assert!(emu.alternate_screen(), "{name}: alt screen active at cut");
             let mut st = PreviewState::new();
             let with = st
-                .resolve(Instant::now(), false, &emu, Some(&ClaudeSummary))
+                .resolve(Instant::now(), &emu, Some(&ClaudeSummary))
                 .clone();
             let mut st = PreviewState::new();
-            let without = st.resolve(Instant::now(), false, &emu, None).clone();
+            let without = st.resolve(Instant::now(), &emu, None).clone();
             assert_eq!(with, without, "{name}: the adapter must change nothing");
             assert_eq!(with.source, PreviewSource::Marker, "{name}");
         }

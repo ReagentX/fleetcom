@@ -743,27 +743,21 @@ impl Task {
     /// the grid lock (see [`crate::preview`]). `now` is the caller's tick
     /// instant so every task in one snapshot resolves against the same clock.
     pub fn resolve_preview(&mut self, now: Instant) -> Preview {
-        let finished = self.finished.is_some();
         let emu = grid(&self.parser);
         self.preview
-            .resolve(now, finished, &*emu, self.summary_adapter)
+            .resolve(now, &*emu, self.summary_adapter)
             .clone()
     }
 
     /// Freeze the preview once output is complete. Any open `?2026` frame is
-    /// landed first, and retained text is read only when an adapter is
-    /// selected.
+    /// landed first.
     pub(crate) fn finalize_preview(&mut self) {
         if self.preview.finalized() || !self.output_complete() {
             return;
         }
         let mut emu = grid(&self.parser);
         let _ = emu.finish_output();
-        let exit_line = self
-            .summary_adapter
-            .and_then(|a| a.exit_preview(&emu.text_with_history()));
-        self.preview
-            .finalize(&*emu, self.summary_adapter, exit_line);
+        self.preview.finalize(&*emu, self.summary_adapter);
     }
 
     /// Full screen as ANSI bytes for attached mode, plus cursor state so we can
