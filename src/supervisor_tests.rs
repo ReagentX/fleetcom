@@ -16,6 +16,24 @@ fn sup(rows: u16, cols: u16) -> Supervisor {
     s
 }
 
+/// Apply an ungrouped `Command::Spawn` of `cmd` in `cwd`.
+fn spawn(s: &mut Supervisor, cmd: impl Into<String>, cwd: PathBuf) {
+    s.apply(Command::Spawn {
+        command: cmd.into(),
+        cwd,
+        group: None,
+    });
+}
+
+/// Apply a `Command::Spawn` of `cmd` in `cwd` under `group`.
+fn spawn_grouped(s: &mut Supervisor, cmd: impl Into<String>, cwd: PathBuf, group: &str) {
+    s.apply(Command::Spawn {
+        command: cmd.into(),
+        cwd,
+        group: Some(group.into()),
+    });
+}
+
 /// Scrollback resolution applies precedence, clamping, and environment fallback.
 #[test]
 fn scrollback_resolution_precedence_clamp_and_fallback() {
@@ -35,21 +53,9 @@ fn scrollback_resolution_precedence_clamp_and_fallback() {
 #[test]
 fn session_config_groups_by_dir_in_spawn_order() {
     let mut s = sup(24, 80);
-    s.apply(Command::Spawn {
-        command: "a".into(),
-        cwd: here(),
-        group: None,
-    });
-    s.apply(Command::Spawn {
-        command: "b".into(),
-        cwd: PathBuf::from("/tmp"),
-        group: None,
-    });
-    s.apply(Command::Spawn {
-        command: "c".into(),
-        cwd: here(),
-        group: None,
-    });
+    spawn(&mut s, "a", here());
+    spawn(&mut s, "b", PathBuf::from("/tmp"));
+    spawn(&mut s, "c", here());
 
     let cfg = s.session_config();
     assert_eq!(
@@ -83,11 +89,7 @@ fn session_config_groups_by_dir_in_spawn_order() {
 #[test]
 fn tick_emits_snapshot_and_watched_screen() {
     let mut s = sup(24, 80);
-    s.apply(Command::Spawn {
-        command: "sleep 30".into(),
-        cwd: here(),
-        group: None,
-    });
+    spawn(&mut s, "sleep 30", here());
 
     s.tick();
     let evs = s.drain();
@@ -116,11 +118,7 @@ fn tick_emits_snapshot_and_watched_screen() {
 #[test]
 fn watched_screen_not_resent_when_unchanged() {
     let mut s = sup(24, 80);
-    s.apply(Command::Spawn {
-        command: "sleep 30".into(),
-        cwd: here(),
-        group: None,
-    });
+    spawn(&mut s, "sleep 30", here());
     // Settle: let the silent shell finish any startup writes so the screen
     // stabilizes before we assert nothing changes.
     let mut id = 0;
@@ -194,11 +192,11 @@ fn decset_1007_flip_resends_watched_screen() {
 #[test]
 fn tick_flushes_a_stalled_sync_update() {
     let mut s = sup(24, 80);
-    s.apply(Command::Spawn {
-        command: "printf 'begin\\033[?2026hstalled'; sleep 30".into(),
-        cwd: here(),
-        group: None,
-    });
+    spawn(
+        &mut s,
+        "printf 'begin\\033[?2026hstalled'; sleep 30",
+        here(),
+    );
     let mut preview = String::new();
     wait_until(Duration::from_secs(5), || {
         s.tick();
@@ -226,11 +224,7 @@ fn scratch(tag: &str) -> PathBuf {
 /// keeps kill-path tests deterministic (no signalling a shell that hasn't
 /// installed its trap yet).
 fn spawn_ready(s: &mut Supervisor, command: String, cwd: PathBuf, ready: &Path) -> u64 {
-    s.apply(Command::Spawn {
-        command,
-        cwd,
-        group: None,
-    });
+    spawn(s, command, cwd);
     assert!(
         wait_until(Duration::from_secs(5), || ready.exists()),
         "task never signalled ready"
@@ -316,11 +310,7 @@ fn term_ignoring_task_escalates_to_kill() {
 #[test]
 fn shutdown_returns_early_when_jobs_respect_term() {
     let mut s = sup(24, 80);
-    s.apply(Command::Spawn {
-        command: "sleep 300".into(),
-        cwd: here(),
-        group: None,
-    });
+    spawn(&mut s, "sleep 300", here());
     let t0 = Instant::now();
     s.apply(Command::Shutdown);
     assert!(
@@ -341,11 +331,7 @@ fn shutdown_returns_early_when_jobs_respect_term() {
 fn shutdown_survives_a_child_that_never_reads_stdin() {
     let mut s = sup(24, 80);
     s.set_kill_grace(Duration::from_millis(200));
-    s.apply(Command::Spawn {
-        command: "sleep 300".into(),
-        cwd: here(),
-        group: None,
-    });
+    spawn(&mut s, "sleep 300", here());
     let id = first_id(&mut s);
     // Newline-terminated input fills the canonical-mode PTY queue and
     // blocks the writer worker while the child is not reading.
@@ -373,11 +359,7 @@ fn shutdown_survives_a_child_that_never_reads_stdin() {
 fn overfull_writer_queue_refuses_message_with_notice() {
     let mut s = sup(24, 80);
     s.set_kill_grace(Duration::from_millis(200));
-    s.apply(Command::Spawn {
-        command: "sleep 300".into(),
-        cwd: here(),
-        group: None,
-    });
+    spawn(&mut s, "sleep 300", here());
     let id = first_id(&mut s);
     // Newline-terminated input keeps the worker blocked and its admitted
     // byte count pending while the child does not read.
@@ -445,11 +427,7 @@ fn shutdown_is_bounded_by_grace() {
 #[test]
 fn clear_watch_stops_screen_stream_and_resets_dedup() {
     let mut s = sup(24, 80);
-    s.apply(Command::Spawn {
-        command: "sleep 30".into(),
-        cwd: here(),
-        group: None,
-    });
+    spawn(&mut s, "sleep 30", here());
     let id = first_id(&mut s);
 
     s.apply(Command::Watch { id: Some(id) });
@@ -482,11 +460,7 @@ fn clear_watch_stops_screen_stream_and_resets_dedup() {
 fn clear_watch_snaps_the_watched_task_live() {
     // Use a short grid to build scrollback quickly.
     let mut s = sup(6, 80);
-    s.apply(Command::Spawn {
-        command: "seq 1 200; sleep 30".into(),
-        cwd: here(),
-        group: None,
-    });
+    spawn(&mut s, "seq 1 200; sleep 30", here());
     let id = first_id(&mut s);
     s.apply(Command::Watch { id: Some(id) });
 
@@ -519,11 +493,11 @@ fn rerun_replaces_finished_task_in_place() {
     let dir = scratch("rerun");
     let marker = dir.join("marker");
     let mut s = sup(24, 80);
-    s.apply(Command::Spawn {
-        command: format!("echo run >> {}", marker.display()),
-        cwd: dir.clone(),
-        group: None,
-    });
+    spawn(
+        &mut s,
+        format!("echo run >> {}", marker.display()),
+        dir.clone(),
+    );
     let id = first_id(&mut s);
     s.apply(Command::Tag { id, on: true });
     wait_for_lifecycle(&mut s, id, |l| l == Lifecycle::Ok);
@@ -592,11 +566,7 @@ fn display_names_normalize_at_the_boundary() {
 #[test]
 fn set_group_round_trips_and_clears() {
     let mut s = sup(24, 80);
-    s.apply(Command::Spawn {
-        command: "sleep 30".into(),
-        cwd: here(),
-        group: None,
-    });
+    spawn(&mut s, "sleep 30", here());
     let id = first_id(&mut s);
     let group_of = |s: &mut Supervisor| -> Option<String> {
         s.tick();
@@ -633,11 +603,7 @@ fn set_group_round_trips_and_clears() {
 #[test]
 fn set_name_round_trips_and_clears() {
     let mut s = sup(24, 80);
-    s.apply(Command::Spawn {
-        command: "sleep 30".into(),
-        cwd: here(),
-        group: None,
-    });
+    spawn(&mut s, "sleep 30", here());
     let id = first_id(&mut s);
     let name_of = |s: &mut Supervisor| -> Option<String> {
         s.tick();
@@ -680,11 +646,7 @@ fn set_name_round_trips_and_clears() {
 #[test]
 fn spawn_carries_a_normalized_group_from_birth() {
     let mut s = sup(24, 80);
-    s.apply(Command::Spawn {
-        command: "sleep 30".into(),
-        cwd: here(),
-        group: Some("  ui\x1b[2J  ".into()),
-    });
+    spawn_grouped(&mut s, "sleep 30", here(), "  ui\x1b[2J  ");
     s.tick();
     match s.drain().first() {
         Some(Event::Tasks(v)) => assert_eq!(v[0].group.as_deref(), Some("ui[2J")),
@@ -697,11 +659,7 @@ fn spawn_carries_a_normalized_group_from_birth() {
 fn rerun_carries_the_group_over() {
     use crate::protocol::Lifecycle;
     let mut s = sup(24, 80);
-    s.apply(Command::Spawn {
-        command: "true".into(),
-        cwd: here(),
-        group: Some("infra".into()),
-    });
+    spawn_grouped(&mut s, "true", here(), "infra");
     let id = first_id(&mut s);
     wait_for_lifecycle(&mut s, id, |l| l == Lifecycle::Ok);
 
@@ -720,11 +678,7 @@ fn rerun_carries_the_group_over() {
 fn rerun_carries_the_name_over() {
     use crate::protocol::Lifecycle;
     let mut s = sup(24, 80);
-    s.apply(Command::Spawn {
-        command: "true".into(),
-        cwd: here(),
-        group: None,
-    });
+    spawn(&mut s, "true", here());
     let id = first_id(&mut s);
     s.apply(Command::SetName {
         id,
@@ -748,11 +702,7 @@ fn rerun_carries_the_name_over() {
 fn rerun_refuses_running_task_and_unknown_id() {
     use crate::protocol::Lifecycle;
     let mut s = sup(24, 80);
-    s.apply(Command::Spawn {
-        command: "sleep 30".into(),
-        cwd: here(),
-        group: None,
-    });
+    spawn(&mut s, "sleep 30", here());
     let id = first_id(&mut s);
 
     s.apply(Command::Restart { id });
@@ -786,11 +736,7 @@ fn rerun_refuses_running_task_and_unknown_id() {
 fn rerun_watched_task_resends_screen() {
     use crate::protocol::Lifecycle;
     let mut s = sup(24, 80);
-    s.apply(Command::Spawn {
-        command: "true".into(),
-        cwd: here(),
-        group: None,
-    });
+    spawn(&mut s, "true", here());
     let id = first_id(&mut s);
     wait_for_lifecycle(&mut s, id, |l| l == Lifecycle::Ok);
 
@@ -813,11 +759,7 @@ fn rerun_watched_task_resends_screen() {
 #[test]
 fn resize_clamps_hostile_dimensions() {
     let mut s = sup(24, 80);
-    s.apply(Command::Spawn {
-        command: "sleep 30".into(),
-        cwd: here(),
-        group: None,
-    });
+    spawn(&mut s, "sleep 30", here());
     s.apply(Command::Resize { rows: 0, cols: 0 });
     s.tick(); // exercises the resized grid (snapshot + screen): no panic
     let _ = s.drain();
@@ -1191,11 +1133,7 @@ fn shutdown_holds_the_grace_for_members_of_an_exited_leader() {
 fn shutdown_is_prompt_when_every_group_is_already_empty() {
     let mut s = sup(24, 80);
     for _ in 0..2 {
-        s.apply(Command::Spawn {
-            command: "true".into(),
-            cwd: here(),
-            group: None,
-        });
+        spawn(&mut s, "true", here());
     }
     assert!(reap_until(&mut s, Duration::from_secs(5), |s| {
         s.tasks.len() == 2 && s.tasks.iter().all(|t| t.finished.is_some())
@@ -1269,16 +1207,8 @@ fn load_session_restores_saved_groups() {
     };
     let mut s = Supervisor::new(24, 80, 2000);
     s.set_launch_context(ctx.clone());
-    s.apply(Command::Spawn {
-        command: "sleep 30".into(),
-        cwd: dir.clone(),
-        group: Some("api".into()),
-    });
-    s.apply(Command::Spawn {
-        command: "sleep 31".into(),
-        cwd: dir.clone(),
-        group: None,
-    });
+    spawn_grouped(&mut s, "sleep 30", dir.clone(), "api");
+    spawn(&mut s, "sleep 31", dir.clone());
     s.apply(Command::SaveSession {
         name: "fleet".into(),
     });
@@ -1330,16 +1260,8 @@ fn load_session_restores_saved_names() {
     };
     let mut s = Supervisor::new(24, 80, 2000);
     s.set_launch_context(ctx.clone());
-    s.apply(Command::Spawn {
-        command: "sleep 30".into(),
-        cwd: dir.clone(),
-        group: None,
-    });
-    s.apply(Command::Spawn {
-        command: "sleep 31".into(),
-        cwd: dir.clone(),
-        group: None,
-    });
+    spawn(&mut s, "sleep 30", dir.clone());
+    spawn(&mut s, "sleep 31", dir.clone());
     s.tick();
     let id = match s.drain().first() {
         Some(Event::Tasks(v)) => v.iter().find(|t| t.command == "sleep 30").unwrap().id,
@@ -1576,14 +1498,14 @@ fn spawn_uses_the_launch_context_env_not_the_process_env() {
         env: vec![("FLEETCOM_MARKER".into(), "xyzzy".into())],
         cwd: dir.clone(),
     });
-    s.apply(Command::Spawn {
-        command: format!(
+    spawn(
+        &mut s,
+        format!(
             "printf '%s:%s' \"$FLEETCOM_MARKER\" \"${{USER:-unset}}\" > {}",
             out.display()
         ),
-        cwd: dir.clone(),
-        group: None,
-    });
+        dir.clone(),
+    );
     let ok = reap_until(&mut s, Duration::from_secs(5), |_| {
         std::fs::read_to_string(&out).is_ok_and(|c| !c.is_empty())
     });
@@ -1597,11 +1519,7 @@ fn spawn_uses_the_launch_context_env_not_the_process_env() {
 #[test]
 fn launch_without_context_is_refused() {
     let mut s = Supervisor::new(24, 80, 2000);
-    s.apply(Command::Spawn {
-        command: "true".into(),
-        cwd: here(),
-        group: None,
-    });
+    spawn(&mut s, "true", here());
     assert!(
         s.drain()
             .iter()
@@ -1723,11 +1641,7 @@ fn spawn_claude_pins_an_id_and_layers_settings() {
     install_stub(&bin, "claude", &dir);
     let mut s = Supervisor::new(24, 80, 2000);
     s.set_launch_context(agent_ctx(&bin, &runtime, dir.clone()));
-    s.apply(Command::Spawn {
-        command: "claude".into(),
-        cwd: dir.clone(),
-        group: None,
-    });
+    spawn(&mut s, "claude", dir.clone());
 
     let argv = wait_argv(&mut s, &dir.join("argv"));
     let si = argv
@@ -1801,11 +1715,7 @@ fn spawn_non_agent_command_is_not_instrumented() {
     let runtime = dir.join("run");
     let mut s = Supervisor::new(24, 80, 2000);
     s.set_launch_context(agent_ctx(&dir.join("bin"), &runtime, dir.clone()));
-    s.apply(Command::Spawn {
-        command: "printf ok".into(),
-        cwd: dir.clone(),
-        group: None,
-    });
+    spawn(&mut s, "printf ok", dir.clone());
     let t = &s.tasks[0];
     assert!(t.harness.is_none());
     assert!(t.capture_file.is_none());
@@ -1827,11 +1737,7 @@ fn spawn_resuming_claude_injects_only_the_capture_channel() {
     install_stub(&bin, "claude", &dir);
     let mut s = Supervisor::new(24, 80, 2000);
     s.set_launch_context(agent_ctx(&bin, &runtime, dir.clone()));
-    s.apply(Command::Spawn {
-        command: format!("claude --resume {CAP_ID}"),
-        cwd: dir.clone(),
-        group: None,
-    });
+    spawn(&mut s, format!("claude --resume {CAP_ID}"), dir.clone());
 
     let argv = wait_argv(&mut s, &dir.join("argv"));
     assert!(
@@ -1858,11 +1764,7 @@ fn rerun_resumes_the_captured_conversation() {
     install_stub(&bin, "claude", &dir);
     let mut s = Supervisor::new(24, 80, 2000);
     s.set_launch_context(agent_ctx(&bin, &runtime, dir.clone()));
-    s.apply(Command::Spawn {
-        command: "claude".into(),
-        cwd: dir.clone(),
-        group: None,
-    });
+    spawn(&mut s, "claude", dir.clone());
     let _ = wait_argv(&mut s, &dir.join("argv"));
     let id = s.tasks[0].id;
     wait_for_lifecycle(&mut s, id, |l| l == Lifecycle::Ok);
@@ -1925,11 +1827,7 @@ fn rerun_cannot_read_the_old_runs_stale_capture() {
         dir.clone(),
         &[("FLEETCOM_CONFIG_DIR", &config)],
     ));
-    s.apply(Command::Spawn {
-        command: "claude".into(),
-        cwd: dir.clone(),
-        group: None,
-    });
+    spawn(&mut s, "claude", dir.clone());
     let id = s.tasks[0].id;
     // The capture file still holds the pre-drift session.
     let stale = format!(
@@ -1974,11 +1872,7 @@ fn remove_deletes_the_capture_file() {
     install_stub(&bin, "claude", &dir);
     let mut s = Supervisor::new(24, 80, 2000);
     s.set_launch_context(agent_ctx(&bin, &runtime, dir.clone()));
-    s.apply(Command::Spawn {
-        command: "claude".into(),
-        cwd: dir.clone(),
-        group: None,
-    });
+    spawn(&mut s, "claude", dir.clone());
     let _ = wait_argv(&mut s, &dir.join("argv"));
     let id = s.tasks[0].id;
     wait_for_lifecycle(&mut s, id, |l| l == Lifecycle::Ok);
@@ -1999,21 +1893,13 @@ fn reconnect_with_unchanged_root_preserves_capture_files() {
     install_stub(&bin, "claude", &dir);
     let mut s = Supervisor::new(24, 80, 2000);
     s.set_launch_context(agent_ctx(&bin, &runtime, dir.clone()));
-    s.apply(Command::Spawn {
-        command: "claude".into(),
-        cwd: dir.clone(),
-        group: None,
-    });
+    spawn(&mut s, "claude", dir.clone());
     let cap = s.tasks[0].capture_file.clone().expect("capture file set");
     std::fs::write(&cap, "{}").unwrap();
 
     // The client reconnects with an identical env and spawns again.
     s.set_launch_context(agent_ctx(&bin, &runtime, dir.clone()));
-    s.apply(Command::Spawn {
-        command: "claude".into(),
-        cwd: dir.clone(),
-        group: None,
-    });
+    spawn(&mut s, "claude", dir.clone());
     assert_eq!(s.tasks.len(), 2);
     assert!(
         cap.exists(),
@@ -2030,28 +1916,16 @@ fn returning_to_a_prior_root_preserves_its_live_captures() {
     install_stub(&bin, "claude", &dir);
     let mut s = Supervisor::new(24, 80, 2000);
     s.set_launch_context(agent_ctx(&bin, &root_a, dir.clone()));
-    s.apply(Command::Spawn {
-        command: "claude".into(),
-        cwd: dir.clone(),
-        group: None,
-    });
+    spawn(&mut s, "claude", dir.clone());
     let cap_a = s.tasks[0].capture_file.clone().expect("capture file set");
     std::fs::write(&cap_a, "{}").unwrap();
 
     // The client reconnects under root B, spawns, then returns to A and
     // spawns again.
     s.set_launch_context(agent_ctx(&bin, &root_b, dir.clone()));
-    s.apply(Command::Spawn {
-        command: "claude".into(),
-        cwd: dir.clone(),
-        group: None,
-    });
+    spawn(&mut s, "claude", dir.clone());
     s.set_launch_context(agent_ctx(&bin, &root_a, dir.clone()));
-    s.apply(Command::Spawn {
-        command: "claude".into(),
-        cwd: dir.clone(),
-        group: None,
-    });
+    spawn(&mut s, "claude", dir.clone());
 
     assert_eq!(s.tasks.len(), 3);
     assert!(
@@ -2081,11 +1955,7 @@ fn remove_deletes_the_capture_file_under_the_spawn_root() {
     install_stub(&bin, "claude", &dir);
     let mut s = Supervisor::new(24, 80, 2000);
     s.set_launch_context(agent_ctx(&bin, &root_a, dir.clone()));
-    s.apply(Command::Spawn {
-        command: "claude".into(),
-        cwd: dir.clone(),
-        group: None,
-    });
+    spawn(&mut s, "claude", dir.clone());
     let _ = wait_argv(&mut s, &dir.join("argv"));
     let id = s.tasks[0].id;
     wait_for_lifecycle(&mut s, id, |l| l == Lifecycle::Ok);
@@ -2095,11 +1965,7 @@ fn remove_deletes_the_capture_file_under_the_spawn_root() {
     // Root B is installed by a newer spawn; a same-id file under it must
     // survive the A task's removal.
     s.set_launch_context(agent_ctx(&bin, &root_b, dir.clone()));
-    s.apply(Command::Spawn {
-        command: "claude".into(),
-        cwd: dir.clone(),
-        group: None,
-    });
+    spawn(&mut s, "claude", dir.clone());
     let decoy = s.tasks[1]
         .capture_file
         .as_deref()
@@ -2136,11 +2002,7 @@ fn spawn_codex_installs_the_notify_override() {
         dir.clone(),
         &[("CODEX_HOME", &dir.join("codex_home"))],
     ));
-    s.apply(Command::Spawn {
-        command: "codex".into(),
-        cwd: dir.clone(),
-        group: None,
-    });
+    spawn(&mut s, "codex", dir.clone());
 
     let argv = wait_argv(&mut s, &dir.join("argv"));
     let ci = argv
@@ -2182,11 +2044,7 @@ fn spawn_grok_pins_an_id_and_injects_nothing_else() {
             ("GROK_HOME", &dir.join("grok_home")),
         ],
     ));
-    s.apply(Command::Spawn {
-        command: "grok".into(),
-        cwd: dir.clone(),
-        group: None,
-    });
+    spawn(&mut s, "grok", dir.clone());
 
     let argv = wait_argv(&mut s, &dir.join("argv"));
     assert_eq!(
@@ -2238,11 +2096,7 @@ fn exit_hint_is_scraped_and_saved_as_a_resume() {
         dir.clone(),
         &[("FLEETCOM_CONFIG_DIR", &config)],
     ));
-    s.apply(Command::Spawn {
-        command: "claude".into(),
-        cwd: dir.clone(),
-        group: None,
-    });
+    spawn(&mut s, "claude", dir.clone());
     // No pre-exit synchronization: the scrape's reader-EOF gate means
     // reap can run against the exiting stub at any point and the hint
     // still lands.
@@ -2277,11 +2131,7 @@ fn save_scrapes_a_finished_task_without_reap() {
         dir.clone(),
         &[("FLEETCOM_CONFIG_DIR", &config)],
     ));
-    s.apply(Command::Spawn {
-        command: "claude".into(),
-        cwd: dir.clone(),
-        group: None,
-    });
+    spawn(&mut s, "claude", dir.clone());
 
     // Wait out only the residual reader-drain race: after EOF the sole
     // remaining gate is the exit latch, which save's own pass must flip.
@@ -2313,11 +2163,7 @@ fn rerun_scrapes_a_finished_task_without_reap() {
     );
     let mut s = Supervisor::new(24, 80, 2000);
     s.set_launch_context(agent_ctx(&bin, &runtime, dir.clone()));
-    s.apply(Command::Spawn {
-        command: "claude".into(),
-        cwd: dir.clone(),
-        group: None,
-    });
+    spawn(&mut s, "claude", dir.clone());
     let id = s.tasks[0].id;
 
     assert!(
@@ -2359,11 +2205,7 @@ fn resume_id_precedence_scrape_over_capture_over_spawn() {
         dir.clone(),
         &[("FLEETCOM_CONFIG_DIR", &config)],
     ));
-    s.apply(Command::Spawn {
-        command: "claude".into(),
-        cwd: dir.clone(),
-        group: None,
-    });
+    spawn(&mut s, "claude", dir.clone());
     let injected = s.tasks[0]
         .resume_id
         .clone()
@@ -2424,11 +2266,7 @@ fn save_falls_back_to_fs_correlation_for_a_silent_codex() {
             ("CODEX_HOME", &codex_home),
         ],
     ));
-    s.apply(Command::Spawn {
-        command: "codex".into(),
-        cwd: dir.clone(),
-        group: None,
-    });
+    spawn(&mut s, "codex", dir.clone());
     assert!(reap_until(&mut s, Duration::from_secs(5), |s| s.tasks[0]
         .finished
         .is_some()));
@@ -2466,11 +2304,7 @@ fn save_correlates_against_the_spawn_time_home() {
         dir.clone(),
         &[("FLEETCOM_CONFIG_DIR", &config), ("CODEX_HOME", &home_a)],
     ));
-    s.apply(Command::Spawn {
-        command: "codex".into(),
-        cwd: dir.clone(),
-        group: None,
-    });
+    spawn(&mut s, "codex", dir.clone());
     assert!(reap_until(&mut s, Duration::from_secs(5), |s| s.tasks[0]
         .finished
         .is_some()));
@@ -2553,11 +2387,7 @@ fn home_only_launch_env_targets_the_clients_dot_codex() {
         dir.clone(),
         &[("FLEETCOM_CONFIG_DIR", &config), ("HOME", &home)],
     ));
-    s.apply(Command::Spawn {
-        command: "codex".into(),
-        cwd: dir.clone(),
-        group: None,
-    });
+    spawn(&mut s, "codex", dir.clone());
     assert_eq!(
         s.tasks[0].harness_home.as_deref(),
         Some(codex_home.as_path()),
@@ -2610,11 +2440,7 @@ fn stale_inherited_notify_chain_is_never_executed() {
         stale.as_os_str().to_os_string(),
     ));
     s.set_launch_context(ctx);
-    s.apply(Command::Spawn {
-        command: "codex".into(),
-        cwd: dir.clone(),
-        group: None,
-    });
+    spawn(&mut s, "codex", dir.clone());
     assert!(reap_until(&mut s, Duration::from_secs(5), |s| s.tasks[0]
         .finished
         .is_some()));
@@ -2651,11 +2477,7 @@ fn agent_save_without_any_id_keeps_the_plain_command() {
             ("CODEX_HOME", &codex_home),
         ],
     ));
-    s.apply(Command::Spawn {
-        command: "codex".into(),
-        cwd: dir.clone(),
-        group: None,
-    });
+    spawn(&mut s, "codex", dir.clone());
     assert!(reap_until(&mut s, Duration::from_secs(5), |s| s.tasks[0]
         .finished
         .is_some()));
@@ -2722,11 +2544,7 @@ fn config_toml_notify_chains_through_the_injected_script() {
         dir.clone(),
         &[("CODEX_HOME", &codex_home)],
     ));
-    s.apply(Command::Spawn {
-        command: "codex".into(),
-        cwd: dir.clone(),
-        group: None,
-    });
+    spawn(&mut s, "codex", dir.clone());
     let argv = wait_argv(&mut s, &dir.join("argv"));
     assert!(
         argv.iter().any(|a| a.starts_with("notify=[")),
@@ -2782,11 +2600,7 @@ fn unrepresentable_config_notify_suppresses_injection() {
         dir.clone(),
         &[("CODEX_HOME", &codex_home)],
     ));
-    s.apply(Command::Spawn {
-        command: "codex".into(),
-        cwd: dir.clone(),
-        group: None,
-    });
+    spawn(&mut s, "codex", dir.clone());
     let argv = wait_argv(&mut s, &dir.join("argv"));
     assert!(
         !argv.iter().any(|a| a.contains("notify=")),
@@ -2800,11 +2614,7 @@ fn unrepresentable_config_notify_suppresses_injection() {
     )
     .unwrap();
     std::fs::remove_file(dir.join("argv")).unwrap();
-    s.apply(Command::Spawn {
-        command: "codex".into(),
-        cwd: dir.clone(),
-        group: None,
-    });
+    spawn(&mut s, "codex", dir.clone());
     let argv = wait_argv(&mut s, &dir.join("argv"));
     assert!(
         argv.iter().any(|a| a.starts_with("notify=[")),
@@ -2829,11 +2639,7 @@ fn non_agent_entries_survive_save_as_plain_strings() {
         ],
         cwd: dir.clone(),
     });
-    s.apply(Command::Spawn {
-        command: "sleep 30".into(),
-        cwd: dir.clone(),
-        group: None,
-    });
+    spawn(&mut s, "sleep 30", dir.clone());
     let text = save_and_read(&mut s, &config, "plain");
     assert!(
         text.contains("\"sleep 30\""),
