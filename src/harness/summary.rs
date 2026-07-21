@@ -80,6 +80,41 @@ fn is_rule_row(row: &str) -> bool {
     n >= 40
 }
 
+/// The status phrase of a spinner row: a frame char accepted by `is_frame`,
+/// a space, then text through the first `…` inclusive. The phrase must open
+/// alphanumeric; past that it is task-derived and unconstrained (spaces,
+/// parentheses, digits). Everything after the ellipsis — tickers,
+/// parentheticals — is the caller's to interpret.
+fn spinner_text(row: &str, is_frame: impl Fn(char) -> bool) -> Option<String> {
+    let mut chars = row.chars();
+    if !is_frame(chars.next()?) || chars.next()? != ' ' {
+        return None;
+    }
+    let rest = chars.as_str();
+    let text = &rest[..rest.find('…')? + '…'.len_utf8()];
+    text.chars()
+        .next()?
+        .is_alphanumeric()
+        .then(|| text.to_string())
+}
+
+/// Filter a ` · `-separated tail down to its slow-moving segments: each
+/// segment is trimmed, dropped when empty or when `drop` says so, and the
+/// survivors re-join in order, each prefixed ` · `. No survivors yields the
+/// empty string, so callers append the result unconditionally.
+fn slow_segments(tail: &str, drop: impl Fn(&str) -> bool) -> String {
+    let mut out = String::new();
+    for seg in tail.split(" · ") {
+        let seg = seg.trim();
+        if seg.is_empty() || drop(seg) {
+            continue;
+        }
+        out.push_str(" · ");
+        out.push_str(seg);
+    }
+    out
+}
+
 // ---------------------------------------------------------------- claude --
 
 /// Accepted claude spinner frames. A frame matches only when followed by a
@@ -155,7 +190,7 @@ fn claude_spinner_status(rows: &[String], top: usize) -> Option<(String, &'stati
         if row.starts_with(' ') {
             continue;
         }
-        if let Some(verb) = claude_spinner_text(row) {
+        if let Some(verb) = spinner_text(row, |c| CLAUDE_SPINNER.contains(&c)) {
             // The spinner row's parenthetical contributes its slow
             // semantic tail to whichever text wins the head.
             let tail = claude_semantic_tail(row);
@@ -197,24 +232,6 @@ fn claude_waiting_text(row: &str) -> Option<String> {
         .then(|| text.to_string())
 }
 
-/// Extract the text through the first `…` after a claude spinner frame.
-/// Task-derived phrases may contain spaces, parentheses, and digits. The
-/// parenthetical after the ellipsis is not discarded wholesale: its
-/// recognized tickers drop and its slow segments survive through
-/// [`claude_semantic_tail`].
-fn claude_spinner_text(row: &str) -> Option<String> {
-    let mut chars = row.chars();
-    if !CLAUDE_SPINNER.contains(&chars.next()?) || chars.next()? != ' ' {
-        return None;
-    }
-    let rest = chars.as_str();
-    let text = &rest[..rest.find('…')? + '…'.len_utf8()];
-    text.chars()
-        .next()?
-        .is_alphanumeric()
-        .then(|| text.to_string())
-}
-
 /// The spinner parenthetical's slow semantic tail:
 /// `(1m 8s · ↓ 2.1k tokens · thinking with high effort)` keeps
 /// ` · thinking with high effort`. Recognized ticker segments drop;
@@ -226,16 +243,7 @@ fn claude_semantic_tail(row: &str) -> String {
     };
     let inner = &row[open + "… (".len()..];
     let inner = inner.strip_suffix(')').unwrap_or(inner);
-    let mut out = String::new();
-    for seg in inner.split(" · ") {
-        let seg = seg.trim();
-        if seg.is_empty() || claude_ticker_segment(seg) {
-            continue;
-        }
-        out.push_str(" · ");
-        out.push_str(seg);
-    }
-    out
+    slow_segments(inner, claude_ticker_segment)
 }
 
 /// Whether one parenthetical segment is recognized ticker churn: elapsed
@@ -434,17 +442,8 @@ fn codex_status(rows: &[String], composer: usize) -> Option<(String, &'static st
 /// everything else is slow-moving state and is kept, with its own ellipsis
 /// when the CLI truncated it.
 fn codex_working(after_paren: &str) -> String {
-    let mut out = String::from("Working");
     let tail = after_paren.find(')').map_or("", |i| &after_paren[i + 1..]);
-    for seg in tail.split(" · ") {
-        let seg = seg.trim();
-        if seg.is_empty() || seg.starts_with('/') {
-            continue;
-        }
-        out.push_str(" · ");
-        out.push_str(seg);
-    }
-    out
+    format!("Working{}", slow_segments(tail, |seg| seg.starts_with('/')))
 }
 
 // ------------------------------------------------------------------ grok --
@@ -463,7 +462,11 @@ impl SummaryAdapter for GrokSummary {
         // states and match neither shape.
         let probe = rows[..top].iter().rev().find(|r| !r.is_empty())?;
         let t = probe.trim_start();
-        if let Some(text) = grok_spinner_text(t) {
+        // `⠼ Sleep 5 seconds then echo ok… 1.5s 2.8s ⇣14.2k [↓][stop]` → the
+        // label through its `…`; everything after it is elapsed/throughput
+        // ticker. A wrapped status row leaves its `…` tail here with no
+        // spinner head, which fails the frame check and falls through.
+        if let Some(text) = spinner_text(t, |c| ('\u{2800}'..='\u{28FF}').contains(&c)) {
             return Some((text, "grok:spinner"));
         }
         grok_worked(t).then(|| (t.to_string(), "grok:worked"))
@@ -492,24 +495,6 @@ fn grok_input_box(rows: &[String]) -> Option<(usize, usize)> {
         .iter()
         .any(|r| r.trim_start().starts_with('│'))
         .then_some((top, bottom))
-}
-
-/// `⠼ Sleep 5 seconds then echo ok… 1.5s 2.8s ⇣14.2k [↓][stop]` → the label
-/// through its `…`: a braille spinner frame, a space, text cut at the first
-/// `…`. Everything after it is elapsed/throughput ticker. A wrapped status
-/// row leaves its `…` tail on the probe row with no spinner head, which
-/// fails here and falls through.
-fn grok_spinner_text(t: &str) -> Option<String> {
-    let mut chars = t.chars();
-    if !('\u{2800}'..='\u{28FF}').contains(&chars.next()?) || chars.next()? != ' ' {
-        return None;
-    }
-    let rest = chars.as_str();
-    let text = &rest[..rest.find('…')? + '…'.len_utf8()];
-    text.chars()
-        .next()?
-        .is_alphanumeric()
-        .then(|| text.to_string())
 }
 
 /// The completion row grok leaves above its box, kept verbatim: `Worked for
