@@ -44,7 +44,7 @@ pub(crate) fn now_ms() -> u64 {
         .as_millis() as u64
 }
 
-/// Read a pid a test job wrote, waiting for the write to land.
+/// Read a pid a test task wrote, waiting for the write to land.
 pub(crate) fn read_pid(path: &Path) -> nix::unistd::Pid {
     let mut pid = None;
     wait_until(Duration::from_secs(5), || {

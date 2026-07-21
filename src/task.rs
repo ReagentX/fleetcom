@@ -486,7 +486,7 @@ impl Task {
         // shell functions are not loaded.
         cmd.arg("-c");
         cmd.arg(exec_command);
-        // The job runs under the *client's* environment, verbatim: clear the
+        // The task runs under the *client's* environment, verbatim: clear the
         // builder's captured base (the daemon's own env, whatever the client
         // that first autostarted it happened to have) so nothing leaks through
         // where the client's env lacks a key.
@@ -880,10 +880,10 @@ impl Task {
         )
     }
 
-    /// Ask the whole job to exit: SIGTERM to the process *group*, not just the
+    /// Ask the whole task to exit: SIGTERM to the process *group*, not just the
     /// direct child, so every group member gets it, including background
     /// children a `cmd &` left behind (a non-interactive shell's `&` creates no
-    /// new group, so they never leave this one). TERM, not KILL: the job gets a
+    /// new group, so they never leave this one). TERM, not KILL: the task gets a
     /// chance to flush and clean up. The supervisor owns the escalation:
     /// `overdue` turns true once the grace elapses, and `force_kill` finishes it.
     ///
@@ -976,7 +976,7 @@ impl Task {
 impl Drop for Task {
     fn drop(&mut self) {
         // The last-resort backstop, not the policy point: guarantees no
-        // orphaned job tree regardless of how a Task leaves scope. Graceful
+        // orphaned task tree regardless of how a Task leaves scope. Graceful
         // TERM-first teardown happens above this, in the supervisor. The
         // collect is best-effort: an already-exited leader reaps instantly; one
         // still dying from the KILL reparents to init, which collects it.

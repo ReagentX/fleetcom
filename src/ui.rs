@@ -200,7 +200,7 @@ fn render_dashboard(out: &mut impl Write, app: &App) -> io::Result<()> {
     // Footer hints. In foreground there is no daemon to detach from: both
     // intents stop the in-process core (`ThreadTransport::shutdown` ignores
     // the intent), so advertising `q detach` there would promise survival the
-    // jobs don't have.
+    // tasks don't have.
     let exit_hint = if app.daemon_backed {
         "q detach · Q quit"
     } else {

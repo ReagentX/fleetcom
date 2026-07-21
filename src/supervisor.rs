@@ -85,10 +85,10 @@ fn effective_scrollback(flag: Option<usize>, env: Option<&str>) -> usize {
         .map_or(DEFAULT_SCROLLBACK, |lines| lines.min(MAX_SCROLLBACK))
 }
 
-/// How long a SIGTERMed job gets to exit before SIGKILL. TERM-respecting
+/// How long a SIGTERMed task gets to exit before SIGKILL. TERM-respecting
 /// processes exit in milliseconds, so this is the *ceiling* on quit latency,
 /// not the norm; 2 s is enough for any real flush handler while keeping a
-/// wedged job from making `Q` feel broken.
+/// wedged task from making `Q` feel broken.
 const KILL_GRACE: Duration = Duration::from_secs(2);
 
 /// Maximum stored label length in Unicode scalar values after normalization,
@@ -698,7 +698,7 @@ impl Supervisor {
                 fresh.tagged = self.tasks[i].tagged;
                 fresh.group = self.tasks[i].group.clone();
                 fresh.name = self.tasks[i].name.clone();
-                // The displaced job exits like a Remove: TERM now, the
+                // The displaced task exits like a Remove: TERM now, the
                 // graveyard's grace-then-KILL behind it. Dropping it here
                 // would straight-SIGKILL stragglers of the old run.
                 let mut old = std::mem::replace(&mut self.tasks[i], fresh);

@@ -281,7 +281,7 @@ fn kill_delivers_term_before_kill() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// A job that ignores SIGTERM is SIGKILLed once the grace elapses, via the
+/// A task that ignores SIGTERM is SIGKILLed once the grace elapses, via the
 /// reap-driven escalation. `Kill` must never leave an immortal task.
 #[test]
 fn term_ignoring_task_escalates_to_kill() {
@@ -304,17 +304,17 @@ fn term_ignoring_task_escalates_to_kill() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// `Shutdown` exits as soon as TERM-respecting jobs die: well inside the
+/// `Shutdown` exits as soon as TERM-respecting tasks die: well inside the
 /// grace, not after it.
 #[test]
-fn shutdown_returns_early_when_jobs_respect_term() {
+fn shutdown_returns_early_when_tasks_respect_term() {
     let mut s = sup(24, 80);
     spawn(&mut s, "sleep 300", here());
     let t0 = Instant::now();
     s.apply(Command::Shutdown);
     assert!(
         t0.elapsed() < Duration::from_secs(1),
-        "shutdown waited the full grace for a TERM-respecting job"
+        "shutdown waited the full grace for a TERM-respecting task"
     );
     s.tick();
     assert!(
@@ -387,7 +387,7 @@ fn overfull_writer_queue_refuses_message_with_notice() {
     );
 }
 
-/// `Shutdown` with a TERM-ignoring job is bounded by the grace, then
+/// `Shutdown` with a TERM-ignoring task is bounded by the grace, then
 /// SIGKILLs it: quit can be slowed, never wedged.
 #[test]
 fn shutdown_is_bounded_by_grace() {
@@ -947,7 +947,7 @@ fn remove_sweeps_stragglers_of_an_exited_leader() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Rerun must give the displaced job the same graceful exit as Remove:
+/// Rerun must give the displaced task the same graceful exit as Remove:
 /// TERM through the graveyard, not the straight SIGKILL a `Drop` delivers.
 /// The old run's HUP-immune straggler dies of the TERM while the fresh run
 /// (same id) is already up.
@@ -1505,7 +1505,7 @@ fn spawn_uses_the_launch_context_env_not_the_process_env() {
     let ok = reap_until(&mut s, Duration::from_secs(5), |_| {
         std::fs::read_to_string(&out).is_ok_and(|c| !c.is_empty())
     });
-    assert!(ok, "the marker job never wrote its output");
+    assert!(ok, "the marker task never wrote its output");
     assert_eq!(std::fs::read_to_string(&out).unwrap(), "xyzzy:unset");
     let _ = std::fs::remove_dir_all(&dir);
 }

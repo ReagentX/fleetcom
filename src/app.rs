@@ -199,7 +199,7 @@ pub struct App {
     term_signal: Arc<AtomicBool>,
     should_quit: bool,
     /// How to leave when `should_quit` fires: `q`/Ctrl-C/signals disconnect
-    /// (daemon + jobs survive), `Q` quits and kills. Defaults to the safe
+    /// (daemon + tasks survive), `Q` quits and kills. Defaults to the safe
     /// `Disconnect` so an unexpected exit never reaps the daemon.
     exit_intent: ExitIntent,
     /// Whether the client currently captures terminal mouse events.
@@ -254,7 +254,7 @@ fn bucket(v: &TaskView) -> u8 {
 
 impl App {
     /// Default client: connect to the daemon (autostarting it if needed) and
-    /// complete the hello handshake, so jobs outlive the UI and run under
+    /// complete the hello handshake, so tasks outlive the UI and run under
     /// *this* client's env. The core lives in `fleetcom --daemon`, reached over
     /// the socket.
     pub fn connect(rows: u16, cols: u16) -> io::Result<App> {
@@ -646,7 +646,7 @@ impl App {
             }
 
             if self.term_signal.load(Ordering::Relaxed) {
-                // A terminating signal detaches: the daemon keeps the jobs.
+                // A terminating signal detaches: the daemon keeps the tasks.
                 self.exit_intent = ExitIntent::Disconnect;
                 self.should_quit = true;
             }
@@ -888,7 +888,7 @@ impl App {
         // Any key dismisses a lingering save/load notice.
         self.status = None;
         // Global escape hatch, except while attached (Ctrl-C belongs to the child).
-        // Ctrl-C disconnects: it leaves the daemon and jobs running.
+        // Ctrl-C disconnects: it leaves the daemon and tasks running.
         if self.mode != Mode::Attached
             && k.code == KeyCode::Char('c')
             && k.modifiers.contains(KeyModifiers::CONTROL)
@@ -924,7 +924,7 @@ impl App {
 
     fn on_key_dashboard(&mut self, k: KeyEvent) {
         match k.code {
-            // `q` detaches (daemon + jobs live on); `Q` kills all and stops it.
+            // `q` detaches (daemon + tasks live on); `Q` kills all and stops it.
             KeyCode::Char('q') => {
                 self.exit_intent = ExitIntent::Disconnect;
                 self.should_quit = true;
@@ -1355,12 +1355,12 @@ impl App {
     }
 
     /// Leave, per `exit_intent`: `Disconnect` detaches and the daemon keeps the
-    /// jobs running; `Quit` group-kills every job and stops the daemon. Against
+    /// tasks running; `Quit` group-kills every task and stops the daemon. Against
     /// an in-process core (`--foreground`) both kill everything: there's no
     /// daemon to outlive the UI.
     fn shutdown(&mut self) {
         // Blocks until the transport has acted on the intent. On `Quit` the
-        // jobs are dead before `main` restores the terminal; on `Disconnect` the
+        // tasks are dead before `main` restores the terminal; on `Disconnect` the
         // daemon keeps running.
         self.transport.shutdown(self.exit_intent);
     }

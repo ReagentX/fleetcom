@@ -22,9 +22,9 @@ use crate::{
 /// leave running, so both intents kill everything there.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ExitIntent {
-    /// Detach this client; the daemon and its jobs keep running.
+    /// Detach this client; the daemon and its tasks keep running.
     Disconnect,
-    /// Kill every job and stop the daemon.
+    /// Kill every task and stop the daemon.
     Quit,
 }
 
@@ -40,7 +40,7 @@ pub trait Transport {
     /// client surfaces instead of freezing on a stale mirror.
     fn connected(&self) -> bool;
     /// Tear down per `intent`, blocking until it's done, so the client restores
-    /// the terminal only after the core has acted (jobs killed on `Quit`, the
+    /// the terminal only after the core has acted (tasks killed on `Quit`, the
     /// connection closed on `Disconnect`).
     fn shutdown(&mut self, intent: ExitIntent);
 }
@@ -98,7 +98,7 @@ impl ThreadTransport {
                 true
             });
             // Loop returned (Shutdown or client gone): `sup` drops here, and with
-            // it every Task (Task::drop → killpg), so no job outlives the core.
+            // it every Task (Task::drop → killpg), so no task outlives the core.
         });
         ThreadTransport {
             wake_tx,
@@ -109,7 +109,7 @@ impl ThreadTransport {
     }
 
     fn stop(&mut self) {
-        // Tell the core to kill jobs and exit, then wait for it. The join is what
+        // Tell the core to kill tasks and exit, then wait for it. The join is what
         // guarantees the SIGKILLs have been sent before we return. The core
         // clears its tasks (Task::drop → killpg) as `run_loop` returns.
         let _ = self.wake_tx.send(Wake::Cmd(Command::Shutdown));
@@ -225,17 +225,17 @@ impl Transport for SocketTransport {
 
     fn shutdown(&mut self, intent: ExitIntent) {
         match intent {
-            // Group-kill every job and stop the daemon; the socket then closes
-            // (daemon gone = jobs killed).
+            // Group-kill every task and stop the daemon; the socket then closes
+            // (daemon gone = tasks killed).
             ExitIntent::Quit => self.send(Command::Shutdown),
             // Close the connection without a Shutdown: the daemon sees EOF and
-            // keeps the jobs running for the next client to reattach.
+            // keeps the tasks running for the next client to reattach.
             ExitIntent::Disconnect => {
                 let _ = self.write.shutdown(Shutdown::Both);
             }
         }
         // Either way, wait for our reader to see the socket close before the
-        // client restores the terminal. On Quit that means the jobs are dead.
+        // client restores the terminal. On Quit that means the tasks are dead.
         if let Some(h) = self.reader.take() {
             let _ = h.join();
         }

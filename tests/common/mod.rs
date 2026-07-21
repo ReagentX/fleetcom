@@ -133,8 +133,8 @@ pub fn spawn_frame(command: &str, cwd: &Path) -> Vec<u8> {
 }
 
 /// Spawn `command` (which must write its own `$$` to `pidfile`) and return the
-/// job's leader pid (== pgid: portable-pty `setsid`s it).
-pub fn spawn_job(
+/// task's leader pid (== pgid: portable-pty `setsid`s it).
+pub fn spawn_task(
     stream: &mut UnixStream,
     cwd: &Path,
     pidfile: &Path,
@@ -147,7 +147,7 @@ pub fn spawn_job(
                 .map(|s| !s.trim().is_empty())
                 .unwrap_or(false)
         }),
-        "the job never wrote its pid"
+        "the task never wrote its pid"
     );
     nix::unistd::Pid::from_raw(
         std::fs::read_to_string(pidfile)
@@ -172,7 +172,7 @@ pub fn stop_daemon(daemon: &mut KillOnDrop) {
 }
 
 /// Kill the daemon if the test fails before its clean shutdown, so an
-/// assertion failure never leaks a daemon (and its jobs) onto the host.
+/// assertion failure never leaks a daemon (and its tasks) onto the host.
 pub struct KillOnDrop(pub Child);
 impl Drop for KillOnDrop {
     fn drop(&mut self) {
