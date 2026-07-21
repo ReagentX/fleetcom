@@ -11,6 +11,8 @@ use std::{
     time::SystemTime,
 };
 
+use crate::protocol::RecoveryEntry;
+
 /// One recipe entry. Entries without a group or name serialize as strings;
 /// other entries use objects whose optional fields are written only when set.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -303,8 +305,8 @@ pub fn list_in(dir: &Path) -> Vec<String> {
 }
 
 // --- recovery snapshots: the supervisor's automatic fleet backups, written
-// under `<sessions root>/recovery` in the ordinary wrapped format. Phase 1
-// only writes; listing and loading them arrive in later phases. ---------------
+// under `<sessions root>/recovery` in the ordinary wrapped format, and listed
+// and loaded by stem for the wire (`list_recovery_in`/`load_recovery_in`). ----
 
 /// Snapshots kept per recovery directory; older ones are pruned after each
 /// write.
@@ -364,6 +366,71 @@ pub fn save_recovery_in(
     let file = write_atomic(dir, &format!("{file_stem}.json"), &to_json(name, cfg))?;
     prune_recovery(dir);
     Ok(file)
+}
+
+/// List recovery snapshots under `dir` as wire entries, newest first (stems
+/// lead with a UTC stamp, so descending lexical order is ascending age).
+/// Unreadable and unparseable files are skipped silently: one corrupt
+/// snapshot must not empty the picker of the intact ones beside it. A file
+/// without a stored name labels as its stem, matching `list_in`.
+pub fn list_recovery_in(dir: &Path) -> Vec<RecoveryEntry> {
+    let mut out = Vec::new();
+    if let Ok(entries) = fs::read_dir(dir) {
+        for e in entries.flatten() {
+            let p = e.path();
+            if p.extension().and_then(|s| s.to_str()) != Some("json") {
+                continue;
+            }
+            let Some(stem) = p.file_stem().and_then(|s| s.to_str()) else {
+                continue;
+            };
+            let Ok((stored, cfg)) = fs::read_to_string(&p).and_then(|t| from_json(&t)) else {
+                continue;
+            };
+            // Saturate both derived numbers: a count past `u32` pins to the
+            // maximum, and an unreadable or future mtime reads as age 0.
+            let tasks =
+                u32::try_from(cfg.values().map(Vec::len).sum::<usize>()).unwrap_or(u32::MAX);
+            let age_secs = fs::metadata(&p)
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|mtime| SystemTime::now().duration_since(mtime).ok())
+                .map_or(0, |d| d.as_secs());
+            out.push(RecoveryEntry {
+                stem: stem.to_string(),
+                label: stored.unwrap_or_else(|| stem.to_string()),
+                tasks,
+                age_secs,
+            });
+        }
+    }
+    out.sort_by(|a, b| b.stem.cmp(&a.stem));
+    out
+}
+
+/// Whether a wire-supplied stem may be joined into a recovery directory.
+/// Separators cover traversal (`../x`, `a/b`); rejecting `.` outright also
+/// covers extension smuggling and dot-files. Stems the writer generates are
+/// digits and dashes only (see [`recovery_stem`]), so a legitimate stem never
+/// trips this.
+fn valid_recovery_stem(stem: &str) -> bool {
+    !stem.is_empty() && !stem.contains(['/', '\\', '.'])
+}
+
+/// Load one recovery snapshot by filename stem. `load_in` does not fit here:
+/// it maps a user-typed session *name* through `sanitize` into a filename,
+/// while this addresses a file by the exact stem the daemon listed -- and the
+/// stem arrives over the wire, so it is validated, never rewritten. A stem
+/// this module would not have written fails as `InvalidInput` before any
+/// path is built from it.
+pub fn load_recovery_in(dir: &Path, stem: &str) -> io::Result<SessionConfig> {
+    if !valid_recovery_stem(stem) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("invalid recovery stem {stem:?}"),
+        ));
+    }
+    from_json(&fs::read_to_string(dir.join(format!("{stem}.json")))?).map(|(_, cfg)| cfg)
 }
 
 /// Best-effort prune: keep the newest [`RECOVERY_KEEP`] snapshots by filename
@@ -868,5 +935,92 @@ mod tests {
 
         assert_eq!(list_in(&dir), vec!["real".to_string()]);
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Listing returns newest-first entries with labels and task counts; a
+    /// corrupt snapshot is skipped, not fatal; a missing directory lists as
+    /// empty.
+    #[test]
+    fn recovery_listing_is_newest_first_and_skips_corrupt_files() {
+        let base = temp("session_recovery_list");
+        let rec = recovery_dir(&base);
+        assert!(
+            list_recovery_in(&rec).is_empty(),
+            "a missing recovery dir must list empty"
+        );
+
+        let mut one = SessionConfig::new();
+        one.insert("~/a".into(), vec![e("vim")]);
+        let mut three = SessionConfig::new();
+        three.insert("~/a".into(), vec![e("vim"), e("top")]);
+        three.insert("~/b".into(), vec![e("make")]);
+        save_recovery_in(
+            &rec,
+            "20260714-093015-11",
+            "autosaved 2026-07-14 09:30",
+            &one,
+        )
+        .unwrap();
+        save_recovery_in(
+            &rec,
+            "20260715-070000-22",
+            "autosaved 2026-07-15 07:00",
+            &three,
+        )
+        .unwrap();
+        fs::write(rec.join("20260716-000000-33.json"), "{not json").unwrap();
+
+        let entries = list_recovery_in(&rec);
+        assert_eq!(
+            entries.len(),
+            2,
+            "the corrupt snapshot must drop alone: {entries:?}"
+        );
+        assert_eq!(entries[0].stem, "20260715-070000-22");
+        assert_eq!(entries[0].label, "autosaved 2026-07-15 07:00");
+        assert_eq!(entries[0].tasks, 3);
+        assert_eq!(entries[1].stem, "20260714-093015-11");
+        assert_eq!(entries[1].label, "autosaved 2026-07-14 09:30");
+        assert_eq!(entries[1].tasks, 1);
+        assert!(
+            entries.iter().all(|en| en.age_secs < 3600),
+            "just-written files must read near-zero ages: {entries:?}"
+        );
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    /// `load_recovery_in` loads by exact stem; a stem carrying a separator or
+    /// dot -- or nothing at all -- fails as `InvalidInput` before any path is
+    /// built, and an unknown stem reads as `NotFound`.
+    #[test]
+    fn load_recovery_in_loads_by_stem_and_rejects_traversal() {
+        let base = temp("session_recovery_load");
+        let rec = recovery_dir(&base);
+        let mut cfg = SessionConfig::new();
+        cfg.insert("~/p".into(), vec![gne("cargo run", "api", "server")]);
+        save_recovery_in(
+            &rec,
+            "20260714-093015-11",
+            "autosaved 2026-07-14 09:30",
+            &cfg,
+        )
+        .unwrap();
+
+        assert_eq!(load_recovery_in(&rec, "20260714-093015-11").unwrap(), cfg);
+        for bad in ["../x", "a/b", "a.b", "a\\b", ""] {
+            let err = load_recovery_in(&rec, bad).unwrap_err();
+            assert_eq!(
+                err.kind(),
+                io::ErrorKind::InvalidInput,
+                "stem {bad:?} must be refused, got {err}"
+            );
+        }
+        assert_eq!(
+            load_recovery_in(&rec, "20990101-000000-1")
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::NotFound
+        );
+        let _ = fs::remove_dir_all(&base);
     }
 }

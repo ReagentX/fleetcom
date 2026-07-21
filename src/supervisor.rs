@@ -178,7 +178,7 @@ struct Recovery {
     /// which would otherwise land snapshots in the developer's real config
     /// root; recovery tests arm explicitly via `set_recovery_timing`.
     enabled: bool,
-    /// Set by the six structural recipe mutations, cleared by the next due
+    /// Set by the seven structural recipe mutations, cleared by the next due
     /// pass (written, unchanged, empty, or unwritable alike -- see
     /// `Supervisor::maybe_write_recovery`).
     dirty: bool,
@@ -336,7 +336,7 @@ impl Supervisor {
     /// Apply one client request. Fire-and-forget: any result (a save/load
     /// notice, a spawn failure) is queued as `Event::Status`, never returned.
     pub fn apply(&mut self, cmd: Command) {
-        // The six structural recipe mutations arm the recovery writer; the
+        // The seven structural recipe mutations arm the recovery writer; the
         // burst coalesces behind `RECOVERY_DEBOUNCE` in `tick`. `Tag` is
         // deliberately absent: tags are not recipe state (a `SessionEntry`
         // stores cmd, group, and name only), so a tag flip cannot change the
@@ -351,6 +351,7 @@ impl Supervisor {
                 | Command::SetGroup { .. }
                 | Command::SetName { .. }
                 | Command::LoadSession { .. }
+                | Command::LoadRecovery { .. }
         ) {
             self.recovery.dirty = true;
             self.recovery.last_mutation = Some(Instant::now());
@@ -461,6 +462,7 @@ impl Supervisor {
             }
             Command::SaveSession { name } => self.save_session(&name),
             Command::LoadSession { name } => self.load_session(&name),
+            Command::LoadRecovery { stem } => self.load_recovery(&stem),
             Command::ListSessions => self.list_sessions(),
             Command::Shutdown => self.shutdown_all(),
         }
@@ -950,40 +952,31 @@ impl Supervisor {
     }
 
     /// Answer `ListSessions` with the recipe names under this connection's
-    /// session root (sorted by `list_in`); no root reads as no sessions.
+    /// session root (sorted by `list_in`) and the recovery snapshots under its
+    /// `recovery/` directory (newest first by `list_recovery_in`); no root
+    /// reads as neither.
     fn list_sessions(&mut self) {
-        let names = self
+        let (names, recovery) = self
             .sessions_root()
-            .map(|root| session::list_in(&root))
+            .map(|root| {
+                (
+                    session::list_in(&root),
+                    session::list_recovery_in(&session::recovery_dir(&root)),
+                )
+            })
             .unwrap_or_default();
-        self.events.push(Event::Sessions(names));
+        self.events.push(Event::Sessions { names, recovery });
     }
 
-    /// Spawn every command in the named session, each in its (existing) dir.
+    /// Spawn every entry of a loaded recipe, each in its (existing) dir.
     /// Missing dirs are skipped rather than spawning tasks doomed to fail on
-    /// chdir.
-    fn load_session(&mut self, name: &str) {
-        let Some(root) = self.sessions_root() else {
-            self.status("load failed: no config directory available");
-            return;
-        };
-        let cfg = match session::load_in(&root, name) {
-            Ok(c) => c,
-            // Preserve load errors; only a missing file maps to "not found".
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                self.status(format!("session '{name}' not found"));
-                return;
-            }
-            Err(e) => {
-                self.status(format!("session '{name}' failed to load: {e}"));
-                return;
-            }
-        };
-        let Some(launch) = self.launch_or_refuse() else {
-            return;
-        };
+    /// chdir. Returns `(spawned, skipped, failed)` for the caller's notice, or
+    /// `None` when no launch context is installed (already refused with its
+    /// own notice).
+    fn materialize(&mut self, cfg: &SessionConfig) -> Option<(usize, usize, usize)> {
+        let launch = self.launch_or_refuse()?;
         let (mut spawned, mut skipped, mut failed) = (0usize, 0usize, 0usize);
-        for (dir, entries) in &cfg {
+        for (dir, entries) in cfg {
             let resolved = path::resolve(&launch.cwd, dir);
             if !resolved.is_dir() {
                 skipped += entries.len();
@@ -1008,6 +1001,30 @@ impl Supervisor {
                 }
             }
         }
+        Some((spawned, skipped, failed))
+    }
+
+    /// Spawn every command in the named session via `materialize`.
+    fn load_session(&mut self, name: &str) {
+        let Some(root) = self.sessions_root() else {
+            self.status("load failed: no config directory available");
+            return;
+        };
+        let cfg = match session::load_in(&root, name) {
+            Ok(c) => c,
+            // Preserve load errors; only a missing file maps to "not found".
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                self.status(format!("session '{name}' not found"));
+                return;
+            }
+            Err(e) => {
+                self.status(format!("session '{name}' failed to load: {e}"));
+                return;
+            }
+        };
+        let Some((spawned, skipped, failed)) = self.materialize(&cfg) else {
+            return;
+        };
         // Omit zero buckets, except report zero tasks for an empty recipe.
         let mut parts = Vec::new();
         if spawned > 0 || (skipped == 0 && failed == 0) {
@@ -1022,6 +1039,45 @@ impl Supervisor {
             parts.push(format!("{failed} failed to spawn"));
         }
         self.status(format!("loaded '{name}': {}", parts.join(", ")));
+    }
+
+    /// Spawn every command in a recovery snapshot, addressed by the validated
+    /// filename stem. Mirrors `load_session` except for the notice: a clean
+    /// load steers the user toward `SaveSession`, because the snapshot's
+    /// writer overwrites its own file and pruning ages the rest out --
+    /// naming the fleet is what makes it durable.
+    fn load_recovery(&mut self, stem: &str) {
+        let Some(root) = self.sessions_root() else {
+            self.status("load failed: no config directory available");
+            return;
+        };
+        let cfg = match session::load_recovery_in(&session::recovery_dir(&root), stem) {
+            Ok(c) => c,
+            // Preserve load errors; only a missing file maps to "not found".
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                self.status(format!("recovery snapshot '{stem}' not found"));
+                return;
+            }
+            Err(e) => {
+                self.status(format!("recovery snapshot '{stem}' failed to load: {e}"));
+                return;
+            }
+        };
+        let Some((_, skipped, failed)) = self.materialize(&cfg) else {
+            return;
+        };
+        // The success notice is fixed; problem buckets append after it so a
+        // partial materialization is never reported as clean.
+        let mut msg = String::from("loaded recovery snapshot; save to name it");
+        if skipped > 0 {
+            msg.push_str(&format!(
+                ", {skipped} skipped (missing dir, task limit, or command too long)"
+            ));
+        }
+        if failed > 0 {
+            msg.push_str(&format!(", {failed} failed to spawn"));
+        }
+        self.status(msg);
     }
 }
 

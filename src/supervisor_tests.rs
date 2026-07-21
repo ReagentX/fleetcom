@@ -1174,7 +1174,7 @@ fn session_commands_use_the_launch_context_config_dir() {
     let evs = s.drain();
     assert!(
         evs.iter()
-            .any(|e| matches!(e, Event::Sessions(n) if n == &["ctx".to_string()])),
+            .any(|e| matches!(e, Event::Sessions { names, .. } if names == &["ctx".to_string()])),
         "list must see the recipe save just wrote; got {evs:?}"
     );
 
@@ -1637,7 +1637,7 @@ fn take_dirty(s: &mut Supervisor) -> bool {
     std::mem::replace(&mut s.recovery.dirty, false)
 }
 
-/// The six structural recipe mutations arm the writer; `Tag` does not (tags
+/// The seven structural recipe mutations arm the writer; `Tag` does not (tags
 /// are not recipe state). Arming keys on the command, not its outcome, so a
 /// refused `Restart` and a missing `LoadSession` recipe still arm.
 #[test]
@@ -1676,8 +1676,165 @@ fn recovery_arms_on_structural_mutations_not_tag() {
     });
     assert!(take_dirty(&mut s), "LoadSession must arm");
 
+    s.apply(Command::LoadRecovery {
+        stem: "20990101-000000-1".into(),
+    });
+    assert!(take_dirty(&mut s), "LoadRecovery must arm");
+
     s.apply(Command::Remove { id });
     assert!(take_dirty(&mut s), "Remove must arm");
+}
+
+/// `ListSessions` answers with the recovery snapshots newest first beside the
+/// recipe names, both from the connection's session root.
+#[test]
+fn list_sessions_includes_recovery_snapshots_newest_first() {
+    let dir = scratch("recovery_list_wire");
+    let config = dir.join("config");
+    let mut s = Supervisor::new(24, 80, 2000);
+    s.set_launch_context(config_ctx(&config, dir.clone(), &[]));
+
+    let rec = config.join("sessions").join("recovery");
+    let entry = |cmd: &str| SessionEntry {
+        cmd: cmd.into(),
+        group: None,
+        name: None,
+    };
+    let mut one = SessionConfig::new();
+    one.insert("~/a".into(), vec![entry("vim")]);
+    let mut two = SessionConfig::new();
+    two.insert("~/a".into(), vec![entry("vim"), entry("top")]);
+    session::save_recovery_in(
+        &rec,
+        "20260714-093015-11",
+        "autosaved 2026-07-14 09:30",
+        &one,
+    )
+    .unwrap();
+    session::save_recovery_in(
+        &rec,
+        "20260715-070000-22",
+        "autosaved 2026-07-15 07:00",
+        &two,
+    )
+    .unwrap();
+
+    s.apply(Command::ListSessions);
+    let evs = s.drain();
+    let (names, recovery) = evs
+        .iter()
+        .find_map(|e| match e {
+            Event::Sessions { names, recovery } => Some((names, recovery)),
+            _ => None,
+        })
+        .expect("a Sessions reply");
+    assert!(names.is_empty(), "no recipes were saved; got {names:?}");
+    let summary: Vec<(&str, &str, u32)> = recovery
+        .iter()
+        .map(|r| (r.stem.as_str(), r.label.as_str(), r.tasks))
+        .collect();
+    assert_eq!(
+        summary,
+        vec![
+            ("20260715-070000-22", "autosaved 2026-07-15 07:00", 2),
+            ("20260714-093015-11", "autosaved 2026-07-14 09:30", 1),
+        ],
+        "snapshots must list newest first with labels and task counts"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `LoadRecovery` materializes the snapshot through the session-load path --
+/// groups and names included -- and reports the fixed notice steering the
+/// user toward `SaveSession`.
+#[test]
+fn load_recovery_materializes_the_fleet_and_notices() {
+    let dir = scratch("recovery_load_wire");
+    let config = dir.join("config");
+    let mut s = Supervisor::new(24, 80, 2000);
+    s.set_launch_context(config_ctx(&config, dir.clone(), &[]));
+
+    let mut cfg = SessionConfig::new();
+    cfg.insert(
+        dir.to_string_lossy().into_owned(),
+        vec![
+            SessionEntry {
+                cmd: "sleep 30".into(),
+                group: Some("api".into()),
+                name: None,
+            },
+            SessionEntry {
+                cmd: "sleep 31".into(),
+                group: None,
+                name: Some("web".into()),
+            },
+        ],
+    );
+    session::save_recovery_in(
+        &config.join("sessions").join("recovery"),
+        "20260714-093015-11",
+        "autosaved 2026-07-14 09:30",
+        &cfg,
+    )
+    .unwrap();
+
+    s.apply(Command::LoadRecovery {
+        stem: "20260714-093015-11".into(),
+    });
+    let evs = s.drain();
+    assert!(
+        evs.iter().any(|e| matches!(
+            e,
+            Event::Status(m) if m == "loaded recovery snapshot; save to name it"
+        )),
+        "a clean load must report exactly the rename-steering notice; got {evs:?}"
+    );
+    assert_eq!(s.tasks.len(), 2, "both snapshot commands must spawn");
+    let by_cmd = |s: &Supervisor, cmd: &str| {
+        let t = s
+            .tasks
+            .iter()
+            .find(|t| t.command == cmd)
+            .unwrap_or_else(|| panic!("task '{cmd}' missing after load"));
+        (t.group.clone(), t.name.clone())
+    };
+    assert_eq!(by_cmd(&s, "sleep 30"), (Some("api".into()), None));
+    assert_eq!(by_cmd(&s, "sleep 31"), (None, Some("web".into())));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// An unknown stem reads as not-found and a traversal-shaped stem is refused
+/// before any path is built; neither panics or spawns anything.
+#[test]
+fn load_recovery_refuses_unknown_and_traversal_stems() {
+    let dir = scratch("recovery_load_refuse");
+    let config = dir.join("config");
+    let mut s = Supervisor::new(24, 80, 2000);
+    s.set_launch_context(config_ctx(&config, dir.clone(), &[]));
+
+    s.apply(Command::LoadRecovery {
+        stem: "20990101-000000-1".into(),
+    });
+    assert!(
+        s.drain().iter().any(|e| matches!(
+            e,
+            Event::Status(m) if m == "recovery snapshot '20990101-000000-1' not found"
+        )),
+        "an unknown stem must read as not-found"
+    );
+
+    s.apply(Command::LoadRecovery {
+        stem: "../x".into(),
+    });
+    assert!(
+        s.drain().iter().any(|e| matches!(
+            e,
+            Event::Status(m) if m.starts_with("recovery snapshot '../x' failed to load:")
+        )),
+        "a traversal stem must be refused, not probed"
+    );
+    assert!(s.tasks.is_empty(), "refused loads must spawn nothing");
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// A burst of mutations coalesces behind the debounce into one snapshot

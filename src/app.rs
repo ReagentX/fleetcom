@@ -601,7 +601,9 @@ impl App {
                     self.focused_screen = Some(s);
                 }
                 Event::Status(s) => self.status = Some(s),
-                Event::Sessions(names) => {
+                // Recovery entries are ignored here until the picker learns
+                // to show them (the client work behind this event's v9 shape).
+                Event::Sessions { names, .. } => {
                     // A shorter list can land while the picker is open; clamp
                     // the selection before it can index past the end.
                     self.session_sel = self.session_sel.min(names.len().saturating_sub(1));
