@@ -304,8 +304,7 @@ pub fn list_in(dir: &Path) -> Vec<String> {
 
 // --- automatic recovery snapshots -------------------------------------------
 
-/// Retention bound applied after each recovery write. Live-writer
-/// exemptions can hold a shared directory above it; see [`prune_recovery`].
+/// Target snapshot count when no other live writers share the directory.
 const RECOVERY_KEEP: usize = 10;
 
 /// Recovery-snapshot directory under a session root.
@@ -336,9 +335,8 @@ pub fn recovery_label(now: SystemTime) -> String {
     format!("autosaved {y:04}-{m:02}-{d:02} {hh:02}:{mm:02}")
 }
 
-/// Atomically write a recovery snapshot with mode 0600, then prune old files.
-/// Reusing `file_stem` replaces that snapshot without a stored-name check.
-/// The just-written snapshot is never pruned, even when ten newer stems exist.
+/// Atomically replace a mode-0600 recovery snapshot, then prune old snapshots.
+/// The written stem and stems naming live process IDs are exempt from pruning.
 pub fn save_recovery_in(
     dir: &Path,
     file_stem: &str,
@@ -403,11 +401,7 @@ pub fn load_recovery_in(dir: &Path, stem: &str) -> io::Result<SessionConfig> {
     from_json(&fs::read_to_string(dir.join(format!("{stem}.json")))?).map(|(_, cfg)| cfg)
 }
 
-/// Parse the trailing `-<pid>` of a recovery stem: nonempty, digits only,
-/// parses as a positive `i32`. Mirrors the pid shape check in
-/// `harness::assets::namespace_owner`; the modules parse different name
-/// shapes (`<timestamp>-<pid>` here, `<pid>-<nonce>` there), so the parse
-/// stays local.
+/// Parse a recovery stem's trailing positive `i32` process ID.
 fn stem_pid(stem: &str) -> Option<i32> {
     let (_, pid) = stem.rsplit_once('-')?;
     if pid.is_empty() || !pid.bytes().all(|b| b.is_ascii_digit()) {
@@ -416,34 +410,16 @@ fn stem_pid(stem: &str) -> Option<i32> {
     pid.parse::<i32>().ok().filter(|p| *p > 0)
 }
 
-/// True when `stem` names a pid that still exists. Only ESRCH reads dead;
-/// Ok, EPERM, and every other errno read alive — the one-sidedness mirrors
-/// `harness::assets::owner_is_dead`: a recycled pid misreads only as alive,
-/// so a liveness-gated prune can under-delete but never delete a live
-/// writer's snapshot. A stem without a valid pid suffix — a name no writer
-/// would produce — gets no liveness protection.
+/// Return whether a valid PID suffix is not known to be dead. Only `ESRCH`
+/// proves death; invalid suffixes receive no liveness protection.
 fn stem_names_live_writer(stem: &str) -> bool {
     use nix::{errno::Errno, sys::signal::kill, unistd::Pid};
     stem_pid(stem).is_some_and(|pid| !matches!(kill(Pid::from_raw(pid), None), Err(Errno::ESRCH)))
 }
 
-/// Best-effort pruning by filename: every error is ignored, and a failed
-/// prune never fails the write.
-///
-/// `<keep_stem>.json` is exempt unconditionally: retention exists to bound
-/// disk use, never to undo a write that just succeeded. A long-running
-/// incarnation whose start-time stem has aged below ten newer stems would
-/// otherwise delete its own snapshot on every rewrite — and report `Ok`.
-///
-/// Files whose stems name a live pid are also exempt: a writer sharing this
-/// root protects only its own stem, so without the probe its prune would
-/// delete a long-lived sibling's older-stem snapshot — permanently, because
-/// the sibling's write-skip state still matches and suppresses every
-/// rewrite. Retention may only delete what provably belongs to no live
-/// fleetcom; when liveness is in doubt, keep. The remaining candidates keep
-/// the lexically greatest [`RECOVERY_KEEP`] - 1, so N live writers hold up
-/// to [`RECOVERY_KEEP`] + N - 1 files — guaranteed, not transient — and
-/// dead-stem files beyond the bound age out as writes continue.
+/// Best-effort pruning that protects `keep_stem` and snapshots whose PID is
+/// not known to be dead. Of the remaining JSON files, retain the lexically
+/// greatest [`RECOVERY_KEEP`] minus one. Filesystem errors are ignored.
 fn prune_recovery(dir: &Path, keep_stem: &str) {
     let Ok(entries) = fs::read_dir(dir) else {
         return;
@@ -867,10 +843,7 @@ mod tests {
         SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_784_021_415)
     }
 
-    /// A pid no process can hold: above Linux's pid ceiling (`pid_max` caps
-    /// at 2^22) and macOS's (99998), so the liveness probe reads ESRCH
-    /// deterministically on both. Prunable fixtures use this — small
-    /// literals like 77 can name a real launchd-adjacent process.
+    /// Out-of-range PID used for dead-writer fixtures.
     const DEAD_FIXTURE_PID: u32 = 9_999_999;
 
     /// Spawn and reap a child, then return its inactive PID.
@@ -948,9 +921,7 @@ mod tests {
         let _ = fs::remove_dir_all(&base);
     }
 
-    /// A rewrite under an old stem survives its own prune. Ten newer stems
-    /// exist; the write must keep its file and drop the oldest of the others,
-    /// leaving [`RECOVERY_KEEP`] files total.
+    /// Pruning retains the just-written stem even when it is the oldest.
     #[test]
     fn recovery_prune_exempts_the_active_stem() {
         let base = temp("session_recovery_prune_active");
@@ -962,8 +933,7 @@ mod tests {
             save_recovery_in(&rec, &stem, "autosaved 2026-07-15 09:30", &cfg).unwrap();
         }
 
-        // Day-old start-time stem: lexically below every file on disk. Its
-        // pid is dead, so only the keep_stem rule can protect it here.
+        // This dead-PID stem sorts below every existing snapshot.
         let active_stem = format!("20260714-093000-{DEAD_FIXTURE_PID}");
         let active =
             save_recovery_in(&rec, &active_stem, "autosaved 2026-07-15 09:30", &cfg).unwrap();
@@ -1005,17 +975,14 @@ mod tests {
         let _ = fs::remove_dir_all(&base);
     }
 
-    /// Another writer's prune must not delete a live writer's snapshot, even
-    /// when it is the oldest file on disk. The final file set is the
-    /// [`RECOVERY_KEEP`] + N - 1 arithmetic with N = 2: the live exempt file
-    /// plus the writer's own plus the nine newest dead.
+    /// Pruning retains an older snapshot whose PID is still live.
     #[test]
     fn recovery_prune_exempts_live_pid_stems() {
         let base = temp("session_recovery_prune_live");
         let rec = recovery_dir(&base);
         let mut cfg = SessionConfig::new();
         cfg.insert("~/p".into(), vec![e("vim")]);
-        // The oldest candidate names this test process: provably live.
+        // The oldest candidate names this live test process.
         let live_stem = format!("20260101-000000-{}", std::process::id());
         save_recovery_in(&rec, &live_stem, "autosaved 2026-01-01 00:00", &cfg).unwrap();
         for i in 1..=11u32 {
@@ -1039,8 +1006,7 @@ mod tests {
         let _ = fs::remove_dir_all(&base);
     }
 
-    /// A stem naming an exited process gets no exemption, so the ten-file
-    /// bound converges once writers exit.
+    /// A snapshot from an exited process is eligible for pruning.
     #[test]
     fn recovery_prune_removes_dead_pid_stems() {
         let base = temp("session_recovery_prune_dead");
@@ -1066,8 +1032,7 @@ mod tests {
         let _ = fs::remove_dir_all(&base);
     }
 
-    /// Stems without a positive all-digit pid suffix get no liveness
-    /// protection: a file the writer would not have named.
+    /// Invalid PID suffixes receive no liveness protection.
     #[test]
     fn recovery_prune_ignores_malformed_pid_suffixes() {
         let base = temp("session_recovery_prune_malformed");

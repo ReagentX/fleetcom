@@ -12,7 +12,6 @@ use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
 use crate::frame::{KIND_CONTROL, KIND_HELLO, KIND_SCREEN};
 
 /// Wire-protocol version; the handshake rejects mismatched peers.
-/// Version 9 includes recovery entries and recovery-load commands.
 pub const PROTOCOL_VERSION: u32 = 9;
 
 /// Environment and working directory supplied by the launching client.

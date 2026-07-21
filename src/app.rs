@@ -94,7 +94,7 @@ impl GroupMode {
     }
 }
 
-/// The list displayed by the session picker.
+/// Active page in the session picker.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum SessionPage {
     Saved,
@@ -618,10 +618,9 @@ impl App {
                 }
                 Event::Status(s) => self.status = Some(s),
                 Event::Sessions { names, recovery } => {
-                    // Clamp each selection to the refreshed list.
+                    // Clamp both page selections to the refreshed lists.
                     self.session_sel = self.session_sel.min(names.len().saturating_sub(1));
                     self.recovery_sel = self.recovery_sel.min(recovery.len().saturating_sub(1));
-                    // The recovery page is unavailable when its list is empty.
                     if recovery.is_empty() {
                         self.session_page = SessionPage::Saved;
                     }
@@ -1048,7 +1047,6 @@ impl App {
     }
 
     fn on_key_loadsession(&mut self, k: KeyEvent) {
-        // Recovery is a Tab target only while snapshots are available.
         if matches!(k.code, KeyCode::Tab | KeyCode::BackTab) {
             if !self.session_recovery.is_empty() {
                 self.session_page = match self.session_page {
@@ -1058,7 +1056,6 @@ impl App {
             }
             return;
         }
-        // Each page keeps an independent selection.
         match self.session_page {
             SessionPage::Saved => match k.code {
                 KeyCode::Esc => self.mode = Mode::Dashboard,
@@ -1081,7 +1078,6 @@ impl App {
                     self.recovery_sel = step_down(self.recovery_sel, self.session_recovery.len())
                 }
                 KeyCode::Enter => {
-                    // Load the file identified by the selected wire stem.
                     if let Some(e) = self.session_recovery.get(self.recovery_sel) {
                         let stem = e.stem.clone();
                         self.transport.send(Command::LoadRecovery { stem });

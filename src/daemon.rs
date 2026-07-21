@@ -571,11 +571,8 @@ pub fn run_daemon() -> io::Result<()> {
     // as shutdown like the rest.
     crate::install_signal_handlers(Arc::clone(&term))?;
 
-    // Non-blocking accept lets the daemon reap exited tasks and finish pending
-    // recovery writes while idle: between clients it would otherwise block in
-    // accept() and never call poll_exit, so a task that finished after `q`
-    // would linger as a zombie until a reconnect — and a snapshot armed just
-    // before disconnect would sit unwritten, lost if the daemon died detached.
+    // Polling accept lets the daemon reap tasks and maintain recovery snapshots
+    // while no client is connected.
     listener.set_nonblocking(true)?;
     const IDLE_REAP: Duration = Duration::from_millis(100);
     loop {
@@ -603,9 +600,7 @@ pub fn run_daemon() -> io::Result<()> {
             }
             Err(e) if e.kind() == ErrorKind::WouldBlock || transient_accept_error(&e) => {
                 sup.reap();
-                // Keep snapshots current between clients: a debounce armed
-                // just before disconnect, resume-ID drift while detached.
-                // Never `tick` here — its queued events have no drain.
+                // `tick` is reserved for connected clients that drain its events.
                 sup.recovery_maintenance();
                 thread::sleep(IDLE_REAP);
             }

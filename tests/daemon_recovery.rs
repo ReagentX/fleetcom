@@ -1,7 +1,5 @@
-//! The recovery writer must track the daemon's real lifecycle, not the
-//! attached-client happy path: a snapshot armed just before a client
-//! disconnects lands from the *detached* idle loop, where a crash would
-//! otherwise lose it, not on the next attach.
+//! Verifies that a detached daemon writes pending recovery snapshots and
+//! remains available for reconnection.
 
 mod common;
 
@@ -13,7 +11,7 @@ use std::{
 
 use common::{read_frame, shake_hands, spawn_task, start_daemon, stop_daemon, wait_until};
 
-/// Recovery-snapshot paths under the daemon's pinned config root.
+/// Recovery-snapshot paths under the test daemon's config root.
 fn snapshots(dir: &Path) -> Vec<PathBuf> {
     std::fs::read_dir(dir.join("config").join("sessions").join("recovery"))
         .map(|it| it.flatten().map(|e| e.path()).collect())
@@ -31,16 +29,14 @@ fn detached_daemon_writes_the_pending_snapshot() {
         &format!("echo $$ > {} && exec sleep 30", pidfile.display()),
     );
 
-    // The spawn armed the 2 s debounce moments ago (the pidfile round-trip is
-    // far shorter); disconnect while the write is still pending, so only the
-    // detached accept loop can complete it.
+    // Disconnect before the two-second debounce expires.
     assert!(
         snapshots(&dir).is_empty(),
         "the snapshot landed before disconnect; the detached path went untested"
     );
     drop(stream);
 
-    // No client is attached: the write must come from the idle accept loop.
+    // The detached daemon's idle loop completes the pending write.
     assert!(
         wait_until(Duration::from_secs(10), || !snapshots(&dir).is_empty()),
         "no recovery snapshot landed while detached"
@@ -51,7 +47,7 @@ fn detached_daemon_writes_the_pending_snapshot() {
         "the snapshot must carry the fleet's command: {text}"
     );
 
-    // Reconnect: the daemon still serves normally and the task survived.
+    // The daemon remains available and retains the task after the write.
     let mut stream = UnixStream::connect(dir.join("default.sock")).expect("reconnect failed");
     shake_hands(&mut stream, &dir.display().to_string());
     stream

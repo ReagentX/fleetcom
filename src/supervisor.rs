@@ -165,7 +165,7 @@ fn harness_home(env: &[(OsString, OsString)], h: &dyn harness::Harness) -> Optio
 /// State for automatic recovery snapshots. Write failures do not interrupt
 /// task supervision, and teardown does not write or delete snapshots.
 struct Recovery {
-    /// Disabled by default in unit tests to avoid writes to ambient config.
+    /// Recovery writes are opt-in in unit tests.
     enabled: bool,
     /// Whether a potentially recipe-changing command awaits a debounced pass.
     dirty: bool,
@@ -173,21 +173,14 @@ struct Recovery {
     last_mutation: Option<Instant>,
     /// The start of the most recent cadence interval.
     last_cadence: Instant,
-    /// The last successful write's destination and content: the sessions root
-    /// it landed under, and the FNV-1a of the recipe fingerprint; `None` until
-    /// the first write. Both halves gate the skip because the root is
-    /// per-connection (`sessions_root` reads the connecting client's
-    /// `FLEETCOM_CONFIG_DIR`): an unchanged recipe must still write after a
-    /// reconnect moves the root, or the new destination never gets a snapshot.
-    /// The pair is a hint, not a proof: a sibling writer's prune or a manual
-    /// delete removes the file without touching this state, so the skip also
-    /// stats the destination — the filesystem is the authority on existence.
+    /// Sessions root and recipe fingerprint of the last successful write.
+    /// A match is skipped only while the corresponding snapshot still exists.
     last_written: Option<(PathBuf, String)>,
     /// Filename stem reused for this supervisor's recovery writes.
     stem: String,
     /// Whether a write failure has been reported since the last successful write.
     failing: bool,
-    /// Configurable timings, shortened by recovery tests.
+    /// Debounce and content-check intervals.
     debounce: Duration,
     cadence: Duration,
 }
@@ -324,9 +317,8 @@ impl Supervisor {
     /// Apply one client request. Fire-and-forget: any result (a save/load
     /// notice, a spawn failure) is queued as `Event::Status`, never returned.
     pub fn apply(&mut self, cmd: Command) {
-        // Commands that can change a serialized recipe schedule a snapshot.
-        // Tags are not serialized. Scheduling precedes command validation, so
-        // rejected commands may still trigger a content comparison.
+        // Recipe-affecting command variants arm recovery before validation;
+        // fingerprinting filters rejected commands and other no-ops.
         if matches!(
             &cmd,
             Command::Spawn { .. }
@@ -582,9 +574,8 @@ impl Supervisor {
         self.maybe_write_recovery(now);
     }
 
-    /// Run a due debounce or cadence pass. Empty or unchanged recipes are
-    /// skipped; write failures produce one notice until a write succeeds without
-    /// interrupting supervision.
+    /// Run a due debounce or cadence pass. Skip empty or unchanged recipes and
+    /// report at most one consecutive write-failure notice.
     fn maybe_write_recovery(&mut self, now: Instant) {
         if !self.recovery.enabled {
             return;
@@ -618,12 +609,8 @@ impl Supervisor {
         let cfg = self.session_config();
         // Exclude the timestamped label from content comparison.
         let hash = fnv1a_hex(session::fingerprint_json(&cfg).as_bytes());
-        // Skip only when this destination already holds this content AND the
-        // file is still on disk; see `Recovery::last_written` for why the
-        // root is part of the compare and why the pair alone cannot be
-        // trusted. The stat runs at most once per due pass — the pass is
-        // debounce/cadence-gated — and a missing file falls through to the
-        // write, repairing any external deletion within one pass.
+        // Deduplication is scoped to the current root and requires the snapshot
+        // to remain on disk, so a removed snapshot is recreated on a due pass.
         let dest = session::recovery_dir(&root).join(format!("{}.json", self.recovery.stem));
         if self
             .recovery
@@ -647,9 +634,8 @@ impl Supervisor {
                 self.recovery.failing = false;
             }
             Err(e) => {
-                // Report once until a write succeeds; cadence passes keep
-                // retrying because the pair still holds the last *written*
-                // state, so the failed content never compares as current.
+                // Keep retrying on cadence passes, but report only the first
+                // consecutive failure.
                 if !self.recovery.failing {
                     self.recovery.failing = true;
                     self.status(format!("recovery snapshot failed: {e}"));
@@ -659,15 +645,8 @@ impl Supervisor {
         self.recovery.dirty = false;
     }
 
-    /// The detached idle loop's recovery pass: run a due debounce or cadence
-    /// write and nothing else. `tick` is off-limits between clients — it
-    /// queues `Event::Tasks` (and screen frames) on every call with nothing
-    /// draining them — yet snapshots must stay current exactly then: a
-    /// mutation burst armed just before disconnect, resume-ID drift while
-    /// agents run unwatched. The caller's polling interval bounds the pass
-    /// rate; the writer's debounce and cadence gates do the rest. A failed
-    /// pass queues at most one `Event::Status` (the `failing` latch), held
-    /// for the next client's drain.
+    /// Run recovery maintenance between clients without queuing task or screen
+    /// snapshots. Debounce and cadence checks bound the write rate.
     pub fn recovery_maintenance(&mut self) {
         self.maybe_write_recovery(Instant::now());
     }
@@ -1041,8 +1020,7 @@ impl Supervisor {
         self.status(format!("loaded '{name}': {}", parts.join(", ")));
     }
 
-    /// Load a recovery snapshot by stem and prompt the user to save the
-    /// recovered fleet as a named session.
+    /// Load a recovery snapshot by stem and suggest saving it as a named session.
     fn load_recovery(&mut self, stem: &str) {
         let Some(root) = self.sessions_root() else {
             self.status("load failed: no config directory available");
@@ -1063,7 +1041,6 @@ impl Supervisor {
         let Some((_, skipped, failed)) = self.materialize(&cfg) else {
             return;
         };
-        // Append skipped and failed counts to the standard recovery notice.
         let mut msg = String::from("loaded recovery snapshot; save to name it");
         if skipped > 0 {
             msg.push_str(&format!(

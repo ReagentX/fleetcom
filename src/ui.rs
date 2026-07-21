@@ -647,7 +647,6 @@ fn render_session_picker(out: &mut impl Write, app: &App) -> io::Result<()> {
                     sel: app.recovery_sel,
                     max_rows: 10,
                     hint: "↑↓ pick · enter load · tab saved · esc".to_string(),
-                    // The recovery page is available only when entries exist.
                     empty: None,
                     cursor: None,
                 },
@@ -789,7 +788,7 @@ mod tests {
         }
     }
 
-    /// The saved-page hint advertises the recovery page only when it exists.
+    /// The saved-page hint shows the recovery page only when it exists.
     #[test]
     fn saved_page_hint_shows_the_count_only_when_nonzero() {
         assert_eq!(saved_page_hint(0), "↑↓ pick · enter load · esc");

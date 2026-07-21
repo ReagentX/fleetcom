@@ -1946,9 +1946,7 @@ fn recovery_write_failure_notices_once_and_keeps_supervising() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// The detached idle path writes a due snapshot through
-/// `recovery_maintenance` alone — no `tick` — and queues no events: between
-/// clients nothing drains the queue, so growth there would be unbounded.
+/// Detached recovery maintenance writes without queuing client events.
 #[test]
 fn recovery_maintenance_writes_detached_and_queues_nothing() {
     let dir = scratch("recovery_detached");
@@ -1960,7 +1958,7 @@ fn recovery_maintenance_writes_detached_and_queues_nothing() {
         Duration::from_secs(600),
     );
     spawn(&mut s, "sleep 30", dir.clone());
-    // The daemon's idle arm: reap plus the maintenance pass, never tick.
+    // Match the daemon's detached reap-and-maintain loop.
     assert!(
         wait_until(Duration::from_secs(5), || {
             s.reap();
@@ -1976,9 +1974,7 @@ fn recovery_maintenance_writes_detached_and_queues_nothing() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// The write-skip is scoped to its destination: after a reconnect moves the
-/// session root, an unchanged recipe must still write, because the new root
-/// holds no snapshot yet.
+/// Deduplication treats the destination root as part of snapshot identity.
 #[test]
 fn recovery_dedup_is_per_destination_root() {
     let dir = scratch("recovery_root_switch");
@@ -1998,8 +1994,7 @@ fn recovery_dedup_is_per_destination_root() {
         "root A never received the first snapshot"
     );
 
-    // A reconnect with a different `FLEETCOM_CONFIG_DIR`: same recipe, new
-    // destination. Arm the debounce as a structural command would.
+    // Move the unchanged recipe to a new destination and arm recovery.
     s.set_launch_context(config_ctx(&config_b, dir.clone(), &[]));
     s.recovery.dirty = true;
     s.recovery.last_mutation = Some(Instant::now());
@@ -2017,14 +2012,12 @@ fn recovery_dedup_is_per_destination_root() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// A failed write leaves the dedup pair at the last *written* state, so a
-/// later pass retries the same content and lands it once the root is
-/// writable again.
+/// A failed write remains eligible for a later cadence retry.
 #[test]
 fn recovery_failed_write_retries_until_success() {
     let dir = scratch("recovery_retry");
     let config = dir.join("config");
-    // A plain file where `recovery/` must go fails the first pass.
+    // A plain file at the recovery path blocks the first write.
     std::fs::create_dir_all(config.join("sessions")).unwrap();
     std::fs::write(config.join("sessions").join("recovery"), "not a dir").unwrap();
     let mut s = recovery_sup(
@@ -2046,7 +2039,7 @@ fn recovery_failed_write_retries_until_success() {
         "a failed write must not advance the dedup pair"
     );
 
-    // Unblock the root; a cadence pass retries the unchanged content.
+    // Remove the blocker; a cadence pass retries the unchanged content.
     std::fs::remove_file(config.join("sessions").join("recovery")).unwrap();
     assert!(
         wait_until(Duration::from_secs(5), || {
@@ -2059,11 +2052,7 @@ fn recovery_failed_write_retries_until_success() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// The multi-writer finding, composed: writer X snapshots; a sibling
-/// writer's prune deletes X's file; X's next due pass with UNCHANGED
-/// content must rewrite it. `last_written` still matches `(root, hash)`
-/// throughout, so only the existence check can force the write — without
-/// it the deletion is permanent until the recipe changes.
+/// A cadence pass recreates a missing snapshot even when its recipe is unchanged.
 #[test]
 fn recovery_rewrites_after_a_sibling_prune_deletes_the_snapshot() {
     let dir = scratch("recovery_sibling_prune");
@@ -2083,14 +2072,13 @@ fn recovery_rewrites_after_a_sibling_prune_deletes_the_snapshot() {
         "the first snapshot never landed"
     );
 
-    // Writer Y's prune, distilled: X's file disappears while X's dedup
-    // state and recipe stay unchanged.
+    // Remove the snapshot without changing the recipe or deduplication state.
     let rec = config.join("sessions").join("recovery");
     for name in recovery_files(&config) {
         std::fs::remove_file(rec.join(name)).unwrap();
     }
 
-    // Nothing arms the debounce; the cadence pass alone must repair.
+    // No mutation arms the debounce; cadence alone must recreate the file.
     assert!(
         wait_until(Duration::from_secs(5), || {
             s.recovery_maintenance();

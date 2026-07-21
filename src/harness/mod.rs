@@ -31,7 +31,6 @@ use std::{
 
 pub use claude::Claude;
 pub use codex::Codex;
-// Shared UTC civil-date conversion.
 pub(crate) use codex::civil_from_days;
 pub use grok::Grok;
 

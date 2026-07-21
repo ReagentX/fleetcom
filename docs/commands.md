@@ -134,7 +134,7 @@ The daemon normalizes every group name received from the picker or a [session](s
 
 `o` opens a bottom panel listing the saved [sessions](sessions.md): `↑`/`↓` move the highlight, `Enter` loads, `Esc` cancels. While [recovery snapshots](sessions.md#recovery) exist, the hint adds `tab recovery (N)` and `Tab` (or `Shift-Tab`) flips the panel to them; `Tab` again returns to the saved list. Each list keeps its own highlight. With no snapshots, `Tab` does nothing and the hint omits it.
 
-A recovery row reads `<age> ago · <tasks> task(s) · <label>`: the file's age, the number of commands it would launch, and its stored label (normally `autosaved <timestamp>`). `Enter` loads the highlighted snapshot; the status line then reads `loaded recovery snapshot; save to name it`. Press `w` to save the recovered fleet as a named session.
+A recovery row reads `<age> ago · <tasks> task(s) · <label>`: the file's age, its command count, and its stored label (normally `autosaved <timestamp>`). `Enter` loads the highlighted snapshot; the status line confirms the load and suggests saving it. Press `w` to save the recovered fleet as a named session.
 
 ## Peek
 

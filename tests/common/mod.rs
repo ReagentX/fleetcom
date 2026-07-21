@@ -196,7 +196,7 @@ pub fn start_daemon_raw(
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_fleetcom"));
     cmd.arg("--daemon")
         .env("FLEETCOM_RUNTIME_DIR", &dir)
-        // Keep automatic recovery snapshots inside the test directory.
+        // Isolate recovery snapshots with the daemon's runtime files.
         .env("FLEETCOM_CONFIG_DIR", dir.join("config"))
         .stdin(Stdio::null())
         .stdout(Stdio::null())
