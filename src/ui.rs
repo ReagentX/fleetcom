@@ -324,7 +324,9 @@ fn row_age(v: &TaskView) -> Duration {
 }
 
 /// Split a task row into its leading, preview, and time cells so the preview
-/// can be styled independently.
+/// can be styled independently. Cells are column-exact: `pad` measures
+/// terminal columns, so a wide-glyph title or preview (CJK, emoji) fills its
+/// budget instead of overflowing it, and the three widths always sum to `cols`.
 fn task_row_parts(v: &TaskView, cols: usize) -> (String, String, String) {
     let glyph = match v.lifecycle {
         Lifecycle::Active => "✻",
@@ -335,15 +337,13 @@ fn task_row_parts(v: &TaskView, cols: usize) -> (String, String, String) {
     let tag = if v.tagged { "◆" } else { " " };
     let time = rel_time(row_age(v));
     let title_w = 26.min(cols / 3);
-    let title = truncate(display_label(v), title_w);
 
-    // prefix(2) glyph+sp(2) tag+sp(2) title(title_w) sp(1) preview(prev_w) sp(1) time
-    let used = 2 + 2 + 2 + title_w + 1 + 1 + time.chars().count();
+    // indent(2) glyph(1) sp(1) tag(1) title(title_w) sp(1) preview(prev_w) sp(1) time
+    let used = 2 + 1 + 1 + 1 + title_w + 1 + 1 + time.width();
     let prev_w = cols.saturating_sub(used);
-    let preview = truncate(&v.preview.text, prev_w);
     (
-        format!("  {glyph} {tag}{title:<title_w$} "),
-        format!("{preview:<prev_w$}"),
+        format!("  {glyph} {tag}{} ", pad(display_label(v), title_w)),
+        pad(&v.preview.text, prev_w),
         format!(" {time}"),
     )
 }
@@ -355,12 +355,15 @@ fn task_row(v: &TaskView, cols: usize) -> String {
 
 /// Paint a task row with only its padded preview cell dimmed.
 fn dim_preview_row(out: &mut impl Write, y: u16, v: &TaskView, cols: usize) -> io::Result<()> {
+    // Queue the three column-exact cells directly rather than re-splitting a
+    // composed string: a char-count split desynchronizes from cell boundaries
+    // as soon as a cell holds wide glyphs. Clamping each cell to the columns
+    // still open reproduces `put`'s pad-to-`cols` behavior on narrow terminals.
     let (lead, preview, time) = task_row_parts(v, cols);
-    let display = pad(&format!("{lead}{preview}{time}"), cols);
-    let mut chars = display.chars();
-    let lead: String = chars.by_ref().take(lead.chars().count()).collect();
-    let preview: String = chars.by_ref().take(preview.chars().count()).collect();
-    let rest: String = chars.collect();
+    let lead = truncate(&lead, cols);
+    let mut rem = cols - lead.width();
+    let preview = truncate(&preview, rem);
+    rem -= preview.width();
     queue!(
         out,
         MoveTo(0, y),
@@ -368,8 +371,20 @@ fn dim_preview_row(out: &mut impl Write, y: u16, v: &TaskView, cols: usize) -> i
         SetAttribute(Attribute::Dim),
         Print(preview),
         SetAttribute(Attribute::Reset),
-        Print(rest)
+        Print(pad(&time, rem))
     )
+}
+
+/// Peek-box top border: `─ label ` extended with `─` fill to exactly
+/// `inner_w` columns. The label is measured in display columns — wide glyphs
+/// consume two — so the fill always meets the corner.
+fn peek_top_border(label: &str, inner_w: usize) -> String {
+    let mut border = format!("─ {} ", truncate(label, inner_w.saturating_sub(4)));
+    let w = border.width();
+    if w < inner_w {
+        border.extend(std::iter::repeat_n('─', inner_w - w));
+    }
+    border
 }
 
 fn render_peek(out: &mut impl Write, app: &App) -> io::Result<()> {
@@ -394,19 +409,10 @@ fn render_peek(out: &mut impl Write, app: &App) -> io::Result<()> {
     let start = lines.len().saturating_sub(inner_h);
     let tail = &lines[start..];
 
-    // Top border with the task's display label inlined.
-    let mut top_mid = format!(
-        "─ {} ",
-        truncate(display_label(v), inner_w.saturating_sub(4))
-    );
-    let tl = top_mid.chars().count();
-    if tl < inner_w {
-        top_mid.extend(std::iter::repeat_n('─', inner_w - tl));
-    }
     queue!(
         out,
         MoveTo(x0 as u16, y0 as u16),
-        Print(format!("┌{top_mid}┐"))
+        Print(format!("┌{}┐", peek_top_border(display_label(v), inner_w)))
     )?;
 
     for k in 0..inner_h {
@@ -616,13 +622,13 @@ fn render_session_picker(out: &mut impl Write, app: &App) -> io::Result<()> {
 
 /// Center `s` in `width` columns (a full-width string, so it overwrites the row).
 fn center(s: &str, width: usize) -> String {
-    let len = s.chars().count();
+    let len = s.width();
     if len >= width {
         return truncate(s, width);
     }
     let mut out = " ".repeat((width - len) / 2);
     out.push_str(s);
-    let cur = out.chars().count();
+    let cur = out.width();
     out.push_str(&" ".repeat(width - cur));
     out
 }
@@ -796,6 +802,71 @@ mod tests {
             !row.contains("cargo test"),
             "the name replaces the command: {row:?}"
         );
+    }
+
+    /// Every cell is padded in display columns, so the composed row is
+    /// exactly `cols` wide and the time cell survives at the right edge for
+    /// any title/preview content: CJK, emoji, combining marks.
+    #[test]
+    fn task_row_is_column_exact_for_wide_glyphs() {
+        let titles = [
+            "plain ascii title",
+            "日本語のタスクタイトルです", // 13 wide chars: fills title_w exactly at 80 cols
+            "🚀 emoji 🚀 title",
+            "e\u{0301}e\u{0301} combining", // combining marks are zero-width
+        ];
+        let previews = [
+            "build ok",
+            "ビルド中の😀プレビュー出力がここに続いています",
+            "",
+        ];
+        for cols in [40usize, 80] {
+            for title in titles {
+                for preview in previews {
+                    let mut v = timed_view(Lifecycle::Active, false, None, None);
+                    v.name = Some(title.to_string());
+                    v.preview = Preview::floor(preview.to_string());
+                    let row = task_row(&v, cols);
+                    assert_eq!(
+                        row.width(),
+                        cols,
+                        "cols {cols} title {title:?} preview {preview:?}: {row:?}"
+                    );
+                    assert!(row.ends_with(" 2h"), "time cell lost: {row:?}");
+                }
+            }
+        }
+    }
+
+    /// Cell budgets are fixed by `cols`, not by content: `dim_preview_row`
+    /// queues the cells separately, so the dim run must cover exactly the
+    /// preview cell whatever glyphs the cells hold.
+    #[test]
+    fn task_row_cells_hold_their_column_budgets() {
+        let cols = 72;
+        let ascii = timed_view(Lifecycle::Active, false, None, None);
+        let mut wide = timed_view(Lifecycle::Active, false, None, None);
+        wide.name = Some("日本語のテスト".into());
+        wide.preview = Preview::floor("進捗 50% 😀".into());
+        let (al, ap, at) = task_row_parts(&ascii, cols);
+        let (wl, wp, wt) = task_row_parts(&wide, cols);
+        assert_eq!(al.width(), wl.width(), "lead width varies with content");
+        assert_eq!(ap.width(), wp.width(), "preview width varies with content");
+        assert_eq!(at.width(), wt.width(), "time width varies with content");
+        assert_eq!(wl.width() + wp.width() + wt.width(), cols);
+    }
+
+    /// The peek top border fills to exactly the inner width for any label,
+    /// including wide glyphs and labels longer than the border.
+    #[test]
+    fn peek_top_border_fills_to_inner_width() {
+        for label in ["cargo test", "日本語のテスト", "🚀 build", "e\u{0301}", ""] {
+            let b = peek_top_border(label, 40);
+            assert_eq!(b.width(), 40, "label {label:?}: {b:?}");
+        }
+        // Overlong labels truncate inside the border rather than widening it.
+        let b = peek_top_border(&"長".repeat(40), 40);
+        assert_eq!(b.width(), 40, "{b:?}");
     }
 
     /// The peek footer's provenance label composes source, rule, and frozen.
