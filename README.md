@@ -31,6 +31,7 @@ Running several long-lived commands is pesky once they span terminal panes or ne
 - Saves and reloads task recipes: directories, commands, group assignments, and display names.
 - Reruns a completed task in place, keeping its identity, group, and name.
 - Preserves `claude`, `codex`, and `grok` conversations, so saved or rerun tasks resume instead of starting fresh.
+- Automatically snapshots the current task set for recovery.
 
 ## Documentation
 

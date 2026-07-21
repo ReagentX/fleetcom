@@ -1174,7 +1174,7 @@ fn session_commands_use_the_launch_context_config_dir() {
     let evs = s.drain();
     assert!(
         evs.iter()
-            .any(|e| matches!(e, Event::Sessions(n) if n == &["ctx".to_string()])),
+            .any(|e| matches!(e, Event::Sessions { names, .. } if names == &["ctx".to_string()])),
         "list must see the recipe save just wrote; got {evs:?}"
     );
 
@@ -1605,6 +1605,487 @@ fn key_command_encodes_against_live_cursor_mode() {
     );
 
     s.apply(Command::Kill { id });
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// --- recovery-snapshot writer -------------------------------------------
+
+/// Build a supervisor with recovery enabled at test-specific intervals.
+fn recovery_sup(config: &Path, cwd: PathBuf, debounce: Duration, cadence: Duration) -> Supervisor {
+    let mut s = Supervisor::new(24, 80, 2000);
+    s.set_launch_context(config_ctx(config, cwd, &[]));
+    s.set_recovery_timing(debounce, cadence);
+    s
+}
+
+/// Sorted recovery-snapshot filenames under `config`'s session root.
+fn recovery_files(config: &Path) -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(config.join("sessions").join("recovery"))
+        .map(|it| {
+            it.flatten()
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .collect()
+        })
+        .unwrap_or_default();
+    names.sort();
+    names
+}
+
+/// Read and clear the writer's dirty flag.
+fn take_dirty(s: &mut Supervisor) -> bool {
+    std::mem::replace(&mut s.recovery.dirty, false)
+}
+
+/// Recipe-changing commands arm recovery even when rejected; tags do not.
+#[test]
+fn recovery_arms_on_structural_mutations_not_tag() {
+    let mut s = sup(24, 80);
+    assert!(!s.recovery.dirty, "a fresh supervisor starts clean");
+
+    spawn(&mut s, "sleep 30", here());
+    assert!(take_dirty(&mut s), "Spawn must arm");
+    let id = first_id(&mut s);
+
+    s.recovery.dirty = false; // first_id ticks; reassert a clean baseline
+    s.apply(Command::Tag { id, on: true });
+    assert!(
+        !take_dirty(&mut s),
+        "Tag is not recipe state and must not arm"
+    );
+
+    s.apply(Command::SetGroup {
+        id,
+        group: Some("api".into()),
+    });
+    assert!(take_dirty(&mut s), "SetGroup must arm");
+
+    s.apply(Command::SetName {
+        id,
+        name: Some("server".into()),
+    });
+    assert!(take_dirty(&mut s), "SetName must arm");
+
+    s.apply(Command::Restart { id });
+    assert!(take_dirty(&mut s), "Restart must arm");
+
+    s.apply(Command::LoadSession {
+        name: "ghost".into(),
+    });
+    assert!(take_dirty(&mut s), "LoadSession must arm");
+
+    s.apply(Command::LoadRecovery {
+        stem: "20990101-000000-1".into(),
+    });
+    assert!(take_dirty(&mut s), "LoadRecovery must arm");
+
+    s.apply(Command::Remove { id });
+    assert!(take_dirty(&mut s), "Remove must arm");
+}
+
+/// Session listings include recovery metadata in descending stem order.
+#[test]
+fn list_sessions_includes_recovery_snapshots_newest_first() {
+    let dir = scratch("recovery_list_wire");
+    let config = dir.join("config");
+    let mut s = Supervisor::new(24, 80, 2000);
+    s.set_launch_context(config_ctx(&config, dir.clone(), &[]));
+
+    let rec = config.join("sessions").join("recovery");
+    let entry = |cmd: &str| SessionEntry {
+        cmd: cmd.into(),
+        group: None,
+        name: None,
+    };
+    let mut one = SessionConfig::new();
+    one.insert("~/a".into(), vec![entry("vim")]);
+    let mut two = SessionConfig::new();
+    two.insert("~/a".into(), vec![entry("vim"), entry("top")]);
+    session::save_recovery_in(
+        &rec,
+        "20260714-093015-11",
+        "autosaved 2026-07-14 09:30",
+        &one,
+    )
+    .unwrap();
+    session::save_recovery_in(
+        &rec,
+        "20260715-070000-22",
+        "autosaved 2026-07-15 07:00",
+        &two,
+    )
+    .unwrap();
+
+    s.apply(Command::ListSessions);
+    let evs = s.drain();
+    let (names, recovery) = evs
+        .iter()
+        .find_map(|e| match e {
+            Event::Sessions { names, recovery } => Some((names, recovery)),
+            _ => None,
+        })
+        .expect("a Sessions reply");
+    assert!(names.is_empty(), "no recipes were saved; got {names:?}");
+    let summary: Vec<(&str, &str, u32)> = recovery
+        .iter()
+        .map(|r| (r.stem.as_str(), r.label.as_str(), r.tasks))
+        .collect();
+    assert_eq!(
+        summary,
+        vec![
+            ("20260715-070000-22", "autosaved 2026-07-15 07:00", 2),
+            ("20260714-093015-11", "autosaved 2026-07-14 09:30", 1),
+        ],
+        "snapshots must list newest first with labels and task counts"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Recovery loading restores commands, groups, and names and reports success.
+#[test]
+fn load_recovery_materializes_the_fleet_and_notices() {
+    let dir = scratch("recovery_load_wire");
+    let config = dir.join("config");
+    let mut s = Supervisor::new(24, 80, 2000);
+    s.set_launch_context(config_ctx(&config, dir.clone(), &[]));
+
+    let mut cfg = SessionConfig::new();
+    cfg.insert(
+        dir.to_string_lossy().into_owned(),
+        vec![
+            SessionEntry {
+                cmd: "sleep 30".into(),
+                group: Some("api".into()),
+                name: None,
+            },
+            SessionEntry {
+                cmd: "sleep 31".into(),
+                group: None,
+                name: Some("web".into()),
+            },
+        ],
+    );
+    session::save_recovery_in(
+        &config.join("sessions").join("recovery"),
+        "20260714-093015-11",
+        "autosaved 2026-07-14 09:30",
+        &cfg,
+    )
+    .unwrap();
+
+    s.apply(Command::LoadRecovery {
+        stem: "20260714-093015-11".into(),
+    });
+    let evs = s.drain();
+    assert!(
+        evs.iter().any(|e| matches!(
+            e,
+            Event::Status(m) if m == "loaded recovery snapshot; save to name it"
+        )),
+        "a clean load must report exactly the rename-steering notice; got {evs:?}"
+    );
+    assert_eq!(s.tasks.len(), 2, "both snapshot commands must spawn");
+    let by_cmd = |s: &Supervisor, cmd: &str| {
+        let t = s
+            .tasks
+            .iter()
+            .find(|t| t.command == cmd)
+            .unwrap_or_else(|| panic!("task '{cmd}' missing after load"));
+        (t.group.clone(), t.name.clone())
+    };
+    assert_eq!(by_cmd(&s, "sleep 30"), (Some("api".into()), None));
+    assert_eq!(by_cmd(&s, "sleep 31"), (None, Some("web".into())));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Unknown and path-shaped recovery stems fail without spawning tasks.
+#[test]
+fn load_recovery_refuses_unknown_and_traversal_stems() {
+    let dir = scratch("recovery_load_refuse");
+    let config = dir.join("config");
+    let mut s = Supervisor::new(24, 80, 2000);
+    s.set_launch_context(config_ctx(&config, dir.clone(), &[]));
+
+    s.apply(Command::LoadRecovery {
+        stem: "20990101-000000-1".into(),
+    });
+    assert!(
+        s.drain().iter().any(|e| matches!(
+            e,
+            Event::Status(m) if m == "recovery snapshot '20990101-000000-1' not found"
+        )),
+        "an unknown stem must read as not-found"
+    );
+
+    s.apply(Command::LoadRecovery {
+        stem: "../x".into(),
+    });
+    assert!(
+        s.drain().iter().any(|e| matches!(
+            e,
+            Event::Status(m) if m.starts_with("recovery snapshot '../x' failed to load:")
+        )),
+        "a traversal stem must be refused, not probed"
+    );
+    assert!(s.tasks.is_empty(), "refused loads must spawn nothing");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Debouncing coalesces a mutation burst into one complete snapshot.
+#[test]
+fn recovery_debounce_coalesces_a_mutation_burst() {
+    let dir = scratch("recovery_debounce");
+    let config = dir.join("config");
+    let mut s = recovery_sup(
+        &config,
+        dir.clone(),
+        Duration::from_millis(500),
+        Duration::from_secs(600),
+    );
+    spawn(&mut s, "sleep 30", dir.clone());
+    spawn(&mut s, "sleep 31", dir.clone());
+    spawn(&mut s, "sleep 32", dir.clone());
+    s.tick();
+    assert!(
+        recovery_files(&config).is_empty(),
+        "a write inside the debounce window defeats coalescing"
+    );
+
+    assert!(
+        wait_until(Duration::from_secs(5), || {
+            s.tick();
+            !recovery_files(&config).is_empty()
+        }),
+        "the debounced snapshot never landed"
+    );
+    let files = recovery_files(&config);
+    assert_eq!(
+        files.len(),
+        1,
+        "a burst must produce one snapshot: {files:?}"
+    );
+    let text =
+        std::fs::read_to_string(config.join("sessions").join("recovery").join(&files[0])).unwrap();
+    for cmd in ["sleep 30", "sleep 31", "sleep 32"] {
+        assert!(text.contains(cmd), "snapshot must carry {cmd:?}: {text}");
+    }
+    assert!(!s.recovery.dirty, "a completed pass clears the flag");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Empty fleets do not create or replace recovery snapshots.
+#[test]
+fn recovery_empty_fleet_never_writes() {
+    let dir = scratch("recovery_empty");
+    let config = dir.join("config");
+    let mut s = recovery_sup(
+        &config,
+        dir.clone(),
+        Duration::from_millis(100),
+        Duration::from_millis(200),
+    );
+    // Cadence passes do not snapshot an initially empty fleet.
+    assert!(
+        !wait_until(Duration::from_millis(600), || {
+            s.tick();
+            !recovery_files(&config).is_empty()
+        }),
+        "an idle empty fleet must never write"
+    );
+
+    // Remove the only task before the debounced pass runs.
+    spawn(&mut s, "sleep 30", dir.clone());
+    let id = s.tasks[0].id;
+    s.apply(Command::Remove { id });
+    assert!(
+        !wait_until(Duration::from_millis(600), || {
+            s.tick();
+            !recovery_files(&config).is_empty()
+        }),
+        "a fleet emptied before the pass must never write"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Persistent write failures emit one notice and do not interrupt supervision.
+#[test]
+fn recovery_write_failure_notices_once_and_keeps_supervising() {
+    let dir = scratch("recovery_fail");
+    let config = dir.join("config");
+    // A plain file where `recovery/` must go fails every write attempt.
+    std::fs::create_dir_all(config.join("sessions")).unwrap();
+    std::fs::write(config.join("sessions").join("recovery"), "not a dir").unwrap();
+    let mut s = recovery_sup(
+        &config,
+        dir.clone(),
+        Duration::from_millis(10),
+        Duration::from_millis(50),
+    );
+    spawn(&mut s, "sleep 30", dir.clone());
+
+    // Count notices across several debounce and cadence intervals.
+    let mut notices = 0usize;
+    let deadline = Instant::now() + Duration::from_millis(500);
+    while Instant::now() < deadline {
+        s.tick();
+        notices += s
+            .drain()
+            .iter()
+            .filter(|e| matches!(e, Event::Status(m) if m.contains("recovery snapshot failed")))
+            .count();
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(notices, 1, "persistent failure must notice exactly once");
+
+    s.tick();
+    assert!(
+        s.drain()
+            .iter()
+            .any(|e| matches!(e, Event::Tasks(v) if v.len() == 1)),
+        "a failing writer must never disturb supervision"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Detached recovery maintenance writes without queuing client events.
+#[test]
+fn recovery_maintenance_writes_detached_and_queues_nothing() {
+    let dir = scratch("recovery_detached");
+    let config = dir.join("config");
+    let mut s = recovery_sup(
+        &config,
+        dir.clone(),
+        Duration::from_millis(50),
+        Duration::from_secs(600),
+    );
+    spawn(&mut s, "sleep 30", dir.clone());
+    // Match the daemon's detached reap-and-maintain loop.
+    assert!(
+        wait_until(Duration::from_secs(5), || {
+            s.reap();
+            s.recovery_maintenance();
+            !recovery_files(&config).is_empty()
+        }),
+        "the detached maintenance pass never wrote"
+    );
+    assert!(
+        s.drain().is_empty(),
+        "the idle path must not queue events; nothing drains them"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Deduplication treats the destination root as part of snapshot identity.
+#[test]
+fn recovery_dedup_is_per_destination_root() {
+    let dir = scratch("recovery_root_switch");
+    let (config_a, config_b) = (dir.join("cfg_a"), dir.join("cfg_b"));
+    let mut s = recovery_sup(
+        &config_a,
+        dir.clone(),
+        Duration::from_millis(50),
+        Duration::from_secs(600),
+    );
+    spawn(&mut s, "sleep 30", dir.clone());
+    assert!(
+        wait_until(Duration::from_secs(5), || {
+            s.recovery_maintenance();
+            !recovery_files(&config_a).is_empty()
+        }),
+        "root A never received the first snapshot"
+    );
+
+    // Move the unchanged recipe to a new destination and arm recovery.
+    s.set_launch_context(config_ctx(&config_b, dir.clone(), &[]));
+    s.recovery.dirty = true;
+    s.recovery.last_mutation = Some(Instant::now());
+    assert!(
+        wait_until(Duration::from_secs(5), || {
+            s.recovery_maintenance();
+            !recovery_files(&config_b).is_empty()
+        }),
+        "an unchanged recipe must still write to a root without a snapshot"
+    );
+    assert!(
+        !recovery_files(&config_a).is_empty(),
+        "the old root keeps its snapshot"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A failed write remains eligible for a later cadence retry.
+#[test]
+fn recovery_failed_write_retries_until_success() {
+    let dir = scratch("recovery_retry");
+    let config = dir.join("config");
+    // A plain file at the recovery path blocks the first write.
+    std::fs::create_dir_all(config.join("sessions")).unwrap();
+    std::fs::write(config.join("sessions").join("recovery"), "not a dir").unwrap();
+    let mut s = recovery_sup(
+        &config,
+        dir.clone(),
+        Duration::from_millis(10),
+        Duration::from_millis(50),
+    );
+    spawn(&mut s, "sleep 30", dir.clone());
+    assert!(
+        wait_until(Duration::from_secs(5), || {
+            s.recovery_maintenance();
+            s.recovery.failing
+        }),
+        "the blocked root never produced a failed pass"
+    );
+    assert!(
+        s.recovery.last_written.is_none(),
+        "a failed write must not advance the dedup pair"
+    );
+
+    // Remove the blocker; a cadence pass retries the unchanged content.
+    std::fs::remove_file(config.join("sessions").join("recovery")).unwrap();
+    assert!(
+        wait_until(Duration::from_secs(5), || {
+            s.recovery_maintenance();
+            !recovery_files(&config).is_empty()
+        }),
+        "the cadence never retried after the root became writable"
+    );
+    assert!(!s.recovery.failing, "a successful write clears the latch");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A cadence pass recreates a missing snapshot even when its recipe is unchanged.
+#[test]
+fn recovery_rewrites_after_a_sibling_prune_deletes_the_snapshot() {
+    let dir = scratch("recovery_sibling_prune");
+    let config = dir.join("config");
+    let mut s = recovery_sup(
+        &config,
+        dir.clone(),
+        Duration::from_millis(50),
+        Duration::from_millis(100),
+    );
+    spawn(&mut s, "sleep 30", dir.clone());
+    assert!(
+        wait_until(Duration::from_secs(5), || {
+            s.recovery_maintenance();
+            !recovery_files(&config).is_empty()
+        }),
+        "the first snapshot never landed"
+    );
+
+    // Remove the snapshot without changing the recipe or deduplication state.
+    let rec = config.join("sessions").join("recovery");
+    for name in recovery_files(&config) {
+        std::fs::remove_file(rec.join(name)).unwrap();
+    }
+
+    // No mutation arms the debounce; cadence alone must recreate the file.
+    assert!(
+        wait_until(Duration::from_secs(5), || {
+            s.recovery_maintenance();
+            !recovery_files(&config).is_empty()
+        }),
+        "an unchanged recipe must rewrite an externally deleted snapshot"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 

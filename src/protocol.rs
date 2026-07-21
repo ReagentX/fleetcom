@@ -12,7 +12,7 @@ use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
 use crate::frame::{KIND_CONTROL, KIND_HELLO, KIND_SCREEN};
 
 /// Wire-protocol version; the handshake rejects mismatched peers.
-pub const PROTOCOL_VERSION: u32 = 8;
+pub const PROTOCOL_VERSION: u32 = 9;
 
 /// Environment and working directory supplied by the launching client.
 #[derive(Debug, Clone, PartialEq)]
@@ -99,6 +99,9 @@ pub enum Command {
     SaveSession { name: String },
     /// Spawn every command in a named recipe, each in its (existing) dir.
     LoadSession { name: String },
+    /// Spawn every command in the recovery snapshot identified by a listed
+    /// filename stem.
+    LoadRecovery { stem: String },
     /// Ask for the saved recipe names; answered with `Event::Sessions`. Listing
     /// is core-side like save/load, so the picker shows the same dir they use.
     ListSessions,
@@ -187,8 +190,26 @@ pub enum Event {
     Screen(ScreenView),
     /// A one-line notice for the status line (save/load result, spawn error).
     Status(String),
-    /// Saved session-recipe names, sorted: the reply to `ListSessions`.
-    Sessions(Vec<String>),
+    /// The reply to `ListSessions`: saved session-recipe names (sorted) and
+    /// recovery snapshots (newest first).
+    Sessions {
+        names: Vec<String>,
+        recovery: Vec<RecoveryEntry>,
+    },
+}
+
+/// Recovery-snapshot metadata sent to the session picker.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecoveryEntry {
+    /// Filename stem used by `LoadRecovery`.
+    pub stem: String,
+    /// Stored session name, or the filename stem when no name is stored.
+    pub label: String,
+    /// Command count across the snapshot's directories.
+    pub tasks: u32,
+    /// Seconds since the snapshot file's mtime; 0 when the mtime is unreadable
+    /// or in the future.
+    pub age_secs: u64,
 }
 
 /// Process-derived lifecycle state, independent of the user's `tagged` intent.
@@ -388,6 +409,26 @@ fn str_vec(v: &jzon::JsonValue) -> Option<Vec<String>> {
         out.push(m.as_str()?.to_string());
     }
     Some(out)
+}
+
+/// Decode valid recovery entries, treating a missing or non-array value as
+/// empty and skipping malformed members independently.
+fn recovery_vec(v: &jzon::JsonValue) -> Vec<RecoveryEntry> {
+    let mut out = Vec::new();
+    for m in v.members() {
+        let entry = || -> Option<RecoveryEntry> {
+            Some(RecoveryEntry {
+                stem: m["stem"].as_str()?.to_string(),
+                label: m["label"].as_str()?.to_string(),
+                tasks: u32::try_from(m["tasks"].as_u64()?).ok()?,
+                age_secs: m["age"].as_u64()?,
+            })
+        };
+        if let Some(e) = entry() {
+            out.push(e);
+        }
+    }
+    out
 }
 
 fn lifecycle_str(l: Lifecycle) -> &'static str {
@@ -620,6 +661,10 @@ pub fn encode_command(cmd: &Command) -> (u8, Vec<u8>) {
             let _ = o.insert("t", "load");
             let _ = o.insert("name", name.as_str());
         }
+        Command::LoadRecovery { stem } => {
+            let _ = o.insert("t", "recover");
+            let _ = o.insert("stem", stem.as_str());
+        }
         Command::ListSessions => {
             let _ = o.insert("t", "list");
         }
@@ -764,6 +809,9 @@ pub fn decode_command(kind: u8, payload: &[u8]) -> Option<Command> {
         "load" => Command::LoadSession {
             name: v["name"].as_str()?.to_string(),
         },
+        "recover" => Command::LoadRecovery {
+            stem: v["stem"].as_str()?.to_string(),
+        },
         "list" => Command::ListSessions,
         "shutdown" => Command::Shutdown,
         _ => return None,
@@ -816,14 +864,24 @@ pub fn encode_event(ev: &Event) -> (u8, Vec<u8>) {
             let _ = o.insert("msg", msg.as_str());
             (KIND_CONTROL, o.dump().into_bytes())
         }
-        Event::Sessions(names) => {
+        Event::Sessions { names, recovery } => {
             let mut arr = jzon::JsonValue::new_array();
             for n in names {
                 let _ = arr.push(n.as_str());
             }
+            let mut rec = jzon::JsonValue::new_array();
+            for r in recovery {
+                let mut m = jzon::JsonValue::new_object();
+                let _ = m.insert("stem", r.stem.as_str());
+                let _ = m.insert("label", r.label.as_str());
+                let _ = m.insert("tasks", u64::from(r.tasks));
+                let _ = m.insert("age", r.age_secs);
+                let _ = rec.push(m);
+            }
             let mut o = jzon::JsonValue::new_object();
             let _ = o.insert("t", "sessions");
             let _ = o.insert("names", arr);
+            let _ = o.insert("recovery", rec);
             (KIND_CONTROL, o.dump().into_bytes())
         }
         Event::Screen(sv) => {
@@ -906,7 +964,10 @@ pub fn decode_event(kind: u8, payload: &[u8]) -> Option<Event> {
                     Some(Event::Tasks(views))
                 }
                 "status" => Some(Event::Status(v["msg"].as_str()?.to_string())),
-                "sessions" => Some(Event::Sessions(str_vec(&v["names"])?)),
+                "sessions" => Some(Event::Sessions {
+                    names: str_vec(&v["names"])?,
+                    recovery: recovery_vec(&v["recovery"]),
+                }),
                 _ => None,
             }
         }
@@ -1062,6 +1123,9 @@ mod tests {
             },
             Command::LoadSession {
                 name: "home".into(),
+            },
+            Command::LoadRecovery {
+                stem: "20260714-093015-4242".into(),
             },
             Command::ListSessions,
             Command::Shutdown,
@@ -1525,10 +1589,115 @@ mod tests {
             Vec::new(),
             vec!["my session".to_string(), "café ☕".to_string()],
         ] {
-            let ev = Event::Sessions(names);
+            let ev = Event::Sessions {
+                names,
+                recovery: Vec::new(),
+            };
             let (k, p) = encode_event(&ev);
             assert_eq!(k, KIND_CONTROL);
             assert_eq!(decode_event(k, &p).as_ref(), Some(&ev), "round-trip {ev:?}");
+        }
+    }
+
+    /// Recovery entries round-trip with their exact wire fields.
+    #[test]
+    fn sessions_recovery_entries_round_trip_and_pin_the_wire_shape() {
+        let ev = Event::Sessions {
+            names: vec!["work".to_string()],
+            recovery: vec![
+                RecoveryEntry {
+                    stem: "20260715-070000-22".into(),
+                    label: "autosaved 2026-07-15 07:00".into(),
+                    tasks: 3,
+                    age_secs: 42,
+                },
+                RecoveryEntry {
+                    stem: "20260714-093015-11".into(),
+                    label: "autosaved 2026-07-14 09:30".into(),
+                    tasks: 1,
+                    age_secs: 90_000,
+                },
+            ],
+        };
+        let (k, p) = encode_event(&ev);
+        assert_eq!(k, KIND_CONTROL);
+        assert_eq!(
+            std::str::from_utf8(&p).unwrap(),
+            r#"{"t":"sessions","names":["work"],"recovery":[{"stem":"20260715-070000-22","label":"autosaved 2026-07-15 07:00","tasks":3,"age":42},{"stem":"20260714-093015-11","label":"autosaved 2026-07-14 09:30","tasks":1,"age":90000}]}"#
+        );
+        assert_eq!(decode_event(k, &p), Some(ev));
+    }
+
+    /// A missing or non-array `recovery` value decodes as an empty list.
+    #[test]
+    fn sessions_frame_without_recovery_key_decodes_empty() {
+        for json in [
+            r#"{"t":"sessions","names":["a"]}"#,
+            r#"{"t":"sessions","names":["a"],"recovery":null}"#,
+            r#"{"t":"sessions","names":["a"],"recovery":"junk"}"#,
+        ] {
+            assert_eq!(
+                decode_event(KIND_CONTROL, json.as_bytes()),
+                Some(Event::Sessions {
+                    names: vec!["a".to_string()],
+                    recovery: Vec::new(),
+                }),
+                "should tolerate {json}"
+            );
+        }
+    }
+
+    /// Malformed recovery members are skipped without dropping valid entries.
+    #[test]
+    fn malformed_recovery_members_drop_without_rejecting_the_event() {
+        let json = r#"{"t":"sessions","names":[],"recovery":[
+            {"stem":5,"label":"x","tasks":1,"age":0},
+            {"label":"x","tasks":1,"age":0},
+            {"stem":"s1","tasks":1,"age":0},
+            {"stem":"s2","label":7,"tasks":1,"age":0},
+            {"stem":"s3","label":"x","age":0},
+            {"stem":"s4","label":"x","tasks":4294967296,"age":0},
+            {"stem":"s5","label":"x","tasks":-1,"age":0},
+            {"stem":"s6","label":"x","tasks":1,"age":-3},
+            {"stem":"s7","label":"x","tasks":1},
+            "flat",
+            {"stem":"good","label":"autosaved","tasks":2,"age":7}
+        ]}"#;
+        assert_eq!(
+            decode_event(KIND_CONTROL, json.as_bytes()),
+            Some(Event::Sessions {
+                names: Vec::new(),
+                recovery: vec![RecoveryEntry {
+                    stem: "good".into(),
+                    label: "autosaved".into(),
+                    tasks: 2,
+                    age_secs: 7,
+                }],
+            })
+        );
+    }
+
+    /// `LoadRecovery` requires a string stem in its wire representation.
+    #[test]
+    fn load_recovery_wire_form() {
+        let (k, p) = encode_command(&Command::LoadRecovery {
+            stem: "20260714-093015-4242".into(),
+        });
+        assert_eq!(k, KIND_CONTROL);
+        assert_eq!(
+            std::str::from_utf8(&p).unwrap(),
+            r#"{"t":"recover","stem":"20260714-093015-4242"}"#
+        );
+        for json in [
+            r#"{"t":"recover"}"#,
+            r#"{"t":"recover","stem":5}"#,
+            r#"{"t":"recover","stem":null}"#,
+        ] {
+            assert_eq!(
+                decode_command(KIND_CONTROL, json.as_bytes()),
+                None,
+                "should reject {json}"
+            );
         }
     }
 

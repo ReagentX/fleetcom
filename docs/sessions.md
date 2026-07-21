@@ -66,6 +66,21 @@ A bare agent command does not identify its conversation, so saving it verbatim w
 }
 ```
 
+## Recovery
+
+`fleetcom` automatically snapshots the current task set under `recovery/` inside the session directory. Each daemon (or `--foreground` core) writes to a file named for its start time and process ID. After each write, the new file and files whose process IDs are still live are protected; among the remaining files, the nine newest names survive. A shared recovery directory can therefore contain more than ten snapshots while multiple writers are live.
+
+A snapshot pass runs two seconds after the last command that can change a saved recipe, coalescing a burst of commands. A pass writes a nonempty recipe when its content or destination changed, or when the expected snapshot file is missing. Every 60 seconds, `fleetcom` also checks for stored-command changes such as a newly captured agent resume ID.
+
+- An empty fleet does not write a snapshot, so removing every task does not replace the previous snapshot with an empty recipe.
+- Quitting, disconnecting, and `fleetcom --kill` leave snapshots in place.
+
+A snapshot uses the session format above, with an `autosaved <timestamp>` UTC label in its `name` field. Loading one spawns its commands like a named session and suggests saving the recovered fleet under a permanent name.
+
+In the dashboard, `o` opens the [session picker](commands.md#the-o-session-picker) on the saved list; while snapshots exist, `Tab` flips it to the recovery list.
+
+Recovery files carry the same caveat as saved recipes: they persist full command lines, which can embed secrets. New recovery directories use mode 0700, and snapshot files use mode 0600.
+
 ## Saving and loading
 
 - Save: `w` in the dashboard, type a name, `Enter`. Writes the session name plus each task's directory, command, and optional group and name to `<name>.json`.

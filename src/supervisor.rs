@@ -89,6 +89,13 @@ fn effective_scrollback(flag: Option<usize>, env: Option<&str>) -> usize {
 /// that do not exit after SIGTERM.
 const KILL_GRACE: Duration = Duration::from_secs(2);
 
+/// Quiet period used to coalesce recipe changes into one recovery write.
+const RECOVERY_DEBOUNCE: Duration = Duration::from_secs(2);
+
+/// Interval for detecting stored-command changes that occur without a recipe
+/// mutation, such as a newly captured agent resume ID.
+const RECOVERY_CADENCE: Duration = Duration::from_secs(60);
+
 /// Maximum stored label length in Unicode scalar values after normalization,
 /// shared by group and display-name assignments.
 const MAX_LABEL_CHARS: usize = 64;
@@ -155,6 +162,45 @@ fn harness_home(env: &[(OsString, OsString)], h: &dyn harness::Harness) -> Optio
     val(h.home_env_var()).or_else(|| Some(val("HOME")?.join(h.home_dot_dir())))
 }
 
+/// State for automatic recovery snapshots. Write failures do not interrupt
+/// task supervision, and teardown does not write or delete snapshots.
+struct Recovery {
+    /// Recovery writes are opt-in in unit tests.
+    enabled: bool,
+    /// Whether a potentially recipe-changing command awaits a debounced pass.
+    dirty: bool,
+    /// The most recent scheduled recipe change: the debounce anchor.
+    last_mutation: Option<Instant>,
+    /// The start of the most recent cadence interval.
+    last_cadence: Instant,
+    /// Sessions root and recipe fingerprint of the last successful write.
+    /// A match is skipped only while the corresponding snapshot still exists.
+    last_written: Option<(PathBuf, String)>,
+    /// Filename stem reused for this supervisor's recovery writes.
+    stem: String,
+    /// Whether a write failure has been reported since the last successful write.
+    failing: bool,
+    /// Debounce and content-check intervals.
+    debounce: Duration,
+    cadence: Duration,
+}
+
+impl Recovery {
+    fn new() -> Recovery {
+        Recovery {
+            enabled: !cfg!(test),
+            dirty: false,
+            last_mutation: None,
+            last_cadence: Instant::now(),
+            last_written: None,
+            stem: session::recovery_stem(std::time::SystemTime::now(), std::process::id()),
+            failing: false,
+            debounce: RECOVERY_DEBOUNCE,
+            cadence: RECOVERY_CADENCE,
+        }
+    }
+}
+
 pub struct Supervisor {
     tasks: Vec<Task>,
     /// Removed tasks whose process groups may still be winding down: TERMed at
@@ -196,6 +242,8 @@ pub struct Supervisor {
     /// Capture assets keyed by canonicalized root and reused for this
     /// supervisor's lifetime.
     capture: BTreeMap<PathBuf, assets::CaptureAssets>,
+    /// Automatic fleet-recovery snapshot state.
+    recovery: Recovery,
 }
 
 impl Supervisor {
@@ -214,6 +262,7 @@ impl Supervisor {
             waker: Arc::new(Mutex::new(None)),
             kill_grace: KILL_GRACE,
             capture: BTreeMap::new(),
+            recovery: Recovery::new(),
         }
     }
 
@@ -226,6 +275,14 @@ impl Supervisor {
     #[cfg(test)]
     pub fn set_kill_grace(&mut self, grace: Duration) {
         self.kill_grace = grace;
+    }
+
+    /// Enable recovery with test-specific timings.
+    #[cfg(test)]
+    pub fn set_recovery_timing(&mut self, debounce: Duration, cadence: Duration) {
+        self.recovery.enabled = true;
+        self.recovery.debounce = debounce;
+        self.recovery.cadence = cadence;
     }
 
     /// Install the sender the current serving loop waits on, so task reader
@@ -260,6 +317,21 @@ impl Supervisor {
     /// Apply one client request. Fire-and-forget: any result (a save/load
     /// notice, a spawn failure) is queued as `Event::Status`, never returned.
     pub fn apply(&mut self, cmd: Command) {
+        // Recipe-affecting command variants arm recovery before validation;
+        // fingerprinting filters rejected commands and other no-ops.
+        if matches!(
+            &cmd,
+            Command::Spawn { .. }
+                | Command::Remove { .. }
+                | Command::Restart { .. }
+                | Command::SetGroup { .. }
+                | Command::SetName { .. }
+                | Command::LoadSession { .. }
+                | Command::LoadRecovery { .. }
+        ) {
+            self.recovery.dirty = true;
+            self.recovery.last_mutation = Some(Instant::now());
+        }
         match cmd {
             Command::Spawn {
                 command,
@@ -366,6 +438,7 @@ impl Supervisor {
             }
             Command::SaveSession { name } => self.save_session(&name),
             Command::LoadSession { name } => self.load_session(&name),
+            Command::LoadRecovery { stem } => self.load_recovery(&stem),
             Command::ListSessions => self.list_sessions(),
             Command::Shutdown => self.shutdown_all(),
         }
@@ -497,6 +570,85 @@ impl Supervisor {
                 self.events.push(Event::Screen(view));
             }
         }
+
+        self.maybe_write_recovery(now);
+    }
+
+    /// Run a due debounce or cadence pass. Skip empty or unchanged recipes and
+    /// report at most one consecutive write-failure notice.
+    fn maybe_write_recovery(&mut self, now: Instant) {
+        if !self.recovery.enabled {
+            return;
+        }
+        let debounce_due = self.recovery.dirty
+            && self
+                .recovery
+                .last_mutation
+                .is_some_and(|t| now.duration_since(t) >= self.recovery.debounce);
+        let cadence_due = now.duration_since(self.recovery.last_cadence) >= self.recovery.cadence;
+        if !(debounce_due || cadence_due) {
+            return;
+        }
+        if cadence_due {
+            self.recovery.last_cadence = now;
+        }
+        // Do not replace an existing snapshot with an empty recipe.
+        if self.tasks.is_empty() {
+            self.recovery.dirty = false;
+            return;
+        }
+        // A missing config root disables this pass.
+        let Some(root) = self.sessions_root() else {
+            self.recovery.dirty = false;
+            return;
+        };
+        // Refresh finished tasks' resume IDs before serialization.
+        for t in &mut self.tasks {
+            scrape_now(t);
+        }
+        let cfg = self.session_config();
+        // Exclude the timestamped label from content comparison.
+        let hash = fnv1a_hex(session::fingerprint_json(&cfg).as_bytes());
+        // Deduplication is scoped to the current root and requires the snapshot
+        // to remain on disk, so a removed snapshot is recreated on a due pass.
+        let dest = session::recovery_dir(&root).join(format!("{}.json", self.recovery.stem));
+        if self
+            .recovery
+            .last_written
+            .as_ref()
+            .is_some_and(|(r, h)| *r == root && *h == hash)
+            && std::fs::metadata(&dest).is_ok()
+        {
+            self.recovery.dirty = false;
+            return;
+        }
+        let label = session::recovery_label(std::time::SystemTime::now());
+        match session::save_recovery_in(
+            &session::recovery_dir(&root),
+            &self.recovery.stem,
+            &label,
+            &cfg,
+        ) {
+            Ok(_) => {
+                self.recovery.last_written = Some((root, hash));
+                self.recovery.failing = false;
+            }
+            Err(e) => {
+                // Keep retrying on cadence passes, but report only the first
+                // consecutive failure.
+                if !self.recovery.failing {
+                    self.recovery.failing = true;
+                    self.status(format!("recovery snapshot failed: {e}"));
+                }
+            }
+        }
+        self.recovery.dirty = false;
+    }
+
+    /// Run recovery maintenance between clients without queuing task or screen
+    /// snapshots. Debounce and cadence checks bound the write rate.
+    pub fn recovery_maintenance(&mut self) {
+        self.maybe_write_recovery(Instant::now());
     }
 
     /// Hand the client every event queued since the last drain.
@@ -780,41 +932,30 @@ impl Supervisor {
         self.status(status);
     }
 
-    /// Answer `ListSessions` with the recipe names under this connection's
-    /// session root (sorted by `list_in`); no root reads as no sessions.
+    /// List named sessions and recovery snapshots from the connection's
+    /// session root.
     fn list_sessions(&mut self) {
-        let names = self
+        let (names, recovery) = self
             .sessions_root()
-            .map(|root| session::list_in(&root))
+            .map(|root| {
+                (
+                    session::list_in(&root),
+                    session::list_recovery_in(&session::recovery_dir(&root)),
+                )
+            })
             .unwrap_or_default();
-        self.events.push(Event::Sessions(names));
+        self.events.push(Event::Sessions { names, recovery });
     }
 
-    /// Spawn every command in the named session, each in its (existing) dir.
+    /// Spawn every entry of a loaded recipe, each in its (existing) dir.
     /// Missing dirs are skipped rather than spawning tasks doomed to fail on
-    /// chdir.
-    fn load_session(&mut self, name: &str) {
-        let Some(root) = self.sessions_root() else {
-            self.status("load failed: no config directory available");
-            return;
-        };
-        let cfg = match session::load_in(&root, name) {
-            Ok(c) => c,
-            // Preserve load errors; only a missing file maps to "not found".
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                self.status(format!("session '{name}' not found"));
-                return;
-            }
-            Err(e) => {
-                self.status(format!("session '{name}' failed to load: {e}"));
-                return;
-            }
-        };
-        let Some(launch) = self.launch_or_refuse() else {
-            return;
-        };
+    /// chdir. Returns `(spawned, skipped, failed)` for the caller's notice, or
+    /// `None` when no launch context is installed (already refused with its
+    /// own notice).
+    fn materialize(&mut self, cfg: &SessionConfig) -> Option<(usize, usize, usize)> {
+        let launch = self.launch_or_refuse()?;
         let (mut spawned, mut skipped, mut failed) = (0usize, 0usize, 0usize);
-        for (dir, entries) in &cfg {
+        for (dir, entries) in cfg {
             let resolved = path::resolve(&launch.cwd, dir);
             if !resolved.is_dir() {
                 skipped += entries.len();
@@ -839,6 +980,30 @@ impl Supervisor {
                 }
             }
         }
+        Some((spawned, skipped, failed))
+    }
+
+    /// Spawn every command in the named session via `materialize`.
+    fn load_session(&mut self, name: &str) {
+        let Some(root) = self.sessions_root() else {
+            self.status("load failed: no config directory available");
+            return;
+        };
+        let cfg = match session::load_in(&root, name) {
+            Ok(c) => c,
+            // Preserve load errors; only a missing file maps to "not found".
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                self.status(format!("session '{name}' not found"));
+                return;
+            }
+            Err(e) => {
+                self.status(format!("session '{name}' failed to load: {e}"));
+                return;
+            }
+        };
+        let Some((spawned, skipped, failed)) = self.materialize(&cfg) else {
+            return;
+        };
         // Omit zero buckets, except report zero tasks for an empty recipe.
         let mut parts = Vec::new();
         if spawned > 0 || (skipped == 0 && failed == 0) {
@@ -853,6 +1018,39 @@ impl Supervisor {
             parts.push(format!("{failed} failed to spawn"));
         }
         self.status(format!("loaded '{name}': {}", parts.join(", ")));
+    }
+
+    /// Load a recovery snapshot by stem and suggest saving it as a named session.
+    fn load_recovery(&mut self, stem: &str) {
+        let Some(root) = self.sessions_root() else {
+            self.status("load failed: no config directory available");
+            return;
+        };
+        let cfg = match session::load_recovery_in(&session::recovery_dir(&root), stem) {
+            Ok(c) => c,
+            // Preserve load errors; only a missing file maps to "not found".
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                self.status(format!("recovery snapshot '{stem}' not found"));
+                return;
+            }
+            Err(e) => {
+                self.status(format!("recovery snapshot '{stem}' failed to load: {e}"));
+                return;
+            }
+        };
+        let Some((_, skipped, failed)) = self.materialize(&cfg) else {
+            return;
+        };
+        let mut msg = String::from("loaded recovery snapshot; save to name it");
+        if skipped > 0 {
+            msg.push_str(&format!(
+                ", {skipped} skipped (missing dir, task limit, or command too long)"
+            ));
+        }
+        if failed > 0 {
+            msg.push_str(&format!(", {failed} failed to spawn"));
+        }
+        self.status(msg);
     }
 }
 

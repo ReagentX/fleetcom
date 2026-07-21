@@ -27,8 +27,8 @@ use crate::{
     editbuf::EditBuffer,
     path,
     protocol::{
-        Command, Event, Key, Lifecycle, Mods, MouseBtn, MouseKind, ScreenView, ScrollAction,
-        TaskView,
+        Command, Event, Key, Lifecycle, Mods, MouseBtn, MouseKind, RecoveryEntry, ScreenView,
+        ScrollAction, TaskView,
     },
     transport::{ExitIntent, SocketTransport, ThreadTransport, Transport},
     ui,
@@ -92,6 +92,13 @@ impl GroupMode {
             GroupMode::Custom => GroupMode::State,
         }
     }
+}
+
+/// Active page in the session picker.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum SessionPage {
+    Saved,
+    Recovery,
 }
 
 /// What Enter does with a picker row.
@@ -179,6 +186,12 @@ pub struct App {
     // Load-session picker state.
     pub session_names: Vec<String>,
     pub session_sel: usize,
+    /// Recovery snapshots from the latest `Sessions` event, newest first.
+    pub session_recovery: Vec<RecoveryEntry>,
+    /// The displayed session-picker list; `o` resets it to `Saved`.
+    pub session_page: SessionPage,
+    /// Selection in the recovery list, clamped independently of `session_sel`.
+    pub recovery_sel: usize,
     /// Transient one-line notice (save/load result), dismissed on the next key.
     pub status: Option<String>,
     /// Parsed terminal events from the stdin reader thread. crossterm owns the
@@ -354,6 +367,9 @@ impl App {
             rename_target: None,
             session_names: Vec::new(),
             session_sel: 0,
+            session_recovery: Vec::new(),
+            session_page: SessionPage::Saved,
+            recovery_sel: 0,
             status: None,
             input_rx,
             input_tx: Some(input_tx),
@@ -601,11 +617,15 @@ impl App {
                     self.focused_screen = Some(s);
                 }
                 Event::Status(s) => self.status = Some(s),
-                Event::Sessions(names) => {
-                    // A shorter list can land while the picker is open; clamp
-                    // the selection before it can index past the end.
+                Event::Sessions { names, recovery } => {
+                    // Clamp both page selections to the refreshed lists.
                     self.session_sel = self.session_sel.min(names.len().saturating_sub(1));
+                    self.recovery_sel = self.recovery_sel.min(recovery.len().saturating_sub(1));
+                    if recovery.is_empty() {
+                        self.session_page = SessionPage::Saved;
+                    }
                     self.session_names = names;
+                    self.session_recovery = recovery;
                 }
             }
         }
@@ -977,6 +997,9 @@ impl App {
                 self.transport.send(Command::ListSessions);
                 self.session_names.clear();
                 self.session_sel = 0;
+                self.session_recovery.clear();
+                self.session_page = SessionPage::Saved;
+                self.recovery_sel = 0;
                 self.mode = Mode::LoadSession;
             }
             // Restart only finished tasks.
@@ -1024,19 +1047,45 @@ impl App {
     }
 
     fn on_key_loadsession(&mut self, k: KeyEvent) {
-        match k.code {
-            KeyCode::Esc => self.mode = Mode::Dashboard,
-            KeyCode::Up => self.session_sel = self.session_sel.saturating_sub(1),
-            KeyCode::Down => {
-                self.session_sel = step_down(self.session_sel, self.session_names.len())
+        if matches!(k.code, KeyCode::Tab | KeyCode::BackTab) {
+            if !self.session_recovery.is_empty() {
+                self.session_page = match self.session_page {
+                    SessionPage::Saved => SessionPage::Recovery,
+                    SessionPage::Recovery => SessionPage::Saved,
+                };
             }
-            KeyCode::Enter => {
-                if let Some(name) = self.session_names.get(self.session_sel).cloned() {
-                    self.load_session(&name);
+            return;
+        }
+        match self.session_page {
+            SessionPage::Saved => match k.code {
+                KeyCode::Esc => self.mode = Mode::Dashboard,
+                KeyCode::Up => self.session_sel = self.session_sel.saturating_sub(1),
+                KeyCode::Down => {
+                    self.session_sel = step_down(self.session_sel, self.session_names.len())
                 }
-                self.mode = Mode::Dashboard;
-            }
-            _ => {}
+                KeyCode::Enter => {
+                    if let Some(name) = self.session_names.get(self.session_sel).cloned() {
+                        self.load_session(&name);
+                    }
+                    self.mode = Mode::Dashboard;
+                }
+                _ => {}
+            },
+            SessionPage::Recovery => match k.code {
+                KeyCode::Esc => self.mode = Mode::Dashboard,
+                KeyCode::Up => self.recovery_sel = self.recovery_sel.saturating_sub(1),
+                KeyCode::Down => {
+                    self.recovery_sel = step_down(self.recovery_sel, self.session_recovery.len())
+                }
+                KeyCode::Enter => {
+                    if let Some(e) = self.session_recovery.get(self.recovery_sel) {
+                        let stem = e.stem.clone();
+                        self.transport.send(Command::LoadRecovery { stem });
+                    }
+                    self.mode = Mode::Dashboard;
+                }
+                _ => {}
+            },
         }
     }
 

@@ -33,7 +33,7 @@
 | `r` | Rerun a finished task; supported agent tasks use the captured resume command |
 | `X` | Kill a running task (`TERM`, then `KILL` after 2 s), or remove a finished one |
 | `w` | Save the current tasks as a session |
-| `o` | Load a saved session |
+| `o` | Load a saved session or a recovery snapshot (opens the [session picker](#the-o-session-picker)) |
 | `q` (or `Ctrl-C`) | Disconnect; leave the daemon and tasks running |
 | `Q` | Quit; kill the tasks and stop the daemon |
 
@@ -129,6 +129,12 @@ Typing filters the rows; `Backspace` deletes one character and the matches re-fi
 `↑`/`↓` move the highlight; `Esc` cancels without changing anything.
 
 The daemon normalizes every group name received from the picker or a [session](sessions.md) file. It removes control characters, trims surrounding whitespace, and caps the result at 64 characters. An empty result or the exact name `Unassigned` means no group, preventing a user-defined name from colliding with the reserved section. Comparison remains case-sensitive, so `unassigned` is a valid group name.
+
+## The `o` session picker
+
+`o` opens a bottom panel listing the saved [sessions](sessions.md): `↑`/`↓` move the highlight, `Enter` loads, `Esc` cancels. While [recovery snapshots](sessions.md#recovery) exist, the hint adds `tab recovery (N)` and `Tab` (or `Shift-Tab`) flips the panel to them; `Tab` again returns to the saved list. Each list keeps its own highlight. With no snapshots, `Tab` does nothing and the hint omits it.
+
+A recovery row reads `<age> ago · <tasks> task(s) · <label>`: the file's age, its command count, and its stored label (normally `autosaved <timestamp>`). `Enter` loads the highlighted snapshot; the status line confirms the load and suggests saving it. Press `w` to save the recovered fleet as a named session.
 
 ## Peek
 

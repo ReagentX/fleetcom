@@ -31,8 +31,6 @@ use std::{
 
 pub use claude::Claude;
 pub use codex::Codex;
-// Test-only: `testutil::write_rollout` derives day directories from it.
-#[cfg(test)]
 pub(crate) use codex::civil_from_days;
 pub use grok::Grok;
 

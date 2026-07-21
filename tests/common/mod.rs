@@ -17,7 +17,7 @@ use std::{
 
 /// The protocol version this test suite speaks; must track
 /// `protocol::PROTOCOL_VERSION` (drift fails the handshake, loudly).
-pub const PROTOCOL_VERSION: u32 = 8;
+pub const PROTOCOL_VERSION: u32 = 9;
 
 /// One frame of the given kind: `[u32 len][kind][payload]`.
 pub fn frame(kind: u8, payload: &[u8]) -> Vec<u8> {
@@ -196,6 +196,8 @@ pub fn start_daemon_raw(
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_fleetcom"));
     cmd.arg("--daemon")
         .env("FLEETCOM_RUNTIME_DIR", &dir)
+        // Isolate recovery snapshots with the daemon's runtime files.
+        .env("FLEETCOM_CONFIG_DIR", dir.join("config"))
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
