@@ -1946,5 +1946,118 @@ fn recovery_write_failure_notices_once_and_keeps_supervising() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// The detached idle path writes a due snapshot through
+/// `recovery_maintenance` alone — no `tick` — and queues no events: between
+/// clients nothing drains the queue, so growth there would be unbounded.
+#[test]
+fn recovery_maintenance_writes_detached_and_queues_nothing() {
+    let dir = scratch("recovery_detached");
+    let config = dir.join("config");
+    let mut s = recovery_sup(
+        &config,
+        dir.clone(),
+        Duration::from_millis(50),
+        Duration::from_secs(600),
+    );
+    spawn(&mut s, "sleep 30", dir.clone());
+    // The daemon's idle arm: reap plus the maintenance pass, never tick.
+    assert!(
+        wait_until(Duration::from_secs(5), || {
+            s.reap();
+            s.recovery_maintenance();
+            !recovery_files(&config).is_empty()
+        }),
+        "the detached maintenance pass never wrote"
+    );
+    assert!(
+        s.drain().is_empty(),
+        "the idle path must not queue events; nothing drains them"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The write-skip is scoped to its destination: after a reconnect moves the
+/// session root, an unchanged recipe must still write, because the new root
+/// holds no snapshot yet.
+#[test]
+fn recovery_dedup_is_per_destination_root() {
+    let dir = scratch("recovery_root_switch");
+    let (config_a, config_b) = (dir.join("cfg_a"), dir.join("cfg_b"));
+    let mut s = recovery_sup(
+        &config_a,
+        dir.clone(),
+        Duration::from_millis(50),
+        Duration::from_secs(600),
+    );
+    spawn(&mut s, "sleep 30", dir.clone());
+    assert!(
+        wait_until(Duration::from_secs(5), || {
+            s.recovery_maintenance();
+            !recovery_files(&config_a).is_empty()
+        }),
+        "root A never received the first snapshot"
+    );
+
+    // A reconnect with a different `FLEETCOM_CONFIG_DIR`: same recipe, new
+    // destination. Arm the debounce as a structural command would.
+    s.set_launch_context(config_ctx(&config_b, dir.clone(), &[]));
+    s.recovery.dirty = true;
+    s.recovery.last_mutation = Some(Instant::now());
+    assert!(
+        wait_until(Duration::from_secs(5), || {
+            s.recovery_maintenance();
+            !recovery_files(&config_b).is_empty()
+        }),
+        "an unchanged recipe must still write to a root without a snapshot"
+    );
+    assert!(
+        !recovery_files(&config_a).is_empty(),
+        "the old root keeps its snapshot"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A failed write leaves the dedup pair at the last *written* state, so a
+/// later pass retries the same content and lands it once the root is
+/// writable again.
+#[test]
+fn recovery_failed_write_retries_until_success() {
+    let dir = scratch("recovery_retry");
+    let config = dir.join("config");
+    // A plain file where `recovery/` must go fails the first pass.
+    std::fs::create_dir_all(config.join("sessions")).unwrap();
+    std::fs::write(config.join("sessions").join("recovery"), "not a dir").unwrap();
+    let mut s = recovery_sup(
+        &config,
+        dir.clone(),
+        Duration::from_millis(10),
+        Duration::from_millis(50),
+    );
+    spawn(&mut s, "sleep 30", dir.clone());
+    assert!(
+        wait_until(Duration::from_secs(5), || {
+            s.recovery_maintenance();
+            s.recovery.failing
+        }),
+        "the blocked root never produced a failed pass"
+    );
+    assert!(
+        s.recovery.last_written.is_none(),
+        "a failed write must not advance the dedup pair"
+    );
+
+    // Unblock the root; a cadence pass retries the unchanged content.
+    std::fs::remove_file(config.join("sessions").join("recovery")).unwrap();
+    assert!(
+        wait_until(Duration::from_secs(5), || {
+            s.recovery_maintenance();
+            !recovery_files(&config).is_empty()
+        }),
+        "the cadence never retried after the root became writable"
+    );
+    assert!(!s.recovery.failing, "a successful write clears the latch");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[path = "supervisor_capture_tests.rs"]
 mod capture;

@@ -173,9 +173,13 @@ struct Recovery {
     last_mutation: Option<Instant>,
     /// The start of the most recent cadence interval.
     last_cadence: Instant,
-    /// FNV-1a of the last successfully written recipe fingerprint; `None`
-    /// until the first write.
-    last_hash: Option<String>,
+    /// The last successful write's destination and content: the sessions root
+    /// it landed under, and the FNV-1a of the recipe fingerprint; `None` until
+    /// the first write. Both halves gate the skip because the root is
+    /// per-connection (`sessions_root` reads the connecting client's
+    /// `FLEETCOM_CONFIG_DIR`): an unchanged recipe must still write after a
+    /// reconnect moves the root, or the new destination never gets a snapshot.
+    last_written: Option<(PathBuf, String)>,
     /// Filename stem reused for this supervisor's recovery writes.
     stem: String,
     /// Whether a write failure has been reported since the last successful write.
@@ -192,7 +196,7 @@ impl Recovery {
             dirty: false,
             last_mutation: None,
             last_cadence: Instant::now(),
-            last_hash: None,
+            last_written: None,
             stem: session::recovery_stem(std::time::SystemTime::now(), std::process::id()),
             failing: false,
             debounce: RECOVERY_DEBOUNCE,
@@ -611,7 +615,14 @@ impl Supervisor {
         let cfg = self.session_config();
         // Exclude the timestamped label from content comparison.
         let hash = fnv1a_hex(session::fingerprint_json(&cfg).as_bytes());
-        if self.recovery.last_hash.as_ref() == Some(&hash) {
+        // Skip only when this destination already holds this content; see
+        // `Recovery::last_written` for why the root is part of the compare.
+        if self
+            .recovery
+            .last_written
+            .as_ref()
+            .is_some_and(|(r, h)| *r == root && *h == hash)
+        {
             self.recovery.dirty = false;
             return;
         }
@@ -623,11 +634,13 @@ impl Supervisor {
             &cfg,
         ) {
             Ok(_) => {
-                self.recovery.last_hash = Some(hash);
+                self.recovery.last_written = Some((root, hash));
                 self.recovery.failing = false;
             }
             Err(e) => {
-                // Report once until a write succeeds; cadence passes keep retrying.
+                // Report once until a write succeeds; cadence passes keep
+                // retrying because the pair still holds the last *written*
+                // state, so the failed content never compares as current.
                 if !self.recovery.failing {
                     self.recovery.failing = true;
                     self.status(format!("recovery snapshot failed: {e}"));
@@ -635,6 +648,19 @@ impl Supervisor {
             }
         }
         self.recovery.dirty = false;
+    }
+
+    /// The detached idle loop's recovery pass: run a due debounce or cadence
+    /// write and nothing else. `tick` is off-limits between clients — it
+    /// queues `Event::Tasks` (and screen frames) on every call with nothing
+    /// draining them — yet snapshots must stay current exactly then: a
+    /// mutation burst armed just before disconnect, resume-ID drift while
+    /// agents run unwatched. The caller's polling interval bounds the pass
+    /// rate; the writer's debounce and cadence gates do the rest. A failed
+    /// pass queues at most one `Event::Status` (the `failing` latch), held
+    /// for the next client's drain.
+    pub fn recovery_maintenance(&mut self) {
+        self.maybe_write_recovery(Instant::now());
     }
 
     /// Hand the client every event queued since the last drain.
