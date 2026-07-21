@@ -324,9 +324,8 @@ fn row_age(v: &TaskView) -> Duration {
 }
 
 /// Split a task row into its leading, preview, and time cells so the preview
-/// can be styled independently. Cells are column-exact: `pad` measures
-/// terminal columns, so a wide-glyph title or preview (CJK, emoji) fills its
-/// budget instead of overflowing it, and the three widths always sum to `cols`.
+/// can be styled independently. Each cell is padded to its display-column
+/// budget, and the budgets sum to `cols`.
 fn task_row_parts(v: &TaskView, cols: usize) -> (String, String, String) {
     let glyph = match v.lifecycle {
         Lifecycle::Active => "✻",
@@ -355,10 +354,7 @@ fn task_row(v: &TaskView, cols: usize) -> String {
 
 /// Paint a task row with only its padded preview cell dimmed.
 fn dim_preview_row(out: &mut impl Write, y: u16, v: &TaskView, cols: usize) -> io::Result<()> {
-    // Queue the three column-exact cells directly rather than re-splitting a
-    // composed string: a char-count split desynchronizes from cell boundaries
-    // as soon as a cell holds wide glyphs. Clamping each cell to the columns
-    // still open reproduces `put`'s pad-to-`cols` behavior on narrow terminals.
+    // Clamp each styled cell to the display columns still available.
     let (lead, preview, time) = task_row_parts(v, cols);
     let lead = truncate(&lead, cols);
     let mut rem = cols - lead.width();
@@ -375,9 +371,7 @@ fn dim_preview_row(out: &mut impl Write, y: u16, v: &TaskView, cols: usize) -> i
     )
 }
 
-/// Peek-box top border: `─ label ` extended with `─` fill to exactly
-/// `inner_w` columns. The label is measured in display columns — wide glyphs
-/// consume two — so the fill always meets the corner.
+/// Build a labeled peek-box border exactly `inner_w` display columns wide.
 fn peek_top_border(label: &str, inner_w: usize) -> String {
     let mut border = format!("─ {} ", truncate(label, inner_w.saturating_sub(4)));
     let w = border.width();
@@ -804,9 +798,7 @@ mod tests {
         );
     }
 
-    /// Every cell is padded in display columns, so the composed row is
-    /// exactly `cols` wide and the time cell survives at the right edge for
-    /// any title/preview content: CJK, emoji, combining marks.
+    /// Rows remain column-exact with wide and combining glyphs.
     #[test]
     fn task_row_is_column_exact_for_wide_glyphs() {
         let titles = [
@@ -838,9 +830,7 @@ mod tests {
         }
     }
 
-    /// Cell budgets are fixed by `cols`, not by content: `dim_preview_row`
-    /// queues the cells separately, so the dim run must cover exactly the
-    /// preview cell whatever glyphs the cells hold.
+    /// Row-cell display widths depend on `cols`, not their contents.
     #[test]
     fn task_row_cells_hold_their_column_budgets() {
         let cols = 72;
@@ -856,8 +846,7 @@ mod tests {
         assert_eq!(wl.width() + wp.width() + wt.width(), cols);
     }
 
-    /// The peek top border fills to exactly the inner width for any label,
-    /// including wide glyphs and labels longer than the border.
+    /// Peek borders remain column-exact for wide and overlong labels.
     #[test]
     fn peek_top_border_fills_to_inner_width() {
         for label in ["cargo test", "日本語のテスト", "🚀 build", "e\u{0301}", ""] {

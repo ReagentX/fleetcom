@@ -4,10 +4,8 @@
 //! `task-<id>-<run>.json` path per task run. The nonce isolates concurrent
 //! processes and prevents PID reuse from selecting an existing namespace.
 //!
-//! Namespace lifecycle: `Drop` removes this process's own namespace; `install`
-//! reaps dead-owner siblings. Drop alone cannot cover a SIGKILLed or OOM-killed
-//! supervisor, and the cache-directory fallback root persists across boots, so
-//! without the reap those namespaces would accumulate forever.
+//! Namespace lifecycle: `Drop` removes this process's namespace, while
+//! `install` reaps sibling namespaces whose owner no longer exists.
 //!
 //! Asset contracts:
 //! - `claude`: `--settings <claude-settings.json>` layers a `SessionStart` hook
@@ -84,17 +82,7 @@ pub fn runtime_root(override_dir: Option<&Path>) -> Option<PathBuf> {
     dirs::cache_dir().map(|c| c.join("fleetcom").join("run"))
 }
 
-/// Remove sibling namespaces whose owning supervisor is dead. Drop-only
-/// cleanup leaks the namespace of any supervisor that dies without unwinding
-/// (SIGKILL, OOM kill), so each install sweeps the root's immediate entries
-/// and removes every directory named `<pid>-<nonce>` whose pid probes dead.
-/// Removal is best-effort per entry: a failed reap never fails `install`.
-///
-/// One reachable corner: a TERM-refusing reparented child of a dead supervisor
-/// may still hold `FLEETCOM_CAPTURE_FILE` pointing into a reaped namespace.
-/// Its eventual write fails on the missing path, which is harmless — the codex
-/// notify script continues to its chain, and the claude hook errors
-/// cosmetically.
+/// Best-effort removal of namespace directories whose owner no longer exists.
 fn reap_dead_namespaces(root: &Path) {
     let Ok(entries) = fs::read_dir(root) else {
         return;
@@ -115,11 +103,7 @@ fn reap_dead_namespaces(root: &Path) {
     }
 }
 
-/// Parse a namespace name into its owner pid. The match is strict — split on
-/// the first `-`, the pid part is all decimal digits parsing as `i32 > 0`
-/// (parse failure covers overflow past `i32::MAX`), and the nonce part is
-/// exactly 12 lowercase hex chars. Anything else is not a namespace and must
-/// be kept: root-level legacy files and foreign layouts pass through here.
+/// Parse `<positive decimal pid>-<12 lowercase hex characters>`.
 fn namespace_owner(name: &str) -> Option<i32> {
     let (pid, nonce) = name.split_once('-')?;
     if pid.is_empty() || !pid.bytes().all(|b| b.is_ascii_digit()) {
@@ -135,11 +119,7 @@ fn namespace_owner(name: &str) -> Option<i32> {
     pid.parse::<i32>().ok().filter(|p| *p > 0)
 }
 
-/// Whether `pid` provably names no live process. The probe's errors are
-/// one-sided by design: only `ESRCH` reads as dead. `Ok` and `EPERM` read as
-/// alive (or not ours to judge), and any other errno keeps the entry. A
-/// recycled pid therefore misreads only as "alive" — the reaper can keep
-/// garbage but can never delete a live supervisor's namespace.
+/// Return true only when signal 0 reports that `pid` does not exist.
 fn owner_is_dead(pid: i32) -> bool {
     use nix::{errno::Errno, sys::signal::kill, unistd::Pid};
     matches!(kill(Pid::from_raw(pid), None), Err(Errno::ESRCH))
@@ -157,9 +137,8 @@ pub struct CaptureAssets {
 impl CaptureAssets {
     /// Create `root` and a private `<root>/<pid>-<nonce>` namespace. The
     /// namespace uses mode `0700`; its Claude settings use `0600`, and its
-    /// executable Codex notifier uses `0700`. Existing root entries remain
-    /// unchanged except sibling namespaces whose owner is provably dead: those
-    /// are reaped best-effort before the new namespace is minted.
+    /// executable Codex notifier uses `0700`. Dead-owner namespaces are reaped
+    /// before the new namespace is created; other root entries remain.
     pub fn install(root: &Path, pid: u32) -> io::Result<CaptureAssets> {
         fs::DirBuilder::new()
             .recursive(true)
@@ -313,9 +292,7 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
-    /// Installation leaves live-owner namespaces and every non-namespace root
-    /// entry unchanged. Pid 1 is always alive and never ours to signal, so the
-    /// probe reads it as alive on both its `Ok` and `EPERM` outcomes.
+    /// Installation retains live-owner namespaces and non-namespace entries.
     #[test]
     fn install_never_deletes_live_owner_namespaces_or_legacy_files() {
         let root = temp("assets_retain");
@@ -349,9 +326,7 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
-    /// A matching PID prefix does not cause an existing namespace to be reused
-    /// or reaped: the planted namespace carries this test's own live pid, so
-    /// the liveness probe keeps it and the nonce forces a distinct directory.
+    /// A live matching PID retains its namespace and receives a distinct nonce.
     #[test]
     fn install_after_pid_reuse_leaves_the_predecessor_namespace_alone() {
         let root = temp("assets_reuse");
@@ -390,9 +365,7 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
-    /// Spawn and wait a trivial child, returning its now-dead pid. Waiting
-    /// reaps the zombie — a zombie still accepts signal 0 and would probe as
-    /// alive. The tiny window for pid reuse before the probe is accepted.
+    /// Spawn and reap a child, then return its inactive PID.
     fn dead_pid() -> u32 {
         let mut child = Command::new("sh").arg("-c").arg("exit 0").spawn().unwrap();
         let pid = child.id();
@@ -400,8 +373,7 @@ mod tests {
         pid
     }
 
-    /// A namespace directory whose owner pid probes dead is reaped at
-    /// install, contents included.
+    /// Installation removes a dead owner's namespace and its contents.
     #[test]
     fn install_reaps_a_dead_owner_namespace() {
         let root = temp("assets_reap");
@@ -415,8 +387,7 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
-    /// Only directories are namespaces: a root-level file named like a dead
-    /// owner's namespace is kept.
+    /// A namespace-shaped file is not reaped.
     #[test]
     fn install_keeps_a_file_named_like_a_dead_namespace() {
         let root = temp("assets_reap_file");
@@ -429,8 +400,7 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
-    /// Names outside the strict `<decimal pid>-<12 lowercase hex>` shape are
-    /// never probed or reaped, whatever their pid part would mean.
+    /// Malformed namespace names are not reaped.
     #[test]
     fn install_keeps_directories_with_malformed_namespace_names() {
         let root = temp("assets_reap_malformed");
@@ -612,8 +582,7 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
-    /// Drop removes only the owned namespace and its contents. The sibling
-    /// carries pid 1 so `install`'s reap keeps it: the test isolates Drop.
+    /// Drop removes only the owned namespace and its contents.
     #[test]
     fn drop_removes_only_the_incarnation_namespace() {
         let root = temp("assets_drop");

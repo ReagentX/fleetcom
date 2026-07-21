@@ -28,12 +28,11 @@ pub const FLEETCOM_CONFIG_DIR: &str = "FLEETCOM_CONFIG_DIR";
 /// Characters replaced with `_` in session filenames.
 const DISALLOWED: &[char] = &['*', '"', '/', '\\', '<', '>', ':', '|', '?', '.'];
 
-/// Byte cap for sanitized names: `NAME_MAX` (255 bytes) common to Unix
-/// filesystems minus the 5-byte `.json` extension `save_in` appends.
+/// Sanitized-stem cap that reserves 5 bytes for `.json` in a 255-byte
+/// filename component.
 const MAX_STEM_BYTES: usize = 250;
 
-/// Make `name` safe as a bare filename. The cap counts encoded bytes, not
-/// chars: a char that would cross [`MAX_STEM_BYTES`] drops whole, never split.
+/// Sanitize `name` and limit its UTF-8 encoding without splitting a character.
 fn sanitize(name: &str) -> String {
     let mut out = String::new();
     for c in name.trim().chars() {
@@ -72,17 +71,12 @@ pub fn sessions_dir(root: Option<PathBuf>) -> Option<PathBuf> {
         .map(|base| base.join("sessions"))
 }
 
-/// On-disk session format version: written by `to_json`, the newest
-/// `from_json` accepts. The contract: any change an older reader would decode
-/// lossily bumps this number, and a reader refuses versions above its own
-/// rather than dropping what it does not recognize and rewriting the file on
-/// the next save. A missing `version` key means 1 — every file written by
-/// released fleetcom (0.6.0–0.8.0) predates the key and is structurally v1 —
-/// and that absence rule is permanent.
+/// Session format version written by `to_json` and accepted by `from_json`.
+/// Missing versions are interpreted as version 1; unsupported versions fail.
 const FORMAT_VERSION: u64 = 1;
 
-/// Serialize `{"name": <original>, "dirs": {...}}`. The stored name lets
-/// `save_in` distinguish names that sanitize to the same filename.
+/// Serialize the versioned wrapped schema. The stored name distinguishes
+/// names that sanitize to the same filename.
 fn to_json(name: &str, cfg: &SessionConfig) -> String {
     let mut dirs = jzon::JsonValue::new_object();
     for (dir, entries) in cfg {
@@ -116,13 +110,11 @@ fn to_json(name: &str, cfg: &SessionConfig) -> String {
 /// Parse wrapped and flat schemas, returning the stored name when present.
 /// A wrapped file has an object-valued `dirs`; flat files have entry arrays at
 /// the top level, including when a directory is literally named `dirs`.
-/// A top-level `version` above [`FORMAT_VERSION`] refuses to load: this
-/// build would drop the members it does not recognize, and the next save
-/// would rewrite the file without them.
+/// A top-level `version` must be an integer from 1 through [`FORMAT_VERSION`];
+/// a missing version is interpreted as 1.
 fn from_json(text: &str) -> io::Result<(Option<String>, SessionConfig)> {
     let parsed = jzon::parse(text).map_err(|e| io::Error::other(e.to_string()))?;
-    // Gate before schema detection. Absence means version 1: every file
-    // written by released fleetcom (0.6.0–0.8.0) predates the key.
+    // Validate version metadata before detecting the schema shape.
     let version = &parsed["version"];
     if !version.is_null() {
         match version.as_u64() {
@@ -133,9 +125,7 @@ fn from_json(text: &str) -> io::Result<(Option<String>, SessionConfig)> {
                      (supports {FORMAT_VERSION}); load it with a newer build"
                 )));
             }
-            // Zero, fractional, negative, or non-numeric: an encoding this
-            // build cannot interpret — refuse over guess. Zero lands here,
-            // not in the arm above: "0 is newer" would be a false claim.
+            // Reject zero, fractional, negative, and non-numeric values.
             _ => {
                 return Err(io::Error::other(format!(
                     "session format version {} is not one this fleetcom reads \
@@ -153,9 +143,7 @@ fn from_json(text: &str) -> io::Result<(Option<String>, SessionConfig)> {
     };
     let mut cfg = SessionConfig::new();
     for (dir, val) in dirs.entries() {
-        // In a flat file the accepted `version` member sits beside directory
-        // keys; it is metadata, not a directory. Wrapped iteration reads only
-        // `dirs`, which never contains it.
+        // In a flat file, `version` is metadata beside the directory keys.
         if flat && dir == "version" {
             continue;
         }
@@ -235,9 +223,8 @@ pub fn save_in(dir: &Path, name: &str, cfg: &SessionConfig) -> io::Result<PathBu
     let pid = std::process::id();
     let (mut tmp_file, tmp) = loop {
         let n = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
-        // A max-length recipe name fills the 255-byte NAME_MAX budget on its
-        // own, so the name portion shrinks to fit this component's leading dot
-        // and pid/seq/tmp decorations. Uniqueness rides on pid and seq alone.
+        // Shorten the recipe portion so the decorated temporary filename stays
+        // within the 255-byte component limit.
         let suffix = format!(".{pid}.{n}.tmp");
         let stem = prefix_bytes(&file_name, 254 - suffix.len());
         let candidate = dir.join(format!(".{stem}{suffix}"));
@@ -409,7 +396,7 @@ mod tests {
         assert_eq!(to_json("work", &cfg), expected);
     }
 
-    /// Saved files carry the format version and load back under the gate.
+    /// Saved files include the accepted format version.
     #[test]
     fn save_writes_version_1_and_load_accepts_it() {
         let dir = temp("session_version_roundtrip");
@@ -426,8 +413,7 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
-    /// A wrapped file without the key is version 1: every file written by
-    /// released fleetcom (0.6.0–0.8.0) predates it. The rule is permanent.
+    /// A missing version is interpreted as version 1.
     #[test]
     fn missing_version_means_version_1() {
         let (name, cfg) = from_json(r#"{"name": "old", "dirs": {"~/proj": ["vim"]}}"#).unwrap();
@@ -443,8 +429,7 @@ mod tests {
         assert_eq!(cfg["~/proj"], vec![e("vim")]);
     }
 
-    /// A newer format refuses with an error naming both versions rather than
-    /// dropping unrecognized members and rewriting the file on the next save.
+    /// A newer format fails with an error naming both versions.
     #[test]
     fn newer_version_refuses_naming_both_versions() {
         let err = from_json(r#"{"version": 2, "name": "v", "dirs": {}}"#).unwrap_err();
@@ -455,8 +440,7 @@ mod tests {
         );
     }
 
-    /// Version zero is not "newer" — it takes the unreadable-version message,
-    /// never the false "0 is newer than this fleetcom" claim.
+    /// Version zero uses the unsupported-version error.
     #[test]
     fn version_zero_refuses_as_unreadable_not_newer() {
         let err = from_json(r#"{"version": 0, "name": "v", "dirs": {}}"#).unwrap_err();
@@ -467,8 +451,7 @@ mod tests {
         );
     }
 
-    /// A non-numeric version is an encoding this build cannot interpret:
-    /// refuse over guess.
+    /// A non-numeric version uses the unsupported-version error.
     #[test]
     fn non_numeric_version_refuses() {
         let err = from_json(r#"{"version": "2.0", "name": "v", "dirs": {}}"#).unwrap_err();
@@ -479,8 +462,7 @@ mod tests {
         );
     }
 
-    /// A refused load is `Err` from `load_in`: no caller holds a config to
-    /// resave, so the gate also blocks the lossy rewrite.
+    /// `load_in` propagates unsupported-version errors.
     #[test]
     fn refused_load_yields_err_with_nothing_to_resave() {
         let dir = temp("session_version_refuse");
@@ -496,8 +478,7 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
-    /// In a flat file an accepted numeric `version` member is metadata, not a
-    /// directory: it must not materialize as an empty-entry directory.
+    /// A flat schema treats `version` as metadata, not a directory.
     #[test]
     fn flat_version_member_does_not_become_a_directory() {
         let (name, cfg) = from_json(r#"{"version": 1, "~/proj": ["vim"]}"#).unwrap();
@@ -544,8 +525,7 @@ mod tests {
         assert_eq!(sanitize("  a.b  "), "a_b");
     }
 
-    /// The cap keeps exactly 250 ASCII bytes and drops the 251st, so the
-    /// `.json` filename lands on NAME_MAX exactly.
+    /// The stem cap keeps 250 ASCII bytes and drops the remainder.
     #[test]
     fn caps_names_at_250_bytes() {
         assert_eq!(sanitize(&"a".repeat(250)), "a".repeat(250));
@@ -554,7 +534,7 @@ mod tests {
         assert_eq!(format!("{capped}.json").len(), 255);
     }
 
-    /// A char that would cross the 250-byte cap drops whole, never split.
+    /// The stem cap never splits a multibyte character.
     #[test]
     fn cap_drops_a_multibyte_char_whole() {
         // 249 bytes used; the 2-byte 'é' would reach 251.
@@ -562,8 +542,7 @@ mod tests {
         assert_eq!(capped, "a".repeat(249));
     }
 
-    /// A 255-char name saves and loads: the byte cap keeps every filename
-    /// component, the temp file's included, within NAME_MAX.
+    /// Long names save and load within the filename component limit.
     #[test]
     fn long_names_save_within_name_max() {
         let dir = temp("session_long_name");

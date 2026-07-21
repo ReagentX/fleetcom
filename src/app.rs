@@ -265,8 +265,8 @@ impl App {
             Box::new(SocketTransport::from_halves(stream, read, wait_tx))
         });
         app.daemon_backed = true;
-        // A `--scrollback` that an already-running daemon never saw gets one
-        // visible status-line notice instead of a silently kept old value.
+        // Report when a running daemon could not apply this invocation's
+        // startup-only scrollback setting.
         app.status = crate::daemon::ignored_scrollback_notice(origin);
         Ok(app)
     }

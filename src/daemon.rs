@@ -200,23 +200,17 @@ fn check_hello_ack(kind: u8, payload: &[u8]) -> io::Result<()> {
     }
 }
 
-/// How this client's daemon connection came to exist. The distinction matters
-/// because startup-only configuration (`--scrollback`) reaches the daemon
-/// solely through `spawn_daemon`'s environment: an `AlreadyRunning` daemon
-/// never saw this invocation's flags.
+/// Whether this invocation reused a daemon or autostarted one.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum DaemonOrigin {
-    /// The pre-spawn connect succeeded: a daemon predates this invocation.
+    /// The initial connection attempt succeeded.
     AlreadyRunning,
-    /// This invocation spawned the daemon, which inherited its environment.
+    /// The connection succeeded after autostarting the daemon.
     Autostarted,
 }
 
-/// The dashboard notice for a `--scrollback` the daemon never saw, or `None`
-/// when the flag took effect (autostart) or was not passed. Kept beside
-/// `DaemonOrigin` because the *why* is daemon lifecycle: the flag rides
-/// `spawn_daemon`'s env, so an already-running daemon keeps its resolved
-/// depth until `--kill` restarts it.
+/// Return a notice when a running daemon cannot apply a startup-only
+/// `--scrollback` value.
 fn scrollback_notice(origin: DaemonOrigin, flag: Option<usize>) -> Option<String> {
     match (origin, flag) {
         (DaemonOrigin::AlreadyRunning, Some(lines)) => Some(format!(
@@ -227,18 +221,16 @@ fn scrollback_notice(origin: DaemonOrigin, flag: Option<usize>) -> Option<String
     }
 }
 
-/// `scrollback_notice` over this process's actual `--scrollback` flag.
+/// Return the scrollback notice for this process's parsed flag.
 pub fn ignored_scrollback_notice(origin: DaemonOrigin) -> Option<String> {
     scrollback_notice(origin, supervisor::scrollback_flag())
 }
 
 /// Connect (autostarting if needed) and complete the hello handshake: send
 /// this process's protocol version and launch context, require the daemon's
-/// ack. Every launch this connection makes then runs under *this* client's
-/// env, and a version mismatch surfaces as one actionable error here instead
-/// of a silently wrong environment later. Also reports whether this
-/// invocation autostarted the daemon, so the caller can flag startup-only
-/// options an already-running daemon ignored.
+/// ack. Every launch this connection makes runs under *this* client's env.
+/// Returns the daemon origin so callers can report ignored startup-only
+/// options.
 ///
 /// The daemon serves one client at a time, so a slow handshake means "queued
 /// behind another client", not failure: announce it and wait without a
@@ -294,8 +286,7 @@ fn busy_daemon_error(e: io::Error) -> io::Error {
 /// connection) must not wedge the UI either. A timed-out write drops the
 /// connection, so a partial frame is never read.
 pub fn connect_ready_bounded() -> io::Result<UnixStream> {
-    // The origin is dropped: the ignored-`--scrollback` notice is a startup
-    // concern, shown once by `App::connect`, not repeated on every reconnect.
+    // Scrollback notices apply only to the initial connection.
     let (mut stream, _) = connect_or_autostart()?;
     stream.set_write_timeout(Some(HANDSHAKE_TIMEOUT))?;
     let (kind, payload) = encode_hello(&LaunchContext::here());
@@ -313,9 +304,7 @@ fn connect_or_autostart() -> io::Result<(UnixStream, DaemonOrigin)> {
     connect_or_autostart_in(&runtime_dir())
 }
 
-/// Validate `dir` before the first daemon connection attempt. The returned
-/// origin records which branch produced the stream: the pre-spawn connect
-/// succeeding is the one signal that a daemon predates this invocation.
+/// Validate `dir`, connect or autostart, and report which path succeeded.
 fn connect_or_autostart_in(dir: &Path) -> io::Result<(UnixStream, DaemonOrigin)> {
     // Validate before connecting because the hello sends the client's
     // environment and a successful connection skips daemon-side validation.
@@ -402,8 +391,8 @@ pub fn run_kill() -> io::Result<()> {
     file.read_to_string(&mut pid_str)?;
     let Some(pid) = pid_str.trim().parse::<i32>().ok().filter(|p| *p > 0) else {
         // Without a usable pid, fall back to a Shutdown frame over the socket.
-        // Bounded: an attached client keeps the daemon from ever accepting
-        // this connection, and `--kill` must terminate regardless.
+        // Bound the fallback because an attached client can keep the daemon
+        // from accepting this connection.
         return kill_via_socket();
     };
 
@@ -430,15 +419,10 @@ pub fn run_kill() -> io::Result<()> {
     ))
 }
 
-/// Overall budget for the socket-fallback kill exchange, matching the pid
-/// path's 10 s flock poll. Without it the fallback inherits the daemon's
-/// one-client-at-a-time serving: with another client attached, the hello
-/// reply never comes and `--kill` would block forever, silently.
+/// Overall budget for the socket-fallback kill exchange.
 const KILL_SOCKET_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// The one error the socket-fallback deadline produces. The daemon is
-/// demonstrably up (the connect succeeded) but never finished the exchange,
-/// which with a healthy daemon means it is serving an attached client.
+/// Timeout reported when the socket-fallback kill exchange does not finish.
 fn kill_handshake_timeout() -> io::Error {
     io::Error::new(
         ErrorKind::TimedOut,
@@ -448,9 +432,7 @@ fn kill_handshake_timeout() -> io::Error {
     )
 }
 
-/// Arm the stream's read timeout with what is left of `deadline`. Errors out
-/// when the budget is already spent, because `set_read_timeout` rejects a
-/// zero duration and a stale timeout would silently extend the deadline.
+/// Set the read timeout to the remaining deadline budget.
 fn arm_read_deadline(s: &UnixStream, deadline: Instant) -> io::Result<()> {
     let left = deadline.saturating_duration_since(Instant::now());
     if left.is_zero() {
@@ -465,8 +447,7 @@ fn kill_via_socket() -> io::Result<()> {
     kill_via_socket_at(&socket_path(), KILL_SOCKET_TIMEOUT)
 }
 
-/// `kill_via_socket` against an explicit socket under an injectable budget
-/// (tests use a short one against a mute listener).
+/// Run the socket-fallback kill exchange at `path` within `budget`.
 fn kill_via_socket_at(path: &Path, budget: Duration) -> io::Result<()> {
     match UnixStream::connect(path) {
         Ok(mut s) => kill_over_stream(&mut s, budget),
@@ -477,10 +458,7 @@ fn kill_via_socket_at(path: &Path, budget: Duration) -> io::Result<()> {
     }
 }
 
-/// Drive the Shutdown exchange over a connected stream, every blocking step
-/// bounded by one overall deadline. Writes share the budget too: an attached
-/// client means our connection sits unaccepted, and while the small frames
-/// almost surely fit the send buffer, "almost surely" is not a deadline.
+/// Drive the Shutdown exchange with one deadline for all blocking I/O.
 fn kill_over_stream(s: &mut UnixStream, budget: Duration) -> io::Result<()> {
     let deadline = Instant::now() + budget;
     s.set_write_timeout(Some(budget))?;
@@ -499,10 +477,8 @@ fn kill_over_stream(s: &mut UnixStream, budget: Duration) -> io::Result<()> {
 
     let (kind, payload) = encode_command(&Command::Shutdown);
     write_frame(s, kind, &payload)?;
-    // Drain until the daemon closes the socket: its exit is the completion
-    // signal, mirroring the pid path's flock poll. Each pass re-arms the
-    // remaining budget so the loop cannot outlive the deadline. Non-timeout
-    // read errors keep the old meaning — the daemon is gone, kill complete.
+    // Socket closure signals completion. Re-arm each read with the remaining
+    // budget so the loop cannot outlive the deadline.
     let mut buf = [0u8; 256];
     loop {
         arm_read_deadline(s, deadline)?;
@@ -924,8 +900,7 @@ mod tests {
         let _ = fs::remove_dir_all(&base);
     }
 
-    /// The ignored-`--scrollback` decision table: only "flag passed" plus
-    /// "daemon predates this invocation" produces the notice.
+    /// The notice requires both a flag and an already-running daemon.
     #[test]
     fn scrollback_notice_requires_flag_and_preexisting_daemon() {
         assert_eq!(
@@ -939,16 +914,13 @@ mod tests {
         assert!(notice.contains("--kill"), "{notice}");
     }
 
-    /// A daemon that accepts the connection but never answers the hello (the
-    /// attached-client shape: our connection sits in the backlog) must error
-    /// out on the deadline, not hang `--kill` forever.
+    /// A missing hello response times out the kill exchange.
     #[test]
     fn kill_via_socket_bounds_the_handshake_wait() {
         let base = temp("kill_socket_mute");
         fs::create_dir_all(&base).unwrap();
         let sock = base.join("mute.sock");
-        // Never accepted: connect still succeeds via the backlog, exactly like
-        // a live daemon busy serving another client.
+        // Leave the connection queued in the listener backlog.
         let _listener = UnixListener::bind(&sock).unwrap();
         let start = Instant::now();
         let err = kill_via_socket_at(&sock, Duration::from_millis(200)).unwrap_err();
@@ -961,9 +933,7 @@ mod tests {
         let _ = fs::remove_dir_all(&base);
     }
 
-    /// The post-Shutdown drain is bounded too: a daemon that acks the hello
-    /// and swallows `Shutdown` without ever closing the socket must not turn
-    /// the completion wait into a hang.
+    /// A daemon that keeps the socket open after Shutdown times out the drain.
     #[test]
     fn kill_via_socket_bounds_the_drain_wait() {
         let base = temp("kill_socket_drain");
@@ -976,8 +946,7 @@ mod tests {
             let (kind, payload) = encode_event(&Event::HelloOk);
             let _ = write_frame(&mut s, kind, &payload);
             let _ = read_frame(&mut s); // Shutdown, swallowed
-            // Hold the socket open until the client gives up and drops its
-            // end; this read's EOF is the thread's exit signal.
+            // Hold the socket open until the client drops its end.
             let _ = s.read(&mut [0u8; 16]);
         });
         let err = kill_via_socket_at(&sock, Duration::from_millis(300)).unwrap_err();
@@ -986,7 +955,7 @@ mod tests {
         let _ = fs::remove_dir_all(&base);
     }
 
-    /// No socket means no daemon: the fallback stays a friendly no-op.
+    /// A missing socket makes the fallback a no-op.
     #[test]
     fn kill_via_socket_without_a_socket_is_a_noop() {
         let base = temp("kill_socket_absent");

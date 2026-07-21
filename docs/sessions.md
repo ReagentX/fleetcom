@@ -14,7 +14,7 @@ A session is a launch recipe, not a process snapshot. It records commands, worki
 
 The first save creates the directory. This matches the [configuration path resolution](README.md#config-directory-sessions) used by save, list, and load.
 
-The filename derives from the session name. `fleetcom` trims leading and trailing whitespace, replaces control characters and any of `* " / \ < > : | ? .` with `_`, and caps the result at 250 bytes: `NAME_MAX` is 255 bytes on common Unix filesystems, and the `.json` extension takes the other 5. The cap falls on a character boundary — a multibyte character that would cross it is dropped whole, never split. `my/session` becomes `my_session.json`, and `a.b` becomes `a_b.json`. Replacing `.` prevents the session name from supplying another extension.
+The filename derives from the session name. `fleetcom` trims leading and trailing whitespace, replaces control characters and any of `* " / \ < > : | ? .` with `_`, and limits the sanitized stem to 250 UTF-8 bytes so the `.json` filename fits within 255 bytes. The cap falls on a character boundary. `my/session` becomes `my_session.json`, and `a.b` becomes `a_b.json`. Replacing `.` prevents the session name from supplying another extension.
 
 ## Format
 
@@ -37,11 +37,11 @@ A session file is a JSON object with three fields. `version` is the format versi
 ```
 
 - `name` exists because sanitization collapses distinct session names onto one filename: `a/b` and `a.b` both save to `a_b.json`. Saving compares the stored name against the incoming one and refuses a mismatch with an error naming both sessions. The load picker also displays it, so the list shows `a/b`, not `a_b`.
-- Keys under `dirs` are directory paths: each task's working directory. Saves write directories under `$HOME` as `~/…`; other paths stay absolute. On load, `~` expands to `$HOME`, and a relative key resolves against the invocation directory of the client loading the session.
+- Keys under `dirs` are directory paths: each task's working directory. Saves write directories under `$HOME` as `~/...`; other paths stay absolute. On load, `~` expands to `$HOME`, and a relative key resolves against the invocation directory of the client loading the session.
 - Values are ordered lists. A string member is a bare shell command; the object form adds the optional group and display name assigned on load. Order is preserved, and each command runs in its own PTY under that directory.
 - Directories serialize alphabetically. Command order remains stable within each directory.
 
-Files carry a format version. A missing `version` means 1: every file written before the key existed (releases 0.6.0–0.8.0) is structurally version 1, and that absence rule is permanent. A version newer than the running `fleetcom` supports refuses to load — the error names both versions — instead of dropping the members this build does not recognize and rewriting the file on the next save; a newer build loads it.
+The `version` field must be an integer from 1 through the newest format supported by the running `fleetcom`. A missing field means version 1. Invalid or unsupported versions fail to load, and the error reports the file's value and the supported version.
 
 The shape, not the version, discriminates the schema. An object-valued `dirs` marks the wrapped form shown above. The loader also accepts a flat map whose top-level keys are directories and whose values are entry arrays. In that form, an array-valued key named `dirs` remains a directory entry, but a top-level `version` member is always the format version, never a directory. Flat-map files list by filename stem because they have no stored name. Saving one writes the wrapped form and permits overwriting it without a stored-name collision check.
 
