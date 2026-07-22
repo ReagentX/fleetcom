@@ -22,7 +22,7 @@ use crate::{
         ClipboardKind, Command, Event, LaunchContext, ScreenView, ScrollAction, TaskView, env_get,
     },
     session::{self, SessionConfig, SessionEntry},
-    task::Task,
+    task::{Task, WriteRefused},
 };
 
 /// Quiet period after which a live task becomes idle. Lifecycle and placement
@@ -49,6 +49,10 @@ const MAX_TASKS: usize = 256;
 /// Maximum command length in bytes. Direct spawns and session loads enforce
 /// this limit to bound shell arguments and serialized task snapshots.
 const MAX_COMMAND_LEN: usize = 64 * 1024;
+
+/// The reasons `materialize` counts an entry as skipped, quoted verbatim in
+/// both load notices.
+const SKIP_REASONS: &str = "missing dir, task limit, or command too long";
 
 /// Environment variable overriding per-task terminal history depth.
 pub const FLEETCOM_SCROLLBACK: &str = "FLEETCOM_SCROLLBACK";
@@ -423,37 +427,17 @@ impl Supervisor {
                 self.watched = id;
                 self.watch_attached = attached;
             }
-            Command::Input { id, bytes } => {
-                let refused = self.by_id_mut(id).and_then(|t| t.send_input(&bytes).err());
-                if let Some(r) = refused {
-                    self.notice_refused(id, "input", r.len);
-                }
-            }
+            Command::Input { id, bytes } => self.deliver(id, "input", |t| t.send_input(&bytes)),
             // Paste and scroll land here (not as pre-encoded `Input`) because
             // their encoding depends on the child's terminal state, which
             // only this side of the socket can see.
-            Command::Paste { id, bytes } => {
-                let refused = self.by_id_mut(id).and_then(|t| t.send_paste(&bytes).err());
-                if let Some(r) = refused {
-                    self.notice_refused(id, "paste", r.len);
-                }
-            }
+            Command::Paste { id, bytes } => self.deliver(id, "paste", |t| t.send_paste(&bytes)),
             Command::Mouse { id, kind, col, row } => {
-                let refused = self
-                    .by_id_mut(id)
-                    .and_then(|t| t.send_mouse(kind, col, row).err());
-                if let Some(r) = refused {
-                    self.notice_refused(id, "mouse input", r.len);
-                }
+                self.deliver(id, "mouse input", |t| t.send_mouse(kind, col, row))
             }
             // Encode keys here because the child's cursor-key mode is core-side.
             Command::Key { id, code, mods } => {
-                let refused = self
-                    .by_id_mut(id)
-                    .and_then(|t| t.send_key(code, mods).err());
-                if let Some(r) = refused {
-                    self.notice_refused(id, "key input", r.len);
-                }
+                self.deliver(id, "key input", |t| t.send_key(code, mods))
             }
             Command::Scrollback { id, action } => {
                 if let Some(t) = self.by_id_mut(id) {
@@ -656,10 +640,7 @@ impl Supervisor {
             return;
         };
         // Refresh finished tasks' resume IDs before serialization.
-        for t in &mut self.tasks {
-            scrape_now(t);
-        }
-        let cfg = self.session_config();
+        let cfg = self.refreshed_config();
         // Exclude the timestamped label from content comparison.
         let hash = fnv1a_hex(session::fingerprint_json(&cfg).as_bytes());
         // Deduplication is scoped to the current root and requires the snapshot
@@ -714,6 +695,18 @@ impl Supervisor {
     /// Queue a one-line notice for the client's status line.
     fn status(&mut self, msg: impl Into<String>) {
         self.events.push(Event::Status(msg.into()));
+    }
+
+    /// Route one input send to task `id`, reporting a bounded-queue refusal.
+    fn deliver(
+        &mut self,
+        id: u64,
+        what: &str,
+        f: impl FnOnce(&mut Task) -> Result<(), WriteRefused>,
+    ) {
+        if let Some(r) = self.by_id_mut(id).and_then(|t| f(t).err()) {
+            self.notice_refused(id, what, r.len);
+        }
     }
 
     /// Report the task and message size for a bounded writer-queue refusal.
@@ -919,6 +912,16 @@ impl Supervisor {
         }
     }
 
+    /// Give finished tasks their exit scrape, then snapshot the recipe.
+    /// `session_config` reads resume IDs through `&self`, so the scrape must
+    /// precede it (see `scrape_now`).
+    fn refreshed_config(&mut self) -> SessionConfig {
+        for t in &mut self.tasks {
+            scrape_now(t);
+        }
+        self.session_config()
+    }
+
     /// Build `{dir: [entries]}` in spawn order. Groups and names remain intact;
     /// agent entries use the command returned by `recipe_command`.
     fn session_config(&self) -> SessionConfig {
@@ -967,12 +970,7 @@ impl Supervisor {
     }
 
     fn save_session(&mut self, name: &str) {
-        // `session_config` reads ids through `&self`; give finished tasks
-        // their exit scrape first (see `scrape_now`).
-        for t in &mut self.tasks {
-            scrape_now(t);
-        }
-        let cfg = self.session_config();
+        let cfg = self.refreshed_config();
         let count: usize = cfg.values().map(Vec::len).sum();
         let status = match self
             .sessions_root()
@@ -1036,23 +1034,37 @@ impl Supervisor {
         Some((spawned, skipped, failed))
     }
 
-    /// Spawn every command in the named session via `materialize`.
-    fn load_session(&mut self, name: &str) {
+    /// Resolve the sessions root, run `load` against it, and map failure to a
+    /// status. `subject` is the "<noun> '<name>'" phrase both notices open with.
+    fn load_config(
+        &mut self,
+        subject: &str,
+        load: impl FnOnce(&Path) -> io::Result<SessionConfig>,
+    ) -> Option<SessionConfig> {
         let Some(root) = self.sessions_root() else {
             self.status("load failed: no config directory available");
-            return;
+            return None;
         };
-        let cfg = match session::load_in(&root, name) {
-            Ok(c) => c,
+        match load(&root) {
+            Ok(c) => Some(c),
             // Preserve load errors; only a missing file maps to "not found".
             Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                self.status(format!("session '{name}' not found"));
-                return;
+                self.status(format!("{subject} not found"));
+                None
             }
             Err(e) => {
-                self.status(format!("session '{name}' failed to load: {e}"));
-                return;
+                self.status(format!("{subject} failed to load: {e}"));
+                None
             }
+        }
+    }
+
+    /// Spawn every command in the named session via `materialize`.
+    fn load_session(&mut self, name: &str) {
+        let Some(cfg) = self.load_config(&format!("session '{name}'"), |root| {
+            session::load_in(root, name)
+        }) else {
+            return;
         };
         let Some((spawned, skipped, failed)) = self.materialize(&cfg) else {
             return;
@@ -1063,9 +1075,7 @@ impl Supervisor {
             parts.push(format!("{spawned} task(s)"));
         }
         if skipped > 0 {
-            parts.push(format!(
-                "{skipped} skipped (missing dir, task limit, or command too long)"
-            ));
+            parts.push(format!("{skipped} skipped ({SKIP_REASONS})"));
         }
         if failed > 0 {
             parts.push(format!("{failed} failed to spawn"));
@@ -1075,30 +1085,17 @@ impl Supervisor {
 
     /// Load a recovery snapshot by stem and suggest saving it as a named session.
     fn load_recovery(&mut self, stem: &str) {
-        let Some(root) = self.sessions_root() else {
-            self.status("load failed: no config directory available");
+        let Some(cfg) = self.load_config(&format!("recovery snapshot '{stem}'"), |root| {
+            session::load_recovery_in(&session::recovery_dir(root), stem)
+        }) else {
             return;
-        };
-        let cfg = match session::load_recovery_in(&session::recovery_dir(&root), stem) {
-            Ok(c) => c,
-            // Preserve load errors; only a missing file maps to "not found".
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                self.status(format!("recovery snapshot '{stem}' not found"));
-                return;
-            }
-            Err(e) => {
-                self.status(format!("recovery snapshot '{stem}' failed to load: {e}"));
-                return;
-            }
         };
         let Some((_, skipped, failed)) = self.materialize(&cfg) else {
             return;
         };
         let mut msg = String::from("loaded recovery snapshot; save to name it");
         if skipped > 0 {
-            msg.push_str(&format!(
-                ", {skipped} skipped (missing dir, task limit, or command too long)"
-            ));
+            msg.push_str(&format!(", {skipped} skipped ({SKIP_REASONS})"));
         }
         if failed > 0 {
             msg.push_str(&format!(", {failed} failed to spawn"));
