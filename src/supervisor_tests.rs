@@ -100,7 +100,10 @@ fn tick_emits_snapshot_and_watched_screen() {
         _ => panic!("expected a Tasks snapshot"),
     };
 
-    s.apply(Command::Watch { id: Some(id) });
+    s.apply(Command::Watch {
+        id: Some(id),
+        attached: true,
+    });
     s.tick();
     let evs = s.drain();
     assert!(evs.iter().any(|e| matches!(e, Event::Tasks(_))));
@@ -133,7 +136,10 @@ fn watched_screen_not_resent_when_unchanged() {
     }
     assert!(id != 0, "task never appeared");
 
-    s.apply(Command::Watch { id: Some(id) });
+    s.apply(Command::Watch {
+        id: Some(id),
+        attached: true,
+    });
     s.tick();
     assert!(
         s.drain().iter().any(|e| matches!(e, Event::Screen(_))),
@@ -163,7 +169,10 @@ fn decset_1007_flip_resends_watched_screen() {
         f = flag.display()
     );
     let id = spawn_ready(&mut s, cmd, here(), &ready);
-    s.apply(Command::Watch { id: Some(id) });
+    s.apply(Command::Watch {
+        id: Some(id),
+        attached: true,
+    });
 
     // Wait for the initial alternate-scroll state.
     let open = wait_until(Duration::from_secs(5), || {
@@ -211,6 +220,283 @@ fn tick_flushes_a_stalled_sync_update() {
         preview.contains("stalled"),
         "the stalled sync frame never flushed; preview: {preview:?}"
     );
+}
+
+/// Stores from the attached task are forwarded in arrival order.
+#[test]
+fn watched_task_clipboard_stores_are_forwarded() {
+    let dir = scratch("clip_fwd");
+    let ready = dir.join("ready");
+    let flag = dir.join("flag");
+    let mut s = sup(24, 80);
+    let cmd = format!(
+        "touch {r}; until [ -e {f} ]; do sleep 0.05; done; \
+         printf '\\033]52;c;aGVsbG8=\\007\\033]52;p;cHJp\\007\\033]52;s;d29ybGQ=\\007'; sleep 30",
+        r = ready.display(),
+        f = flag.display()
+    );
+    let id = spawn_ready(&mut s, cmd, here(), &ready);
+    s.apply(Command::Watch {
+        id: Some(id),
+        attached: true,
+    });
+    std::fs::write(&flag, b"").unwrap();
+
+    let mut copies = Vec::new();
+    let ok = wait_until(Duration::from_secs(5), || {
+        s.tick();
+        copies.extend(s.drain().into_iter().filter_map(|e| match e {
+            Event::ClipboardCopy { id, kind, text } => Some((id, kind, text)),
+            _ => None,
+        }));
+        copies.len() >= 3
+    });
+    assert!(ok, "the clipboard stores never arrived; got {copies:?}");
+    // Each selector is forwarded as its matching protocol kind.
+    assert_eq!(
+        copies,
+        vec![
+            (id, ClipboardKind::Clipboard, "hello".to_string()),
+            (id, ClipboardKind::Primary, "pri".to_string()),
+            (id, ClipboardKind::Selection, "world".to_string()),
+        ]
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Starting a watch discards stores captured before the watch.
+#[test]
+fn watch_purges_stores_captured_before_the_watch() {
+    let mut s = sup(24, 80);
+    // The marker follows the store and confirms that both were parsed.
+    spawn(
+        &mut s,
+        "printf '\\033]52;c;c3RhbGU=\\007MARKER'; sleep 30",
+        here(),
+    );
+    let parsed = wait_until(Duration::from_secs(5), || {
+        s.tasks.first().is_some_and(|t| {
+            let (formatted, _, _) = t.formatted();
+            String::from_utf8_lossy(&formatted).contains("MARKER")
+        })
+    });
+    assert!(parsed, "the marker never reached the grid");
+
+    let id = s.tasks[0].id;
+    s.apply(Command::Watch {
+        id: Some(id),
+        attached: true,
+    });
+    let mut saw_screen = false;
+    for _ in 0..3 {
+        s.tick();
+        for e in s.drain() {
+            match e {
+                Event::ClipboardCopy { .. } => {
+                    panic!("a store captured before the watch must not fire after it")
+                }
+                Event::Screen(_) => saw_screen = true,
+                _ => {}
+            }
+        }
+    }
+    assert!(saw_screen, "watching the task should stream its screen");
+}
+
+/// Stores from an unwatched task are discarded instead of deferred.
+#[test]
+fn backgrounded_clipboard_store_is_discarded_not_deferred() {
+    let mut s = sup(24, 80);
+    // The marker follows the store and confirms that both were parsed.
+    spawn(
+        &mut s,
+        "printf '\\033]52;c;c3RhbGU=\\007COPIED'; sleep 30",
+        here(),
+    );
+    let mut id = 0;
+    let parsed = wait_until(Duration::from_secs(5), || {
+        s.tick();
+        let mut seen = false;
+        for e in s.drain() {
+            match e {
+                Event::Tasks(v) => {
+                    if let Some(t) = v.first() {
+                        id = t.id;
+                        seen = t.preview.text.contains("COPIED");
+                    }
+                }
+                Event::ClipboardCopy { .. } => {
+                    panic!("an unwatched task's store must not be forwarded")
+                }
+                _ => {}
+            }
+        }
+        seen
+    });
+    assert!(parsed, "the marker never reached the grid");
+    // Run one more tick to drain a store parsed after the preceding drain.
+    s.tick();
+    let _ = s.drain();
+
+    s.apply(Command::Watch {
+        id: Some(id),
+        attached: true,
+    });
+    let mut saw_screen = false;
+    for _ in 0..3 {
+        s.tick();
+        for e in s.drain() {
+            match e {
+                Event::ClipboardCopy { .. } => {
+                    panic!("a store buffered while backgrounded must never fire on watch")
+                }
+                Event::Screen(_) => saw_screen = true,
+                _ => {}
+            }
+        }
+    }
+    assert!(saw_screen, "watching the task should stream its screen");
+}
+
+/// Peeked stores are discarded, while stores captured after attachment forward.
+#[test]
+fn peeked_stores_never_forward_and_die_at_the_attach_transition() {
+    let dir = scratch("clip_peek");
+    let ready = dir.join("ready");
+    let flag1 = dir.join("flag1");
+    let flag2 = dir.join("flag2");
+    let flag3 = dir.join("flag3");
+    let mut s = sup(24, 80);
+    // Each marker follows its store and confirms that both were parsed.
+    let cmd = format!(
+        "touch {r}; until [ -e {f1} ]; do sleep 0.05; done; \
+         printf '\\033]52;c;cGVlazE=\\007M1'; \
+         until [ -e {f2} ]; do sleep 0.05; done; \
+         printf '\\033]52;c;cGVlazI=\\007M2'; \
+         until [ -e {f3} ]; do sleep 0.05; done; \
+         printf '\\033]52;c;cG9zdA==\\007M3'; sleep 30",
+        r = ready.display(),
+        f1 = flag1.display(),
+        f2 = flag2.display(),
+        f3 = flag3.display()
+    );
+    let id = spawn_ready(&mut s, cmd, here(), &ready);
+    s.apply(Command::Watch {
+        id: Some(id),
+        attached: false,
+    });
+
+    // A store drained during peek is not forwarded.
+    std::fs::write(&flag1, b"").unwrap();
+    let parsed = wait_until(Duration::from_secs(5), || {
+        s.tasks.first().is_some_and(|t| {
+            let (formatted, _, _) = t.formatted();
+            String::from_utf8_lossy(&formatted).contains("M1")
+        })
+    });
+    assert!(parsed, "the first marker never reached the grid");
+    let mut saw_screen = false;
+    for _ in 0..3 {
+        s.tick();
+        for e in s.drain() {
+            match e {
+                Event::ClipboardCopy { .. } => {
+                    panic!("a peeked task's store must never forward")
+                }
+                Event::Screen(_) => saw_screen = true,
+                _ => {}
+            }
+        }
+    }
+    assert!(
+        saw_screen,
+        "peeking the task should still stream its screen"
+    );
+
+    // A buffered peek store is discarded when the same task becomes attached.
+    std::fs::write(&flag2, b"").unwrap();
+    let parsed = wait_until(Duration::from_secs(5), || {
+        s.tasks.first().is_some_and(|t| {
+            let (formatted, _, _) = t.formatted();
+            String::from_utf8_lossy(&formatted).contains("M2")
+        })
+    });
+    assert!(parsed, "the second marker never reached the grid");
+    s.apply(Command::Watch {
+        id: Some(id),
+        attached: true,
+    });
+    for _ in 0..3 {
+        s.tick();
+        for e in s.drain() {
+            if let Event::ClipboardCopy { .. } = e {
+                panic!("a store captured during peek must not fire after attach")
+            }
+        }
+    }
+
+    // A store captured after attachment is forwarded.
+    std::fs::write(&flag3, b"").unwrap();
+    let mut copies = Vec::new();
+    let ok = wait_until(Duration::from_secs(5), || {
+        s.tick();
+        copies.extend(s.drain().into_iter().filter_map(|e| match e {
+            Event::ClipboardCopy { id, kind, text } => Some((id, kind, text)),
+            _ => None,
+        }));
+        !copies.is_empty()
+    });
+    assert!(ok, "the post-attach store never arrived");
+    assert_eq!(
+        copies,
+        vec![(id, ClipboardKind::Clipboard, "post".to_string())]
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// An oversized store produces a status notice instead of a clipboard event.
+#[test]
+fn oversized_watched_store_yields_notice_and_no_copy() {
+    let dir = scratch("clip_oversize");
+    let ready = dir.join("ready");
+    let flag = dir.join("flag");
+    let mut s = sup(24, 80);
+    // Generate a 3 MiB decoded payload without placing it in the command string.
+    let cmd = format!(
+        "touch {r}; until [ -e {f} ]; do sleep 0.05; done; \
+         printf '\\033]52;c;'; \
+         dd if=/dev/zero bs=1024 count=3072 2>/dev/null | base64 | tr -d '\\n'; \
+         printf '\\007'; sleep 30",
+        r = ready.display(),
+        f = flag.display()
+    );
+    let id = spawn_ready(&mut s, cmd, here(), &ready);
+    s.apply(Command::Watch {
+        id: Some(id),
+        attached: true,
+    });
+    std::fs::write(&flag, b"").unwrap();
+
+    let mut notice = None;
+    let ok = wait_until(Duration::from_secs(10), || {
+        s.tick();
+        for e in s.drain() {
+            match e {
+                Event::ClipboardCopy { .. } => {
+                    panic!("an over-cap store must be dropped, not forwarded")
+                }
+                Event::Status(msg) => notice = Some(msg),
+                _ => {}
+            }
+        }
+        notice.is_some()
+    });
+    assert!(ok, "the oversized-store notice never arrived");
+    assert_eq!(
+        notice.as_deref(),
+        Some("clipboard copy dropped: 3 MiB exceeds the 1 MiB limit")
+    );
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// Scratch dir for tests that sync through marker files.
@@ -428,7 +714,10 @@ fn clear_watch_stops_screen_stream_and_resets_dedup() {
     spawn(&mut s, "sleep 30", here());
     let id = first_id(&mut s);
 
-    s.apply(Command::Watch { id: Some(id) });
+    s.apply(Command::Watch {
+        id: Some(id),
+        attached: true,
+    });
     s.tick();
     assert!(
         s.drain().iter().any(|e| matches!(e, Event::Screen(_))),
@@ -445,7 +734,10 @@ fn clear_watch_stops_screen_stream_and_resets_dedup() {
 
     // A new client watching the same task gets a full screen at once, even
     // though the screen bytes haven't changed since the last send.
-    s.apply(Command::Watch { id: Some(id) });
+    s.apply(Command::Watch {
+        id: Some(id),
+        attached: true,
+    });
     s.tick();
     assert!(
         s.drain().iter().any(|e| matches!(e, Event::Screen(_))),
@@ -460,7 +752,10 @@ fn clear_watch_snaps_the_watched_task_live() {
     let mut s = sup(6, 80);
     spawn(&mut s, "seq 1 200; sleep 30", here());
     let id = first_id(&mut s);
-    s.apply(Command::Watch { id: Some(id) });
+    s.apply(Command::Watch {
+        id: Some(id),
+        attached: true,
+    });
 
     // Retry until output has produced retained history.
     let scrolled = wait_until(Duration::from_secs(5), || {
@@ -738,7 +1033,10 @@ fn rerun_watched_task_resends_screen() {
     let id = first_id(&mut s);
     wait_for_lifecycle(&mut s, id, |l| l == Lifecycle::Ok);
 
-    s.apply(Command::Watch { id: Some(id) });
+    s.apply(Command::Watch {
+        id: Some(id),
+        attached: true,
+    });
     s.tick();
     assert!(
         s.drain().iter().any(|e| matches!(e, Event::Screen(_))),

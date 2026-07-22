@@ -15,9 +15,12 @@ use std::{
 
 use crate::{
     core::{Wake, Waker},
+    emulator::ClipboardSelector,
     harness::{self, assets},
     path,
-    protocol::{Command, Event, LaunchContext, ScreenView, ScrollAction, TaskView, env_get},
+    protocol::{
+        ClipboardKind, Command, Event, LaunchContext, ScreenView, ScrollAction, TaskView, env_get,
+    },
     session::{self, SessionConfig, SessionEntry},
     task::Task,
 };
@@ -117,6 +120,15 @@ fn normalize_label(label: Option<String>) -> Option<String> {
 /// `Unassigned` to `None`. Display names do not reserve this label.
 fn normalize_group(name: Option<String>) -> Option<String> {
     normalize_label(name).filter(|g| g != "Unassigned")
+}
+
+/// Map an emulator clipboard selector to its protocol representation.
+fn clipboard_kind(kind: ClipboardSelector) -> ClipboardKind {
+    match kind {
+        ClipboardSelector::Clipboard => ClipboardKind::Clipboard,
+        ClipboardSelector::Primary => ClipboardKind::Primary,
+        ClipboardSelector::Select => ClipboardKind::Selection,
+    }
 }
 
 /// Return the 64-bit FNV-1a hash used to separate fallback capture roots. The
@@ -223,6 +235,8 @@ pub struct Supervisor {
     scrollback: usize,
     /// The task whose screen the client is watching (attach/peek), or `None`.
     watched: Option<u64>,
+    /// Whether the current watch permits clipboard forwarding.
+    watch_attached: bool,
     /// The last emitted screen fingerprint. `lines` stays empty because only
     /// emitted copies carry them. Cleared when `watched` changes to force a
     /// fresh screen after attachment.
@@ -256,6 +270,7 @@ impl Supervisor {
             cols,
             scrollback,
             watched: None,
+            watch_attached: false,
             last_screen: None,
             launch: None,
             events: Vec::new(),
@@ -311,6 +326,7 @@ impl Supervisor {
             t.scroll_view(ScrollAction::Live);
         }
         self.watched = None;
+        self.watch_attached = false;
         self.last_screen = None;
     }
 
@@ -387,17 +403,25 @@ impl Supervisor {
                     let _ = t.resize(self.rows, self.cols);
                 }
             }
-            Command::Watch { id } => {
-                // Reset the previous task's viewport before changing targets.
-                if id != self.watched {
-                    if let Some(old) = self.watched
-                        && let Some(t) = self.by_id_mut(old)
+            Command::Watch { id, attached } => {
+                // Preserve the viewport when only the attachment mode changes.
+                if id != self.watched
+                    && let Some(old) = self.watched
+                    && let Some(t) = self.by_id_mut(old)
+                {
+                    t.scroll_view(ScrollAction::Live);
+                }
+                if id != self.watched || attached != self.watch_attached {
+                    // Discard stores captured before this watch state took effect.
+                    if let Some(new) = id
+                        && let Some(t) = self.by_id_mut(new)
                     {
-                        t.scroll_view(ScrollAction::Live);
+                        let _ = t.drain_clipboard();
                     }
                     self.last_screen = None;
                 }
                 self.watched = id;
+                self.watch_attached = attached;
             }
             Command::Input { id, bytes } => {
                 let refused = self.by_id_mut(id).and_then(|t| t.send_input(&bytes).err());
@@ -519,11 +543,23 @@ impl Supervisor {
         // least every 200 ms), so an expired sync flushes here, before the
         // preview resolution reads the grid, letting the same tick ship it.
         // Resolution mutates per-task hold state; all tasks use one timestamp.
+        // Only the attached watch may forward clipboard stores.
+        let forwarding = if self.watch_attached {
+            self.watched
+        } else {
+            None
+        };
+        let mut clipboard = None;
         let views = self
             .tasks
             .iter_mut()
             .map(|t| {
                 t.flush_expired_sync();
+                // Drain all tasks so stores from inactive tasks cannot be forwarded later.
+                let stores = t.drain_clipboard();
+                if forwarding == Some(t.id) {
+                    clipboard = Some((t.id, stores));
+                }
                 TaskView {
                     id: t.id,
                     command: t.command.clone(),
@@ -541,6 +577,23 @@ impl Supervisor {
             })
             .collect();
         self.events.push(Event::Tasks(views));
+
+        if let Some((id, stores)) = clipboard {
+            for (kind, text) in stores.stores {
+                self.events.push(Event::ClipboardCopy {
+                    id,
+                    kind: clipboard_kind(kind),
+                    text,
+                });
+            }
+            if let Some(len) = stores.oversized_len {
+                self.status(format!(
+                    "clipboard copy dropped: {} exceeds the {} limit",
+                    crate::format::bytes(len),
+                    crate::format::bytes(crate::emulator::CLIPBOARD_STORE_MAX_BYTES)
+                ));
+            }
+        }
 
         if let Some(id) = self.watched
             && let Some(t) = self.tasks.iter().find(|t| t.id == id)

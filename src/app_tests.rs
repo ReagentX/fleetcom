@@ -1242,7 +1242,7 @@ fn attached_wheel_honors_the_childs_1007_veto() {
         app.resolve_selection();
         app.attach();
         let id = app.focused_id.expect("attached");
-        app.set_watch(Some(id));
+        app.set_watch(Some((id, true)));
         // Wait for the child's terminal modes to reach the client.
         assert!(
             wait_until(Duration::from_secs(5), || {
@@ -1881,4 +1881,272 @@ fn state_and_dir_mode_spawns_stay_unassigned() {
     app.pump();
     let v = app.views.iter().find(|v| v.id == 2).unwrap();
     assert_eq!(v.group, None);
+}
+
+// --- OSC 52 clipboard emission ------------------------------------------
+
+/// An attached clipboard store emits one BEL-terminated OSC 52 sequence.
+#[test]
+fn attached_clipboard_store_emits_the_osc52_envelope() {
+    let mut app = App::new_local(30, 100);
+    app.mode = Mode::Attached;
+    app.focused_id = Some(1);
+    app.on_clipboard_copy(1, ClipboardKind::Clipboard, "hello".to_string());
+    let mut out = Vec::new();
+    app.flush_clipboard(&mut out).unwrap();
+    assert_eq!(out, b"\x1b]52;c;aGVsbG8=\x07");
+    assert_eq!(app.notice(), Some("copied 5 chars"));
+    assert!(
+        app.status.is_none(),
+        "the copy confirmation is ephemeral; it must not occupy the status"
+    );
+}
+
+/// A selection store emits the `s` selector.
+#[test]
+fn selection_store_emits_its_own_kind_byte() {
+    let mut app = App::new_local(30, 100);
+    app.mode = Mode::Attached;
+    app.focused_id = Some(1);
+    app.on_clipboard_copy(1, ClipboardKind::Selection, "hello".to_string());
+    let mut out = Vec::new();
+    app.flush_clipboard(&mut out).unwrap();
+    assert_eq!(out, b"\x1b]52;s;aGVsbG8=\x07");
+}
+
+/// A primary-selection store emits the `p` selector.
+#[test]
+fn primary_store_emits_its_own_kind_byte() {
+    let mut app = App::new_local(30, 100);
+    app.mode = Mode::Attached;
+    app.focused_id = Some(1);
+    app.on_clipboard_copy(1, ClipboardKind::Primary, "hello".to_string());
+    let mut out = Vec::new();
+    app.flush_clipboard(&mut out).unwrap();
+    assert_eq!(out, b"\x1b]52;p;aGVsbG8=\x07");
+}
+
+/// Clipboard payloads are base64-encoded before reaching the host terminal.
+#[test]
+fn clipboard_payload_bytes_never_reach_the_terminal_raw() {
+    let payload = "line1\nline2\x1b[31mred\x1b]52;c;evil\x07";
+    let mut app = App::new_local(30, 100);
+    app.mode = Mode::Attached;
+    app.focused_id = Some(1);
+    app.on_clipboard_copy(1, ClipboardKind::Clipboard, payload.to_string());
+    let mut out = Vec::new();
+    app.flush_clipboard(&mut out).unwrap();
+
+    assert!(out.starts_with(b"\x1b]52;c;"));
+    assert!(out.ends_with(b"\x07"));
+    let body = &out[b"\x1b]52;c;".len()..out.len() - 1];
+    assert!(
+        body.iter()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'/' | b'=')),
+        "only base64 may sit between the prefix and the BEL"
+    );
+    assert_eq!(B64.decode(body).unwrap(), payload.as_bytes());
+    assert!(
+        !out.windows(payload.len()).any(|w| w == payload.as_bytes()),
+        "the raw payload must not appear in the output"
+    );
+}
+
+/// Clipboard stores are ignored outside attached mode.
+#[test]
+fn clipboard_stores_outside_attached_mode_are_dropped() {
+    for mode in [Mode::Peek, Mode::Dashboard] {
+        let mut app = App::new_local(30, 100);
+        app.mode = mode;
+        app.focused_id = Some(1);
+        app.on_clipboard_copy(1, ClipboardKind::Clipboard, "hello".to_string());
+        assert!(app.pending_clipboard.is_empty(), "nothing may buffer");
+        let mut out = Vec::new();
+        app.flush_clipboard(&mut out).unwrap();
+        assert!(out.is_empty(), "nothing may emit");
+        assert!(app.notice().is_none(), "no notice without an emission");
+    }
+}
+
+/// Stores from tasks other than the attached task are ignored.
+#[test]
+fn mismatched_id_clipboard_store_drops_at_receipt() {
+    let mut app = App::new_local(30, 100);
+    app.mode = Mode::Attached;
+    app.focused_id = Some(7);
+    app.on_clipboard_copy(3, ClipboardKind::Clipboard, "stale".to_string());
+    assert!(
+        app.pending_clipboard.is_empty(),
+        "an in-flight copy from another task must not buffer"
+    );
+    app.on_clipboard_copy(7, ClipboardKind::Clipboard, "fresh".to_string());
+    assert_eq!(
+        app.pending_clipboard,
+        vec![(ClipboardKind::Clipboard, "fresh".to_string())]
+    );
+}
+
+/// Changing from peek to attach sends a new watch for the same task.
+#[test]
+fn set_watch_resends_on_kind_change_with_the_same_id() {
+    let dir = temp("app_watch_kind");
+    let flag = dir.join("flag");
+    let mut app = App::new_local(30, 100);
+    let cwd = app.invocation_dir.clone();
+    let cmd = format!(
+        "until [ -e {f} ]; do sleep 0.05; done; printf '\\033]52;c;cG9zdA==\\007'; sleep 30",
+        f = flag.display()
+    );
+    app.spawn_in(&cmd, cwd);
+    app.pump();
+    let id = app.views[0].id;
+
+    // Change only the attachment mode.
+    app.set_watch(Some((id, false)));
+    app.set_watch(Some((id, true)));
+    app.mode = Mode::Attached;
+    app.focused_id = Some(id);
+
+    std::fs::write(&flag, b"").unwrap();
+    let ok = wait_until(Duration::from_secs(5), || {
+        app.pump();
+        !app.pending_clipboard.is_empty()
+    });
+    assert!(
+        ok,
+        "the post-attach store never forwarded: the kind change never reached the core"
+    );
+    assert_eq!(
+        app.pending_clipboard,
+        vec![(ClipboardKind::Clipboard, "post".to_string())]
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Pending stores emit in order, and the notice counts the last store's characters.
+#[test]
+fn pending_stores_emit_in_order_and_notice_counts_last_entry_chars() {
+    let mut app = App::new_local(30, 100);
+    app.mode = Mode::Attached;
+    app.focused_id = Some(1);
+    app.on_clipboard_copy(1, ClipboardKind::Clipboard, "first".to_string());
+    app.on_clipboard_copy(1, ClipboardKind::Primary, "second".to_string());
+    app.on_clipboard_copy(1, ClipboardKind::Selection, "héllo日".to_string());
+    let mut out = Vec::new();
+    app.flush_clipboard(&mut out).unwrap();
+
+    let expected = format!(
+        "\x1b]52;c;{}\x07\x1b]52;p;{}\x07\x1b]52;s;{}\x07",
+        B64.encode("first"),
+        B64.encode("second"),
+        B64.encode("héllo日")
+    );
+    assert_eq!(out, expected.as_bytes());
+    // The final payload contains six characters and nine bytes.
+    assert_eq!(app.notice(), Some("copied 6 chars"));
+    assert!(
+        app.pending_clipboard.is_empty(),
+        "the flush drains the buffer"
+    );
+}
+
+/// Flushing an empty clipboard buffer writes nothing.
+#[test]
+fn empty_clipboard_flush_writes_nothing() {
+    let mut app = App::new_local(30, 100);
+    app.mode = Mode::Attached;
+    let mut out = Vec::new();
+    app.flush_clipboard(&mut out).unwrap();
+    assert!(out.is_empty());
+    assert!(app.notice().is_none());
+}
+
+/// Notices are hidden after `NOTICE_TTL`.
+#[test]
+fn notice_expires_lazily_after_the_ttl() {
+    let mut app = App::new_local(30, 100);
+    app.set_notice("copied 5 chars".to_string(), NoticeLevel::Info);
+    assert_eq!(app.notice(), Some("copied 5 chars"));
+
+    let past = Instant::now()
+        .checked_sub(NOTICE_TTL)
+        .expect("system uptime exceeds NOTICE_TTL");
+    app.notice = Some(("copied 5 chars".to_string(), NoticeLevel::Info, past));
+    assert_eq!(app.notice(), None, "an aged-out notice must not render");
+}
+
+/// A copy confirmation does not replace an active warning.
+#[test]
+fn warning_notice_survives_the_copy_confirmation() {
+    let mut app = App::new_local(30, 100);
+    app.mode = Mode::Attached;
+    app.focused_id = Some(1);
+    app.set_notice("clipboard copy dropped".to_string(), NoticeLevel::Warning);
+    app.on_clipboard_copy(1, ClipboardKind::Clipboard, "hello".to_string());
+    let mut out = Vec::new();
+    app.flush_clipboard(&mut out).unwrap();
+    assert_eq!(out, b"\x1b]52;c;aGVsbG8=\x07", "the copy must still emit");
+    assert_eq!(app.notice(), Some("clipboard copy dropped"));
+}
+
+/// A new info notice replaces the current info notice.
+#[test]
+fn info_notice_replaces_info() {
+    let mut app = App::new_local(30, 100);
+    app.set_notice("copied 5 chars".to_string(), NoticeLevel::Info);
+    app.set_notice("copied 2 chars".to_string(), NoticeLevel::Info);
+    assert_eq!(app.notice(), Some("copied 2 chars"));
+}
+
+/// A warning replaces any current notice.
+#[test]
+fn warning_notice_replaces_info() {
+    let mut app = App::new_local(30, 100);
+    app.set_notice("copied 5 chars".to_string(), NoticeLevel::Info);
+    app.set_notice("spawn failed".to_string(), NoticeLevel::Warning);
+    assert_eq!(app.notice(), Some("spawn failed"));
+
+    app.set_notice("recovery failed".to_string(), NoticeLevel::Warning);
+    assert_eq!(
+        app.notice(),
+        Some("recovery failed"),
+        "warning over warning"
+    );
+}
+
+/// An info notice replaces an expired warning.
+#[test]
+fn expired_warning_yields_to_info() {
+    let mut app = App::new_local(30, 100);
+    let past = Instant::now()
+        .checked_sub(NOTICE_TTL)
+        .expect("system uptime exceeds NOTICE_TTL");
+    app.notice = Some(("old warning".to_string(), NoticeLevel::Warning, past));
+    app.set_notice("copied 5 chars".to_string(), NoticeLevel::Info);
+    assert_eq!(app.notice(), Some("copied 5 chars"));
+}
+
+/// Attached-mode status events update both the notice and persistent status.
+#[test]
+fn attached_status_event_mirrors_into_the_notice() {
+    let dir = session_scratch("status_mirror", &[]);
+    let mut app = app_with_config_dir(&dir);
+    app.mode = Mode::Attached;
+    app.save_session("mirror");
+    app.pump();
+    assert_eq!(app.status.as_deref(), Some("saved 'mirror': 0 command(s)"));
+    assert_eq!(app.notice(), Some("saved 'mirror': 0 command(s)"));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Dashboard status events do not create an ephemeral notice.
+#[test]
+fn dashboard_status_event_sets_only_the_status() {
+    let dir = session_scratch("status_dash", &[]);
+    let mut app = app_with_config_dir(&dir);
+    app.save_session("dash");
+    app.pump();
+    assert_eq!(app.status.as_deref(), Some("saved 'dash': 0 command(s)"));
+    assert!(app.notice().is_none(), "no mirror outside attached mode");
+    let _ = std::fs::remove_dir_all(&dir);
 }

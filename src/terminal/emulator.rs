@@ -17,6 +17,7 @@ use alacritty_terminal::{
     },
     vte::ansi::{self as vt, Handler, Processor},
 };
+use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
 
 /// Mouse event classes requested by the child through DECSET 1000/1002/1003.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -35,9 +36,39 @@ pub enum MouseProtocolEncoding {
     Sgr,
 }
 
+/// Maximum decoded size of one buffered OSC 52 clipboard payload.
+pub(crate) const CLIPBOARD_STORE_MAX_BYTES: usize = 1024 * 1024;
+
+// A maximum-size store expands to this base64 bound when re-encoded for
+// forwarding. Reserve 64 KiB for the command envelope and keep the result
+// within one frame.
+const _: () = assert!(
+    CLIPBOARD_STORE_MAX_BYTES.div_ceil(3) * 4 + 64 * 1024 <= crate::frame::MAX_FRAME as usize,
+    "CLIPBOARD_STORE_MAX_BYTES must base64-encode to under frame::MAX_FRAME"
+);
+
+/// Supported OSC 52 clipboard targets.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ClipboardSelector {
+    /// The system clipboard (selector byte `c`).
+    Clipboard,
+    /// The primary selection (selector byte `p`).
+    Primary,
+    /// The select buffer (selector byte `s`).
+    Select,
+}
+
+/// OSC 52 clipboard stores captured since the last drain.
+#[derive(Debug, Default)]
+pub struct ClipboardStores {
+    /// Latest store per selector, ordered by arrival.
+    pub stores: Vec<(ClipboardSelector, String)>,
+    /// Byte length of the most recent oversized store.
+    pub oversized_len: Option<usize>,
+}
+
 /// Buffers backend-generated PTY responses while the parser advances. Other
-/// backend events are discarded; [`ObservedTerm`] captures titles directly
-/// from parser events.
+/// events are discarded; [`ObservedTerm`] captures titles and clipboard stores.
 pub struct ProbeSink {
     responses: Arc<Mutex<Vec<String>>>,
 }
@@ -177,6 +208,8 @@ pub struct Emulator {
     term: Term<ProbeSink>,
     parser: Processor,
     responses: Arc<Mutex<Vec<String>>>,
+    /// OSC 52 stores captured since the last drain.
+    clipboard: ClipboardStores,
     /// Alt-screen and title facts, advanced at parser-event granularity by
     /// [`ObservedTerm`] during the parse itself.
     alt: AltScreen,
@@ -199,6 +232,11 @@ impl Emulator {
         buf.drain(..)
             .filter(|r| allowed_probe_response(r))
             .collect()
+    }
+
+    /// Drain captured OSC 52 stores and the latest oversized-store length.
+    pub fn drain_clipboard(&mut self) -> ClipboardStores {
+        std::mem::take(&mut self.clipboard)
     }
 
     /// Truncate zero-width characters in each active-grid cell to
@@ -262,6 +300,7 @@ impl Emulator {
             term,
             parser: Processor::new(),
             responses,
+            clipboard: ClipboardStores::default(),
             alt: AltScreen::default(),
             revision: 0,
             bytes_since_sweep: 0,
@@ -280,6 +319,7 @@ impl Emulator {
         let mut observed = ObservedTerm {
             term: &mut self.term,
             alt: &mut self.alt,
+            clipboard: &mut self.clipboard,
         };
         self.parser.advance(&mut observed, bytes);
         self.observe_advance();
@@ -310,6 +350,7 @@ impl Emulator {
         let mut observed = ObservedTerm {
             term: &mut self.term,
             alt: &mut self.alt,
+            clipboard: &mut self.clipboard,
         };
         self.parser.stop_sync(&mut observed);
         self.observe_advance();
@@ -329,6 +370,7 @@ impl Emulator {
         let mut observed = ObservedTerm {
             term: &mut self.term,
             alt: &mut self.alt,
+            clipboard: &mut self.clipboard,
         };
         self.parser.stop_sync(&mut observed);
         self.observe_advance();
@@ -628,6 +670,7 @@ const TITLE_STACK_SHADOW_MAX: usize = 4096;
 /// `Handler` methods default to no-ops, so every method must delegate to
 /// `Term`. `golden::emulator_wrapper_matches_the_raw_backend_on_every_fixture`
 /// compares wrapper and raw-backend replays to detect missing delegation.
+/// `clipboard_store` is captured by this wrapper instead of delegated.
 ///
 /// # Synchronized updates
 ///
@@ -639,6 +682,7 @@ const TITLE_STACK_SHADOW_MAX: usize = 4096;
 struct ObservedTerm<'a> {
     term: &'a mut Term<ProbeSink>,
     alt: &'a mut AltScreen,
+    clipboard: &'a mut ClipboardStores,
 }
 
 impl ObservedTerm<'_> {
@@ -874,10 +918,30 @@ impl Handler for ObservedTerm<'_> {
     fn reset_color(&mut self, a0: usize) {
         self.term.reset_color(a0);
     }
+    /// Capture supported OSC 52 stores while preserving their selector.
     fn clipboard_store(&mut self, a0: u8, a1: &[u8]) {
-        self.term.clipboard_store(a0, a1);
+        // Ignore selectors without a forwarding target.
+        let selector = match a0 {
+            b'c' => ClipboardSelector::Clipboard,
+            b'p' => ClipboardSelector::Primary,
+            b's' => ClipboardSelector::Select,
+            _ => return,
+        };
+        // Accept padded standard base64 containing UTF-8 text.
+        let Ok(bytes) = B64.decode(a1) else { return };
+        let Ok(text) = String::from_utf8(bytes) else {
+            return;
+        };
+        // Retain only the most recent value for this selector, including on overflow.
+        self.clipboard.stores.retain(|(k, _)| *k != selector);
+        if text.len() > CLIPBOARD_STORE_MAX_BYTES {
+            self.clipboard.oversized_len = Some(text.len());
+            return;
+        }
+        self.clipboard.stores.push((selector, text));
     }
     fn clipboard_load(&mut self, a0: u8, a1: &str) {
+        // The configured terminal policy denies clipboard loads.
         self.term.clipboard_load(a0, a1);
     }
     fn decaln(&mut self) {
@@ -1012,6 +1076,144 @@ mod tests {
         // Kitty keyboard query: disabled in config, no reply generated; the
         // allowlist would drop the `ESC[?...u` shape regardless.
         assert!(emu.process(b"\x1b[?u").is_empty());
+    }
+
+    /// An OSC 52 store is captured without a probe reply and drains once.
+    #[test]
+    fn osc52_store_is_captured_and_drains_once() {
+        let mut emu = Emulator::new(4, 20, 0);
+        assert!(
+            emu.process(b"\x1b]52;c;aGVsbG8=\x07").is_empty(),
+            "a store is not a probe reply"
+        );
+        let drained = emu.drain_clipboard();
+        assert_eq!(
+            drained.stores,
+            vec![(ClipboardSelector::Clipboard, "hello".to_string())]
+        );
+        assert_eq!(drained.oversized_len, None);
+        let again = emu.drain_clipboard();
+        assert!(again.stores.is_empty(), "a drain empties the buffer");
+        assert_eq!(again.oversized_len, None);
+    }
+
+    /// Primary and selection stores remain distinct.
+    #[test]
+    fn osc52_p_and_s_selectors_stay_distinct() {
+        let mut emu = Emulator::new(4, 20, 0);
+        emu.process(b"\x1b]52;p;YQ==\x07\x1b]52;s;Yg==\x07");
+        assert_eq!(
+            emu.drain_clipboard().stores,
+            vec![
+                (ClipboardSelector::Primary, "a".to_string()),
+                (ClipboardSelector::Select, "b".to_string()),
+            ]
+        );
+    }
+
+    /// An empty OSC 52 selector targets the system clipboard.
+    #[test]
+    fn osc52_empty_selector_defaults_to_clipboard() {
+        let mut emu = Emulator::new(4, 20, 0);
+        emu.process(b"\x1b]52;;aGk=\x07");
+        assert_eq!(
+            emu.drain_clipboard().stores,
+            vec![(ClipboardSelector::Clipboard, "hi".to_string())]
+        );
+    }
+
+    /// Unsupported OSC 52 selectors are ignored.
+    #[test]
+    fn osc52_unknown_selectors_drop() {
+        let mut emu = Emulator::new(4, 20, 0);
+        emu.process(b"\x1b]52;q;aGk=\x07");
+        emu.process(b"\x1b]52;0;aGk=\x07");
+        let drained = emu.drain_clipboard();
+        assert!(drained.stores.is_empty());
+        assert_eq!(drained.oversized_len, None);
+    }
+
+    /// Only the latest store for each selector is retained.
+    #[test]
+    fn osc52_last_store_wins_per_kind() {
+        let mut emu = Emulator::new(4, 20, 0);
+        emu.process(b"\x1b]52;c;Zmlyc3Q=\x07\x1b]52;c;c2Vjb25k\x07");
+        assert_eq!(
+            emu.drain_clipboard().stores,
+            vec![(ClipboardSelector::Clipboard, "second".to_string())]
+        );
+    }
+
+    /// Different selectors buffer independently and drain in arrival order.
+    #[test]
+    fn osc52_kinds_buffer_independently() {
+        let mut emu = Emulator::new(4, 20, 0);
+        emu.process(b"\x1b]52;s;c2Vs\x07\x1b]52;p;cHJp\x07\x1b]52;c;Y2xpcA==\x07");
+        assert_eq!(
+            emu.drain_clipboard().stores,
+            vec![
+                (ClipboardSelector::Select, "sel".to_string()),
+                (ClipboardSelector::Primary, "pri".to_string()),
+                (ClipboardSelector::Clipboard, "clip".to_string()),
+            ]
+        );
+    }
+
+    /// Invalid base64, clear requests, and non-UTF-8 payloads are ignored.
+    #[test]
+    fn osc52_invalid_base64_and_clear_buffer_nothing() {
+        let mut emu = Emulator::new(4, 20, 0);
+        emu.process(b"\x1b]52;c;%%%\x07");
+        emu.process(b"\x1b]52;c;!\x07");
+        // "/w==" decodes to 0xFF: valid base64, invalid UTF-8.
+        emu.process(b"\x1b]52;c;/w==\x07");
+        let drained = emu.drain_clipboard();
+        assert!(drained.stores.is_empty());
+        assert_eq!(drained.oversized_len, None);
+    }
+
+    /// OSC 52 clipboard queries are denied without a reply.
+    #[test]
+    fn osc52_query_is_denied_without_a_reply() {
+        let mut emu = Emulator::new(4, 20, 0);
+        assert!(emu.process(b"\x1b]52;c;?\x07").is_empty());
+        let drained = emu.drain_clipboard();
+        assert!(drained.stores.is_empty());
+        assert_eq!(drained.oversized_len, None);
+    }
+
+    /// ST-terminated OSC 52 stores are captured.
+    #[test]
+    fn osc52_st_terminated_store_is_captured() {
+        let mut emu = Emulator::new(4, 20, 0);
+        emu.process(b"\x1b]52;c;aGVsbG8=\x1b\\");
+        assert_eq!(
+            emu.drain_clipboard().stores,
+            vec![(ClipboardSelector::Clipboard, "hello".to_string())]
+        );
+    }
+
+    /// An oversized store clears its selector and records its length.
+    #[test]
+    fn osc52_oversized_store_supersedes_its_kind_and_records_length() {
+        let mut emu = Emulator::new(4, 20, 0);
+        emu.process(b"\x1b]52;c;aGVsbG8=\x07");
+        emu.process(b"\x1b]52;s;c2Vs\x07");
+        emu.process(b"\x1b]52;p;cHJp\x07");
+        // This payload decodes to two bytes over the cap.
+        let reps = CLIPBOARD_STORE_MAX_BYTES / 3 + 1;
+        let payload = "YWFh".repeat(reps);
+        emu.process(format!("\x1b]52;c;{payload}\x07").as_bytes());
+        let drained = emu.drain_clipboard();
+        assert_eq!(
+            drained.stores,
+            vec![
+                (ClipboardSelector::Select, "sel".to_string()),
+                (ClipboardSelector::Primary, "pri".to_string()),
+            ],
+            "the drop clears its own selector's slot and no other"
+        );
+        assert_eq!(drained.oversized_len, Some(reps * 3));
     }
 
     /// The stall the flush hook exists for: BSU plus a partial frame, then

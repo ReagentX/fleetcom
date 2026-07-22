@@ -2,7 +2,7 @@
 //! here through `Command`s and `Event` snapshots over a `Transport`.
 
 use std::{
-    io::{self, Stdout},
+    io::{self, Stdout, Write},
     path::{Path, PathBuf},
     sync::{
         Arc,
@@ -10,9 +10,10 @@ use std::{
         mpsc::{Receiver, Sender, channel},
     },
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
+use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
 use crossterm::{
     cursor::MoveTo,
     event::{
@@ -27,8 +28,8 @@ use crate::{
     editbuf::EditBuffer,
     path,
     protocol::{
-        Command, Event, Key, Lifecycle, Mods, MouseBtn, MouseKind, RecoveryEntry, ScreenView,
-        ScrollAction, TaskView,
+        ClipboardKind, Command, Event, Key, Lifecycle, Mods, MouseBtn, MouseKind, RecoveryEntry,
+        ScreenView, ScrollAction, TaskView,
     },
     transport::{ExitIntent, SocketTransport, ThreadTransport, Transport},
     ui,
@@ -43,6 +44,16 @@ const _: () = assert!(
     MAX_PASTE.div_ceil(3) * 4 + 64 * 1024 <= crate::frame::MAX_FRAME as usize,
     "MAX_PASTE must base64-encode to under frame::MAX_FRAME"
 );
+
+/// How long an ephemeral notice remains visible.
+const NOTICE_TTL: Duration = Duration::from_secs(5);
+
+/// Priority of an ephemeral notice. Active warnings take precedence over info.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NoticeLevel {
+    Warning,
+    Info,
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
@@ -140,8 +151,8 @@ pub struct App {
     pub views: Vec<TaskView>,
     /// The watched task's screen (attach/peek), from `Event::Screen`.
     focused_screen: Option<ScreenView>,
-    /// Last `Watch` target sent to the core, so we don't resend it every tick.
-    watched: Option<u64>,
+    /// Last `(target, attached)` watch state sent to the core.
+    watched: Option<(u64, bool)>,
     /// Whether this client talks to a daemon (vs. an in-process `--foreground`
     /// core). Only a daemon client can meaningfully reconnect after a drop.
     pub daemon_backed: bool,
@@ -194,6 +205,10 @@ pub struct App {
     pub recovery_sel: usize,
     /// Transient one-line notice (save/load result), dismissed on the next key.
     pub status: Option<String>,
+    /// Ephemeral notice text, priority, and creation time.
+    notice: Option<(String, NoticeLevel, Instant)>,
+    /// Clipboard stores awaiting emission to the host terminal.
+    pending_clipboard: Vec<(ClipboardKind, String)>,
     /// Parsed terminal events from the stdin reader thread. crossterm owns the
     /// tty, so a dedicated thread blocks on `event::read()` and forwards here; the
     /// run loop drains this instead of polling stdin itself.
@@ -371,6 +386,8 @@ impl App {
             session_page: SessionPage::Saved,
             recovery_sel: 0,
             status: None,
+            notice: None,
+            pending_clipboard: Vec::new(),
             input_rx,
             input_tx: Some(input_tx),
             wait_rx,
@@ -586,9 +603,8 @@ impl App {
         self.selected_id = Some(self.views[sections[prev].1[0]].id);
     }
 
-    /// Tell the core which task's screen we need (attach/peek), sending `Watch`
-    /// only when the target actually changes.
-    fn set_watch(&mut self, want: Option<u64>) {
+    /// Send the desired watch state when its target or attachment mode changes.
+    fn set_watch(&mut self, want: Option<(u64, bool)>) {
         if want != self.watched {
             self.watched = want;
             // Drop the now-irrelevant screen so a stale one can't flash before
@@ -596,7 +612,10 @@ impl App {
             if want.is_none() {
                 self.focused_screen = None;
             }
-            self.transport.send(Command::Watch { id: want });
+            self.transport.send(Command::Watch {
+                id: want.map(|(id, _)| id),
+                attached: want.is_some_and(|(_, attached)| attached),
+            });
         }
     }
 
@@ -616,7 +635,14 @@ impl App {
                     }
                     self.focused_screen = Some(s);
                 }
-                Event::Status(s) => self.status = Some(s),
+                Event::Status(s) => {
+                    // Mirror attached-mode status messages into the visible notice bar.
+                    if self.mode == Mode::Attached {
+                        self.set_notice(s.clone(), NoticeLevel::Warning);
+                    }
+                    self.status = Some(s);
+                }
+                Event::ClipboardCopy { id, kind, text } => self.on_clipboard_copy(id, kind, text),
                 Event::Sessions { names, recovery } => {
                     // Clamp both page selections to the refreshed lists.
                     self.session_sel = self.session_sel.min(names.len().saturating_sub(1));
@@ -629,6 +655,51 @@ impl App {
                 }
             }
         }
+    }
+
+    /// Queue a clipboard store only when it comes from the attached task.
+    fn on_clipboard_copy(&mut self, id: u64, kind: ClipboardKind, text: String) {
+        if self.mode == Mode::Attached && self.focused_id == Some(id) {
+            self.pending_clipboard.push((kind, text));
+        }
+    }
+
+    /// Set an ephemeral notice without replacing an active warning with info.
+    fn set_notice(&mut self, msg: String, level: NoticeLevel) {
+        if level == NoticeLevel::Info
+            && let Some((_, NoticeLevel::Warning, set_at)) = self.notice.as_ref()
+            && set_at.elapsed() < NOTICE_TTL
+        {
+            return;
+        }
+        self.notice = Some((msg, level, Instant::now()));
+    }
+
+    /// Return the staged notice while it is younger than `NOTICE_TTL`.
+    pub fn notice(&self) -> Option<&str> {
+        let (msg, _, set_at) = self.notice.as_ref()?;
+        (set_at.elapsed() < NOTICE_TTL).then_some(msg.as_str())
+    }
+
+    /// Emit queued clipboard stores as base64-encoded OSC 52 sequences in order.
+    fn flush_clipboard(&mut self, out: &mut impl Write) -> io::Result<()> {
+        if self.pending_clipboard.is_empty() {
+            return Ok(());
+        }
+        let mut last = 0;
+        for (kind, text) in self.pending_clipboard.drain(..) {
+            let k = match kind {
+                ClipboardKind::Clipboard => 'c',
+                ClipboardKind::Primary => 'p',
+                ClipboardKind::Selection => 's',
+            };
+            write!(out, "\x1b]52;{k};{}\x07", B64.encode(&text))?;
+            last = copied_chars(&text);
+        }
+        out.flush()?;
+        // Show the confirmation in the attached-mode notice bar.
+        self.set_notice(format!("copied {last} chars"), NoticeLevel::Info);
+        Ok(())
     }
 
     pub fn run(&mut self, out: &mut Stdout) -> io::Result<()> {
@@ -650,8 +721,8 @@ impl App {
             // Synchronize before checking for exit so teardown still runs if the
             // terminal has gone away.
             let watch = match self.mode {
-                Mode::Peek => self.selected_id,
-                Mode::Attached => self.focused_id,
+                Mode::Peek => self.selected_id.map(|id| (id, false)),
+                Mode::Attached => self.focused_id.map(|id| (id, true)),
                 _ => None,
             };
             self.set_watch(watch);
@@ -680,6 +751,8 @@ impl App {
                 self.focused_id = None;
             }
 
+            // Emit accepted clipboard stores before painting the next frame.
+            self.flush_clipboard(out)?;
             self.sync_input_modes(out)?;
             ui::render(out, self)?;
 
@@ -1490,6 +1563,11 @@ fn on_key_edit(buf: &mut EditBuffer, k: KeyEvent) -> Option<bool> {
         KeyCode::Char(_) => Some(false),
         _ => None,
     }
+}
+
+/// Count the characters reported by the clipboard-copy notice.
+fn copied_chars(text: &str) -> usize {
+    text.chars().count()
 }
 
 /// Insert pasted text at the caret after removing control characters.

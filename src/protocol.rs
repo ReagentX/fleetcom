@@ -12,7 +12,7 @@ use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
 use crate::frame::{KIND_CONTROL, KIND_HELLO, KIND_SCREEN};
 
 /// Wire-protocol version; the handshake rejects mismatched peers.
-pub const PROTOCOL_VERSION: u32 = 9;
+pub const PROTOCOL_VERSION: u32 = 10;
 
 /// Environment and working directory supplied by the launching client.
 #[derive(Debug, Clone, PartialEq)]
@@ -71,7 +71,8 @@ pub enum Command {
     /// client has already subtracted the row it reserves for its status bar.
     Resize { rows: u16, cols: u16 },
     /// Stream this task's screen (attach or peek), or `None` to stop.
-    Watch { id: Option<u64> },
+    /// `attached` permits clipboard forwarding from the watched task.
+    Watch { id: Option<u64>, attached: bool },
     /// Forward raw keystroke bytes to a task's PTY.
     Input { id: u64, bytes: Vec<u8> },
     /// Clipboard paste for a task. Kept distinct from `Input` because the
@@ -196,6 +197,23 @@ pub enum Event {
         names: Vec<String>,
         recovery: Vec<RecoveryEntry>,
     },
+    /// A decoded OSC 52 clipboard store from the attached task.
+    ClipboardCopy {
+        id: u64,
+        kind: ClipboardKind,
+        text: String,
+    },
+}
+
+/// Clipboard target carried by an OSC 52 event.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClipboardKind {
+    /// The system clipboard (OSC 52 kind byte `c`).
+    Clipboard,
+    /// The primary selection (OSC 52 kind byte `p`).
+    Primary,
+    /// The select buffer (OSC 52 kind byte `s`).
+    Selection,
 }
 
 /// Recovery-snapshot metadata sent to the session picker.
@@ -557,7 +575,7 @@ pub fn encode_command(cmd: &Command) -> (u8, Vec<u8>) {
             let _ = o.insert("rows", *rows as u64);
             let _ = o.insert("cols", *cols as u64);
         }
-        Command::Watch { id } => {
+        Command::Watch { id, attached } => {
             let _ = o.insert("t", "watch");
             match id {
                 Some(n) => {
@@ -567,6 +585,7 @@ pub fn encode_command(cmd: &Command) -> (u8, Vec<u8>) {
                     let _ = o.insert("id", jzon::JsonValue::Null);
                 }
             }
+            let _ = o.insert("attached", *attached);
         }
         // Encode both byte-carrying commands as base64. The paste-size bound in
         // `app` accounts for base64 expansion and the frame limit.
@@ -722,6 +741,8 @@ pub fn decode_command(kind: u8, payload: &[u8]) -> Option<Command> {
             } else {
                 Some(v["id"].as_u64()?)
             },
+            // Reject watch frames that do not specify an attachment mode.
+            attached: v["attached"].as_bool()?,
         },
         "input" => Command::Input {
             id: v["id"].as_u64()?,
@@ -884,6 +905,22 @@ pub fn encode_event(ev: &Event) -> (u8, Vec<u8>) {
             let _ = o.insert("recovery", rec);
             (KIND_CONTROL, o.dump().into_bytes())
         }
+        // Base64 preserves arbitrary clipboard text in the JSON frame.
+        Event::ClipboardCopy { id, kind, text } => {
+            let mut o = jzon::JsonValue::new_object();
+            let _ = o.insert("t", "clip");
+            let _ = o.insert("id", *id);
+            let _ = o.insert(
+                "k",
+                match kind {
+                    ClipboardKind::Clipboard => "c",
+                    ClipboardKind::Primary => "p",
+                    ClipboardKind::Selection => "s",
+                },
+            );
+            let _ = o.insert("text", B64.encode(text.as_bytes()));
+            (KIND_CONTROL, o.dump().into_bytes())
+        }
         Event::Screen(sv) => {
             let mut header = jzon::JsonValue::new_object();
             let _ = header.insert("id", sv.id);
@@ -968,6 +1005,18 @@ pub fn decode_event(kind: u8, payload: &[u8]) -> Option<Event> {
                     names: str_vec(&v["names"])?,
                     recovery: recovery_vec(&v["recovery"]),
                 }),
+                "clip" => {
+                    let id = v["id"].as_u64()?;
+                    let kind = match v["k"].as_str()? {
+                        "c" => ClipboardKind::Clipboard,
+                        "p" => ClipboardKind::Primary,
+                        "s" => ClipboardKind::Selection,
+                        _ => return None,
+                    };
+                    // Reject clipboard payloads that are not valid UTF-8.
+                    let text = String::from_utf8(B64.decode(v["text"].as_str()?).ok()?).ok()?;
+                    Some(Event::ClipboardCopy { id, kind, text })
+                }
                 _ => None,
             }
         }
@@ -1038,8 +1087,18 @@ mod tests {
                 rows: 30,
                 cols: 100,
             },
-            Command::Watch { id: Some(5) },
-            Command::Watch { id: None },
+            Command::Watch {
+                id: Some(5),
+                attached: true,
+            },
+            Command::Watch {
+                id: Some(5),
+                attached: false,
+            },
+            Command::Watch {
+                id: None,
+                attached: false,
+            },
             Command::Input {
                 id: 1,
                 bytes: vec![0, 27, 91, 255],
@@ -1677,6 +1736,40 @@ mod tests {
         );
     }
 
+    /// Watch frames require a Boolean `attached` field.
+    #[test]
+    fn watch_wire_form_requires_the_attached_flag() {
+        let (k, p) = encode_command(&Command::Watch {
+            id: Some(5),
+            attached: true,
+        });
+        assert_eq!(k, KIND_CONTROL);
+        assert_eq!(
+            std::str::from_utf8(&p).unwrap(),
+            r#"{"t":"watch","id":5,"attached":true}"#
+        );
+        let (_, p) = encode_command(&Command::Watch {
+            id: None,
+            attached: false,
+        });
+        assert_eq!(
+            std::str::from_utf8(&p).unwrap(),
+            r#"{"t":"watch","id":null,"attached":false}"#
+        );
+        for json in [
+            r#"{"t":"watch","id":5}"#,                 // missing flag
+            r#"{"t":"watch","id":null}"#,              // missing flag on unwatch
+            r#"{"t":"watch","id":5,"attached":null}"#, // null is not a kind
+            r#"{"t":"watch","id":5,"attached":1}"#,    // flag must be a boolean
+        ] {
+            assert_eq!(
+                decode_command(KIND_CONTROL, json.as_bytes()),
+                None,
+                "should reject {json}"
+            );
+        }
+    }
+
     /// `LoadRecovery` requires a string stem in its wire representation.
     #[test]
     fn load_recovery_wire_form() {
@@ -1720,5 +1813,85 @@ mod tests {
         let (k, p) = encode_event(&screen);
         assert_eq!(k, KIND_SCREEN);
         assert_eq!(decode_event(k, &p), Some(screen));
+    }
+
+    /// Clipboard events preserve their source, target, and text.
+    #[test]
+    fn clipboard_copy_round_trips() {
+        for ev in [
+            Event::ClipboardCopy {
+                id: 1,
+                kind: ClipboardKind::Clipboard,
+                text: "hello".into(),
+            },
+            Event::ClipboardCopy {
+                id: 1 << 40,
+                kind: ClipboardKind::Selection,
+                text: "sélection λ 🦀".into(),
+            },
+            Event::ClipboardCopy {
+                id: 2,
+                kind: ClipboardKind::Primary,
+                text: "primary".into(),
+            },
+            Event::ClipboardCopy {
+                id: 7,
+                kind: ClipboardKind::Clipboard,
+                // Exercise control characters and paste-marker-shaped text.
+                text: "line1\nline2\tcol\u{0}\u{1b}[201~end".into(),
+            },
+        ] {
+            let (k, p) = encode_event(&ev);
+            assert_eq!(k, KIND_CONTROL);
+            assert_eq!(decode_event(k, &p), Some(ev));
+        }
+    }
+
+    /// Clipboard events encode every target with its OSC 52 selector.
+    #[test]
+    fn clipboard_copy_wire_form() {
+        for (kind, wire) in [
+            (
+                ClipboardKind::Clipboard,
+                r#"{"t":"clip","id":5,"k":"c","text":"aGk="}"#,
+            ),
+            (
+                ClipboardKind::Primary,
+                r#"{"t":"clip","id":5,"k":"p","text":"aGk="}"#,
+            ),
+            (
+                ClipboardKind::Selection,
+                r#"{"t":"clip","id":5,"k":"s","text":"aGk="}"#,
+            ),
+        ] {
+            let (k, p) = encode_event(&Event::ClipboardCopy {
+                id: 5,
+                kind,
+                text: "hi".into(),
+            });
+            assert_eq!(k, KIND_CONTROL);
+            assert_eq!(std::str::from_utf8(&p).unwrap(), wire);
+        }
+    }
+
+    /// Malformed clipboard event frames are rejected.
+    #[test]
+    fn malformed_clipboard_copy_is_rejected() {
+        for json in [
+            r#"{"t":"clip","id":1,"text":"aGk="}"#,  // missing kind
+            r#"{"t":"clip","id":1,"k":"c"}"#,        // missing text
+            r#"{"t":"clip","k":"c","text":"aGk="}"#, // missing id
+            r#"{"t":"clip","id":"1","k":"c","text":"aGk="}"#, // id must be a number
+            r#"{"t":"clip","id":1,"k":"x","text":"aGk="}"#, // unknown kind string
+            r#"{"t":"clip","id":1,"k":"c","text":"!!!"}"#, // invalid base64
+            r#"{"t":"clip","id":1,"k":"c","text":"/w=="}"#, // 0xFF: not UTF-8
+            r#"{"t":"clip","id":1,"k":"c","text":["aGk="]}"#, // text must be a string
+        ] {
+            assert_eq!(
+                decode_event(KIND_CONTROL, json.as_bytes()),
+                None,
+                "should reject {json}"
+            );
+        }
     }
 }

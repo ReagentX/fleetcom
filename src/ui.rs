@@ -181,13 +181,12 @@ fn render_dashboard(out: &mut impl Write, app: &App) -> io::Result<()> {
         y += 1;
     }
 
-    // Command line: input modes show a prompt (with cursor); otherwise a
-    // transient save/load notice, else the key hint.
+    // Input modes show a prompt; otherwise show a notice, status, or key hint.
     let cmd_y = rows.saturating_sub(2);
     match cmdline(app) {
         Some((line, _)) => put(out, cmd_y, &line, cols)?,
-        None => match &app.status {
-            Some(s) => put(out, cmd_y, &format!("  {s}"), cols)?,
+        None => match transient_line(app.notice(), app.status.as_deref()) {
+            Some(line) => put(out, cmd_y, &line, cols)?,
             None => dim(
                 out,
                 cmd_y,
@@ -223,6 +222,11 @@ fn render_dashboard(out: &mut impl Write, app: &App) -> io::Result<()> {
         None => queue!(out, Hide)?,
     }
     Ok(())
+}
+
+/// Prefer an active notice over persistent status text.
+fn transient_line(notice: Option<&str>, status: Option<&str>) -> Option<String> {
+    notice.or(status).map(|s| format!("  {s}"))
 }
 
 /// The editable bottom line for the text-input modes (the rendered line and
@@ -704,14 +708,8 @@ fn render_attached(out: &mut impl Write, app: &App) -> io::Result<()> {
     }
 
     let cols = app.cols as usize;
-    // Display the scrollback offset when viewing history.
     let title = attached_title(v);
-    let bar = match screen.map_or(0, |s| s.scrollback) {
-        0 => format!("  [attached] {title}    Ctrl-\\ background"),
-        n => {
-            format!("  [scroll ↑{n}] {title}    Esc live · PgUp/PgDn move · Ctrl-\\ background")
-        }
-    };
+    let bar = attached_bar(&title, screen.map_or(0, |s| s.scrollback), app.notice());
     rev(out, app.rows.saturating_sub(1), &bar, cols)?;
 
     // Place the real cursor where the child's is, so typing feels native.
@@ -720,6 +718,17 @@ fn render_attached(out: &mut impl Write, app: &App) -> io::Result<()> {
         _ => queue!(out, Hide)?,
     }
     Ok(())
+}
+
+/// Build the attached or scrollback bar, showing notices only in live view.
+fn attached_bar(title: &str, scrollback: usize, notice: Option<&str>) -> String {
+    match (scrollback, notice) {
+        (0, Some(n)) => format!("  [attached] {title}    {n}"),
+        (0, None) => format!("  [attached] {title}    Ctrl-\\ background"),
+        (n, _) => {
+            format!("  [scroll ↑{n}] {title}    Esc live · PgUp/PgDn move · Ctrl-\\ background")
+        }
+    }
 }
 
 /// Visible `(start, count)` window that includes the selected list item.
@@ -970,6 +979,37 @@ mod tests {
             attached_title(&view(Some("api server"))),
             "api server · cargo test"
         );
+    }
+
+    /// The live bar shows notices while the scrollback bar keeps its key hints.
+    #[test]
+    fn attached_bar_swaps_the_hint_for_an_active_notice() {
+        assert_eq!(
+            attached_bar("cargo test", 0, None),
+            "  [attached] cargo test    Ctrl-\\ background"
+        );
+        assert_eq!(
+            attached_bar("cargo test", 0, Some("copied 5 chars")),
+            "  [attached] cargo test    copied 5 chars"
+        );
+        assert_eq!(
+            attached_bar("cargo test", 3, Some("copied 5 chars")),
+            "  [scroll ↑3] cargo test    Esc live · PgUp/PgDn move · Ctrl-\\ background"
+        );
+    }
+
+    /// The dashboard command row prefers an active notice over status text.
+    #[test]
+    fn transient_line_prefers_the_notice_over_the_status() {
+        assert_eq!(
+            transient_line(Some("copied 5 chars"), Some("saved 'x': 1 command(s)")),
+            Some("  copied 5 chars".to_string())
+        );
+        assert_eq!(
+            transient_line(None, Some("saved 'x': 1 command(s)")),
+            Some("  saved 'x': 1 command(s)".to_string())
+        );
+        assert_eq!(transient_line(None, None), None);
     }
 
     /// The strip's plain text is fixed; exactly the active mode's label is

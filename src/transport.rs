@@ -290,7 +290,10 @@ mod tests {
         assert!(t.connected());
 
         drop(theirs); // the daemon is gone
-        t.send(Command::Watch { id: None });
+        t.send(Command::Watch {
+            id: None,
+            attached: false,
+        });
         assert!(!t.connected(), "a failed send must mark the transport dead");
         // The stream was shut down with it, so the reader thread saw EOF and
         // exited: joining it cannot hang.

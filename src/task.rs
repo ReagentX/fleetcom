@@ -23,7 +23,7 @@ use rustix::process::{WaitId, WaitIdOptions, waitid};
 
 use crate::{
     core::{Wake, Waker},
-    emulator::Emulator,
+    emulator::{ClipboardStores, Emulator},
     input,
     preview::PreviewState,
     protocol::{Key, Lifecycle, Mods, MouseKind, Preview, ScrollAction, env_get},
@@ -483,6 +483,11 @@ impl Task {
         {
             forward_probe_replies(tx, &self.pending_write, replies);
         }
+    }
+
+    /// Drain OSC 52 clipboard stores captured by this task's emulator.
+    pub fn drain_clipboard(&self) -> ClipboardStores {
+        grid(&self.parser).drain_clipboard()
     }
 
     /// The dashboard preview, resolved through the provenance cascade under
