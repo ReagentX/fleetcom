@@ -236,6 +236,12 @@ pub struct Supervisor {
     scrollback: usize,
     /// The task whose screen the client is watching (attach/peek), or `None`.
     watched: Option<u64>,
+    /// Whether the current watch is an attach rather than a peek. Attachment
+    /// is the consent proxy for clipboard forwarding — input flows to the
+    /// child only then — so `tick` forwards OSC 52 stores only while this is
+    /// set. Screen streaming ignores it: peek needs screens. Meaningful only
+    /// while `watched` is `Some`.
+    watch_attached: bool,
     /// The last emitted screen fingerprint. `lines` stays empty because only
     /// emitted copies carry them. Cleared when `watched` changes to force a
     /// fresh screen after attachment.
@@ -269,6 +275,7 @@ impl Supervisor {
             cols,
             scrollback,
             watched: None,
+            watch_attached: false,
             last_screen: None,
             launch: None,
             events: Vec::new(),
@@ -324,6 +331,7 @@ impl Supervisor {
             t.scroll_view(ScrollAction::Live);
         }
         self.watched = None;
+        self.watch_attached = false;
         self.last_screen = None;
     }
 
@@ -400,21 +408,27 @@ impl Supervisor {
                     let _ = t.resize(self.rows, self.cols);
                 }
             }
-            Command::Watch { id } => {
-                // Reset the previous task's viewport before changing targets.
-                if id != self.watched {
-                    if let Some(old) = self.watched
-                        && let Some(t) = self.by_id_mut(old)
-                    {
-                        t.scroll_view(ScrollAction::Live);
-                    }
+            Command::Watch { id, attached } => {
+                // Reset the previous task's viewport only when the target
+                // itself changes: a peek→attach on the same task must keep
+                // the user's scrollback position.
+                if id != self.watched
+                    && let Some(old) = self.watched
+                    && let Some(t) = self.by_id_mut(old)
+                {
+                    t.scroll_view(ScrollAction::Live);
+                }
+                if id != self.watched || attached != self.watch_attached {
                     // Purge the new target's buffered stores before the watch
                     // takes effect. The wake loop applies a whole burst before
                     // ticking, so without this a store captured while
-                    // backgrounded survives into a tick that already sees the
-                    // task as watched — and fires. The residual window (bytes
-                    // emitted pre-attach but parsed post-purge) is
-                    // irreducible: a transparent terminal has it too.
+                    // backgrounded — or during a peek of this same task, the
+                    // peek→attach case — survives into a tick that already
+                    // sees an attach-watch, and fires. Purging on the
+                    // attach→peek edge too is harmless: peek forwards
+                    // nothing. The residual window (bytes emitted pre-attach
+                    // but parsed post-purge) is irreducible: a transparent
+                    // terminal has it too.
                     if let Some(new) = id
                         && let Some(t) = self.by_id_mut(new)
                     {
@@ -423,6 +437,7 @@ impl Supervisor {
                     self.last_screen = None;
                 }
                 self.watched = id;
+                self.watch_attached = attached;
             }
             Command::Input { id, bytes } => {
                 let refused = self.by_id_mut(id).and_then(|t| t.send_input(&bytes).err());
@@ -544,7 +559,13 @@ impl Supervisor {
         // least every 200 ms), so an expired sync flushes here, before the
         // preview resolution reads the grid, letting the same tick ship it.
         // Resolution mutates per-task hold state; all tasks use one timestamp.
-        let watched = self.watched;
+        // Forward stores only for an attach-watch: peek forwards no input to
+        // the child, so nothing captured during peek can be user-caused.
+        let forwarding = if self.watch_attached {
+            self.watched
+        } else {
+            None
+        };
         let mut clipboard = None;
         let views = self
             .tasks
@@ -552,16 +573,16 @@ impl Supervisor {
             .map(|t| {
                 t.flush_expired_sync();
                 // Drain every task's clipboard every tick and forward only the
-                // watched task's. Dropping the others here is the staleness
-                // guarantee: a store captured while backgrounded must never
-                // fire when the task is later watched — a wrong clipboard is
-                // silently harmful, an empty one visibly inert. The two-slot
-                // capture bound makes the constant drain cheap. This drain
-                // alone cannot close the wake-coalescing race (a `Watch` in
-                // the same burst lands before the tick); `apply`'s `Watch`
-                // arm purges the new target for that case.
+                // attach-watched task's. Dropping the others here is the
+                // staleness guarantee: a store captured while backgrounded or
+                // peeked must never fire when the task is later attached — a
+                // wrong clipboard is silently harmful, an empty one visibly
+                // inert. The two-slot capture bound makes the constant drain
+                // cheap. This drain alone cannot close the wake-coalescing
+                // race (a `Watch` in the same burst lands before the tick);
+                // `apply`'s `Watch` arm purges the new target for that case.
                 let stores = t.drain_clipboard();
-                if watched == Some(t.id) {
+                if forwarding == Some(t.id) {
                     clipboard = Some((t.id, stores));
                 }
                 TaskView {

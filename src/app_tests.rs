@@ -1242,7 +1242,7 @@ fn attached_wheel_honors_the_childs_1007_veto() {
         app.resolve_selection();
         app.attach();
         let id = app.focused_id.expect("attached");
-        app.set_watch(Some(id));
+        app.set_watch(Some((id, true)));
         // Wait for the child's terminal modes to reach the client.
         assert!(
             wait_until(Duration::from_secs(5), || {
@@ -1981,6 +1981,50 @@ fn mismatched_id_clipboard_store_drops_at_receipt() {
         app.pending_clipboard,
         vec![(ClipboardKind::Clipboard, "fresh".to_string())]
     );
+}
+
+/// `set_watch` deduplicates on the (id, attached) pair, not the id: the
+/// peek→attach transition on the same task must send a fresh `Watch`, or the
+/// core keeps treating the watch as a peek and never forwards. There is no
+/// command-observation seam on the in-process transport (it applies commands
+/// straight to the supervisor), so the resend is asserted through core
+/// behavior: a store emitted after the transition forwards, which cannot
+/// happen unless the attach-kind `Watch` actually left the client.
+#[test]
+fn set_watch_resends_on_kind_change_with_the_same_id() {
+    let dir = temp("app_watch_kind");
+    let flag = dir.join("flag");
+    let mut app = App::new_local(30, 100);
+    let cwd = app.invocation_dir.clone();
+    // "cG9zdA==" is "post".
+    let cmd = format!(
+        "until [ -e {f} ]; do sleep 0.05; done; printf '\\033]52;c;cG9zdA==\\007'; sleep 30",
+        f = flag.display()
+    );
+    app.spawn_in(&cmd, cwd);
+    app.pump();
+    let id = app.views[0].id;
+
+    // Peek, then attach the same task: the id is unchanged, the pair is not.
+    app.set_watch(Some((id, false)));
+    app.set_watch(Some((id, true)));
+    app.mode = Mode::Attached;
+    app.focused_id = Some(id);
+
+    std::fs::write(&flag, b"").unwrap();
+    let ok = wait_until(Duration::from_secs(5), || {
+        app.pump();
+        !app.pending_clipboard.is_empty()
+    });
+    assert!(
+        ok,
+        "the post-attach store never forwarded: the kind change never reached the core"
+    );
+    assert_eq!(
+        app.pending_clipboard,
+        vec![(ClipboardKind::Clipboard, "post".to_string())]
+    );
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// Multiple pending stores emit in receipt order (the host clipboard ends

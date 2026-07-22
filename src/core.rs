@@ -224,7 +224,10 @@ mod tests {
             }))
             .unwrap();
         wake_tx
-            .send(Wake::Cmd(Command::Watch { id: Some(1) }))
+            .send(Wake::Cmd(Command::Watch {
+                id: Some(1),
+                attached: true,
+            }))
             .unwrap();
 
         // Wait for the task to come up and emit its first (blank) screen.

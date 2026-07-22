@@ -12,7 +12,7 @@ use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
 use crate::frame::{KIND_CONTROL, KIND_HELLO, KIND_SCREEN};
 
 /// Wire-protocol version; the handshake rejects mismatched peers.
-pub const PROTOCOL_VERSION: u32 = 9;
+pub const PROTOCOL_VERSION: u32 = 10;
 
 /// Environment and working directory supplied by the launching client.
 #[derive(Debug, Clone, PartialEq)]
@@ -71,7 +71,12 @@ pub enum Command {
     /// client has already subtracted the row it reserves for its status bar.
     Resize { rows: u16, cols: u16 },
     /// Stream this task's screen (attach or peek), or `None` to stop.
-    Watch { id: Option<u64> },
+    /// `attached` carries the attach/peek distinction to where clipboard
+    /// forwarding is enforced: attachment is the consent proxy (input flows
+    /// to the child only then), so the supervisor forwards OSC 52 stores only
+    /// for an attach-watch. Peek forwards no input, so nothing captured
+    /// during peek can be user-caused.
+    Watch { id: Option<u64>, attached: bool },
     /// Forward raw keystroke bytes to a task's PTY.
     Input { id: u64, bytes: Vec<u8> },
     /// Clipboard paste for a task. Kept distinct from `Input` because the
@@ -579,7 +584,7 @@ pub fn encode_command(cmd: &Command) -> (u8, Vec<u8>) {
             let _ = o.insert("rows", *rows as u64);
             let _ = o.insert("cols", *cols as u64);
         }
-        Command::Watch { id } => {
+        Command::Watch { id, attached } => {
             let _ = o.insert("t", "watch");
             match id {
                 Some(n) => {
@@ -589,6 +594,7 @@ pub fn encode_command(cmd: &Command) -> (u8, Vec<u8>) {
                     let _ = o.insert("id", jzon::JsonValue::Null);
                 }
             }
+            let _ = o.insert("attached", *attached);
         }
         // Encode both byte-carrying commands as base64. The paste-size bound in
         // `app` accounts for base64 expansion and the frame limit.
@@ -744,6 +750,10 @@ pub fn decode_command(kind: u8, payload: &[u8]) -> Option<Command> {
             } else {
                 Some(v["id"].as_u64()?)
             },
+            // Required, not defaulted: the flag gates clipboard forwarding,
+            // and a frame without it (an older client) must reject rather
+            // than have the daemon guess the user's mode.
+            attached: v["attached"].as_bool()?,
         },
         "input" => Command::Input {
             id: v["id"].as_u64()?,
@@ -1090,8 +1100,18 @@ mod tests {
                 rows: 30,
                 cols: 100,
             },
-            Command::Watch { id: Some(5) },
-            Command::Watch { id: None },
+            Command::Watch {
+                id: Some(5),
+                attached: true,
+            },
+            Command::Watch {
+                id: Some(5),
+                attached: false,
+            },
+            Command::Watch {
+                id: None,
+                attached: false,
+            },
             Command::Input {
                 id: 1,
                 bytes: vec![0, 27, 91, 255],
@@ -1727,6 +1747,43 @@ mod tests {
                 }],
             })
         );
+    }
+
+    /// `Watch` pins its wire shape and requires the `attached` flag: a frame
+    /// without it (an older client) or with a non-boolean value is rejected
+    /// whole. The flag gates clipboard forwarding, so the daemon never
+    /// defaults it.
+    #[test]
+    fn watch_wire_form_requires_the_attached_flag() {
+        let (k, p) = encode_command(&Command::Watch {
+            id: Some(5),
+            attached: true,
+        });
+        assert_eq!(k, KIND_CONTROL);
+        assert_eq!(
+            std::str::from_utf8(&p).unwrap(),
+            r#"{"t":"watch","id":5,"attached":true}"#
+        );
+        let (_, p) = encode_command(&Command::Watch {
+            id: None,
+            attached: false,
+        });
+        assert_eq!(
+            std::str::from_utf8(&p).unwrap(),
+            r#"{"t":"watch","id":null,"attached":false}"#
+        );
+        for json in [
+            r#"{"t":"watch","id":5}"#,                 // missing flag
+            r#"{"t":"watch","id":null}"#,              // missing flag on unwatch
+            r#"{"t":"watch","id":5,"attached":null}"#, // null is not a kind
+            r#"{"t":"watch","id":5,"attached":1}"#,    // flag must be a boolean
+        ] {
+            assert_eq!(
+                decode_command(KIND_CONTROL, json.as_bytes()),
+                None,
+                "should reject {json}"
+            );
+        }
     }
 
     /// `LoadRecovery` requires a string stem in its wire representation.

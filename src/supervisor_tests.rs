@@ -100,7 +100,10 @@ fn tick_emits_snapshot_and_watched_screen() {
         _ => panic!("expected a Tasks snapshot"),
     };
 
-    s.apply(Command::Watch { id: Some(id) });
+    s.apply(Command::Watch {
+        id: Some(id),
+        attached: true,
+    });
     s.tick();
     let evs = s.drain();
     assert!(evs.iter().any(|e| matches!(e, Event::Tasks(_))));
@@ -133,7 +136,10 @@ fn watched_screen_not_resent_when_unchanged() {
     }
     assert!(id != 0, "task never appeared");
 
-    s.apply(Command::Watch { id: Some(id) });
+    s.apply(Command::Watch {
+        id: Some(id),
+        attached: true,
+    });
     s.tick();
     assert!(
         s.drain().iter().any(|e| matches!(e, Event::Screen(_))),
@@ -163,7 +169,10 @@ fn decset_1007_flip_resends_watched_screen() {
         f = flag.display()
     );
     let id = spawn_ready(&mut s, cmd, here(), &ready);
-    s.apply(Command::Watch { id: Some(id) });
+    s.apply(Command::Watch {
+        id: Some(id),
+        attached: true,
+    });
 
     // Wait for the initial alternate-scroll state.
     let open = wait_until(Duration::from_secs(5), || {
@@ -230,7 +239,10 @@ fn watched_task_clipboard_stores_are_forwarded() {
         f = flag.display()
     );
     let id = spawn_ready(&mut s, cmd, here(), &ready);
-    s.apply(Command::Watch { id: Some(id) });
+    s.apply(Command::Watch {
+        id: Some(id),
+        attached: true,
+    });
     std::fs::write(&flag, b"").unwrap();
 
     let mut copies = Vec::new();
@@ -280,7 +292,10 @@ fn watch_purges_stores_captured_before_the_watch() {
     assert!(parsed, "the marker never reached the grid");
 
     let id = s.tasks[0].id;
-    s.apply(Command::Watch { id: Some(id) });
+    s.apply(Command::Watch {
+        id: Some(id),
+        attached: true,
+    });
     let mut saw_screen = false;
     for _ in 0..3 {
         s.tick();
@@ -338,7 +353,10 @@ fn backgrounded_clipboard_store_is_discarded_not_deferred() {
     s.tick();
     let _ = s.drain();
 
-    s.apply(Command::Watch { id: Some(id) });
+    s.apply(Command::Watch {
+        id: Some(id),
+        attached: true,
+    });
     let mut saw_screen = false;
     for _ in 0..3 {
         s.tick();
@@ -353,6 +371,115 @@ fn backgrounded_clipboard_store_is_discarded_not_deferred() {
         }
     }
     assert!(saw_screen, "watching the task should stream its screen");
+}
+
+/// Peek is clipboard-inert end to end, and consent is not retroactive. Three
+/// phases against one task: a store drained while peek-watched never
+/// forwards (though the peek's screen keeps streaming); a store captured
+/// during peek and still buffered when the attach-watch lands — the
+/// peek→attach straddle, with no tick between, exactly how the wake loop
+/// applies a burst — dies in the watch-time purge instead of firing under
+/// the new attach; a store emitted under the attach-watch forwards. Markers
+/// are observed through non-draining grid reads; a tick while waiting would
+/// drain the buffer and mask both races.
+#[test]
+fn peeked_stores_never_forward_and_die_at_the_attach_transition() {
+    let dir = scratch("clip_peek");
+    let ready = dir.join("ready");
+    let flag1 = dir.join("flag1");
+    let flag2 = dir.join("flag2");
+    let flag3 = dir.join("flag3");
+    let mut s = sup(24, 80);
+    // "cGVlazE=" is "peek1", "cGVlazI=" is "peek2", "cG9zdA==" is "post".
+    // Each marker follows its store in the output stream, proving the
+    // store's bytes were parsed by the time the marker is visible.
+    let cmd = format!(
+        "touch {r}; until [ -e {f1} ]; do sleep 0.05; done; \
+         printf '\\033]52;c;cGVlazE=\\007M1'; \
+         until [ -e {f2} ]; do sleep 0.05; done; \
+         printf '\\033]52;c;cGVlazI=\\007M2'; \
+         until [ -e {f3} ]; do sleep 0.05; done; \
+         printf '\\033]52;c;cG9zdA==\\007M3'; sleep 30",
+        r = ready.display(),
+        f1 = flag1.display(),
+        f2 = flag2.display(),
+        f3 = flag3.display()
+    );
+    let id = spawn_ready(&mut s, cmd, here(), &ready);
+    s.apply(Command::Watch {
+        id: Some(id),
+        attached: false,
+    });
+
+    // Phase 1: drained while peeked, never forwarded.
+    std::fs::write(&flag1, b"").unwrap();
+    let parsed = wait_until(Duration::from_secs(5), || {
+        s.tasks.first().is_some_and(|t| {
+            let (formatted, _, _) = t.formatted();
+            String::from_utf8_lossy(&formatted).contains("M1")
+        })
+    });
+    assert!(parsed, "the first marker never reached the grid");
+    let mut saw_screen = false;
+    for _ in 0..3 {
+        s.tick();
+        for e in s.drain() {
+            match e {
+                Event::ClipboardCopy { .. } => {
+                    panic!("a peeked task's store must never forward")
+                }
+                Event::Screen(_) => saw_screen = true,
+                _ => {}
+            }
+        }
+    }
+    assert!(
+        saw_screen,
+        "peeking the task should still stream its screen"
+    );
+
+    // Phase 2: the straddle. The store sits in the buffer across the
+    // peek→attach on the same id; only the purge on the kind change stops
+    // the next (attached) tick from forwarding it.
+    std::fs::write(&flag2, b"").unwrap();
+    let parsed = wait_until(Duration::from_secs(5), || {
+        s.tasks.first().is_some_and(|t| {
+            let (formatted, _, _) = t.formatted();
+            String::from_utf8_lossy(&formatted).contains("M2")
+        })
+    });
+    assert!(parsed, "the second marker never reached the grid");
+    s.apply(Command::Watch {
+        id: Some(id),
+        attached: true,
+    });
+    for _ in 0..3 {
+        s.tick();
+        for e in s.drain() {
+            if let Event::ClipboardCopy { .. } = e {
+                panic!("a store captured during peek must not fire after attach")
+            }
+        }
+    }
+
+    // Phase 3: a store emitted under the attach-watch forwards, and it is
+    // the only one that ever does.
+    std::fs::write(&flag3, b"").unwrap();
+    let mut copies = Vec::new();
+    let ok = wait_until(Duration::from_secs(5), || {
+        s.tick();
+        copies.extend(s.drain().into_iter().filter_map(|e| match e {
+            Event::ClipboardCopy { id, kind, text } => Some((id, kind, text)),
+            _ => None,
+        }));
+        !copies.is_empty()
+    });
+    assert!(ok, "the post-attach store never arrived");
+    assert_eq!(
+        copies,
+        vec![(id, ClipboardKind::Clipboard, "post".to_string())]
+    );
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// An over-cap store on the watched task yields the drop notice and no
@@ -375,7 +502,10 @@ fn oversized_watched_store_yields_notice_and_no_copy() {
         f = flag.display()
     );
     let id = spawn_ready(&mut s, cmd, here(), &ready);
-    s.apply(Command::Watch { id: Some(id) });
+    s.apply(Command::Watch {
+        id: Some(id),
+        attached: true,
+    });
     std::fs::write(&flag, b"").unwrap();
 
     let mut notice = None;
@@ -615,7 +745,10 @@ fn clear_watch_stops_screen_stream_and_resets_dedup() {
     spawn(&mut s, "sleep 30", here());
     let id = first_id(&mut s);
 
-    s.apply(Command::Watch { id: Some(id) });
+    s.apply(Command::Watch {
+        id: Some(id),
+        attached: true,
+    });
     s.tick();
     assert!(
         s.drain().iter().any(|e| matches!(e, Event::Screen(_))),
@@ -632,7 +765,10 @@ fn clear_watch_stops_screen_stream_and_resets_dedup() {
 
     // A new client watching the same task gets a full screen at once, even
     // though the screen bytes haven't changed since the last send.
-    s.apply(Command::Watch { id: Some(id) });
+    s.apply(Command::Watch {
+        id: Some(id),
+        attached: true,
+    });
     s.tick();
     assert!(
         s.drain().iter().any(|e| matches!(e, Event::Screen(_))),
@@ -647,7 +783,10 @@ fn clear_watch_snaps_the_watched_task_live() {
     let mut s = sup(6, 80);
     spawn(&mut s, "seq 1 200; sleep 30", here());
     let id = first_id(&mut s);
-    s.apply(Command::Watch { id: Some(id) });
+    s.apply(Command::Watch {
+        id: Some(id),
+        attached: true,
+    });
 
     // Retry until output has produced retained history.
     let scrolled = wait_until(Duration::from_secs(5), || {
@@ -925,7 +1064,10 @@ fn rerun_watched_task_resends_screen() {
     let id = first_id(&mut s);
     wait_for_lifecycle(&mut s, id, |l| l == Lifecycle::Ok);
 
-    s.apply(Command::Watch { id: Some(id) });
+    s.apply(Command::Watch {
+        id: Some(id),
+        attached: true,
+    });
     s.tick();
     assert!(
         s.drain().iter().any(|e| matches!(e, Event::Screen(_))),

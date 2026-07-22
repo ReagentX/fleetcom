@@ -157,8 +157,11 @@ pub struct App {
     pub views: Vec<TaskView>,
     /// The watched task's screen (attach/peek), from `Event::Screen`.
     focused_screen: Option<ScreenView>,
-    /// Last `Watch` target sent to the core, so we don't resend it every tick.
-    watched: Option<u64>,
+    /// Last `Watch` (target, attached) pair sent to the core, so we don't
+    /// resend it every tick. The pair, not the id: peek→attach on the same
+    /// task must send a fresh `Watch`, because the core's watch-time purge
+    /// and its clipboard-forwarding gate both key on the attach flag.
+    watched: Option<(u64, bool)>,
     /// Whether this client talks to a daemon (vs. an in-process `--foreground`
     /// core). Only a daemon client can meaningfully reconnect after a drop.
     pub daemon_backed: bool,
@@ -613,9 +616,13 @@ impl App {
         self.selected_id = Some(self.views[sections[prev].1[0]].id);
     }
 
-    /// Tell the core which task's screen we need (attach/peek), sending `Watch`
-    /// only when the target actually changes.
-    fn set_watch(&mut self, want: Option<u64>) {
+    /// Tell the core which task's screen we need and whether we are attached
+    /// (`(id, attached)`), sending `Watch` only when that pair changes.
+    /// Deduplicating on the pair is load-bearing: an id-only dedup would
+    /// swallow the peek→attach transition on the same task, and the core's
+    /// watch-time clipboard purge would never run for it. Cost: one extra
+    /// command frame per attach.
+    fn set_watch(&mut self, want: Option<(u64, bool)>) {
         if want != self.watched {
             self.watched = want;
             // Drop the now-irrelevant screen so a stale one can't flash before
@@ -623,7 +630,10 @@ impl App {
             if want.is_none() {
                 self.focused_screen = None;
             }
-            self.transport.send(Command::Watch { id: want });
+            self.transport.send(Command::Watch {
+                id: want.map(|(id, _)| id),
+                attached: want.is_some_and(|(_, attached)| attached),
+            });
         }
     }
 
@@ -761,8 +771,8 @@ impl App {
             // Synchronize before checking for exit so teardown still runs if the
             // terminal has gone away.
             let watch = match self.mode {
-                Mode::Peek => self.selected_id,
-                Mode::Attached => self.focused_id,
+                Mode::Peek => self.selected_id.map(|id| (id, false)),
+                Mode::Attached => self.focused_id.map(|id| (id, true)),
                 _ => None,
             };
             self.set_watch(watch);
