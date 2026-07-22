@@ -9,7 +9,7 @@ use std::{
 use alacritty_terminal::{
     Term,
     event::{Event, EventListener},
-    grid::{Dimensions, Scroll},
+    grid::{Dimensions, Row, Scroll},
     index::{Column, Line},
     term::{
         Config, TermMode,
@@ -400,20 +400,7 @@ impl Emulator {
         for row in top..=bottom {
             let row_start = out.len();
             let line = &grid[Line(row)];
-            for col in 0..grid.columns() {
-                let cell = &line[Column(col)];
-                // Spacers have no glyph; terminal tabs occupy visible spaces.
-                if cell
-                    .flags
-                    .intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER)
-                {
-                    continue;
-                }
-                out.push(if cell.c == '\t' { ' ' } else { cell.c });
-                if let Some(zerowidth) = cell.zerowidth() {
-                    out.extend(zerowidth.iter());
-                }
-            }
+            push_row_glyphs(&mut out, line);
             // A soft wrap continues on the next grid row.
             if line[Column(last_col)].flags.contains(Flags::WRAPLINE) {
                 continue;
@@ -599,15 +586,15 @@ fn live_floor_of(term: &Term<ProbeSink>) -> String {
     String::new()
 }
 
-/// Plain text of one live-viewport row, trailing padding trimmed. Rows
-/// `0..screen_lines` address live output regardless of the display
-/// offset; only display iteration follows the offset.
-fn live_row_text_of(term: &Term<ProbeSink>, row: i32) -> String {
-    let grid = term.grid();
-    let line = &grid[Line(row)];
-    let mut text = String::new();
-    for col in 0..grid.columns() {
-        let cell = &line[Column(col)];
+/// Append one grid row's plain-text glyphs to `out`: skip wide-char spacer
+/// cells (no glyph of their own), render a tab cell as one space, else the
+/// cell's char, then any combining marks. Single-sourced deliberately —
+/// scrollback text ([`ObservedTerm::text_with_history`]) and live-row text
+/// ([`live_row_text_of`]) must extract glyphs identically or the two views of
+/// the same grid diverge. Trailing-space trim is each caller's own policy, not
+/// part of this rule.
+fn push_row_glyphs(out: &mut String, row: &Row<Cell>) {
+    for cell in row {
         // Spacers have no glyph; terminal tabs occupy visible spaces.
         if cell
             .flags
@@ -615,11 +602,21 @@ fn live_row_text_of(term: &Term<ProbeSink>, row: i32) -> String {
         {
             continue;
         }
-        text.push(if cell.c == '\t' { ' ' } else { cell.c });
+        out.push(if cell.c == '\t' { ' ' } else { cell.c });
         if let Some(zerowidth) = cell.zerowidth() {
-            text.extend(zerowidth.iter());
+            out.extend(zerowidth.iter());
         }
     }
+}
+
+/// Plain text of one live-viewport row, trailing padding trimmed. Rows
+/// `0..screen_lines` address live output regardless of the display
+/// offset; only display iteration follows the offset.
+fn live_row_text_of(term: &Term<ProbeSink>, row: i32) -> String {
+    let grid = term.grid();
+    let line = &grid[Line(row)];
+    let mut text = String::new();
+    push_row_glyphs(&mut text, line);
     while text.ends_with(' ') {
         text.pop();
     }
