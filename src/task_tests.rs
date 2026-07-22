@@ -271,6 +271,19 @@ fn viewport_scrolls_and_snaps_live_on_input() {
     t.terminate();
 }
 
+/// `screen_lines` returns one entry per grid row, including a blank final row.
+#[test]
+fn screen_lines_yields_one_entry_per_grid_row() {
+    let mut t = spawn(60, "sleep 300");
+    grid(&t.parser).process(b"top");
+    let lines = t.screen_lines();
+    // The spawn helper's grid is 24x80.
+    assert_eq!(lines.len(), 24, "one entry per grid row");
+    assert_eq!(lines[0], "top");
+    assert_eq!(lines[23], "", "the blank bottom row keeps its slot");
+    t.terminate();
+}
+
 /// The per-task writer worker delivers queued messages in FIFO order.
 #[test]
 fn queued_writes_reach_the_child_in_order() {

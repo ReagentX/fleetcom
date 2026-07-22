@@ -17,6 +17,7 @@ use crate::{
     editbuf::EditBuffer,
     format::{pad, rel_time, truncate},
     protocol::{Lifecycle, Preview, PreviewSource, RecoveryEntry, TaskView},
+    selection::Selection,
 };
 
 pub fn render(out: &mut Stdout, app: &mut App) -> io::Result<()> {
@@ -705,6 +706,17 @@ fn render_attached(out: &mut impl Write, app: &App) -> io::Result<()> {
     queue!(out, Hide, MoveTo(0, 0))?;
     if let Some(s) = screen {
         out.write_all(&s.formatted)?;
+        // Repaint selected spans as reverse-video plain text over the child's
+        // formatted output.
+        for (row, col, text) in selection_overlay(app.selection(), &s.lines) {
+            queue!(
+                out,
+                MoveTo(col, row),
+                SetAttribute(Attribute::Reverse),
+                Print(text),
+                SetAttribute(Attribute::Reset)
+            )?;
+        }
     }
 
     let cols = app.cols as usize;
@@ -718,6 +730,23 @@ fn render_attached(out: &mut impl Write, app: &App) -> io::Result<()> {
         _ => queue!(out, Hide)?,
     }
     Ok(())
+}
+
+/// Return one `(row, start_col, text)` overlay for each nonempty selected row.
+fn selection_overlay<'a>(sel: Option<&Selection>, lines: &'a [String]) -> Vec<(u16, u16, &'a str)> {
+    let (Some(sel), Some(last)) = (sel, lines.len().checked_sub(1)) else {
+        return Vec::new();
+    };
+    lines
+        .iter()
+        .enumerate()
+        .filter_map(|(row, text)| {
+            // Screen row counts are bounded by the terminal's `u16` height.
+            let row = row as u16;
+            sel.row_segment(row, text, last)
+                .map(|(col, seg)| (row, col, seg))
+        })
+        .collect()
 }
 
 /// Build the attached or scrollback bar, showing notices only in live view.
@@ -744,6 +773,24 @@ pub fn scroll_window(sel: usize, total: usize, max: usize) -> (usize, usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn selection_overlay_spans_rows_and_rounds_wide_glyphs() {
+        let lines: Vec<String> = ["a日本b", "  mid ", "tail"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        // A boundary inside 日 expands to the glyph's first cell; the middle
+        // row starts at column 0 and excludes trailing whitespace.
+        let mut sel = Selection::begin(0, 2);
+        sel.extend(2, 1);
+        assert_eq!(
+            selection_overlay(Some(&sel), &lines),
+            vec![(0, 1, "日本b"), (1, 0, "  mid"), (2, 0, "ta")]
+        );
+        assert!(selection_overlay(None, &lines).is_empty());
+        assert!(selection_overlay(Some(&sel), &[]).is_empty());
+    }
 
     #[test]
     fn scroll_window_keeps_selection_visible() {

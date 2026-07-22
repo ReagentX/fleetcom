@@ -31,6 +31,7 @@ use crate::{
         ClipboardKind, Command, Event, Key, Lifecycle, Mods, MouseBtn, MouseKind, RecoveryEntry,
         ScreenView, ScrollAction, TaskView,
     },
+    selection::Selection,
     transport::{ExitIntent, SocketTransport, ThreadTransport, Transport},
     ui,
 };
@@ -233,6 +234,10 @@ pub struct App {
     mouse_captured: bool,
     /// Whether the attached task is displaying scrollback.
     view_scroll: bool,
+    /// Active live-screen drag selection in attached-pane cell coordinates.
+    /// Cleared when its attachment context or viewport changes, mouse reporting
+    /// takes over, or host mouse capture ends.
+    selection: Option<Selection>,
 }
 
 /// Whether the attached view captures the mouse. Scrollback, inline views,
@@ -396,6 +401,7 @@ impl App {
             should_quit: false,
             mouse_captured: false,
             view_scroll: false,
+            selection: None,
             exit_intent: ExitIntent::Disconnect,
         }
     }
@@ -438,6 +444,11 @@ impl App {
     /// switches (a real race once the core is across a socket).
     pub fn screen_for(&self, id: u64) -> Option<&ScreenView> {
         self.focused_screen.as_ref().filter(|s| s.id == id)
+    }
+
+    /// The active live-screen selection displayed by the attached overlay.
+    pub fn selection(&self) -> Option<&Selection> {
+        self.selection.as_ref()
     }
 
     pub fn dir_label(&self, path: &Path) -> String {
@@ -599,6 +610,8 @@ impl App {
     fn set_watch(&mut self, want: Option<(u64, bool)>) {
         if want != self.watched {
             self.watched = want;
+            // A selection is scoped to one watch target and attachment mode.
+            self.selection = None;
             // Drop the now-irrelevant screen so a stale one can't flash before
             // the new target's first frame arrives.
             if want.is_none() {
@@ -725,6 +738,7 @@ impl App {
                 self.mode = Mode::Disconnected;
                 self.focused_id = None;
                 self.status = None;
+                self.selection = None;
             }
 
             if self.term_signal.load(Ordering::Relaxed) {
@@ -741,6 +755,7 @@ impl App {
             if self.mode == Mode::Attached && self.focused_task().is_none() {
                 self.mode = Mode::Dashboard;
                 self.focused_id = None;
+                self.selection = None;
             }
 
             // Emit accepted clipboard stores before painting the next frame.
@@ -774,6 +789,8 @@ impl App {
     }
 
     fn on_resize(&mut self, rows: u16, cols: u16) {
+        // A terminal resize invalidates the selected pane coordinates.
+        self.selection = None;
         self.rows = rows;
         self.cols = cols;
         // Send the *content* size; the core resizes every PTY to it.
@@ -1259,6 +1276,7 @@ impl App {
             self.focused_id = None;
             // The watch change resets the task viewport.
             self.view_scroll = false;
+            self.selection = None;
             // Repaint from scratch next tick; wipe the child's screen now.
             let _ = execute!(out, Clear(ClearType::All), MoveTo(0, 0));
             return Ok(());
@@ -1291,6 +1309,8 @@ impl App {
                 .intersects(KeyModifiers::SHIFT | KeyModifiers::CONTROL | KeyModifiers::ALT)
         {
             self.view_scroll = true;
+            // Entering scrollback replaces the selected live rows.
+            self.selection = None;
             self.send_scrollback(ScrollAction::Up(page));
             return Ok(());
         }
@@ -1345,8 +1365,8 @@ impl App {
         }
     }
 
-    /// Forward attached mouse events to the supervisor. Wheel events queued
-    /// during a mode transition still move dashboard and peek selection.
+    /// Route mouse input to dashboard or peek navigation, attached scrollback,
+    /// live-screen selection, or the attached child's PTY.
     fn on_mouse(&mut self, m: MouseEvent) {
         let btn = |b: MouseButton| match b {
             MouseButton::Left => MouseBtn::Left,
@@ -1379,6 +1399,56 @@ impl App {
                     return;
                 }
                 if let Some(id) = self.focused_id {
+                    // Without child mouse reporting, left-button gestures
+                    // select text on captured live screens.
+                    if matches!(self.screen_for(id), Some(s) if !s.wants_mouse) {
+                        match kind {
+                            // Wheel navigation cancels the active drag.
+                            MouseKind::WheelUp | MouseKind::WheelDown => self.selection = None,
+                            MouseKind::Press(MouseBtn::Left) => {
+                                // A selection needs the rest of its gesture
+                                let fresh = self
+                                    .screen_for(id)
+                                    .is_some_and(|s| s.lines.len() == self.pane_rows() as usize);
+                                self.selection = (self.mouse_captured
+                                    && fresh
+                                    && m.row < self.rows.saturating_sub(1))
+                                .then(|| {
+                                    Selection::begin(
+                                        m.row,
+                                        m.column.min(self.cols.saturating_sub(1)),
+                                    )
+                                });
+                                if self.selection.is_some() {
+                                    return;
+                                }
+                            }
+                            MouseKind::Drag(MouseBtn::Left) if self.selection.is_some() => {
+                                let row = m.row.min(self.pane_rows().saturating_sub(1));
+                                let col = m.column.min(self.cols.saturating_sub(1));
+                                if let Some(sel) = self.selection.as_mut() {
+                                    sel.extend(row, col);
+                                }
+                                return;
+                            }
+                            MouseKind::Release(MouseBtn::Left) if self.selection.is_some() => {
+                                // The release cell is the final head, including
+                                // for flicks with no intermediate drag event.
+                                let row = m.row.min(self.pane_rows().saturating_sub(1));
+                                let col = m.column.min(self.cols.saturating_sub(1));
+                                if let Some(sel) = self.selection.as_mut() {
+                                    sel.extend(row, col);
+                                }
+                                self.finish_selection(id);
+                                return;
+                            }
+                            _ => {}
+                        }
+                    } else if self.selection.is_some() {
+                        // Mouse reporting can turn on mid-gesture. Discard the
+                        // client selection before forwarding subsequent events.
+                        self.selection = None;
+                    }
                     // Wheel-up enters scrollback for inline children that do
                     // not receive mouse events.
                     let inline = matches!(
@@ -1401,6 +1471,30 @@ impl App {
         }
     }
 
+    /// Queue the selected text unless the gesture is a click or selects only
+    /// whitespace.
+    fn finish_selection(&mut self, id: u64) {
+        let Some(sel) = self.selection.take() else {
+            return;
+        };
+        if sel.is_click() {
+            return;
+        }
+        // Copy the screen contents visible when the gesture completes.
+        let Some(text) = self.screen_for(id).map(|s| sel.extract(&s.lines)) else {
+            return;
+        };
+        // A drag released at the bottom of a mostly empty screen
+        // must not stuff the clipboard with newlines the user
+        // never saw selected
+        let text = text.trim_end_matches('\n');
+        if text.trim().is_empty() {
+            return;
+        }
+        self.pending_clipboard
+            .push((ClipboardKind::Clipboard, text.to_string()));
+    }
+
     /// Move the attached task's scrollback viewport.
     fn send_scrollback(&mut self, action: ScrollAction) {
         if let Some(id) = self.focused_id {
@@ -1420,6 +1514,9 @@ impl App {
             if capture {
                 execute!(out, EnableMouseCapture)?;
             } else {
+                // Disabling capture ends mouse delivery; clear the selection
+                // before its release event becomes unavailable.
+                self.selection = None;
                 execute!(out, DisableMouseCapture)?;
             }
             self.mouse_captured = capture;

@@ -11,6 +11,7 @@ compile_error!("fleetcom supports Unix platforms only.");
 // Terminal-attached client.
 mod app;
 mod editbuf;
+mod selection;
 mod ui;
 
 // Task lifecycle and dashboard-preview core.

@@ -2150,3 +2150,478 @@ fn dashboard_status_event_sets_only_the_status() {
     assert!(app.notice().is_none(), "no mirror outside attached mode");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// --- drag-copy selection ------------------------------------------------
+
+/// A left-button mouse event at `(row, col)`.
+fn left(kind: MouseEventKind, row: u16, col: u16) -> MouseEvent {
+    MouseEvent {
+        kind,
+        column: col,
+        row,
+        modifiers: KeyModifiers::NONE,
+    }
+}
+
+fn press(row: u16, col: u16) -> MouseEvent {
+    left(MouseEventKind::Down(MouseButton::Left), row, col)
+}
+
+fn drag_to(row: u16, col: u16) -> MouseEvent {
+    left(MouseEventKind::Drag(MouseButton::Left), row, col)
+}
+
+fn release(row: u16, col: u16) -> MouseEvent {
+    left(MouseEventKind::Up(MouseButton::Left), row, col)
+}
+
+impl App {
+    /// Attach to a freshly spawned inline child and install a screen whose
+    /// `lines` the test controls.
+    fn attached_with_lines(lines: &[&str]) -> App {
+        let mut app = App::new_local(30, 100);
+        let dir = app.invocation_dir.clone();
+        app.spawn_in("sleep 5", dir);
+        app.pump();
+        app.resolve_selection();
+        app.attach();
+        let id = app.focused_id.expect("attached");
+        let mut lines: Vec<String> = lines.iter().map(|l| l.to_string()).collect();
+        lines.resize(app.pane_rows() as usize, String::new());
+        app.focused_screen = Some(ScreenView {
+            id,
+            lines,
+            formatted: Vec::new(),
+            cursor: (0, 0),
+            hide_cursor: false,
+            wants_mouse: false,
+            alt_screen: false,
+            alt_scroll: false,
+            scrollback: 0,
+        });
+        app.mouse_captured = true;
+        app
+    }
+
+    /// Spawn `cmd`, attach, and wait for a `ScreenView` satisfying `ready`.
+    fn attached_watching(cmd: &str, ready: impl Fn(&ScreenView) -> bool) -> (App, u64) {
+        let mut app = App::new_local(30, 100);
+        let cwd = app.invocation_dir.clone();
+        app.spawn_in(cmd, cwd);
+        app.pump();
+        app.resolve_selection();
+        app.attach();
+        let id = app.focused_id.expect("attached");
+        app.set_watch(Some((id, true)));
+        assert!(
+            wait_until(Duration::from_secs(5), || {
+                app.pump();
+                app.screen_for(id).is_some_and(&ready)
+            }),
+            "the expected screen never reached the client"
+        );
+        app.mouse_captured = true;
+        (app, id)
+    }
+}
+
+/// A press-drag-release over the live view copies the selected text through
+/// the OSC 52 path and shows the copy notice.
+#[test]
+fn drag_copy_gesture_emits_the_selection_via_osc52() {
+    let mut app = App::attached_with_lines(&["hello world", "second row"]);
+    app.on_mouse(press(0, 0));
+    app.on_mouse(drag_to(0, 4));
+    app.on_mouse(release(0, 4));
+    assert_eq!(
+        app.pending_clipboard,
+        vec![(ClipboardKind::Clipboard, "hello".to_string())]
+    );
+    assert!(app.selection.is_none(), "release must clear the selection");
+    let mut out = Vec::new();
+    app.flush_clipboard(&mut out).unwrap();
+    assert_eq!(out, b"\x1b]52;c;aGVsbG8=\x07");
+    assert_eq!(app.notice(), Some("copied 5 chars"));
+}
+
+/// A drag across rows samples the screen's rendered rows at release.
+#[test]
+fn drag_copy_spans_rows() {
+    let mut app = App::attached_with_lines(&["hello world", "second row"]);
+    app.on_mouse(press(0, 6));
+    app.on_mouse(drag_to(1, 5));
+    app.on_mouse(release(1, 5));
+    assert_eq!(
+        app.pending_clipboard,
+        vec![(ClipboardKind::Clipboard, "world\nsecond".to_string())]
+    );
+}
+
+/// A motionless click queues no copy and shows no notice.
+#[test]
+fn click_without_drag_copies_nothing() {
+    let mut app = App::attached_with_lines(&["hello world"]);
+    app.on_mouse(press(0, 3));
+    app.on_mouse(release(0, 3));
+    assert!(app.pending_clipboard.is_empty());
+    assert!(app.selection.is_none());
+    let mut out = Vec::new();
+    app.flush_clipboard(&mut out).unwrap();
+    assert!(out.is_empty());
+    assert_eq!(app.notice(), None);
+}
+
+/// Whitespace-only selected text is not queued for copying.
+#[test]
+fn all_whitespace_selection_copies_nothing() {
+    let mut app = App::attached_with_lines(&["abc         ", "            "]);
+    app.on_mouse(press(0, 5));
+    app.on_mouse(drag_to(1, 8));
+    app.on_mouse(release(1, 8));
+    assert!(app.pending_clipboard.is_empty());
+    assert!(app.selection.is_none());
+}
+
+/// A press on the bar row (outside the child pane) starts no selection.
+#[test]
+fn bar_row_press_starts_no_selection() {
+    let mut app = App::attached_with_lines(&["hello world"]);
+    let bar = app.rows - 1;
+    app.on_mouse(press(bar, 3));
+    assert!(app.selection.is_none(), "the bar row is not selectable");
+    app.on_mouse(drag_to(bar, 8));
+    app.on_mouse(release(bar, 8));
+    assert!(app.pending_clipboard.is_empty());
+}
+
+/// A wheel event cancels an active drag and still enters inline scrollback.
+#[test]
+fn wheel_cancels_a_live_drag_and_keeps_its_function() {
+    let mut app = App::attached_with_lines(&["hello world"]);
+    app.on_mouse(press(0, 0));
+    app.on_mouse(drag_to(0, 4));
+    assert!(app.selection.is_some());
+    app.on_mouse(left(MouseEventKind::ScrollUp, 0, 0));
+    assert!(app.selection.is_none(), "wheel must drop the drag");
+    assert!(app.view_scroll, "wheel-up must still enter scrollback");
+    assert!(app.pending_clipboard.is_empty(), "a cancel is not a copy");
+}
+
+/// Resize, detach, scrollback entry, and watch changes clear active selections.
+#[test]
+fn coordinate_invalidation_clears_the_selection() {
+    let start = |app: &mut App| {
+        app.on_mouse(press(0, 0));
+        app.on_mouse(drag_to(0, 4));
+        assert!(app.selection.is_some(), "the drag must be live");
+    };
+    let mut out = io::stdout();
+
+    let mut app = App::attached_with_lines(&["hello world"]);
+    start(&mut app);
+    app.on_resize(31, 101);
+    assert!(app.selection.is_none(), "resize must clear");
+
+    let mut app = App::attached_with_lines(&["hello world"]);
+    start(&mut app);
+    app.on_key_attached(&mut out, ctrl(KeyCode::Char('\\')))
+        .unwrap();
+    assert!(app.mode == Mode::Dashboard, "ctrl-\\ detaches");
+    assert!(app.selection.is_none(), "detach must clear");
+
+    let mut app = App::attached_with_lines(&["hello world"]);
+    start(&mut app);
+    app.on_key_attached(
+        &mut out,
+        KeyEvent::new(KeyCode::PageUp, KeyModifiers::SHIFT),
+    )
+    .unwrap();
+    assert!(app.view_scroll);
+    assert!(app.selection.is_none(), "scrollback entry must clear");
+
+    let mut app = App::attached_with_lines(&["hello world"]);
+    // Change an established attached watch.
+    let id = app.focused_id.expect("attached");
+    app.set_watch(Some((id, true)));
+    start(&mut app);
+    app.set_watch(None);
+    assert!(app.selection.is_none(), "a watch change must clear");
+}
+
+/// Row-faithful screen lines reach the client: one entry per pane row, the
+/// blank bottom row included.
+#[test]
+fn attached_screen_lines_cover_every_pane_row() {
+    let (app, id) = App::attached_watching("printf 'top'; sleep 5", |s| {
+        s.lines.first().is_some_and(|l| l == "top")
+    });
+    let lines = &app.screen_for(id).unwrap().lines;
+    // 30-row client, one-row status bar: the pane grid is 29 rows.
+    assert_eq!(lines.len(), 29, "one entry per pane row");
+    assert_eq!(lines[28], "", "the blank bottom row keeps its slot");
+}
+
+/// A drag from beyond the penultimate row's text into the blank bottom row
+/// selects only blank cells and copies nothing.
+#[test]
+fn bottom_row_drag_does_not_alias_onto_the_penultimate_row() {
+    // CUP is 1-based: row 28 is 0-based row 27, the 29-row pane's penultimate.
+    let (mut app, _) = App::attached_watching("printf '\\033[28;1Hbottomtext'; sleep 5", |s| {
+        s.lines.iter().any(|l| l == "bottomtext")
+    });
+    // Press past the text's end (col 15 > "bottomtext"), drag into the blank
+    // bottom row: the highlight shows blank cells only.
+    app.on_mouse(press(27, 15));
+    app.on_mouse(drag_to(28, 0));
+    app.on_mouse(release(28, 0));
+    assert!(
+        app.pending_clipboard.is_empty(),
+        "a drag over blank cells must copy nothing, got {:?}",
+        app.pending_clipboard
+    );
+}
+
+/// Enabling child mouse reporting mid-gesture discards the client selection
+/// before subsequent events are forwarded.
+#[test]
+fn mid_drag_wants_mouse_flip_drops_the_selection() {
+    let mut app = App::attached_with_lines(&["hello world"]);
+    app.on_mouse(press(0, 0));
+    app.on_mouse(drag_to(0, 4));
+    assert!(app.selection.is_some());
+    // Install a new screen snapshot with mouse reporting enabled.
+    let mut flipped = app.focused_screen.clone().expect("screen installed");
+    flipped.wants_mouse = true;
+    app.focused_screen = Some(flipped);
+    app.on_mouse(drag_to(0, 6));
+    assert!(app.selection.is_none(), "the flip must drop the selection");
+    app.on_mouse(release(0, 6));
+    assert!(app.selection.is_none());
+    assert!(
+        app.pending_clipboard.is_empty(),
+        "a canceled drag is not a copy"
+    );
+}
+
+/// The child enables mouse reporting mid-drag: the selection cancels, and
+/// the rerouted drag/release bytes reach the child's PTY.
+#[test]
+fn mid_drag_mouse_enable_reroutes_the_gesture_to_the_child() {
+    let dir = temp("app_drag_flip");
+    let out_file = dir.join("bytes");
+    // The child enables button-motion+SGR reporting only after one byte of
+    // stdin arrives, so the flip lands mid-gesture under test control.
+    let cmd = format!(
+        "stty -icanon -echo min 1 time 0; head -c 1 >/dev/null; \
+         printf '\\033[?1002h\\033[?1006h'; head -c 19 > {}",
+        out_file.display()
+    );
+    let (mut app, id) = App::attached_watching(&cmd, |s| !s.wants_mouse);
+    app.on_mouse(press(1, 2));
+    assert!(app.selection.is_some(), "the press must start a drag");
+    // Trigger the child's mouse enable and wait for the flip to arrive.
+    app.transport.send(Command::Input {
+        id,
+        bytes: b"\n".to_vec(),
+    });
+    assert!(
+        wait_until(Duration::from_secs(5), || {
+            app.pump();
+            matches!(app.screen_for(id), Some(s) if s.wants_mouse)
+        }),
+        "the mouse-mode flip never reached the client"
+    );
+    app.on_mouse(drag_to(1, 5));
+    assert!(app.selection.is_none(), "the flip must drop the selection");
+    app.on_mouse(release(1, 5));
+    assert!(
+        app.pending_clipboard.is_empty(),
+        "a canceled drag is not a copy"
+    );
+    // SGR: drag `\x1b[<32;6;2M`, release `\x1b[<0;6;2m`; the press stayed
+    // client-side, so the child sees exactly the rerouted pair.
+    let mut got = Vec::new();
+    wait_until(Duration::from_secs(5), || {
+        got = std::fs::read(&out_file).unwrap_or_default();
+        got.len() >= 19
+    });
+    assert_eq!(got, b"\x1b[<32;6;2M\x1b[<0;6;2m".to_vec());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Concealed (SGR 8) text reaches the client as the blanks the screen shows,
+/// and a selection over it copies nothing: highlight and clipboard agree.
+#[test]
+fn selection_over_concealed_text_copies_nothing() {
+    // Row 1: nine hidden cells, then a visible sentinel to key arrival on.
+    let (mut app, id) = App::attached_watching(
+        "printf 'ok\\r\\n\\033[8mTOPSECRET\\033[28mZ'; sleep 5",
+        |s| s.lines.get(1).is_some_and(|l| l.ends_with('Z')),
+    );
+    assert_eq!(
+        app.screen_for(id).unwrap().lines[1],
+        "         Z",
+        "concealed cells must read as spaces"
+    );
+    app.on_mouse(press(1, 0));
+    app.on_mouse(drag_to(1, 8));
+    app.on_mouse(release(1, 8));
+    assert!(
+        app.pending_clipboard.is_empty(),
+        "concealed text must not copy, got {:?}",
+        app.pending_clipboard
+    );
+}
+
+/// A press→release flick with no drag event between copies the span from
+/// press to release: the release coordinate is part of the gesture.
+#[test]
+fn release_without_drag_copies_the_flick_span() {
+    let mut app = App::attached_with_lines(&["hello world", "second row"]);
+    app.on_mouse(press(0, 0));
+    app.on_mouse(release(0, 4));
+    assert_eq!(
+        app.pending_clipboard,
+        vec![(ClipboardKind::Clipboard, "hello".to_string())]
+    );
+    assert!(app.selection.is_none(), "release must clear the selection");
+}
+
+/// A release past the pane clamps like a drag: the copy extends through the
+/// bottom-most, right-most cell the highlight can show.
+#[test]
+fn release_past_the_view_clamps_like_a_drag() {
+    let mut app = App::attached_with_lines(&["hello world", "second row"]);
+    app.on_mouse(press(0, 6));
+    app.on_mouse(drag_to(0, 8));
+    app.on_mouse(release(u16::MAX, u16::MAX));
+    assert_eq!(
+        app.pending_clipboard,
+        vec![(ClipboardKind::Clipboard, "world\nsecond row".to_string())]
+    );
+}
+
+/// Disabling host mouse capture clears a live selection before mouse delivery
+/// stops.
+#[test]
+fn capture_drop_clears_a_live_selection() {
+    let mut app = App::attached_with_lines(&["alpha beta", "gamma"]);
+    app.mouse_captured = true;
+    app.on_mouse(press(0, 2));
+    app.on_mouse(drag_to(0, 6));
+    assert!(app.selection().is_some(), "premise: a drag is live");
+    // Alternate scroll on the alternate screen disables host mouse capture.
+    if let Some(s) = app.focused_screen.as_mut() {
+        s.alt_screen = true;
+        s.alt_scroll = true;
+    }
+    app.sync_input_modes(&mut std::io::stdout()).unwrap();
+    assert!(!app.mouse_captured, "premise: capture dropped");
+    assert!(app.selection().is_none(), "the drop must clear the drag");
+    assert!(app.pending_clipboard.is_empty(), "nothing may copy");
+}
+
+/// A press queued before capture dropped is processed after it
+#[test]
+fn press_after_capture_drop_starts_no_selection() {
+    let mut app = App::attached_with_lines(&["alpha beta", "gamma"]);
+    app.mouse_captured = false;
+    app.on_mouse(press(0, 2));
+    assert!(app.selection().is_none(), "no capture, no gesture to come");
+    app.on_mouse(drag_to(0, 6));
+    app.on_mouse(release(0, 6));
+    assert!(app.pending_clipboard.is_empty(), "nothing may copy");
+}
+
+/// Press eligibility requires the screen's row count to match the current pane geometry.
+#[test]
+fn press_on_a_stale_geometry_screen_starts_no_selection() {
+    let mut app = App::attached_with_lines(&["hello world"]);
+    app.on_resize(40, 100);
+    app.on_mouse(press(0, 0));
+    assert!(app.selection().is_none(), "stale geometry must not select");
+    // The first post-resize frame restores eligibility
+    let rows = app.pane_rows() as usize;
+    if let Some(s) = app.focused_screen.as_mut() {
+        s.lines.resize(rows, String::new());
+    }
+    app.on_mouse(press(0, 0));
+    assert!(app.selection().is_some(), "a fresh frame selects again");
+}
+
+/// At one terminal row the status bar covers the child pane, leaving no
+/// selectable rows.
+#[test]
+fn one_row_terminal_has_no_selectable_pane() {
+    let mut app = App::new_local(1, 80);
+    let dir = app.invocation_dir.clone();
+    app.spawn_in("sleep 5", dir);
+    app.pump();
+    app.resolve_selection();
+    app.attach();
+    app.mouse_captured = true;
+    let id = app.focused_id.expect("attached");
+    app.focused_screen = Some(ScreenView {
+        id,
+        lines: vec!["hidden".to_string()],
+        formatted: Vec::new(),
+        cursor: (0, 0),
+        hide_cursor: false,
+        wants_mouse: false,
+        alt_screen: false,
+        alt_scroll: false,
+        scrollback: 0,
+    });
+    app.on_mouse(press(0, 0));
+    assert!(app.selection().is_none(), "the bar row is not selectable");
+    app.on_mouse(drag_to(0, 5));
+    app.on_mouse(release(0, 5));
+    assert!(app.pending_clipboard.is_empty(), "nothing may copy");
+}
+
+/// With a mouse-aware child the left button forwards: the SGR
+/// press/drag/release bytes reach the child's PTY, and no selection
+/// state forms.
+#[test]
+fn wants_mouse_child_keeps_the_left_button() {
+    let dir = temp("app_drag_fwd");
+    let out_file = dir.join("bytes");
+    let mut app = App::new_local(30, 100);
+    let cwd = app.invocation_dir.clone();
+    // 1002 (button motion) reports drags; 1006 selects the SGR encoding.
+    let cmd = format!(
+        "stty -icanon -echo min 1 time 0; printf '\\033[?1002h\\033[?1006h'; head -c 28 > {}",
+        out_file.display()
+    );
+    app.spawn_in(&cmd, cwd);
+    app.pump();
+    app.resolve_selection();
+    app.attach();
+    let id = app.focused_id.expect("attached");
+    app.set_watch(Some((id, true)));
+    // Wait for the child's mouse mode to reach the client.
+    assert!(
+        wait_until(Duration::from_secs(5), || {
+            app.pump();
+            matches!(app.screen_for(id), Some(s) if s.wants_mouse)
+        }),
+        "mouse mode never reached the client"
+    );
+
+    app.on_mouse(press(1, 2));
+    assert!(app.selection.is_none(), "a wants_mouse press must forward");
+    app.on_mouse(drag_to(1, 5));
+    assert!(app.selection.is_none(), "a wants_mouse drag must forward");
+    app.on_mouse(release(1, 5));
+    assert!(app.selection.is_none());
+    assert!(app.pending_clipboard.is_empty(), "nothing may copy");
+
+    let mut got = Vec::new();
+    wait_until(Duration::from_secs(5), || {
+        got = std::fs::read(&out_file).unwrap_or_default();
+        got.len() >= 28
+    });
+    // SGR: press `\x1b[<0;col+1;row+1M`, drag adds 32, release ends in `m`.
+    assert_eq!(got, b"\x1b[<0;3;2M\x1b[<32;6;2M\x1b[<0;6;2m".to_vec());
+    let _ = std::fs::remove_dir_all(&dir);
+}

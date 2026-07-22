@@ -215,9 +215,9 @@ pub fn formatted<T>(term: &Term<T>) -> (Vec<u8>, (u16, u16), bool) {
 
 /// Plain-text contents of the displayed screen, one line per row, honoring
 /// the display offset. Paired wide-char spacers are skipped so wide glyphs
-/// appear once; zero-width marks ride their base character; `'\t'` cells and
-/// orphaned wide halves read as the blank the replayed screen shows; trailing
-/// spaces are trimmed per row.
+/// appear once; zero-width marks ride their base character; `'\t'` cells,
+/// concealed (SGR 8) cells, and orphaned wide halves read as the blank the
+/// replayed screen shows; trailing spaces are trimmed per row.
 pub fn contents<T>(term: &Term<T>) -> String {
     let grid = term.grid();
     let cols = grid.columns();
@@ -232,6 +232,12 @@ pub fn contents<T>(term: &Term<T>) -> String {
         let line = &grid[Line(row as i32 - offset)];
         for col in 0..cols {
             let cell = &line[Column(col)];
+            // Each concealed cell contributes one blank display column;
+            // attached zero-width marks remain concealed as well.
+            if cell.flags.contains(Flags::HIDDEN) {
+                out.push(' ');
+                continue;
+            }
             if paired_spacer(line, col) {
                 continue;
             }
@@ -941,6 +947,28 @@ mod tests {
         // trailing spaces trim per row; the empty last row stays a line.
         let source = parse("one\r\ntwo 漢\u{301}字\r\n\tx".as_bytes(), 4, 12);
         assert_eq!(contents(&source), "one\ntwo 漢\u{301}字\n        x\n");
+    }
+
+    #[test]
+    fn contents_conceals_hidden_cells() {
+        // SGR 8 cells display blank, so the plain-text view reads them as
+        // spaces (`formatted` re-emits SGR 8 and both views must agree). The
+        // combining mark on the hidden 'S' must not leak, and the trailing
+        // hidden run trims away like padding.
+        let source = parse(
+            "ab\x1b[8mS\u{301}ECRET\x1b[28mcd \x1b[8mtail".as_bytes(),
+            2,
+            20,
+        );
+        assert_eq!(contents(&source), "ab      cd\n");
+    }
+
+    #[test]
+    fn hidden_wide_glyphs_keep_both_columns() {
+        // A concealed wide glyph occupies two cells; both read as spaces so
+        // later glyphs keep their columns.
+        let source = parse("\x1b[8m日\x1b[28mx".as_bytes(), 1, 10);
+        assert_eq!(contents(&source), "  x");
     }
 
     // Randomized escape-soup round trip: deterministic (fixed seeds, no
