@@ -540,29 +540,26 @@ impl App {
         }
     }
 
-    /// Move the selection one task up in display order; up from the first
-    /// task wraps to the last.
-    fn select_up(&mut self) {
+    /// Move the selection one task through display order, wrapping at either
+    /// end: `forward` steps down (last wraps to first), else up (first wraps
+    /// to last).
+    fn select_wrap(&mut self, forward: bool) {
         let order = self.display_order();
         if order.is_empty() {
             self.selected_id = None;
             return;
         }
         let pos = self.selected_pos(&order).unwrap_or(0);
-        self.selected_id = Some(self.views[order[(pos + order.len() - 1) % order.len()]].id);
+        let step = if forward { 1 } else { order.len() - 1 };
+        self.selected_id = Some(self.views[order[(pos + step) % order.len()]].id);
     }
 
-    /// Move the selection one task down in display order; down from the last
-    /// task wraps to the first.
+    fn select_up(&mut self) {
+        self.select_wrap(false);
+    }
+
     fn select_down(&mut self) {
-        let order = self.display_order();
-        if order.is_empty() {
-            self.selected_id = None;
-            return;
-        }
-        let pos = self.selected_pos(&order).unwrap_or(0);
-        let next = (pos + 1) % order.len();
-        self.selected_id = Some(self.views[order[next]].id);
+        self.select_wrap(true);
     }
 
     /// Index within `sections` of the section holding the selected task.
@@ -573,34 +570,32 @@ impl App {
             .position(|(_, idxs)| idxs.iter().any(|&i| self.views[i].id == id))
     }
 
-    /// Select the first task in the next section, wrapping to the first.
-    /// With no current selection, select the first section.
-    fn select_next_section(&mut self) {
+    /// Select the first task in the adjacent section, wrapping at either end.
+    /// `forward` moves to the next section (wrapping to the first); else the
+    /// previous (wrapping to the last). With no current selection, land on the
+    /// first section going forward, the last going back.
+    fn select_section_wrap(&mut self, forward: bool) {
         let sections = self.sections();
         if sections.is_empty() {
             self.selected_id = None;
             return;
         }
-        let next = match self.selected_section(&sections) {
-            Some(cur) => (cur + 1) % sections.len(),
-            None => 0,
+        let len = sections.len();
+        let target = match (self.selected_section(&sections), forward) {
+            (Some(cur), true) => (cur + 1) % len,
+            (Some(cur), false) => (cur + len - 1) % len,
+            (None, true) => 0,
+            (None, false) => len - 1,
         };
-        self.selected_id = Some(self.views[sections[next].1[0]].id);
+        self.selected_id = Some(self.views[sections[target].1[0]].id);
     }
 
-    /// Select the first task in the previous section, wrapping to the last.
-    /// With no current selection, select the last section.
+    fn select_next_section(&mut self) {
+        self.select_section_wrap(true);
+    }
+
     fn select_prev_section(&mut self) {
-        let sections = self.sections();
-        if sections.is_empty() {
-            self.selected_id = None;
-            return;
-        }
-        let prev = match self.selected_section(&sections) {
-            Some(cur) => (cur + sections.len() - 1) % sections.len(),
-            None => sections.len() - 1,
-        };
-        self.selected_id = Some(self.views[sections[prev].1[0]].id);
+        self.select_section_wrap(false);
     }
 
     /// Send the desired watch state when its target or attachment mode changes.
@@ -694,7 +689,7 @@ impl App {
                 ClipboardKind::Selection => 's',
             };
             write!(out, "\x1b]52;{k};{}\x07", B64.encode(&text))?;
-            last = copied_chars(&text);
+            last = text.chars().count();
         }
         out.flush()?;
         // Show the confirmation in the attached-mode notice bar.
@@ -946,6 +941,13 @@ impl App {
             1
         };
         self.group_candidates = cands;
+    }
+
+    /// Whether the typed group names no existing group: nonempty input, only
+    /// the always-present Unassigned row. The Enter action and its render hint
+    /// share this so they agree structurally, not coincidentally.
+    pub(crate) fn group_is_new(&self) -> bool {
+        !self.group_input.is_empty() && self.group_candidates.len() < 2
     }
 
     /// Clear the group-picker state and return to the dashboard.
@@ -1212,7 +1214,7 @@ impl App {
             KeyCode::Enter => {
                 // Enter assigns the highlighted group, or creates the typed
                 // group when no existing name matches.
-                let group = if !self.group_input.is_empty() && self.group_candidates.len() < 2 {
+                let group = if self.group_is_new() {
                     Some(self.group_input.as_str().to_string())
                 } else {
                     self.group_candidates
@@ -1283,11 +1285,7 @@ impl App {
                 // Other input returns to live and is forwarded immediately.
                 _ => {
                     self.view_scroll = false;
-                    if let Some(id) = self.focused_id
-                        && let Some((code, mods)) = key_event_to_key(k)
-                    {
-                        self.transport.send(Command::Key { id, code, mods });
-                    }
+                    self.forward_key(k);
                 }
             }
             return Ok(());
@@ -1301,12 +1299,18 @@ impl App {
             self.send_scrollback(ScrollAction::Up(page));
             return Ok(());
         }
+        self.forward_key(k);
+        Ok(())
+    }
+
+    /// Forward a keystroke to the focused task's PTY, dropping keys with no
+    /// wire encoding.
+    fn forward_key(&mut self, k: KeyEvent) {
         if let Some(id) = self.focused_id
             && let Some((code, mods)) = key_event_to_key(k)
         {
             self.transport.send(Command::Key { id, code, mods });
         }
-        Ok(())
     }
 
     /// Route a clipboard paste by mode. Attached pastes go intact to the core,
@@ -1563,11 +1567,6 @@ fn on_key_edit(buf: &mut EditBuffer, k: KeyEvent) -> Option<bool> {
         KeyCode::Char(_) => Some(false),
         _ => None,
     }
-}
-
-/// Count the characters reported by the clipboard-copy notice.
-fn copied_chars(text: &str) -> usize {
-    text.chars().count()
 }
 
 /// Insert pasted text at the caret after removing control characters.

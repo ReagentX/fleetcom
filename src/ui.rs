@@ -183,8 +183,10 @@ fn render_dashboard(out: &mut impl Write, app: &App) -> io::Result<()> {
 
     // Input modes show a prompt; otherwise show a notice, status, or key hint.
     let cmd_y = rows.saturating_sub(2);
-    match cmdline(app) {
-        Some((line, _)) => put(out, cmd_y, &line, cols)?,
+    // Computed once: caret placement below reuses this line.
+    let cmd = cmdline(app);
+    match &cmd {
+        Some((line, _)) => put(out, cmd_y, line, cols)?,
         None => match transient_line(app.notice(), app.status.as_deref()) {
             Some(line) => put(out, cmd_y, &line, cols)?,
             None => dim(
@@ -214,9 +216,9 @@ fn render_dashboard(out: &mut impl Write, app: &App) -> io::Result<()> {
         cols,
     )?;
 
-    match cmdline(app) {
+    match &cmd {
         Some((line, cx)) => {
-            let cx = clamp_caret(cx, &line, cols);
+            let cx = clamp_caret(*cx, line, cols);
             queue!(out, MoveTo(cx, cmd_y), Show)?;
         }
         None => queue!(out, Hide)?,
@@ -575,7 +577,7 @@ fn render_pickgroup(out: &mut impl Write, app: &App) -> io::Result<()> {
         .collect();
     // Hint reflects what Enter does: create when the typed text matches nothing
     // (nothing matched), otherwise act on the highlighted row.
-    let action = if !app.group_input.is_empty() && app.group_candidates.len() < 2 {
+    let action = if app.group_is_new() {
         "enter create"
     } else {
         match app.group_candidates.get(app.group_sel) {
