@@ -2186,9 +2186,11 @@ impl App {
         app.resolve_selection();
         app.attach();
         let id = app.focused_id.expect("attached");
+        let mut lines: Vec<String> = lines.iter().map(|l| l.to_string()).collect();
+        lines.resize(app.pane_rows() as usize, String::new());
         app.focused_screen = Some(ScreenView {
             id,
-            lines: lines.iter().map(|l| l.to_string()).collect(),
+            lines,
             formatted: Vec::new(),
             cursor: (0, 0),
             hide_cursor: false,
@@ -2197,6 +2199,7 @@ impl App {
             alt_scroll: false,
             scrollback: 0,
         });
+        app.mouse_captured = true;
         app
     }
 
@@ -2217,6 +2220,7 @@ impl App {
             }),
             "the expected screen never reached the client"
         );
+        app.mouse_captured = true;
         (app, id)
     }
 }
@@ -2517,6 +2521,34 @@ fn capture_drop_clears_a_live_selection() {
     assert!(app.pending_clipboard.is_empty(), "nothing may copy");
 }
 
+/// A press queued before capture dropped is processed after it
+#[test]
+fn press_after_capture_drop_starts_no_selection() {
+    let mut app = App::attached_with_lines(&["alpha beta", "gamma"]);
+    app.mouse_captured = false;
+    app.on_mouse(press(0, 2));
+    assert!(app.selection().is_none(), "no capture, no gesture to come");
+    app.on_mouse(drag_to(0, 6));
+    app.on_mouse(release(0, 6));
+    assert!(app.pending_clipboard.is_empty(), "nothing may copy");
+}
+
+/// Press eligibility requires the screen's row count to match the current pane geometry.
+#[test]
+fn press_on_a_stale_geometry_screen_starts_no_selection() {
+    let mut app = App::attached_with_lines(&["hello world"]);
+    app.on_resize(40, 100);
+    app.on_mouse(press(0, 0));
+    assert!(app.selection().is_none(), "stale geometry must not select");
+    // The first post-resize frame restores eligibility
+    let rows = app.pane_rows() as usize;
+    if let Some(s) = app.focused_screen.as_mut() {
+        s.lines.resize(rows, String::new());
+    }
+    app.on_mouse(press(0, 0));
+    assert!(app.selection().is_some(), "a fresh frame selects again");
+}
+
 /// At one terminal row the status bar covers the child pane, leaving no
 /// selectable rows.
 #[test]
@@ -2527,6 +2559,7 @@ fn one_row_terminal_has_no_selectable_pane() {
     app.pump();
     app.resolve_selection();
     app.attach();
+    app.mouse_captured = true;
     let id = app.focused_id.expect("attached");
     app.focused_screen = Some(ScreenView {
         id,

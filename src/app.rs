@@ -1406,9 +1406,14 @@ impl App {
                             // Wheel navigation cancels the active drag.
                             MouseKind::WheelUp | MouseKind::WheelDown => self.selection = None,
                             MouseKind::Press(MouseBtn::Left) => {
-                                // Only rows above the status bar are visible and
-                                // selectable, including at one terminal row.
-                                self.selection = (m.row < self.rows.saturating_sub(1)).then(|| {
+                                // A selection needs the rest of its gesture
+                                let fresh = self
+                                    .screen_for(id)
+                                    .is_some_and(|s| s.lines.len() == self.pane_rows() as usize);
+                                self.selection = (self.mouse_captured
+                                    && fresh
+                                    && m.row < self.rows.saturating_sub(1))
+                                .then(|| {
                                     Selection::begin(
                                         m.row,
                                         m.column.min(self.cols.saturating_sub(1)),
@@ -1479,11 +1484,15 @@ impl App {
         let Some(text) = self.screen_for(id).map(|s| sel.extract(&s.lines)) else {
             return;
         };
+        // A drag released at the bottom of a mostly empty screen
+        // must not stuff the clipboard with newlines the user
+        // never saw selected
+        let text = text.trim_end_matches('\n');
         if text.trim().is_empty() {
             return;
         }
         self.pending_clipboard
-            .push((ClipboardKind::Clipboard, text));
+            .push((ClipboardKind::Clipboard, text.to_string()));
     }
 
     /// Move the attached task's scrollback viewport.
