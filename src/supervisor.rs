@@ -1035,7 +1035,7 @@ impl Supervisor {
     }
 
     /// Resolve the sessions root, run `load` against it, and map failure to a
-    /// status. `subject` is the "<noun> '<name>'" phrase both notices open with.
+    /// status. `subject` is the `<noun> '<name>'` phrase both notices open with.
     fn load_config(
         &mut self,
         subject: &str,
