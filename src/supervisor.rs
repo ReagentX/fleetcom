@@ -408,6 +408,18 @@ impl Supervisor {
                     {
                         t.scroll_view(ScrollAction::Live);
                     }
+                    // Purge the new target's buffered stores before the watch
+                    // takes effect. The wake loop applies a whole burst before
+                    // ticking, so without this a store captured while
+                    // backgrounded survives into a tick that already sees the
+                    // task as watched — and fires. The residual window (bytes
+                    // emitted pre-attach but parsed post-purge) is
+                    // irreducible: a transparent terminal has it too.
+                    if let Some(new) = id
+                        && let Some(t) = self.by_id_mut(new)
+                    {
+                        let _ = t.drain_clipboard();
+                    }
                     self.last_screen = None;
                 }
                 self.watched = id;
@@ -544,10 +556,13 @@ impl Supervisor {
                 // guarantee: a store captured while backgrounded must never
                 // fire when the task is later watched — a wrong clipboard is
                 // silently harmful, an empty one visibly inert. The two-slot
-                // capture bound makes the constant drain cheap.
+                // capture bound makes the constant drain cheap. This drain
+                // alone cannot close the wake-coalescing race (a `Watch` in
+                // the same burst lands before the tick); `apply`'s `Watch`
+                // arm purges the new target for that case.
                 let stores = t.drain_clipboard();
                 if watched == Some(t.id) {
-                    clipboard = Some(stores);
+                    clipboard = Some((t.id, stores));
                 }
                 TaskView {
                     id: t.id,
@@ -567,9 +582,10 @@ impl Supervisor {
             .collect();
         self.events.push(Event::Tasks(views));
 
-        if let Some(stores) = clipboard {
+        if let Some((id, stores)) = clipboard {
             for (kind, text) in stores.stores {
                 self.events.push(Event::ClipboardCopy {
+                    id,
                     kind: clipboard_kind(kind),
                     text,
                 });

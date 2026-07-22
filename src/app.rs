@@ -50,6 +50,17 @@ const _: () = assert!(
 /// bounds how far past the deadline a stale one can stay painted.
 const NOTICE_TTL: Duration = Duration::from_secs(5);
 
+/// Notice severity, two tiers only — the notice is decoration, never
+/// load-bearing. `Warning` covers attached-mode `Event::Status` mirrors
+/// (spawn errors, recovery failures, clipboard drops); `Info` covers
+/// confirmations (the copied-chars line). The sole ranking rule lives in
+/// `set_notice`: `Info` never replaces an unexpired `Warning`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NoticeLevel {
+    Warning,
+    Info,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
     Dashboard,
@@ -200,11 +211,11 @@ pub struct App {
     pub recovery_sel: usize,
     /// Transient one-line notice (save/load result), dismissed on the next key.
     pub status: Option<String>,
-    /// Ephemeral notice and the instant it was set: clipboard-copy
-    /// confirmations, plus attached-mode mirrors of `Event::Status`. A
-    /// separate channel from `status` — that one persists until replaced or
-    /// cleared; this one dies of age through `notice()`.
-    notice: Option<(String, Instant)>,
+    /// Ephemeral notice, its severity, and the instant it was set:
+    /// clipboard-copy confirmations, plus attached-mode mirrors of
+    /// `Event::Status`. A separate channel from `status` — that one persists
+    /// until replaced or cleared; this one dies of age through `notice()`.
+    notice: Option<(String, NoticeLevel, Instant)>,
     /// OSC 52 stores accepted while attached, awaiting re-emission to the host
     /// terminal by `flush_clipboard` later in the same run-loop iteration.
     pending_clipboard: Vec<(ClipboardKind, String)>,
@@ -637,12 +648,15 @@ impl App {
                     // is off screen: mirror the message into the notice so
                     // supervisor warnings (e.g. the clipboard oversize drop)
                     // are seen when they happen. `status` is set as always.
+                    // `Warning` because everything the supervisor says while
+                    // attached is operational: spawn errors, recovery
+                    // failures, clipboard drops.
                     if self.mode == Mode::Attached {
-                        self.set_notice(s.clone());
+                        self.set_notice(s.clone(), NoticeLevel::Warning);
                     }
                     self.status = Some(s);
                 }
-                Event::ClipboardCopy { kind, text } => self.on_clipboard_copy(kind, text),
+                Event::ClipboardCopy { id, kind, text } => self.on_clipboard_copy(id, kind, text),
                 Event::Sessions { names, recovery } => {
                     // Clamp both page selections to the refreshed lists.
                     self.session_sel = self.session_sel.min(names.len().saturating_sub(1));
@@ -660,17 +674,29 @@ impl App {
     /// Accept or drop one forwarded OSC 52 store. A clipboard write is an
     /// outward-facing side effect; only an attached user plausibly caused it,
     /// so every other mode drops the store silently — peek-mode stores and
-    /// copies still in flight when the user detaches both land here.
-    fn on_clipboard_copy(&mut self, kind: ClipboardKind, text: String) {
-        if self.mode == Mode::Attached {
+    /// copies still in flight when the user detaches both land here. The id
+    /// gate drops in-flight copies from a previously watched task: the wire
+    /// preserves ordering per direction, not across a Watch/forward cross,
+    /// so a copy from task A can arrive after attachment moved to task B.
+    fn on_clipboard_copy(&mut self, id: u64, kind: ClipboardKind, text: String) {
+        if self.mode == Mode::Attached && self.focused_id == Some(id) {
             self.pending_clipboard.push((kind, text));
         }
     }
 
-    /// Stage the ephemeral notice, replacing any predecessor: the newest
-    /// message wins, and replacement caps the state at one string.
-    fn set_notice(&mut self, msg: String) {
-        self.notice = Some((msg, Instant::now()));
+    /// Stage the ephemeral notice. The newest message wins with one
+    /// exception: an `Info` set yields to an unexpired `Warning`, because the
+    /// attached bar is the only place a warning shows and a copy
+    /// confirmation landing in the same batch would clobber it. An expired
+    /// `Warning` loses — staleness must not pin warnings forever.
+    fn set_notice(&mut self, msg: String, level: NoticeLevel) {
+        if level == NoticeLevel::Info
+            && let Some((_, NoticeLevel::Warning, set_at)) = self.notice.as_ref()
+            && set_at.elapsed() < NOTICE_TTL
+        {
+            return;
+        }
+        self.notice = Some((msg, level, Instant::now()));
     }
 
     /// The staged notice while it is younger than `NOTICE_TTL`. Expiry is
@@ -678,7 +704,7 @@ impl App {
     /// here and the run loop renders at least every ~100ms, which bounds how
     /// long an expired notice can stay painted.
     pub fn notice(&self) -> Option<&str> {
-        let (msg, set_at) = self.notice.as_ref()?;
+        let (msg, _, set_at) = self.notice.as_ref()?;
         (set_at.elapsed() < NOTICE_TTL).then_some(msg.as_str())
     }
 
@@ -693,18 +719,26 @@ impl App {
             return Ok(());
         }
         let mut last = 0;
-        for (_kind, text) in self.pending_clipboard.drain(..) {
-            // Selection also emits kind byte `c`: the host-terminal chain is
-            // verified working for `c` and unverified for `s`, and a selection
-            // copy that lands in the system clipboard beats one that vanishes.
-            write!(out, "\x1b]52;c;{}\x07", B64.encode(&text))?;
+        for (kind, text) in self.pending_clipboard.drain(..) {
+            // Emit the kind verbatim. Collapsing `s` to `c` (the original
+            // design) creates a wrong-content collision: one batch can hold
+            // one store per kind, and the later-emitted selection payload
+            // would overwrite the clipboard payload. A host without `s`
+            // support ignores the sequence — unsupported means inert, not
+            // aimed at a different clipboard.
+            let k = match kind {
+                ClipboardKind::Clipboard => 'c',
+                ClipboardKind::Selection => 's',
+            };
+            write!(out, "\x1b]52;{k};{}\x07", B64.encode(&text))?;
             last = copied_chars(&text);
         }
         out.flush()?;
         // The status row is off screen while attached — exactly when copies
         // happen — so the confirmation goes to the notice, which the attached
-        // bar renders.
-        self.set_notice(format!("copied {last} chars"));
+        // bar renders. `Info`: a confirmation must not clobber an unexpired
+        // warning (the oversize-drop mirror lands in the same iteration).
+        self.set_notice(format!("copied {last} chars"), NoticeLevel::Info);
         Ok(())
     }
 

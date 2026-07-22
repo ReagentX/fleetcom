@@ -1891,7 +1891,8 @@ fn state_and_dir_mode_spawns_stay_unassigned() {
 fn attached_clipboard_store_emits_the_osc52_envelope() {
     let mut app = App::new_local(30, 100);
     app.mode = Mode::Attached;
-    app.on_clipboard_copy(ClipboardKind::Clipboard, "hello".to_string());
+    app.focused_id = Some(1);
+    app.on_clipboard_copy(1, ClipboardKind::Clipboard, "hello".to_string());
     let mut out = Vec::new();
     app.flush_clipboard(&mut out).unwrap();
     assert_eq!(out, b"\x1b]52;c;aGVsbG8=\x07");
@@ -1902,16 +1903,18 @@ fn attached_clipboard_store_emits_the_osc52_envelope() {
     );
 }
 
-/// A `Selection` store collapses to kind byte `c`: the host-terminal chain
-/// is verified for `c` and unverified for `s`.
+/// A `Selection` store emits its own kind byte `s`, never collapsed to `c`:
+/// collapsing would let a same-batch selection payload overwrite the
+/// clipboard payload. A host without `s` support ignores the sequence.
 #[test]
-fn selection_store_collapses_to_the_clipboard_kind() {
+fn selection_store_emits_its_own_kind_byte() {
     let mut app = App::new_local(30, 100);
     app.mode = Mode::Attached;
-    app.on_clipboard_copy(ClipboardKind::Selection, "hello".to_string());
+    app.focused_id = Some(1);
+    app.on_clipboard_copy(1, ClipboardKind::Selection, "hello".to_string());
     let mut out = Vec::new();
     app.flush_clipboard(&mut out).unwrap();
-    assert_eq!(out, b"\x1b]52;c;aGVsbG8=\x07");
+    assert_eq!(out, b"\x1b]52;s;aGVsbG8=\x07");
 }
 
 /// Nothing from the payload reaches the terminal raw: ESC/CSI sequences and
@@ -1921,7 +1924,8 @@ fn clipboard_payload_bytes_never_reach_the_terminal_raw() {
     let payload = "line1\nline2\x1b[31mred\x1b]52;c;evil\x07";
     let mut app = App::new_local(30, 100);
     app.mode = Mode::Attached;
-    app.on_clipboard_copy(ClipboardKind::Clipboard, payload.to_string());
+    app.focused_id = Some(1);
+    app.on_clipboard_copy(1, ClipboardKind::Clipboard, payload.to_string());
     let mut out = Vec::new();
     app.flush_clipboard(&mut out).unwrap();
 
@@ -1941,13 +1945,15 @@ fn clipboard_payload_bytes_never_reach_the_terminal_raw() {
 }
 
 /// Stores arriving outside attached mode buffer nothing and emit nothing:
-/// only an attached user plausibly caused the copy.
+/// only an attached user plausibly caused the copy. The id matches
+/// `focused_id` so the mode gate alone is what drops the store.
 #[test]
 fn clipboard_stores_outside_attached_mode_are_dropped() {
     for mode in [Mode::Peek, Mode::Dashboard] {
         let mut app = App::new_local(30, 100);
         app.mode = mode;
-        app.on_clipboard_copy(ClipboardKind::Clipboard, "hello".to_string());
+        app.focused_id = Some(1);
+        app.on_clipboard_copy(1, ClipboardKind::Clipboard, "hello".to_string());
         assert!(app.pending_clipboard.is_empty(), "nothing may buffer");
         let mut out = Vec::new();
         app.flush_clipboard(&mut out).unwrap();
@@ -1956,20 +1962,42 @@ fn clipboard_stores_outside_attached_mode_are_dropped() {
     }
 }
 
+/// A store whose id is not the attached task's drops at receipt: the wire
+/// preserves ordering per direction, not across a Watch/forward cross, so a
+/// copy from the previously watched task can arrive after attachment moved.
+/// The matching id buffers as before.
+#[test]
+fn mismatched_id_clipboard_store_drops_at_receipt() {
+    let mut app = App::new_local(30, 100);
+    app.mode = Mode::Attached;
+    app.focused_id = Some(7);
+    app.on_clipboard_copy(3, ClipboardKind::Clipboard, "stale".to_string());
+    assert!(
+        app.pending_clipboard.is_empty(),
+        "an in-flight copy from another task must not buffer"
+    );
+    app.on_clipboard_copy(7, ClipboardKind::Clipboard, "fresh".to_string());
+    assert_eq!(
+        app.pending_clipboard,
+        vec![(ClipboardKind::Clipboard, "fresh".to_string())]
+    );
+}
+
 /// Multiple pending stores emit in receipt order (the host clipboard ends
-/// at the last: last-writer-wins), and the notice counts the last entry's
-/// chars, not its bytes.
+/// at the last: last-writer-wins), each under its own kind byte, and the
+/// notice counts the last entry's chars, not its bytes.
 #[test]
 fn pending_stores_emit_in_order_and_notice_counts_last_entry_chars() {
     let mut app = App::new_local(30, 100);
     app.mode = Mode::Attached;
-    app.on_clipboard_copy(ClipboardKind::Clipboard, "first".to_string());
-    app.on_clipboard_copy(ClipboardKind::Clipboard, "héllo日".to_string());
+    app.focused_id = Some(1);
+    app.on_clipboard_copy(1, ClipboardKind::Clipboard, "first".to_string());
+    app.on_clipboard_copy(1, ClipboardKind::Selection, "héllo日".to_string());
     let mut out = Vec::new();
     app.flush_clipboard(&mut out).unwrap();
 
     let expected = format!(
-        "\x1b]52;c;{}\x07\x1b]52;c;{}\x07",
+        "\x1b]52;c;{}\x07\x1b]52;s;{}\x07",
         B64.encode("first"),
         B64.encode("héllo日")
     );
@@ -1998,14 +2026,70 @@ fn empty_clipboard_flush_writes_nothing() {
 #[test]
 fn notice_expires_lazily_after_the_ttl() {
     let mut app = App::new_local(30, 100);
-    app.set_notice("copied 5 chars".to_string());
+    app.set_notice("copied 5 chars".to_string(), NoticeLevel::Info);
     assert_eq!(app.notice(), Some("copied 5 chars"));
 
     let past = Instant::now()
         .checked_sub(NOTICE_TTL)
         .expect("system uptime exceeds NOTICE_TTL");
-    app.notice = Some(("copied 5 chars".to_string(), past));
+    app.notice = Some(("copied 5 chars".to_string(), NoticeLevel::Info, past));
     assert_eq!(app.notice(), None, "an aged-out notice must not render");
+}
+
+/// A live `Warning` survives an `Info` set: the copy confirmation emitted by
+/// `flush_clipboard` must not clobber the oversize-drop mirror that landed
+/// in the same iteration — the attached bar is the only place that warning
+/// shows. The copy itself still emits; only the notice yields.
+#[test]
+fn warning_notice_survives_the_copy_confirmation() {
+    let mut app = App::new_local(30, 100);
+    app.mode = Mode::Attached;
+    app.focused_id = Some(1);
+    app.set_notice("clipboard copy dropped".to_string(), NoticeLevel::Warning);
+    app.on_clipboard_copy(1, ClipboardKind::Clipboard, "hello".to_string());
+    let mut out = Vec::new();
+    app.flush_clipboard(&mut out).unwrap();
+    assert_eq!(out, b"\x1b]52;c;aGVsbG8=\x07", "the copy must still emit");
+    assert_eq!(app.notice(), Some("clipboard copy dropped"));
+}
+
+/// `Info` replaces `Info`: a second copy updates the count.
+#[test]
+fn info_notice_replaces_info() {
+    let mut app = App::new_local(30, 100);
+    app.set_notice("copied 5 chars".to_string(), NoticeLevel::Info);
+    app.set_notice("copied 2 chars".to_string(), NoticeLevel::Info);
+    assert_eq!(app.notice(), Some("copied 2 chars"));
+}
+
+/// `Warning` replaces everything, `Info` included: a fresh operational
+/// message always shows.
+#[test]
+fn warning_notice_replaces_info() {
+    let mut app = App::new_local(30, 100);
+    app.set_notice("copied 5 chars".to_string(), NoticeLevel::Info);
+    app.set_notice("spawn failed".to_string(), NoticeLevel::Warning);
+    assert_eq!(app.notice(), Some("spawn failed"));
+
+    app.set_notice("recovery failed".to_string(), NoticeLevel::Warning);
+    assert_eq!(
+        app.notice(),
+        Some("recovery failed"),
+        "warning over warning"
+    );
+}
+
+/// An expired `Warning` loses to `Info`: staleness must not pin warnings
+/// forever — the yield rule reads the same TTL clock as `notice()`.
+#[test]
+fn expired_warning_yields_to_info() {
+    let mut app = App::new_local(30, 100);
+    let past = Instant::now()
+        .checked_sub(NOTICE_TTL)
+        .expect("system uptime exceeds NOTICE_TTL");
+    app.notice = Some(("old warning".to_string(), NoticeLevel::Warning, past));
+    app.set_notice("copied 5 chars".to_string(), NoticeLevel::Info);
+    assert_eq!(app.notice(), Some("copied 5 chars"));
 }
 
 /// A status event arriving while attached mirrors into the notice — the

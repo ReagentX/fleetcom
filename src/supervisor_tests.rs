@@ -237,7 +237,7 @@ fn watched_task_clipboard_stores_are_forwarded() {
     let ok = wait_until(Duration::from_secs(5), || {
         s.tick();
         copies.extend(s.drain().into_iter().filter_map(|e| match e {
-            Event::ClipboardCopy { kind, text } => Some((kind, text)),
+            Event::ClipboardCopy { id, kind, text } => Some((id, kind, text)),
             _ => None,
         }));
         copies.len() >= 2
@@ -246,11 +246,55 @@ fn watched_task_clipboard_stores_are_forwarded() {
     assert_eq!(
         copies,
         vec![
-            (ClipboardKind::Clipboard, "hello".to_string()),
-            (ClipboardKind::Selection, "world".to_string()),
+            (id, ClipboardKind::Clipboard, "hello".to_string()),
+            (id, ClipboardKind::Selection, "world".to_string()),
         ]
     );
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A store captured before its task is watched must not fire once `Watch`
+/// lands. The per-tick drain cannot cover this: the wake loop applies a
+/// whole command burst before ticking, so a `Watch` in the burst makes the
+/// next drain see the task as already watched. The test reproduces that
+/// interleaving exactly — capture, then `Watch`, with no tick between —
+/// which only `apply`'s watch-time purge can close. The marker is observed
+/// through a non-draining grid read; a tick here would drain (and discard)
+/// the buffer and mask the race.
+#[test]
+fn watch_purges_stores_captured_before_the_watch() {
+    let mut s = sup(24, 80);
+    // "c3RhbGU=" is "stale". The trailing marker proves the store's bytes
+    // were parsed: it follows them in the output stream.
+    spawn(
+        &mut s,
+        "printf '\\033]52;c;c3RhbGU=\\007MARKER'; sleep 30",
+        here(),
+    );
+    let parsed = wait_until(Duration::from_secs(5), || {
+        s.tasks.first().is_some_and(|t| {
+            let (formatted, _, _) = t.formatted();
+            String::from_utf8_lossy(&formatted).contains("MARKER")
+        })
+    });
+    assert!(parsed, "the marker never reached the grid");
+
+    let id = s.tasks[0].id;
+    s.apply(Command::Watch { id: Some(id) });
+    let mut saw_screen = false;
+    for _ in 0..3 {
+        s.tick();
+        for e in s.drain() {
+            match e {
+                Event::ClipboardCopy { .. } => {
+                    panic!("a store captured before the watch must not fire after it")
+                }
+                Event::Screen(_) => saw_screen = true,
+                _ => {}
+            }
+        }
+    }
+    assert!(saw_screen, "watching the task should stream its screen");
 }
 
 /// A store captured while the task is not watched is discarded by the
