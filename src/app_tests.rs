@@ -2199,6 +2199,27 @@ impl App {
         });
         app
     }
+
+    /// Spawn `cmd`, attach, and watch its real screen: returns once a
+    /// `Screen` satisfying `ready` reaches the client.
+    fn attached_watching(cmd: &str, ready: impl Fn(&ScreenView) -> bool) -> (App, u64) {
+        let mut app = App::new_local(30, 100);
+        let cwd = app.invocation_dir.clone();
+        app.spawn_in(cmd, cwd);
+        app.pump();
+        app.resolve_selection();
+        app.attach();
+        let id = app.focused_id.expect("attached");
+        app.set_watch(Some((id, true)));
+        assert!(
+            wait_until(Duration::from_secs(5), || {
+                app.pump();
+                app.screen_for(id).is_some_and(&ready)
+            }),
+            "the expected screen never reached the client"
+        );
+        (app, id)
+    }
 }
 
 /// A press-drag-release over the live view copies the selected text through
@@ -2322,6 +2343,162 @@ fn coordinate_invalidation_clears_the_selection() {
     start(&mut app);
     app.set_watch(None);
     assert!(app.selection.is_none(), "a watch change must clear");
+}
+
+/// Row-faithful screen lines reach the client: one entry per pane row, the
+/// blank bottom row included.
+#[test]
+fn attached_screen_lines_cover_every_pane_row() {
+    let (app, id) = App::attached_watching("printf 'top'; sleep 5", |s| {
+        s.lines.first().is_some_and(|l| l == "top")
+    });
+    let lines = &app.screen_for(id).unwrap().lines;
+    // 30-row client, one-row status bar: the pane grid is 29 rows.
+    assert_eq!(lines.len(), 29, "one entry per pane row");
+    assert_eq!(lines[28], "", "the blank bottom row keeps its slot");
+}
+
+/// A drag from past-end-of-text on the penultimate row into the blank bottom
+/// row copies nothing. Without the row-faithful bottom row the engine's clamp
+/// aliased the head onto the penultimate row, and endpoint normalization then
+/// selected the text *before* the press point.
+#[test]
+fn bottom_row_drag_does_not_alias_onto_the_penultimate_row() {
+    // CUP is 1-based: row 28 is 0-based row 27, the 29-row pane's penultimate.
+    let (mut app, _) = App::attached_watching("printf '\\033[28;1Hbottomtext'; sleep 5", |s| {
+        s.lines.iter().any(|l| l == "bottomtext")
+    });
+    // Press past the text's end (col 15 > "bottomtext"), drag into the blank
+    // bottom row: the highlight shows blank cells only.
+    app.on_mouse(press(27, 15));
+    app.on_mouse(drag_to(28, 0));
+    app.on_mouse(release(28, 0));
+    assert!(
+        app.pending_clipboard.is_empty(),
+        "a drag over blank cells must copy nothing, got {:?}",
+        app.pending_clipboard
+    );
+}
+
+/// A `wants_mouse` flip between press and release cancels the selection: the
+/// rest of the gesture belongs to the forward path, so a stale overlay must
+/// not linger.
+#[test]
+fn mid_drag_wants_mouse_flip_drops_the_selection() {
+    let mut app = App::attached_with_lines(&["hello world"]);
+    app.on_mouse(press(0, 0));
+    app.on_mouse(drag_to(0, 4));
+    assert!(app.selection.is_some());
+    // The seam the run loop uses: a fresh `ScreenView` replaces the old one.
+    let mut flipped = app.focused_screen.clone().expect("screen installed");
+    flipped.wants_mouse = true;
+    app.focused_screen = Some(flipped);
+    app.on_mouse(drag_to(0, 6));
+    assert!(app.selection.is_none(), "the flip must drop the selection");
+    app.on_mouse(release(0, 6));
+    assert!(app.selection.is_none());
+    assert!(
+        app.pending_clipboard.is_empty(),
+        "a canceled drag is not a copy"
+    );
+}
+
+/// End to end: the child enables mouse reporting mid-drag, the selection
+/// cancels, and the rerouted drag/release bytes reach the child's PTY.
+#[test]
+fn mid_drag_mouse_enable_reroutes_the_gesture_to_the_child() {
+    let dir = temp("app_drag_flip");
+    let out_file = dir.join("bytes");
+    // The child enables button-motion+SGR reporting only after one byte of
+    // stdin arrives, so the flip lands mid-gesture under test control.
+    let cmd = format!(
+        "stty -icanon -echo min 1 time 0; head -c 1 >/dev/null; \
+         printf '\\033[?1002h\\033[?1006h'; head -c 19 > {}",
+        out_file.display()
+    );
+    let (mut app, id) = App::attached_watching(&cmd, |s| !s.wants_mouse);
+    app.on_mouse(press(1, 2));
+    assert!(app.selection.is_some(), "the press must start a drag");
+    // Trigger the child's mouse enable and wait for the flip to arrive.
+    app.transport.send(Command::Input {
+        id,
+        bytes: b"\n".to_vec(),
+    });
+    assert!(
+        wait_until(Duration::from_secs(5), || {
+            app.pump();
+            matches!(app.screen_for(id), Some(s) if s.wants_mouse)
+        }),
+        "the mouse-mode flip never reached the client"
+    );
+    app.on_mouse(drag_to(1, 5));
+    assert!(app.selection.is_none(), "the flip must drop the selection");
+    app.on_mouse(release(1, 5));
+    assert!(
+        app.pending_clipboard.is_empty(),
+        "a canceled drag is not a copy"
+    );
+    // SGR: drag `\x1b[<32;6;2M`, release `\x1b[<0;6;2m`; the press stayed
+    // client-side, so the child sees exactly the rerouted pair.
+    let mut got = Vec::new();
+    wait_until(Duration::from_secs(5), || {
+        got = std::fs::read(&out_file).unwrap_or_default();
+        got.len() >= 19
+    });
+    assert_eq!(got, b"\x1b[<32;6;2M\x1b[<0;6;2m".to_vec());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Concealed (SGR 8) text reaches the client as the blanks the screen shows,
+/// and a selection over it copies nothing: highlight and clipboard agree.
+#[test]
+fn selection_over_concealed_text_copies_nothing() {
+    // Row 1: nine hidden cells, then a visible sentinel to key arrival on.
+    let (mut app, id) = App::attached_watching(
+        "printf 'ok\\r\\n\\033[8mTOPSECRET\\033[28mZ'; sleep 5",
+        |s| s.lines.get(1).is_some_and(|l| l.ends_with('Z')),
+    );
+    assert_eq!(
+        app.screen_for(id).unwrap().lines[1],
+        "         Z",
+        "concealed cells must read as spaces"
+    );
+    app.on_mouse(press(1, 0));
+    app.on_mouse(drag_to(1, 8));
+    app.on_mouse(release(1, 8));
+    assert!(
+        app.pending_clipboard.is_empty(),
+        "concealed text must not copy, got {:?}",
+        app.pending_clipboard
+    );
+}
+
+/// A press→release flick with no drag event between copies the span from
+/// press to release: the release coordinate is part of the gesture.
+#[test]
+fn release_without_drag_copies_the_flick_span() {
+    let mut app = App::attached_with_lines(&["hello world", "second row"]);
+    app.on_mouse(press(0, 0));
+    app.on_mouse(release(0, 4));
+    assert_eq!(
+        app.pending_clipboard,
+        vec![(ClipboardKind::Clipboard, "hello".to_string())]
+    );
+    assert!(app.selection.is_none(), "release must clear the selection");
+}
+
+/// A release past the pane clamps like a drag: the copy extends through the
+/// bottom-most, right-most cell the highlight can show.
+#[test]
+fn release_past_the_view_clamps_like_a_drag() {
+    let mut app = App::attached_with_lines(&["hello world", "second row"]);
+    app.on_mouse(press(0, 6));
+    app.on_mouse(drag_to(0, 8));
+    app.on_mouse(release(u16::MAX, u16::MAX));
+    assert_eq!(
+        app.pending_clipboard,
+        vec![(ClipboardKind::Clipboard, "world\nsecond row".to_string())]
+    );
 }
 
 /// With a mouse-aware child the left button forwards untouched: the exact

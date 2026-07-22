@@ -1426,11 +1426,27 @@ impl App {
                                 return;
                             }
                             MouseKind::Release(MouseBtn::Left) if self.selection.is_some() => {
+                                // The release coordinate is part of the gesture:
+                                // without it the copy stops at the last sampled
+                                // drag event, and a press→release flick with no
+                                // drag between degrades to a click.
+                                let row = m.row.min(self.pane_rows().saturating_sub(1));
+                                let col = m.column.min(self.cols.saturating_sub(1));
+                                if let Some(sel) = self.selection.as_mut() {
+                                    sel.extend(row, col);
+                                }
                                 self.finish_selection(id);
                                 return;
                             }
                             _ => {}
                         }
+                    } else if self.selection.is_some() {
+                        // The gate is per event: a child enabling mouse
+                        // reporting between press and release reroutes the
+                        // rest of the gesture to the forward path below, so
+                        // the selection can never finish. Drop it here or its
+                        // overlay lingers until an unrelated state change.
+                        self.selection = None;
                     }
                     // Wheel-up enters scrollback for inline children that do
                     // not receive mouse events.
