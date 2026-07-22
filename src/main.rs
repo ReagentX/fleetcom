@@ -25,6 +25,7 @@ mod protocol;
 mod session;
 mod transport;
 
+mod format;
 mod harness;
 mod path;
 mod terminal;
@@ -33,7 +34,7 @@ mod terminal;
 #[cfg(test)]
 mod testutil;
 
-pub(crate) use terminal::{ansi, emulator, format, frame, input};
+pub(crate) use terminal::{ansi, emulator, frame, input};
 
 use std::{
     io::{self, IsTerminal},

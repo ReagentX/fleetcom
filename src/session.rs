@@ -318,7 +318,7 @@ fn civil_utc(t: SystemTime) -> (i64, u32, u32, u64, u64, u64) {
         .duration_since(SystemTime::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
-    let (y, m, d) = crate::harness::civil_from_days((secs / 86_400) as i64);
+    let (y, m, d) = crate::format::civil_from_days((secs / 86_400) as i64);
     let tod = secs % 86_400;
     (y, m, d, tod / 3600, (tod % 3600) / 60, tod % 60)
 }

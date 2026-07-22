@@ -9,7 +9,7 @@ use std::{
 use alacritty_terminal::{
     Term,
     event::{Event, EventListener},
-    grid::{Dimensions, Scroll},
+    grid::{Dimensions, Row, Scroll},
     index::{Column, Line},
     term::{
         Config, TermMode,
@@ -400,20 +400,7 @@ impl Emulator {
         for row in top..=bottom {
             let row_start = out.len();
             let line = &grid[Line(row)];
-            for col in 0..grid.columns() {
-                let cell = &line[Column(col)];
-                // Spacers have no glyph; terminal tabs occupy visible spaces.
-                if cell
-                    .flags
-                    .intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER)
-                {
-                    continue;
-                }
-                out.push(if cell.c == '\t' { ' ' } else { cell.c });
-                if let Some(zerowidth) = cell.zerowidth() {
-                    out.extend(zerowidth.iter());
-                }
-            }
+            push_row_glyphs(&mut out, line);
             // A soft wrap continues on the next grid row.
             if line[Column(last_col)].flags.contains(Flags::WRAPLINE) {
                 continue;
@@ -599,6 +586,23 @@ fn live_floor_of(term: &Term<ProbeSink>) -> String {
     String::new()
 }
 
+/// Append a grid row's glyphs, omitting wide-character spacers, mapping tabs
+/// to spaces, and preserving combining marks. Callers handle trailing spaces.
+fn push_row_glyphs(out: &mut String, row: &Row<Cell>) {
+    for cell in row {
+        if cell
+            .flags
+            .intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER)
+        {
+            continue;
+        }
+        out.push(if cell.c == '\t' { ' ' } else { cell.c });
+        if let Some(zerowidth) = cell.zerowidth() {
+            out.extend(zerowidth.iter());
+        }
+    }
+}
+
 /// Plain text of one live-viewport row, trailing padding trimmed. Rows
 /// `0..screen_lines` address live output regardless of the display
 /// offset; only display iteration follows the offset.
@@ -606,20 +610,7 @@ fn live_row_text_of(term: &Term<ProbeSink>, row: i32) -> String {
     let grid = term.grid();
     let line = &grid[Line(row)];
     let mut text = String::new();
-    for col in 0..grid.columns() {
-        let cell = &line[Column(col)];
-        // Spacers have no glyph; terminal tabs occupy visible spaces.
-        if cell
-            .flags
-            .intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER)
-        {
-            continue;
-        }
-        text.push(if cell.c == '\t' { ' ' } else { cell.c });
-        if let Some(zerowidth) = cell.zerowidth() {
-            text.extend(zerowidth.iter());
-        }
-    }
+    push_row_glyphs(&mut text, line);
     while text.ends_with(' ') {
         text.pop();
     }

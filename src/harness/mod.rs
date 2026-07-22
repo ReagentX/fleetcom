@@ -31,7 +31,6 @@ use std::{
 
 pub use claude::Claude;
 pub use codex::Codex;
-pub(crate) use codex::civil_from_days;
 pub use grok::Grok;
 
 /// Environment variable naming the capture file used by injected assets.

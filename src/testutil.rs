@@ -10,7 +10,7 @@ use std::{
     time::{Duration, Instant, SystemTime},
 };
 
-use crate::{emulator::Emulator, harness::civil_from_days};
+use crate::{emulator::Emulator, format::civil_from_days};
 
 /// Fresh scratch directory under the system temp dir. Any leftover from a
 /// previous run is removed first; the pid suffix isolates concurrent suites.
