@@ -1917,6 +1917,20 @@ fn selection_store_emits_its_own_kind_byte() {
     assert_eq!(out, b"\x1b]52;s;aGVsbG8=\x07");
 }
 
+/// A `Primary` store emits its own kind byte `p`, never collapsed to `s`
+/// or `c`: the child aimed at the primary selection, and on hosts where
+/// the targets differ the byte is the aim.
+#[test]
+fn primary_store_emits_its_own_kind_byte() {
+    let mut app = App::new_local(30, 100);
+    app.mode = Mode::Attached;
+    app.focused_id = Some(1);
+    app.on_clipboard_copy(1, ClipboardKind::Primary, "hello".to_string());
+    let mut out = Vec::new();
+    app.flush_clipboard(&mut out).unwrap();
+    assert_eq!(out, b"\x1b]52;p;aGVsbG8=\x07");
+}
+
 /// Nothing from the payload reaches the terminal raw: ESC/CSI sequences and
 /// newlines cross only as base64 between the envelope prefix and the BEL.
 #[test]
@@ -2036,13 +2050,15 @@ fn pending_stores_emit_in_order_and_notice_counts_last_entry_chars() {
     app.mode = Mode::Attached;
     app.focused_id = Some(1);
     app.on_clipboard_copy(1, ClipboardKind::Clipboard, "first".to_string());
+    app.on_clipboard_copy(1, ClipboardKind::Primary, "second".to_string());
     app.on_clipboard_copy(1, ClipboardKind::Selection, "héllo日".to_string());
     let mut out = Vec::new();
     app.flush_clipboard(&mut out).unwrap();
 
     let expected = format!(
-        "\x1b]52;c;{}\x07\x1b]52;s;{}\x07",
+        "\x1b]52;c;{}\x07\x1b]52;p;{}\x07\x1b]52;s;{}\x07",
         B64.encode("first"),
+        B64.encode("second"),
         B64.encode("héllo日")
     );
     assert_eq!(out, expected.as_bytes());

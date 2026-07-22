@@ -730,14 +730,16 @@ impl App {
         }
         let mut last = 0;
         for (kind, text) in self.pending_clipboard.drain(..) {
-            // Emit the kind verbatim. Collapsing `s` to `c` (the original
-            // design) creates a wrong-content collision: one batch can hold
-            // one store per kind, and the later-emitted selection payload
-            // would overwrite the clipboard payload. A host without `s`
-            // support ignores the sequence — unsupported means inert, not
-            // aimed at a different clipboard.
+            // Emit the kind verbatim. Collapsing any pair (the original
+            // design folded `s` into `c`) creates a wrong-content collision:
+            // one batch can hold one store per kind, and a later-emitted
+            // payload would overwrite an earlier one aimed at the same
+            // collapsed target. A host without `p` or `s` support ignores
+            // the sequence — unsupported means inert, not aimed at a
+            // different clipboard.
             let k = match kind {
                 ClipboardKind::Clipboard => 'c',
+                ClipboardKind::Primary => 'p',
                 ClipboardKind::Selection => 's',
             };
             write!(out, "\x1b]52;{k};{}\x07", B64.encode(&text))?;

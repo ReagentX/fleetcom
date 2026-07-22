@@ -13,10 +13,9 @@ use std::{
     time::{Duration, Instant},
 };
 
-use alacritty_terminal::term::ClipboardType;
-
 use crate::{
     core::{Wake, Waker},
+    emulator::ClipboardSelector,
     harness::{self, assets},
     path,
     protocol::{
@@ -123,12 +122,15 @@ fn normalize_group(name: Option<String>) -> Option<String> {
     normalize_label(name).filter(|g| g != "Unassigned")
 }
 
-/// Map the emulator's clipboard kind to its wire mirror. The boundary where
-/// `alacritty_terminal` types stop: `protocol` deliberately imports none.
-fn clipboard_kind(kind: ClipboardType) -> ClipboardKind {
+/// Map the emulator's clipboard selector to its wire mirror. The boundary
+/// where terminal-module types stop: `protocol` deliberately imports none.
+/// Three arms, verbatim — folding any pair here would recreate the fidelity
+/// loss this mapping exists to prevent.
+fn clipboard_kind(kind: ClipboardSelector) -> ClipboardKind {
     match kind {
-        ClipboardType::Clipboard => ClipboardKind::Clipboard,
-        ClipboardType::Selection => ClipboardKind::Selection,
+        ClipboardSelector::Clipboard => ClipboardKind::Clipboard,
+        ClipboardSelector::Primary => ClipboardKind::Primary,
+        ClipboardSelector::Select => ClipboardKind::Selection,
     }
 }
 
@@ -577,7 +579,7 @@ impl Supervisor {
                 // staleness guarantee: a store captured while backgrounded or
                 // peeked must never fire when the task is later attached — a
                 // wrong clipboard is silently harmful, an empty one visibly
-                // inert. The two-slot capture bound makes the constant drain
+                // inert. The three-slot capture bound makes the constant drain
                 // cheap. This drain alone cannot close the wake-coalescing
                 // race (a `Watch` in the same burst lands before the tick);
                 // `apply`'s `Watch` arm purges the new target for that case.

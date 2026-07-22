@@ -202,8 +202,9 @@ pub enum Event {
         recovery: Vec<RecoveryEntry>,
     },
     /// One OSC 52 clipboard store from the watched task, already base64-decoded
-    /// by the terminal backend. Store-only: no load or query path exists, so
-    /// this event never solicits a reply. `id` names the source task so the
+    /// by the emulator's capture pipeline. Store-only: no load or query path
+    /// exists, so this event never solicits a reply. `id` names the source
+    /// task so the
     /// client can drop a copy still in flight when it switches attachment:
     /// the wire preserves ordering per direction, not across a Watch/forward
     /// cross.
@@ -215,13 +216,17 @@ pub enum Event {
 }
 
 /// Which clipboard an OSC 52 store targets. A wire-layer mirror of the
-/// emulator's `ClipboardType`, kept here so `protocol` stays free of
-/// `alacritty_terminal` types; the supervisor maps at its boundary.
+/// emulator's `ClipboardSelector`, kept here so `protocol` stays free of
+/// terminal-module types; the supervisor maps at its boundary. One variant
+/// per raw selector byte: `p` and `s` are distinct xterm targets and must
+/// not fold.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ClipboardKind {
     /// The system clipboard (OSC 52 kind byte `c`).
     Clipboard,
-    /// The primary selection (OSC 52 kind byte `s`).
+    /// The primary selection (OSC 52 kind byte `p`).
+    Primary,
+    /// The select buffer (OSC 52 kind byte `s`).
     Selection,
 }
 
@@ -928,6 +933,7 @@ pub fn encode_event(ev: &Event) -> (u8, Vec<u8>) {
                 "k",
                 match kind {
                     ClipboardKind::Clipboard => "c",
+                    ClipboardKind::Primary => "p",
                     ClipboardKind::Selection => "s",
                 },
             );
@@ -1022,6 +1028,7 @@ pub fn decode_event(kind: u8, payload: &[u8]) -> Option<Event> {
                     let id = v["id"].as_u64()?;
                     let kind = match v["k"].as_str()? {
                         "c" => ClipboardKind::Clipboard,
+                        "p" => ClipboardKind::Primary,
                         "s" => ClipboardKind::Selection,
                         _ => return None,
                     };
@@ -1831,7 +1838,7 @@ mod tests {
         assert_eq!(decode_event(k, &p), Some(screen));
     }
 
-    /// `ClipboardCopy` round-trips both kinds and carries clipboard text
+    /// `ClipboardCopy` round-trips all three kinds and carries clipboard text
     /// unsanitized: unicode, control characters, and embedded markers survive
     /// the JSON+base64 path byte-for-byte. The source id survives too,
     /// including values past `u32`.
@@ -1847,6 +1854,11 @@ mod tests {
                 id: 1 << 40,
                 kind: ClipboardKind::Selection,
                 text: "sélection λ 🦀".into(),
+            },
+            Event::ClipboardCopy {
+                id: 2,
+                kind: ClipboardKind::Primary,
+                text: "primary".into(),
             },
             Event::ClipboardCopy {
                 id: 7,
@@ -1865,18 +1877,32 @@ mod tests {
 
     /// `ClipboardCopy` pins its wire shape: `t` discriminator, the source
     /// task under `id`, the OSC 52 kind byte under `k`, and base64 text.
+    /// All three kind strings are pinned — `"p"` in particular, so the
+    /// primary selection can never silently re-fold into `"s"`.
     #[test]
     fn clipboard_copy_wire_form() {
-        let (k, p) = encode_event(&Event::ClipboardCopy {
-            id: 5,
-            kind: ClipboardKind::Selection,
-            text: "hi".into(),
-        });
-        assert_eq!(k, KIND_CONTROL);
-        assert_eq!(
-            std::str::from_utf8(&p).unwrap(),
-            r#"{"t":"clip","id":5,"k":"s","text":"aGk="}"#
-        );
+        for (kind, wire) in [
+            (
+                ClipboardKind::Clipboard,
+                r#"{"t":"clip","id":5,"k":"c","text":"aGk="}"#,
+            ),
+            (
+                ClipboardKind::Primary,
+                r#"{"t":"clip","id":5,"k":"p","text":"aGk="}"#,
+            ),
+            (
+                ClipboardKind::Selection,
+                r#"{"t":"clip","id":5,"k":"s","text":"aGk="}"#,
+            ),
+        ] {
+            let (k, p) = encode_event(&Event::ClipboardCopy {
+                id: 5,
+                kind,
+                text: "hi".into(),
+            });
+            assert_eq!(k, KIND_CONTROL);
+            assert_eq!(std::str::from_utf8(&p).unwrap(), wire);
+        }
     }
 
     /// A malformed `ClipboardCopy` frame is rejected whole: missing fields,
@@ -1889,8 +1915,10 @@ mod tests {
             r#"{"t":"clip","id":1,"k":"c"}"#,        // missing text
             r#"{"t":"clip","k":"c","text":"aGk="}"#, // missing id
             r#"{"t":"clip","id":"1","k":"c","text":"aGk="}"#, // id must be a number
-            r#"{"t":"clip","id":1,"k":"p","text":"aGk="}"#, // unknown kind string
-            r#"{"t":"clip","id":1,"k":"c","text":"!!!"}"#, // invalid base64
+            // "x" here, not "p": "p" joined the accept set when the primary
+            // selection got its own kind.
+            r#"{"t":"clip","id":1,"k":"x","text":"aGk="}"#, // unknown kind string
+            r#"{"t":"clip","id":1,"k":"c","text":"!!!"}"#,  // invalid base64
             r#"{"t":"clip","id":1,"k":"c","text":"/w=="}"#, // 0xFF: not UTF-8
             r#"{"t":"clip","id":1,"k":"c","text":["aGk="]}"#, // text must be a string
         ] {

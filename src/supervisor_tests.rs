@@ -231,10 +231,11 @@ fn watched_task_clipboard_stores_are_forwarded() {
     let ready = dir.join("ready");
     let flag = dir.join("flag");
     let mut s = sup(24, 80);
-    // "aGVsbG8=" is "hello" (clipboard), "d29ybGQ=" is "world" (selection).
+    // "aGVsbG8=" is "hello" (clipboard), "cHJp" is "pri" (primary),
+    // "d29ybGQ=" is "world" (select).
     let cmd = format!(
         "touch {r}; until [ -e {f} ]; do sleep 0.05; done; \
-         printf '\\033]52;c;aGVsbG8=\\007\\033]52;s;d29ybGQ=\\007'; sleep 30",
+         printf '\\033]52;c;aGVsbG8=\\007\\033]52;p;cHJp\\007\\033]52;s;d29ybGQ=\\007'; sleep 30",
         r = ready.display(),
         f = flag.display()
     );
@@ -252,13 +253,16 @@ fn watched_task_clipboard_stores_are_forwarded() {
             Event::ClipboardCopy { id, kind, text } => Some((id, kind, text)),
             _ => None,
         }));
-        copies.len() >= 2
+        copies.len() >= 3
     });
     assert!(ok, "the clipboard stores never arrived; got {copies:?}");
+    // Three kinds in one burst, each under its own raw selector: a `p`
+    // store forwards as `Primary`, never re-folded into `Selection`.
     assert_eq!(
         copies,
         vec![
             (id, ClipboardKind::Clipboard, "hello".to_string()),
+            (id, ClipboardKind::Primary, "pri".to_string()),
             (id, ClipboardKind::Selection, "world".to_string()),
         ]
     );
