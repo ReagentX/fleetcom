@@ -485,10 +485,7 @@ impl Task {
         }
     }
 
-    /// Take the OSC 52 clipboard stores captured since the last drain (see
-    /// [`Emulator::drain_clipboard`]). The caller owns forwarding: a drain
-    /// whose result is dropped discards the stores, which is how a
-    /// non-watched task's copies are kept from ever firing later.
+    /// Drain OSC 52 clipboard stores captured by this task's emulator.
     pub fn drain_clipboard(&self) -> ClipboardStores {
         grid(&self.parser).drain_clipboard()
     }

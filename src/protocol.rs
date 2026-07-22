@@ -71,11 +71,7 @@ pub enum Command {
     /// client has already subtracted the row it reserves for its status bar.
     Resize { rows: u16, cols: u16 },
     /// Stream this task's screen (attach or peek), or `None` to stop.
-    /// `attached` carries the attach/peek distinction to where clipboard
-    /// forwarding is enforced: attachment is the consent proxy (input flows
-    /// to the child only then), so the supervisor forwards OSC 52 stores only
-    /// for an attach-watch. Peek forwards no input, so nothing captured
-    /// during peek can be user-caused.
+    /// `attached` permits clipboard forwarding from the watched task.
     Watch { id: Option<u64>, attached: bool },
     /// Forward raw keystroke bytes to a task's PTY.
     Input { id: u64, bytes: Vec<u8> },
@@ -201,13 +197,7 @@ pub enum Event {
         names: Vec<String>,
         recovery: Vec<RecoveryEntry>,
     },
-    /// One OSC 52 clipboard store from the watched task, already base64-decoded
-    /// by the emulator's capture pipeline. Store-only: no load or query path
-    /// exists, so this event never solicits a reply. `id` names the source
-    /// task so the
-    /// client can drop a copy still in flight when it switches attachment:
-    /// the wire preserves ordering per direction, not across a Watch/forward
-    /// cross.
+    /// A decoded OSC 52 clipboard store from the attached task.
     ClipboardCopy {
         id: u64,
         kind: ClipboardKind,
@@ -215,11 +205,7 @@ pub enum Event {
     },
 }
 
-/// Which clipboard an OSC 52 store targets. A wire-layer mirror of the
-/// emulator's `ClipboardSelector`, kept here so `protocol` stays free of
-/// terminal-module types; the supervisor maps at its boundary. One variant
-/// per raw selector byte: `p` and `s` are distinct xterm targets and must
-/// not fold.
+/// Clipboard target carried by an OSC 52 event.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ClipboardKind {
     /// The system clipboard (OSC 52 kind byte `c`).
@@ -755,9 +741,7 @@ pub fn decode_command(kind: u8, payload: &[u8]) -> Option<Command> {
             } else {
                 Some(v["id"].as_u64()?)
             },
-            // Required, not defaulted: the flag gates clipboard forwarding,
-            // and a frame without it (an older client) must reject rather
-            // than have the daemon guess the user's mode.
+            // Reject watch frames that do not specify an attachment mode.
             attached: v["attached"].as_bool()?,
         },
         "input" => Command::Input {
@@ -921,10 +905,7 @@ pub fn encode_event(ev: &Event) -> (u8, Vec<u8>) {
             let _ = o.insert("recovery", rec);
             (KIND_CONTROL, o.dump().into_bytes())
         }
-        // Base64 like `Command::Input`: clipboard text is arbitrary child
-        // output and must cross the wire unsanitized. The emulator's 1 MiB
-        // store cap keeps the encoded frame far under `frame::MAX_FRAME`
-        // (see `CLIPBOARD_STORE_MAX_BYTES`'s const assertion).
+        // Base64 preserves arbitrary clipboard text in the JSON frame.
         Event::ClipboardCopy { id, kind, text } => {
             let mut o = jzon::JsonValue::new_object();
             let _ = o.insert("t", "clip");
@@ -1032,8 +1013,7 @@ pub fn decode_event(kind: u8, payload: &[u8]) -> Option<Event> {
                         "s" => ClipboardKind::Selection,
                         _ => return None,
                     };
-                    // The store was UTF-8 when the emulator captured it; a
-                    // frame that decodes to anything else is malformed.
+                    // Reject clipboard payloads that are not valid UTF-8.
                     let text = String::from_utf8(B64.decode(v["text"].as_str()?).ok()?).ok()?;
                     Some(Event::ClipboardCopy { id, kind, text })
                 }
@@ -1756,10 +1736,7 @@ mod tests {
         );
     }
 
-    /// `Watch` pins its wire shape and requires the `attached` flag: a frame
-    /// without it (an older client) or with a non-boolean value is rejected
-    /// whole. The flag gates clipboard forwarding, so the daemon never
-    /// defaults it.
+    /// Watch frames require a Boolean `attached` field.
     #[test]
     fn watch_wire_form_requires_the_attached_flag() {
         let (k, p) = encode_command(&Command::Watch {
@@ -1838,10 +1815,7 @@ mod tests {
         assert_eq!(decode_event(k, &p), Some(screen));
     }
 
-    /// `ClipboardCopy` round-trips all three kinds and carries clipboard text
-    /// unsanitized: unicode, control characters, and embedded markers survive
-    /// the JSON+base64 path byte-for-byte. The source id survives too,
-    /// including values past `u32`.
+    /// Clipboard events preserve their source, target, and text.
     #[test]
     fn clipboard_copy_round_trips() {
         for ev in [
@@ -1863,9 +1837,7 @@ mod tests {
             Event::ClipboardCopy {
                 id: 7,
                 kind: ClipboardKind::Clipboard,
-                // Clipboard content is arbitrary: newlines, tabs, NUL, ESC,
-                // and paste-marker-shaped text must not be sanitized in
-                // transit.
+                // Exercise control characters and paste-marker-shaped text.
                 text: "line1\nline2\tcol\u{0}\u{1b}[201~end".into(),
             },
         ] {
@@ -1875,10 +1847,7 @@ mod tests {
         }
     }
 
-    /// `ClipboardCopy` pins its wire shape: `t` discriminator, the source
-    /// task under `id`, the OSC 52 kind byte under `k`, and base64 text.
-    /// All three kind strings are pinned — `"p"` in particular, so the
-    /// primary selection can never silently re-fold into `"s"`.
+    /// Clipboard events encode every target with its OSC 52 selector.
     #[test]
     fn clipboard_copy_wire_form() {
         for (kind, wire) in [
@@ -1905,9 +1874,7 @@ mod tests {
         }
     }
 
-    /// A malformed `ClipboardCopy` frame is rejected whole: missing fields,
-    /// an unknown kind string, a non-numeric id, invalid base64, and
-    /// non-UTF-8 decoded bytes.
+    /// Malformed clipboard event frames are rejected.
     #[test]
     fn malformed_clipboard_copy_is_rejected() {
         for json in [
@@ -1915,10 +1882,8 @@ mod tests {
             r#"{"t":"clip","id":1,"k":"c"}"#,        // missing text
             r#"{"t":"clip","k":"c","text":"aGk="}"#, // missing id
             r#"{"t":"clip","id":"1","k":"c","text":"aGk="}"#, // id must be a number
-            // "x" here, not "p": "p" joined the accept set when the primary
-            // selection got its own kind.
             r#"{"t":"clip","id":1,"k":"x","text":"aGk="}"#, // unknown kind string
-            r#"{"t":"clip","id":1,"k":"c","text":"!!!"}"#,  // invalid base64
+            r#"{"t":"clip","id":1,"k":"c","text":"!!!"}"#, // invalid base64
             r#"{"t":"clip","id":1,"k":"c","text":"/w=="}"#, // 0xFF: not UTF-8
             r#"{"t":"clip","id":1,"k":"c","text":["aGk="]}"#, // text must be a string
         ] {

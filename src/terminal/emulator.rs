@@ -36,10 +36,7 @@ pub enum MouseProtocolEncoding {
     Sgr,
 }
 
-/// Buffered-store cap in bytes for one OSC 52 clipboard payload. The cap
-/// bounds forwarding-frame size and per-task memory, not what a host
-/// clipboard could hold; an over-cap store is dropped and its length
-/// recorded so the caller can surface a notice.
+/// Maximum decoded size of one buffered OSC 52 clipboard payload.
 pub(crate) const CLIPBOARD_STORE_MAX_BYTES: usize = 1024 * 1024;
 
 // A maximum-size store expands to this base64 bound when re-encoded for
@@ -50,11 +47,7 @@ const _: () = assert!(
     "CLIPBOARD_STORE_MAX_BYTES must base64-encode to under frame::MAX_FRAME"
 );
 
-/// Which OSC 52 target a store addressed, preserving the raw selector byte.
-/// The backend's `ClipboardType` folds `p` and `s` into one variant; per
-/// xterm ctlseqs they are distinct targets (the primary selection and the
-/// select buffer), so [`ObservedTerm::clipboard_store`] captures the byte
-/// before that fold can happen.
+/// Supported OSC 52 clipboard targets.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ClipboardSelector {
     /// The system clipboard (selector byte `c`).
@@ -65,25 +58,17 @@ pub enum ClipboardSelector {
     Select,
 }
 
-/// OSC 52 clipboard stores captured since the last drain. A clipboard is
-/// last-writer-wins by nature, so coalescing to one store per
-/// [`ClipboardSelector`] between drains loses nothing, and the three-slot
-/// bound means a never-drained background task cannot accumulate memory.
+/// OSC 52 clipboard stores captured since the last drain.
 #[derive(Debug, Default)]
 pub struct ClipboardStores {
-    /// At most one store per [`ClipboardSelector`], ordered by the surviving
-    /// store's arrival.
+    /// Latest store per selector, ordered by arrival.
     pub stores: Vec<(ClipboardSelector, String)>,
-    /// Byte length of the most recent store dropped for exceeding
-    /// [`CLIPBOARD_STORE_MAX_BYTES`], kept so the caller can surface a
-    /// notice instead of silently losing the copy.
+    /// Byte length of the most recent oversized store.
     pub oversized_len: Option<usize>,
 }
 
 /// Buffers backend-generated PTY responses while the parser advances. Other
-/// backend events are discarded; [`ObservedTerm`] captures titles directly
-/// from parser events and OSC 52 stores never reach the backend (see
-/// [`ObservedTerm`]'s `clipboard_store`).
+/// events are discarded; [`ObservedTerm`] captures titles and clipboard stores.
 pub struct ProbeSink {
     responses: Arc<Mutex<Vec<String>>>,
 }
@@ -223,9 +208,7 @@ pub struct Emulator {
     term: Term<ProbeSink>,
     parser: Processor,
     responses: Arc<Mutex<Vec<String>>>,
-    /// OSC 52 stores captured since the last drain. A plain field, not an
-    /// `Arc<Mutex<_>>`: stores are written by [`ObservedTerm`] during the
-    /// parse (like `alt`), never through the backend's event listener.
+    /// OSC 52 stores captured since the last drain.
     clipboard: ClipboardStores,
     /// Alt-screen and title facts, advanced at parser-event granularity by
     /// [`ObservedTerm`] during the parse itself.
@@ -251,10 +234,7 @@ impl Emulator {
             .collect()
     }
 
-    /// Drain the OSC 52 clipboard stores captured since the last drain,
-    /// plus the oversized-drop record. The caller owns forwarding; a drain
-    /// whose result is dropped discards the stores. An empty capture costs
-    /// no allocation, so calling every tick for every task is fine.
+    /// Drain captured OSC 52 stores and the latest oversized-store length.
     pub fn drain_clipboard(&mut self) -> ClipboardStores {
         std::mem::take(&mut self.clipboard)
     }
@@ -690,9 +670,7 @@ const TITLE_STACK_SHADOW_MAX: usize = 4096;
 /// `Handler` methods default to no-ops, so every method must delegate to
 /// `Term`. `golden::emulator_wrapper_matches_the_raw_backend_on_every_fixture`
 /// compares wrapper and raw-backend replays to detect missing delegation.
-/// One deliberate exception: `clipboard_store` never delegates — the wrapper
-/// owns that pipeline outright, and the backend's version touches no grid
-/// state the golden comparison could see.
+/// `clipboard_store` is captured by this wrapper instead of delegated.
 ///
 /// # Synchronized updates
 ///
@@ -940,40 +918,21 @@ impl Handler for ObservedTerm<'_> {
     fn reset_color(&mut self, a0: usize) {
         self.term.reset_color(a0);
     }
-    /// The one non-delegating handler: the backend's `clipboard_store` folds
-    /// both `p` and `s` into `ClipboardType::Selection` before its event
-    /// fires, so delegating loses the raw selector — a `p` store would
-    /// re-emit as `s`, and a `p` and an `s` store in one batch would collide
-    /// in one slot. Owning the pipeline here keeps the byte.
-    ///
-    /// Scope bound: vte's OSC 52 dispatch passes only the FIRST selector
-    /// byte to this handler and defaults an empty selector to `c`
-    /// (vte 0.15.0 `ansi.rs`, `params[1].first().unwrap_or(&b'c')`), so a
-    /// multi-target selector like `pc` is first-byte-truncated before
-    /// anything below can see it.
+    /// Capture supported OSC 52 stores while preserving their selector.
     fn clipboard_store(&mut self, a0: u8, a1: &[u8]) {
-        // Selector policy is ours now, not the backend's: `c`, `p`, and `s`
-        // buffer under their own slots; anything else (`q`, the numbered cut
-        // buffers `0`-`7`) drops silently, matching the backend behavior
-        // this replaces.
+        // Ignore selectors without a forwarding target.
         let selector = match a0 {
             b'c' => ClipboardSelector::Clipboard,
             b'p' => ClipboardSelector::Primary,
             b's' => ClipboardSelector::Select,
             _ => return,
         };
-        // Same decode contract as the backend: strict padded standard
-        // base64, then UTF-8. The `!` clear form and the `?` query never
-        // reach here as text — `?` dispatches to `clipboard_load`, and `!`
-        // fails the decode.
+        // Accept padded standard base64 containing UTF-8 text.
         let Ok(bytes) = B64.decode(a1) else { return };
         let Ok(text) = String::from_utf8(bytes) else {
             return;
         };
-        // Last writer wins per selector even when the last writer is
-        // over-cap: forwarding a superseded store would misrepresent the
-        // child's final clipboard state, so the drop clears its selector's
-        // slot and the recorded length feeds the caller's notice.
+        // Retain only the most recent value for this selector, including on overflow.
         self.clipboard.stores.retain(|(k, _)| *k != selector);
         if text.len() > CLIPBOARD_STORE_MAX_BYTES {
             self.clipboard.oversized_len = Some(text.len());
@@ -982,8 +941,7 @@ impl Handler for ObservedTerm<'_> {
         self.clipboard.stores.push((selector, text));
     }
     fn clipboard_load(&mut self, a0: u8, a1: &str) {
-        // Still delegated: the backend's default `Osc52::OnlyCopy` denies
-        // loads, which is exactly the policy fleetcom wants.
+        // The configured terminal policy denies clipboard loads.
         self.term.clipboard_load(a0, a1);
     }
     fn decaln(&mut self) {
@@ -1120,8 +1078,7 @@ mod tests {
         assert!(emu.process(b"\x1b[?u").is_empty());
     }
 
-    /// End to end through `process`: an OSC 52 store is captured, produces
-    /// no probe reply, and drains exactly once.
+    /// An OSC 52 store is captured without a probe reply and drains once.
     #[test]
     fn osc52_store_is_captured_and_drains_once() {
         let mut emu = Emulator::new(4, 20, 0);
@@ -1140,10 +1097,7 @@ mod tests {
         assert_eq!(again.oversized_len, None);
     }
 
-    /// The `p` and `s` selectors stay distinct: per xterm ctlseqs they are
-    /// different targets, and folding them (the backend's mapping this
-    /// pipeline replaced) would both mislabel a lone `p` store and let a
-    /// same-batch pair collide in one slot.
+    /// Primary and selection stores remain distinct.
     #[test]
     fn osc52_p_and_s_selectors_stay_distinct() {
         let mut emu = Emulator::new(4, 20, 0);
@@ -1157,10 +1111,7 @@ mod tests {
         );
     }
 
-    /// An empty selector arrives as `c`: vte's dispatch defaults it
-    /// (`params[1].first().unwrap_or(&b'c')`, vte 0.15.0) before the
-    /// handler runs, so this pins upstream behavior the pipeline depends
-    /// on, not a choice made here.
+    /// An empty OSC 52 selector targets the system clipboard.
     #[test]
     fn osc52_empty_selector_defaults_to_clipboard() {
         let mut emu = Emulator::new(4, 20, 0);
@@ -1171,8 +1122,7 @@ mod tests {
         );
     }
 
-    /// Selectors outside `c`/`p`/`s` drop silently: `q` and the numbered
-    /// cut buffers have no forwarding target.
+    /// Unsupported OSC 52 selectors are ignored.
     #[test]
     fn osc52_unknown_selectors_drop() {
         let mut emu = Emulator::new(4, 20, 0);
@@ -1183,8 +1133,7 @@ mod tests {
         assert_eq!(drained.oversized_len, None);
     }
 
-    /// Two stores to the same kind before a drain coalesce: only the second
-    /// survives.
+    /// Only the latest store for each selector is retained.
     #[test]
     fn osc52_last_store_wins_per_kind() {
         let mut emu = Emulator::new(4, 20, 0);
@@ -1195,8 +1144,7 @@ mod tests {
         );
     }
 
-    /// Stores to different selectors buffer independently and drain in
-    /// arrival order; all three selectors in one batch survive.
+    /// Different selectors buffer independently and drain in arrival order.
     #[test]
     fn osc52_kinds_buffer_independently() {
         let mut emu = Emulator::new(4, 20, 0);
@@ -1211,10 +1159,7 @@ mod tests {
         );
     }
 
-    /// Invalid base64 (including the `!` clear form) and non-UTF-8 payloads
-    /// die inside this pipeline's own decode — the backend no longer stands
-    /// in front of it — so these rejections are load-bearing here: nothing
-    /// buffers.
+    /// Invalid base64, clear requests, and non-UTF-8 payloads are ignored.
     #[test]
     fn osc52_invalid_base64_and_clear_buffer_nothing() {
         let mut emu = Emulator::new(4, 20, 0);
@@ -1227,9 +1172,7 @@ mod tests {
         assert_eq!(drained.oversized_len, None);
     }
 
-    /// The query form is an OSC 52 load, which the backend's default
-    /// `Osc52::OnlyCopy` denies: nothing buffers and no reply is generated
-    /// for the child.
+    /// OSC 52 clipboard queries are denied without a reply.
     #[test]
     fn osc52_query_is_denied_without_a_reply() {
         let mut emu = Emulator::new(4, 20, 0);
@@ -1239,7 +1182,7 @@ mod tests {
         assert_eq!(drained.oversized_len, None);
     }
 
-    /// vte accepts ST as the OSC terminator alongside BEL.
+    /// ST-terminated OSC 52 stores are captured.
     #[test]
     fn osc52_st_terminated_store_is_captured() {
         let mut emu = Emulator::new(4, 20, 0);
@@ -1250,18 +1193,14 @@ mod tests {
         );
     }
 
-    /// An over-cap store is not buffered, but it still supersedes its
-    /// selector's slot: forwarding the older store would misrepresent the
-    /// child's final clipboard state. The recorded length feeds the
-    /// caller's notice; other selectors are untouched.
+    /// An oversized store clears its selector and records its length.
     #[test]
     fn osc52_oversized_store_supersedes_its_kind_and_records_length() {
         let mut emu = Emulator::new(4, 20, 0);
         emu.process(b"\x1b]52;c;aGVsbG8=\x07");
         emu.process(b"\x1b]52;s;c2Vs\x07");
         emu.process(b"\x1b]52;p;cHJp\x07");
-        // "YWFh" decodes to "aaa"; this repeat count decodes to two bytes
-        // over the cap.
+        // This payload decodes to two bytes over the cap.
         let reps = CLIPBOARD_STORE_MAX_BYTES / 3 + 1;
         let payload = "YWFh".repeat(reps);
         emu.process(format!("\x1b]52;c;{payload}\x07").as_bytes());

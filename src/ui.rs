@@ -181,8 +181,7 @@ fn render_dashboard(out: &mut impl Write, app: &App) -> io::Result<()> {
         y += 1;
     }
 
-    // Command line: input modes show a prompt (with cursor); otherwise the
-    // ephemeral notice or persistent status, else the key hint.
+    // Input modes show a prompt; otherwise show a notice, status, or key hint.
     let cmd_y = rows.saturating_sub(2);
     match cmdline(app) {
         Some((line, _)) => put(out, cmd_y, &line, cols)?,
@@ -225,8 +224,7 @@ fn render_dashboard(out: &mut impl Write, app: &App) -> io::Result<()> {
     Ok(())
 }
 
-/// The command row's transient text: an active ephemeral notice beats the
-/// persistent status, so a copy landing just before a detach is still seen.
+/// Prefer an active notice over persistent status text.
 fn transient_line(notice: Option<&str>, status: Option<&str>) -> Option<String> {
     notice.or(status).map(|s| format!("  {s}"))
 }
@@ -722,11 +720,7 @@ fn render_attached(out: &mut impl Write, app: &App) -> io::Result<()> {
     Ok(())
 }
 
-/// The attached bottom bar, titled by the live/scrollback state. In the live
-/// view an active notice replaces the background hint; the bar is rebuilt
-/// every frame, so the hint returns the moment the notice expires. The
-/// scrollback bar never yields its hints: those keys are how the user gets
-/// back out.
+/// Build the attached or scrollback bar, showing notices only in live view.
 fn attached_bar(title: &str, scrollback: usize, notice: Option<&str>) -> String {
     match (scrollback, notice) {
         (0, Some(n)) => format!("  [attached] {title}    {n}"),
@@ -987,8 +981,7 @@ mod tests {
         );
     }
 
-    /// The live bar swaps its background hint for an active notice; the
-    /// scrollback bar keeps its navigation hints regardless.
+    /// The live bar shows notices while the scrollback bar keeps its key hints.
     #[test]
     fn attached_bar_swaps_the_hint_for_an_active_notice() {
         assert_eq!(
@@ -1005,8 +998,7 @@ mod tests {
         );
     }
 
-    /// The dashboard command row prefers an active notice over the
-    /// persistent status.
+    /// The dashboard command row prefers an active notice over status text.
     #[test]
     fn transient_line_prefers_the_notice_over_the_status() {
         assert_eq!(

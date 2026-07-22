@@ -45,16 +45,10 @@ const _: () = assert!(
     "MAX_PASTE must base64-encode to under frame::MAX_FRAME"
 );
 
-/// How long an ephemeral notice stays visible. Expiry is lazy — `notice()`
-/// answers `None` past this age — and the run loop's 100ms receive timeout
-/// bounds how far past the deadline a stale one can stay painted.
+/// How long an ephemeral notice remains visible.
 const NOTICE_TTL: Duration = Duration::from_secs(5);
 
-/// Notice severity, two tiers only — the notice is decoration, never
-/// load-bearing. `Warning` covers attached-mode `Event::Status` mirrors
-/// (spawn errors, recovery failures, clipboard drops); `Info` covers
-/// confirmations (the copied-chars line). The sole ranking rule lives in
-/// `set_notice`: `Info` never replaces an unexpired `Warning`.
+/// Priority of an ephemeral notice. Active warnings take precedence over info.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum NoticeLevel {
     Warning,
@@ -157,10 +151,7 @@ pub struct App {
     pub views: Vec<TaskView>,
     /// The watched task's screen (attach/peek), from `Event::Screen`.
     focused_screen: Option<ScreenView>,
-    /// Last `Watch` (target, attached) pair sent to the core, so we don't
-    /// resend it every tick. The pair, not the id: peek→attach on the same
-    /// task must send a fresh `Watch`, because the core's watch-time purge
-    /// and its clipboard-forwarding gate both key on the attach flag.
+    /// Last `(target, attached)` watch state sent to the core.
     watched: Option<(u64, bool)>,
     /// Whether this client talks to a daemon (vs. an in-process `--foreground`
     /// core). Only a daemon client can meaningfully reconnect after a drop.
@@ -214,13 +205,9 @@ pub struct App {
     pub recovery_sel: usize,
     /// Transient one-line notice (save/load result), dismissed on the next key.
     pub status: Option<String>,
-    /// Ephemeral notice, its severity, and the instant it was set:
-    /// clipboard-copy confirmations, plus attached-mode mirrors of
-    /// `Event::Status`. A separate channel from `status` — that one persists
-    /// until replaced or cleared; this one dies of age through `notice()`.
+    /// Ephemeral notice text, priority, and creation time.
     notice: Option<(String, NoticeLevel, Instant)>,
-    /// OSC 52 stores accepted while attached, awaiting re-emission to the host
-    /// terminal by `flush_clipboard` later in the same run-loop iteration.
+    /// Clipboard stores awaiting emission to the host terminal.
     pending_clipboard: Vec<(ClipboardKind, String)>,
     /// Parsed terminal events from the stdin reader thread. crossterm owns the
     /// tty, so a dedicated thread blocks on `event::read()` and forwards here; the
@@ -616,12 +603,7 @@ impl App {
         self.selected_id = Some(self.views[sections[prev].1[0]].id);
     }
 
-    /// Tell the core which task's screen we need and whether we are attached
-    /// (`(id, attached)`), sending `Watch` only when that pair changes.
-    /// Deduplicating on the pair is load-bearing: an id-only dedup would
-    /// swallow the peek→attach transition on the same task, and the core's
-    /// watch-time clipboard purge would never run for it. Cost: one extra
-    /// command frame per attach.
+    /// Send the desired watch state when its target or attachment mode changes.
     fn set_watch(&mut self, want: Option<(u64, bool)>) {
         if want != self.watched {
             self.watched = want;
@@ -654,13 +636,7 @@ impl App {
                     self.focused_screen = Some(s);
                 }
                 Event::Status(s) => {
-                    // While attached, the dashboard row that displays `status`
-                    // is off screen: mirror the message into the notice so
-                    // supervisor warnings (e.g. the clipboard oversize drop)
-                    // are seen when they happen. `status` is set as always.
-                    // `Warning` because everything the supervisor says while
-                    // attached is operational: spawn errors, recovery
-                    // failures, clipboard drops.
+                    // Mirror attached-mode status messages into the visible notice bar.
                     if self.mode == Mode::Attached {
                         self.set_notice(s.clone(), NoticeLevel::Warning);
                     }
@@ -681,24 +657,14 @@ impl App {
         }
     }
 
-    /// Accept or drop one forwarded OSC 52 store. A clipboard write is an
-    /// outward-facing side effect; only an attached user plausibly caused it,
-    /// so every other mode drops the store silently — peek-mode stores and
-    /// copies still in flight when the user detaches both land here. The id
-    /// gate drops in-flight copies from a previously watched task: the wire
-    /// preserves ordering per direction, not across a Watch/forward cross,
-    /// so a copy from task A can arrive after attachment moved to task B.
+    /// Queue a clipboard store only when it comes from the attached task.
     fn on_clipboard_copy(&mut self, id: u64, kind: ClipboardKind, text: String) {
         if self.mode == Mode::Attached && self.focused_id == Some(id) {
             self.pending_clipboard.push((kind, text));
         }
     }
 
-    /// Stage the ephemeral notice. The newest message wins with one
-    /// exception: an `Info` set yields to an unexpired `Warning`, because the
-    /// attached bar is the only place a warning shows and a copy
-    /// confirmation landing in the same batch would clobber it. An expired
-    /// `Warning` loses — staleness must not pin warnings forever.
+    /// Set an ephemeral notice without replacing an active warning with info.
     fn set_notice(&mut self, msg: String, level: NoticeLevel) {
         if level == NoticeLevel::Info
             && let Some((_, NoticeLevel::Warning, set_at)) = self.notice.as_ref()
@@ -709,34 +675,19 @@ impl App {
         self.notice = Some((msg, level, Instant::now()));
     }
 
-    /// The staged notice while it is younger than `NOTICE_TTL`. Expiry is
-    /// lazy — nothing ever clears the field — because every render pass asks
-    /// here and the run loop renders at least every ~100ms, which bounds how
-    /// long an expired notice can stay painted.
+    /// Return the staged notice while it is younger than `NOTICE_TTL`.
     pub fn notice(&self) -> Option<&str> {
         let (msg, _, set_at) = self.notice.as_ref()?;
         (set_at.elapsed() < NOTICE_TTL).then_some(msg.as_str())
     }
 
-    /// Re-emit buffered clipboard stores to the host terminal, oldest first:
-    /// with multiple entries the host's clipboard ends at the last one,
-    /// matching last-writer-wins clipboard semantics. The payload is data,
-    /// the envelope is protocol: nothing from the stored text reaches `out`
-    /// except through base64, because raw payload bytes on the terminal are
-    /// an escape-sequence injection vector.
+    /// Emit queued clipboard stores as base64-encoded OSC 52 sequences in order.
     fn flush_clipboard(&mut self, out: &mut impl Write) -> io::Result<()> {
         if self.pending_clipboard.is_empty() {
             return Ok(());
         }
         let mut last = 0;
         for (kind, text) in self.pending_clipboard.drain(..) {
-            // Emit the kind verbatim. Collapsing any pair (the original
-            // design folded `s` into `c`) creates a wrong-content collision:
-            // one batch can hold one store per kind, and a later-emitted
-            // payload would overwrite an earlier one aimed at the same
-            // collapsed target. A host without `p` or `s` support ignores
-            // the sequence — unsupported means inert, not aimed at a
-            // different clipboard.
             let k = match kind {
                 ClipboardKind::Clipboard => 'c',
                 ClipboardKind::Primary => 'p',
@@ -746,10 +697,7 @@ impl App {
             last = copied_chars(&text);
         }
         out.flush()?;
-        // The status row is off screen while attached — exactly when copies
-        // happen — so the confirmation goes to the notice, which the attached
-        // bar renders. `Info`: a confirmation must not clobber an unexpired
-        // warning (the oversize-drop mirror lands in the same iteration).
+        // Show the confirmation in the attached-mode notice bar.
         self.set_notice(format!("copied {last} chars"), NoticeLevel::Info);
         Ok(())
     }
@@ -803,10 +751,7 @@ impl App {
                 self.focused_id = None;
             }
 
-            // After the `should_quit` break, so a final partial iteration's
-            // pending stores drop with the session instead of landing on a
-            // torn-down terminal; before `ui::render`, whose sequential turn
-            // keeps these bytes from interleaving with a frame.
+            // Emit accepted clipboard stores before painting the next frame.
             self.flush_clipboard(out)?;
             self.sync_input_modes(out)?;
             ui::render(out, self)?;
@@ -1620,8 +1565,7 @@ fn on_key_edit(buf: &mut EditBuffer, k: KeyEvent) -> Option<bool> {
     }
 }
 
-/// Size of an emitted clipboard payload as the "copied {n} chars" notice
-/// reports it: chars, not bytes, matching what the user sees when pasting.
+/// Count the characters reported by the clipboard-copy notice.
 fn copied_chars(text: &str) -> usize {
     text.chars().count()
 }

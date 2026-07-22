@@ -1885,8 +1885,7 @@ fn state_and_dir_mode_spawns_stay_unassigned() {
 
 // --- OSC 52 clipboard emission ------------------------------------------
 
-/// An attached clipboard store re-emits as exactly one OSC 52 envelope:
-/// kind byte `c`, padded standard base64, BEL-terminated.
+/// An attached clipboard store emits one BEL-terminated OSC 52 sequence.
 #[test]
 fn attached_clipboard_store_emits_the_osc52_envelope() {
     let mut app = App::new_local(30, 100);
@@ -1903,9 +1902,7 @@ fn attached_clipboard_store_emits_the_osc52_envelope() {
     );
 }
 
-/// A `Selection` store emits its own kind byte `s`, never collapsed to `c`:
-/// collapsing would let a same-batch selection payload overwrite the
-/// clipboard payload. A host without `s` support ignores the sequence.
+/// A selection store emits the `s` selector.
 #[test]
 fn selection_store_emits_its_own_kind_byte() {
     let mut app = App::new_local(30, 100);
@@ -1917,9 +1914,7 @@ fn selection_store_emits_its_own_kind_byte() {
     assert_eq!(out, b"\x1b]52;s;aGVsbG8=\x07");
 }
 
-/// A `Primary` store emits its own kind byte `p`, never collapsed to `s`
-/// or `c`: the child aimed at the primary selection, and on hosts where
-/// the targets differ the byte is the aim.
+/// A primary-selection store emits the `p` selector.
 #[test]
 fn primary_store_emits_its_own_kind_byte() {
     let mut app = App::new_local(30, 100);
@@ -1931,8 +1926,7 @@ fn primary_store_emits_its_own_kind_byte() {
     assert_eq!(out, b"\x1b]52;p;aGVsbG8=\x07");
 }
 
-/// Nothing from the payload reaches the terminal raw: ESC/CSI sequences and
-/// newlines cross only as base64 between the envelope prefix and the BEL.
+/// Clipboard payloads are base64-encoded before reaching the host terminal.
 #[test]
 fn clipboard_payload_bytes_never_reach_the_terminal_raw() {
     let payload = "line1\nline2\x1b[31mred\x1b]52;c;evil\x07";
@@ -1958,9 +1952,7 @@ fn clipboard_payload_bytes_never_reach_the_terminal_raw() {
     );
 }
 
-/// Stores arriving outside attached mode buffer nothing and emit nothing:
-/// only an attached user plausibly caused the copy. The id matches
-/// `focused_id` so the mode gate alone is what drops the store.
+/// Clipboard stores are ignored outside attached mode.
 #[test]
 fn clipboard_stores_outside_attached_mode_are_dropped() {
     for mode in [Mode::Peek, Mode::Dashboard] {
@@ -1976,10 +1968,7 @@ fn clipboard_stores_outside_attached_mode_are_dropped() {
     }
 }
 
-/// A store whose id is not the attached task's drops at receipt: the wire
-/// preserves ordering per direction, not across a Watch/forward cross, so a
-/// copy from the previously watched task can arrive after attachment moved.
-/// The matching id buffers as before.
+/// Stores from tasks other than the attached task are ignored.
 #[test]
 fn mismatched_id_clipboard_store_drops_at_receipt() {
     let mut app = App::new_local(30, 100);
@@ -1997,20 +1986,13 @@ fn mismatched_id_clipboard_store_drops_at_receipt() {
     );
 }
 
-/// `set_watch` deduplicates on the (id, attached) pair, not the id: the
-/// peek→attach transition on the same task must send a fresh `Watch`, or the
-/// core keeps treating the watch as a peek and never forwards. There is no
-/// command-observation seam on the in-process transport (it applies commands
-/// straight to the supervisor), so the resend is asserted through core
-/// behavior: a store emitted after the transition forwards, which cannot
-/// happen unless the attach-kind `Watch` actually left the client.
+/// Changing from peek to attach sends a new watch for the same task.
 #[test]
 fn set_watch_resends_on_kind_change_with_the_same_id() {
     let dir = temp("app_watch_kind");
     let flag = dir.join("flag");
     let mut app = App::new_local(30, 100);
     let cwd = app.invocation_dir.clone();
-    // "cG9zdA==" is "post".
     let cmd = format!(
         "until [ -e {f} ]; do sleep 0.05; done; printf '\\033]52;c;cG9zdA==\\007'; sleep 30",
         f = flag.display()
@@ -2019,7 +2001,7 @@ fn set_watch_resends_on_kind_change_with_the_same_id() {
     app.pump();
     let id = app.views[0].id;
 
-    // Peek, then attach the same task: the id is unchanged, the pair is not.
+    // Change only the attachment mode.
     app.set_watch(Some((id, false)));
     app.set_watch(Some((id, true)));
     app.mode = Mode::Attached;
@@ -2041,9 +2023,7 @@ fn set_watch_resends_on_kind_change_with_the_same_id() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Multiple pending stores emit in receipt order (the host clipboard ends
-/// at the last: last-writer-wins), each under its own kind byte, and the
-/// notice counts the last entry's chars, not its bytes.
+/// Pending stores emit in order, and the notice counts the last store's characters.
 #[test]
 fn pending_stores_emit_in_order_and_notice_counts_last_entry_chars() {
     let mut app = App::new_local(30, 100);
@@ -2062,7 +2042,7 @@ fn pending_stores_emit_in_order_and_notice_counts_last_entry_chars() {
         B64.encode("héllo日")
     );
     assert_eq!(out, expected.as_bytes());
-    // "héllo日" is 6 chars but 9 bytes: the notice must report chars.
+    // The final payload contains six characters and nine bytes.
     assert_eq!(app.notice(), Some("copied 6 chars"));
     assert!(
         app.pending_clipboard.is_empty(),
@@ -2070,7 +2050,7 @@ fn pending_stores_emit_in_order_and_notice_counts_last_entry_chars() {
     );
 }
 
-/// The common per-iteration case, an empty buffer, writes zero bytes.
+/// Flushing an empty clipboard buffer writes nothing.
 #[test]
 fn empty_clipboard_flush_writes_nothing() {
     let mut app = App::new_local(30, 100);
@@ -2081,8 +2061,7 @@ fn empty_clipboard_flush_writes_nothing() {
     assert!(app.notice().is_none());
 }
 
-/// The notice dies of age: the accessor answers `None` once `NOTICE_TTL` has
-/// passed. No clearing pass exists — expiry is the accessor's answer.
+/// Notices are hidden after `NOTICE_TTL`.
 #[test]
 fn notice_expires_lazily_after_the_ttl() {
     let mut app = App::new_local(30, 100);
@@ -2096,10 +2075,7 @@ fn notice_expires_lazily_after_the_ttl() {
     assert_eq!(app.notice(), None, "an aged-out notice must not render");
 }
 
-/// A live `Warning` survives an `Info` set: the copy confirmation emitted by
-/// `flush_clipboard` must not clobber the oversize-drop mirror that landed
-/// in the same iteration — the attached bar is the only place that warning
-/// shows. The copy itself still emits; only the notice yields.
+/// A copy confirmation does not replace an active warning.
 #[test]
 fn warning_notice_survives_the_copy_confirmation() {
     let mut app = App::new_local(30, 100);
@@ -2113,7 +2089,7 @@ fn warning_notice_survives_the_copy_confirmation() {
     assert_eq!(app.notice(), Some("clipboard copy dropped"));
 }
 
-/// `Info` replaces `Info`: a second copy updates the count.
+/// A new info notice replaces the current info notice.
 #[test]
 fn info_notice_replaces_info() {
     let mut app = App::new_local(30, 100);
@@ -2122,8 +2098,7 @@ fn info_notice_replaces_info() {
     assert_eq!(app.notice(), Some("copied 2 chars"));
 }
 
-/// `Warning` replaces everything, `Info` included: a fresh operational
-/// message always shows.
+/// A warning replaces any current notice.
 #[test]
 fn warning_notice_replaces_info() {
     let mut app = App::new_local(30, 100);
@@ -2139,8 +2114,7 @@ fn warning_notice_replaces_info() {
     );
 }
 
-/// An expired `Warning` loses to `Info`: staleness must not pin warnings
-/// forever — the yield rule reads the same TTL clock as `notice()`.
+/// An info notice replaces an expired warning.
 #[test]
 fn expired_warning_yields_to_info() {
     let mut app = App::new_local(30, 100);
@@ -2152,9 +2126,7 @@ fn expired_warning_yields_to_info() {
     assert_eq!(app.notice(), Some("copied 5 chars"));
 }
 
-/// A status event arriving while attached mirrors into the notice — the
-/// dashboard row that displays `status` is off screen there — and still sets
-/// the persistent status verbatim.
+/// Attached-mode status events update both the notice and persistent status.
 #[test]
 fn attached_status_event_mirrors_into_the_notice() {
     let dir = session_scratch("status_mirror", &[]);
@@ -2167,8 +2139,7 @@ fn attached_status_event_mirrors_into_the_notice() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// A status event on the dashboard stays out of the notice: the command row
-/// already displays `status` there, and the attached bar is off screen.
+/// Dashboard status events do not create an ephemeral notice.
 #[test]
 fn dashboard_status_event_sets_only_the_status() {
     let dir = session_scratch("status_dash", &[]);

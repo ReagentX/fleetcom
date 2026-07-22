@@ -222,17 +222,13 @@ fn tick_flushes_a_stalled_sync_update() {
     );
 }
 
-/// OSC 52 stores from the watched task reach `drain` as decoded
-/// `ClipboardCopy` events, one per store in arrival order. The emission is
-/// flag-gated so `Watch` is installed before any store can arrive.
+/// Stores from the attached task are forwarded in arrival order.
 #[test]
 fn watched_task_clipboard_stores_are_forwarded() {
     let dir = scratch("clip_fwd");
     let ready = dir.join("ready");
     let flag = dir.join("flag");
     let mut s = sup(24, 80);
-    // "aGVsbG8=" is "hello" (clipboard), "cHJp" is "pri" (primary),
-    // "d29ybGQ=" is "world" (select).
     let cmd = format!(
         "touch {r}; until [ -e {f} ]; do sleep 0.05; done; \
          printf '\\033]52;c;aGVsbG8=\\007\\033]52;p;cHJp\\007\\033]52;s;d29ybGQ=\\007'; sleep 30",
@@ -256,8 +252,7 @@ fn watched_task_clipboard_stores_are_forwarded() {
         copies.len() >= 3
     });
     assert!(ok, "the clipboard stores never arrived; got {copies:?}");
-    // Three kinds in one burst, each under its own raw selector: a `p`
-    // store forwards as `Primary`, never re-folded into `Selection`.
+    // Each selector is forwarded as its matching protocol kind.
     assert_eq!(
         copies,
         vec![
@@ -269,19 +264,11 @@ fn watched_task_clipboard_stores_are_forwarded() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// A store captured before its task is watched must not fire once `Watch`
-/// lands. The per-tick drain cannot cover this: the wake loop applies a
-/// whole command burst before ticking, so a `Watch` in the burst makes the
-/// next drain see the task as already watched. The test reproduces that
-/// interleaving exactly — capture, then `Watch`, with no tick between —
-/// which only `apply`'s watch-time purge can close. The marker is observed
-/// through a non-draining grid read; a tick here would drain (and discard)
-/// the buffer and mask the race.
+/// Starting a watch discards stores captured before the watch.
 #[test]
 fn watch_purges_stores_captured_before_the_watch() {
     let mut s = sup(24, 80);
-    // "c3RhbGU=" is "stale". The trailing marker proves the store's bytes
-    // were parsed: it follows them in the output stream.
+    // The marker follows the store and confirms that both were parsed.
     spawn(
         &mut s,
         "printf '\\033]52;c;c3RhbGU=\\007MARKER'; sleep 30",
@@ -316,15 +303,11 @@ fn watch_purges_stores_captured_before_the_watch() {
     assert!(saw_screen, "watching the task should stream its screen");
 }
 
-/// A store captured while the task is not watched is discarded by the
-/// per-tick drain, never deferred: watching the task afterwards forwards
-/// nothing. Staleness is worse than loss — a wrong clipboard is silently
-/// harmful, an empty one visibly inert.
+/// Stores from an unwatched task are discarded instead of deferred.
 #[test]
 fn backgrounded_clipboard_store_is_discarded_not_deferred() {
     let mut s = sup(24, 80);
-    // "c3RhbGU=" is "stale". The trailing marker proves the store's bytes
-    // were parsed: it follows them in the output stream.
+    // The marker follows the store and confirms that both were parsed.
     spawn(
         &mut s,
         "printf '\\033]52;c;c3RhbGU=\\007COPIED'; sleep 30",
@@ -351,9 +334,7 @@ fn backgrounded_clipboard_store_is_discarded_not_deferred() {
         seen
     });
     assert!(parsed, "the marker never reached the grid");
-    // The marker only proves the store was parsed by that tick's preview
-    // resolution, which runs after the drain; one more tick guarantees a
-    // drain after capture.
+    // Run one more tick to drain a store parsed after the preceding drain.
     s.tick();
     let _ = s.drain();
 
@@ -377,15 +358,7 @@ fn backgrounded_clipboard_store_is_discarded_not_deferred() {
     assert!(saw_screen, "watching the task should stream its screen");
 }
 
-/// Peek is clipboard-inert end to end, and consent is not retroactive. Three
-/// phases against one task: a store drained while peek-watched never
-/// forwards (though the peek's screen keeps streaming); a store captured
-/// during peek and still buffered when the attach-watch lands — the
-/// peek→attach straddle, with no tick between, exactly how the wake loop
-/// applies a burst — dies in the watch-time purge instead of firing under
-/// the new attach; a store emitted under the attach-watch forwards. Markers
-/// are observed through non-draining grid reads; a tick while waiting would
-/// drain the buffer and mask both races.
+/// Peeked stores are discarded, while stores captured after attachment forward.
 #[test]
 fn peeked_stores_never_forward_and_die_at_the_attach_transition() {
     let dir = scratch("clip_peek");
@@ -394,9 +367,7 @@ fn peeked_stores_never_forward_and_die_at_the_attach_transition() {
     let flag2 = dir.join("flag2");
     let flag3 = dir.join("flag3");
     let mut s = sup(24, 80);
-    // "cGVlazE=" is "peek1", "cGVlazI=" is "peek2", "cG9zdA==" is "post".
-    // Each marker follows its store in the output stream, proving the
-    // store's bytes were parsed by the time the marker is visible.
+    // Each marker follows its store and confirms that both were parsed.
     let cmd = format!(
         "touch {r}; until [ -e {f1} ]; do sleep 0.05; done; \
          printf '\\033]52;c;cGVlazE=\\007M1'; \
@@ -415,7 +386,7 @@ fn peeked_stores_never_forward_and_die_at_the_attach_transition() {
         attached: false,
     });
 
-    // Phase 1: drained while peeked, never forwarded.
+    // A store drained during peek is not forwarded.
     std::fs::write(&flag1, b"").unwrap();
     let parsed = wait_until(Duration::from_secs(5), || {
         s.tasks.first().is_some_and(|t| {
@@ -442,9 +413,7 @@ fn peeked_stores_never_forward_and_die_at_the_attach_transition() {
         "peeking the task should still stream its screen"
     );
 
-    // Phase 2: the straddle. The store sits in the buffer across the
-    // peek→attach on the same id; only the purge on the kind change stops
-    // the next (attached) tick from forwarding it.
+    // A buffered peek store is discarded when the same task becomes attached.
     std::fs::write(&flag2, b"").unwrap();
     let parsed = wait_until(Duration::from_secs(5), || {
         s.tasks.first().is_some_and(|t| {
@@ -466,8 +435,7 @@ fn peeked_stores_never_forward_and_die_at_the_attach_transition() {
         }
     }
 
-    // Phase 3: a store emitted under the attach-watch forwards, and it is
-    // the only one that ever does.
+    // A store captured after attachment is forwarded.
     std::fs::write(&flag3, b"").unwrap();
     let mut copies = Vec::new();
     let ok = wait_until(Duration::from_secs(5), || {
@@ -486,17 +454,14 @@ fn peeked_stores_never_forward_and_die_at_the_attach_transition() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// An over-cap store on the watched task yields the drop notice and no
-/// `ClipboardCopy`: the copy is lost loudly, not truncated or forwarded.
+/// An oversized store produces a status notice instead of a clipboard event.
 #[test]
 fn oversized_watched_store_yields_notice_and_no_copy() {
     let dir = scratch("clip_oversize");
     let ready = dir.join("ready");
     let flag = dir.join("flag");
     let mut s = sup(24, 80);
-    // 3 MiB decoded exceeds the 1 MiB cap. The child generates the base64
-    // itself because `MAX_COMMAND_LEN` cannot carry the payload inline;
-    // `tr` strips GNU base64's line wrapping (macOS emits none).
+    // Generate a 3 MiB decoded payload without placing it in the command string.
     let cmd = format!(
         "touch {r}; until [ -e {f} ]; do sleep 0.05; done; \
          printf '\\033]52;c;'; \

@@ -122,10 +122,7 @@ fn normalize_group(name: Option<String>) -> Option<String> {
     normalize_label(name).filter(|g| g != "Unassigned")
 }
 
-/// Map the emulator's clipboard selector to its wire mirror. The boundary
-/// where terminal-module types stop: `protocol` deliberately imports none.
-/// Three arms, verbatim — folding any pair here would recreate the fidelity
-/// loss this mapping exists to prevent.
+/// Map an emulator clipboard selector to its protocol representation.
 fn clipboard_kind(kind: ClipboardSelector) -> ClipboardKind {
     match kind {
         ClipboardSelector::Clipboard => ClipboardKind::Clipboard,
@@ -238,11 +235,7 @@ pub struct Supervisor {
     scrollback: usize,
     /// The task whose screen the client is watching (attach/peek), or `None`.
     watched: Option<u64>,
-    /// Whether the current watch is an attach rather than a peek. Attachment
-    /// is the consent proxy for clipboard forwarding — input flows to the
-    /// child only then — so `tick` forwards OSC 52 stores only while this is
-    /// set. Screen streaming ignores it: peek needs screens. Meaningful only
-    /// while `watched` is `Some`.
+    /// Whether the current watch permits clipboard forwarding.
     watch_attached: bool,
     /// The last emitted screen fingerprint. `lines` stays empty because only
     /// emitted copies carry them. Cleared when `watched` changes to force a
@@ -411,9 +404,7 @@ impl Supervisor {
                 }
             }
             Command::Watch { id, attached } => {
-                // Reset the previous task's viewport only when the target
-                // itself changes: a peek→attach on the same task must keep
-                // the user's scrollback position.
+                // Preserve the viewport when only the attachment mode changes.
                 if id != self.watched
                     && let Some(old) = self.watched
                     && let Some(t) = self.by_id_mut(old)
@@ -421,16 +412,7 @@ impl Supervisor {
                     t.scroll_view(ScrollAction::Live);
                 }
                 if id != self.watched || attached != self.watch_attached {
-                    // Purge the new target's buffered stores before the watch
-                    // takes effect. The wake loop applies a whole burst before
-                    // ticking, so without this a store captured while
-                    // backgrounded — or during a peek of this same task, the
-                    // peek→attach case — survives into a tick that already
-                    // sees an attach-watch, and fires. Purging on the
-                    // attach→peek edge too is harmless: peek forwards
-                    // nothing. The residual window (bytes emitted pre-attach
-                    // but parsed post-purge) is irreducible: a transparent
-                    // terminal has it too.
+                    // Discard stores captured before this watch state took effect.
                     if let Some(new) = id
                         && let Some(t) = self.by_id_mut(new)
                     {
@@ -561,8 +543,7 @@ impl Supervisor {
         // least every 200 ms), so an expired sync flushes here, before the
         // preview resolution reads the grid, letting the same tick ship it.
         // Resolution mutates per-task hold state; all tasks use one timestamp.
-        // Forward stores only for an attach-watch: peek forwards no input to
-        // the child, so nothing captured during peek can be user-caused.
+        // Only the attached watch may forward clipboard stores.
         let forwarding = if self.watch_attached {
             self.watched
         } else {
@@ -574,15 +555,7 @@ impl Supervisor {
             .iter_mut()
             .map(|t| {
                 t.flush_expired_sync();
-                // Drain every task's clipboard every tick and forward only the
-                // attach-watched task's. Dropping the others here is the
-                // staleness guarantee: a store captured while backgrounded or
-                // peeked must never fire when the task is later attached — a
-                // wrong clipboard is silently harmful, an empty one visibly
-                // inert. The three-slot capture bound makes the constant drain
-                // cheap. This drain alone cannot close the wake-coalescing
-                // race (a `Watch` in the same burst lands before the tick);
-                // `apply`'s `Watch` arm purges the new target for that case.
+                // Drain all tasks so stores from inactive tasks cannot be forwarded later.
                 let stores = t.drain_clipboard();
                 if forwarding == Some(t.id) {
                     clipboard = Some((t.id, stores));
