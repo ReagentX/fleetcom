@@ -706,9 +706,8 @@ fn render_attached(out: &mut impl Write, app: &App) -> io::Result<()> {
     queue!(out, Hide, MoveTo(0, 0))?;
     if let Some(s) = screen {
         out.write_all(&s.formatted)?;
-        // Repaint each selected span in reverse video as plain text over the
-        // styled cells: parsing `formatted` to keep the child's colors under
-        // the highlight is not worth it for v1.
+        // Repaint selected spans as reverse-video plain text over the child's
+        // formatted output.
         for (row, col, text) in selection_overlay(app.selection(), &s.lines) {
             queue!(
                 out,
@@ -733,8 +732,7 @@ fn render_attached(out: &mut impl Write, app: &App) -> io::Result<()> {
     Ok(())
 }
 
-/// Repaint spans for the drag selection, one `(row, start_col, text)` per
-/// selected row with visible content. Empty without a selection.
+/// Return one `(row, start_col, text)` overlay for each nonempty selected row.
 fn selection_overlay<'a>(sel: Option<&Selection>, lines: &'a [String]) -> Vec<(u16, u16, &'a str)> {
     let (Some(sel), Some(last)) = (sel, lines.len().checked_sub(1)) else {
         return Vec::new();
@@ -743,7 +741,7 @@ fn selection_overlay<'a>(sel: Option<&Selection>, lines: &'a [String]) -> Vec<(u
         .iter()
         .enumerate()
         .filter_map(|(row, text)| {
-            // Screen rows fit u16 by construction: the terminal sizes them.
+            // Screen row counts are bounded by the terminal's `u16` height.
             let row = row as u16;
             sel.row_segment(row, text, last)
                 .map(|(col, seg)| (row, col, seg))
@@ -782,9 +780,8 @@ mod tests {
             .iter()
             .map(|s| s.to_string())
             .collect();
-        // Anchor inside 日 (cell 2), head at row 2 cell 1: the first span
-        // starts at the glyph's first cell, the middle row at column 0 with
-        // its trailing padding trimmed.
+        // A boundary inside 日 expands to the glyph's first cell; the middle
+        // row starts at column 0 and excludes trailing whitespace.
         let mut sel = Selection::begin(0, 2);
         sel.extend(2, 1);
         assert_eq!(

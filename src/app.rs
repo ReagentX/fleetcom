@@ -234,11 +234,8 @@ pub struct App {
     mouse_captured: bool,
     /// Whether the attached task is displaying scrollback.
     view_scroll: bool,
-    /// In-progress drag-copy over the attached live view, in screen cells.
-    /// A selection is decoration over a momentary screen: every transition
-    /// that invalidates its cell coordinates (resize, detach, watch change,
-    /// scrollback entry) drops it, because a lost selection costs one re-drag
-    /// while a stale one copies the wrong content.
+    /// Active drag selection in attached-screen cell coordinates. Cleared when
+    /// its watched view, terminal size, or live/scrollback state changes.
     selection: Option<Selection>,
 }
 
@@ -448,7 +445,7 @@ impl App {
         self.focused_screen.as_ref().filter(|s| s.id == id)
     }
 
-    /// The in-progress drag-copy selection, read by the attached overlay.
+    /// The active drag selection displayed by the attached-screen overlay.
     pub fn selection(&self) -> Option<&Selection> {
         self.selection.as_ref()
     }
@@ -612,8 +609,7 @@ impl App {
     fn set_watch(&mut self, want: Option<(u64, bool)>) {
         if want != self.watched {
             self.watched = want;
-            // The selection addresses cells of the outgoing view: any change
-            // of target or attachment invalidates them.
+            // A selection belongs to one watched view and attachment state.
             self.selection = None;
             // Drop the now-irrelevant screen so a stale one can't flash before
             // the new target's first frame arrives.
@@ -792,7 +788,7 @@ impl App {
     }
 
     fn on_resize(&mut self, rows: u16, cols: u16) {
-        // The reflowed screen shares no cell geometry with the old one.
+        // Resizing changes the selected screen cells' coordinates.
         self.selection = None;
         self.rows = rows;
         self.cols = cols;
@@ -1312,7 +1308,7 @@ impl App {
                 .intersects(KeyModifiers::SHIFT | KeyModifiers::CONTROL | KeyModifiers::ALT)
         {
             self.view_scroll = true;
-            // Scrollback repaints different content into the same cells.
+            // Scrollback replaces the live content under the selection.
             self.selection = None;
             self.send_scrollback(ScrollAction::Up(page));
             return Ok(());
@@ -1368,10 +1364,9 @@ impl App {
         }
     }
 
-    /// Forward attached mouse events to the supervisor, except the left-button
-    /// gestures that drive drag-copy over children that do not want the mouse.
-    /// Wheel events queued during a mode transition still move dashboard and
-    /// peek selection.
+    /// Handle mouse input in attached and dashboard modes. Left-button gestures
+    /// select text when the child has not enabled mouse reporting; mouse-aware
+    /// children receive supported events. Wheel input navigates the active view.
     fn on_mouse(&mut self, m: MouseEvent) {
         let btn = |b: MouseButton| match b {
             MouseButton::Left => MouseBtn::Left,
@@ -1404,20 +1399,14 @@ impl App {
                     return;
                 }
                 if let Some(id) = self.focused_id {
-                    // Drag-copy owns the left button over children that do not
-                    // want the mouse: their presses, drags, and releases
-                    // encode to nothing downstream (`input::mouse_bytes`
-                    // returns `None` without a protocol), so claiming those
-                    // events takes nothing from the child.
+                    // Fleetcom uses left-button gestures only when the child
+                    // has not enabled mouse reporting.
                     if matches!(self.screen_for(id), Some(s) if !s.wants_mouse) {
                         match kind {
-                            // Navigation outranks selection: drop the drag and
-                            // fall through to the wheel handling below.
+                            // Cancel the drag before handling wheel navigation.
                             MouseKind::WheelUp | MouseKind::WheelDown => self.selection = None,
                             MouseKind::Press(MouseBtn::Left) => {
-                                // The bar row below the view is fleetcom's,
-                                // not the child's: a press there starts
-                                // nothing (and drops any leftover selection).
+                                // The status bar is outside the selectable pane.
                                 self.selection = (m.row < self.pane_rows()).then(|| {
                                     Selection::begin(
                                         m.row,
@@ -1465,10 +1454,8 @@ impl App {
         }
     }
 
-    /// Finish a drag at release: copy the selected text, then drop the
-    /// selection. A motionless click selects nothing worth copying, and an
-    /// all-whitespace region would only clobber the user's clipboard with
-    /// noise; both push nothing.
+    /// Complete a drag by queuing its non-whitespace text for copying.
+    /// Motionless clicks and whitespace-only selections are discarded.
     fn finish_selection(&mut self, id: u64) {
         let Some(sel) = self.selection.take() else {
             return;
@@ -1476,20 +1463,15 @@ impl App {
         if sel.is_click() {
             return;
         }
-        // The selection addresses screen cells, not content: a child writing
-        // mid-drag repaints under the highlight, so the copy samples the rows
-        // as they stand at release. The race is inherent and accepted —
-        // clearing on every child write would make selection impossible over
-        // a chatty task.
+        // Extract from the current screen so updates during the drag are
+        // reflected in the copied text.
         let Some(text) = self.screen_for(id).map(|s| sel.extract(&s.lines)) else {
             return;
         };
         if text.trim().is_empty() {
             return;
         }
-        // User-originated by construction, so push directly instead of
-        // routing through `on_clipboard_copy`, whose id/mode gate vets
-        // child-originated events.
+        // Queue directly because this selection originates in the client.
         self.pending_clipboard
             .push((ClipboardKind::Clipboard, text));
     }

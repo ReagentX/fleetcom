@@ -2247,7 +2247,7 @@ fn click_without_drag_copies_nothing() {
     assert_eq!(app.notice(), None);
 }
 
-/// An all-whitespace region pushes nothing: an empty clipboard write is noise.
+/// Whitespace-only selected text is not queued for copying.
 #[test]
 fn all_whitespace_selection_copies_nothing() {
     let mut app = App::attached_with_lines(&["abc         ", "            "]);
@@ -2270,8 +2270,7 @@ fn bar_row_press_starts_no_selection() {
     assert!(app.pending_clipboard.is_empty());
 }
 
-/// A wheel notch mid-drag drops the selection and still enters scrollback
-/// for inline children.
+/// A wheel event cancels an active drag and still enters inline scrollback.
 #[test]
 fn wheel_cancels_a_live_drag_and_keeps_its_function() {
     let mut app = App::attached_with_lines(&["hello world"]);
@@ -2284,8 +2283,7 @@ fn wheel_cancels_a_live_drag_and_keeps_its_function() {
     assert!(app.pending_clipboard.is_empty(), "a cancel is not a copy");
 }
 
-/// Everything that invalidates the selection's cell coordinates drops it:
-/// resize, detach, scrollback entry, and a watch change.
+/// Resize, detach, scrollback entry, and watch changes clear active selections.
 #[test]
 fn coordinate_invalidation_clears_the_selection() {
     let start = |app: &mut App| {

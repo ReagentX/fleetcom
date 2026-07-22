@@ -1,15 +1,12 @@
-//! Drag-selection engine over a rendered screen: a press/drag state machine
-//! plus width-aware text extraction, pure over 0-based cell coordinates. The
-//! engine imports no event or protocol types; the caller maps its mouse
-//! stream onto [`Selection::begin`] and [`Selection::extend`] and reads the
-//! result with [`Selection::extract`]. Cancellation is dropping the value.
+//! Cell-coordinate drag selections and width-aware text extraction from
+//! plain-text screen rows.
 
 use unicode_width::UnicodeWidthChar;
 
 /// An in-progress drag selection: a pair of 0-based `(row, col)` cells.
 ///
 /// The anchor is the pressed cell and never moves; the head tracks the
-/// pointer. Either may precede the other — [`Selection::extract`] normalizes.
+/// pointer. Either may precede the other: [`Selection::extract`] normalizes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Selection {
     anchor: (u16, u16),
@@ -30,28 +27,21 @@ impl Selection {
         self.head = (row, col);
     }
 
-    /// Whether the head sits on the pressed cell — a motionless click, which
-    /// selects nothing worth copying; callers skip the copy for these. A drag
-    /// that returns to the pressed cell reads the same.
+    /// Whether the head and anchor occupy the same cell.
     pub fn is_click(&self) -> bool {
         self.anchor == self.head
     }
 
     /// Extract the selected text from `rows`, the rendered screen top-down.
     ///
-    /// Linear (stream) semantics over document order: the first row from the
-    /// start column to end-of-row, intermediate rows whole, the last row up
-    /// to and including the cell under the end column — dragging onto a cell
-    /// selects it, matching terminal behavior. Columns are display cells: a
-    /// column landing inside a wide glyph takes the whole glyph on either
-    /// edge, so a selection never splits one. Each row segment loses its
-    /// trailing whitespace (rows are space-padded to terminal width; the
-    /// padding is not content), and segments join with `\n`, none trailing.
+    /// Endpoints are ordered by row and column. The first row starts at the
+    /// first endpoint, intermediate rows are included in full, and the final
+    /// row includes the cell under the second endpoint. A boundary inside a
+    /// wide glyph includes the whole glyph. Trailing whitespace is removed
+    /// from each segment, and segments are joined with `\n`.
     ///
-    /// The coordinates come from a racing mouse over a live screen, so every
-    /// input is clamped: rows below the screen land on the bottom row,
-    /// columns past a row's width select nothing, and an empty screen yields
-    /// an empty string.
+    /// Rows below the screen clamp to its last row. Columns beyond a row select
+    /// no text, and an empty screen produces an empty string.
     pub fn extract(&self, rows: &[String]) -> String {
         let Some(last) = rows.len().checked_sub(1) else {
             return String::new();
@@ -69,14 +59,10 @@ impl Selection {
         out
     }
 
-    /// The highlighted span of screen row `row` for the attached overlay: the
-    /// display column where the span starts and the text it covers, under the
-    /// same normalization as [`Selection::extract`] — endpoints clamp to
-    /// `last_row` and order row-major, middle rows span from column 0, and a
-    /// boundary inside a wide glyph rounds outward, so the returned column is
-    /// that glyph's first cell: the true repaint position. Rows outside the
-    /// selection, and rows whose span trims to nothing (trailing padding is
-    /// not content), return `None`.
+    /// Return the selected text on `row` and its starting display column.
+    /// Uses the same endpoint ordering, row clamping, wide-glyph expansion,
+    /// and trailing-whitespace removal as [`Selection::extract`]. Returns
+    /// `None` outside the selection or when the row's selected span is empty.
     pub fn row_segment<'a>(
         &self,
         row: u16,
@@ -92,17 +78,12 @@ impl Selection {
         let to = (row == end.0).then_some(end.1);
         let (col, seg) = segment_span(text, from, to)?;
         let seg = seg.trim_end();
-        // A taken glyph starts below the u16 column bounds the caller drags
-        // over, so the cast is lossless for terminal-width rows.
+        // The first selected glyph starts at or before a `u16` endpoint.
         (!seg.is_empty()).then_some((col as u16, seg))
     }
 
-    /// Both endpoints clamped to the screen and ordered: the normalization
-    /// shared by `extract` and `row_segment`. Clamping precedes ordering
-    /// because collapsing an endpoint onto the bottom row can invert which
-    /// endpoint comes first. Document order is row-major: tuple comparison
-    /// orders by row first, then column, so either drag direction yields
-    /// identical spans.
+    /// Clamp endpoints to the last row, then order them by row and column.
+    /// Clamping first handles endpoints that collapse onto the same row.
     fn bounds(&self, last: usize) -> ((usize, usize), (usize, usize)) {
         let clamp = |(row, col): (u16, u16)| ((row as usize).min(last), col as usize);
         let (mut start, mut end) = (clamp(self.anchor), clamp(self.head));
@@ -113,12 +94,10 @@ impl Selection {
     }
 }
 
-/// The slice of `row` covering display cells `from..=to` and the display
-/// column where it starts; `to == None` means end-of-row. A glyph is taken
-/// when any of its cells is in range, so a boundary landing inside a wide
-/// glyph rounds outward to keep it whole — the returned column is that
-/// glyph's first cell. Zero-width characters (combining marks, VS16) occupy
-/// no cell of their own and travel with the glyph before them.
+/// Return the text overlapping display cells `from..=to` and its starting
+/// display column. `None` for `to` extends through the row. Wide glyphs are
+/// included whole, and zero-width characters following a selected glyph are
+/// included with it.
 fn segment_span(row: &str, from: usize, to: Option<usize>) -> Option<(usize, &str)> {
     // Exclusive right edge; `to` is the inclusive cell under the head.
     let to = to.map_or(usize::MAX, |t| t.saturating_add(1));
@@ -280,7 +259,7 @@ mod tests {
     #[test]
     fn row_segment_starts_at_the_glyph_not_the_boundary() {
         // Cells: a=0, 日=1-2, 本=3-4, b=5. A start boundary inside 日 rounds
-        // back to cell 1, the glyph's first cell — the repaint position.
+        // back to cell 1, the glyph's first cell: the repaint position.
         let s = drag((0, 2), (0, 4));
         assert_eq!(s.row_segment(0, "a日本b", 0), Some((1, "日本")));
         assert_eq!(s.extract(&screen(&["a日本b"])), "日本");
