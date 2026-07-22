@@ -11,10 +11,6 @@ compile_error!("fleetcom supports Unix platforms only.");
 // Terminal-attached client.
 mod app;
 mod editbuf;
-// Phase 2 wires the attached-mode mouse path and clipboard copy through this
-// module; until then only its tests call it, so the allow is scoped to the
-// non-test build.
-#[cfg_attr(not(test), allow(dead_code))]
 mod selection;
 mod ui;
 

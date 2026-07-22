@@ -56,15 +56,7 @@ impl Selection {
         let Some(last) = rows.len().checked_sub(1) else {
             return String::new();
         };
-        // Clamp rows before ordering: collapsing an endpoint onto the bottom
-        // row can invert which endpoint comes first.
-        let clamp = |(row, col): (u16, u16)| ((row as usize).min(last), col as usize);
-        let (mut start, mut end) = (clamp(self.anchor), clamp(self.head));
-        // Document order is row-major: tuple comparison orders by row first,
-        // then column, so either drag direction extracts identical text.
-        if start > end {
-            std::mem::swap(&mut start, &mut end);
-        }
+        let (start, end) = self.bounds(last);
         let mut out = String::new();
         for (row, text) in rows.iter().enumerate().take(end.0 + 1).skip(start.0) {
             if row > start.0 {
@@ -76,14 +68,58 @@ impl Selection {
         }
         out
     }
+
+    /// The highlighted span of screen row `row` for the attached overlay: the
+    /// display column where the span starts and the text it covers, under the
+    /// same normalization as [`Selection::extract`] — endpoints clamp to
+    /// `last_row` and order row-major, middle rows span from column 0, and a
+    /// boundary inside a wide glyph rounds outward, so the returned column is
+    /// that glyph's first cell: the true repaint position. Rows outside the
+    /// selection, and rows whose span trims to nothing (trailing padding is
+    /// not content), return `None`.
+    pub fn row_segment<'a>(
+        &self,
+        row: u16,
+        text: &'a str,
+        last_row: usize,
+    ) -> Option<(u16, &'a str)> {
+        let (start, end) = self.bounds(last_row);
+        let row = row as usize;
+        if row < start.0 || row > end.0 {
+            return None;
+        }
+        let from = if row == start.0 { start.1 } else { 0 };
+        let to = (row == end.0).then_some(end.1);
+        let (col, seg) = segment_span(text, from, to)?;
+        let seg = seg.trim_end();
+        // A taken glyph starts below the u16 column bounds the caller drags
+        // over, so the cast is lossless for terminal-width rows.
+        (!seg.is_empty()).then_some((col as u16, seg))
+    }
+
+    /// Both endpoints clamped to the screen and ordered: the normalization
+    /// shared by `extract` and `row_segment`. Clamping precedes ordering
+    /// because collapsing an endpoint onto the bottom row can invert which
+    /// endpoint comes first. Document order is row-major: tuple comparison
+    /// orders by row first, then column, so either drag direction yields
+    /// identical spans.
+    fn bounds(&self, last: usize) -> ((usize, usize), (usize, usize)) {
+        let clamp = |(row, col): (u16, u16)| ((row as usize).min(last), col as usize);
+        let (mut start, mut end) = (clamp(self.anchor), clamp(self.head));
+        if start > end {
+            std::mem::swap(&mut start, &mut end);
+        }
+        (start, end)
+    }
 }
 
-/// The slice of `row` covering display cells `from..=to`; `to == None` means
-/// end-of-row. A glyph is taken when any of its cells is in range, so a
-/// boundary landing inside a wide glyph rounds outward to keep it whole.
-/// Zero-width characters (combining marks, VS16) occupy no cell of their own
-/// and travel with the glyph before them.
-fn segment(row: &str, from: usize, to: Option<usize>) -> &str {
+/// The slice of `row` covering display cells `from..=to` and the display
+/// column where it starts; `to == None` means end-of-row. A glyph is taken
+/// when any of its cells is in range, so a boundary landing inside a wide
+/// glyph rounds outward to keep it whole — the returned column is that
+/// glyph's first cell. Zero-width characters (combining marks, VS16) occupy
+/// no cell of their own and travel with the glyph before them.
+fn segment_span(row: &str, from: usize, to: Option<usize>) -> Option<(usize, &str)> {
     // Exclusive right edge; `to` is the inclusive cell under the head.
     let to = to.map_or(usize::MAX, |t| t.saturating_add(1));
     let mut col = 0;
@@ -102,12 +138,17 @@ fn segment(row: &str, from: usize, to: Option<usize>) -> &str {
         // The glyph spans cells [col, col + w); take it on any overlap.
         taken = col < to && col + w > from;
         if taken {
-            start.get_or_insert(i);
+            start.get_or_insert((i, col));
             end = i + c.len_utf8();
         }
         col += w;
     }
-    start.map_or("", |s| &row[s..end])
+    start.map(|(s, c)| (c, &row[s..end]))
+}
+
+/// [`segment_span`] without the column, for whole-selection extraction.
+fn segment(row: &str, from: usize, to: Option<usize>) -> &str {
+    segment_span(row, from, to).map_or("", |(_, s)| s)
 }
 
 #[cfg(test)]
@@ -234,6 +275,48 @@ mod tests {
         let rows = screen(&["a", "", "b"]);
         assert_eq!(drag((0, 0), (2, 0)).extract(&rows), "a\n\nb");
         assert_eq!(drag((1, 0), (1, 5)).extract(&rows), "");
+    }
+
+    #[test]
+    fn row_segment_starts_at_the_glyph_not_the_boundary() {
+        // Cells: a=0, 日=1-2, 本=3-4, b=5. A start boundary inside 日 rounds
+        // back to cell 1, the glyph's first cell — the repaint position.
+        let s = drag((0, 2), (0, 4));
+        assert_eq!(s.row_segment(0, "a日本b", 0), Some((1, "日本")));
+        assert_eq!(s.extract(&screen(&["a日本b"])), "日本");
+    }
+
+    #[test]
+    fn row_segment_middle_rows_span_from_column_zero() {
+        let s = drag((0, 3), (2, 1));
+        assert_eq!(s.row_segment(0, "aaaa", 2), Some((3, "a")));
+        assert_eq!(s.row_segment(1, "bbbb", 2), Some((0, "bbbb")));
+        assert_eq!(s.row_segment(2, "cccc", 2), Some((0, "cc")));
+    }
+
+    #[test]
+    fn row_segment_outside_the_selection_is_none() {
+        let s = drag((1, 0), (2, 1));
+        assert_eq!(s.row_segment(0, "above", 3), None);
+        assert_eq!(s.row_segment(3, "below", 3), None);
+    }
+
+    #[test]
+    fn row_segment_clamps_like_extract() {
+        // Both endpoints below a two-row screen collapse onto the bottom row,
+        // matching `extract`'s clamping (including the ordering inversion).
+        let s = drag((5, 1), (9, 0));
+        assert_eq!(s.extract(&screen(&["ab", "cd"])), "cd");
+        assert_eq!(s.row_segment(0, "ab", 1), None);
+        assert_eq!(s.row_segment(1, "cd", 1), Some((0, "cd")));
+    }
+
+    #[test]
+    fn row_segment_trims_padding_to_none() {
+        let s = drag((0, 0), (2, 3));
+        assert_eq!(s.row_segment(1, "      ", 2), None);
+        // A column range past the row's content is likewise empty.
+        assert_eq!(drag((0, 40), (0, 90)).row_segment(0, "ab", 0), None);
     }
 
     #[test]
