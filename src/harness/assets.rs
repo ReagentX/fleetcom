@@ -54,20 +54,21 @@ exec "$@"
 
 /// Build the `claude` settings overlay containing the `SessionStart` hook.
 fn claude_settings_json() -> String {
-    let mut hook = jzon::JsonValue::new_object();
-    let _ = hook.insert("type", "command");
-    let _ = hook.insert("command", format!("cat > \"${}\"", super::CAPTURE_ENV));
-    let mut inner = jzon::JsonValue::new_array();
-    let _ = inner.push(hook);
-    let mut matcher = jzon::JsonValue::new_object();
-    let _ = matcher.insert("hooks", inner);
-    let mut starts = jzon::JsonValue::new_array();
-    let _ = starts.push(matcher);
-    let mut hooks = jzon::JsonValue::new_object();
-    let _ = hooks.insert("SessionStart", starts);
-    let mut root = jzon::JsonValue::new_object();
-    let _ = root.insert("hooks", hooks);
-    root.dump()
+    jzon::object! {
+        "hooks": {
+            "SessionStart": [
+                {
+                    "hooks": [
+                        {
+                            "type": "command",
+                            "command": format!("cat > \"${}\"", super::CAPTURE_ENV),
+                        },
+                    ],
+                },
+            ],
+        },
+    }
+    .dump()
 }
 
 /// Resolve the capture root from an explicit runtime directory, the platform
