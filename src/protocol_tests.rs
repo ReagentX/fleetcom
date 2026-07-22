@@ -256,8 +256,7 @@ fn invalid_base64_is_rejected() {
     }
 }
 
-/// Build a `KIND_SCREEN` payload (`[u32 header_len][header]`, empty tail)
-/// from a raw header string, for malformed-header tests.
+/// Build a `KIND_SCREEN` payload with a raw header and an empty byte tail.
 fn screen_payload(header: &str) -> Vec<u8> {
     let mut p = Vec::with_capacity(4 + header.len());
     p.extend_from_slice(&(header.len() as u32).to_be_bytes());
@@ -265,8 +264,7 @@ fn screen_payload(header: &str) -> Vec<u8> {
     p
 }
 
-/// The neutral task view the exact-wire-string assertions pin: every
-/// optional key absent, every flag false, an empty unfrozen floor preview.
+/// Build the neutral task view used by exact wire-format assertions.
 fn tv(id: u64) -> TaskView {
     TaskView {
         id,
@@ -464,9 +462,7 @@ fn tasks_frame_name_key_is_optional() {
     }
 }
 
-/// The age keys ride the optional-key idiom: a live parked view carries
-/// `quiet_ms` and no `finished_ms`, a finished view the reverse, and
-/// both round-trip.
+/// Live parked and finished views encode only their applicable age field.
 #[test]
 fn parked_and_age_fields_round_trip() {
     let tasks = Event::Tasks(vec![
@@ -492,10 +488,7 @@ fn parked_and_age_fields_round_trip() {
     assert_eq!(decode_event(k, &p), Some(tasks));
 }
 
-/// A frame from a daemon predating `parked` still decodes: `parked`
-/// falls back to the idle lifecycle and both ages read as unknown, so
-/// skew degrades to the pre-`parked` signal instead of dropping the
-/// frame.
+/// Missing parked and age fields use lifecycle-derived and unknown defaults.
 #[test]
 fn tasks_frame_without_parked_keys_decodes_with_defaults() {
     let old = r#"{"t":"tasks","tasks":[{"id":1,"command":"x","cwd":"Lw==","tagged":false,"life":"idle","preview":"","started_ms":0},{"id":2,"command":"y","cwd":"Lw==","tagged":false,"life":"active","preview":"","started_ms":0}]}"#;
@@ -747,8 +740,7 @@ fn load_recovery_wire_form() {
     }
 }
 
-/// The `Screen` event keeps its formatted bytes intact through the raw tail,
-/// including non-UTF-8 bytes (0xFF) an ANSI stream really contains.
+/// A `Screen` event preserves formatted bytes, including non-UTF-8 values.
 #[test]
 fn screen_round_trips_raw_bytes() {
     let screen = Event::Screen(ScreenView {

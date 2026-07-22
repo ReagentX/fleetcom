@@ -50,8 +50,7 @@ const MAX_TASKS: usize = 256;
 /// this limit to bound shell arguments and serialized task snapshots.
 const MAX_COMMAND_LEN: usize = 64 * 1024;
 
-/// The reasons `materialize` counts an entry as skipped, quoted verbatim in
-/// both load notices.
+/// Conditions counted as skipped by `materialize`.
 const SKIP_REASONS: &str = "missing dir, task limit, or command too long";
 
 /// Environment variable overriding per-task terminal history depth.
@@ -912,9 +911,7 @@ impl Supervisor {
         }
     }
 
-    /// Give finished tasks their exit scrape, then snapshot the recipe.
-    /// `session_config` reads resume IDs through `&self`, so the scrape must
-    /// precede it (see `scrape_now`).
+    /// Refresh finished tasks' resume IDs before building the session recipe.
     fn refreshed_config(&mut self) -> SessionConfig {
         for t in &mut self.tasks {
             scrape_now(t);
@@ -1034,8 +1031,8 @@ impl Supervisor {
         Some((spawned, skipped, failed))
     }
 
-    /// Resolve the sessions root, run `load` against it, and map failure to a
-    /// status. `subject` is the `<noun> '<name>'` phrase both notices open with.
+    /// Run a config loader against the sessions root, prefixing errors with
+    /// `subject`.
     fn load_config(
         &mut self,
         subject: &str,

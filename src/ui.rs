@@ -183,7 +183,6 @@ fn render_dashboard(out: &mut impl Write, app: &App) -> io::Result<()> {
 
     // Input modes show a prompt; otherwise show a notice, status, or key hint.
     let cmd_y = rows.saturating_sub(2);
-    // Computed once: caret placement below reuses this line.
     let cmd = cmdline(app);
     match &cmd {
         Some((line, _)) => put(out, cmd_y, line, cols)?,
@@ -575,8 +574,7 @@ fn render_pickgroup(out: &mut impl Write, app: &App) -> io::Result<()> {
         .iter()
         .map(|c| c.label.clone())
         .collect();
-    // Hint reflects what Enter does: create when the typed text matches nothing
-    // (nothing matched), otherwise act on the highlighted row.
+    // Mirror Enter: create unmatched text or act on the highlighted row.
     let action = if app.group_is_new() {
         "enter create"
     } else {

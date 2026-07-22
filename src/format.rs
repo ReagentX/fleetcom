@@ -1,4 +1,4 @@
-//! Small display helpers: relative time and column-bounded truncation.
+//! Formatting, display-width, and civil-date helpers.
 
 use std::time::Duration;
 
@@ -75,7 +75,7 @@ pub fn pad(s: &str, width: usize) -> String {
     t
 }
 
-/// Proleptic Gregorian date for a count of days since 1970-01-01.
+/// Convert days since 1970-01-01 to a proleptic Gregorian date.
 pub(crate) fn civil_from_days(days: i64) -> (i64, u32, u32) {
     let z = days + 719_468;
     let era = if z >= 0 { z } else { z - 146_096 } / 146_097;

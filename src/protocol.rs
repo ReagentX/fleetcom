@@ -368,8 +368,7 @@ fn path_from_b64(v: &jzon::JsonValue) -> Option<PathBuf> {
     Some(PathBuf::from(os_from_b64(v)?))
 }
 
-/// Decode a JSON number as a bounded integer `T`, rejecting negative and
-/// out-of-range values: `as_u64` fails a negative, `T::try_from` an overflow.
+/// Decode a JSON unsigned integer as `T`, rejecting out-of-range values.
 fn num_from<T: TryFrom<u64>>(v: &jzon::JsonValue) -> Option<T> {
     T::try_from(v.as_u64()?).ok()
 }
@@ -578,7 +577,7 @@ pub fn encode_command(cmd: &Command) -> (u8, Vec<u8>) {
         }
         Command::Watch { id, attached } => {
             let _ = o.insert("t", "watch");
-            // `From<Option<T>>` maps `None` to `Null`, keeping `"id":null`.
+            // Encode an absent watch ID as explicit JSON null.
             let _ = o.insert("id", *id);
             let _ = o.insert("attached", *attached);
         }

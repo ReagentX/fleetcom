@@ -540,9 +540,8 @@ impl App {
         }
     }
 
-    /// Move the selection one task through display order, wrapping at either
-    /// end: `forward` steps down (last wraps to first), else up (first wraps
-    /// to last).
+    /// Move the selection one task forward or backward in display order,
+    /// wrapping at either end.
     fn select_wrap(&mut self, forward: bool) {
         let order = self.display_order();
         if order.is_empty() {
@@ -570,10 +569,8 @@ impl App {
             .position(|(_, idxs)| idxs.iter().any(|&i| self.views[i].id == id))
     }
 
-    /// Select the first task in the adjacent section, wrapping at either end.
-    /// `forward` moves to the next section (wrapping to the first); else the
-    /// previous (wrapping to the last). With no current selection, land on the
-    /// first section going forward, the last going back.
+    /// Select the first task in the next or previous section, wrapping at
+    /// either end. Without a selection, choose the first or last section.
     fn select_section_wrap(&mut self, forward: bool) {
         let sections = self.sections();
         if sections.is_empty() {
@@ -943,9 +940,7 @@ impl App {
         self.group_candidates = cands;
     }
 
-    /// Whether the typed group names no existing group: nonempty input, only
-    /// the always-present Unassigned row. The Enter action and its render hint
-    /// share this so they agree structurally, not coincidentally.
+    /// Return whether nonempty input matches no existing group.
     pub(crate) fn group_is_new(&self) -> bool {
         !self.group_input.is_empty() && self.group_candidates.len() < 2
     }
@@ -1303,8 +1298,7 @@ impl App {
         Ok(())
     }
 
-    /// Forward a keystroke to the focused task's PTY, dropping keys with no
-    /// wire encoding.
+    /// Forward an encodable keystroke to the focused task's PTY.
     fn forward_key(&mut self, k: KeyEvent) {
         if let Some(id) = self.focused_id
             && let Some((code, mods)) = key_event_to_key(k)

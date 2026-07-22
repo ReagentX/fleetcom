@@ -586,16 +586,10 @@ fn live_floor_of(term: &Term<ProbeSink>) -> String {
     String::new()
 }
 
-/// Append one grid row's plain-text glyphs to `out`: skip wide-char spacer
-/// cells (no glyph of their own), render a tab cell as one space, else the
-/// cell's char, then any combining marks. Single-sourced deliberately —
-/// scrollback text ([`Emulator::text_with_history`]) and live-row text
-/// ([`live_row_text_of`]) must extract glyphs identically or the two views of
-/// the same grid diverge. Trailing-space trim is each caller's own policy, not
-/// part of this rule.
+/// Append a grid row's glyphs, omitting wide-character spacers, mapping tabs
+/// to spaces, and preserving combining marks. Callers handle trailing spaces.
 fn push_row_glyphs(out: &mut String, row: &Row<Cell>) {
     for cell in row {
-        // Spacers have no glyph; terminal tabs occupy visible spaces.
         if cell
             .flags
             .intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER)
