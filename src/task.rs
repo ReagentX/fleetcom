@@ -517,13 +517,11 @@ impl Task {
         grid(&self.parser).formatted()
     }
 
-    /// Snapshot of visible rows for the peek overlay and drag selection:
-    /// exactly one entry per grid row, top to bottom.
+    /// Return one plain-text string per visible grid row for peek and drag
+    /// selection, including a blank final row.
     pub fn screen_lines(&self) -> Vec<String> {
-        // `split('\n')`, not `str::lines()`: `contents()` joins rows with one
-        // '\n' each, so `lines()`'s trailing-newline rule would drop a blank
-        // bottom row and the selection engine's row clamp would alias a
-        // bottom-row drag onto the row above.
+        // `contents()` separates grid rows with `\n`; `split` preserves the
+        // trailing empty field that represents a blank final row.
         grid(&self.parser)
             .contents()
             .split('\n')

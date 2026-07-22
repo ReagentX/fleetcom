@@ -232,10 +232,8 @@ pub fn contents<T>(term: &Term<T>) -> String {
         let line = &grid[Line(row as i32 - offset)];
         for col in 0..cols {
             let cell = &line[Column(col)];
-            // A concealed cell displays blank (`formatted` re-emits SGR 8),
-            // so it reads as the space the screen shows. Checked before the
-            // spacer skip and without zero-width extras: a hidden wide glyph
-            // must keep both of its columns, and hidden marks must not leak.
+            // Each concealed cell contributes one blank display column;
+            // attached zero-width marks remain concealed as well.
             if cell.flags.contains(Flags::HIDDEN) {
                 out.push(' ');
                 continue;

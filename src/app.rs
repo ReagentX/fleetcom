@@ -234,8 +234,9 @@ pub struct App {
     mouse_captured: bool,
     /// Whether the attached task is displaying scrollback.
     view_scroll: bool,
-    /// Active drag selection in attached-screen cell coordinates. Cleared when
-    /// its watched view, terminal size, or live/scrollback state changes.
+    /// Active live-screen drag selection in attached-pane cell coordinates.
+    /// Cleared when its attachment context or viewport changes, mouse reporting
+    /// takes over, or host mouse capture ends.
     selection: Option<Selection>,
 }
 
@@ -445,7 +446,7 @@ impl App {
         self.focused_screen.as_ref().filter(|s| s.id == id)
     }
 
-    /// The active drag selection displayed by the attached-screen overlay.
+    /// The active live-screen selection displayed by the attached overlay.
     pub fn selection(&self) -> Option<&Selection> {
         self.selection.as_ref()
     }
@@ -609,7 +610,7 @@ impl App {
     fn set_watch(&mut self, want: Option<(u64, bool)>) {
         if want != self.watched {
             self.watched = want;
-            // A selection belongs to one watched view and attachment state.
+            // A selection is scoped to one watch target and attachment mode.
             self.selection = None;
             // Drop the now-irrelevant screen so a stale one can't flash before
             // the new target's first frame arrives.
@@ -788,7 +789,7 @@ impl App {
     }
 
     fn on_resize(&mut self, rows: u16, cols: u16) {
-        // Resizing changes the selected screen cells' coordinates.
+        // A terminal resize invalidates the selected pane coordinates.
         self.selection = None;
         self.rows = rows;
         self.cols = cols;
@@ -1308,7 +1309,7 @@ impl App {
                 .intersects(KeyModifiers::SHIFT | KeyModifiers::CONTROL | KeyModifiers::ALT)
         {
             self.view_scroll = true;
-            // Scrollback replaces the live content under the selection.
+            // Entering scrollback replaces the selected live rows.
             self.selection = None;
             self.send_scrollback(ScrollAction::Up(page));
             return Ok(());
@@ -1364,9 +1365,8 @@ impl App {
         }
     }
 
-    /// Handle mouse input in attached and dashboard modes. Left-button gestures
-    /// select text when the child has not enabled mouse reporting; mouse-aware
-    /// children receive supported events. Wheel input navigates the active view.
+    /// Route mouse input to dashboard or peek navigation, attached scrollback,
+    /// live-screen selection, or the attached child's PTY.
     fn on_mouse(&mut self, m: MouseEvent) {
         let btn = |b: MouseButton| match b {
             MouseButton::Left => MouseBtn::Left,
@@ -1399,15 +1399,16 @@ impl App {
                     return;
                 }
                 if let Some(id) = self.focused_id {
-                    // Fleetcom uses left-button gestures only when the child
-                    // has not enabled mouse reporting.
+                    // Without child mouse reporting, left-button gestures
+                    // select text on captured live screens.
                     if matches!(self.screen_for(id), Some(s) if !s.wants_mouse) {
                         match kind {
-                            // Cancel the drag before handling wheel navigation.
+                            // Wheel navigation cancels the active drag.
                             MouseKind::WheelUp | MouseKind::WheelDown => self.selection = None,
                             MouseKind::Press(MouseBtn::Left) => {
-                                // The status bar is outside the selectable pane.
-                                self.selection = (m.row < self.pane_rows()).then(|| {
+                                // Only rows above the status bar are visible and
+                                // selectable, including at one terminal row.
+                                self.selection = (m.row < self.rows.saturating_sub(1)).then(|| {
                                     Selection::begin(
                                         m.row,
                                         m.column.min(self.cols.saturating_sub(1)),
@@ -1426,10 +1427,8 @@ impl App {
                                 return;
                             }
                             MouseKind::Release(MouseBtn::Left) if self.selection.is_some() => {
-                                // The release coordinate is part of the gesture:
-                                // without it the copy stops at the last sampled
-                                // drag event, and a press→release flick with no
-                                // drag between degrades to a click.
+                                // The release cell is the final head, including
+                                // for flicks with no intermediate drag event.
                                 let row = m.row.min(self.pane_rows().saturating_sub(1));
                                 let col = m.column.min(self.cols.saturating_sub(1));
                                 if let Some(sel) = self.selection.as_mut() {
@@ -1441,11 +1440,8 @@ impl App {
                             _ => {}
                         }
                     } else if self.selection.is_some() {
-                        // The gate is per event: a child enabling mouse
-                        // reporting between press and release reroutes the
-                        // rest of the gesture to the forward path below, so
-                        // the selection can never finish. Drop it here or its
-                        // overlay lingers until an unrelated state change.
+                        // Mouse reporting can turn on mid-gesture. Discard the
+                        // client selection before forwarding subsequent events.
                         self.selection = None;
                     }
                     // Wheel-up enters scrollback for inline children that do
@@ -1470,8 +1466,8 @@ impl App {
         }
     }
 
-    /// Complete a drag by queuing its non-whitespace text for copying.
-    /// Motionless clicks and whitespace-only selections are discarded.
+    /// Queue the selected text unless the gesture is a click or selects only
+    /// whitespace.
     fn finish_selection(&mut self, id: u64) {
         let Some(sel) = self.selection.take() else {
             return;
@@ -1479,15 +1475,13 @@ impl App {
         if sel.is_click() {
             return;
         }
-        // Extract from the current screen so updates during the drag are
-        // reflected in the copied text.
+        // Copy the screen contents visible when the gesture completes.
         let Some(text) = self.screen_for(id).map(|s| sel.extract(&s.lines)) else {
             return;
         };
         if text.trim().is_empty() {
             return;
         }
-        // Queue directly because this selection originates in the client.
         self.pending_clipboard
             .push((ClipboardKind::Clipboard, text));
     }
@@ -1511,6 +1505,9 @@ impl App {
             if capture {
                 execute!(out, EnableMouseCapture)?;
             } else {
+                // Disabling capture ends mouse delivery; clear the selection
+                // before its release event becomes unavailable.
+                self.selection = None;
                 execute!(out, DisableMouseCapture)?;
             }
             self.mouse_captured = capture;

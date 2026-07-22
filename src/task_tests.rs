@@ -271,10 +271,7 @@ fn viewport_scrolls_and_snaps_live_on_input() {
     t.terminate();
 }
 
-/// `screen_lines` is row-faithful: one entry per grid row, blank bottom row
-/// included. `str::lines()` would drop that final blank row, and the
-/// selection engine's row clamp would alias a bottom-row drag onto the row
-/// above.
+/// `screen_lines` returns one entry per grid row, including a blank final row.
 #[test]
 fn screen_lines_yields_one_entry_per_grid_row() {
     let mut t = spawn(60, "sleep 300");
