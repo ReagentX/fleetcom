@@ -749,12 +749,15 @@ fn selection_overlay<'a>(sel: Option<&Selection>, lines: &'a [String]) -> Vec<(u
         .collect()
 }
 
-/// Build the attached or scrollback bar, showing notices only in live view.
+/// Build the attached or scrollback bar. An active notice replaces the key
+/// hints in either view.
 fn attached_bar(title: &str, scrollback: usize, notice: Option<&str>) -> String {
     match (scrollback, notice) {
         (0, Some(n)) => format!("  [attached] {title}    {n}"),
         (0, None) => format!("  [attached] {title}    Ctrl-\\ background"),
-        (n, _) => {
+        // Active notices replace the scrollback key hints until they expire.
+        (n, Some(msg)) => format!("  [scroll ↑{n}] {title}    {msg}"),
+        (n, None) => {
             format!("  [scroll ↑{n}] {title}    Esc live · PgUp/PgDn move · Ctrl-\\ background")
         }
     }
@@ -1028,7 +1031,7 @@ mod tests {
         );
     }
 
-    /// The live bar shows notices while the scrollback bar keeps its key hints.
+    /// Both bars swap their key hints for an active notice.
     #[test]
     fn attached_bar_swaps_the_hint_for_an_active_notice() {
         assert_eq!(
@@ -1040,8 +1043,12 @@ mod tests {
             "  [attached] cargo test    copied 5 chars"
         );
         assert_eq!(
-            attached_bar("cargo test", 3, Some("copied 5 chars")),
+            attached_bar("cargo test", 3, None),
             "  [scroll ↑3] cargo test    Esc live · PgUp/PgDn move · Ctrl-\\ background"
+        );
+        assert_eq!(
+            attached_bar("cargo test", 3, Some("copied 5 chars")),
+            "  [scroll ↑3] cargo test    copied 5 chars"
         );
     }
 
