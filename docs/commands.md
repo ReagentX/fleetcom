@@ -49,7 +49,7 @@
 
 The `∙` glyph and the Idle section both apply after 10 seconds without output.
 
-### Input and lifecycle mechanics
+### Input and task lifecycle
 
 #### Peek vs. attach
 
@@ -57,7 +57,11 @@ The `∙` glyph and the Idle section both apply after 10 seconds without output.
 
 #### Attach and background
 
-While attached, `Ctrl-\` returns to the dashboard. Other supported keys, including `Ctrl-C`, `Ctrl-Z`, and `Ctrl-D`, are forwarded to the child. The daemon encodes cursor keys against the child's live cursor-key mode: unmodified cursor keys use `SS3` in application-cursor mode (`ESC O A` for Up), while modified cursor keys use `CSI`. Function keys, modified navigation (e.g. `Alt+Left`), and standard `Ctrl` combinations are included. `Ctrl-\` refers to the physical chord; the input handler accepts both `Ctrl-\` and crossterm's `Ctrl-4` representation of that chord.
+Attached mode gives the child control of terminal input. `Ctrl-\` returns to the dashboard; other supported keys, including `Ctrl-C`, `Ctrl-Z`, and `Ctrl-D`, are forwarded to the child.
+
+Cursor-key encoding follows the child's live cursor-key mode. In application-cursor mode, unmodified cursor keys use `SS3` (`ESC O A` for Up); modified cursor keys use `CSI`. Function keys, modified navigation such as `Alt+Left`, and standard `Ctrl` combinations are also supported.
+
+`Ctrl-\` names the physical chord. Crossterm may report the same chord as `Ctrl-4`, so `fleetcom` accepts both representations.
 
 #### Modified keys, paste, and mouse input
 
@@ -77,19 +81,37 @@ Attached children do not receive kitty keyboard-protocol or application-keypad s
 
 #### Scrollback
 
-Tasks retain 2,000 lines of scrollback by default. `--scrollback <lines>` or the `FLEETCOM_SCROLLBACK` environment variable overrides the depth (the flag wins), clamped to 100,000; `0` disables scrollback, and an unparsable env value falls back to the default rather than failing startup. The value is read when a supervisor starts, so it applies to a `--foreground` run or to a daemon the invocation autostarts. An already-running daemon keeps its depth until `fleetcom --kill`. While attached to an inline child, wheel-up over its output enters scrollback; `Shift+PageUp` also enters it (`Ctrl+PageUp` and `Alt+PageUp` work when Shift is intercepted). The status bar shows `[scroll ↑N]`. The wheel scrolls, `PageUp`/`PageDown` move by pages, `↑`/`↓` by lines, and `Home` jumps to the oldest row. A left drag selects displayed history; release copies it with the same trimming and concealment rules as live-screen selection. Scrolling or leaving scrollback cancels an in-progress drag. `Esc`, `Enter`, `q`, `End`, or reaching the bottom returns to live output. Typing also returns to live and forwards the key. Detaching or switching tasks resets the view.
+Each task retains 2,000 lines of scrollback by default. `--scrollback <lines>` or `FLEETCOM_SCROLLBACK` overrides the depth, with the flag taking precedence. Values are capped at 100,000 lines; `0` disables scrollback, and an unparsable environment value falls back to the default instead of failing startup.
 
-#### Destroy is Shift-gated
+The supervisor reads this setting when it starts. It therefore applies to a `--foreground` run or a daemon started by the current invocation. An existing daemon keeps its configured depth until `fleetcom --kill`.
 
-`X` kills a running task or removes a finished one. Removal also terminates remaining processes in the task's process group, escalating from `TERM` to `KILL` after two seconds. Lowercase `x` and Ctrl-X do nothing.
+While attached to an inline child, wheel-up over its output enters scrollback. `Shift+PageUp` also enters it; `Ctrl+PageUp` and `Alt+PageUp` provide alternatives when the terminal intercepts Shift. The status bar shows the current offset as `[scroll ↑N]`.
 
-#### Rerun
+Once open, the wheel scrolls by three lines. `PageUp` and `PageDown` move by pages, `↑` and `↓` move by one line, and `Home` jumps to the oldest retained row. A left drag selects the displayed history; release copies it using the same trimming and concealment rules as live-screen selection. Scrolling cancels an active drag.
 
-`r` re-executes a *finished* task in the same directory, using the environment of the client that requested the rerun. Most tasks reuse their stored command. A supported `claude`, `codex`, or `grok` task instead uses its captured resume command when a valid conversation ID is available. The task retains its ID, `◆` tag, group, name, and spawn order; its clock and screen reset. Because lifecycle participates in sorting, the task can move to another section when it starts running again. A running task is left untouched because rerunning it would require a destructive kill first. The same key works inside peek, keeping the task visible while the replacement starts.
+`Esc`, `Enter`, `q`, `End`, or reaching the bottom returns to live output. Typing returns to live output and forwards the key to the child; `Ctrl-\` backgrounds the task as usual. Leaving scrollback cancels an active drag, while detaching or switching tasks resets the view.
 
-#### Detach vs. quit
+#### Destroying tasks
 
-From the dashboard, `q` or `Ctrl-C` disconnects the client and leaves the daemon and its tasks running; the next `fleetcom` reattaches. `Q` stops the daemon after sending `TERM` to each task's process group, then `KILL` after a 2 s grace. Processes that have moved to another group are outside this sweep. A `TERM`-ignoring member can also survive if its leader exits during shutdown, because checking group emptiness releases the process-group ID reservation before escalation (see [Shutdown is graceful-first](README.md#shutdown-is-graceful-first)). Outside attached mode, `Ctrl-C` disconnects the client; while attached, it belongs to the child. In prompts and pickers, `Esc` cancels without disconnecting.
+Destroy is Shift-gated: only uppercase `X` acts. It kills a running task or removes a finished one. Removal also terminates remaining processes in the task's process group, escalating from `TERM` to `KILL` after two seconds. Lowercase `x` and `Ctrl-X` do nothing.
+
+#### Rerunning tasks
+
+`r` acts only on a finished task. A running task remains untouched because rerunning it would first require a destructive kill.
+
+The replacement starts in the same directory using the requesting client's environment. Most tasks reuse their stored command. A supported `claude`, `codex`, or `grok` task instead uses its captured resume command when a valid conversation ID is available.
+
+Rerunning preserves the task's ID, `◆` tag, group, name, and spawn order; its clock and screen reset. Since lifecycle affects sorting, the task may move to another section when it starts. The same key works inside peek, which remains open while the replacement starts.
+
+#### Disconnecting and quitting
+
+Input meaning depends on the active surface. From the dashboard, `q` or `Ctrl-C` disconnects the client. A daemon and its tasks continue running, so the next `fleetcom` invocation reconnects. Under `--foreground`, the in-process core exits with the client and its tasks die. While attached, `Ctrl-C` belongs to the child. In prompts and pickers, `Esc` cancels without disconnecting.
+
+Uppercase `Q` stops the daemon and terminates each task's process group. Shutdown sends `TERM` first, then `KILL` after a two-second grace period. Processes that have moved into another group are outside this sweep.
+
+A `TERM`-ignoring member can also survive when its leader exits during shutdown. The group-emptiness check then releases the process-group ID reservation before escalation; [Shutdown is graceful-first](README.md#shutdown-is-graceful-first) explains the tradeoff.
+
+### Task organization
 
 #### Grouping and tagging
 
