@@ -2579,6 +2579,82 @@ fn one_row_terminal_has_no_selectable_pane() {
     assert!(app.pending_clipboard.is_empty(), "nothing may copy");
 }
 
+impl App {
+    /// Put an attached fixture into scrollback at the given offset.
+    fn enter_scrollback(&mut self, offset: usize) {
+        self.view_scroll = true;
+        if let Some(s) = self.focused_screen.as_mut() {
+            s.scrollback = offset;
+        }
+    }
+}
+
+/// A drag in scrollback copies the displayed history rows.
+#[test]
+fn scrollback_drag_copies_the_displayed_history_rows() {
+    let mut app = App::attached_with_lines(&["old line one", "old line two"]);
+    app.enter_scrollback(5);
+    app.on_mouse(press(0, 4));
+    app.on_mouse(drag_to(1, 7));
+    app.on_mouse(release(1, 7));
+    assert_eq!(
+        app.pending_clipboard,
+        vec![(ClipboardKind::Clipboard, "line one\nold line".to_string())]
+    );
+    assert!(app.selection.is_none(), "release must clear the selection");
+}
+
+/// A scrollback wheel event cancels the drag without leaving scrollback.
+#[test]
+fn scrollback_wheel_cancels_the_drag() {
+    let mut app = App::attached_with_lines(&["old line one"]);
+    app.enter_scrollback(5);
+    app.on_mouse(press(0, 0));
+    app.on_mouse(drag_to(0, 4));
+    assert!(app.selection.is_some(), "premise: a drag is live");
+    app.on_mouse(left(MouseEventKind::ScrollUp, 0, 0));
+    assert!(app.selection.is_none(), "wheel must drop the drag");
+    assert!(app.view_scroll, "the view stays in scrollback");
+    app.on_mouse(release(0, 4));
+    assert!(app.pending_clipboard.is_empty(), "a cancel is not a copy");
+}
+
+/// Scrollback navigation and exit keys cancel an active drag.
+#[test]
+fn scrollback_keys_clear_the_drag() {
+    let mut out = io::stdout();
+    let mut app = App::attached_with_lines(&["old line one"]);
+    app.enter_scrollback(5);
+    app.on_mouse(press(0, 0));
+    app.on_mouse(drag_to(0, 4));
+    assert!(app.selection.is_some(), "premise: a drag is live");
+    app.on_key_attached(&mut out, KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE))
+        .unwrap();
+    assert!(app.selection.is_none(), "navigation must drop the drag");
+
+    app.on_mouse(press(0, 0));
+    app.on_mouse(drag_to(0, 4));
+    app.on_key_attached(&mut out, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+        .unwrap();
+    assert!(!app.view_scroll, "Esc exits to live");
+    assert!(app.selection.is_none(), "the exit must drop the drag");
+}
+
+/// A live frame exits scrollback and cancels a drag over replaced history rows.
+#[test]
+fn live_return_frame_clears_a_scrollback_drag() {
+    let mut app = App::attached_with_lines(&["old line one"]);
+    app.enter_scrollback(5);
+    app.on_mouse(press(0, 0));
+    app.on_mouse(drag_to(0, 4));
+    assert!(app.selection.is_some(), "premise: a drag is live");
+    let mut live = app.focused_screen.clone().expect("screen");
+    live.scrollback = 0;
+    app.on_screen(live);
+    assert!(!app.view_scroll, "a live frame exits the view");
+    assert!(app.selection.is_none(), "the exit must drop the drag");
+}
+
 /// With a mouse-aware child the left button forwards: the SGR
 /// press/drag/release bytes reach the child's PTY, and no selection
 /// state forms.

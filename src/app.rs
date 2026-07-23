@@ -234,8 +234,8 @@ pub struct App {
     mouse_captured: bool,
     /// Whether the attached task is displaying scrollback.
     view_scroll: bool,
-    /// Active live-screen drag selection in attached-pane cell coordinates.
-    /// Cleared when its attachment context or viewport changes, mouse reporting
+    /// Active drag selection over the attached pane's displayed rows. Cleared
+    /// when its attachment context or viewport changes, child mouse reporting
     /// takes over, or host mouse capture ends.
     selection: Option<Selection>,
 }
@@ -446,7 +446,7 @@ impl App {
         self.focused_screen.as_ref().filter(|s| s.id == id)
     }
 
-    /// The active live-screen selection displayed by the attached overlay.
+    /// The active selection displayed by the attached overlay.
     pub fn selection(&self) -> Option<&Selection> {
         self.selection.as_ref()
     }
@@ -631,15 +631,7 @@ impl App {
                 // The handshake is handled before the transport is created.
                 Event::HelloOk => {}
                 Event::Tasks(v) => self.views = v,
-                Event::Screen(s) => {
-                    // Exit only after a nonzero offset returns to live, so a
-                    // pre-entry screen update cannot immediately exit the view.
-                    let prev = self.focused_screen.as_ref().map_or(0, |p| p.scrollback);
-                    if self.view_scroll && prev > 0 && s.scrollback == 0 {
-                        self.view_scroll = false;
-                    }
-                    self.focused_screen = Some(s);
-                }
+                Event::Screen(s) => self.on_screen(s),
                 Event::Status(s) => {
                     // Mirror attached-mode status messages into the visible notice bar.
                     if self.mode == Mode::Attached {
@@ -660,6 +652,19 @@ impl App {
                 }
             }
         }
+    }
+
+    /// Apply a screen frame and leave scrollback when its viewport returns live.
+    fn on_screen(&mut self, s: ScreenView) {
+        // A live frame ends an established scrollback view. Requiring a prior
+        // nonzero offset prevents an already-queued live frame from canceling entry.
+        let prev = self.focused_screen.as_ref().map_or(0, |p| p.scrollback);
+        if self.view_scroll && prev > 0 && s.scrollback == 0 {
+            self.view_scroll = false;
+            // The live rows invalidate a drag anchored to history rows.
+            self.selection = None;
+        }
+        self.focused_screen = Some(s);
     }
 
     /// Queue a clipboard store only when it comes from the attached task.
@@ -1284,6 +1289,8 @@ impl App {
         // Keep one row of overlap between pages.
         let page = self.pane_rows().saturating_sub(1).max(1);
         if self.view_scroll {
+            // Scrollback keys can replace the displayed rows, invalidating the drag.
+            self.selection = None;
             // Scrollback navigation is not forwarded to the child.
             match k.code {
                 KeyCode::PageUp => self.send_scrollback(ScrollAction::Up(page)),
@@ -1365,8 +1372,8 @@ impl App {
         }
     }
 
-    /// Route mouse input to dashboard or peek navigation, attached scrollback,
-    /// live-screen selection, or the attached child's PTY.
+    /// Route mouse input to dashboard or peek navigation, attached-pane
+    /// selection and scrollback, or the attached child's PTY.
     fn on_mouse(&mut self, m: MouseEvent) {
         let btn = |b: MouseButton| match b {
             MouseButton::Left => MouseBtn::Left,
@@ -1389,12 +1396,25 @@ impl App {
                 _ => {}
             },
             Mode::Attached => {
-                // The wheel navigates scrollback instead of the child.
+                // In scrollback, the wheel moves the viewport and left-button
+                // gestures select displayed history. The child receives no mouse
+                // events while history is visible.
                 if self.view_scroll {
                     match kind {
-                        MouseKind::WheelUp => self.send_scrollback(ScrollAction::Up(3)),
-                        MouseKind::WheelDown => self.send_scrollback(ScrollAction::Down(3)),
-                        _ => {}
+                        // Scrolling can replace the rows beneath the drag.
+                        MouseKind::WheelUp => {
+                            self.selection = None;
+                            self.send_scrollback(ScrollAction::Up(3));
+                        }
+                        MouseKind::WheelDown => {
+                            self.selection = None;
+                            self.send_scrollback(ScrollAction::Down(3));
+                        }
+                        _ => {
+                            if let Some(id) = self.focused_id {
+                                self.on_selection_gesture(id, kind, m.row, m.column);
+                            }
+                        }
                     }
                     return;
                 }
@@ -1405,44 +1425,11 @@ impl App {
                         match kind {
                             // Wheel navigation cancels the active drag.
                             MouseKind::WheelUp | MouseKind::WheelDown => self.selection = None,
-                            MouseKind::Press(MouseBtn::Left) => {
-                                // A selection needs the rest of its gesture
-                                let fresh = self
-                                    .screen_for(id)
-                                    .is_some_and(|s| s.lines.len() == self.pane_rows() as usize);
-                                self.selection = (self.mouse_captured
-                                    && fresh
-                                    && m.row < self.rows.saturating_sub(1))
-                                .then(|| {
-                                    Selection::begin(
-                                        m.row,
-                                        m.column.min(self.cols.saturating_sub(1)),
-                                    )
-                                });
-                                if self.selection.is_some() {
+                            _ => {
+                                if self.on_selection_gesture(id, kind, m.row, m.column) {
                                     return;
                                 }
                             }
-                            MouseKind::Drag(MouseBtn::Left) if self.selection.is_some() => {
-                                let row = m.row.min(self.pane_rows().saturating_sub(1));
-                                let col = m.column.min(self.cols.saturating_sub(1));
-                                if let Some(sel) = self.selection.as_mut() {
-                                    sel.extend(row, col);
-                                }
-                                return;
-                            }
-                            MouseKind::Release(MouseBtn::Left) if self.selection.is_some() => {
-                                // The release cell is the final head, including
-                                // for flicks with no intermediate drag event.
-                                let row = m.row.min(self.pane_rows().saturating_sub(1));
-                                let col = m.column.min(self.cols.saturating_sub(1));
-                                if let Some(sel) = self.selection.as_mut() {
-                                    sel.extend(row, col);
-                                }
-                                self.finish_selection(id);
-                                return;
-                            }
-                            _ => {}
                         }
                     } else if self.selection.is_some() {
                         // Mouse reporting can turn on mid-gesture. Discard the
@@ -1468,6 +1455,42 @@ impl App {
                 }
             }
             _ => {}
+        }
+    }
+
+    /// Handle a non-wheel drag-selection event over displayed live or scrollback
+    /// rows. The live view forwards unconsumed events to the child.
+    fn on_selection_gesture(&mut self, id: u64, kind: MouseKind, row: u16, col: u16) -> bool {
+        match kind {
+            MouseKind::Press(MouseBtn::Left) => {
+                let fresh = self
+                    .screen_for(id)
+                    .is_some_and(|s| s.lines.len() == self.pane_rows() as usize);
+                self.selection =
+                    (self.mouse_captured && fresh && row < self.rows.saturating_sub(1))
+                        .then(|| Selection::begin(row, col.min(self.cols.saturating_sub(1))));
+                self.selection.is_some()
+            }
+            MouseKind::Drag(MouseBtn::Left) if self.selection.is_some() => {
+                let row = row.min(self.pane_rows().saturating_sub(1));
+                let col = col.min(self.cols.saturating_sub(1));
+                if let Some(sel) = self.selection.as_mut() {
+                    sel.extend(row, col);
+                }
+                true
+            }
+            MouseKind::Release(MouseBtn::Left) if self.selection.is_some() => {
+                // The release cell is the final head, including for flicks
+                // with no intermediate drag event.
+                let row = row.min(self.pane_rows().saturating_sub(1));
+                let col = col.min(self.cols.saturating_sub(1));
+                if let Some(sel) = self.selection.as_mut() {
+                    sel.extend(row, col);
+                }
+                self.finish_selection(id);
+                true
+            }
+            _ => false,
         }
     }
 

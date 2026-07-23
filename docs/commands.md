@@ -59,18 +59,25 @@ The `∙` glyph and the Idle section both apply after 10 seconds without output.
 
 While attached, `Ctrl-\` returns to the dashboard. Other supported keys, including `Ctrl-C`, `Ctrl-Z`, and `Ctrl-D`, are forwarded to the child. The daemon encodes cursor keys against the child's live cursor-key mode: unmodified cursor keys use `SS3` in application-cursor mode (`ESC O A` for Up), while modified cursor keys use `CSI`. Function keys, modified navigation (e.g. `Alt+Left`), and standard `Ctrl` combinations are included. `Ctrl-\` refers to the physical chord; the input handler accepts both `Ctrl-\` and crossterm's `Ctrl-4` representation of that chord.
 
-#### Shift+Enter, paste, and the wheel
+#### Modified keys, paste, and mouse input
 
-Modified Enter, paste, and mouse input require state-dependent encoding:
+These inputs cannot all be forwarded byte-for-byte. Their encoding and destination depend on the terminal and the attached child's modes.
 
-- Shift+Enter and Alt+Enter are sent as `ESC CR`, which is distinct from plain Enter. Shift requires a terminal that reports modified keys; terminals that do not report it send plain `CR`.
-- Paste travels as one message. Bracketed-paste-aware children receive paste markers with embedded terminators removed; other children receive line endings as `CR`. `fleetcom` text fields strip control characters.
-- Mouse-protocol children receive clicks, drags, releases, and wheel events in the negotiated encoding. Full-screen children without a mouse protocol use alternate scroll when enabled. For a live child without mouse reporting, a left drag selects child-screen text whenever `fleetcom` owns mouse capture: on inline screens and in full-screen programs that disable alternate scroll. Release copies the highlighted span to the system clipboard via OSC 52 and shows a `copied N chars` status-bar notice. Trailing padding is trimmed from each selected row, and concealed (SGR 8) cells copy as the blanks shown on screen. Whenever `fleetcom` captures the mouse, terminal-native selection requires the terminal's selection-override modifier (typically Shift) and covers the terminal's view, including `fleetcom`'s chrome. On the dashboard, in peek, and in full-screen programs using alternate scroll, drag remains terminal-native.
-- Attached children do not receive kitty keyboard-protocol or application-keypad sequences. Keypad digits send their normal characters.
+Shift+Enter and Alt+Enter send `ESC CR` rather than plain `CR`. If the terminal does not report modified keys, `fleetcom` cannot distinguish Shift+Enter from Enter and forwards plain `CR`.
+
+Paste travels as one message. For bracketed-paste-aware children, `fleetcom` adds paste markers and removes embedded terminators. Otherwise, it converts line endings to `CR`. Its own text fields strip control characters.
+
+Mouse routing follows the child's reported modes. A mouse-aware child receives clicks, drags, releases, and wheel events in the negotiated encoding. For a full-screen child without mouse reporting, the terminal's alternate-scroll mode handles the wheel when enabled.
+
+Selection depends on who owns mouse input. When `fleetcom` has capture, a left drag selects child-screen text on inline screens, in full-screen programs that disable alternate scroll, and in scrollback. While scrollback is visible, `fleetcom` keeps capture and never forwards mouse events to the child. Release copies the highlighted span to the system clipboard via OSC 52 and shows a `copied N chars` status-bar notice. Trailing padding is trimmed from each selected row, and concealed (SGR 8) cells copy as the blanks shown on screen.
+
+Terminal-native selection remains available under capture through the terminal's override modifier, typically Shift. This selects across the terminal's entire view, including `fleetcom`'s chrome. On the dashboard, in peek, and in full-screen programs using alternate scroll, the terminal owns drag selection directly.
+
+Attached children do not receive kitty keyboard-protocol or application-keypad sequences. Keypad digits send their normal characters.
 
 #### Scrollback
 
-Tasks retain 2,000 lines of scrollback by default. `--scrollback <lines>` or the `FLEETCOM_SCROLLBACK` environment variable overrides the depth (the flag wins), clamped to 100,000; `0` disables scrollback, and an unparseable env value falls back to the default rather than failing startup. The value is read when a supervisor starts, so it applies to a `--foreground` run or to a daemon the invocation autostarts. An already-running daemon keeps its depth until `fleetcom --kill`. While attached to an inline child, wheel-up over its output enters scrollback; `Shift+PageUp` also enters it (`Ctrl+PageUp` and `Alt+PageUp` work when Shift is intercepted). The status bar shows `[scroll ↑N]`. The wheel scrolls, `PageUp`/`PageDown` move by pages, `↑`/`↓` by lines, and `Home` jumps to the oldest row. `Esc`, `Enter`, `q`, `End`, or reaching the bottom returns to live output. Typing also returns to live and forwards the key. Detaching or switching tasks resets the view.
+Tasks retain 2,000 lines of scrollback by default. `--scrollback <lines>` or the `FLEETCOM_SCROLLBACK` environment variable overrides the depth (the flag wins), clamped to 100,000; `0` disables scrollback, and an unparsable env value falls back to the default rather than failing startup. The value is read when a supervisor starts, so it applies to a `--foreground` run or to a daemon the invocation autostarts. An already-running daemon keeps its depth until `fleetcom --kill`. While attached to an inline child, wheel-up over its output enters scrollback; `Shift+PageUp` also enters it (`Ctrl+PageUp` and `Alt+PageUp` work when Shift is intercepted). The status bar shows `[scroll ↑N]`. The wheel scrolls, `PageUp`/`PageDown` move by pages, `↑`/`↓` by lines, and `Home` jumps to the oldest row. A left drag selects displayed history; release copies it with the same trimming and concealment rules as live-screen selection. Scrolling or leaving scrollback cancels an in-progress drag. `Esc`, `Enter`, `q`, `End`, or reaching the bottom returns to live output. Typing also returns to live and forwards the key. Detaching or switching tasks resets the view.
 
 #### Destroy is Shift-gated
 
