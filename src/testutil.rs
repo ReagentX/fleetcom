@@ -7,6 +7,7 @@ use std::{
     fs,
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
+    process::Command,
     time::{Duration, Instant, SystemTime},
 };
 
@@ -54,6 +55,14 @@ pub(crate) fn read_pid(path: &Path) -> nix::unistd::Pid {
         pid.is_some()
     });
     nix::unistd::Pid::from_raw(pid.expect("pid file never appeared"))
+}
+
+/// Return the PID of a child process after reaping it.
+pub(crate) fn dead_pid() -> u32 {
+    let mut child = Command::new("sh").arg("-c").arg("exit 0").spawn().unwrap();
+    let pid = child.id();
+    child.wait().unwrap();
+    pid
 }
 
 /// Return this process's working directory.

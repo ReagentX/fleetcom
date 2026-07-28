@@ -1,16 +1,25 @@
 use std::path::Path;
 
 use super::*;
-use crate::protocol::{Key, Mods};
-use crate::testutil::{
-    here, install_fake_notifier, now_ms, read_pid, sh_env, wait_until, write_executable,
-    write_rollout,
+use crate::{
+    protocol::{ClipboardKind, Key, Mods},
+    testutil::{
+        here, install_fake_notifier, now_ms, read_pid, sh_env, wait_until, write_executable,
+        write_rollout,
+    },
 };
 
 /// Build a supervisor with this process's launch context.
 fn sup(rows: u16, cols: u16) -> Supervisor {
     let mut s = Supervisor::new(rows, cols, 2000);
     s.set_launch_context(LaunchContext::here());
+    s
+}
+
+/// Build a default-size supervisor with `ctx` installed.
+fn sup_ctx(ctx: LaunchContext) -> Supervisor {
+    let mut s = Supervisor::new(24, 80, 2000);
+    s.set_launch_context(ctx);
     s
 }
 
@@ -525,6 +534,31 @@ fn first_id(s: &mut Supervisor) -> u64 {
     }
 }
 
+/// Tick once and return task `id` from the emitted snapshot.
+fn view_of(s: &mut Supervisor, id: u64) -> TaskView {
+    s.tick();
+    for e in s.drain() {
+        if let Event::Tasks(v) = e
+            && let Some(t) = v.iter().find(|t| t.id == id)
+        {
+            return t.clone();
+        }
+    }
+    panic!("task {id} missing from the snapshot");
+}
+
+/// Launch context with `FLEETCOM_CONFIG_DIR` and optional environment entries.
+fn config_ctx(config: &Path, cwd: PathBuf, extra: &[(&str, &str)]) -> LaunchContext {
+    let mut env: Vec<(std::ffi::OsString, std::ffi::OsString)> = vec![(
+        "FLEETCOM_CONFIG_DIR".into(),
+        config.as_os_str().to_os_string(),
+    )];
+    for (k, v) in extra {
+        env.push(((*k).into(), (*v).into()));
+    }
+    LaunchContext { env, cwd }
+}
+
 /// Poll ticks until the task's lifecycle satisfies `pred`, or fail.
 fn wait_for_lifecycle(
     s: &mut Supervisor,
@@ -861,26 +895,14 @@ fn set_group_round_trips_and_clears() {
     let mut s = sup(24, 80);
     spawn(&mut s, "sleep 30", here());
     let id = first_id(&mut s);
-    let group_of = |s: &mut Supervisor| -> Option<String> {
-        s.tick();
-        for e in s.drain() {
-            if let Event::Tasks(v) = e
-                && let Some(t) = v.iter().find(|t| t.id == id)
-            {
-                return t.group.clone();
-            }
-        }
-        panic!("task {id} missing from the snapshot");
-    };
-
     s.apply(Command::SetGroup {
         id,
         group: Some("  api  ".into()),
     });
-    assert_eq!(group_of(&mut s), Some("api".into()));
+    assert_eq!(view_of(&mut s, id).group, Some("api".into()));
 
     s.apply(Command::SetGroup { id, group: None });
-    assert_eq!(group_of(&mut s), None);
+    assert_eq!(view_of(&mut s, id).group, None);
 
     // Unknown id: no panic, no event, no state change.
     s.apply(Command::SetGroup {
@@ -888,7 +910,7 @@ fn set_group_round_trips_and_clears() {
         group: Some("ghost".into()),
     });
     assert!(s.drain().is_empty(), "unknown-id SetGroup must stay silent");
-    assert_eq!(group_of(&mut s), None);
+    assert_eq!(view_of(&mut s, id).group, None);
 }
 
 /// `SetName` normalizes assignments, keeps the literal `Unassigned`
@@ -898,33 +920,21 @@ fn set_name_round_trips_and_clears() {
     let mut s = sup(24, 80);
     spawn(&mut s, "sleep 30", here());
     let id = first_id(&mut s);
-    let name_of = |s: &mut Supervisor| -> Option<String> {
-        s.tick();
-        for e in s.drain() {
-            if let Event::Tasks(v) = e
-                && let Some(t) = v.iter().find(|t| t.id == id)
-            {
-                return t.name.clone();
-            }
-        }
-        panic!("task {id} missing from the snapshot");
-    };
-
     s.apply(Command::SetName {
         id,
         name: Some("  api \x1b[2J ".into()),
     });
-    assert_eq!(name_of(&mut s), Some("api [2J".into()));
+    assert_eq!(view_of(&mut s, id).name, Some("api [2J".into()));
 
     // The group picker's reserved label has no meaning for names.
     s.apply(Command::SetName {
         id,
         name: Some("Unassigned".into()),
     });
-    assert_eq!(name_of(&mut s), Some("Unassigned".into()));
+    assert_eq!(view_of(&mut s, id).name, Some("Unassigned".into()));
 
     s.apply(Command::SetName { id, name: None });
-    assert_eq!(name_of(&mut s), None);
+    assert_eq!(view_of(&mut s, id).name, None);
 
     // Unknown id: no panic, no event, no state change.
     s.apply(Command::SetName {
@@ -932,7 +942,81 @@ fn set_name_round_trips_and_clears() {
         name: Some("ghost".into()),
     });
     assert!(s.drain().is_empty(), "unknown-id SetName must stay silent");
-    assert_eq!(name_of(&mut s), None);
+    assert_eq!(view_of(&mut s, id).name, None);
+}
+
+/// Killing an unknown id does not signal a live task.
+#[test]
+fn kill_with_an_unknown_id_leaves_the_live_task_alone() {
+    let mut s = sup(24, 80);
+    spawn(&mut s, "sleep 30", here());
+    let id = first_id(&mut s);
+    let before = view_of(&mut s, id).lifecycle;
+
+    s.apply(Command::Kill { id: 999 });
+    assert!(s.drain().is_empty(), "unknown-id Kill must stay silent");
+    assert!(
+        !s.tasks[0].overdue(Instant::now(), Duration::ZERO),
+        "unknown-id Kill must not signal the live task"
+    );
+    assert_eq!(view_of(&mut s, id).lifecycle, before);
+}
+
+/// Tagging an unknown id does not change a live task's tag.
+#[test]
+fn tag_with_an_unknown_id_leaves_the_live_task_alone() {
+    let mut s = sup(24, 80);
+    spawn(&mut s, "sleep 30", here());
+    let id = first_id(&mut s);
+    s.apply(Command::Tag { id, on: true });
+    assert!(view_of(&mut s, id).tagged);
+
+    s.apply(Command::Tag { id: 999, on: false });
+    assert!(s.drain().is_empty(), "unknown-id Tag must stay silent");
+    assert!(
+        view_of(&mut s, id).tagged,
+        "unknown-id Tag must not clear the live task's flag"
+    );
+}
+
+/// Scrolling an unknown id does not change a live task's viewport.
+#[test]
+fn scrollback_with_an_unknown_id_leaves_the_live_task_alone() {
+    // Short grid: history accrues within a few rows of output.
+    let mut s = sup(6, 80);
+    spawn(&mut s, "seq 1 200; sleep 30", here());
+    let id = first_id(&mut s);
+    s.apply(Command::Watch {
+        id: Some(id),
+        attached: true,
+    });
+
+    // Retry until output has produced retained history.
+    let scrolled = wait_until(Duration::from_secs(5), || {
+        s.tick();
+        let _ = s.drain();
+        s.apply(Command::Scrollback {
+            id,
+            action: ScrollAction::Up(3),
+        });
+        s.tasks[0].scroll_offset() > 0
+    });
+    assert!(scrolled, "the task never accrued scrollback");
+    let offset = s.tasks[0].scroll_offset();
+
+    s.apply(Command::Scrollback {
+        id: 999,
+        action: ScrollAction::Live,
+    });
+    assert!(
+        s.drain().is_empty(),
+        "unknown-id Scrollback must stay silent"
+    );
+    assert_eq!(
+        s.tasks[0].scroll_offset(),
+        offset,
+        "unknown-id Scrollback must not snap the live task's viewport"
+    );
 }
 
 /// Spawned tasks expose their normalized initial group in the first snapshot.
@@ -1448,14 +1532,7 @@ fn shutdown_is_prompt_when_every_group_is_already_empty() {
 fn session_commands_use_the_launch_context_config_dir() {
     let dir = scratch("sess_root");
     let config = dir.join("config");
-    let mut s = Supervisor::new(24, 80, 2000);
-    s.set_launch_context(LaunchContext {
-        env: vec![(
-            "FLEETCOM_CONFIG_DIR".into(),
-            config.clone().into_os_string(),
-        )],
-        cwd: dir.clone(),
-    });
+    let mut s = sup_ctx(config_ctx(&config, dir.clone(), &[]));
 
     s.apply(Command::SaveSession { name: "ctx".into() });
     assert!(
@@ -1486,22 +1563,20 @@ fn session_commands_use_the_launch_context_config_dir() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Saving and loading preserve group assignments.
+/// Saving and loading preserve independent group and display-name fields.
 #[test]
-fn load_session_restores_saved_groups() {
-    let dir = scratch("sess_groups");
+fn load_session_restores_saved_groups_and_names() {
+    let dir = scratch("sess_labels");
     let config = dir.join("config");
-    let ctx = LaunchContext {
-        env: vec![(
-            "FLEETCOM_CONFIG_DIR".into(),
-            config.clone().into_os_string(),
-        )],
-        cwd: dir.clone(),
-    };
-    let mut s = Supervisor::new(24, 80, 2000);
-    s.set_launch_context(ctx.clone());
-    spawn_grouped(&mut s, "sleep 30", dir.clone(), "api");
+    let ctx = config_ctx(&config, dir.clone(), &[]);
+    let mut s = sup_ctx(ctx.clone());
     spawn(&mut s, "sleep 31", dir.clone());
+    let id = first_id(&mut s);
+    s.apply(Command::SetName {
+        id,
+        name: Some("web".into()),
+    });
+    spawn_grouped(&mut s, "sleep 30", dir.clone(), "api");
     s.apply(Command::SaveSession {
         name: "fleet".into(),
     });
@@ -1512,8 +1587,7 @@ fn load_session_restores_saved_groups() {
         "save must still count commands"
     );
 
-    let mut fresh = Supervisor::new(24, 80, 2000);
-    fresh.set_launch_context(ctx);
+    let mut fresh = sup_ctx(ctx);
     fresh.apply(Command::LoadSession {
         name: "fleet".into(),
     });
@@ -1526,72 +1600,23 @@ fn load_session_restores_saved_groups() {
             _ => None,
         })
         .expect("a Tasks snapshot after load");
-    let group_of = |cmd: &str| {
-        tasks
+    let by_cmd = |cmd: &str| {
+        let t = tasks
             .iter()
             .find(|t| t.command == cmd)
-            .unwrap_or_else(|| panic!("task '{cmd}' missing after load"))
-            .group
-            .clone()
+            .unwrap_or_else(|| panic!("task '{cmd}' missing after load"));
+        (t.group.clone(), t.name.clone())
     };
-    assert_eq!(group_of("sleep 30"), Some("api".into()));
-    assert_eq!(group_of("sleep 31"), None);
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
-/// Saving and loading preserve display names.
-#[test]
-fn load_session_restores_saved_names() {
-    let dir = scratch("sess_names");
-    let config = dir.join("config");
-    let ctx = LaunchContext {
-        env: vec![(
-            "FLEETCOM_CONFIG_DIR".into(),
-            config.clone().into_os_string(),
-        )],
-        cwd: dir.clone(),
-    };
-    let mut s = Supervisor::new(24, 80, 2000);
-    s.set_launch_context(ctx.clone());
-    spawn(&mut s, "sleep 30", dir.clone());
-    spawn(&mut s, "sleep 31", dir.clone());
-    s.tick();
-    let id = match s.drain().first() {
-        Some(Event::Tasks(v)) => v.iter().find(|t| t.command == "sleep 30").unwrap().id,
-        _ => panic!("expected a Tasks snapshot"),
-    };
-    s.apply(Command::SetName {
-        id,
-        name: Some("api server".into()),
-    });
-    s.apply(Command::SaveSession {
-        name: "fleet".into(),
-    });
-
-    let mut fresh = Supervisor::new(24, 80, 2000);
-    fresh.set_launch_context(ctx);
-    fresh.apply(Command::LoadSession {
-        name: "fleet".into(),
-    });
-    fresh.tick();
-    let evs = fresh.drain();
-    let tasks = evs
-        .iter()
-        .find_map(|e| match e {
-            Event::Tasks(v) => Some(v),
-            _ => None,
-        })
-        .expect("a Tasks snapshot after load");
-    let name_of = |cmd: &str| {
-        tasks
-            .iter()
-            .find(|t| t.command == cmd)
-            .unwrap_or_else(|| panic!("task '{cmd}' missing after load"))
-            .name
-            .clone()
-    };
-    assert_eq!(name_of("sleep 30"), Some("api server".into()));
-    assert_eq!(name_of("sleep 31"), None);
+    assert_eq!(
+        by_cmd("sleep 30"),
+        (Some("api".into()), None),
+        "the {{cmd,group}} member must restore its group and stay unnamed"
+    );
+    assert_eq!(
+        by_cmd("sleep 31"),
+        (None, Some("web".into())),
+        "the {{cmd,name}} member must restore its name and stay ungrouped"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -1609,11 +1634,7 @@ fn load_session_renormalizes_hand_edited_groups() {
         ),
     )
     .unwrap();
-    let mut s = Supervisor::new(24, 80, 2000);
-    s.set_launch_context(LaunchContext {
-        env: vec![("FLEETCOM_CONFIG_DIR".into(), config.into_os_string())],
-        cwd: dir.clone(),
-    });
+    let mut s = sup_ctx(config_ctx(&config, dir.clone(), &[]));
     s.apply(Command::LoadSession {
         name: "edited".into(),
     });
@@ -1631,18 +1652,6 @@ fn load_session_renormalizes_hand_edited_groups() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Launch context with a session directory and optional environment entries.
-fn config_ctx(config: &Path, cwd: PathBuf, extra: &[(&str, &str)]) -> LaunchContext {
-    let mut env: Vec<(std::ffi::OsString, std::ffi::OsString)> = vec![(
-        "FLEETCOM_CONFIG_DIR".into(),
-        config.as_os_str().to_os_string(),
-    )];
-    for (k, v) in extra {
-        env.push(((*k).into(), (*v).into()));
-    }
-    LaunchContext { env, cwd }
-}
-
 /// Broken JSON reports a load error rather than a missing session.
 #[test]
 fn load_surfaces_parse_errors_instead_of_absence() {
@@ -1650,8 +1659,7 @@ fn load_surfaces_parse_errors_instead_of_absence() {
     let config = dir.join("config");
     std::fs::create_dir_all(config.join("sessions")).unwrap();
     std::fs::write(config.join("sessions").join("broken.json"), "{not json").unwrap();
-    let mut s = Supervisor::new(24, 80, 2000);
-    s.set_launch_context(config_ctx(&config, dir.clone(), &[]));
+    let mut s = sup_ctx(config_ctx(&config, dir.clone(), &[]));
     s.apply(Command::LoadSession {
         name: "broken".into(),
     });
@@ -1675,8 +1683,7 @@ fn load_surfaces_parse_errors_instead_of_absence() {
 fn load_missing_session_reads_as_not_found() {
     let dir = scratch("sess_missing");
     let config = dir.join("config");
-    let mut s = Supervisor::new(24, 80, 2000);
-    s.set_launch_context(config_ctx(&config, dir.clone(), &[]));
+    let mut s = sup_ctx(config_ctx(&config, dir.clone(), &[]));
     s.apply(Command::LoadSession {
         name: "ghost".into(),
     });
@@ -1701,8 +1708,7 @@ fn load_reports_admit_failures_not_clean_success() {
         format!(r#"{{"{}": ["true", "true"]}}"#, dir.display()),
     )
     .unwrap();
-    let mut s = Supervisor::new(24, 80, 2000);
-    s.set_launch_context(config_ctx(
+    let mut s = sup_ctx(config_ctx(
         &config,
         dir.clone(),
         &[("SHELL", "/nonexistent/no-such-shell")],
@@ -1765,8 +1771,7 @@ fn load_skips_over_length_commands() {
         ),
     )
     .unwrap();
-    let mut s = Supervisor::new(24, 80, 2000);
-    s.set_launch_context(config_ctx(&config, dir.clone(), &[]));
+    let mut s = sup_ctx(config_ctx(&config, dir.clone(), &[]));
     s.apply(Command::LoadSession { name: "big".into() });
     let evs = s.drain();
     assert!(
@@ -1786,8 +1791,7 @@ fn spawn_uses_the_launch_context_env_not_the_process_env() {
     );
     let dir = scratch("hello_env");
     let out = dir.join("out");
-    let mut s = Supervisor::new(24, 80, 2000);
-    s.set_launch_context(LaunchContext {
+    let mut s = sup_ctx(LaunchContext {
         env: vec![("FLEETCOM_MARKER".into(), "xyzzy".into())],
         cwd: dir.clone(),
     });
@@ -1910,8 +1914,7 @@ fn key_command_encodes_against_live_cursor_mode() {
 
 /// Build a supervisor with recovery enabled at test-specific intervals.
 fn recovery_sup(config: &Path, cwd: PathBuf, debounce: Duration, cadence: Duration) -> Supervisor {
-    let mut s = Supervisor::new(24, 80, 2000);
-    s.set_launch_context(config_ctx(config, cwd, &[]));
+    let mut s = sup_ctx(config_ctx(config, cwd, &[]));
     s.set_recovery_timing(debounce, cadence);
     s
 }
@@ -1985,8 +1988,7 @@ fn recovery_arms_on_structural_mutations_not_tag() {
 fn list_sessions_includes_recovery_snapshots_newest_first() {
     let dir = scratch("recovery_list_wire");
     let config = dir.join("config");
-    let mut s = Supervisor::new(24, 80, 2000);
-    s.set_launch_context(config_ctx(&config, dir.clone(), &[]));
+    let mut s = sup_ctx(config_ctx(&config, dir.clone(), &[]));
 
     let rec = config.join("sessions").join("recovery");
     let entry = |cmd: &str| SessionEntry {
@@ -2043,8 +2045,7 @@ fn list_sessions_includes_recovery_snapshots_newest_first() {
 fn load_recovery_materializes_the_fleet_and_notices() {
     let dir = scratch("recovery_load_wire");
     let config = dir.join("config");
-    let mut s = Supervisor::new(24, 80, 2000);
-    s.set_launch_context(config_ctx(&config, dir.clone(), &[]));
+    let mut s = sup_ctx(config_ctx(&config, dir.clone(), &[]));
 
     let mut cfg = SessionConfig::new();
     cfg.insert(
@@ -2100,8 +2101,7 @@ fn load_recovery_materializes_the_fleet_and_notices() {
 fn load_recovery_refuses_unknown_and_traversal_stems() {
     let dir = scratch("recovery_load_refuse");
     let config = dir.join("config");
-    let mut s = Supervisor::new(24, 80, 2000);
-    s.set_launch_context(config_ctx(&config, dir.clone(), &[]));
+    let mut s = sup_ctx(config_ctx(&config, dir.clone(), &[]));
 
     s.apply(Command::LoadRecovery {
         stem: "20990101-000000-1".into(),

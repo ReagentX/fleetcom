@@ -199,8 +199,7 @@ fn run() -> io::Result<()> {
     // The interactive client requires stdout for terminal frames. Headless
     // and informational modes return before this check.
     if !io::stdout().is_terminal() {
-        eprintln!("{}", error_line("stdout is not a terminal"));
-        std::process::exit(1);
+        return Err(io::Error::other("stdout is not a terminal"));
     }
 
     // Install the value before constructing or autostarting a supervisor.
@@ -218,13 +217,8 @@ fn run() -> io::Result<()> {
     let mut app = if foreground {
         App::new_foreground(rows, cols)
     } else {
-        match App::connect(rows, cols) {
-            Ok(a) => a,
-            Err(e) => {
-                eprintln!("fleetcom: could not reach the daemon: {e}");
-                std::process::exit(1);
-            }
-        }
+        App::connect(rows, cols)
+            .map_err(|e| io::Error::other(format!("could not reach the daemon: {e}")))?
     };
 
     // Keep SIGINT's default behavior while a connection is waiting, then route

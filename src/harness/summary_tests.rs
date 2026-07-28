@@ -4,71 +4,47 @@ use super::*;
 use crate::{
     emulator::Emulator,
     preview::{MARKER, PreviewState, SummaryAdapter},
-    protocol::{Preview, PreviewSource},
+    protocol::PreviewSource,
 };
 
-/// Synthetic screen: adapters read only `live_rows`, so the other facts
-/// are inert defaults.
-struct RowsScreen {
-    rows: Vec<String>,
+/// Build a synthetic live viewport for an adapter.
+fn rs(rows: &[&str]) -> Vec<String> {
+    rows.iter().map(|s| s.to_string()).collect()
 }
 
-fn rs(rows: &[&str]) -> RowsScreen {
-    RowsScreen {
-        rows: rows.iter().map(|s| s.to_string()).collect(),
-    }
+/// Place status rows above a 120-column Claude input box.
+fn claude_screen<S: AsRef<str>>(above: &[S]) -> Vec<String> {
+    let sep = "─".repeat(120);
+    let mut rows: Vec<String> = above.iter().map(|s| s.as_ref().to_string()).collect();
+    rows.extend([sep.clone(), "❯".to_string(), sep]);
+    rows
 }
 
-impl ScreenFacts for RowsScreen {
-    fn revision(&self) -> u64 {
-        1
-    }
-
-    fn alt_epoch(&self) -> u64 {
-        0
-    }
-
-    fn alternate_screen(&self) -> bool {
-        false
-    }
-
-    fn title(&self) -> Option<&str> {
-        None
-    }
-
-    fn live_floor(&self) -> String {
-        self.rows
-            .iter()
-            .rev()
-            .find(|r| !r.is_empty())
-            .cloned()
-            .unwrap_or_default()
-    }
-
-    fn live_rows(&self) -> Vec<String> {
-        self.rows.clone()
-    }
-
-    fn alt_leave_floor(&self) -> Option<&str> {
-        None
-    }
-}
-
-/// Replay a corpus fixture and resolve one preview against its final
-/// screen with `adapter` installed.
-fn resolve_corpus(bytes: &[u8], adapter: &dyn SummaryAdapter, rows: u16, cols: u16) -> Preview {
-    let mut emu = Emulator::new(rows, cols, 2000);
+/// Resolve a corpus fixture at 40 rows and return its text, source, and rule.
+fn corpus(
+    bytes: &[u8],
+    adapter: &dyn SummaryAdapter,
+    cols: u16,
+) -> (String, PreviewSource, Option<&'static str>) {
+    let mut emu = Emulator::new(40, cols, 2000);
     emu.process(bytes);
     let mut st = PreviewState::new();
-    st.resolve(Instant::now(), &emu, Some(adapter)).clone()
+    let p = st.resolve(Instant::now(), &emu, Some(adapter));
+    (p.text.clone(), p.source, p.rule)
 }
 
 fn anchor(text: &str, rule: &'static str) -> (String, PreviewSource, Option<&'static str>) {
     (text.to_string(), PreviewSource::Anchor, Some(rule))
 }
 
-fn parts(p: &Preview) -> (String, PreviewSource, Option<&'static str>) {
-    (p.text.clone(), p.source, p.rule)
+/// Expected alternate-screen marker preview.
+fn marker() -> (String, PreviewSource, Option<&'static str>) {
+    (MARKER.to_string(), PreviewSource::Marker, None)
+}
+
+/// Expected floor-preview tuple.
+fn floor(text: &str) -> (String, PreviewSource, Option<&'static str>) {
+    (text.to_string(), PreviewSource::Floor, None)
 }
 
 /// Selection is a basename match on the first word only: wider than
@@ -128,20 +104,18 @@ fn select_routes_to_the_matching_adapter() {
 /// and the concrete-action row wins over the spinner when present.
 #[test]
 fn claude_spinner_and_action_row() {
-    let sep = "─".repeat(120);
-    let spin = rs(&["✻ Hashing… (6s · ↓ 87 tokens)", &sep, "❯", &sep, "  status"]);
+    // Rows below the input box are outside the status scan.
+    let mut spin = claude_screen(&["✻ Hashing… (6s · ↓ 87 tokens)"]);
+    spin.push("  status".to_string());
     assert_eq!(
         ClaudeSummary.live_preview(&spin),
         Some(("Hashing…".to_string(), "claude:spinner"))
     );
 
-    let action = rs(&[
+    let action = claude_screen(&[
         "⏺ Running 1 shell command…",
         "",
         "· Hashing… (3s · ↓ 52 tokens)",
-        &sep,
-        "❯",
-        &sep,
     ]);
     assert_eq!(
         ClaudeSummary.live_preview(&action),
@@ -149,13 +123,10 @@ fn claude_spinner_and_action_row() {
     );
 
     // An indented attachment above the spinner is not the action row.
-    let attach = rs(&[
+    let attach = claude_screen(&[
         "  Running 1 shell command…",
         "  ⎿  $ sleep 5 && echo ok",
         "✻ Hashing… (6s)",
-        &sep,
-        "❯",
-        &sep,
     ]);
     assert_eq!(
         ClaudeSummary.live_preview(&attach),
@@ -163,7 +134,7 @@ fn claude_spinner_and_action_row() {
     );
 
     // A `⏺` reply row without a trailing ellipsis is not the action row.
-    let reply = rs(&["⏺ ok", "", "✻ Hashing… (2s)", &sep, "❯", &sep]);
+    let reply = claude_screen(&["⏺ ok", "", "✻ Hashing… (2s)"]);
     assert_eq!(
         ClaudeSummary.live_preview(&reply),
         Some(("Hashing…".to_string(), "claude:spinner"))
@@ -174,12 +145,8 @@ fn claude_spinner_and_action_row() {
 /// digits; extraction keeps everything through the first ellipsis.
 #[test]
 fn claude_spinner_extracts_task_derived_phrases() {
-    let sep = "─".repeat(120);
-    let s = rs(&[
+    let s = claude_screen(&[
         "✳ Overseeing phase 4 (adapters)… (54s · almost done thinking with high effort)",
-        &sep,
-        "❯",
-        &sep,
     ]);
     assert_eq!(
         ClaudeSummary.live_preview(&s),
@@ -194,11 +161,7 @@ fn claude_spinner_extracts_task_derived_phrases() {
 /// unknown segments are preserved. A bare row is unchanged.
 #[test]
 fn claude_parenthetical_keeps_slow_segments_and_drops_tickers() {
-    let sep = "─".repeat(120);
-    let spin = |row: &str| {
-        let rows = [row, &sep, "❯", &sep];
-        ClaudeSummary.live_preview(&rs(&rows))
-    };
+    let spin = |row: &str| ClaudeSummary.live_preview(&claude_screen(&[row]));
     assert_eq!(
         spin("✻ Envisioning… (1m 8s · ↓ 2.1k tokens · thinking with high effort)"),
         Some((
@@ -239,17 +202,13 @@ fn claude_parenthetical_keeps_slow_segments_and_drops_tickers() {
 /// still contributes the semantic tail.
 #[test]
 fn claude_action_row_carries_the_spinner_rows_semantic_tail() {
-    let sep = "─".repeat(120);
-    let rows = [
+    let screen = claude_screen(&[
         "⏺ Running 1 shell command…",
         "",
         "✻ Envisioning… (1m 8s · ↓ 2.1k tokens · thinking with high effort)",
-        &sep,
-        "❯",
-        &sep,
-    ];
+    ]);
     assert_eq!(
-        ClaudeSummary.live_preview(&rs(&rows)),
+        ClaudeSummary.live_preview(&screen),
         Some((
             "Running 1 shell command… · thinking with high effort".to_string(),
             "claude:action-row"
@@ -261,11 +220,7 @@ fn claude_action_row_carries_the_spinner_rows_semantic_tail() {
 /// trigger an action-row lookup.
 #[test]
 fn claude_waiting_family_matches_the_skeleton_and_never_probes() {
-    let sep = "─".repeat(120);
-    let spin = |row: &str| {
-        let rows = [row, &sep, "❯", &sep];
-        ClaudeSummary.live_preview(&rs(&rows))
-    };
+    let spin = |row: &str| ClaudeSummary.live_preview(&claude_screen(&[row]));
     for row in [
         "✻ Waiting for 1 background agent to finish",
         "· Waiting for 1 background agent to finish",
@@ -292,16 +247,13 @@ fn claude_waiting_family_matches_the_skeleton_and_never_probes() {
     }
 
     // Waiting rows return without probing the action row above them.
-    let rows = [
+    let screen = claude_screen(&[
         "⏺ Running 1 shell command…",
         "",
         "✻ Waiting for 1 background agent to finish",
-        &sep,
-        "❯",
-        &sep,
-    ];
+    ]);
     assert_eq!(
-        ClaudeSummary.live_preview(&rs(&rows)),
+        ClaudeSummary.live_preview(&screen),
         Some((
             "Waiting for 1 background agent to finish".to_string(),
             "claude:waiting"
@@ -380,14 +332,11 @@ fn claude_aborts_on_foreign_column_zero_rows() {
 /// The status scan crosses bounded indented gaps but stops at body prose.
 #[test]
 fn claude_scan_crosses_task_list_gaps_within_the_window() {
-    let sep = "─".repeat(120);
     let behind_gap = |status: &str, gap: usize| {
         let mut rows = vec![status.to_string()];
         rows.push("  ⎿  ✔ Phase 0: verify facts".to_string());
         rows.extend((1..gap).map(|i| format!("     ◼ Phase {i}: generic step")));
-        rows.extend([sep.clone(), "❯".to_string(), sep.clone()]);
-        let refs: Vec<&str> = rows.iter().map(String::as_str).collect();
-        ClaudeSummary.live_preview(&rs(&refs))
+        ClaudeSummary.live_preview(&claude_screen(&rows))
     };
     for gap in [4, 15] {
         assert_eq!(
@@ -423,14 +372,11 @@ fn claude_scan_crosses_task_list_gaps_within_the_window() {
     );
 
     // Column-0 body prose invalidates the status structure.
-    let prose = rs(&[
+    let prose = claude_screen(&[
         "✢ Running phase 1 (dashboard UI)… (4m 20s · ↓ 17.1k tokens)",
         "⏺ The phase list below is queued, not running.",
         "  ⎿  ✔ Phase 0: verify facts",
         "     ◼ Phase 1: dashboard polish",
-        &sep,
-        "❯",
-        &sep,
     ]);
     assert_eq!(ClaudeSummary.live_preview(&prose), None);
 }
@@ -438,19 +384,11 @@ fn claude_scan_crosses_task_list_gaps_within_the_window() {
 /// Blank rows do not consume the nonblank-row window.
 #[test]
 fn claude_blank_rows_do_not_consume_the_window() {
-    let sep = "─".repeat(120);
-    let resolve = |rows: Vec<String>| {
-        let refs: Vec<&str> = rows.iter().map(String::as_str).collect();
-        ClaudeSummary.live_preview(&rs(&refs))
-    };
-    let boxed = |sep: &str| [sep.to_string(), "❯ /workflows".to_string(), sep.to_string()];
-
     // Nineteen blank rows separate the waiting row from the input box.
     let mut rows = vec!["✻ Waiting for 1 dynamic workflow to finish".to_string()];
     rows.extend(std::iter::repeat_n(String::new(), 19));
-    rows.extend(boxed(&sep));
     assert_eq!(
-        resolve(rows),
+        ClaudeSummary.live_preview(&claude_screen(&rows)),
         Some((
             "Waiting for 1 dynamic workflow to finish".to_string(),
             "claude:waiting"
@@ -464,9 +402,8 @@ fn claude_blank_rows_do_not_consume_the_window() {
         rows.push(String::new());
         rows.push(format!("     ◼ Phase {i}: generic step"));
     }
-    rows.extend(boxed(&sep));
     assert_eq!(
-        resolve(rows),
+        ClaudeSummary.live_preview(&claude_screen(&rows)),
         Some((
             "Running phase 1 (dashboard UI)…".to_string(),
             "claude:spinner"
@@ -479,20 +416,16 @@ fn claude_blank_rows_do_not_consume_the_window() {
         rows.push(String::new());
         rows.push(format!("     ◼ Phase {i}: generic step"));
     }
-    rows.extend(boxed(&sep));
-    assert_eq!(resolve(rows), None);
+    assert_eq!(ClaudeSummary.live_preview(&claude_screen(&rows)), None);
 
     // An intervening column-0 prose row still aborts the scan.
-    let prose = rs(&[
+    let prose = claude_screen(&[
         "✻ Hashing… (6s · ↓ 87 tokens)",
         "",
         "",
         "⏺ The workflow report lands below.",
         "",
         "",
-        &sep,
-        "❯ /workflows",
-        &sep,
     ]);
     assert_eq!(ClaudeSummary.live_preview(&prose), None);
 }
@@ -850,8 +783,8 @@ fn corpus_positive_states_anchor_exactly() {
         ),
     ];
     for Case(name, bytes, adapter, text, rule) in cases {
-        let p = resolve_corpus(bytes, adapter, 40, 120);
-        assert_eq!(parts(&p), anchor(text, rule), "{name}");
+        let got = corpus(bytes, adapter, 120);
+        assert_eq!(got, anchor(text, rule), "{name}");
     }
 }
 
@@ -882,12 +815,8 @@ fn corpus_idle_states_fall_through() {
         ),
     ];
     for (name, bytes, adapter) in cases {
-        let p = resolve_corpus(bytes, adapter, 40, 120);
-        assert_eq!(
-            parts(&p),
-            (MARKER.to_string(), PreviewSource::Marker, None),
-            "{name}"
-        );
+        let got = corpus(bytes, adapter, 120);
+        assert_eq!(got, marker(), "{name}");
     }
 }
 
@@ -897,82 +826,58 @@ fn corpus_idle_states_fall_through() {
 #[test]
 fn corpus_body_shaped_text_never_extracts() {
     // Menu in the body, spinner live: the pinned spinner wins.
-    let p = resolve_corpus(
+    let got = corpus(
         include_bytes!("../../tests/corpus/preview_claude_body_menu.bin"),
         &ClaudeSummary,
-        40,
         120,
     );
-    assert_eq!(
-        parts(&p),
-        anchor("Fable 5 (high) · Hashing…", "claude:spinner")
-    );
+    assert_eq!(got, anchor("Fable 5 (high) · Hashing…", "claude:spinner"));
 
     // Menu touching the chrome window on an idle screen: abort, marker.
-    let p = resolve_corpus(
+    let got = corpus(
         include_bytes!("../../tests/corpus/preview_claude_body_menu_idle.bin"),
         &ClaudeSummary,
-        40,
         120,
     );
-    assert_eq!(parts(&p), (MARKER.to_string(), PreviewSource::Marker, None));
+    assert_eq!(got, marker());
 
     // Body prose between spinner-shaped text and the task list yields the marker.
-    let p = resolve_corpus(
+    let got = corpus(
         include_bytes!("../../tests/corpus/preview_claude_body_above_tasklist.bin"),
         &ClaudeSummary,
-        40,
         120,
     );
-    assert_eq!(parts(&p), (MARKER.to_string(), PreviewSource::Marker, None));
+    assert_eq!(got, marker());
 
     // Prior-turn `• Ran` in scrollback with the turn finished: the scan
     // stops at the reply bullet and the floor tier reports the screen.
-    let p = resolve_corpus(
+    let got = corpus(
         include_bytes!("../../tests/corpus/preview_codex_scrollback.bin"),
         &CodexSummary,
-        40,
         120,
     );
     assert_eq!(
-        parts(&p),
-        (
-            // Floor previews omit the status bar's indentation.
-            "gpt-5.6-sol high · 5.26K used · 28.2K in · 78 out".to_string(),
-            PreviewSource::Floor,
-            None
-        )
+        got,
+        floor("gpt-5.6-sol high · 5.26K used · 28.2K in · 78 out")
     );
 
     // A modal-shaped menu quoted in the body with the live composer
     // below it: the composer suppresses the approval match, the quote
     // is foreign to the status scan, and the floor tier reports.
-    let p = resolve_corpus(
+    let got = corpus(
         include_bytes!("../../tests/corpus/preview_codex_body_menu.bin"),
         &CodexSummary,
-        40,
         120,
     );
-    assert_eq!(
-        parts(&p),
-        (
-            "gpt-5.6-sol high · 0 in · 0 out".to_string(),
-            PreviewSource::Floor,
-            None
-        )
-    );
+    assert_eq!(got, floor("gpt-5.6-sol high · 0 in · 0 out"));
 
     // `• Ran` visible mid-turn with `• Working` at the pin: live wins.
-    let p = resolve_corpus(
+    let got = corpus(
         include_bytes!("../../tests/corpus/preview_codex_working_over_ran.bin"),
         &CodexSummary,
-        40,
         120,
     );
-    assert_eq!(
-        parts(&p),
-        anchor("gpt-5.6-sol high · Working", "codex:working")
-    );
+    assert_eq!(got, anchor("gpt-5.6-sol high · Working", "codex:working"));
 }
 
 /// 80-column truncation: the CLIs cut their status rows at a word
@@ -980,37 +885,34 @@ fn corpus_body_shaped_text_never_extracts() {
 /// the kept suffix keeps that ellipsis verbatim.
 #[test]
 fn corpus_truncated_rows_still_anchor() {
-    let p = resolve_corpus(
+    let got = corpus(
         include_bytes!("../../tests/corpus/preview_trunc_claude.bin"),
         &ClaudeSummary,
-        40,
         80,
     );
     // No welcome box on the narrow screen: the label drops with it.
-    assert_eq!(parts(&p), anchor("Hashing…", "claude:spinner"));
+    assert_eq!(got, anchor("Hashing…", "claude:spinner"));
 
-    let p = resolve_corpus(
+    let got = corpus(
         include_bytes!("../../tests/corpus/preview_trunc_codex.bin"),
         &CodexSummary,
-        40,
         80,
     );
     assert_eq!(
-        parts(&p),
+        got,
         anchor(
             "gpt-5.6-sol high · Working · 1 background terminal running",
             "codex:working"
         )
     );
 
-    let p = resolve_corpus(
+    let got = corpus(
         include_bytes!("../../tests/corpus/preview_trunc_grok.bin"),
         &GrokSummary,
-        40,
         80,
     );
     assert_eq!(
-        parts(&p),
+        got,
         anchor(
             "Grok 4.5 (xhigh) · Sleep 5 seconds then echo…",
             "grok:spinner"
@@ -1022,13 +924,12 @@ fn corpus_truncated_rows_still_anchor() {
 /// resolves to the alternate-screen marker.
 #[test]
 fn corpus_wrapped_ellipsis_falls_through() {
-    let p = resolve_corpus(
+    let got = corpus(
         include_bytes!("../../tests/corpus/preview_wrap_grok.bin"),
         &GrokSummary,
-        40,
         30,
     );
-    assert_eq!(parts(&p), (MARKER.to_string(), PreviewSource::Marker, None));
+    assert_eq!(got, marker());
 }
 
 /// Non-agent TUIs on the alternate screen resolve through the

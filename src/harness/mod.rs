@@ -316,7 +316,7 @@ fn shell_quote(s: &str) -> String {
 
 /// Fixtures and assertions for harness detection and exit scraping.
 #[cfg(test)]
-pub(crate) mod testutil {
+pub(crate) mod fixtures {
     use std::path::PathBuf;
 
     use super::{CapturePaths, Harness};
@@ -358,8 +358,10 @@ pub(crate) mod testutil {
 
 #[cfg(test)]
 mod tests {
-    use super::testutil::{ID, OTHER};
-    use super::*;
+    use super::{
+        fixtures::{ID, OTHER},
+        *,
+    };
 
     /// Harness, program word, selector, and path prefix for the shape tests
     /// shared by every harness. Codex's resume selector is a subcommand, not

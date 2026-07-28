@@ -70,12 +70,13 @@ impl ScreenFacts for Emulator {
 /// Display-only status and model-label extraction for one agent CLI.
 pub trait SummaryAdapter: Sync {
     /// Return normalized live status and its matcher ID when the expected
-    /// chrome structure is present.
-    fn live_preview(&self, screen: &dyn ScreenFacts) -> Option<(String, &'static str)>;
+    /// chrome is present. `rows` contains live rows with trailing padding
+    /// removed.
+    fn live_preview(&self, rows: &[String]) -> Option<(String, &'static str)>;
 
     /// Return a model label from stable CLI chrome. The preview cascade
     /// prepends it to live status as `{label} · `.
-    fn model_label(&self, screen: &dyn ScreenFacts) -> Option<String>;
+    fn model_label(&self, rows: &[String]) -> Option<String>;
 
     /// Optionally normalize a captured title for display. Emulator title
     /// capture remains program-agnostic; `None` renders the title verbatim.
@@ -91,19 +92,21 @@ pub trait SummaryAdapter: Sync {
 /// 2. alternate screen: the title while its epoch is current, else the marker
 /// 3. primary screen: the live floor
 fn cascade(screen: &impl ScreenFacts, adapter: Option<&dyn SummaryAdapter>) -> Preview {
-    if let Some(a) = adapter
-        && let Some((text, rule)) = a.live_preview(screen)
-    {
-        let text = match a.model_label(screen) {
-            Some(label) => format!("{label} · {text}"),
-            None => text,
-        };
-        return Preview {
-            text,
-            source: PreviewSource::Anchor,
-            rule: Some(rule),
-            frozen: false,
-        };
+    if let Some(a) = adapter {
+        // Both probes use the same viewport snapshot.
+        let rows = screen.live_rows();
+        if let Some((text, rule)) = a.live_preview(&rows) {
+            let text = match a.model_label(&rows) {
+                Some(label) => format!("{label} · {text}"),
+                None => text,
+            };
+            return Preview {
+                text,
+                source: PreviewSource::Anchor,
+                rule: Some(rule),
+                frozen: false,
+            };
+        }
     }
     if screen.alternate_screen() {
         return match screen.title() {
@@ -233,8 +236,7 @@ impl PreviewState {
         match self.candidate.source.cmp(&self.rendered.source) {
             Ordering::Greater => {
                 self.cancel_demotion();
-                let cand = self.candidate.clone();
-                self.render(cand, now, alt);
+                self.render(self.candidate.clone(), now, alt);
             }
             Ordering::Equal => {
                 // A recovered rank cancels a pending demotion without a
@@ -254,16 +256,14 @@ impl PreviewState {
                             .last_title_render
                             .is_some_and(|t| now.duration_since(t) < TITLE_MIN_HOLD);
                         if !held {
-                            let cand = self.candidate.clone();
-                            self.render(cand, now, alt);
+                            self.render(self.candidate.clone(), now, alt);
                         }
                     }
                     // The floor is live output; anchor text changes are
                     // semantic (a new verb, a new completion row). Both
                     // render immediately.
                     PreviewSource::Floor | PreviewSource::Anchor => {
-                        let cand = self.candidate.clone();
-                        self.render(cand, now, alt);
+                        self.render(self.candidate.clone(), now, alt);
                     }
                 }
             }
@@ -429,11 +429,11 @@ mod tests {
     }
 
     impl SummaryAdapter for StubAdapter {
-        fn live_preview(&self, _screen: &dyn ScreenFacts) -> Option<(String, &'static str)> {
+        fn live_preview(&self, _rows: &[String]) -> Option<(String, &'static str)> {
             self.live.map(|(text, rule)| (text.to_string(), rule))
         }
 
-        fn model_label(&self, _screen: &dyn ScreenFacts) -> Option<String> {
+        fn model_label(&self, _rows: &[String]) -> Option<String> {
             self.label.map(str::to_string)
         }
     }

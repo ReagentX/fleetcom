@@ -205,10 +205,11 @@ mod tests {
         process::{Command, Stdio},
     };
 
-    use super::super::testutil::ID;
-    use super::super::{CAPTURE_ENV, NOTIFY_CHAIN_ENV};
     use super::*;
-    use crate::testutil::{install_fake_notifier, temp, write_executable};
+    use crate::{
+        harness::{CAPTURE_ENV, NOTIFY_CHAIN_ENV, fixtures::ID},
+        testutil::{dead_pid, install_fake_notifier, temp, write_executable},
+    };
 
     fn mode(p: &Path) -> u32 {
         fs::metadata(p).unwrap().permissions().mode() & 0o777
@@ -364,14 +365,6 @@ mod tests {
         );
         assert_eq!(mode(&ns), 0o700);
         let _ = fs::remove_dir_all(&root);
-    }
-
-    /// Spawn and reap a child, then return its inactive PID.
-    fn dead_pid() -> u32 {
-        let mut child = Command::new("sh").arg("-c").arg("exit 0").spawn().unwrap();
-        let pid = child.id();
-        child.wait().unwrap();
-        pid
     }
 
     /// Installation removes a dead owner's namespace and its contents.

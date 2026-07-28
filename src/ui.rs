@@ -2,8 +2,10 @@
 //! buffered, wrapped in one synchronized update, and written only when they
 //! differ from the previous frame.
 
-use std::io::{self, Write};
-use std::time::Duration;
+use std::{
+    io::{self, Write},
+    time::Duration,
+};
 
 use crossterm::{
     cursor::{Hide, MoveTo, Show},
@@ -411,8 +413,7 @@ fn render_peek(out: &mut impl Write, app: &App) -> io::Result<()> {
 
     // Screen lines for the selected task, once the core has streamed them. Empty
     // until then (or if the watch just switched); the box still frames cleanly.
-    let empty: Vec<String> = Vec::new();
-    let lines = app.screen_for(v.id).map(|s| &s.lines).unwrap_or(&empty);
+    let lines: &[String] = app.screen_for(v.id).map_or(&[], |s| &s.lines);
     let start = lines.len().saturating_sub(inner_h);
     let tail = &lines[start..];
 
@@ -748,10 +749,10 @@ fn selection_overlay<'a>(sel: Option<&Selection>, lines: &'a [String]) -> Vec<(u
         .iter()
         .enumerate()
         .filter_map(|(row, text)| {
-            // Screen row counts are bounded by the terminal's `u16` height.
-            let row = row as u16;
-            sel.row_segment(row, text, last)
-                .map(|(col, seg)| (row, col, seg))
+            sel.row_segment(row, text, last).map(|(col, seg)| {
+                // Screen row counts are bounded by the terminal's `u16` height.
+                (row as u16, col, seg)
+            })
         })
         .collect()
 }

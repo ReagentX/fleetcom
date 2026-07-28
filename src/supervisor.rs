@@ -15,12 +15,9 @@ use std::{
 
 use crate::{
     core::{Wake, Waker},
-    emulator::ClipboardSelector,
     harness::{self, assets},
     path,
-    protocol::{
-        ClipboardKind, Command, Event, LaunchContext, ScreenView, ScrollAction, TaskView, env_get,
-    },
+    protocol::{Command, Event, LaunchContext, ScreenView, ScrollAction, TaskView, env_get},
     session::{self, SessionConfig, SessionEntry},
     task::{Task, WriteRefused},
 };
@@ -123,15 +120,6 @@ fn normalize_label(label: Option<String>) -> Option<String> {
 /// `Unassigned` to `None`. Display names do not reserve this label.
 fn normalize_group(name: Option<String>) -> Option<String> {
     normalize_label(name).filter(|g| g != "Unassigned")
-}
-
-/// Map an emulator clipboard selector to its protocol representation.
-fn clipboard_kind(kind: ClipboardSelector) -> ClipboardKind {
-    match kind {
-        ClipboardSelector::Clipboard => ClipboardKind::Clipboard,
-        ClipboardSelector::Primary => ClipboardKind::Primary,
-        ClipboardSelector::Select => ClipboardKind::Selection,
-    }
 }
 
 /// Return the 64-bit FNV-1a hash used to separate fallback capture roots. The
@@ -357,11 +345,7 @@ impl Supervisor {
                 cwd,
                 group,
             } => self.spawn(&command, cwd, group),
-            Command::Kill { id } => {
-                if let Some(t) = self.by_id_mut(id) {
-                    t.terminate();
-                }
-            }
+            Command::Kill { id } => self.with_task(id, Task::terminate),
             Command::Remove { id } => {
                 // Keep removed tasks for TERM→KILL escalation and reaping.
                 if let Some(i) = self.index_of(id) {
@@ -376,22 +360,11 @@ impl Supervisor {
                 }
             }
             Command::Restart { id } => self.rerun(id),
-            Command::Tag { id, on } => {
-                if let Some(t) = self.by_id_mut(id) {
-                    t.tagged = on;
-                }
-            }
-            // Ignore assignments for tasks no longer present.
+            Command::Tag { id, on } => self.with_task(id, |t| t.tagged = on),
             Command::SetGroup { id, group } => {
-                if let Some(t) = self.by_id_mut(id) {
-                    t.group = normalize_group(group);
-                }
+                self.with_task(id, |t| t.group = normalize_group(group))
             }
-            Command::SetName { id, name } => {
-                if let Some(t) = self.by_id_mut(id) {
-                    t.name = normalize_label(name);
-                }
-            }
+            Command::SetName { id, name } => self.with_task(id, |t| t.name = normalize_label(name)),
             Command::Resize { rows, cols } => {
                 // Clamp each dimension first, then preserve rows and reduce
                 // columns when the grid exceeds `MAX_CELLS`. The constant
@@ -438,11 +411,7 @@ impl Supervisor {
             Command::Key { id, code, mods } => {
                 self.deliver(id, "key input", |t| t.send_key(code, mods))
             }
-            Command::Scrollback { id, action } => {
-                if let Some(t) = self.by_id_mut(id) {
-                    t.scroll_view(action);
-                }
-            }
+            Command::Scrollback { id, action } => self.with_task(id, |t| t.scroll_view(action)),
             Command::SaveSession { name } => self.save_session(&name),
             Command::LoadSession { name } => self.load_session(&name),
             Command::LoadRecovery { stem } => self.load_recovery(&stem),
@@ -563,11 +532,7 @@ impl Supervisor {
 
         if let Some((id, stores)) = clipboard {
             for (kind, text) in stores.stores {
-                self.events.push(Event::ClipboardCopy {
-                    id,
-                    kind: clipboard_kind(kind),
-                    text,
-                });
+                self.events.push(Event::ClipboardCopy { id, kind, text });
             }
             if let Some(len) = stores.oversized_len {
                 self.status(format!(
@@ -694,6 +659,13 @@ impl Supervisor {
     /// Queue a one-line notice for the client's status line.
     fn status(&mut self, msg: impl Into<String>) {
         self.events.push(Event::Status(msg.into()));
+    }
+
+    /// Run `f` against task `id`; ignore an unknown id.
+    fn with_task(&mut self, id: u64, f: impl FnOnce(&mut Task)) {
+        if let Some(t) = self.by_id_mut(id) {
+            f(t);
+        }
     }
 
     /// Route one input send to task `id`, reporting a bounded-queue refusal.

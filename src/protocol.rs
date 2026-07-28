@@ -205,14 +205,14 @@ pub enum Event {
     },
 }
 
-/// Clipboard target carried by an OSC 52 event.
+/// Clipboard target identified by an OSC 52 selector byte.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ClipboardKind {
-    /// The system clipboard (OSC 52 kind byte `c`).
+    /// The system clipboard (selector byte `c`).
     Clipboard,
-    /// The primary selection (OSC 52 kind byte `p`).
+    /// The primary selection (selector byte `p`).
     Primary,
-    /// The select buffer (OSC 52 kind byte `s`).
+    /// The select buffer (selector byte `s`).
     Selection,
 }
 
