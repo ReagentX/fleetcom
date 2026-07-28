@@ -42,35 +42,38 @@ impl Selection {
     ///
     /// Rows below the screen clamp to its last row. Columns beyond a row select
     /// no text, and an empty screen produces an empty string.
+    ///
+    /// The per-row rule is [`Selection::row_segment`]; this walks it down the
+    /// selected rows, so a row it declines contributes an empty line.
     pub fn extract(&self, rows: &[String]) -> String {
         let Some(last) = rows.len().checked_sub(1) else {
             return String::new();
         };
         let (start, end) = self.bounds(last);
-        let mut out = String::new();
-        for (row, text) in rows.iter().enumerate().take(end.0 + 1).skip(start.0) {
-            if row > start.0 {
-                out.push('\n');
-            }
-            let from = if row == start.0 { start.1 } else { 0 };
-            let to = (row == end.0).then_some(end.1);
-            out.push_str(segment(text, from, to).trim_end());
-        }
-        out
+        // `bounds` clamps both rows to `last`, so indexing `rows` is in range.
+        (start.0..=end.0)
+            .map(|row| {
+                self.row_segment(row, &rows[row], last)
+                    .map_or("", |(_, seg)| seg)
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     /// Return the selected text on `row` and its starting display column.
-    /// Uses the same endpoint ordering, row clamping, wide-glyph expansion,
-    /// and trailing-whitespace removal as [`Selection::extract`]. Returns
-    /// `None` outside the selection or when the row's selected span is empty.
+    ///
+    /// This is the sole definition of the per-row rule — endpoint ordering,
+    /// row clamping, wide-glyph expansion, trailing-whitespace removal — and
+    /// [`Selection::extract`] is built from it, so the whole-selection and
+    /// per-row paths cannot drift apart. `None` marks a row that contributes
+    /// no text: outside the selection, or a span that trims away to nothing.
     pub fn row_segment<'a>(
         &self,
-        row: u16,
+        row: usize,
         text: &'a str,
         last_row: usize,
     ) -> Option<(u16, &'a str)> {
         let (start, end) = self.bounds(last_row);
-        let row = row as usize;
         if row < start.0 || row > end.0 {
             return None;
         }
@@ -123,11 +126,6 @@ fn segment_span(row: &str, from: usize, to: Option<usize>) -> Option<(usize, &st
         col += w;
     }
     start.map(|(s, c)| (c, &row[s..end]))
-}
-
-/// [`segment_span`] without the column, for whole-selection extraction.
-fn segment(row: &str, from: usize, to: Option<usize>) -> &str {
-    segment_span(row, from, to).map_or("", |(_, s)| s)
 }
 
 #[cfg(test)]
@@ -281,9 +279,10 @@ mod tests {
     }
 
     #[test]
-    fn row_segment_clamps_like_extract() {
-        // Both endpoints below a two-row screen collapse onto the bottom row,
-        // matching `extract`'s clamping (including the ordering inversion).
+    fn clamping_below_the_screen_inverts_endpoint_order() {
+        // Clamping precedes ordering, so both endpoints below a two-row screen
+        // collapse onto the bottom row and swap: the anchor's column 1 becomes
+        // the end, the head's column 0 the start. Row 0 drops out entirely.
         let s = drag((5, 1), (9, 0));
         assert_eq!(s.extract(&screen(&["ab", "cd"])), "cd");
         assert_eq!(s.row_segment(0, "ab", 1), None);

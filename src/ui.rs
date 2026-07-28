@@ -747,10 +747,10 @@ fn selection_overlay<'a>(sel: Option<&Selection>, lines: &'a [String]) -> Vec<(u
         .iter()
         .enumerate()
         .filter_map(|(row, text)| {
-            // Screen row counts are bounded by the terminal's `u16` height.
-            let row = row as u16;
-            sel.row_segment(row, text, last)
-                .map(|(col, seg)| (row, col, seg))
+            sel.row_segment(row, text, last).map(|(col, seg)| {
+                // Screen row counts are bounded by the terminal's `u16` height.
+                (row as u16, col, seg)
+            })
         })
         .collect()
 }
