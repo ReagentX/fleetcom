@@ -354,8 +354,10 @@ mod tests {
     use std::path::PathBuf;
 
     use super::*;
-    use crate::harness::fixtures::{OTHER, assert_all_opaque, assert_corpus_scrape, paths};
-    use crate::testutil::{temp, v7_at, write_rollout};
+    use crate::{
+        harness::fixtures::{OTHER, assert_all_opaque, assert_corpus_scrape, paths},
+        testutil::{temp, v7_at, write_rollout},
+    };
 
     /// Codex's own launch and resume commands carry v7 IDs; the shared v4
     /// fixture stays valid for detection, which is version-agnostic.

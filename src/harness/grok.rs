@@ -86,9 +86,13 @@ mod tests {
     use std::fs;
 
     use super::*;
-    use crate::harness::fixtures::{ID, OTHER, assert_all_opaque, assert_corpus_scrape, paths};
-    use crate::harness::is_uuid;
-    use crate::testutil::temp;
+    use crate::{
+        harness::{
+            fixtures::{ID, OTHER, assert_all_opaque, assert_corpus_scrape, paths},
+            is_uuid,
+        },
+        testutil::temp,
+    };
 
     /// Grok-specific opaque shapes: flags, the `-r`/`-s`/`=` spellings the
     /// tool prints but detection refuses, and subcommands. The syntax shared

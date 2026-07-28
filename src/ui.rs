@@ -2,8 +2,10 @@
 //! buffered, wrapped in one synchronized update, and written only when they
 //! differ from the previous frame.
 
-use std::io::{self, Write};
-use std::time::Duration;
+use std::{
+    io::{self, Write},
+    time::Duration,
+};
 
 use crossterm::{
     cursor::{Hide, MoveTo, Show},

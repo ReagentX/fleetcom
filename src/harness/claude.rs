@@ -89,8 +89,10 @@ mod tests {
     use std::{fs, path::PathBuf};
 
     use super::*;
-    use crate::harness::fixtures::{ID, OTHER, assert_all_opaque, assert_corpus_scrape, paths};
-    use crate::testutil::temp;
+    use crate::{
+        harness::fixtures::{ID, OTHER, assert_all_opaque, assert_corpus_scrape, paths},
+        testutil::temp,
+    };
 
     /// Claude-specific opaque shapes: flags, `--continue`/`-c`, subcommands,
     /// the short/`=` resume spellings, and `--session-id`. The syntax shared

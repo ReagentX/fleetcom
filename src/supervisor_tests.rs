@@ -1,10 +1,12 @@
 use std::path::Path;
 
 use super::*;
-use crate::protocol::{ClipboardKind, Key, Mods};
-use crate::testutil::{
-    here, install_fake_notifier, now_ms, read_pid, sh_env, wait_until, write_executable,
-    write_rollout,
+use crate::{
+    protocol::{ClipboardKind, Key, Mods},
+    testutil::{
+        here, install_fake_notifier, now_ms, read_pid, sh_env, wait_until, write_executable,
+        write_rollout,
+    },
 };
 
 /// Build a supervisor with this process's launch context.

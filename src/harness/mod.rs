@@ -358,8 +358,10 @@ pub(crate) mod fixtures {
 
 #[cfg(test)]
 mod tests {
-    use super::fixtures::{ID, OTHER};
-    use super::*;
+    use super::{
+        fixtures::{ID, OTHER},
+        *,
+    };
 
     /// Harness, program word, selector, and path prefix for the shape tests
     /// shared by every harness. Codex's resume selector is a subcommand, not

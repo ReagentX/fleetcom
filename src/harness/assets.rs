@@ -206,9 +206,10 @@ mod tests {
     };
 
     use super::*;
-    use crate::harness::fixtures::ID;
-    use crate::harness::{CAPTURE_ENV, NOTIFY_CHAIN_ENV};
-    use crate::testutil::{dead_pid, install_fake_notifier, temp, write_executable};
+    use crate::{
+        harness::{CAPTURE_ENV, NOTIFY_CHAIN_ENV, fixtures::ID},
+        testutil::{dead_pid, install_fake_notifier, temp, write_executable},
+    };
 
     fn mode(p: &Path) -> u32 {
         fs::metadata(p).unwrap().permissions().mode() & 0o777
