@@ -87,4 +87,4 @@ Recovery files carry the same caveat as saved recipes: they persist full command
 - Load in-app: `o`, pick from the list, `Enter`.
 - Load at launch: `fleetcom <name>`.
 
-Loading always spawns new processes from the stored commands. Existing tasks remain daemon state and never enter the session file. [Agent session resume](../src/harness/agent-resume.md) documents when supported agent commands can preserve their conversations across that relaunch.
+Loading always spawns new processes from the stored commands. Existing tasks remain daemon state and never enter the session file. [Agent session resume](agent-resume.md) documents when supported agent commands can preserve their conversations across that relaunch.

@@ -7,9 +7,10 @@
 - [Commands](commands.md): every key and launch flag, including the routing mechanics
 - [How it works](how-it-works.md): the PTY emulation, input routing, and activity grouping
 - [Sessions](sessions.md): the task recipe format and where it lives
-- [Agent session resume](../src/harness/agent-resume.md): when `fleetcom` can save resumable `claude`, `codex`, and `grok` commands
+- [Agent session resume](agent-resume.md): how `fleetcom` captures and resumes supported `claude`, `codex`, and `grok` sessions
 - [Storage paths](#storage-paths): the socket, the lock, and the session paths
 - [First-run walkthrough](#first-run-walkthrough): a first run, start to finish
+- [Security](#security): the trust boundary, on-disk state, and what is not protected
 - [Operational constraints](#operational-constraints): process and protocol boundaries
 
 ## Installation from source
@@ -135,6 +136,44 @@ In custom mode, a new command inherits the selected task's group. The spawn prom
 The attached status bar shows both: `[attached] api tests · cargo watch -x test`. Names are daemon state, survive detach and rerun, and persist in saved [sessions](sessions.md).
 
 `w`, a name, and `Enter` save the fleet as a [session](sessions.md). `q` then disconnects while the daemon and both tasks continue running. A subsequent `fleetcom` invocation reconstructs the dashboard from the daemon's current task state. `Q` or `fleetcom --kill` stops the tasks (`TERM`, then `KILL` after a two-second grace period) and exits the daemon.
+
+## Security
+
+`fleetcom` runs entirely as your user. It neither raises nor drops privileges. Access control comes from filesystem permissions rather than authentication: the socket is mode `0600` inside a mode-`0700` directory, and the daemon performs no peer check. Any process running as your user can therefore connect, spawn commands, and read task output. That is the trust boundary.
+
+### What lands on disk
+
+| Path | Mode | Contents |
+| -- | -- | -- |
+| [runtime directory](#runtime-directory-socket--lock) | `0700` | the socket, lock, daemon log, and any capture roots resolved beneath it |
+| `<runtime>/default.sock` | `0600` | the client↔daemon socket |
+| `<runtime>/daemon.lock` | `0666 & ~umask` when new; otherwise unchanged | the owning daemon's PID, trustworthy only while its `flock` is held |
+| `<runtime>/daemon.log` | `0666 & ~umask` when new; otherwise unchanged | stderr from the autostarted daemon |
+| [session directory](#config-directory-sessions) | `0700` | saved recipes |
+| `<sessions>/<name>.json` | `0600` | directories, commands, groups, display names |
+| `<sessions>/recovery/` | `0700` | [automatic snapshots](sessions.md#recovery) |
+| `<sessions>/recovery/<snapshot>.json` | `0600` | one automatic session recipe |
+| `<capture-root>/<pid>-<nonce>/` | `0700` | [agent hook and notifier assets plus per-run capture payloads](agent-resume.md#capture-state-and-isolation) |
+
+Saves are atomic: `fleetcom` writes a mode-`0600` temporary file in the destination directory, syncs it, then renames it over the target. This does not expose a partial or world-readable recipe. New session and recovery directories use mode `0700`; each save also removes group and other permissions from the destination directory.
+
+### The runtime directory must be trustworthy
+
+`fleetcom` validates the runtime directory before trusting its contents. The path must be a real directory owned by the current user; symlinks and directories owned by another user are rejected. Group or other write access is fatal because another user could already have planted entries. Any remaining group or other permissions are removed in place.
+
+### What is not protected
+
+Recipes persist full command lines, which can embed secrets. A token passed as an argument is written to its session file and to every recovery snapshot that captures the task.
+
+`fleetcom` does not persist the client environment. Each client sends its environment and working directory during the connection handshake, and the daemon retains that launch context in memory. Session and recovery files store only directories, commands, group assignments, and display names.
+
+### Captured IDs cross a shell boundary
+
+Agent resume writes a captured conversation ID into a command run through `$SHELL -c`, so validation is a security boundary. Accepted IDs contain only lowercase hexadecimal in the `8-4-4-4-12` UUID shape. Hook payloads, terminal scrapes, filesystem correlation, and the command builder all apply that check. Instrumentation applies only to a bare program word or its canonical resume form, never arbitrary shell text. [Agent session resume](agent-resume.md#validation-boundary) documents both boundaries.
+
+### Copied text leaves through the terminal
+
+When `fleetcom` copies a selection or forwards an attached task's clipboard store, it sends the text to the host terminal as an OSC 52 escape sequence. The sequence also crosses intermediaries such as SSH connections and terminal multiplexers.
 
 ## Operational constraints
 

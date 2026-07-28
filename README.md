@@ -39,7 +39,7 @@ Running several long-lived commands is pesky once they span terminal panes or ne
 
 ## Documentation
 
-The [`docs/`](docs/README.md) directory covers configuration, on-disk state, session files, commands, and a complete first run.
+The [`docs/`](docs/README.md) directory covers configuration, on-disk state, session files, resuming supported agent sessions, commands, and a complete first run.
 
 ## Installation
 

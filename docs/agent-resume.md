@@ -1,8 +1,19 @@
 # Agent session resume
 
-Session files preserve launch commands, not application state. That boundary is problematic for agent CLIs because relaunching a bare `claude`, `codex`, or `grok` command starts another conversation.
+Session files preserve launch commands, not process state. Relaunching a bare `claude`, `codex`, or `grok` command ordinarily starts another conversation. For accepted commands, `fleetcom` captures a validated conversation ID when available and builds a canonical resume command when saving a session or rerunning a finished task (`r`).
 
-To preserve that conversation, `fleetcom` captures a validated ID and builds the resume command used by session save or rerun (`r`). Instrumentation changes only the string executed through `$SHELL -c`; direct spawns and session loads still display the requested command. Rerun displays the generated resume command because that command becomes the task's new launch recipe.
+## Workflow
+
+Start a supported agent without flags:
+
+1. Press `n` and run `claude`, `codex`, or `grok`. The task appears in the dashboard under the command you typed. Instrumentation changes only the string executed through `$SHELL -c`, so a direct spawn still displays the requested command.
+2. Work in it. `Enter` attaches; `Ctrl-\` returns to the dashboard. Depending on the agent, `fleetcom` pins an ID at launch and may update it from a hook or notifier while the task runs or from terminal output after it exits.
+3. Press `w`, enter a session name, and press `Enter`. If the earlier sources produced no ID, the save also checks the agent's on-disk session store. A captured bare command becomes its canonical resume form, such as `claude --resume '<uuid>'`.
+4. Run `fleetcom <session>`, or press `o` in the dashboard, to start new processes from the saved commands. A stored resume command reopens its captured conversation.
+
+On a finished agent task, `r` uses the captured launch, hook, notifier, or exit ID without performing save-time filesystem correlation. The replacement keeps the task's ID, tag, group, and name. After a successful rewrite, the row shows the resume command because it has become the task's launch recipe; a [saved session](sessions.md) records the same string.
+
+Capture is best-effort and narrow by design. A command carrying a prompt, extra flags, or shell syntax stays opaque and saves verbatim. An accepted command with no available ID also saves unchanged. In both cases, loading the recipe reruns the original command.
 
 ## Accepted command boundary
 
@@ -88,7 +99,7 @@ Every captured value eventually enters a shell command, which makes validation t
 
 ## Extending capture
 
-Each tool implements the `Harness` trait in [`mod.rs`](mod.rs). The methods keep detection, evidence collection, and command construction separate:
+Each tool implements the `Harness` trait in [`src/harness/mod.rs`](../src/harness/mod.rs). The methods keep detection, evidence collection, and command construction separate:
 
 - `detect` classifies the accepted command shapes.
 - `instrument` returns spawn-time arguments, environment entries, and an optional pinned ID.
