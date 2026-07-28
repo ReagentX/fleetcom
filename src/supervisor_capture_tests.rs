@@ -94,8 +94,7 @@ fn spawn_claude_pins_an_id_and_layers_settings() {
     let dir = scratch("cap_claude");
     let (bin, runtime) = (dir.join("bin"), dir.join("run"));
     install_stub(&bin, "claude", &dir);
-    let mut s = Supervisor::new(24, 80, 2000);
-    s.set_launch_context(agent_ctx(&bin, &runtime, dir.clone()));
+    let mut s = sup_ctx(agent_ctx(&bin, &runtime, dir.clone()));
     spawn(&mut s, "claude", dir.clone());
 
     let argv = wait_argv(&mut s, &dir.join("argv"));
@@ -168,8 +167,7 @@ fn spawn_claude_pins_an_id_and_layers_settings() {
 fn spawn_non_agent_command_is_not_instrumented() {
     let dir = scratch("cap_plain");
     let runtime = dir.join("run");
-    let mut s = Supervisor::new(24, 80, 2000);
-    s.set_launch_context(agent_ctx(&dir.join("bin"), &runtime, dir.clone()));
+    let mut s = sup_ctx(agent_ctx(&dir.join("bin"), &runtime, dir.clone()));
     spawn(&mut s, "printf ok", dir.clone());
     let t = &s.tasks[0];
     assert!(t.harness.is_none());
@@ -190,8 +188,7 @@ fn spawn_resuming_claude_injects_only_the_capture_channel() {
     let dir = scratch("cap_resume");
     let (bin, runtime) = (dir.join("bin"), dir.join("run"));
     install_stub(&bin, "claude", &dir);
-    let mut s = Supervisor::new(24, 80, 2000);
-    s.set_launch_context(agent_ctx(&bin, &runtime, dir.clone()));
+    let mut s = sup_ctx(agent_ctx(&bin, &runtime, dir.clone()));
     spawn(&mut s, format!("claude --resume {CAP_ID}"), dir.clone());
 
     let argv = wait_argv(&mut s, &dir.join("argv"));
@@ -217,8 +214,7 @@ fn rerun_resumes_the_captured_conversation() {
     let dir = scratch("cap_rerun");
     let (bin, runtime) = (dir.join("bin"), dir.join("run"));
     install_stub(&bin, "claude", &dir);
-    let mut s = Supervisor::new(24, 80, 2000);
-    s.set_launch_context(agent_ctx(&bin, &runtime, dir.clone()));
+    let mut s = sup_ctx(agent_ctx(&bin, &runtime, dir.clone()));
     spawn(&mut s, "claude", dir.clone());
     let _ = wait_argv(&mut s, &dir.join("argv"));
     let id = s.tasks[0].id;
@@ -275,8 +271,7 @@ fn rerun_cannot_read_the_old_runs_stale_capture() {
         "claude",
         &format!("printf 'Resume this session with:\\nclaude --resume {CAP_ID}\\n'"),
     );
-    let mut s = Supervisor::new(24, 80, 2000);
-    s.set_launch_context(agent_ctx_plus(
+    let mut s = sup_ctx(agent_ctx_plus(
         &bin,
         &runtime,
         dir.clone(),
@@ -325,8 +320,7 @@ fn remove_deletes_the_capture_file() {
     let dir = scratch("cap_remove");
     let (bin, runtime) = (dir.join("bin"), dir.join("run"));
     install_stub(&bin, "claude", &dir);
-    let mut s = Supervisor::new(24, 80, 2000);
-    s.set_launch_context(agent_ctx(&bin, &runtime, dir.clone()));
+    let mut s = sup_ctx(agent_ctx(&bin, &runtime, dir.clone()));
     spawn(&mut s, "claude", dir.clone());
     let _ = wait_argv(&mut s, &dir.join("argv"));
     let id = s.tasks[0].id;
@@ -346,8 +340,7 @@ fn reconnect_with_unchanged_root_preserves_capture_files() {
     let dir = scratch("cap_reconnect");
     let (bin, runtime) = (dir.join("bin"), dir.join("run"));
     install_stub(&bin, "claude", &dir);
-    let mut s = Supervisor::new(24, 80, 2000);
-    s.set_launch_context(agent_ctx(&bin, &runtime, dir.clone()));
+    let mut s = sup_ctx(agent_ctx(&bin, &runtime, dir.clone()));
     spawn(&mut s, "claude", dir.clone());
     let cap = s.tasks[0].capture_file.clone().expect("capture file set");
     std::fs::write(&cap, "{}").unwrap();
@@ -449,9 +442,8 @@ fn spawn_codex_installs_the_notify_override() {
     let dir = scratch("cap_codex");
     let (bin, runtime) = (dir.join("bin"), dir.join("run"));
     install_stub(&bin, "codex", &dir);
-    let mut s = Supervisor::new(24, 80, 2000);
     // Keep config lookup within this test's scratch directory.
-    s.set_launch_context(agent_ctx_plus(
+    let mut s = sup_ctx(agent_ctx_plus(
         &bin,
         &runtime,
         dir.clone(),
@@ -488,9 +480,8 @@ fn spawn_grok_pins_an_id_and_injects_nothing_else() {
     let dir = scratch("cap_grok");
     let (bin, runtime, config) = (dir.join("bin"), dir.join("run"), dir.join("config"));
     install_stub(&bin, "grok", &dir);
-    let mut s = Supervisor::new(24, 80, 2000);
     // Keep save-time correlation inside the scratch tree.
-    s.set_launch_context(agent_ctx_plus(
+    let mut s = sup_ctx(agent_ctx_plus(
         &bin,
         &runtime,
         dir.clone(),
@@ -544,8 +535,7 @@ fn exit_hint_is_scraped_and_saved_as_a_resume() {
         "claude",
         &format!("printf 'Resume this session with:\\nclaude --resume {CAP_ID}\\n'"),
     );
-    let mut s = Supervisor::new(24, 80, 2000);
-    s.set_launch_context(agent_ctx_plus(
+    let mut s = sup_ctx(agent_ctx_plus(
         &bin,
         &runtime,
         dir.clone(),
@@ -579,8 +569,7 @@ fn save_scrapes_a_finished_task_without_reap() {
         "claude",
         &format!("printf 'Resume this session with:\\nclaude --resume {CAP_ID}\\n'"),
     );
-    let mut s = Supervisor::new(24, 80, 2000);
-    s.set_launch_context(agent_ctx_plus(
+    let mut s = sup_ctx(agent_ctx_plus(
         &bin,
         &runtime,
         dir.clone(),
@@ -616,8 +605,7 @@ fn rerun_scrapes_a_finished_task_without_reap() {
         "claude",
         &format!("printf 'Resume this session with:\\nclaude --resume {CAP_ID}\\n'"),
     );
-    let mut s = Supervisor::new(24, 80, 2000);
-    s.set_launch_context(agent_ctx(&bin, &runtime, dir.clone()));
+    let mut s = sup_ctx(agent_ctx(&bin, &runtime, dir.clone()));
     spawn(&mut s, "claude", dir.clone());
     let id = s.tasks[0].id;
 
@@ -653,8 +641,7 @@ fn resume_id_precedence_scrape_over_capture_over_spawn() {
             d = done.display()
         ),
     );
-    let mut s = Supervisor::new(24, 80, 2000);
-    s.set_launch_context(agent_ctx_plus(
+    let mut s = sup_ctx(agent_ctx_plus(
         &bin,
         &runtime,
         dir.clone(),
@@ -711,8 +698,7 @@ fn save_falls_back_to_fs_correlation_for_a_silent_codex() {
     let now_ms = now_ms();
     let id = write_rollout(&codex_home, now_ms, 1, &dir);
 
-    let mut s = Supervisor::new(24, 80, 2000);
-    s.set_launch_context(agent_ctx_plus(
+    let mut s = sup_ctx(agent_ctx_plus(
         &bin,
         &runtime,
         dir.clone(),
@@ -752,8 +738,7 @@ fn save_correlates_against_the_spawn_time_home() {
     let id_a = write_rollout(&home_a, now_ms, 1, &dir);
     let id_b = write_rollout(&home_b, now_ms, 2, &dir);
 
-    let mut s = Supervisor::new(24, 80, 2000);
-    s.set_launch_context(agent_ctx_plus(
+    let mut s = sup_ctx(agent_ctx_plus(
         &bin,
         &runtime,
         dir.clone(),
@@ -835,8 +820,7 @@ fn home_only_launch_env_targets_the_clients_dot_codex() {
     let now_ms = now_ms();
     let id = write_rollout(&codex_home, now_ms, 1, &dir);
 
-    let mut s = Supervisor::new(24, 80, 2000);
-    s.set_launch_context(agent_ctx_plus(
+    let mut s = sup_ctx(agent_ctx_plus(
         &bin,
         &runtime,
         dir.clone(),
@@ -920,8 +904,7 @@ fn agent_save_without_any_id_keeps_the_plain_command() {
     // nothing to find, and the notify routing nothing to read.
     let codex_home = dir.join("codex_home");
     install_stub(&bin, "codex", &dir);
-    let mut s = Supervisor::new(24, 80, 2000);
-    s.set_launch_context(agent_ctx_plus(
+    let mut s = sup_ctx(agent_ctx_plus(
         &bin,
         &runtime,
         dir.clone(),
@@ -980,8 +963,7 @@ fn config_toml_notify_chains_through_the_injected_script() {
             chain = NOTIFY_CHAIN_ENV,
         ),
     );
-    let mut s = Supervisor::new(24, 80, 2000);
-    s.set_launch_context(agent_ctx_plus(
+    let mut s = sup_ctx(agent_ctx_plus(
         &bin,
         &runtime,
         dir.clone(),
@@ -1036,8 +1018,7 @@ fn unrepresentable_config_notify_suppresses_injection() {
     )
     .unwrap();
     install_stub(&bin, "codex", &dir);
-    let mut s = Supervisor::new(24, 80, 2000);
-    s.set_launch_context(agent_ctx_plus(
+    let mut s = sup_ctx(agent_ctx_plus(
         &bin,
         &runtime,
         dir.clone(),
@@ -1071,17 +1052,7 @@ fn unrepresentable_config_notify_suppresses_injection() {
 fn non_agent_entries_survive_save_as_plain_strings() {
     let dir = scratch("plain_save");
     let config = dir.join("config");
-    let mut s = Supervisor::new(24, 80, 2000);
-    s.set_launch_context(LaunchContext {
-        env: vec![
-            ("SHELL".into(), "/bin/sh".into()),
-            (
-                "FLEETCOM_CONFIG_DIR".into(),
-                config.clone().into_os_string(),
-            ),
-        ],
-        cwd: dir.clone(),
-    });
+    let mut s = sup_ctx(config_ctx(&config, dir.clone(), &[("SHELL", "/bin/sh")]));
     spawn(&mut s, "sleep 30", dir.clone());
     let text = save_and_read(&mut s, &config, "plain");
     assert!(
@@ -1110,8 +1081,7 @@ fn recovery_cadence_rewrites_on_capture_drift_and_skips_when_static() {
     let dir = scratch("cap_recovery_cadence");
     let (bin, runtime, config) = (dir.join("bin"), dir.join("run"), dir.join("config"));
     install_stub(&bin, "claude", &dir);
-    let mut s = Supervisor::new(24, 80, 2000);
-    s.set_launch_context(agent_ctx_plus(
+    let mut s = sup_ctx(agent_ctx_plus(
         &bin,
         &runtime,
         dir.clone(),
