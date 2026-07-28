@@ -26,6 +26,7 @@
 | `Space` | Peek at the selected task |
 | `n` | New command in the invocation directory |
 | `@` | New command in a directory you pick |
+| `/` | Jump the selection to a task by name, command, or group (opens the [find palette](#the--find-palette)) |
 | `s` | Cycle grouping: by state / by directory / by custom group |
 | `m` | Tag the selected task "in use" (toggles) |
 | `g` | Assign the selected task to a group (opens the group picker) |
@@ -144,6 +145,16 @@ The daemon removes control characters, trims surrounding whitespace, and limits 
 - Subdirectories of the current path: `Enter` or `Tab`/`→` descends into one.
 
 Typing filters the rows; `Backspace` deletes one character and the matches re-filter; `↑`/`↓` move the highlight; `Esc` cancels. Completion updates on each input, permitting navigation and launch without leaving the dashboard. `←`/`→` move the caret within the typed path (`→` descends only when the caret is at the end), and `Ctrl-A`/`Ctrl-E` (or `Home`/`End`) jump to either end; the same caret keys work in every `fleetcom` text field.
+
+## The `/` find palette
+
+`/` opens a bottom panel over the dashboard listing the tasks that match what you type. Each row reads `<glyph> <label> · <section>`: the task's status glyph, its name (or its command when unnamed), and the section it currently sits in. Empty input lists the whole fleet, and every list is in dashboard order, so the panel reads the same way as the list behind it. With no tasks, `/` does nothing.
+
+Matching is a case-insensitive substring of three fields: name, command, and group. Substring, not prefix: `eep` finds `sleep 5`. A name adds a field rather than replacing one, so a task renamed `api tests` is still reachable by typing `cargo`.
+
+The working directory is not matched. In a monorepo every task shares one directory, and cross-repo tasks often carry `~` as their base, so the directory separates nothing.
+
+`Enter` moves the dashboard selection to the highlighted task and closes the panel. It does not attach: `Enter` attaches from the dashboard, so `/api` `Enter` `Enter` attaches and `/api` `Enter` `Space` peeks. With nothing matched, `Enter` leaves the panel open so the query can be corrected. `↑`/`↓` move the highlight; `Esc` closes and leaves the selection where it was. The palette changes nothing else: no task is spawned, tagged, grouped, renamed, or killed through it.
 
 ## The `g` group picker
 

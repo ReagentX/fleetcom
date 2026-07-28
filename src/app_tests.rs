@@ -1514,6 +1514,285 @@ fn group_esc_cancels_without_sending() {
     assert_eq!(v.group.as_deref(), Some("alpha"), "Esc must send nothing");
 }
 
+// --- `/` find palette ---------------------------------------------------
+
+/// Candidate ids for the current palette state.
+fn find_ids(app: &App) -> Vec<u64> {
+    app.find_candidates.clone()
+}
+
+/// Type `text` into the open palette one key at a time.
+fn find_type(app: &mut App, text: &str) {
+    for c in text.chars() {
+        app.on_key_find(key(KeyCode::Char(c)));
+    }
+}
+
+/// `/` needs tasks, not a selection: it no-ops on an empty fleet and opens
+/// before anything is selected.
+#[test]
+fn find_palette_opens_on_slash_only_with_tasks() {
+    let mut app = App::new_local(30, 100);
+    app.on_key_dashboard(key(KeyCode::Char('/')));
+    assert!(app.mode == Mode::Dashboard, "empty fleet: / must no-op");
+    assert!(app.find_candidates.is_empty());
+
+    let inv = app.invocation_dir.clone();
+    app.spawn_in("sleep 5", inv);
+    app.pump();
+    assert_eq!(app.selected_id, None, "nothing selected yet");
+    app.on_key_dashboard(key(KeyCode::Char('/')));
+    assert!(app.mode == Mode::Find);
+    assert_eq!(find_ids(&app), vec![1]);
+}
+
+/// Candidates arrive in display order, not id order: tagging id 3 floats it
+/// to the top of the list and to the top of the palette with it.
+#[test]
+fn find_candidates_follow_display_order() {
+    let mut app = App::new_local(30, 100);
+    let inv = app.invocation_dir.clone();
+    app.spawn_in("sleep 5", inv.clone()); // id 1
+    app.spawn_in("sleep 5", inv.clone()); // id 2
+    app.spawn_in("sleep 5", inv); // id 3
+    app.transport.send(Command::Tag { id: 3, on: true });
+    app.pump();
+    let order: Vec<u64> = app
+        .display_order()
+        .into_iter()
+        .map(|i| app.views[i].id)
+        .collect();
+    assert_eq!(order, vec![3, 1, 2], "tag floats id 3 first");
+
+    app.on_key_dashboard(key(KeyCode::Char('/')));
+    assert_eq!(find_ids(&app), order);
+    assert_eq!(app.find_sel, 0, "the first match is highlighted");
+}
+
+/// Empty input lists the whole fleet.
+#[test]
+fn find_empty_input_lists_every_task() {
+    let mut app = App::new_local(30, 100);
+    let inv = app.invocation_dir.clone();
+    app.spawn_in("sleep 5", inv.clone()); // id 1
+    app.spawn_grouped("sleep 5", inv, "alpha"); // id 2
+    app.pump();
+    app.on_key_dashboard(key(KeyCode::Char('/')));
+    assert_eq!(find_ids(&app), vec![1, 2]);
+
+    // Typing then deleting returns the full fleet.
+    find_type(&mut app, "alpha");
+    assert_eq!(find_ids(&app), vec![2]);
+    for _ in 0.."alpha".len() {
+        app.on_key_find(key(KeyCode::Backspace));
+    }
+    assert_eq!(find_ids(&app), vec![1, 2]);
+}
+
+/// Matching ignores case and hits substrings anywhere in the field, not just
+/// its prefix.
+#[test]
+fn find_matches_case_insensitive_substrings() {
+    let mut app = App::new_local(30, 100);
+    let inv = app.invocation_dir.clone();
+    app.spawn_in("sleep 5", inv.clone()); // id 1
+    app.spawn_in("true", inv); // id 2
+    app.pump();
+
+    app.on_key_dashboard(key(KeyCode::Char('/')));
+    find_type(&mut app, "SLEEP");
+    assert_eq!(find_ids(&app), vec![1], "case-insensitive");
+
+    app.on_key_find(key(KeyCode::Esc));
+    app.on_key_dashboard(key(KeyCode::Char('/')));
+    find_type(&mut app, "eep");
+    assert_eq!(find_ids(&app), vec![1], "matches mid-command, not a prefix");
+
+    app.on_key_find(key(KeyCode::Esc));
+    app.on_key_dashboard(key(KeyCode::Char('/')));
+    find_type(&mut app, "ru");
+    assert_eq!(find_ids(&app), vec![2], "matches mid-command of \"true\"");
+}
+
+/// A renamed task keeps matching its command: the name is another haystack,
+/// not a replacement for one.
+#[test]
+fn find_matches_a_named_task_on_both_fields() {
+    let mut app = App::new_local(30, 100);
+    let inv = app.invocation_dir.clone();
+    app.spawn_in("sleep 5", inv.clone()); // id 1
+    app.spawn_in("true", inv); // id 2
+    app.transport.send(Command::SetName {
+        id: 1,
+        name: Some("api tests".to_string()),
+    });
+    app.pump();
+
+    app.on_key_dashboard(key(KeyCode::Char('/')));
+    find_type(&mut app, "api");
+    assert_eq!(find_ids(&app), vec![1], "matches the name");
+
+    app.on_key_find(key(KeyCode::Esc));
+    app.on_key_dashboard(key(KeyCode::Char('/')));
+    find_type(&mut app, "sleep");
+    assert_eq!(find_ids(&app), vec![1], "still matches the command");
+}
+
+/// Group names are a match field.
+#[test]
+fn find_matches_group_names() {
+    let mut app = App::new_local(30, 100);
+    let inv = app.invocation_dir.clone();
+    app.spawn_grouped("sleep 5", inv.clone(), "backend"); // id 1
+    app.spawn_in("sleep 5", inv); // id 2, no group
+    app.pump();
+
+    app.on_key_dashboard(key(KeyCode::Char('/')));
+    find_type(&mut app, "backend");
+    assert_eq!(find_ids(&app), vec![1]);
+}
+
+/// The working directory is not a match field: a task spawned in a uniquely
+/// named directory is unreachable by that name.
+#[test]
+fn find_does_not_match_the_directory() {
+    let mut app = App::new_local(30, 100);
+    let dir = temp("findpalettedir");
+    let name = dir.file_name().unwrap().to_string_lossy().into_owned();
+    app.spawn_in("sleep 5", dir); // id 1
+    app.pump();
+    assert!(name.contains("findpalettedir"), "scratch dir name: {name}");
+
+    app.on_key_dashboard(key(KeyCode::Char('/')));
+    find_type(&mut app, "findpalettedir");
+    assert!(
+        find_ids(&app).is_empty(),
+        "the directory must not match: {:?}",
+        find_ids(&app)
+    );
+
+    // The same task is reachable through a field that is matched.
+    app.on_key_find(key(KeyCode::Esc));
+    app.on_key_dashboard(key(KeyCode::Char('/')));
+    find_type(&mut app, "sleep");
+    assert_eq!(find_ids(&app), vec![1]);
+}
+
+/// Enter jumps the dashboard selection to the highlighted task and closes.
+#[test]
+fn find_enter_jumps_the_selection() {
+    let mut app = App::new_local(30, 100);
+    let inv = app.invocation_dir.clone();
+    app.spawn_in("sleep 5", inv.clone()); // id 1
+    app.spawn_in("sleep 5", inv.clone()); // id 2
+    app.spawn_in("sleep 5", inv); // id 3
+    app.pump();
+    app.resolve_selection();
+    assert_eq!(app.selected_id, Some(1));
+
+    app.on_key_dashboard(key(KeyCode::Char('/')));
+    app.on_key_find(key(KeyCode::Down));
+    app.on_key_find(key(KeyCode::Down));
+    assert_eq!(app.find_sel, 2);
+    app.on_key_find(key(KeyCode::Enter));
+    assert!(
+        app.mode == Mode::Dashboard,
+        "Enter jumps, it never attaches"
+    );
+    assert_eq!(app.focused_id, None);
+    assert_eq!(app.selected_id, Some(3));
+    assert!(app.find_input.is_empty() && app.find_candidates.is_empty());
+}
+
+/// Esc closes the palette and leaves the selection where it was.
+#[test]
+fn find_esc_leaves_the_selection_alone() {
+    let mut app = App::new_local(30, 100);
+    let inv = app.invocation_dir.clone();
+    app.spawn_in("sleep 5", inv.clone()); // id 1
+    app.spawn_in("true", inv); // id 2
+    app.pump();
+    app.resolve_selection();
+    assert_eq!(app.selected_id, Some(1));
+
+    app.on_key_dashboard(key(KeyCode::Char('/')));
+    find_type(&mut app, "true");
+    assert_eq!(find_ids(&app), vec![2]);
+    app.on_key_find(key(KeyCode::Esc));
+    assert!(app.mode == Mode::Dashboard);
+    assert_eq!(app.selected_id, Some(1), "Esc must not move the selection");
+    assert!(app.find_input.is_empty() && app.find_candidates.is_empty());
+    assert_eq!(app.find_sel, 0);
+}
+
+/// Enter on an empty candidate list changes nothing and keeps the panel open,
+/// so a typo can be corrected in place.
+#[test]
+fn find_enter_without_candidates_keeps_the_panel_open() {
+    let mut app = App::new_local(30, 100);
+    let inv = app.invocation_dir.clone();
+    app.spawn_in("sleep 5", inv);
+    app.pump();
+    app.resolve_selection();
+
+    app.on_key_dashboard(key(KeyCode::Char('/')));
+    find_type(&mut app, "zzz");
+    assert!(find_ids(&app).is_empty());
+    app.on_key_find(key(KeyCode::Enter));
+    assert!(app.mode == Mode::Find, "no match: Enter must not close");
+    assert_eq!(app.selected_id, Some(1), "selection is untouched");
+
+    // Correcting the query recovers a match.
+    for _ in 0.."zzz".len() {
+        app.on_key_find(key(KeyCode::Backspace));
+    }
+    find_type(&mut app, "sleep");
+    assert_eq!(find_ids(&app), vec![1]);
+}
+
+/// The panel paints its rows as `<glyph> <label> · <section>`, and says so
+/// when a query matches nothing.
+#[test]
+fn find_panel_rows_name_the_task_and_its_section() {
+    let mut app = App::new_local(30, 100);
+    let inv = app.invocation_dir.clone();
+    app.spawn_in("sleep 5", inv);
+    app.transport.send(Command::SetName {
+        id: 1,
+        name: Some("api tests".to_string()),
+    });
+    app.pump();
+    app.on_key_dashboard(key(KeyCode::Char('/')));
+
+    let mut out = Vec::new();
+    crate::ui::render(&mut out, &mut app).unwrap();
+    let frame = String::from_utf8_lossy(&out).into_owned();
+    assert!(frame.contains("✻ api tests · Running"), "{frame:?}");
+    assert!(frame.contains("enter jump · ↑↓ pick · esc"), "{frame:?}");
+
+    find_type(&mut app, "zzz");
+    app.last_frame.clear();
+    let mut out = Vec::new();
+    crate::ui::render(&mut out, &mut app).unwrap();
+    let frame = String::from_utf8_lossy(&out).into_owned();
+    assert!(frame.contains("(no matching tasks)"), "{frame:?}");
+}
+
+/// A paste lands in the palette field and re-filters, like the other pickers.
+#[test]
+fn find_paste_filters_the_candidates() {
+    let mut app = App::new_local(30, 100);
+    let inv = app.invocation_dir.clone();
+    app.spawn_in("sleep 5", inv.clone()); // id 1
+    app.spawn_in("true", inv); // id 2
+    app.pump();
+
+    app.on_key_dashboard(key(KeyCode::Char('/')));
+    app.on_paste("true");
+    assert_eq!(app.find_input.as_str(), "true");
+    assert_eq!(find_ids(&app), vec![2]);
+}
+
 // --- `R` rename prompt --------------------------------------------------
 
 /// The rename prompt captures the selected task ID and current name.

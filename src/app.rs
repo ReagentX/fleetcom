@@ -85,6 +85,8 @@ pub enum Mode {
     PickDir,
     /// Live group picker (the `g` flow) that reassigns the selected task's group.
     PickGroup,
+    /// Live find palette (the `/` flow) that jumps the selection to a task.
+    Find,
     /// Typing a name to save the current tasks as a session.
     SaveSession,
     /// Editing the display name of the task selected when the prompt opened.
@@ -217,6 +219,13 @@ pub struct App {
     pub group_sel: usize,
     /// Id of the task being reassigned by the open group picker.
     group_target: Option<u64>,
+    // `/` find-palette state (only meaningful in `Mode::Find`).
+    pub find_input: EditBuffer,
+    /// Matching task *ids*, in display order. Ids, not `views` indices: a
+    /// daemon snapshot can land while the panel is open and reorder `views`,
+    /// which would point a stored index at a different task.
+    pub find_candidates: Vec<u64>,
+    pub find_sel: usize,
     /// Task ID captured when the rename prompt opens.
     rename_target: Option<u64>,
     // Load-session picker state.
@@ -410,6 +419,9 @@ impl App {
             group_candidates: Vec::new(),
             group_sel: 0,
             group_target: None,
+            find_input: EditBuffer::default(),
+            find_candidates: Vec::new(),
+            find_sel: 0,
             rename_target: None,
             session_names: Vec::new(),
             session_sel: 0,
@@ -1014,6 +1026,40 @@ impl App {
         self.mode = Mode::Dashboard;
     }
 
+    // --- `/` find palette -------------------------------------------------------
+
+    /// Open the `/` palette with the whole fleet listed. A no-op on an empty
+    /// fleet: there is nothing to find, so the panel would be a dead end.
+    fn open_find_palette(&mut self) {
+        if self.views.is_empty() {
+            return;
+        }
+        self.find_input.clear();
+        self.refresh_find_candidates();
+        self.mode = Mode::Find;
+    }
+
+    /// Rebuild the palette rows in display order, so the panel reads in the
+    /// same order as the list behind it, and highlight the first match.
+    fn refresh_find_candidates(&mut self) {
+        let needle = self.find_input.to_lowercase();
+        self.find_candidates = self
+            .display_order()
+            .into_iter()
+            .filter(|&i| task_matches(&self.views[i], &needle))
+            .map(|i| self.views[i].id)
+            .collect();
+        self.find_sel = 0;
+    }
+
+    /// Clear the palette state and return to the dashboard.
+    fn close_find_palette(&mut self) {
+        self.find_input.clear();
+        self.find_candidates.clear();
+        self.find_sel = 0;
+        self.mode = Mode::Dashboard;
+    }
+
     // --- `R` rename prompt ------------------------------------------------------
 
     /// Open the rename prompt for the selected task, prefilled with its name.
@@ -1052,6 +1098,7 @@ impl App {
             Mode::Spawn => self.on_key_spawn(k),
             Mode::PickDir => self.on_key_pickdir(k),
             Mode::PickGroup => self.on_key_pickgroup(k),
+            Mode::Find => self.on_key_find(k),
             Mode::SaveSession => self.on_key_savesession(k),
             Mode::Rename => self.on_key_rename(k),
             Mode::LoadSession => self.on_key_loadsession(k),
@@ -1100,6 +1147,7 @@ impl App {
                 }
             }
             KeyCode::Char('g') => self.open_group_picker(),
+            KeyCode::Char('/') => self.open_find_palette(),
             // Uppercase R renames; lowercase r reruns.
             KeyCode::Char('R') => self.open_rename_prompt(),
             KeyCode::Char('n') => {
@@ -1291,6 +1339,31 @@ impl App {
         }
     }
 
+    fn on_key_find(&mut self, k: KeyEvent) {
+        match k.code {
+            KeyCode::Esc => self.close_find_palette(),
+            KeyCode::Up => self.find_sel = self.find_sel.saturating_sub(1),
+            KeyCode::Down => self.find_sel = step_down(self.find_sel, self.find_candidates.len()),
+            KeyCode::Enter => {
+                // Enter moves the dashboard selection and nothing else. It
+                // deliberately does not attach: Enter attaches *from* the
+                // dashboard, so `/api` Enter Enter attaches and `/api` Enter
+                // Space peeks. With nothing matched the panel stays open, so a
+                // mistyped query can be corrected instead of being cancelled.
+                if let Some(&id) = self.find_candidates.get(self.find_sel) {
+                    self.selected_id = Some(id);
+                    self.close_find_palette();
+                }
+            }
+            // Caret motion does not affect the matches.
+            _ => {
+                if on_key_edit(&mut self.find_input, k) == Some(true) {
+                    self.refresh_find_candidates();
+                }
+            }
+        }
+    }
+
     fn on_key_spawn(&mut self, k: KeyEvent) {
         self.on_key_textinput(k, |app, cmd| {
             if !cmd.is_empty() {
@@ -1406,6 +1479,10 @@ impl App {
             Mode::PickGroup => {
                 paste_into(&mut self.group_input, s);
                 self.refresh_group_candidates();
+            }
+            Mode::Find => {
+                paste_into(&mut self.find_input, s);
+                self.refresh_find_candidates();
             }
             _ => {}
         }
@@ -1720,6 +1797,25 @@ fn on_key_edit(buf: &mut EditBuffer, k: KeyEvent) -> Option<bool> {
         KeyCode::Char(_) => Some(false),
         _ => None,
     }
+}
+
+/// Whether a task matches the find palette's lowercased `needle`: a
+/// case-insensitive substring of its name, command, or group. A named task
+/// still matches its command, so a task renamed "api tests" is found by typing
+/// `cargo`. The empty needle matches everything.
+///
+/// The working directory is deliberately absent. In a monorepo every task
+/// shares one directory and cross-repo tasks often carry `~` as their base, so
+/// the directory separates nothing and would only dilute the matches.
+fn task_matches(v: &TaskView, needle: &str) -> bool {
+    [
+        v.name.as_deref(),
+        Some(v.command.as_str()),
+        v.group.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .any(|field| field.to_lowercase().contains(needle))
 }
 
 /// Insert pasted text at the caret after removing control characters.

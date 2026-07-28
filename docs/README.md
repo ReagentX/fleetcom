@@ -62,7 +62,7 @@ Run `fleetcom`. The first invocation starts the daemon and opens an empty dashbo
 ```text
   fleetcom   0 running · 0 idle · 0 done      by state · dir · custom
 
-  ❯ n run · @ dir · s sort · w save · o load
+  ❯ n run · @ dir · / find · s sort · w save · o load
   ↑↓ select · enter attach · space peek · m tag · g group · R rename · r rerun · X kill · q detach · Q quit
 ```
 
@@ -75,7 +75,7 @@ Press `n`, enter a command, and press `Enter`. The command runs in its own PTY a
   ✻  cargo watch -x test      test result: ok. 42 passed         9s
   ✻  npm run dev              VITE v5.0  ready in 312 ms         4s
 
-  ❯ n run · @ dir · s sort · w save · o load
+  ❯ n run · @ dir · / find · s sort · w save · o load
   ↑↓ select · enter attach · space peek · m tag · g group · R rename · r rerun · X kill · q detach · Q quit
 ```
 
