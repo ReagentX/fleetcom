@@ -2746,9 +2746,45 @@ fn unchanged_frame_emits_nothing() {
     app.resolve_selection();
     app.mode = Mode::Peek;
     let mut first = Vec::new();
-    crate::ui::render(&mut first, &mut app).unwrap();
-    assert!(!first.is_empty(), "the first frame paints");
+    assert!(
+        crate::ui::render(&mut first, &mut app).unwrap(),
+        "the first frame paints"
+    );
+    assert!(!first.is_empty());
     let mut second = Vec::new();
-    crate::ui::render(&mut second, &mut app).unwrap();
+    // An unchanged frame reports that no bytes were written.
+    assert!(
+        !crate::ui::render(&mut second, &mut app).unwrap(),
+        "an identical frame reports no paint"
+    );
     assert!(second.is_empty(), "an identical frame is a no-op");
+}
+
+// Repaint timing.
+
+/// Core-driven repaints wait for the remainder of `PAINT_MIN`.
+#[test]
+fn repaint_floor_gates_core_driven_frames() {
+    assert!(!paint_due(false, false, Duration::from_millis(10)));
+    assert_eq!(
+        wait_for_paint(false, Duration::from_millis(10)),
+        Duration::from_millis(23)
+    );
+    assert!(paint_due(false, false, PAINT_MIN));
+    assert_eq!(wait_for_paint(true, PAINT_MIN), WAIT_MAX);
+}
+
+/// Terminal input and attached mode permit immediate repainting.
+#[test]
+fn input_and_attached_echo_bypass_the_repaint_floor() {
+    assert!(
+        paint_due(false, true, Duration::ZERO),
+        "a handled event paints"
+    );
+    assert!(
+        paint_due(true, false, Duration::ZERO),
+        "attached echo paints"
+    );
+    // Before the floor elapses, wait for its remaining duration.
+    assert_eq!(wait_for_paint(false, Duration::ZERO), PAINT_MIN);
 }

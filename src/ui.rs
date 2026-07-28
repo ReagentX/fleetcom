@@ -22,7 +22,8 @@ use crate::{
     selection::Selection,
 };
 
-pub fn render(out: &mut impl Write, app: &mut App) -> io::Result<()> {
+/// Paint the current mode's frame, returning whether bytes were written.
+pub fn render(out: &mut impl Write, app: &mut App) -> io::Result<bool> {
     let mut buf: Vec<u8> = Vec::with_capacity(app.cols as usize * app.rows as usize * 3 + 128);
     // DECSET 2026 around the whole frame
     queue!(buf, BeginSynchronizedUpdate)?;
@@ -52,12 +53,13 @@ pub fn render(out: &mut impl Write, app: &mut App) -> io::Result<()> {
     queue!(buf, EndSynchronizedUpdate)?;
     // Repaint only on change: a stable frame (idle tasks, no input) is a no-op,
     // so there is nothing to flicker and nothing to burn CPU on.
-    if buf != app.last_frame {
-        out.write_all(&buf)?;
-        out.flush()?;
-        app.last_frame = buf;
+    if buf == app.last_frame {
+        return Ok(false);
     }
-    Ok(())
+    out.write_all(&buf)?;
+    out.flush()?;
+    app.last_frame = buf;
+    Ok(true)
 }
 
 fn put(out: &mut impl Write, y: u16, s: &str, cols: usize) -> io::Result<()> {
