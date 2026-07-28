@@ -314,9 +314,13 @@ fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
-/// Fixtures and assertions for harness detection and exit scraping.
+/// Fixtures and assertions for harness detection and exit scraping. Named
+/// `fixtures` because `crate::testutil` already owns the name `testutil`: that
+/// module holds the crate-wide scaffolding — temp dirs, deadline polling,
+/// corpus and rollout builders — while everything here is specific to the
+/// harnesses in this module.
 #[cfg(test)]
-pub(crate) mod testutil {
+pub(crate) mod fixtures {
     use std::path::PathBuf;
 
     use super::{CapturePaths, Harness};
@@ -358,7 +362,7 @@ pub(crate) mod testutil {
 
 #[cfg(test)]
 mod tests {
-    use super::testutil::{ID, OTHER};
+    use super::fixtures::{ID, OTHER};
     use super::*;
 
     /// Harness, program word, selector, and path prefix for the shape tests

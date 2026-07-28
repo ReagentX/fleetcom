@@ -1,5 +1,5 @@
 use super::*;
-use crate::harness::testutil::{ID as CAP_ID, OTHER as CAP_OTHER};
+use crate::harness::fixtures::{ID as CAP_ID, OTHER as CAP_OTHER};
 
 // --- session-capture wiring -------------------------------------------
 

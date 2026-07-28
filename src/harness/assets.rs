@@ -205,9 +205,9 @@ mod tests {
         process::{Command, Stdio},
     };
 
-    use super::super::testutil::ID;
-    use super::super::{CAPTURE_ENV, NOTIFY_CHAIN_ENV};
     use super::*;
+    use crate::harness::fixtures::ID;
+    use crate::harness::{CAPTURE_ENV, NOTIFY_CHAIN_ENV};
     use crate::testutil::{dead_pid, install_fake_notifier, temp, write_executable};
 
     fn mode(p: &Path) -> u32 {

@@ -85,9 +85,9 @@ fn encode_cwd(cwd: &Path) -> Option<String> {
 mod tests {
     use std::fs;
 
-    use super::super::is_uuid;
-    use super::super::testutil::{ID, OTHER, assert_all_opaque, assert_corpus_scrape, paths};
     use super::*;
+    use crate::harness::fixtures::{ID, OTHER, assert_all_opaque, assert_corpus_scrape, paths};
+    use crate::harness::is_uuid;
     use crate::testutil::temp;
 
     /// Grok-specific opaque shapes: flags, the `-r`/`-s`/`=` spellings the

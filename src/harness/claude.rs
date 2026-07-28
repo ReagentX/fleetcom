@@ -88,8 +88,8 @@ fn slug(cwd: &Path) -> Option<String> {
 mod tests {
     use std::{fs, path::PathBuf};
 
-    use super::super::testutil::{ID, OTHER, assert_all_opaque, assert_corpus_scrape, paths};
     use super::*;
+    use crate::harness::fixtures::{ID, OTHER, assert_all_opaque, assert_corpus_scrape, paths};
     use crate::testutil::temp;
 
     /// Claude-specific opaque shapes: flags, `--continue`/`-c`, subcommands,
