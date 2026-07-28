@@ -357,11 +357,7 @@ impl Supervisor {
                 cwd,
                 group,
             } => self.spawn(&command, cwd, group),
-            Command::Kill { id } => {
-                if let Some(t) = self.by_id_mut(id) {
-                    t.terminate();
-                }
-            }
+            Command::Kill { id } => self.with_task(id, Task::terminate),
             Command::Remove { id } => {
                 // Keep removed tasks for TERM→KILL escalation and reaping.
                 if let Some(i) = self.index_of(id) {
@@ -376,22 +372,11 @@ impl Supervisor {
                 }
             }
             Command::Restart { id } => self.rerun(id),
-            Command::Tag { id, on } => {
-                if let Some(t) = self.by_id_mut(id) {
-                    t.tagged = on;
-                }
-            }
-            // Ignore assignments for tasks no longer present.
+            Command::Tag { id, on } => self.with_task(id, |t| t.tagged = on),
             Command::SetGroup { id, group } => {
-                if let Some(t) = self.by_id_mut(id) {
-                    t.group = normalize_group(group);
-                }
+                self.with_task(id, |t| t.group = normalize_group(group))
             }
-            Command::SetName { id, name } => {
-                if let Some(t) = self.by_id_mut(id) {
-                    t.name = normalize_label(name);
-                }
-            }
+            Command::SetName { id, name } => self.with_task(id, |t| t.name = normalize_label(name)),
             Command::Resize { rows, cols } => {
                 // Clamp each dimension first, then preserve rows and reduce
                 // columns when the grid exceeds `MAX_CELLS`. The constant
@@ -438,11 +423,7 @@ impl Supervisor {
             Command::Key { id, code, mods } => {
                 self.deliver(id, "key input", |t| t.send_key(code, mods))
             }
-            Command::Scrollback { id, action } => {
-                if let Some(t) = self.by_id_mut(id) {
-                    t.scroll_view(action);
-                }
-            }
+            Command::Scrollback { id, action } => self.with_task(id, |t| t.scroll_view(action)),
             Command::SaveSession { name } => self.save_session(&name),
             Command::LoadSession { name } => self.load_session(&name),
             Command::LoadRecovery { stem } => self.load_recovery(&stem),
@@ -694,6 +675,24 @@ impl Supervisor {
     /// Queue a one-line notice for the client's status line.
     fn status(&mut self, msg: impl Into<String>) {
         self.events.push(Event::Status(msg.into()));
+    }
+
+    /// Run `f` against task `id`; do nothing when no task carries that id.
+    ///
+    /// This carries the general rule: a command naming a task that is no
+    /// longer present is ignored — no mutation, no notice, no error. Clients
+    /// act on a rendered snapshot, so an id can be reaped before the command
+    /// naming it arrives.
+    ///
+    /// `deliver` is the near-twin for input sends, its `f` returning
+    /// `Result<(), WriteRefused>` so it can call `notice_refused`. They stay
+    /// apart because they encode opposite failure policies — ignore versus
+    /// report — and one helper generic over the return type could not report,
+    /// pushing `notice_refused` back out to every input arm.
+    fn with_task(&mut self, id: u64, f: impl FnOnce(&mut Task)) {
+        if let Some(t) = self.by_id_mut(id) {
+            f(t);
+        }
     }
 
     /// Route one input send to task `id`, reporting a bounded-queue refusal.
