@@ -4,7 +4,7 @@ use super::*;
 use crate::{
     emulator::Emulator,
     preview::{MARKER, PreviewState, SummaryAdapter},
-    protocol::{Preview, PreviewSource},
+    protocol::PreviewSource,
 };
 
 /// Synthetic live viewport: the adapters' only input.
@@ -25,21 +25,40 @@ fn claude_screen<S: AsRef<str>>(above: &[S]) -> Vec<String> {
     rows
 }
 
-/// Replay a corpus fixture and resolve one preview against its final
-/// screen with `adapter` installed.
-fn resolve_corpus(bytes: &[u8], adapter: &dyn SummaryAdapter, rows: u16, cols: u16) -> Preview {
-    let mut emu = Emulator::new(rows, cols, 2000);
+/// Replay a corpus fixture, resolve one preview against its final screen
+/// with `adapter` installed, and reduce it to the comparable triple.
+///
+/// Height is fixed at 40 rows: that is the corpus capture geometry, since
+/// every fixture is raw output from a 40-row PTY (`tests/corpus/README.md`).
+/// Only `cols` varies across call sites.
+///
+/// `Preview::frozen` is deliberately left out of the triple: these tests
+/// assert resolved preview content and its provenance, not freeze state.
+fn corpus(
+    bytes: &[u8],
+    adapter: &dyn SummaryAdapter,
+    cols: u16,
+) -> (String, PreviewSource, Option<&'static str>) {
+    let mut emu = Emulator::new(40, cols, 2000);
     emu.process(bytes);
     let mut st = PreviewState::new();
-    st.resolve(Instant::now(), &emu, Some(adapter)).clone()
+    let p = st.resolve(Instant::now(), &emu, Some(adapter));
+    (p.text.clone(), p.source, p.rule)
 }
 
 fn anchor(text: &str, rule: &'static str) -> (String, PreviewSource, Option<&'static str>) {
     (text.to_string(), PreviewSource::Anchor, Some(rule))
 }
 
-fn parts(p: &Preview) -> (String, PreviewSource, Option<&'static str>) {
-    (p.text.clone(), p.source, p.rule)
+/// The alternate-screen fallback: nothing extracted, so no rule.
+fn marker() -> (String, PreviewSource, Option<&'static str>) {
+    (MARKER.to_string(), PreviewSource::Marker, None)
+}
+
+/// The floor tier reporting the screen's own status row: no rule, and the
+/// text omits the status bar's indentation.
+fn floor(text: &str) -> (String, PreviewSource, Option<&'static str>) {
+    (text.to_string(), PreviewSource::Floor, None)
 }
 
 /// Selection is a basename match on the first word only: wider than
@@ -778,8 +797,8 @@ fn corpus_positive_states_anchor_exactly() {
         ),
     ];
     for Case(name, bytes, adapter, text, rule) in cases {
-        let p = resolve_corpus(bytes, adapter, 40, 120);
-        assert_eq!(parts(&p), anchor(text, rule), "{name}");
+        let got = corpus(bytes, adapter, 120);
+        assert_eq!(got, anchor(text, rule), "{name}");
     }
 }
 
@@ -810,12 +829,8 @@ fn corpus_idle_states_fall_through() {
         ),
     ];
     for (name, bytes, adapter) in cases {
-        let p = resolve_corpus(bytes, adapter, 40, 120);
-        assert_eq!(
-            parts(&p),
-            (MARKER.to_string(), PreviewSource::Marker, None),
-            "{name}"
-        );
+        let got = corpus(bytes, adapter, 120);
+        assert_eq!(got, marker(), "{name}");
     }
 }
 
@@ -825,82 +840,58 @@ fn corpus_idle_states_fall_through() {
 #[test]
 fn corpus_body_shaped_text_never_extracts() {
     // Menu in the body, spinner live: the pinned spinner wins.
-    let p = resolve_corpus(
+    let got = corpus(
         include_bytes!("../../tests/corpus/preview_claude_body_menu.bin"),
         &ClaudeSummary,
-        40,
         120,
     );
-    assert_eq!(
-        parts(&p),
-        anchor("Fable 5 (high) · Hashing…", "claude:spinner")
-    );
+    assert_eq!(got, anchor("Fable 5 (high) · Hashing…", "claude:spinner"));
 
     // Menu touching the chrome window on an idle screen: abort, marker.
-    let p = resolve_corpus(
+    let got = corpus(
         include_bytes!("../../tests/corpus/preview_claude_body_menu_idle.bin"),
         &ClaudeSummary,
-        40,
         120,
     );
-    assert_eq!(parts(&p), (MARKER.to_string(), PreviewSource::Marker, None));
+    assert_eq!(got, marker());
 
     // Body prose between spinner-shaped text and the task list yields the marker.
-    let p = resolve_corpus(
+    let got = corpus(
         include_bytes!("../../tests/corpus/preview_claude_body_above_tasklist.bin"),
         &ClaudeSummary,
-        40,
         120,
     );
-    assert_eq!(parts(&p), (MARKER.to_string(), PreviewSource::Marker, None));
+    assert_eq!(got, marker());
 
     // Prior-turn `• Ran` in scrollback with the turn finished: the scan
     // stops at the reply bullet and the floor tier reports the screen.
-    let p = resolve_corpus(
+    let got = corpus(
         include_bytes!("../../tests/corpus/preview_codex_scrollback.bin"),
         &CodexSummary,
-        40,
         120,
     );
     assert_eq!(
-        parts(&p),
-        (
-            // Floor previews omit the status bar's indentation.
-            "gpt-5.6-sol high · 5.26K used · 28.2K in · 78 out".to_string(),
-            PreviewSource::Floor,
-            None
-        )
+        got,
+        floor("gpt-5.6-sol high · 5.26K used · 28.2K in · 78 out")
     );
 
     // A modal-shaped menu quoted in the body with the live composer
     // below it: the composer suppresses the approval match, the quote
     // is foreign to the status scan, and the floor tier reports.
-    let p = resolve_corpus(
+    let got = corpus(
         include_bytes!("../../tests/corpus/preview_codex_body_menu.bin"),
         &CodexSummary,
-        40,
         120,
     );
-    assert_eq!(
-        parts(&p),
-        (
-            "gpt-5.6-sol high · 0 in · 0 out".to_string(),
-            PreviewSource::Floor,
-            None
-        )
-    );
+    assert_eq!(got, floor("gpt-5.6-sol high · 0 in · 0 out"));
 
     // `• Ran` visible mid-turn with `• Working` at the pin: live wins.
-    let p = resolve_corpus(
+    let got = corpus(
         include_bytes!("../../tests/corpus/preview_codex_working_over_ran.bin"),
         &CodexSummary,
-        40,
         120,
     );
-    assert_eq!(
-        parts(&p),
-        anchor("gpt-5.6-sol high · Working", "codex:working")
-    );
+    assert_eq!(got, anchor("gpt-5.6-sol high · Working", "codex:working"));
 }
 
 /// 80-column truncation: the CLIs cut their status rows at a word
@@ -908,37 +899,34 @@ fn corpus_body_shaped_text_never_extracts() {
 /// the kept suffix keeps that ellipsis verbatim.
 #[test]
 fn corpus_truncated_rows_still_anchor() {
-    let p = resolve_corpus(
+    let got = corpus(
         include_bytes!("../../tests/corpus/preview_trunc_claude.bin"),
         &ClaudeSummary,
-        40,
         80,
     );
     // No welcome box on the narrow screen: the label drops with it.
-    assert_eq!(parts(&p), anchor("Hashing…", "claude:spinner"));
+    assert_eq!(got, anchor("Hashing…", "claude:spinner"));
 
-    let p = resolve_corpus(
+    let got = corpus(
         include_bytes!("../../tests/corpus/preview_trunc_codex.bin"),
         &CodexSummary,
-        40,
         80,
     );
     assert_eq!(
-        parts(&p),
+        got,
         anchor(
             "gpt-5.6-sol high · Working · 1 background terminal running",
             "codex:working"
         )
     );
 
-    let p = resolve_corpus(
+    let got = corpus(
         include_bytes!("../../tests/corpus/preview_trunc_grok.bin"),
         &GrokSummary,
-        40,
         80,
     );
     assert_eq!(
-        parts(&p),
+        got,
         anchor(
             "Grok 4.5 (xhigh) · Sleep 5 seconds then echo…",
             "grok:spinner"
@@ -950,13 +938,12 @@ fn corpus_truncated_rows_still_anchor() {
 /// resolves to the alternate-screen marker.
 #[test]
 fn corpus_wrapped_ellipsis_falls_through() {
-    let p = resolve_corpus(
+    let got = corpus(
         include_bytes!("../../tests/corpus/preview_wrap_grok.bin"),
         &GrokSummary,
-        40,
         30,
     );
-    assert_eq!(parts(&p), (MARKER.to_string(), PreviewSource::Marker, None));
+    assert_eq!(got, marker());
 }
 
 /// Non-agent TUIs on the alternate screen resolve through the
