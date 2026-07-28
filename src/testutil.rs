@@ -8,18 +8,86 @@ use std::{
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
     process::Command,
+    sync::{
+        Once,
+        atomic::{AtomicU32, Ordering},
+    },
     time::{Duration, Instant, SystemTime},
 };
 
 use crate::{emulator::Emulator, format::civil_from_days};
 
-/// Fresh scratch directory under the system temp dir. Any leftover from a
-/// previous run is removed first; the pid suffix isolates concurrent suites.
+/// Scratch-directory name prefix, shared by creation and the sweep.
+const SCRATCH_PREFIX: &str = "fleetcom_test_";
+
+/// Create an empty `fleetcom_test_<tag>_<pid>_<seq>` directory under the system
+/// temp directory. The PID separates test processes, and the sequence separates
+/// calls within one process. Any existing path with the same name is removed.
 pub(crate) fn temp(tag: &str) -> PathBuf {
-    let d = std::env::temp_dir().join(format!("fleetcom_test_{tag}_{}", std::process::id()));
+    static SEQ: AtomicU32 = AtomicU32::new(0);
+    sweep_dead_scratch();
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    let d = std::env::temp_dir().join(format!(
+        "{SCRATCH_PREFIX}{tag}_{}_{seq}",
+        std::process::id()
+    ));
     let _ = fs::remove_dir_all(&d);
     fs::create_dir_all(&d).unwrap();
     d
+}
+
+/// Remove scratch directories whose recorded processes no longer exist.
+///
+/// This runs once, before the current process creates its first directory, so
+/// this process's directories remain available for post-failure inspection.
+fn sweep_dead_scratch() {
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        let Ok(entries) = fs::read_dir(std::env::temp_dir()) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some(suffix) = name.to_str().and_then(|n| n.strip_prefix(SCRATCH_PREFIX)) else {
+                continue;
+            };
+            if scratch_pid(suffix).is_some_and(pid_is_dead) {
+                let _ = fs::remove_dir_all(entry.path());
+            }
+        }
+    });
+}
+
+/// Parse the `<pid>` from a `<tag>_<pid>_<seq>` scratch suffix. Tags contain
+/// underscores, so both trailing fields are read from the right.
+fn scratch_pid(suffix: &str) -> Option<i32> {
+    let (rest, seq) = suffix.rsplit_once('_')?;
+    let (_, pid) = rest.rsplit_once('_')?;
+    let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    if !digits(seq) || !digits(pid) {
+        return None;
+    }
+    pid.parse::<i32>().ok().filter(|p| *p > 0)
+}
+
+/// Whether a PID is known to be dead. Only `ESRCH` proves death, so a live
+/// process and one owned by another user both keep their directory.
+fn pid_is_dead(pid: i32) -> bool {
+    use nix::{errno::Errno, sys::signal::kill, unistd::Pid};
+    matches!(kill(Pid::from_raw(pid), None), Err(Errno::ESRCH))
+}
+
+/// Accept the current suffix format and reject malformed fields.
+#[test]
+fn scratch_pid_reads_the_pid_field() {
+    assert_eq!(scratch_pid("tag_with_underscores_123_4"), Some(123));
+    assert_eq!(scratch_pid("session_mode_7_0"), Some(7));
+    // Both trailing fields must be decimal integers.
+    assert_eq!(scratch_pid("tag_with_underscores_x_4"), None);
+    assert_eq!(scratch_pid("tag_123_x"), None);
+    // A suffix without all three components is invalid.
+    assert_eq!(scratch_pid("tag_123"), None);
+    assert_eq!(scratch_pid("tag_0_4"), None);
 }
 
 /// Poll `pred` until it holds or `budget` elapses; returns the final answer.
