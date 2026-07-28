@@ -2701,3 +2701,90 @@ fn wants_mouse_child_keeps_the_left_button() {
     assert_eq!(got, b"\x1b[<0;3;2M\x1b[<32;6;2M\x1b[<0;6;2m".to_vec());
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// Frame emission: overlay modes composite by overdraw, so the emulator must
+// never see a frame's dashboard layer without its overlay.
+
+/// Every emitted frame is one synchronized update.
+#[test]
+fn frame_is_wrapped_in_one_synchronized_update() {
+    let mut app = App::new_local(30, 100);
+    let dir = app.invocation_dir.clone();
+    app.spawn_in("sleep 5", dir);
+    app.pump();
+    app.resolve_selection();
+    for (label, mode) in [
+        ("dashboard", Mode::Dashboard),
+        ("peek", Mode::Peek),
+        ("attached", Mode::Attached),
+    ] {
+        app.mode = mode;
+        app.focused_id = app.selected_id;
+        app.last_frame.clear(); // force the write; only changed frames emit
+        let mut out = Vec::new();
+        crate::ui::render(&mut out, &mut app).unwrap();
+        assert!(!out.is_empty(), "{label} must paint");
+        assert!(
+            out.starts_with(b"\x1b[?2026h") && out.ends_with(b"\x1b[?2026l"),
+            "the {label} frame must open and close one synchronized update"
+        );
+        assert_eq!(
+            out.windows(8).filter(|w| *w == b"\x1b[?2026h").count(),
+            1,
+            "{label} must not nest updates"
+        );
+    }
+}
+
+/// The update markers are constant, so an unchanged frame still writes nothing.
+#[test]
+fn unchanged_frame_emits_nothing() {
+    let mut app = App::new_local(30, 100);
+    let dir = app.invocation_dir.clone();
+    app.spawn_in("sleep 5", dir);
+    app.pump();
+    app.resolve_selection();
+    app.mode = Mode::Peek;
+    let mut first = Vec::new();
+    assert!(
+        crate::ui::render(&mut first, &mut app).unwrap(),
+        "the first frame paints"
+    );
+    assert!(!first.is_empty());
+    let mut second = Vec::new();
+    // An unchanged frame reports that no bytes were written.
+    assert!(
+        !crate::ui::render(&mut second, &mut app).unwrap(),
+        "an identical frame reports no paint"
+    );
+    assert!(second.is_empty(), "an identical frame is a no-op");
+}
+
+// Repaint timing.
+
+/// Core-driven repaints wait for the remainder of `PAINT_MIN`.
+#[test]
+fn repaint_floor_gates_core_driven_frames() {
+    assert!(!paint_due(false, false, Duration::from_millis(10)));
+    assert_eq!(
+        wait_for_paint(false, Duration::from_millis(10)),
+        Duration::from_millis(23)
+    );
+    assert!(paint_due(false, false, PAINT_MIN));
+    assert_eq!(wait_for_paint(true, PAINT_MIN), WAIT_MAX);
+}
+
+/// Terminal input and attached mode permit immediate repainting.
+#[test]
+fn input_and_attached_echo_bypass_the_repaint_floor() {
+    assert!(
+        paint_due(false, true, Duration::ZERO),
+        "a handled event paints"
+    );
+    assert!(
+        paint_due(true, false, Duration::ZERO),
+        "attached echo paints"
+    );
+    // Before the floor elapses, wait for its remaining duration.
+    assert_eq!(wait_for_paint(false, Duration::ZERO), PAINT_MIN);
+}

@@ -6,7 +6,7 @@
 
 ### Fleet view
 
-See every task’s state and latest output from one dashboard.
+Monitor every task's state and live output from one dashboard: test results, dev servers, and which agent is waiting on you.
 
 ![`fleetcom` fleet view](docs/img/home.png)
 
@@ -22,6 +22,10 @@ Press `Enter` to take control of a task, then `Ctrl-\` to return to the dashboar
 
 ![`fleetcom` attach](docs/img/attach.png)
 
+### Resume agent sessions
+
+Start `claude`, `codex`, or `grok` normally. When you rerun the task or reload a saved session, `fleetcom` resumes the same conversation automatically.
+
 ## Operational model
 
 Running several long-lived commands is pesky once they span terminal panes or need to survive a disconnect. `fleetcom`:
@@ -35,7 +39,7 @@ Running several long-lived commands is pesky once they span terminal panes or ne
 
 ## Documentation
 
-The [`docs/`](docs/README.md) directory covers configuration, on-disk state, session files, commands, and a complete first run.
+The [`docs/`](docs/README.md) directory covers configuration, on-disk state, session files, resuming supported agent sessions, commands, and a complete first run.
 
 ## Installation
 

@@ -49,6 +49,26 @@ const _: () = assert!(
 /// How long an ephemeral notice remains visible.
 const NOTICE_TTL: Duration = Duration::from_secs(5);
 
+/// Minimum interval between non-forced repaints outside attached mode.
+const PAINT_MIN: Duration = Duration::from_millis(33);
+
+/// Maximum time the run loop blocks before checking for termination.
+const WAIT_MAX: Duration = Duration::from_millis(100);
+
+/// Return whether the current pass may paint.
+fn paint_due(attached: bool, forced: bool, since_paint: Duration) -> bool {
+    attached || forced || since_paint >= PAINT_MIN
+}
+
+/// Return the next repaint or termination-check timeout.
+fn wait_for_paint(due: bool, since_paint: Duration) -> Duration {
+    if due {
+        WAIT_MAX
+    } else {
+        PAINT_MIN.saturating_sub(since_paint).min(WAIT_MAX)
+    }
+}
+
 /// Priority of an ephemeral notice. Active warnings take precedence over info.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum NoticeLevel {
@@ -179,6 +199,10 @@ pub struct App {
     /// Bytes of the last painted frame; the renderer skips the write when the
     /// next frame is identical.
     pub last_frame: Vec<u8>,
+    /// Time of the last frame write, or `None` until the first write.
+    last_paint: Option<Instant>,
+    /// Whether the next pass bypasses `PAINT_MIN`.
+    force_paint: bool,
     /// Directory `fleetcom` was launched from: base for relative `@` paths and
     /// the "default" section that sorts first in "by dir" mode.
     pub invocation_dir: PathBuf,
@@ -375,6 +399,8 @@ impl App {
             rows,
             cols,
             last_frame: Vec::new(),
+            last_paint: None,
+            force_paint: false,
             invocation_dir,
             invocation_label,
             dir_input: EditBuffer::default(),
@@ -763,18 +789,31 @@ impl App {
                 self.selection = None;
             }
 
-            // Emit accepted clipboard stores before painting the next frame.
+            // Flush clipboard output and synchronize terminal input modes.
             self.flush_clipboard(out)?;
             self.sync_input_modes(out)?;
-            ui::render(out, self)?;
 
-            // Wake for input or core events; the timeout observes termination.
-            let _ = self.wait_rx.recv_timeout(Duration::from_millis(100));
+            let now = Instant::now();
+            // Treat an absent prior paint as one full interval elapsed.
+            let since_paint = self.last_paint.map_or(PAINT_MIN, |t| now.duration_since(t));
+            let due = paint_due(self.mode == Mode::Attached, self.force_paint, since_paint);
+            if due {
+                // Start a new interval only when the frame is written.
+                if ui::render(out, self)? {
+                    self.last_paint = Some(now);
+                }
+                self.force_paint = false;
+            }
+
+            // Wait for input, a core event, or the next repaint deadline.
+            let _ = self.wait_rx.recv_timeout(wait_for_paint(due, since_paint));
             while self.wait_rx.try_recv().is_ok() {} // coalesce wake tokens
 
             // Handle every buffered key/resize in one pass: coalesces a paste and
             // shaves the last keystroke's echo (no render between chars).
             while let Ok(ev) = self.input_rx.try_recv() {
+                // Terminal events make the next pass bypass `PAINT_MIN`.
+                self.force_paint = true;
                 match ev {
                     // Accept Repeat too, so a held key still forwards when attached.
                     CtEvent::Key(k)

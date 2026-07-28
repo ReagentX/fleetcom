@@ -372,46 +372,40 @@ fn input_hints_track_child_modes() {
     t.terminate();
 }
 
-/// Holding the grid lock after process exit blocks reader EOF, which must
-/// also block exit-hint scraping.
+/// The scrape waits on two criteria: the child must have exited and the PTY
+/// reader must have stopped; a live reader may still hold bytes that
+/// have not reached the grid.
 #[test]
 fn scrape_exit_hint_waits_for_reader_eof() {
     const ID: &str = "c8c4a5cc-0b32-4ba0-a6b4-6ed08c218e0d";
-    let dir = temp("task_scrape");
-    let flag = dir.join("flag");
-    let cmd = format!(
-        "until [ -e '{f}' ]; do sleep 0.05; done; \
-         printf 'Resume this session with:\\nclaude --resume {ID}\\n'",
-        f = flag.display()
-    );
+    let cmd = format!("printf 'Resume this session with:\\nclaude --resume {ID}\\n'");
     let mut t = Task::spawn(20, &cmd, &cmd, &here(), 24, 80, 2000, &sh_env(), no_waker()).unwrap();
     t.harness = Some(&crate::harness::Claude);
-
-    // Hold the grid before output so the reader cannot process bytes or
-    // observe EOF.
-    let parser = Arc::clone(&t.parser);
-    let guard = parser.lock();
-    std::fs::write(&flag, b"").unwrap();
-    // The process can exit while its hint remains blocked in the reader.
-    // The long deadline bounds failure without constraining loaded CI.
     assert!(
         wait_until(Duration::from_secs(60), || {
             t.poll_exit().unwrap();
-            t.finished.is_some()
+            t.output_complete()
         }),
         "child never exited"
     );
+
+    // Reopen the reader gate: a thread outliving the child's exit stands in
+    // for a reader still working through bytes the grid has not seen.
+    let (release, parked) = channel::<()>();
+    t.handle = Some(thread::spawn(move || {
+        let _ = parked.recv();
+    }));
     t.scrape_exit_hint();
     assert_eq!(t.scraped_id, None, "the scrape must wait for reader EOF");
 
-    // Release the reader so it can parse the hint and reach EOF.
-    drop(guard);
-    wait_until(Duration::from_secs(60), || {
-        t.scrape_exit_hint();
-        t.scraped_id.is_some()
-    });
+    // Dropping the sender ends the stand-in: the reader reached EOF.
+    drop(release);
+    assert!(
+        wait_until(Duration::from_secs(60), || t.reader_done()),
+        "the stand-in reader never stopped"
+    );
+    t.scrape_exit_hint();
     assert_eq!(t.scraped_id.as_deref(), Some(ID));
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// A child that dies with a `?2026` frame still open leaves its hint
