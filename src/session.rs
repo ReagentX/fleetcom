@@ -448,7 +448,7 @@ fn prune_recovery(dir: &Path, keep_stem: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testutil::temp;
+    use crate::testutil::{dead_pid, temp};
 
     /// Unadorned entry: the plain-string member form.
     fn e(cmd: &str) -> SessionEntry {
@@ -846,18 +846,6 @@ mod tests {
     /// Out-of-range PID used for dead-writer fixtures.
     const DEAD_FIXTURE_PID: u32 = 9_999_999;
 
-    /// Spawn and reap a child, then return its inactive PID.
-    fn dead_child_pid() -> u32 {
-        let mut child = std::process::Command::new("sh")
-            .arg("-c")
-            .arg("exit 0")
-            .spawn()
-            .unwrap();
-        let pid = child.id();
-        child.wait().unwrap();
-        pid
-    }
-
     /// The stem is `<YYYYMMDD-HHMMSS>-<pid>`; the label is the write minute.
     #[test]
     fn recovery_stem_and_label_render_utc() {
@@ -1013,7 +1001,7 @@ mod tests {
         let rec = recovery_dir(&base);
         let mut cfg = SessionConfig::new();
         cfg.insert("~/p".into(), vec![e("vim")]);
-        let oldest = format!("20260101-000000-{}", dead_child_pid());
+        let oldest = format!("20260101-000000-{}", dead_pid());
         save_recovery_in(&rec, &oldest, "autosaved 2026-01-01 00:00", &cfg).unwrap();
         for i in 1..=10u32 {
             let stem = format!("20260714-0930{i:02}-{DEAD_FIXTURE_PID}");
