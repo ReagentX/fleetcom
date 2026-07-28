@@ -45,7 +45,7 @@ The `version` field must be an integer from 1 through the newest format supporte
 
 The shape, not the version, discriminates the schema. An object-valued `dirs` marks the wrapped form shown above. The loader also accepts a flat map whose top-level keys are directories and whose values are entry arrays. In that form, an array-valued key named `dirs` remains a directory entry, but a top-level `version` member is always the format version, never a directory. Flat-map files list by filename stem because they have no stored name. Saving one writes the wrapped form and permits overwriting it without a stored-name collision check.
 
-Saves are atomic: `fleetcom` writes and syncs a private temporary file in the session directory, then renames it over the recipe. Recipes persist full command lines, which can embed secrets. New session directories use mode 0700, saves remove group and other permissions from existing session directories, and recipe files use mode 0600.
+Saves are atomic: `fleetcom` writes and syncs a private temporary file in the session directory, then renames it over the recipe. Recipes persist full command lines, which can embed secrets. [Security](README.md#security) documents the directory and file permissions.
 
 The file is plain JSON and practical to edit by hand. Editing the `name` field changes which session the file claims to be: collision checks compare it, so a save under the old name will be refused. On load, the daemon removes control characters, trims surrounding whitespace, and limits group and display names to 64 characters. `Unassigned` maps to no group but remains a legal display name. Invalid JSON fails the entire load. Within valid JSON, `fleetcom` drops any member that matches neither entry form, including a non-string scalar, an object without a string `cmd`, or an object with a non-string `group` or `name`.
 
@@ -79,7 +79,7 @@ A snapshot uses the session format above, with an `autosaved <timestamp>` UTC la
 
 In the dashboard, `o` opens the [session picker](commands.md#the-o-session-picker) on the saved list; while snapshots exist, `Tab` flips it to the recovery list.
 
-Recovery files carry the same caveat as saved recipes: they persist full command lines, which can embed secrets. New recovery directories use mode 0700, and snapshot files use mode 0600.
+Recovery files carry the same caveat as saved recipes: they persist full command lines, which can embed secrets.
 
 ## Saving and loading
 

@@ -29,7 +29,7 @@ Runtime state contains the daemon socket and lock. Configuration contains durabl
 
 ### Runtime directory (socket + lock)
 
-The runtime directory holds `default.sock`, the mode-`0600` client↔daemon socket, and `daemon.lock`, the single-instance `flock`. The daemon records its PID in the lock file; `--kill` uses that PID rather than waiting for the socket. `fleetcom` creates the directory with mode `0700`. An existing path must be a real directory owned by the current user, so symlinks and directories owned by another user are rejected.
+The runtime directory holds `default.sock`, the client↔daemon socket; `daemon.lock`, the single-instance `flock`; and `daemon.log`, the stderr of an autostarted daemon. The daemon records its PID in the lock file; `--kill` uses that PID rather than waiting for the socket. [Security](#security) documents the permissions and the ownership checks this directory must satisfy.
 
 Resolved in this order:
 
@@ -51,7 +51,7 @@ Holds saved sessions under a `sessions/` subdirectory: one sanitized-name `.json
 | 2 | Linux | `${XDG_CONFIG_HOME:-~/.config}/fleetcom/sessions` |
 | 2 | macOS | `~/Library/Application Support/fleetcom/sessions` |
 
-The platform default is [`dirs::config_dir()`](https://docs.rs/dirs/latest/dirs/fn.config_dir.html) joined with `fleetcom`. The first save creates missing session directories with mode `0700`; recipe files use mode `0600`.
+The platform default is [`dirs::config_dir()`](https://docs.rs/dirs/latest/dirs/fn.config_dir.html) joined with `fleetcom`. The first save creates any missing session directories.
 
 ## First-run walkthrough
 
@@ -187,7 +187,7 @@ Because the daemon holds each PTY master, daemon termination closes the terminal
 
 ### Environment and directory
 
-Each launch uses the launching client's environment and working directory, sent once per connection during the hello handshake. Connect from a venv terminal and your spawns, reruns, and session loads all see that venv, whichever client originally autostarted the daemon. Environment is never written to disk; session files store only directories, commands, group assignments, and display names.
+Each launch uses the launching client's environment and working directory, sent once per connection during the hello handshake. Connect from a venv terminal and your spawns, reruns, and session loads all see that venv, whichever client originally autostarted the daemon. [Security](#security) covers what that context does and does not persist.
 
 ### Scrollback depth is fixed per supervisor
 
