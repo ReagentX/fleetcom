@@ -205,14 +205,16 @@ pub enum Event {
     },
 }
 
-/// Clipboard target carried by an OSC 52 event.
+/// Clipboard target named by an OSC 52 selector byte. The same three targets
+/// run in both directions: a store captured from a child's OSC 52, and a
+/// client-side copy the app re-emits as OSC 52 to the host terminal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ClipboardKind {
-    /// The system clipboard (OSC 52 kind byte `c`).
+    /// The system clipboard (selector byte `c`).
     Clipboard,
-    /// The primary selection (OSC 52 kind byte `p`).
+    /// The primary selection (selector byte `p`).
     Primary,
-    /// The select buffer (OSC 52 kind byte `s`).
+    /// The select buffer (selector byte `s`).
     Selection,
 }
 

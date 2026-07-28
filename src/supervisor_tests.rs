@@ -1,7 +1,7 @@
 use std::path::Path;
 
 use super::*;
-use crate::protocol::{Key, Mods};
+use crate::protocol::{ClipboardKind, Key, Mods};
 use crate::testutil::{
     here, install_fake_notifier, now_ms, read_pid, sh_env, wait_until, write_executable,
     write_rollout,

@@ -15,12 +15,9 @@ use std::{
 
 use crate::{
     core::{Wake, Waker},
-    emulator::ClipboardSelector,
     harness::{self, assets},
     path,
-    protocol::{
-        ClipboardKind, Command, Event, LaunchContext, ScreenView, ScrollAction, TaskView, env_get,
-    },
+    protocol::{Command, Event, LaunchContext, ScreenView, ScrollAction, TaskView, env_get},
     session::{self, SessionConfig, SessionEntry},
     task::{Task, WriteRefused},
 };
@@ -123,15 +120,6 @@ fn normalize_label(label: Option<String>) -> Option<String> {
 /// `Unassigned` to `None`. Display names do not reserve this label.
 fn normalize_group(name: Option<String>) -> Option<String> {
     normalize_label(name).filter(|g| g != "Unassigned")
-}
-
-/// Map an emulator clipboard selector to its protocol representation.
-fn clipboard_kind(kind: ClipboardSelector) -> ClipboardKind {
-    match kind {
-        ClipboardSelector::Clipboard => ClipboardKind::Clipboard,
-        ClipboardSelector::Primary => ClipboardKind::Primary,
-        ClipboardSelector::Select => ClipboardKind::Selection,
-    }
 }
 
 /// Return the 64-bit FNV-1a hash used to separate fallback capture roots. The
@@ -544,11 +532,7 @@ impl Supervisor {
 
         if let Some((id, stores)) = clipboard {
             for (kind, text) in stores.stores {
-                self.events.push(Event::ClipboardCopy {
-                    id,
-                    kind: clipboard_kind(kind),
-                    text,
-                });
+                self.events.push(Event::ClipboardCopy { id, kind, text });
             }
             if let Some(len) = stores.oversized_len {
                 self.status(format!(

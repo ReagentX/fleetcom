@@ -19,6 +19,8 @@ use alacritty_terminal::{
 };
 use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
 
+use crate::protocol::ClipboardKind;
+
 /// Mouse event classes requested by the child through DECSET 1000/1002/1003.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MouseProtocolMode {
@@ -47,22 +49,12 @@ const _: () = assert!(
     "CLIPBOARD_STORE_MAX_BYTES must base64-encode to under frame::MAX_FRAME"
 );
 
-/// Supported OSC 52 clipboard targets.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ClipboardSelector {
-    /// The system clipboard (selector byte `c`).
-    Clipboard,
-    /// The primary selection (selector byte `p`).
-    Primary,
-    /// The select buffer (selector byte `s`).
-    Select,
-}
-
 /// OSC 52 clipboard stores captured since the last drain.
 #[derive(Debug, Default)]
 pub struct ClipboardStores {
-    /// Latest store per selector, ordered by arrival.
-    pub stores: Vec<(ClipboardSelector, String)>,
+    /// Latest store per selector, ordered by arrival. Only the three selectors
+    /// [`ClipboardKind`] names can appear here; the rest are dropped at parse.
+    pub stores: Vec<(ClipboardKind, String)>,
     /// Byte length of the most recent oversized store.
     pub oversized_len: Option<usize>,
 }
@@ -836,9 +828,9 @@ impl Handler for ObservedTerm<'_> {
     fn clipboard_store(&mut self, a0: u8, a1: &[u8]) {
         // Ignore selectors without a forwarding target.
         let selector = match a0 {
-            b'c' => ClipboardSelector::Clipboard,
-            b'p' => ClipboardSelector::Primary,
-            b's' => ClipboardSelector::Select,
+            b'c' => ClipboardKind::Clipboard,
+            b'p' => ClipboardKind::Primary,
+            b's' => ClipboardKind::Selection,
             _ => return,
         };
         // Accept padded standard base64 containing UTF-8 text.
@@ -983,7 +975,7 @@ mod tests {
         let drained = emu.drain_clipboard();
         assert_eq!(
             drained.stores,
-            vec![(ClipboardSelector::Clipboard, "hello".to_string())]
+            vec![(ClipboardKind::Clipboard, "hello".to_string())]
         );
         assert_eq!(drained.oversized_len, None);
         let again = emu.drain_clipboard();
@@ -999,8 +991,8 @@ mod tests {
         assert_eq!(
             emu.drain_clipboard().stores,
             vec![
-                (ClipboardSelector::Primary, "a".to_string()),
-                (ClipboardSelector::Select, "b".to_string()),
+                (ClipboardKind::Primary, "a".to_string()),
+                (ClipboardKind::Selection, "b".to_string()),
             ]
         );
     }
@@ -1012,7 +1004,7 @@ mod tests {
         emu.process(b"\x1b]52;;aGk=\x07");
         assert_eq!(
             emu.drain_clipboard().stores,
-            vec![(ClipboardSelector::Clipboard, "hi".to_string())]
+            vec![(ClipboardKind::Clipboard, "hi".to_string())]
         );
     }
 
@@ -1034,7 +1026,7 @@ mod tests {
         emu.process(b"\x1b]52;c;Zmlyc3Q=\x07\x1b]52;c;c2Vjb25k\x07");
         assert_eq!(
             emu.drain_clipboard().stores,
-            vec![(ClipboardSelector::Clipboard, "second".to_string())]
+            vec![(ClipboardKind::Clipboard, "second".to_string())]
         );
     }
 
@@ -1046,9 +1038,9 @@ mod tests {
         assert_eq!(
             emu.drain_clipboard().stores,
             vec![
-                (ClipboardSelector::Select, "sel".to_string()),
-                (ClipboardSelector::Primary, "pri".to_string()),
-                (ClipboardSelector::Clipboard, "clip".to_string()),
+                (ClipboardKind::Selection, "sel".to_string()),
+                (ClipboardKind::Primary, "pri".to_string()),
+                (ClipboardKind::Clipboard, "clip".to_string()),
             ]
         );
     }
@@ -1083,7 +1075,7 @@ mod tests {
         emu.process(b"\x1b]52;c;aGVsbG8=\x1b\\");
         assert_eq!(
             emu.drain_clipboard().stores,
-            vec![(ClipboardSelector::Clipboard, "hello".to_string())]
+            vec![(ClipboardKind::Clipboard, "hello".to_string())]
         );
     }
 
@@ -1102,8 +1094,8 @@ mod tests {
         assert_eq!(
             drained.stores,
             vec![
-                (ClipboardSelector::Select, "sel".to_string()),
-                (ClipboardSelector::Primary, "pri".to_string()),
+                (ClipboardKind::Selection, "sel".to_string()),
+                (ClipboardKind::Primary, "pri".to_string()),
             ],
             "the drop clears its own selector's slot and no other"
         );
