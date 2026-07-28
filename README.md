@@ -6,7 +6,7 @@
 
 ### Fleet view
 
-See every task’s state and latest output from one dashboard.
+Monitor every task's state and live output from one dashboard: test results, dev servers, and which agent is waiting on you.
 
 ![`fleetcom` fleet view](docs/img/home.png)
 
@@ -21,6 +21,10 @@ Press `Space` for a quick peek at a task’s live screen without attaching to it
 Press `Enter` to take control of a task, then `Ctrl-\` to return to the dashboard without interrupting it.
 
 ![`fleetcom` attach](docs/img/attach.png)
+
+### Resume agent sessions
+
+Start `claude`, `codex`, or `grok` normally. When you rerun the task or reload a saved session, `fleetcom` resumes the same conversation automatically.
 
 ## Operational model
 
