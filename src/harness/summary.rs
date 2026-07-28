@@ -27,7 +27,7 @@
 
 use std::path::Path;
 
-use crate::preview::{ScreenFacts, SummaryAdapter};
+use crate::preview::SummaryAdapter;
 
 /// Select an adapter by the basename of the command's first
 /// whitespace-separated word. Arguments are accepted; environment prefixes
@@ -107,17 +107,16 @@ const CLAUDE_STATUS_WINDOW: usize = 16;
 pub struct ClaudeSummary;
 
 impl SummaryAdapter for ClaudeSummary {
-    fn live_preview(&self, screen: &dyn ScreenFacts) -> Option<(String, &'static str)> {
-        let rows = screen.live_rows();
-        match claude_box_top(&rows) {
-            Some(top) => claude_spinner_status(&rows, top),
+    fn live_preview(&self, rows: &[String]) -> Option<(String, &'static str)> {
+        match claude_box_top(rows) {
+            Some(top) => claude_spinner_status(rows, top),
             // Consider approval menus only when the normal input box is absent.
-            None => claude_approval(&rows),
+            None => claude_approval(rows),
         }
     }
 
-    fn model_label(&self, screen: &dyn ScreenFacts) -> Option<String> {
-        claude_welcome_label(&screen.live_rows())
+    fn model_label(&self, rows: &[String]) -> Option<String> {
+        claude_welcome_label(rows)
     }
 
     /// Canonicalize a leading claude spinner or braille frame to `✻` so title
@@ -307,18 +306,16 @@ fn claude_welcome_label(rows: &[String]) -> Option<String> {
 pub struct CodexSummary;
 
 impl SummaryAdapter for CodexSummary {
-    fn live_preview(&self, screen: &dyn ScreenFacts) -> Option<(String, &'static str)> {
-        let rows = screen.live_rows();
-        if let Some(hit) = codex_approval(&rows) {
+    fn live_preview(&self, rows: &[String]) -> Option<(String, &'static str)> {
+        if let Some(hit) = codex_approval(rows) {
             return Some(hit);
         }
-        let composer = codex_composer(&rows)?;
-        codex_status(&rows, composer)
+        let composer = codex_composer(rows)?;
+        codex_status(rows, composer)
     }
 
-    fn model_label(&self, screen: &dyn ScreenFacts) -> Option<String> {
-        let rows = screen.live_rows();
-        let token = codex_token_line(&rows)?;
+    fn model_label(&self, rows: &[String]) -> Option<String> {
+        let token = codex_token_line(rows)?;
         // `codex_token_line` guarantees a non-empty first segment.
         Some(rows[token].trim().split(" · ").next()?.to_string())
     }
@@ -428,9 +425,8 @@ fn codex_working(after_paren: &str) -> String {
 pub struct GrokSummary;
 
 impl SummaryAdapter for GrokSummary {
-    fn live_preview(&self, screen: &dyn ScreenFacts) -> Option<(String, &'static str)> {
-        let rows = screen.live_rows();
-        let (top, _) = grok_input_box(&rows)?;
+    fn live_preview(&self, rows: &[String]) -> Option<(String, &'static str)> {
+        let (top, _) = grok_input_box(rows)?;
         // One probe row: the first painted row above the box. The splash
         // panel's hints and the session header land here in non-working
         // states and match neither shape.
@@ -444,9 +440,8 @@ impl SummaryAdapter for GrokSummary {
         grok_worked(t).then(|| (t.to_string(), "grok:worked"))
     }
 
-    fn model_label(&self, screen: &dyn ScreenFacts) -> Option<String> {
-        let rows = screen.live_rows();
-        let (_, bottom) = grok_input_box(&rows)?;
+    fn model_label(&self, rows: &[String]) -> Option<String> {
+        let (_, bottom) = grok_input_box(rows)?;
         grok_border_label(&rows[bottom])
     }
 }

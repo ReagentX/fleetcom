@@ -7,51 +7,9 @@ use crate::{
     protocol::{Preview, PreviewSource},
 };
 
-/// Synthetic screen: adapters read only `live_rows`, so the other facts
-/// are inert defaults.
-struct RowsScreen {
-    rows: Vec<String>,
-}
-
-fn rs(rows: &[&str]) -> RowsScreen {
-    RowsScreen {
-        rows: rows.iter().map(|s| s.to_string()).collect(),
-    }
-}
-
-impl ScreenFacts for RowsScreen {
-    fn revision(&self) -> u64 {
-        1
-    }
-
-    fn alt_epoch(&self) -> u64 {
-        0
-    }
-
-    fn alternate_screen(&self) -> bool {
-        false
-    }
-
-    fn title(&self) -> Option<&str> {
-        None
-    }
-
-    fn live_floor(&self) -> String {
-        self.rows
-            .iter()
-            .rev()
-            .find(|r| !r.is_empty())
-            .cloned()
-            .unwrap_or_default()
-    }
-
-    fn live_rows(&self) -> Vec<String> {
-        self.rows.clone()
-    }
-
-    fn alt_leave_floor(&self) -> Option<&str> {
-        None
-    }
+/// Synthetic live viewport: the adapters' only input.
+fn rs(rows: &[&str]) -> Vec<String> {
+    rows.iter().map(|s| s.to_string()).collect()
 }
 
 /// Replay a corpus fixture and resolve one preview against its final

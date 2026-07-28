@@ -70,12 +70,14 @@ impl ScreenFacts for Emulator {
 /// Display-only status and model-label extraction for one agent CLI.
 pub trait SummaryAdapter: Sync {
     /// Return normalized live status and its matcher ID when the expected
-    /// chrome structure is present.
-    fn live_preview(&self, screen: &dyn ScreenFacts) -> Option<(String, &'static str)>;
+    /// chrome structure is present. `rows` is the live viewport, trailing
+    /// padding trimmed.
+    fn live_preview(&self, rows: &[String]) -> Option<(String, &'static str)>;
 
     /// Return a model label from stable CLI chrome. The preview cascade
-    /// prepends it to live status as `{label} · `.
-    fn model_label(&self, screen: &dyn ScreenFacts) -> Option<String>;
+    /// prepends it to live status as `{label} · `. `rows` is the live
+    /// viewport, trailing padding trimmed.
+    fn model_label(&self, rows: &[String]) -> Option<String>;
 
     /// Optionally normalize a captured title for display. Emulator title
     /// capture remains program-agnostic; `None` renders the title verbatim.
@@ -91,19 +93,22 @@ pub trait SummaryAdapter: Sync {
 /// 2. alternate screen: the title while its epoch is current, else the marker
 /// 3. primary screen: the live floor
 fn cascade(screen: &impl ScreenFacts, adapter: Option<&dyn SummaryAdapter>) -> Preview {
-    if let Some(a) = adapter
-        && let Some((text, rule)) = a.live_preview(screen)
-    {
-        let text = match a.model_label(screen) {
-            Some(label) => format!("{label} · {text}"),
-            None => text,
-        };
-        return Preview {
-            text,
-            source: PreviewSource::Anchor,
-            rule: Some(rule),
-            frozen: false,
-        };
+    if let Some(a) = adapter {
+        // Render the viewport once and hand the same rows to both probes:
+        // `live_preview` and `model_label` scan the identical snapshot.
+        let rows = screen.live_rows();
+        if let Some((text, rule)) = a.live_preview(&rows) {
+            let text = match a.model_label(&rows) {
+                Some(label) => format!("{label} · {text}"),
+                None => text,
+            };
+            return Preview {
+                text,
+                source: PreviewSource::Anchor,
+                rule: Some(rule),
+                frozen: false,
+            };
+        }
     }
     if screen.alternate_screen() {
         return match screen.title() {
@@ -426,11 +431,11 @@ mod tests {
     }
 
     impl SummaryAdapter for StubAdapter {
-        fn live_preview(&self, _screen: &dyn ScreenFacts) -> Option<(String, &'static str)> {
+        fn live_preview(&self, _rows: &[String]) -> Option<(String, &'static str)> {
             self.live.map(|(text, rule)| (text.to_string(), rule))
         }
 
-        fn model_label(&self, _screen: &dyn ScreenFacts) -> Option<String> {
+        fn model_label(&self, _rows: &[String]) -> Option<String> {
             self.label.map(str::to_string)
         }
     }
