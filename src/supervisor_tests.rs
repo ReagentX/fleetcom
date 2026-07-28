@@ -943,6 +943,86 @@ fn set_name_round_trips_and_clears() {
     assert_eq!(view_of(&mut s, id).name, None);
 }
 
+/// `Kill` ignores unknown task ids. `term_sent` is private to `task`, so
+/// `overdue` at zero grace is the only in-crate view of the flag
+/// `Task::terminate` sets — and it latches before the exit does, which
+/// `lifecycle` alone would miss.
+#[test]
+fn kill_with_an_unknown_id_leaves_the_live_task_alone() {
+    let mut s = sup(24, 80);
+    spawn(&mut s, "sleep 30", here());
+    let id = first_id(&mut s);
+    let before = view_of(&mut s, id).lifecycle;
+
+    s.apply(Command::Kill { id: 999 });
+    assert!(s.drain().is_empty(), "unknown-id Kill must stay silent");
+    assert!(
+        !s.tasks[0].overdue(Instant::now(), Duration::ZERO),
+        "unknown-id Kill must not signal the live task"
+    );
+    assert_eq!(view_of(&mut s, id).lifecycle, before);
+}
+
+/// `Tag` ignores unknown task ids. Clearing at an unknown id is the
+/// load-bearing direction: a fall-through would drop a real task's flag.
+#[test]
+fn tag_with_an_unknown_id_leaves_the_live_task_alone() {
+    let mut s = sup(24, 80);
+    spawn(&mut s, "sleep 30", here());
+    let id = first_id(&mut s);
+    s.apply(Command::Tag { id, on: true });
+    assert!(view_of(&mut s, id).tagged);
+
+    s.apply(Command::Tag { id: 999, on: false });
+    assert!(s.drain().is_empty(), "unknown-id Tag must stay silent");
+    assert!(
+        view_of(&mut s, id).tagged,
+        "unknown-id Tag must not clear the live task's flag"
+    );
+}
+
+/// `Scrollback` ignores unknown task ids. `TaskView` carries no scroll state,
+/// so this reads the task's offset directly; the task is scrolled off live
+/// first because `Live` against a viewport already at zero would prove nothing.
+#[test]
+fn scrollback_with_an_unknown_id_leaves_the_live_task_alone() {
+    // Short grid: history accrues within a few rows of output.
+    let mut s = sup(6, 80);
+    spawn(&mut s, "seq 1 200; sleep 30", here());
+    let id = first_id(&mut s);
+    s.apply(Command::Watch {
+        id: Some(id),
+        attached: true,
+    });
+
+    // Retry until output has produced retained history.
+    let scrolled = wait_until(Duration::from_secs(5), || {
+        s.tick();
+        let _ = s.drain();
+        s.apply(Command::Scrollback {
+            id,
+            action: ScrollAction::Up(3),
+        });
+        s.tasks[0].scroll_offset() > 0
+    });
+    assert!(scrolled, "the task never accrued scrollback");
+    let offset = s.tasks[0].scroll_offset();
+
+    s.apply(Command::Scrollback {
+        id: 999,
+        action: ScrollAction::Live,
+    });
+    assert!(
+        s.drain().is_empty(),
+        "unknown-id Scrollback must stay silent"
+    );
+    assert_eq!(
+        s.tasks[0].scroll_offset(),
+        offset,
+        "unknown-id Scrollback must not snap the live task's viewport"
+    );
+}
+
 /// Spawned tasks expose their normalized initial group in the first snapshot.
 #[test]
 fn spawn_carries_a_normalized_group_from_birth() {

@@ -982,7 +982,8 @@ fn config_toml_notify_chains_through_the_injected_script() {
         reap_until(&mut s, Duration::from_secs(5), |_| {
             std::fs::read_to_string(&record).is_ok_and(|r| r == expected)
         }),
-        "the chained notifier never wrote its complete record"
+        "the chained notifier must receive its original args plus the payload, \
+         and never wrote that complete record"
     );
     assert_eq!(
         std::fs::read_to_string(dir.join("chainenv")).unwrap(),
@@ -994,11 +995,6 @@ fn config_toml_notify_chains_through_the_injected_script() {
         std::fs::read_to_string(&cap).unwrap(),
         payload,
         "the capture write must precede the chain handoff"
-    );
-    assert_eq!(
-        std::fs::read_to_string(&record).unwrap(),
-        format!("turn-ended\n{payload}\n"),
-        "the notifier must receive its original args plus the payload"
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
