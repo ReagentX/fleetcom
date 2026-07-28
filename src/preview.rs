@@ -233,8 +233,7 @@ impl PreviewState {
         match self.candidate.source.cmp(&self.rendered.source) {
             Ordering::Greater => {
                 self.cancel_demotion();
-                let cand = self.candidate.clone();
-                self.render(cand, now, alt);
+                self.render(self.candidate.clone(), now, alt);
             }
             Ordering::Equal => {
                 // A recovered rank cancels a pending demotion without a
@@ -254,16 +253,14 @@ impl PreviewState {
                             .last_title_render
                             .is_some_and(|t| now.duration_since(t) < TITLE_MIN_HOLD);
                         if !held {
-                            let cand = self.candidate.clone();
-                            self.render(cand, now, alt);
+                            self.render(self.candidate.clone(), now, alt);
                         }
                     }
                     // The floor is live output; anchor text changes are
                     // semantic (a new verb, a new completion row). Both
                     // render immediately.
                     PreviewSource::Floor | PreviewSource::Anchor => {
-                        let cand = self.candidate.clone();
-                        self.render(cand, now, alt);
+                        self.render(self.candidate.clone(), now, alt);
                     }
                 }
             }

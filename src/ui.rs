@@ -411,8 +411,7 @@ fn render_peek(out: &mut impl Write, app: &App) -> io::Result<()> {
 
     // Screen lines for the selected task, once the core has streamed them. Empty
     // until then (or if the watch just switched); the box still frames cleanly.
-    let empty: Vec<String> = Vec::new();
-    let lines = app.screen_for(v.id).map(|s| &s.lines).unwrap_or(&empty);
+    let lines: &[String] = app.screen_for(v.id).map_or(&[], |s| &s.lines);
     let start = lines.len().saturating_sub(inner_h);
     let tail = &lines[start..];
 

@@ -600,10 +600,7 @@ impl Task {
             let p = grid(&self.parser);
             input::mouse_bytes(&p, kind, col, row)
         };
-        match bytes {
-            Some(b) => self.send_input(&b),
-            None => Ok(()),
-        }
+        bytes.map_or(Ok(()), |b| self.send_input(&b))
     }
 
     /// Encode and queue one key using the child's cursor-key mode, read under
@@ -613,10 +610,7 @@ impl Task {
             let p = grid(&self.parser);
             input::key_bytes(p.application_cursor(), code, mods)
         };
-        match bytes {
-            Some(b) => self.send_input(&b),
-            None => Ok(()),
-        }
+        bytes.map_or(Ok(()), |b| self.send_input(&b))
     }
 
     /// Return the child's mouse, alternate-screen, and alternate-scroll modes
