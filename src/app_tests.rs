@@ -2701,3 +2701,54 @@ fn wants_mouse_child_keeps_the_left_button() {
     assert_eq!(got, b"\x1b[<0;3;2M\x1b[<32;6;2M\x1b[<0;6;2m".to_vec());
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// Frame emission: overlay modes composite by overdraw, so the emulator must
+// never see a frame's dashboard layer without its overlay.
+
+/// Every emitted frame is one synchronized update.
+#[test]
+fn frame_is_wrapped_in_one_synchronized_update() {
+    let mut app = App::new_local(30, 100);
+    let dir = app.invocation_dir.clone();
+    app.spawn_in("sleep 5", dir);
+    app.pump();
+    app.resolve_selection();
+    for (label, mode) in [
+        ("dashboard", Mode::Dashboard),
+        ("peek", Mode::Peek),
+        ("attached", Mode::Attached),
+    ] {
+        app.mode = mode;
+        app.focused_id = app.selected_id;
+        app.last_frame.clear(); // force the write; only changed frames emit
+        let mut out = Vec::new();
+        crate::ui::render(&mut out, &mut app).unwrap();
+        assert!(!out.is_empty(), "{label} must paint");
+        assert!(
+            out.starts_with(b"\x1b[?2026h") && out.ends_with(b"\x1b[?2026l"),
+            "the {label} frame must open and close one synchronized update"
+        );
+        assert_eq!(
+            out.windows(8).filter(|w| *w == b"\x1b[?2026h").count(),
+            1,
+            "{label} must not nest updates"
+        );
+    }
+}
+
+/// The update markers are constant, so an unchanged frame still writes nothing.
+#[test]
+fn unchanged_frame_emits_nothing() {
+    let mut app = App::new_local(30, 100);
+    let dir = app.invocation_dir.clone();
+    app.spawn_in("sleep 5", dir);
+    app.pump();
+    app.resolve_selection();
+    app.mode = Mode::Peek;
+    let mut first = Vec::new();
+    crate::ui::render(&mut first, &mut app).unwrap();
+    assert!(!first.is_empty(), "the first frame paints");
+    let mut second = Vec::new();
+    crate::ui::render(&mut second, &mut app).unwrap();
+    assert!(second.is_empty(), "an identical frame is a no-op");
+}
