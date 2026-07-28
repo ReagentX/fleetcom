@@ -1,13 +1,15 @@
 //! Terminal rendering from the client's task and screen snapshots. Frames are
-//! buffered and written only when they differ from the previous frame.
+//! buffered, wrapped in one synchronized update, and written only when they
+//! differ from the previous frame.
 
-use std::io::{self, Stdout, Write};
+use std::io::{self, Write};
 use std::time::Duration;
 
 use crossterm::{
     cursor::{Hide, MoveTo, Show},
     queue,
     style::{Attribute, Print, SetAttribute},
+    terminal::{BeginSynchronizedUpdate, EndSynchronizedUpdate},
 };
 
 use unicode_width::UnicodeWidthStr;
@@ -20,8 +22,10 @@ use crate::{
     selection::Selection,
 };
 
-pub fn render(out: &mut Stdout, app: &mut App) -> io::Result<()> {
+pub fn render(out: &mut impl Write, app: &mut App) -> io::Result<()> {
     let mut buf: Vec<u8> = Vec::with_capacity(app.cols as usize * app.rows as usize * 3 + 128);
+    // DECSET 2026 around the whole frame
+    queue!(buf, BeginSynchronizedUpdate)?;
     match app.mode {
         Mode::Attached => render_attached(&mut buf, app)?,
         Mode::Peek => {
@@ -45,6 +49,7 @@ pub fn render(out: &mut Stdout, app: &mut App) -> io::Result<()> {
             render_dashboard(&mut buf, app)?
         }
     }
+    queue!(buf, EndSynchronizedUpdate)?;
     // Repaint only on change: a stable frame (idle tasks, no input) is a no-op,
     // so there is nothing to flicker and nothing to burn CPU on.
     if buf != app.last_frame {
