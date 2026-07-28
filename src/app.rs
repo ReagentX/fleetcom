@@ -1383,9 +1383,9 @@ impl App {
                 // Avoid closing the client connection with an oversized frame.
                 if s.len() > MAX_PASTE {
                     self.status = Some(format!(
-                        "paste dropped: {} MiB exceeds the {} MiB limit",
-                        s.len() >> 20,
-                        MAX_PASTE >> 20
+                        "paste dropped: {} exceeds the {} limit",
+                        crate::format::bytes(s.len()),
+                        crate::format::bytes(MAX_PASTE)
                     ));
                     return;
                 }
