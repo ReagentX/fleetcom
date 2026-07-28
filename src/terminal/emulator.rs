@@ -331,6 +331,18 @@ impl Emulator {
         self.drain_allowed()
     }
 
+    /// Land the open sync frame, count the advance, drain allowlisted replies.
+    fn land_sync_frame(&mut self) -> Vec<String> {
+        let mut observed = ObservedTerm {
+            term: &mut self.term,
+            alt: &mut self.alt,
+            clipboard: &mut self.clipboard,
+        };
+        self.parser.stop_sync(&mut observed);
+        self.observe_advance();
+        self.drain_allowed()
+    }
+
     /// Terminate a `?2026` synchronized update whose timeout has expired,
     /// flushing the buffered frame into the grid; returns any allowlisted
     /// probe replies the flushed bytes generated. vte re-checks its timeout
@@ -347,14 +359,7 @@ impl Emulator {
         if !expired {
             return Vec::new();
         }
-        let mut observed = ObservedTerm {
-            term: &mut self.term,
-            alt: &mut self.alt,
-            clipboard: &mut self.clipboard,
-        };
-        self.parser.stop_sync(&mut observed);
-        self.observe_advance();
-        self.drain_allowed()
+        self.land_sync_frame()
     }
 
     /// Terminate an open `?2026` synchronized update regardless of its
@@ -367,14 +372,7 @@ impl Emulator {
         if self.parser.sync_timeout().sync_timeout().is_none() {
             return Vec::new();
         }
-        let mut observed = ObservedTerm {
-            term: &mut self.term,
-            alt: &mut self.alt,
-            clipboard: &mut self.clipboard,
-        };
-        self.parser.stop_sync(&mut observed);
-        self.observe_advance();
-        self.drain_allowed()
+        self.land_sync_frame()
     }
 
     /// The visible screen as ANSI bytes, plus cursor position and whether the
@@ -661,7 +659,10 @@ const TITLE_STACK_SHADOW_MAX: usize = 4096;
 /// `Handler` methods default to no-ops, so every method must delegate to
 /// `Term`. `golden::emulator_wrapper_matches_the_raw_backend_on_every_fixture`
 /// compares wrapper and raw-backend replays to detect missing delegation.
-/// `clipboard_store` is captured by this wrapper instead of delegated.
+/// `clipboard_store` is captured by this wrapper instead of delegated. The
+/// impl mirrors the upstream trait's declaration order position for position,
+/// which is what makes a pinned-version bump a mechanical diff against
+/// upstream; the `delegate!` runs sit in line so the order survives.
 ///
 /// # Synchronized updates
 ///
@@ -724,6 +725,20 @@ impl ObservedTerm<'_> {
     }
 }
 
+/// Emit trivial [`Handler`] delegations: one entry per method, its argument
+/// names and types verbatim from the trait. The method name is written once
+/// and drives both the definition and the forwarded call, so a delegation
+/// cannot name a backend method other than the one it implements.
+macro_rules! delegate {
+    ($($name:ident($($arg:ident: $ty:ty),*);)+) => {
+        $(
+            fn $name(&mut self, $($arg: $ty),*) {
+                self.term.$name($($arg),*);
+            }
+        )+
+    };
+}
+
 /// Handler delegation. Five methods also update observed state:
 /// `set_private_mode`, `unset_private_mode`, and `reset_state` observe the
 /// alt bit (RIS exits the alt screen too); `set_title` observes title
@@ -735,11 +750,9 @@ impl Handler for ObservedTerm<'_> {
         self.term.set_title(a0.clone());
         self.observe_title(a0);
     }
-    fn set_cursor_style(&mut self, a0: Option<vt::CursorStyle>) {
-        self.term.set_cursor_style(a0);
-    }
-    fn set_cursor_shape(&mut self, a0: vt::CursorShape) {
-        self.term.set_cursor_shape(a0);
+    delegate! {
+        set_cursor_style(a0: Option<vt::CursorStyle>);
+        set_cursor_shape(a0: vt::CursorShape);
     }
     fn input(&mut self, a0: char) {
         self.term.input(a0);
@@ -748,107 +761,41 @@ impl Handler for ObservedTerm<'_> {
             self.alt.staged_title = None;
         }
     }
-    fn goto(&mut self, a0: i32, a1: usize) {
-        self.term.goto(a0, a1);
-    }
-    fn goto_line(&mut self, a0: i32) {
-        self.term.goto_line(a0);
-    }
-    fn goto_col(&mut self, a0: usize) {
-        self.term.goto_col(a0);
-    }
-    fn insert_blank(&mut self, a0: usize) {
-        self.term.insert_blank(a0);
-    }
-    fn move_up(&mut self, a0: usize) {
-        self.term.move_up(a0);
-    }
-    fn move_down(&mut self, a0: usize) {
-        self.term.move_down(a0);
-    }
-    fn identify_terminal(&mut self, a0: Option<char>) {
-        self.term.identify_terminal(a0);
-    }
-    fn device_status(&mut self, a0: usize) {
-        self.term.device_status(a0);
-    }
-    fn move_forward(&mut self, a0: usize) {
-        self.term.move_forward(a0);
-    }
-    fn move_backward(&mut self, a0: usize) {
-        self.term.move_backward(a0);
-    }
-    fn move_down_and_cr(&mut self, a0: usize) {
-        self.term.move_down_and_cr(a0);
-    }
-    fn move_up_and_cr(&mut self, a0: usize) {
-        self.term.move_up_and_cr(a0);
-    }
-    fn put_tab(&mut self, a0: u16) {
-        self.term.put_tab(a0);
-    }
-    fn backspace(&mut self) {
-        self.term.backspace();
-    }
-    fn carriage_return(&mut self) {
-        self.term.carriage_return();
-    }
-    fn linefeed(&mut self) {
-        self.term.linefeed();
-    }
-    fn bell(&mut self) {
-        self.term.bell();
-    }
-    fn substitute(&mut self) {
-        self.term.substitute();
-    }
-    fn newline(&mut self) {
-        self.term.newline();
-    }
-    fn set_horizontal_tabstop(&mut self) {
-        self.term.set_horizontal_tabstop();
-    }
-    fn scroll_up(&mut self, a0: usize) {
-        self.term.scroll_up(a0);
-    }
-    fn scroll_down(&mut self, a0: usize) {
-        self.term.scroll_down(a0);
-    }
-    fn insert_blank_lines(&mut self, a0: usize) {
-        self.term.insert_blank_lines(a0);
-    }
-    fn delete_lines(&mut self, a0: usize) {
-        self.term.delete_lines(a0);
-    }
-    fn erase_chars(&mut self, a0: usize) {
-        self.term.erase_chars(a0);
-    }
-    fn delete_chars(&mut self, a0: usize) {
-        self.term.delete_chars(a0);
-    }
-    fn move_backward_tabs(&mut self, a0: u16) {
-        self.term.move_backward_tabs(a0);
-    }
-    fn move_forward_tabs(&mut self, a0: u16) {
-        self.term.move_forward_tabs(a0);
-    }
-    fn save_cursor_position(&mut self) {
-        self.term.save_cursor_position();
-    }
-    fn restore_cursor_position(&mut self) {
-        self.term.restore_cursor_position();
-    }
-    fn clear_line(&mut self, a0: vt::LineClearMode) {
-        self.term.clear_line(a0);
-    }
-    fn clear_screen(&mut self, a0: vt::ClearMode) {
-        self.term.clear_screen(a0);
-    }
-    fn clear_tabs(&mut self, a0: vt::TabulationClearMode) {
-        self.term.clear_tabs(a0);
-    }
-    fn set_tabs(&mut self, a0: u16) {
-        self.term.set_tabs(a0);
+    delegate! {
+        goto(a0: i32, a1: usize);
+        goto_line(a0: i32);
+        goto_col(a0: usize);
+        insert_blank(a0: usize);
+        move_up(a0: usize);
+        move_down(a0: usize);
+        identify_terminal(a0: Option<char>);
+        device_status(a0: usize);
+        move_forward(a0: usize);
+        move_backward(a0: usize);
+        move_down_and_cr(a0: usize);
+        move_up_and_cr(a0: usize);
+        put_tab(a0: u16);
+        backspace();
+        carriage_return();
+        linefeed();
+        bell();
+        substitute();
+        newline();
+        set_horizontal_tabstop();
+        scroll_up(a0: usize);
+        scroll_down(a0: usize);
+        insert_blank_lines(a0: usize);
+        delete_lines(a0: usize);
+        erase_chars(a0: usize);
+        delete_chars(a0: usize);
+        move_backward_tabs(a0: u16);
+        move_forward_tabs(a0: u16);
+        save_cursor_position();
+        restore_cursor_position();
+        clear_line(a0: vt::LineClearMode);
+        clear_screen(a0: vt::ClearMode);
+        clear_tabs(a0: vt::TabulationClearMode);
+        set_tabs(a0: u16);
     }
     fn reset_state(&mut self) {
         self.term.reset_state();
@@ -859,20 +806,12 @@ impl Handler for ObservedTerm<'_> {
         self.alt.title_stack.clear();
         self.alt.staged_title = None;
     }
-    fn reverse_index(&mut self) {
-        self.term.reverse_index();
-    }
-    fn terminal_attribute(&mut self, a0: vt::Attr) {
-        self.term.terminal_attribute(a0);
-    }
-    fn set_mode(&mut self, a0: vt::Mode) {
-        self.term.set_mode(a0);
-    }
-    fn unset_mode(&mut self, a0: vt::Mode) {
-        self.term.unset_mode(a0);
-    }
-    fn report_mode(&mut self, a0: vt::Mode) {
-        self.term.report_mode(a0);
+    delegate! {
+        reverse_index();
+        terminal_attribute(a0: vt::Attr);
+        set_mode(a0: vt::Mode);
+        unset_mode(a0: vt::Mode);
+        report_mode(a0: vt::Mode);
     }
     fn set_private_mode(&mut self, a0: vt::PrivateMode) {
         self.term.set_private_mode(a0);
@@ -882,32 +821,16 @@ impl Handler for ObservedTerm<'_> {
         self.term.unset_private_mode(a0);
         self.observe_alt();
     }
-    fn report_private_mode(&mut self, a0: vt::PrivateMode) {
-        self.term.report_private_mode(a0);
-    }
-    fn set_scrolling_region(&mut self, a0: usize, a1: Option<usize>) {
-        self.term.set_scrolling_region(a0, a1);
-    }
-    fn set_keypad_application_mode(&mut self) {
-        self.term.set_keypad_application_mode();
-    }
-    fn unset_keypad_application_mode(&mut self) {
-        self.term.unset_keypad_application_mode();
-    }
-    fn set_active_charset(&mut self, a0: vt::CharsetIndex) {
-        self.term.set_active_charset(a0);
-    }
-    fn configure_charset(&mut self, a0: vt::CharsetIndex, a1: vt::StandardCharset) {
-        self.term.configure_charset(a0, a1);
-    }
-    fn set_color(&mut self, a0: usize, a1: vt::Rgb) {
-        self.term.set_color(a0, a1);
-    }
-    fn dynamic_color_sequence(&mut self, a0: String, a1: usize, a2: &str) {
-        self.term.dynamic_color_sequence(a0, a1, a2);
-    }
-    fn reset_color(&mut self, a0: usize) {
-        self.term.reset_color(a0);
+    delegate! {
+        report_private_mode(a0: vt::PrivateMode);
+        set_scrolling_region(a0: usize, a1: Option<usize>);
+        set_keypad_application_mode();
+        unset_keypad_application_mode();
+        set_active_charset(a0: vt::CharsetIndex);
+        configure_charset(a0: vt::CharsetIndex, a1: vt::StandardCharset);
+        set_color(a0: usize, a1: vt::Rgb);
+        dynamic_color_sequence(a0: String, a1: usize, a2: &str);
+        reset_color(a0: usize);
     }
     /// Capture supported OSC 52 stores while preserving their selector.
     fn clipboard_store(&mut self, a0: u8, a1: &[u8]) {
@@ -954,38 +877,18 @@ impl Handler for ObservedTerm<'_> {
             self.observe_title(popped);
         }
     }
-    fn text_area_size_pixels(&mut self) {
-        self.term.text_area_size_pixels();
-    }
-    fn text_area_size_chars(&mut self) {
-        self.term.text_area_size_chars();
-    }
-    fn set_hyperlink(&mut self, a0: Option<vt::Hyperlink>) {
-        self.term.set_hyperlink(a0);
-    }
-    fn set_mouse_cursor_icon(&mut self, a0: vt::cursor_icon::CursorIcon) {
-        self.term.set_mouse_cursor_icon(a0);
-    }
-    fn report_keyboard_mode(&mut self) {
-        self.term.report_keyboard_mode();
-    }
-    fn push_keyboard_mode(&mut self, a0: vt::KeyboardModes) {
-        self.term.push_keyboard_mode(a0);
-    }
-    fn pop_keyboard_modes(&mut self, a0: u16) {
-        self.term.pop_keyboard_modes(a0);
-    }
-    fn set_keyboard_mode(&mut self, a0: vt::KeyboardModes, a1: vt::KeyboardModesApplyBehavior) {
-        self.term.set_keyboard_mode(a0, a1);
-    }
-    fn set_modify_other_keys(&mut self, a0: vt::ModifyOtherKeys) {
-        self.term.set_modify_other_keys(a0);
-    }
-    fn report_modify_other_keys(&mut self) {
-        self.term.report_modify_other_keys();
-    }
-    fn set_scp(&mut self, a0: vt::ScpCharPath, a1: vt::ScpUpdateMode) {
-        self.term.set_scp(a0, a1);
+    delegate! {
+        text_area_size_pixels();
+        text_area_size_chars();
+        set_hyperlink(a0: Option<vt::Hyperlink>);
+        set_mouse_cursor_icon(a0: vt::cursor_icon::CursorIcon);
+        report_keyboard_mode();
+        push_keyboard_mode(a0: vt::KeyboardModes);
+        pop_keyboard_modes(a0: u16);
+        set_keyboard_mode(a0: vt::KeyboardModes, a1: vt::KeyboardModesApplyBehavior);
+        set_modify_other_keys(a0: vt::ModifyOtherKeys);
+        report_modify_other_keys();
+        set_scp(a0: vt::ScpCharPath, a1: vt::ScpUpdateMode);
     }
 }
 
