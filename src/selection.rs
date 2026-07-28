@@ -43,8 +43,8 @@ impl Selection {
     /// Rows below the screen clamp to its last row. Columns beyond a row select
     /// no text, and an empty screen produces an empty string.
     ///
-    /// The per-row rule is [`Selection::row_segment`]; this walks it down the
-    /// selected rows, so a row it declines contributes an empty line.
+    /// Each selected screen row occupies one joined line, even when its
+    /// selected span is empty.
     pub fn extract(&self, rows: &[String]) -> String {
         let Some(last) = rows.len().checked_sub(1) else {
             return String::new();
@@ -62,11 +62,9 @@ impl Selection {
 
     /// Return the selected text on `row` and its starting display column.
     ///
-    /// This is the sole definition of the per-row rule — endpoint ordering,
-    /// row clamping, wide-glyph expansion, trailing-whitespace removal — and
-    /// [`Selection::extract`] is built from it, so the whole-selection and
-    /// per-row paths cannot drift apart. `None` marks a row that contributes
-    /// no text: outside the selection, or a span that trims away to nothing.
+    /// Endpoints are ordered and clamped before wide glyphs are expanded and
+    /// trailing whitespace is removed. Returns `None` outside the selection
+    /// or when the selected span is empty after trimming.
     pub fn row_segment<'a>(
         &self,
         row: usize,
@@ -280,9 +278,8 @@ mod tests {
 
     #[test]
     fn clamping_below_the_screen_inverts_endpoint_order() {
-        // Clamping precedes ordering, so both endpoints below a two-row screen
-        // collapse onto the bottom row and swap: the anchor's column 1 becomes
-        // the end, the head's column 0 the start. Row 0 drops out entirely.
+        // Both endpoints clamp to the bottom row before their columns are
+        // ordered; row 0 is outside the resulting selection.
         let s = drag((5, 1), (9, 0));
         assert_eq!(s.extract(&screen(&["ab", "cd"])), "cd");
         assert_eq!(s.row_segment(0, "ab", 1), None);

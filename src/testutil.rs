@@ -57,7 +57,7 @@ pub(crate) fn read_pid(path: &Path) -> nix::unistd::Pid {
     nix::unistd::Pid::from_raw(pid.expect("pid file never appeared"))
 }
 
-/// Spawn and reap a child, then return its inactive PID.
+/// Return the PID of a child process after reaping it.
 pub(crate) fn dead_pid() -> u32 {
     let mut child = Command::new("sh").arg("-c").arg("exit 0").spawn().unwrap();
     let pid = child.id();

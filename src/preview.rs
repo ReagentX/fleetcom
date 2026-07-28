@@ -70,13 +70,12 @@ impl ScreenFacts for Emulator {
 /// Display-only status and model-label extraction for one agent CLI.
 pub trait SummaryAdapter: Sync {
     /// Return normalized live status and its matcher ID when the expected
-    /// chrome structure is present. `rows` is the live viewport, trailing
-    /// padding trimmed.
+    /// chrome is present. `rows` contains live rows with trailing padding
+    /// removed.
     fn live_preview(&self, rows: &[String]) -> Option<(String, &'static str)>;
 
     /// Return a model label from stable CLI chrome. The preview cascade
-    /// prepends it to live status as `{label} · `. `rows` is the live
-    /// viewport, trailing padding trimmed.
+    /// prepends it to live status as `{label} · `.
     fn model_label(&self, rows: &[String]) -> Option<String>;
 
     /// Optionally normalize a captured title for display. Emulator title
@@ -94,8 +93,7 @@ pub trait SummaryAdapter: Sync {
 /// 3. primary screen: the live floor
 fn cascade(screen: &impl ScreenFacts, adapter: Option<&dyn SummaryAdapter>) -> Preview {
     if let Some(a) = adapter {
-        // Render the viewport once and hand the same rows to both probes:
-        // `live_preview` and `model_label` scan the identical snapshot.
+        // Both probes use the same viewport snapshot.
         let rows = screen.live_rows();
         if let Some((text, rule)) = a.live_preview(&rows) {
             let text = match a.model_label(&rows) {

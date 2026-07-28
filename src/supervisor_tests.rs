@@ -14,7 +14,7 @@ fn sup(rows: u16, cols: u16) -> Supervisor {
     s
 }
 
-/// Supervisor at the default test viewport with `ctx` installed.
+/// Build a default-size supervisor with `ctx` installed.
 fn sup_ctx(ctx: LaunchContext) -> Supervisor {
     let mut s = Supervisor::new(24, 80, 2000);
     s.set_launch_context(ctx);
@@ -532,7 +532,7 @@ fn first_id(s: &mut Supervisor) -> u64 {
     }
 }
 
-/// Tick once and return the snapshot's view of task `id`.
+/// Tick once and return task `id` from the emitted snapshot.
 fn view_of(s: &mut Supervisor, id: u64) -> TaskView {
     s.tick();
     for e in s.drain() {
@@ -545,7 +545,7 @@ fn view_of(s: &mut Supervisor, id: u64) -> TaskView {
     panic!("task {id} missing from the snapshot");
 }
 
-/// Launch context with a session directory and optional environment entries.
+/// Launch context with `FLEETCOM_CONFIG_DIR` and optional environment entries.
 fn config_ctx(config: &Path, cwd: PathBuf, extra: &[(&str, &str)]) -> LaunchContext {
     let mut env: Vec<(std::ffi::OsString, std::ffi::OsString)> = vec![(
         "FLEETCOM_CONFIG_DIR".into(),
@@ -943,10 +943,7 @@ fn set_name_round_trips_and_clears() {
     assert_eq!(view_of(&mut s, id).name, None);
 }
 
-/// `Kill` ignores unknown task ids. `term_sent` is private to `task`, so
-/// `overdue` at zero grace is the only in-crate view of the flag
-/// `Task::terminate` sets — and it latches before the exit does, which
-/// `lifecycle` alone would miss.
+/// Killing an unknown id does not signal a live task.
 #[test]
 fn kill_with_an_unknown_id_leaves_the_live_task_alone() {
     let mut s = sup(24, 80);
@@ -963,8 +960,7 @@ fn kill_with_an_unknown_id_leaves_the_live_task_alone() {
     assert_eq!(view_of(&mut s, id).lifecycle, before);
 }
 
-/// `Tag` ignores unknown task ids. Clearing at an unknown id is the
-/// load-bearing direction: a fall-through would drop a real task's flag.
+/// Tagging an unknown id does not change a live task's tag.
 #[test]
 fn tag_with_an_unknown_id_leaves_the_live_task_alone() {
     let mut s = sup(24, 80);
@@ -981,9 +977,7 @@ fn tag_with_an_unknown_id_leaves_the_live_task_alone() {
     );
 }
 
-/// `Scrollback` ignores unknown task ids. `TaskView` carries no scroll state,
-/// so this reads the task's offset directly; the task is scrolled off live
-/// first because `Live` against a viewport already at zero would prove nothing.
+/// Scrolling an unknown id does not change a live task's viewport.
 #[test]
 fn scrollback_with_an_unknown_id_leaves_the_live_task_alone() {
     // Short grid: history accrues within a few rows of output.
@@ -1567,12 +1561,7 @@ fn session_commands_use_the_launch_context_config_dir() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Saving and loading preserve group assignments and display names.
-/// `session::dirs_json` emits the bare-string member only when both labels
-/// are absent, and otherwise inserts `"group"` and `"name"` independently:
-/// four wire shapes. The labels here are crossed — one task carries only a
-/// group, the other only a name — so the round trip covers `{cmd,group}`
-/// and `{cmd,name}`, which a both-labels-on-one-task layout would skip.
+/// Saving and loading preserve independent group and display-name fields.
 #[test]
 fn load_session_restores_saved_groups_and_names() {
     let dir = scratch("sess_labels");

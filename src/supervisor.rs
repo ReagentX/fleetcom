@@ -661,18 +661,7 @@ impl Supervisor {
         self.events.push(Event::Status(msg.into()));
     }
 
-    /// Run `f` against task `id`; do nothing when no task carries that id.
-    ///
-    /// This carries the general rule: a command naming a task that is no
-    /// longer present is ignored — no mutation, no notice, no error. Clients
-    /// act on a rendered snapshot, so an id can be reaped before the command
-    /// naming it arrives.
-    ///
-    /// `deliver` is the near-twin for input sends, its `f` returning
-    /// `Result<(), WriteRefused>` so it can call `notice_refused`. They stay
-    /// apart because they encode opposite failure policies — ignore versus
-    /// report — and one helper generic over the return type could not report,
-    /// pushing `notice_refused` back out to every input arm.
+    /// Run `f` against task `id`; ignore an unknown id.
     fn with_task(&mut self, id: u64, f: impl FnOnce(&mut Task)) {
         if let Some(t) = self.by_id_mut(id) {
             f(t);

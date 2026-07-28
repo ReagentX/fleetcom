@@ -7,17 +7,12 @@ use crate::{
     protocol::PreviewSource,
 };
 
-/// Synthetic live viewport: the adapters' only input.
+/// Build a synthetic live viewport for an adapter.
 fn rs(rows: &[&str]) -> Vec<String> {
     rows.iter().map(|s| s.to_string()).collect()
 }
 
-/// Synthetic claude screen: `above` rows over the CLI's input box.
-///
-/// The `rule / ❯ / rule` tail is precisely what `claude_box_top` matches —
-/// bottom-most rule row, a second rule within six rows above it, a
-/// `❯`-headed row between the two — so every fixture built here reaches the
-/// status scan. Width 120 is the corpus capture geometry.
+/// Place status rows above a 120-column Claude input box.
 fn claude_screen<S: AsRef<str>>(above: &[S]) -> Vec<String> {
     let sep = "─".repeat(120);
     let mut rows: Vec<String> = above.iter().map(|s| s.as_ref().to_string()).collect();
@@ -25,15 +20,7 @@ fn claude_screen<S: AsRef<str>>(above: &[S]) -> Vec<String> {
     rows
 }
 
-/// Replay a corpus fixture, resolve one preview against its final screen
-/// with `adapter` installed, and reduce it to the comparable triple.
-///
-/// Height is fixed at 40 rows: that is the corpus capture geometry, since
-/// every fixture is raw output from a 40-row PTY (`tests/corpus/README.md`).
-/// Only `cols` varies across call sites.
-///
-/// `Preview::frozen` is deliberately left out of the triple: these tests
-/// assert resolved preview content and its provenance, not freeze state.
+/// Resolve a corpus fixture at 40 rows and return its text, source, and rule.
 fn corpus(
     bytes: &[u8],
     adapter: &dyn SummaryAdapter,
@@ -50,13 +37,12 @@ fn anchor(text: &str, rule: &'static str) -> (String, PreviewSource, Option<&'st
     (text.to_string(), PreviewSource::Anchor, Some(rule))
 }
 
-/// The alternate-screen fallback: nothing extracted, so no rule.
+/// Expected alternate-screen marker preview.
 fn marker() -> (String, PreviewSource, Option<&'static str>) {
     (MARKER.to_string(), PreviewSource::Marker, None)
 }
 
-/// The floor tier reporting the screen's own status row: no rule, and the
-/// text omits the status bar's indentation.
+/// Expected floor-preview tuple.
 fn floor(text: &str) -> (String, PreviewSource, Option<&'static str>) {
     (text.to_string(), PreviewSource::Floor, None)
 }
@@ -118,7 +104,7 @@ fn select_routes_to_the_matching_adapter() {
 /// and the concrete-action row wins over the spinner when present.
 #[test]
 fn claude_spinner_and_action_row() {
-    // The trailing row is a statusline below the box: it never enters the scan.
+    // Rows below the input box are outside the status scan.
     let mut spin = claude_screen(&["✻ Hashing… (6s · ↓ 87 tokens)"]);
     spin.push("  status".to_string());
     assert_eq!(

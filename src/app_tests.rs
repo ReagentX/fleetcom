@@ -1105,8 +1105,7 @@ fn oversized_paste_is_refused_with_a_notice() {
     app.focused_id = Some(1);
     app.on_paste(&"x".repeat(MAX_PASTE + 1));
     let status = app.status.clone().unwrap_or_default();
-    // Both figures round down to whole MiB, so the over-cap paste reports the
-    // same 8 as the cap it just exceeded.
+    // MiB values are truncated, so both sizes display as 8 MiB.
     assert_eq!(status, "paste dropped: 8 MiB exceeds the 8 MiB limit");
     // The boundary value is accepted.
     app.on_paste(&"x".repeat(MAX_PASTE));

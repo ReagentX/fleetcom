@@ -52,8 +52,7 @@ const _: () = assert!(
 /// OSC 52 clipboard stores captured since the last drain.
 #[derive(Debug, Default)]
 pub struct ClipboardStores {
-    /// Latest store per selector, ordered by arrival. Only the three selectors
-    /// [`ClipboardKind`] names can appear here; the rest are dropped at parse.
+    /// Buffered stores, at most one per supported selector, ordered by arrival.
     pub stores: Vec<(ClipboardKind, String)>,
     /// Byte length of the most recent oversized store.
     pub oversized_len: Option<usize>,
@@ -323,7 +322,7 @@ impl Emulator {
         self.drain_allowed()
     }
 
-    /// Land the open sync frame, count the advance, drain allowlisted replies.
+    /// Stop synchronized buffering, record the advance, and drain allowed replies.
     fn land_sync_frame(&mut self) -> Vec<String> {
         let mut observed = ObservedTerm {
             term: &mut self.term,
@@ -651,10 +650,7 @@ const TITLE_STACK_SHADOW_MAX: usize = 4096;
 /// `Handler` methods default to no-ops, so every method must delegate to
 /// `Term`. `golden::emulator_wrapper_matches_the_raw_backend_on_every_fixture`
 /// compares wrapper and raw-backend replays to detect missing delegation.
-/// `clipboard_store` is captured by this wrapper instead of delegated. The
-/// impl mirrors the upstream trait's declaration order position for position,
-/// which is what makes a pinned-version bump a mechanical diff against
-/// upstream; the `delegate!` runs sit in line so the order survives.
+/// `clipboard_store` is captured by this wrapper instead of delegated.
 ///
 /// # Synchronized updates
 ///
@@ -717,10 +713,7 @@ impl ObservedTerm<'_> {
     }
 }
 
-/// Emit trivial [`Handler`] delegations: one entry per method, its argument
-/// names and types verbatim from the trait. The method name is written once
-/// and drives both the definition and the forwarded call, so a delegation
-/// cannot name a backend method other than the one it implements.
+/// Generate [`Handler`] methods that forward each call to the wrapped terminal.
 macro_rules! delegate {
     ($($name:ident($($arg:ident: $ty:ty),*);)+) => {
         $(
