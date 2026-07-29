@@ -299,18 +299,40 @@ fn step_down(sel: usize, len: usize) -> usize {
     (sel + 1).min(len.saturating_sub(1))
 }
 
-/// Dashboard grouping bucket: 0 tagged, 1 live, 2 parked live, 3 completed.
+/// State-grouping section identity: 0 In use, 1 Running, 2 Idle, 3 Completed.
 /// Tagged wins over everything; completed is classified by `lifecycle`, never
 /// by trusting `parked == false`, so a core that ever shipped both signals
-/// still lands finished tasks in Completed. Placement follows `parked`, the
-/// core's debounced quiet signal: it shares the 10 s window with
+/// still lands finished tasks in Completed. The Running/Idle split follows
+/// `parked`, the core's debounced quiet signal: it shares the 10 s window with
 /// `Lifecycle::Idle`, so the idle glyph and the row's section flip together.
-fn bucket(v: &TaskView) -> u8 {
+fn section_rank(v: &TaskView) -> u8 {
     if v.tagged {
         0
     } else if matches!(v.lifecycle, Lifecycle::Ok | Lifecycle::Failed) {
         3
     } else if v.parked {
+        2
+    } else {
+        1
+    }
+}
+
+/// Within-section row order: 0 tagged, 1 live, 2 finished. Applies in every
+/// grouping mode. Finished is classified by `lifecycle`, for the same reason
+/// `section_rank` does it that way.
+///
+/// `parked` is deliberately absent. It reverses on a 10 s timer, so ranking on
+/// it moved a row twice per interaction: up the moment the child echoed a
+/// keystroke, back down ten seconds after the typing stopped. Both moves landed
+/// while the user was attached to some other task, so the dashboard they
+/// returned to had silently reindexed itself — worst for the tasks they touched
+/// most. A row's rank now moves only on a monotonic edge (`finished`) or a
+/// deliberate one (`tagged`). The idle signal keeps its glyph, and in State mode
+/// its own section.
+fn row_rank(v: &TaskView) -> u8 {
+    if v.tagged {
+        0
+    } else if matches!(v.lifecycle, Lifecycle::Ok | Lifecycle::Failed) {
         2
     } else {
         1
@@ -508,7 +530,7 @@ impl App {
             .map(|(i, v)| {
                 let (rank, label) = match self.group_mode {
                     GroupMode::State => {
-                        let b = bucket(v);
+                        let b = section_rank(v);
                         let l = match b {
                             0 => "In use",
                             1 => "Running",
@@ -529,9 +551,11 @@ impl App {
                         None => (1, "Unassigned".to_string()),
                     },
                 };
-                // Within each section, sort by tag/lifecycle bucket, directory,
-                // then task id.
-                (rank, label, bucket(v), self.dir_label(&v.cwd), v.id, i)
+                // Within each section: tagged first, finished last, then
+                // directory, then task id. In State mode `row_rank` is constant
+                // across a section (the section *is* the bucket), so it drops
+                // out and the order stays directory-then-id.
+                (rank, label, row_rank(v), self.dir_label(&v.cwd), v.id, i)
             })
             .collect();
         labeled.sort();

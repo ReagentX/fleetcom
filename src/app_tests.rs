@@ -376,10 +376,11 @@ fn selection_follows_task_across_parked_rebucket() {
     assert_eq!(app.views[app.selected_task().unwrap()].id, 1);
 }
 
-/// `bucket` doubles as the within-group tiebreak, so a parked task sinks
-/// below a running one inside a Custom group too, not only in State mode.
+/// Row order ignores `parked`, so going quiet does not move a task inside its
+/// Custom group. The flip reverses on the 10 s window; ranking on it made a row
+/// travel twice per interaction, out of sight of a user attached elsewhere.
 #[test]
-fn custom_mode_parked_sinks_within_group() {
+fn custom_mode_parked_task_holds_its_row() {
     let mut app = App::new_local(30, 100);
     let inv = app.invocation_dir.clone();
     app.spawn_grouped("sleep 5", inv.clone(), "alpha"); // id 1
@@ -392,9 +393,185 @@ fn custom_mode_parked_sinks_within_group() {
     app.views[i].parked = true;
     assert_eq!(
         app.section_ids(),
-        vec![("alpha".to_string(), vec![2, 1])],
-        "parked id 1 sinks below running id 2 within alpha"
+        vec![("alpha".to_string(), vec![1, 2])],
+        "parked id 1 keeps its row above id 2 within alpha"
     );
+}
+
+/// Same guarantee one section wider: dir mode also holds a row through the
+/// quiet transition.
+#[test]
+fn dir_mode_parked_task_holds_its_row() {
+    let mut app = App::new_local(30, 100);
+    let inv = app.invocation_dir.clone();
+    app.spawn_in("sleep 5", inv.clone()); // id 1
+    app.spawn_in("sleep 5", inv); // id 2
+    app.pump();
+    app.group_mode = GroupMode::Dir;
+    let label = app.invocation_label.clone();
+    assert_eq!(app.section_ids(), vec![(label.clone(), vec![1, 2])]);
+
+    let i = app.views.iter().position(|v| v.id == 1).unwrap();
+    app.views[i].parked = true;
+    assert_eq!(
+        app.section_ids(),
+        vec![(label, vec![1, 2])],
+        "parked id 1 keeps its row above id 2 within its directory"
+    );
+}
+
+/// `parked` round trip: the row sits in the same place before, during, and
+/// after the quiet window. This is the property the sort key now guarantees.
+#[test]
+fn parked_round_trip_leaves_row_order_identical() {
+    let mut app = App::new_local(30, 100);
+    let inv = app.invocation_dir.clone();
+    app.spawn_grouped("sleep 5", inv.clone(), "alpha"); // id 1
+    app.spawn_grouped("sleep 5", inv.clone(), "alpha"); // id 2
+    app.spawn_grouped("sleep 5", inv, "alpha"); // id 3
+    app.pump();
+    app.group_mode = GroupMode::Custom;
+    let want = vec![("alpha".to_string(), vec![1, 2, 3])];
+    assert_eq!(app.section_ids(), want);
+
+    let i = app.views.iter().position(|v| v.id == 2).unwrap();
+    app.views[i].parked = true;
+    assert_eq!(app.section_ids(), want, "quiet does not move id 2");
+
+    app.views[i].parked = false;
+    assert_eq!(app.section_ids(), want, "waking does not move id 2 back");
+}
+
+/// Finished is monotonic, so it stays in the row key: a completed task sinks
+/// below its live siblings inside a Custom group.
+#[test]
+fn custom_mode_finished_sinks_within_group() {
+    let mut app = App::new_local(30, 100);
+    let inv = app.invocation_dir.clone();
+    app.spawn_grouped("true", inv.clone(), "alpha"); // id 1: exits ~immediately
+    app.spawn_grouped("sleep 30", inv, "alpha"); // id 2: stays live
+    wait_until(Duration::from_secs(5), || {
+        app.pump();
+        app.views
+            .iter()
+            .any(|v| v.id == 1 && matches!(v.lifecycle, Lifecycle::Ok | Lifecycle::Failed))
+    });
+    app.group_mode = GroupMode::Custom;
+    assert_eq!(
+        app.section_ids(),
+        vec![("alpha".to_string(), vec![2, 1])],
+        "finished id 1 sinks below live id 2 within alpha"
+    );
+}
+
+/// The same monotonic sink in dir mode.
+#[test]
+fn dir_mode_finished_sinks_within_section() {
+    let mut app = App::new_local(30, 100);
+    let inv = app.invocation_dir.clone();
+    app.spawn_in("true", inv.clone()); // id 1: exits ~immediately
+    app.spawn_in("sleep 30", inv); // id 2: stays live
+    wait_until(Duration::from_secs(5), || {
+        app.pump();
+        app.views
+            .iter()
+            .any(|v| v.id == 1 && matches!(v.lifecycle, Lifecycle::Ok | Lifecycle::Failed))
+    });
+    app.group_mode = GroupMode::Dir;
+    assert_eq!(
+        app.section_ids(),
+        vec![(app.invocation_label.clone(), vec![2, 1])],
+        "finished id 1 sinks below live id 2 within its directory"
+    );
+}
+
+/// A tag is user-controlled, so it stays in the row key: the tagged task floats
+/// to the top of its Custom group and holds that row when it goes quiet.
+#[test]
+fn custom_mode_tagged_task_floats_and_holds_while_parked() {
+    let mut app = App::new_local(30, 100);
+    let inv = app.invocation_dir.clone();
+    app.spawn_grouped("sleep 5", inv.clone(), "alpha"); // id 1
+    app.spawn_grouped("sleep 5", inv, "alpha"); // id 2: tagged
+    app.pump();
+    app.transport.send(Command::Tag { id: 2, on: true });
+    app.pump();
+    app.group_mode = GroupMode::Custom;
+    assert_eq!(app.section_ids(), vec![("alpha".to_string(), vec![2, 1])]);
+
+    let i = app.views.iter().position(|v| v.id == 2).unwrap();
+    app.views[i].parked = true;
+    assert_eq!(
+        app.section_ids(),
+        vec![("alpha".to_string(), vec![2, 1])],
+        "tagged id 2 stays at the top of alpha while parked"
+    );
+}
+
+/// State mode is unchanged by the row-key split, because within a State section
+/// every member shares one `row_rank`: In use all tagged, Running and Idle all
+/// live, Completed all finished. A constant contributes nothing to the sort, so
+/// section order and within-section order (directory, then id) stand exactly as
+/// before. Asserting the whole shape catches a collapsed Running/Idle split or
+/// a `dir_label` dropped from the sort key.
+#[test]
+fn state_mode_ordering_survives_the_row_key_split() {
+    let mut app = App::new_local(30, 100);
+    let base = temp("app_state_order");
+    let (dir_a, dir_b) = (base.join("a"), base.join("b"));
+    std::fs::create_dir_all(&dir_a).unwrap();
+    std::fs::create_dir_all(&dir_b).unwrap();
+
+    app.spawn_in("sleep 30", dir_b.clone()); // id 1: running, dir b
+    app.spawn_in("sleep 30", dir_a.clone()); // id 2: running, dir a
+    app.spawn_in("sleep 30", dir_b.clone()); // id 3: parked -> Idle, dir b
+    app.spawn_in("sleep 30", dir_a.clone()); // id 4: parked -> Idle, dir a
+    app.spawn_in("sleep 30", dir_b.clone()); // id 5: tagged, dir b
+    app.spawn_in("sleep 30", dir_a.clone()); // id 6: tagged + parked, dir a
+    app.spawn_in("true", dir_b.clone()); // id 7: finished, dir b
+    app.spawn_in("true", dir_a.clone()); // id 8: finished, dir a
+    wait_until(Duration::from_secs(5), || {
+        app.pump();
+        [7u64, 8].iter().all(|id| {
+            app.views
+                .iter()
+                .any(|v| v.id == *id && matches!(v.lifecycle, Lifecycle::Ok | Lifecycle::Failed))
+        })
+    });
+    for id in [5u64, 6] {
+        app.transport.send(Command::Tag { id, on: true });
+    }
+    app.pump();
+
+    // Pin `parked` in both directions after the last pump. Later than the last
+    // pump because a fresh core snapshot would overwrite it; both directions
+    // because ids 1, 2, and 5 print nothing, so on a loaded machine they would
+    // cross the real 10 s window and desert Running before the assert.
+    for (id, parked) in [
+        (1u64, false),
+        (2, false),
+        (3, true),
+        (4, true),
+        (5, false),
+        (6, true),
+    ] {
+        let i = app.views.iter().position(|v| v.id == id).unwrap();
+        app.views[i].parked = parked;
+    }
+
+    let (a, b) = (app.dir_label(&dir_a), app.dir_label(&dir_b));
+    assert!(a < b, "dir a must sort before dir b for this test to bite");
+    assert_eq!(
+        app.section_ids(),
+        vec![
+            ("In use".to_string(), vec![6, 5]),
+            ("Running".to_string(), vec![2, 1]),
+            ("Idle".to_string(), vec![4, 3]),
+            ("Completed".to_string(), vec![8, 7]),
+        ],
+        "four sections in state order; within each, dir a before dir b, then id"
+    );
+    let _ = std::fs::remove_dir_all(&base);
 }
 
 /// `r` sends `Restart` only for a finished selection. On a running task

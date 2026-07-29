@@ -124,7 +124,7 @@ A `TERM`-ignoring member can also survive when its leader exits during shutdown.
 
 Groups belong to task state: an assignment survives client detach and rerun (`r`), and switching grouping modes does not modify it. `g` reassigns the selected task through the [group picker](#the-g-group-picker).
 
-`m` toggles the "in use" tag and marks the task with `◆`. In state mode, tagged tasks form the In use section at the top. In custom mode, a tag moves the task to the top of its existing group rather than creating a global section. Within each group, the order is tagged, running, idle, completed; each bucket then sorts by directory and spawn order.
+`m` toggles the "in use" tag and marks the task with `◆`. In state mode, tagged tasks form the In use section at the top. In custom mode, a tag moves the task to the top of its existing group rather than creating a global section. Within a dir or custom section, the order is tagged, live, completed; each bucket then sorts by directory and spawn order. The idle transition is absent from that order by design: it reverses on its 10-second timer, so ranking on it moved a row twice per interaction, both times off screen. A task that goes quiet keeps its row and shows `∙`. State mode still separates Running from Idle, because there the split is the section, not the row order.
 
 In custom mode only, a new command inherits the selected task's group, through both `n` and the `@` picker. The spawn prompt shows the destination as `❯ dir ▸ group ▸ command`, each segment present only when it applies: the dir segment for a non-default directory, the group segment when a group will be inherited. State- and dir-mode spawns start unassigned.
 
