@@ -2,7 +2,7 @@
 
 Each `.ansi` file is one dashboard frame written by the real renderer over a
 fabricated fleet, so a terminal `cat`-ing it paints exactly what a live run
-paints. Screenshot the frame, not a real fleet.
+paints.
 
 | Frame | Shows |
 | -- | -- |
@@ -26,8 +26,6 @@ Every duration in the fixture is a constant, so two runs write identical bytes.
 it to `~`.
 
 ## Capturing
-
-One line per frame, so each is a single copy-paste:
 
 ```sh
 clear; cat docs/img/home.ansi;      read -rsk 1; printf '\033[?25h'
