@@ -53,25 +53,17 @@ For normal use, install the published crate from [crates.io](https://crates.io/c
 cargo install fleetcom
 ```
 
-### From source
-
-From the project root:
-
-- `cargo install --path .` to install `fleetcom` on `PATH`, or
-- `cargo build --release` and run `target/release/fleetcom`.
+[`docs/commands.md`](docs/README.md#installation-from-source) covers advanced installation.
 
 ## Usage
 
-| Invocation | Behavior |
-| -- | -- |
-| `fleetcom` | Connect to the daemon, autostarting it when necessary, and open the dashboard |
-| `fleetcom <session>` | Load a saved session, then open the dashboard |
-| `fleetcom --foreground` | Run in-process without a daemon; tasks stop when the client quits |
-| `fleetcom --scrollback <lines>` | Set per-task scrollback (default 2,000); read at supervisor start, so a running daemon keeps its value until `--kill` |
-| `fleetcom --kill` | Stop the daemon and every task it owns |
-| `fleetcom --help` / `--version` | Print usage or version information and exit |
+```sh
+fleetcom
+```
 
-The first ordinary invocation starts the daemon when necessary. `--daemon` is an internal mode.
+Connect to the daemon, autostarting it when necessary, and open the dashboard.
+
+[`docs/commands.md`](docs/commands.md#invocation) covers advanced usage.
 
 ## Key Commands
 
@@ -86,12 +78,10 @@ The dashboard shows two short key hints; `?` opens an expanded key reference:
 
 ### Attached
 
-| Key | Command |
-| -- | -- |
-| `Ctrl-\` | background the task and return to the dashboard |
-| anything else | forwarded to the task's PTY |
+- `Ctrl-\` backgrounds the task and returns to the dashboard.
+- Every other key reaches the task's PTY.
 
-[`docs/commands.md`](docs/commands.md) covers every key and launch flag, including the routing mechanics.
+[`docs/commands.md`](docs/commands.md#dashboard) covers every key and launch flag, including the routing mechanics.
 
 ## How it works
 
