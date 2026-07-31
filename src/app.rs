@@ -96,6 +96,8 @@ pub enum Mode {
     LoadSession,
     /// Overlay preview of the selected task.
     Peek,
+    /// Read-only key-reference overlay.
+    Controls,
     /// Full-screen, keystrokes forwarded to the focused task's PTY.
     Attached,
     /// The daemon connection dropped; a banner offers reconnect or quit.
@@ -139,9 +141,9 @@ pub enum SessionPage {
 /// What Enter does with a picker row.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum DirKind {
-    /// The current directory (row 0): Enter runs the command here.
+    /// The resolved path (row 0): Enter runs the command there.
     Use,
-    /// A recently-used dir: Enter runs the command there (one-press reuse).
+    /// A current task's directory: Enter runs there; Tab descends into it.
     Jump,
     /// A subdirectory: Enter and Tab descend into it.
     Into,
@@ -664,6 +666,25 @@ impl App {
         self.select_section_wrap(false);
     }
 
+    /// Select the next tagged task in display order, wrapping as needed.
+    /// Start at the first tag when nothing is selected; preserve the selection
+    /// when no task is tagged.
+    fn select_next_tagged(&mut self) {
+        let order = self.display_order();
+        if order.is_empty() {
+            return;
+        }
+        // Start one past the selection so a tagged selection advances; without
+        // a selection, start at the top of the list.
+        let start = self.selected_pos(&order).map_or(0, |pos| pos + 1);
+        let next = (0..order.len())
+            .map(|off| order[(start + off) % order.len()])
+            .find(|&i| self.views[i].tagged);
+        if let Some(i) = next {
+            self.selected_id = Some(self.views[i].id);
+        }
+    }
+
     /// Send the desired watch state when its target or attachment mode changes.
     fn set_watch(&mut self, want: Option<(u64, bool)>) {
         if want != self.watched {
@@ -886,9 +907,9 @@ impl App {
 
     // --- `@` directory picker -------------------------------------------------
 
-    /// Recompute picker rows: the current directory first (row 0, "run here"),
-    /// then, before you've typed anything, the in-use dirs for one-press
-    /// reuse, then the subdirectories of the current dir matching the fragment.
+    /// Rebuild directory-picker rows with the resolved path first. When the
+    /// input has no slash, matching current-task directories follow. Matching
+    /// subdirectories of the resolved path come last.
     fn refresh_dir_candidates(&mut self) {
         let (base_str, partial) = split_input(&self.dir_input);
         let base = self.resolve(base_str);
@@ -899,20 +920,35 @@ impl App {
             kind: DirKind::Use,
         }];
 
-        if self.dir_input.is_empty() {
+        // Include current-task directories only when the input contains no `/`.
+        // `split_input` leaves `base_str` empty exactly in that case.
+        if base_str.is_empty() {
+            let needle = partial.to_lowercase();
             for p in self.in_use_dirs() {
-                if p != base {
-                    cands.push(DirCand {
-                        label: path::abbreviate(&p),
-                        path: p,
-                        kind: DirKind::Jump,
-                    });
+                let label = path::abbreviate(&p);
+                // Match the final component so shared parent components do not
+                // match every sibling directory.
+                if p == base || !label_leaf(&label).to_lowercase().contains(&needle) {
+                    continue;
                 }
+                cands.push(DirCand {
+                    label,
+                    path: p,
+                    kind: DirKind::Jump,
+                });
             }
         }
 
         for name in list_dirs(&base, partial) {
             let path = base.join(&name);
+            // A current-task directory that is also a subdirectory already has
+            // a row: Enter runs there, and Tab descends.
+            if cands
+                .iter()
+                .any(|c| c.kind == DirKind::Jump && c.path == path)
+            {
+                continue;
+            }
             cands.push(DirCand {
                 label: name,
                 path,
@@ -920,8 +956,8 @@ impl App {
             });
         }
 
-        // Nothing typed → keep the current dir selected (row 0). Filtering →
-        // jump to the first match so Tab/Enter drills straight in.
+        // An empty trailing fragment selects the resolved path. Otherwise,
+        // select the first matching row when one exists.
         self.dir_sel = if partial.is_empty() || cands.len() < 2 {
             0
         } else {
@@ -930,8 +966,7 @@ impl App {
         self.dir_candidates = cands;
     }
 
-    /// Distinct working directories of current tasks, most-recently-spawned
-    /// first: the "recent" quick-pick list.
+    /// Distinct task working directories, ordered by the newest task in each.
     fn in_use_dirs(&self) -> Vec<PathBuf> {
         let mut order: Vec<usize> = (0..self.views.len()).collect();
         order.sort_by_key(|&i| std::cmp::Reverse(self.views[i].id));
@@ -1122,6 +1157,7 @@ impl App {
             Mode::Rename => self.on_key_rename(k),
             Mode::LoadSession => self.on_key_loadsession(k),
             Mode::Peek => self.on_key_peek(k),
+            Mode::Controls => self.on_key_controls(k),
             Mode::Attached => self.on_key_attached(out, k)?,
             Mode::Disconnected => self.on_key_disconnected(k),
         }
@@ -1139,6 +1175,10 @@ impl App {
     }
 
     fn on_key_dashboard(&mut self, k: KeyEvent) {
+        if is_controls_key(k) {
+            self.mode = Mode::Controls;
+            return;
+        }
         match k.code {
             // `q` detaches (daemon + tasks live on); `Q` kills all and stops it.
             KeyCode::Char('q') => {
@@ -1159,12 +1199,14 @@ impl App {
                 }
             }
             KeyCode::Enter => self.attach(),
+            // `m` toggles a tag; `M` cycles through tagged tasks.
             KeyCode::Char('m') => {
                 if let Some(i) = self.selected_task() {
                     let (id, tagged) = (self.views[i].id, self.views[i].tagged);
                     self.transport.send(Command::Tag { id, on: !tagged });
                 }
             }
+            KeyCode::Char('M') => self.select_next_tagged(),
             KeyCode::Char('g') => self.open_group_picker(),
             KeyCode::Char('/') => self.open_find_palette(),
             // Uppercase R renames; lowercase r reruns.
@@ -1290,7 +1332,8 @@ impl App {
     fn on_key_pickdir(&mut self, k: KeyEvent) {
         // Tab descends; Right descends at the end and moves the caret elsewhere.
         if k.code == KeyCode::Tab || (k.code == KeyCode::Right && self.dir_input.at_end()) {
-            // Descend into the highlighted dir; a no-op on the current-dir row.
+            // Descend into the highlighted directory; the resolved-path row is
+            // a no-op.
             if let Some(c) = self.dir_candidates.get(self.dir_sel)
                 && c.kind != DirKind::Use
             {
@@ -1311,9 +1354,9 @@ impl App {
                 if let Some(c) = self.dir_candidates.get(self.dir_sel) {
                     let path = c.path.clone();
                     match c.kind {
-                        // Current dir or a recent dir: run the command there.
+                        // Resolved path or current-task directory: run there.
                         DirKind::Use | DirKind::Jump => self.confirm_dir(path),
-                        // Subdirectory: descend and select it (one keypress).
+                        // Subdirectory: descend and select its resolved-path row.
                         DirKind::Into => self.enter_dir(path),
                     }
                 }
@@ -1397,6 +1440,13 @@ impl App {
             // Keep the peek overlay open while the restarted task streams output.
             KeyCode::Char('r') => self.rerun_selected(),
             _ => {}
+        }
+    }
+
+    /// Close the controls overlay on `?`, Esc, or `q`.
+    fn on_key_controls(&mut self, k: KeyEvent) {
+        if is_controls_key(k) || matches!(k.code, KeyCode::Esc | KeyCode::Char('q')) {
+            self.mode = Mode::Dashboard;
         }
     }
 
@@ -1771,6 +1821,16 @@ fn key_event_to_key(ev: KeyEvent) -> Option<(Key, Mods)> {
     Some((code, mods))
 }
 
+/// Recognize either Shift-`/` event: `?`, or `/` with the Shift modifier.
+/// An unmodified `/` remains available to the find palette.
+fn is_controls_key(k: KeyEvent) -> bool {
+    match k.code {
+        KeyCode::Char('?') => true,
+        KeyCode::Char('/') => k.modifiers.contains(KeyModifiers::SHIFT),
+        _ => false,
+    }
+}
+
 /// Apply prompt editing keys. Returns `Some(true)` for text changes,
 /// `Some(false)` for caret motion or ignored Ctrl chords, and `None` for
 /// unsupported keys. Ctrl-A and Ctrl-E move to the start and end.
@@ -1836,13 +1896,23 @@ fn paste_into(buf: &mut EditBuffer, s: &str) {
     }
 }
 
-/// Split a typed path into (directory-so-far, trailing fragment). The fragment
-/// is prefix-matched against candidates; the directory is what we list.
+/// Split a typed path into its directory prefix and trailing search fragment.
+/// Candidate types apply their own matching rules to the fragment.
 fn split_input(input: &str) -> (&str, &str) {
     match input.rfind('/') {
         Some(pos) => (&input[..=pos], &input[pos + 1..]),
         None => ("", input),
     }
+}
+
+/// Return the final path component of an abbreviated display label.
+/// Trailing slashes are ignored. Labels without a final component, such as
+/// `/`, are returned unchanged.
+fn label_leaf(label: &str) -> &str {
+    Path::new(label)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(label)
 }
 
 /// Subdirectories of `base` whose names start with `partial`, ignoring case.

@@ -47,6 +47,10 @@ pub fn render(out: &mut impl Write, app: &mut App) -> io::Result<bool> {
             render_dashboard(&mut buf, app)?;
             render_find(&mut buf, app)?;
         }
+        Mode::Controls => {
+            render_dashboard(&mut buf, app)?;
+            render_controls(&mut buf, app)?;
+        }
         Mode::LoadSession => {
             render_dashboard(&mut buf, app)?;
             render_session_picker(&mut buf, app)?;
@@ -202,30 +206,15 @@ fn render_dashboard(out: &mut impl Write, app: &App) -> io::Result<()> {
         Some((line, _)) => put(out, cmd_y, line, cols)?,
         None => match transient_line(app.notice(), app.status.as_deref()) {
             Some(line) => put(out, cmd_y, &line, cols)?,
-            None => dim(
-                out,
-                cmd_y,
-                "  ❯ n run · @ dir · / find · s sort · w save · o load",
-                cols,
-            )?,
+            None => dim(out, cmd_y, "  ❯ n run · @ dir · / find · s sort", cols)?,
         },
     }
 
-    // Footer hints. In foreground there is no daemon to detach from: both
-    // intents stop the in-process core (`ThreadTransport::shutdown` ignores
-    // the intent), so advertising `q detach` there would promise survival the
-    // tasks don't have.
-    let exit_hint = if app.daemon_backed {
-        "q detach · Q quit"
-    } else {
-        "q quit"
-    };
+    // Keep common actions visible and route the remaining bindings through `?`.
     dim(
         out,
         rows.saturating_sub(1),
-        &format!(
-            "  ↑↓ select · enter attach · space peek · m tag · g group · R rename · r rerun · X kill · {exit_hint}"
-        ),
+        "  ↑↓ select · enter attach · space peek · ? controls",
         cols,
     )?;
 
@@ -474,6 +463,172 @@ fn preview_provenance(p: &Preview) -> String {
         s.push_str(" (frozen)");
     }
     s
+}
+
+/// One controls-overlay entry. Adjacent entries with the same `group` share a
+/// heading in the grouped layout.
+struct Control {
+    key: &'static str,
+    desc: &'static str,
+    group: &'static str,
+}
+
+impl Control {
+    const fn new(key: &'static str, desc: &'static str, group: &'static str) -> Self {
+        Self { key, desc, group }
+    }
+}
+
+/// Controls-overlay entries. Each group's first half fills the left column;
+/// the second half fills the right.
+const CONTROLS: [Control; 19] = [
+    Control::new("↑↓ / kj", "move selection", "Navigate"),
+    Control::new("Tab ⇧Tab", "jump section", "Navigate"),
+    Control::new("/", "find a task", "Navigate"),
+    Control::new("M", "next tagged", "Navigate"),
+    Control::new("enter", "attach", "Act"),
+    Control::new("space", "peek", "Act"),
+    Control::new("r", "rerun finished", "Act"),
+    Control::new("X", "kill or remove", "Act"),
+    Control::new("m", "tag in use", "Organize"),
+    Control::new("g", "assign group", "Organize"),
+    Control::new("R", "rename", "Organize"),
+    Control::new("s", "cycle grouping", "Organize"),
+    Control::new("n", "run here", "Create"),
+    Control::new("@", "run in a dir", "Create"),
+    Control::new("w", "save session", "Session"),
+    Control::new("o", "load session", "Session"),
+    Control::new("q", "detach", "Leave"),
+    Control::new("Q", "quit and kill", "Leave"),
+    Control::new("Ctrl-\\", "background", "Attached"),
+];
+
+/// Label `q` as quit in foreground mode because it stops in-process tasks.
+fn control_desc(c: &Control, daemon_backed: bool) -> &'static str {
+    match c.key {
+        "q" if !daemon_backed => "quit",
+        _ => c.desc,
+    }
+}
+
+/// Split `CONTROLS` into its contiguous group runs.
+fn control_groups() -> Vec<&'static [Control]> {
+    let mut groups = Vec::new();
+    let mut start = 0;
+    for i in 1..=CONTROLS.len() {
+        if i == CONTROLS.len() || CONTROLS[i].group != CONTROLS[start].group {
+            groups.push(&CONTROLS[start..i]);
+            start = i;
+        }
+    }
+    groups
+}
+
+/// Rows required for group headings and their entries.
+fn grouped_rows() -> usize {
+    control_groups()
+        .iter()
+        .map(|g| 1 + g.len().div_ceil(2))
+        .sum()
+}
+
+/// Rows required for the complete two-column table without headings.
+fn flat_rows() -> usize {
+    CONTROLS.len().div_ceil(2)
+}
+
+/// Render the centered key reference, dropping headings before entries when
+/// height is constrained.
+fn render_controls(out: &mut impl Write, app: &App) -> io::Result<()> {
+    let cols = app.cols as usize;
+    let rows = app.rows as usize;
+
+    // Use stored descriptions so foreground's shorter `q` label does not resize
+    // the box.
+    let key_w = CONTROLS.iter().map(|c| c.key.width()).max().unwrap_or(0);
+    let desc_w = CONTROLS.iter().map(|c| c.desc.width()).max().unwrap_or(0);
+    let cell_w = key_w + 2 + desc_w;
+    let cell = |c: &Control| {
+        format!(
+            "{}  {}",
+            pad(c.key, key_w),
+            control_desc(c, app.daemon_backed)
+        )
+    };
+    // Use a fixed left-cell width to align the right column across groups.
+    let two_col = |run: &[Control]| -> Vec<String> {
+        let h = run.len().div_ceil(2);
+        (0..h)
+            .map(|i| match run.get(h + i) {
+                Some(r) => format!("  {}  {}", pad(&cell(&run[i]), cell_w), cell(r)),
+                None => format!("  {}", cell(&run[i])),
+            })
+            .collect()
+    };
+
+    // Reserve four rows for dashboard context when space permits. A three-row
+    // minimum preserves both borders and one entry row.
+    let avail = rows.saturating_sub(4).max(3);
+    let body_h = avail - 2;
+    let mut hidden = 0;
+    let body: Vec<String> = if grouped_rows() <= body_h {
+        control_groups()
+            .into_iter()
+            .flat_map(|g| {
+                let header = std::iter::once(format!("  {}", g[0].group));
+                header.chain(two_col(g).into_iter().map(|r| format!("  {r}")))
+            })
+            .collect()
+    } else if flat_rows() <= body_h {
+        two_col(&CONTROLS)
+    } else {
+        let shown = (body_h * 2).min(CONTROLS.len());
+        hidden = CONTROLS.len() - shown;
+        two_col(&CONTROLS[..shown])
+    };
+
+    // Add two borders and one trailing padding column. The four-column minimum
+    // keeps the border valid; narrow terminals clip rows instead of reflowing.
+    let content_w = body.iter().map(|s| s.width()).max().unwrap_or(0);
+    let bw = (content_w + 3).min(cols.max(4));
+    let bh = body.len() + 2;
+    let inner_w = bw - 2;
+    let x0 = cols.saturating_sub(bw) / 2;
+    let y0 = rows.saturating_sub(bh) / 2;
+
+    queue!(
+        out,
+        MoveTo(x0 as u16, y0 as u16),
+        Print(format!("┌{}┐", peek_top_border("controls", inner_w)))
+    )?;
+    for (k, line) in body.iter().enumerate() {
+        queue!(
+            out,
+            MoveTo(x0 as u16, (y0 + 1 + k) as u16),
+            Print(format!("│{}│", pad(line, inner_w)))
+        )?;
+    }
+
+    let by = (y0 + 1 + body.len()) as u16;
+    queue!(
+        out,
+        MoveTo(x0 as u16, by),
+        Print(format!("└{}┘", "─".repeat(inner_w)))
+    )?;
+    // Report omitted entries on the bottom border.
+    let more = if hidden > 0 {
+        format!(" · +{hidden} more")
+    } else {
+        String::new()
+    };
+    queue!(
+        out,
+        MoveTo((x0 + 2) as u16, by),
+        SetAttribute(Attribute::Dim),
+        Print(truncate(&format!(" ? esc close{more} "), inner_w)),
+        SetAttribute(Attribute::Reset)
+    )?;
+    Ok(())
 }
 
 /// The varying content of a bottom-panel picker; `render_panel` owns the
@@ -1050,6 +1205,34 @@ mod tests {
         assert_eq!(ap.width(), wp.width(), "preview width varies with content");
         assert_eq!(at.width(), wt.width(), "time width varies with content");
         assert_eq!(wl.width() + wp.width() + wt.width(), cols);
+    }
+
+    /// Every entry is non-empty, no key is duplicated, and each group label is
+    /// one contiguous run (the renderer prints a header per run).
+    #[test]
+    fn control_table_is_unique_and_partitioned_by_group() {
+        let mut keys: Vec<&str> = Vec::new();
+        for c in &CONTROLS {
+            assert!(!c.key.is_empty(), "empty key beside {:?}", c.desc);
+            assert!(!c.desc.is_empty(), "empty description beside {}", c.key);
+            assert!(!keys.contains(&c.key), "duplicate key {}", c.key);
+            keys.push(c.key);
+        }
+        let groups = control_groups();
+        let mut labels: Vec<&str> = groups.iter().map(|g| g[0].group).collect();
+        let total: usize = groups.iter().map(|g| g.len()).sum();
+        assert_eq!(total, CONTROLS.len(), "the runs must cover the table");
+        labels.sort_unstable();
+        let distinct = labels.len();
+        labels.dedup();
+        assert_eq!(labels.len(), distinct, "a group must be one contiguous run");
+    }
+
+    /// The grouped form adds one heading row per group to the flat entry rows.
+    #[test]
+    fn control_forms_shrink_before_they_clip() {
+        assert_eq!(flat_rows(), CONTROLS.len().div_ceil(2));
+        assert_eq!(grouped_rows(), flat_rows() + control_groups().len());
     }
 
     /// Peek borders remain column-exact for wide and overlong labels.

@@ -22,6 +22,12 @@ Press `Enter` to take control of a task, then `Ctrl-\` to return to the dashboar
 
 ![`fleetcom` attach](docs/img/attach.png)
 
+### Custom groups
+
+Organize related tasks into named groups, even when they run in different directories.
+
+![`fleetcom` custom-group view](docs/img/groups.png)
+
 ### Resume agent sessions
 
 Start `claude`, `codex`, or `grok` normally. When you rerun the task or reload a saved session, `fleetcom` resumes the same conversation automatically.
@@ -53,48 +59,35 @@ For normal use, install the published crate from [crates.io](https://crates.io/c
 cargo install fleetcom
 ```
 
-### From source
-
-From the project root:
-
-- `cargo install --path .` to install `fleetcom` on `PATH`, or
-- `cargo build --release` and run `target/release/fleetcom`.
+[Source installation](docs/README.md#installation-from-source) covers builds from a repository clone.
 
 ## Usage
 
-| Invocation | Behavior |
-| -- | -- |
-| `fleetcom` | Connect to the daemon, autostarting it when necessary, and open the dashboard |
-| `fleetcom <session>` | Load a saved session, then open the dashboard |
-| `fleetcom --foreground` | Run in-process without a daemon; tasks stop when the client quits |
-| `fleetcom --scrollback <lines>` | Set per-task scrollback (default 2,000); read at supervisor start, so a running daemon keeps its value until `--kill` |
-| `fleetcom --kill` | Stop the daemon and every task it owns |
-| `fleetcom --help` / `--version` | Print usage or version information and exit |
+Connect to the daemon, autostarting it when necessary, and open the dashboard by invoking:
 
-The first ordinary invocation starts the daemon when necessary. `--daemon` is an internal mode.
+```sh
+fleetcom
+```
+
+The [invocation reference](docs/commands.md#invocation) covers sessions, foreground mode, scrollback, and daemon shutdown.
 
 ## Key Commands
 
 ### Dashboard
 
-| Key | Command |
-| -- | -- |
-| ↑ ↓ / `k` `j` | move the selection |
-| `Enter` | attach to the selected task |
-| `Space` | peek at the selected task |
-| `n` | new command in the invocation directory |
-| `@` | new command in a directory you pick (with completion) |
-| `q` | disconnect; leave the daemon and tasks running |
-| `Q` | quit; kill the tasks and stop the daemon |
+The dashboard shows two short key hints; `?` opens an expanded key reference:
+
+```text
+  ❯ n run · @ dir · / find · s sort
+  ↑↓ select · enter attach · space peek · ? controls
+```
 
 ### Attached
 
-| Key | Command |
-| -- | -- |
-| `Ctrl-\` | background the task and return to the dashboard |
-| anything else | forwarded to the task's PTY |
+- `Ctrl-\` backgrounds the task and returns to the dashboard.
+- Other supported input is forwarded to the task's PTY.
 
-[`docs/commands.md`](docs/commands.md) covers every key and launch flag, including the routing mechanics.
+[`docs/commands.md`](docs/commands.md#dashboard) covers every key and launch flag, including the routing mechanics.
 
 ## How it works
 

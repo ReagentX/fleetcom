@@ -1,5 +1,6 @@
 use super::*;
 use crate::{
+    protocol::{Preview, PreviewSource},
     supervisor::Supervisor,
     testutil::{temp, wait_until},
     transport::LocalTransport,
@@ -1019,6 +1020,204 @@ fn list_dirs_collates_case_insensitively() {
     let _ = std::fs::remove_dir_all(&base);
 }
 
+/// Build an `@`-picker fixture with `fleetcom` as the invocation directory,
+/// three sibling task directories, and a `fleetcom/docs` subdirectory.
+fn recents_fixture(tag: &str) -> (App, PathBuf) {
+    let root = temp(tag);
+    let rust = root.join("Documents/Code/Rust");
+    for name in ["fleetcom", "Logria", "crabapple", "crabstep"] {
+        std::fs::create_dir_all(rust.join(name)).unwrap();
+    }
+    std::fs::create_dir_all(rust.join("fleetcom/docs")).unwrap();
+
+    let mut app = App::new_local(30, 100);
+    app.invocation_dir = rust.join("fleetcom");
+    // Spawn oldest first so `in_use_dirs` returns Logria, crabapple, crabstep.
+    for name in ["crabstep", "crabapple", "Logria"] {
+        app.spawn_in("sleep 5", rust.join(name));
+    }
+    app.pump();
+    (app, root)
+}
+
+/// Open the `@` picker and type `fragment` one key at a time.
+fn type_pickdir(app: &mut App, fragment: &str) {
+    app.on_key_dashboard(key(KeyCode::Char('@')));
+    for c in fragment.chars() {
+        app.on_key_pickdir(key(KeyCode::Char(c)));
+    }
+}
+
+/// Current-task directory paths in picker order.
+fn jump_paths(app: &App) -> Vec<PathBuf> {
+    app.dir_candidates
+        .iter()
+        .filter(|c| c.kind == DirKind::Jump)
+        .map(|c| c.path.clone())
+        .collect()
+}
+
+/// Final-component matching includes task directories outside the invocation
+/// directory.
+#[test]
+fn pickdir_fragment_surfaces_a_sibling_recent() {
+    let (mut app, root) = recents_fixture("pickdir_recent_sibling");
+    let rust = root.join("Documents/Code/Rust");
+
+    type_pickdir(&mut app, "log");
+
+    assert_eq!(app.dir_candidates[0].kind, DirKind::Use);
+    assert_eq!(app.dir_candidates[0].path, app.invocation_dir);
+    assert_eq!(
+        jump_paths(&app),
+        vec![rust.join("Logria")],
+        "`log` matches the Logria leaf"
+    );
+    assert!(
+        !rust.join("Logria").starts_with(&app.invocation_dir),
+        "the match must be a sibling, not a subdirectory"
+    );
+    assert_eq!(app.dir_sel, 1, "the recent is preselected for Enter");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Current-task directories use case-insensitive substring matching.
+#[test]
+fn pickdir_recent_match_folds_case() {
+    let (mut app, root) = recents_fixture("pickdir_recent_case");
+    let rust = root.join("Documents/Code/Rust");
+
+    type_pickdir(&mut app, "LOG");
+    assert_eq!(app.dir_candidates[0].kind, DirKind::Use);
+    assert_eq!(
+        jump_paths(&app),
+        vec![rust.join("Logria")],
+        "an uppercase fragment matches a capitalized name"
+    );
+
+    // Mid-component: `ria` sits at the end of `Logria`, past any prefix.
+    app.on_key_pickdir(key(KeyCode::Esc));
+    type_pickdir(&mut app, "ria");
+    assert_eq!(jump_paths(&app), vec![rust.join("Logria")]);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A fragment includes every matching current-task directory.
+#[test]
+fn pickdir_fragment_surfaces_every_matching_recent() {
+    let (mut app, root) = recents_fixture("pickdir_recent_many");
+    let rust = root.join("Documents/Code/Rust");
+
+    type_pickdir(&mut app, "crab");
+
+    assert_eq!(app.dir_candidates[0].kind, DirKind::Use);
+    assert_eq!(
+        jump_paths(&app),
+        vec![rust.join("crabapple"), rust.join("crabstep")],
+        "recents keep their newest-first order"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Parent components do not match current-task directories.
+#[test]
+fn pickdir_middle_component_matches_no_recent() {
+    let (mut app, root) = recents_fixture("pickdir_recent_middle");
+
+    type_pickdir(&mut app, "doc");
+
+    assert_eq!(app.dir_candidates[0].kind, DirKind::Use);
+    assert!(
+        jump_paths(&app).is_empty(),
+        "a shared parent must not flood the panel"
+    );
+    assert_eq!(app.dir_candidates.len(), 2);
+    assert_eq!(app.dir_candidates[1].kind, DirKind::Into);
+    assert_eq!(app.dir_candidates[1].label, "docs");
+    assert_eq!(app.dir_sel, 1, "the subdirectory keeps row 1");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A `/` omits current-task directories from the picker.
+#[test]
+fn pickdir_slash_suppresses_recents() {
+    let (mut app, root) = recents_fixture("pickdir_recent_slash");
+    let rust = root.join("Documents/Code/Rust");
+
+    // `..` resolves to the parent containing every fixture task directory.
+    type_pickdir(&mut app, "../");
+    assert_eq!(app.dir_candidates[0].kind, DirKind::Use);
+    assert_eq!(app.dir_candidates[0].path, rust);
+    assert!(jump_paths(&app).is_empty(), "a `/` drops the recents");
+    assert!(
+        app.dir_candidates[1..]
+            .iter()
+            .all(|c| c.kind == DirKind::Into)
+    );
+    assert_eq!(
+        app.dir_candidates
+            .iter()
+            .filter(|c| c.path == rust.join("Logria"))
+            .count(),
+        1,
+        "Logria is listed once, as a subdirectory"
+    );
+
+    // Filtering the resolved path still omits current-task directory rows.
+    for c in "log".chars() {
+        app.on_key_pickdir(key(KeyCode::Char(c)));
+    }
+    assert!(jump_paths(&app).is_empty());
+    assert_eq!(app.dir_candidates[1].path, rust.join("Logria"));
+    assert_eq!(app.dir_candidates[1].kind, DirKind::Into);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// An empty field lists every current-task directory.
+#[test]
+fn pickdir_empty_input_lists_every_recent() {
+    let (mut app, root) = recents_fixture("pickdir_recent_empty");
+    let rust = root.join("Documents/Code/Rust");
+
+    type_pickdir(&mut app, "");
+
+    assert_eq!(app.dir_candidates[0].kind, DirKind::Use);
+    assert_eq!(app.dir_candidates[0].path, app.invocation_dir);
+    assert_eq!(
+        jump_paths(&app),
+        vec![
+            rust.join("Logria"),
+            rust.join("crabapple"),
+            rust.join("crabstep"),
+        ]
+    );
+    assert_eq!(app.dir_sel, 0, "an empty field keeps the current dir");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A current-task directory that is also a subdirectory appears once, using
+/// current-task row behavior.
+#[test]
+fn pickdir_dedupes_a_recent_that_is_also_a_subdirectory() {
+    let (mut app, root) = recents_fixture("pickdir_recent_dedupe");
+    let docs = root.join("Documents/Code/Rust/fleetcom/docs");
+    app.spawn_in("sleep 5", docs.clone());
+    app.pump();
+
+    type_pickdir(&mut app, "doc");
+
+    assert_eq!(app.dir_candidates[0].kind, DirKind::Use);
+    assert_eq!(
+        app.dir_candidates.iter().filter(|c| c.path == docs).count(),
+        1,
+        "one row per directory"
+    );
+    assert_eq!(app.dir_candidates.len(), 2);
+    assert_eq!(app.dir_candidates[1].kind, DirKind::Jump);
+    assert_eq!(app.dir_candidates[1].path, docs);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 /// Focus is by id, so it points at the same task even after the list shifts
 /// (a lower-id task is removed) and reports gone once it's removed.
 #[test]
@@ -1260,6 +1459,188 @@ fn section_nav_defaults_without_selection() {
     assert_eq!(empty.selected_id, None);
     empty.select_prev_section();
     assert_eq!(empty.selected_id, None);
+}
+
+// --- `M` cycle tagged tasks -------------------------------------------
+
+/// Build four state-grouped tasks with ids 2 and 4 tagged.
+fn app_with_tagged_pair() -> App {
+    let mut app = App::new_local(30, 100);
+    let inv = app.invocation_dir.clone();
+    for _ in 0..4 {
+        app.spawn_in("sleep 5", inv.clone());
+    }
+    app.pump();
+    app.transport.send(Command::Tag { id: 2, on: true });
+    app.transport.send(Command::Tag { id: 4, on: true });
+    app.pump();
+    assert_eq!(
+        app.section_ids(),
+        vec![
+            ("In use".to_string(), vec![2, 4]),
+            ("Running".to_string(), vec![1, 3]),
+        ],
+        "tagging reorders: the cycle runs 2 -> 4, then wraps"
+    );
+    app
+}
+
+/// Build two custom groups with the first task in each group tagged.
+fn app_with_tags_split_across_groups() -> App {
+    let mut app = App::new_local(30, 100);
+    let inv = app.invocation_dir.clone();
+    app.spawn_grouped("sleep 5", inv.clone(), "alpha"); // id 1
+    app.spawn_grouped("sleep 5", inv.clone(), "alpha"); // id 2
+    app.spawn_grouped("sleep 5", inv.clone(), "beta"); // id 3
+    app.spawn_grouped("sleep 5", inv, "beta"); // id 4
+    app.pump();
+    app.group_mode = GroupMode::Custom;
+    app.transport.send(Command::Tag { id: 1, on: true });
+    app.transport.send(Command::Tag { id: 3, on: true });
+    app.pump();
+    assert_eq!(
+        app.section_ids(),
+        vec![
+            ("alpha".to_string(), vec![1, 2]),
+            ("beta".to_string(), vec![3, 4]),
+        ],
+        "tags head their own groups: display order is 1, 2, 3, 4"
+    );
+    app
+}
+
+/// `M` advances through the tagged tasks in display order and wraps.
+#[test]
+fn cycle_tagged_advances_and_wraps() {
+    let mut app = app_with_tagged_pair();
+    app.resolve_selection();
+    assert_eq!(app.selected_id, Some(2), "first row is the first tag");
+
+    app.on_key_dashboard(key(KeyCode::Char('M')));
+    assert_eq!(app.selected_id, Some(4), "forward to the second tag");
+    app.on_key_dashboard(key(KeyCode::Char('M')));
+    assert_eq!(
+        app.selected_id,
+        Some(2),
+        "past the last tag wraps to the first"
+    );
+}
+
+/// `M` skips untagged rows between tagged tasks.
+#[test]
+fn cycle_tagged_skips_untagged_tasks() {
+    let mut app = app_with_tags_split_across_groups();
+    app.selected_id = Some(1);
+
+    app.on_key_dashboard(key(KeyCode::Char('M')));
+    assert_eq!(app.selected_id, Some(3), "untagged id 2 is skipped");
+    app.on_key_dashboard(key(KeyCode::Char('M')));
+    assert_eq!(
+        app.selected_id,
+        Some(1),
+        "untagged id 4 is skipped on the wrap"
+    );
+}
+
+/// `M` leaves the dashboard unchanged when no task is tagged.
+#[test]
+fn cycle_tagged_is_noop_without_tags() {
+    let mut app = App::new_local(30, 100);
+    let inv = app.invocation_dir.clone();
+    app.spawn_in("sleep 5", inv.clone()); // id 1
+    app.spawn_in("sleep 5", inv); // id 2
+    app.pump();
+    app.resolve_selection();
+    assert_eq!(app.selected_id, Some(1));
+
+    app.on_key_dashboard(key(KeyCode::Char('M')));
+    assert_eq!(app.selected_id, Some(1), "no tags: the selection stands");
+    assert!(app.mode == Mode::Dashboard, "no tags: the mode stands");
+    assert!(app.notice().is_none() && app.status.is_none());
+}
+
+/// From an untagged row, `M` selects the next tagged task.
+#[test]
+fn cycle_tagged_from_untagged_selection_jumps_forward() {
+    let mut app = app_with_tags_split_across_groups();
+
+    app.selected_id = Some(2);
+    app.on_key_dashboard(key(KeyCode::Char('M')));
+    assert_eq!(app.selected_id, Some(3), "next tag after the untagged row");
+
+    // A selection after the last tagged task wraps to the first.
+    app.selected_id = Some(4);
+    app.on_key_dashboard(key(KeyCode::Char('M')));
+    assert_eq!(app.selected_id, Some(1), "no tag below: wrap to the first");
+}
+
+/// With one tagged task selected, `M` leaves it selected.
+#[test]
+fn cycle_tagged_with_one_tag_holds_the_selection() {
+    let mut app = App::new_local(30, 100);
+    let inv = app.invocation_dir.clone();
+    app.spawn_in("sleep 5", inv.clone()); // id 1
+    app.spawn_in("sleep 5", inv.clone()); // id 2
+    app.spawn_in("sleep 5", inv); // id 3
+    app.pump();
+    app.transport.send(Command::Tag { id: 2, on: true });
+    app.pump();
+    app.resolve_selection();
+    assert_eq!(app.selected_id, Some(2), "the only tag heads the list");
+
+    app.on_key_dashboard(key(KeyCode::Char('M')));
+    app.on_key_dashboard(key(KeyCode::Char('M')));
+    assert_eq!(app.selected_id, Some(2), "selection is held, not cleared");
+}
+
+/// Without a selection, `M` selects the first tagged task.
+#[test]
+fn cycle_tagged_without_selection_takes_the_first_tag() {
+    let mut app = app_with_tagged_pair();
+    app.selected_id = None;
+    app.on_key_dashboard(key(KeyCode::Char('M')));
+    assert_eq!(app.selected_id, Some(2), "no selection: first tag in order");
+
+    let mut empty = App::new_local(30, 100);
+    empty.on_key_dashboard(key(KeyCode::Char('M')));
+    assert_eq!(empty.selected_id, None, "empty fleet: nothing to select");
+}
+
+/// `M` changes only the dashboard selection.
+#[test]
+fn cycle_tagged_mutates_no_task_state() {
+    let mut app = app_with_tags_split_across_groups();
+    app.resolve_selection();
+    let before: Vec<_> = app
+        .views
+        .iter()
+        .map(|v| (v.id, v.tagged, v.group.clone(), v.lifecycle))
+        .collect();
+
+    for _ in 0..5 {
+        app.on_key_dashboard(key(KeyCode::Char('M')));
+    }
+    // Apply queued transport commands before comparing task state.
+    app.pump();
+
+    let after: Vec<_> = app
+        .views
+        .iter()
+        .map(|v| (v.id, v.tagged, v.group.clone(), v.lifecycle))
+        .collect();
+    assert_eq!(before, after, "tags, groups, and lifecycles are untouched");
+    assert_eq!(
+        app.section_ids(),
+        vec![
+            ("alpha".to_string(), vec![1, 2]),
+            ("beta".to_string(), vec![3, 4]),
+        ],
+        "order is unchanged, so nothing reordered the list"
+    );
+    assert!(app.notice().is_none() && app.status.is_none());
+    assert!(app.mode == Mode::Dashboard);
+    // Five presses over two tags: an odd count lands on the second.
+    assert_eq!(app.selected_id, Some(3));
 }
 
 /// Supported crossterm keys and modifiers map to their wire representation.
@@ -1586,6 +1967,10 @@ fn key(code: KeyCode) -> KeyEvent {
 
 fn ctrl(code: KeyCode) -> KeyEvent {
     KeyEvent::new(code, KeyModifiers::CONTROL)
+}
+
+fn shift(code: KeyCode) -> KeyEvent {
+    KeyEvent::new(code, KeyModifiers::SHIFT)
 }
 
 /// `g` opens the picker only when a task is selected, pinning the target
@@ -2053,6 +2438,145 @@ fn find_paste_filters_the_candidates() {
     app.on_paste("true");
     assert_eq!(app.find_input.as_str(), "true");
     assert_eq!(find_ids(&app), vec![2]);
+}
+
+// --- `?` controls overlay -----------------------------------------------
+
+/// Paint one frame of the current mode and return it as text.
+fn painted(app: &mut App) -> String {
+    app.last_frame.clear(); // identical frames are skipped
+    let mut out = Vec::new();
+    crate::ui::render(&mut out, app).unwrap();
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// `?` opens the overlay; `?`, `Esc`, and `q` each close it.
+#[test]
+fn controls_overlay_opens_on_question_and_closes_on_peeks_key_set() {
+    let mut app = App::new_local(30, 100);
+    for close in [KeyCode::Char('?'), KeyCode::Esc, KeyCode::Char('q')] {
+        app.on_key_dashboard(key(KeyCode::Char('?')));
+        assert!(app.mode == Mode::Controls, "? must open the overlay");
+        app.on_key_controls(key(close));
+        assert!(app.mode == Mode::Dashboard, "{close:?} must close it");
+    }
+}
+
+/// Both accepted Shift-`/` event forms, `?` and `/` with Shift, open and close
+/// the overlay.
+#[test]
+fn controls_overlay_accepts_both_spellings_of_the_chord() {
+    let mut app = App::new_local(30, 100);
+    for chord in [key(KeyCode::Char('?')), shift(KeyCode::Char('/'))] {
+        app.on_key_dashboard(chord);
+        assert!(
+            app.mode == Mode::Controls,
+            "{chord:?} must open the overlay"
+        );
+        app.on_key_controls(chord);
+        assert!(app.mode == Mode::Dashboard, "{chord:?} must close it");
+    }
+}
+
+/// Shift distinguishes the overlay from find: unmodified `/` still opens the
+/// find palette.
+#[test]
+fn plain_slash_still_opens_the_find_palette() {
+    let mut app = App::new_local(30, 100);
+    let inv = app.invocation_dir.clone();
+    app.spawn_in("sleep 5", inv);
+    app.pump();
+    app.on_key_dashboard(key(KeyCode::Char('/')));
+    assert!(app.mode == Mode::Find);
+}
+
+/// Dashboard bindings are inert while the controls overlay is open.
+#[test]
+fn controls_overlay_ignores_dashboard_keys() {
+    let mut app = App::new_local(30, 100);
+    let inv = app.invocation_dir.clone();
+    app.spawn_in("sleep 5", inv);
+    app.pump();
+    app.resolve_selection();
+
+    app.on_key_dashboard(key(KeyCode::Char('?')));
+    app.on_key_controls(key(KeyCode::Char('m')));
+    app.on_key_controls(key(KeyCode::Char('n')));
+    app.pump();
+    assert!(app.mode == Mode::Controls, "neither key closes the overlay");
+    assert!(!app.views[0].tagged, "m must not reach the task");
+    assert!(app.input.as_str().is_empty(), "n must not open the prompt");
+
+    app.on_key_controls(key(KeyCode::Esc));
+    app.on_key_dashboard(key(KeyCode::Char('m')));
+    app.pump();
+    assert!(app.views[0].tagged);
+}
+
+/// A 30-row terminal shows the group headings.
+#[test]
+fn controls_overlay_groups_its_entries_when_the_terminal_is_tall() {
+    let mut app = App::new_local(30, 100);
+    app.on_key_dashboard(key(KeyCode::Char('?')));
+    let f = painted(&mut app);
+    assert!(f.contains("┌─ controls "), "{f:?}");
+    assert!(f.contains("Navigate"), "{f:?}");
+    assert!(f.contains("w         save session"), "{f:?}");
+    assert!(f.contains("? esc close"), "{f:?}");
+}
+
+/// At 20 rows, the flat layout preserves every entry by dropping headings.
+#[test]
+fn controls_overlay_drops_the_group_headers_before_any_entry() {
+    let mut app = App::new_local(20, 100);
+    app.on_key_dashboard(key(KeyCode::Char('?')));
+    let f = painted(&mut app);
+    assert!(!f.contains("Navigate"), "the headers go first: {f:?}");
+    assert!(
+        f.contains("w         save session"),
+        "no entry is hidden: {f:?}"
+    );
+}
+
+/// At 12 rows, the overlay clips seven entries and reports the count.
+#[test]
+fn controls_overlay_reports_clipped_entries_on_its_border() {
+    let mut app = App::new_local(12, 100);
+    app.on_key_dashboard(key(KeyCode::Char('?')));
+    let f = painted(&mut app);
+    assert!(f.contains("? esc close · +7 more"), "{f:?}");
+    assert!(!f.contains("save session"), "the tail is clipped: {f:?}");
+}
+
+/// Foreground has no daemon to leave running, so `q` is labeled quit.
+#[test]
+fn controls_overlay_names_the_foreground_exit_a_quit() {
+    let mut app = App::new_local(30, 100);
+    app.on_key_dashboard(key(KeyCode::Char('?')));
+    let f = painted(&mut app);
+    assert!(!app.daemon_backed);
+    assert!(f.contains("q         quit "), "{f:?}");
+    assert!(!f.contains("detach"), "{f:?}");
+
+    app.daemon_backed = true;
+    let f = painted(&mut app);
+    assert!(f.contains("q         detach"), "{f:?}");
+}
+
+/// Dashboard hint rows show common actions and link to the controls overlay.
+#[test]
+fn dashboard_hints_defer_the_long_tail_to_the_overlay() {
+    let mut app = App::new_local(30, 100);
+    let f = painted(&mut app);
+    assert!(f.contains("  ❯ n run · @ dir · / find · s sort"), "{f:?}");
+    assert!(
+        f.contains("  ↑↓ select · enter attach · space peek · ? controls"),
+        "{f:?}"
+    );
+    assert!(
+        !f.contains("w save"),
+        "the tail moved to the overlay: {f:?}"
+    );
 }
 
 // --- `R` rename prompt --------------------------------------------------
@@ -3329,4 +3853,653 @@ fn input_and_attached_echo_bypass_the_repaint_floor() {
     );
     // Before the floor elapses, wait for its remaining duration.
     assert_eq!(wait_for_paint(false, Duration::ZERO), PAINT_MIN);
+}
+
+// --- README frame fixtures --------------------------------------------------
+//
+// The real renderer writes each fabricated fleet to `docs/img/*.ansi`. Printing
+// one of these files reproduces the corresponding dashboard frame.
+
+/// Fixture terminal size. The 30 rows fit every section plus one spare list
+/// row; 107 columns produce a 71-column preview cell and an 80-column peek box.
+const FIXTURE_ROWS: u16 = 30;
+const FIXTURE_COLS: u16 = 107;
+
+/// A client with no core behind it. The fixture assigns `views` and
+/// `focused_screen` directly, so no command is sent and no event arrives.
+struct NoTransport;
+
+impl Transport for NoTransport {
+    fn send(&mut self, _cmd: Command) {}
+
+    fn poll(&mut self) -> Vec<Event> {
+        Vec::new()
+    }
+
+    fn connected(&self) -> bool {
+        true
+    }
+
+    fn shutdown(&mut self, _intent: ExitIntent) {}
+}
+
+/// Fabricated seconds. Every fixture duration is a constant: a clock reading
+/// would change the bytes between runs. `const` so the `QUIET` table can hold
+/// them directly.
+const fn secs(n: u64) -> Duration {
+    Duration::from_secs(n)
+}
+
+/// Fabricated minutes.
+const fn mins(n: u64) -> Duration {
+    Duration::from_secs(n * 60)
+}
+
+/// Live summary-adapter preview, carrying the matcher id the peek footer names.
+fn anchor(text: &str, rule: &'static str) -> Preview {
+    Preview {
+        text: text.to_string(),
+        source: PreviewSource::Anchor,
+        rule: Some(rule),
+        frozen: false,
+    }
+}
+
+/// Live window-title preview.
+fn title(text: &str) -> Preview {
+    Preview {
+        text: text.to_string(),
+        source: PreviewSource::Title,
+        rule: None,
+        frozen: false,
+    }
+}
+
+/// Live last-row preview.
+fn floor(text: &str) -> Preview {
+    Preview {
+        text: text.to_string(),
+        source: PreviewSource::Floor,
+        rule: None,
+        frozen: false,
+    }
+}
+
+/// The last-row preview a finished task froze on.
+fn frozen(text: &str) -> Preview {
+    Preview {
+        text: text.to_string(),
+        source: PreviewSource::Floor,
+        rule: None,
+        frozen: true,
+    }
+}
+
+/// The fleet's working directories, keyed as they appear in the section labels.
+/// `dir_label` abbreviates `$HOME` to `~`, so these must be built from it.
+struct Dirs {
+    home: PathBuf,
+    fleetcom: PathBuf,
+    turret: PathBuf,
+    crabapple: PathBuf,
+    crabstep: PathBuf,
+    imessage: PathBuf,
+    logria: PathBuf,
+}
+
+impl Dirs {
+    fn new(home: &Path) -> Dirs {
+        let code = home.join("Documents/Code");
+        Dirs {
+            home: home.to_path_buf(),
+            fleetcom: code.join("Rust/fleetcom"),
+            turret: code.join("Apple/turret"),
+            crabapple: code.join("Rust/crabapple"),
+            crabstep: code.join("Rust/crabstep"),
+            imessage: code.join("Rust/imessage-exporter"),
+            logria: code.join("Rust/Logria"),
+        }
+    }
+}
+
+/// A dashboard client over `views`, with `~/Documents/Code/Rust/fleetcom` as
+/// the invocation directory so directory mode ranks that section first.
+/// Daemon-backed mode omits the foreground marker from generated frames.
+fn fixture_app(dirs: &Dirs, group_mode: GroupMode, views: Vec<TaskView>) -> App {
+    let mut app = App::assemble(FIXTURE_ROWS, FIXTURE_COLS, |_, _, _| Box::new(NoTransport));
+    app.daemon_backed = true;
+    app.invocation_label = app.dir_label(&dirs.fleetcom);
+    app.invocation_dir = dirs.fleetcom.clone();
+    app.spawn_cwd = dirs.fleetcom.clone();
+    app.group_mode = group_mode;
+    app.views = views;
+    app
+}
+
+/// The active frame's 21 tasks: 12 active, two idle, and seven finished.
+/// Task IDs encode launch order; `row_rank` moves tagged tasks ahead of their
+/// peers and finished tasks behind them within a section.
+fn live_fleet(dirs: &Dirs) -> Vec<TaskView> {
+    vec![
+        TaskView {
+            id: 1,
+            command: "claude".to_string(),
+            cwd: dirs.fleetcom.clone(),
+            tagged: true,
+            group: Some("dashboard".to_string()),
+            name: Some("Dashboard Refine".to_string()),
+            lifecycle: Lifecycle::Active,
+            parked: false,
+            preview: anchor(
+                "✻ Scope small fixes for dashboard and CLI",
+                "claude:action-row",
+            ),
+            started_ago: mins(2),
+            quiet_ago: Some(secs(3)),
+            finished_ago: None,
+        },
+        TaskView {
+            id: 2,
+            command: "claude".to_string(),
+            cwd: dirs.fleetcom.clone(),
+            tagged: true,
+            group: Some("dashboard".to_string()),
+            name: Some("Summary Refine".to_string()),
+            lifecycle: Lifecycle::Active,
+            parked: false,
+            preview: anchor("Inferring… · thinking with high effort", "claude:spinner"),
+            started_ago: mins(5),
+            quiet_ago: Some(secs(8)),
+            finished_ago: None,
+        },
+        TaskView {
+            id: 3,
+            command: "grok".to_string(),
+            cwd: dirs.fleetcom.clone(),
+            tagged: false,
+            group: Some("dashboard".to_string()),
+            name: Some("Grok Language".to_string()),
+            lifecycle: Lifecycle::Active,
+            parked: false,
+            preview: anchor("Grok 4.5 (xhigh) · Responding…", "grok:spinner"),
+            started_ago: mins(12),
+            quiet_ago: Some(secs(4)),
+            finished_ago: None,
+        },
+        TaskView {
+            id: 4,
+            command: "codex".to_string(),
+            cwd: dirs.fleetcom.clone(),
+            tagged: false,
+            group: Some("dashboard".to_string()),
+            name: Some("Codex Language".to_string()),
+            lifecycle: Lifecycle::Active,
+            parked: false,
+            preview: anchor(CODEX_LANGUAGE, "codex:working"),
+            started_ago: mins(18),
+            quiet_ago: Some(secs(2)),
+            finished_ago: None,
+        },
+        TaskView {
+            id: 5,
+            command: "codex".to_string(),
+            cwd: dirs.fleetcom.clone(),
+            tagged: false,
+            group: Some("dashboard".to_string()),
+            name: Some("Codex Review".to_string()),
+            lifecycle: Lifecycle::Active,
+            parked: false,
+            preview: anchor(CODEX_REVIEW, "codex:working"),
+            started_ago: mins(24),
+            quiet_ago: Some(secs(6)),
+            finished_ago: None,
+        },
+        TaskView {
+            id: 6,
+            command: "cargo test".to_string(),
+            cwd: dirs.fleetcom.clone(),
+            tagged: false,
+            group: Some("tests".to_string()),
+            name: None,
+            lifecycle: Lifecycle::Ok,
+            parked: false,
+            preview: frozen(FLEETCOM_TESTS),
+            started_ago: mins(2),
+            quiet_ago: None,
+            finished_ago: Some(secs(12)),
+        },
+        TaskView {
+            id: 19,
+            command: "cargo clippy".to_string(),
+            cwd: dirs.fleetcom.clone(),
+            tagged: false,
+            group: Some("tests".to_string()),
+            name: None,
+            lifecycle: Lifecycle::Failed,
+            parked: false,
+            preview: frozen(FLEETCOM_CLIPPY),
+            started_ago: mins(5),
+            quiet_ago: None,
+            finished_ago: Some(mins(3)),
+        },
+        TaskView {
+            id: 7,
+            command: "claude".to_string(),
+            cwd: dirs.home.clone(),
+            tagged: false,
+            group: Some("desktop".to_string()),
+            name: Some("claude agents".to_string()),
+            lifecycle: Lifecycle::Active,
+            parked: false,
+            preview: title("2 awaiting input · claude agents"),
+            started_ago: mins(63),
+            quiet_ago: Some(secs(9)),
+            finished_ago: None,
+        },
+        TaskView {
+            id: 8,
+            command: "zellij".to_string(),
+            cwd: dirs.home.clone(),
+            tagged: false,
+            group: Some("desktop".to_string()),
+            name: Some("Zellij".to_string()),
+            lifecycle: Lifecycle::Active,
+            parked: false,
+            preview: title("Desktop ¦ Utility"),
+            started_ago: mins(126),
+            quiet_ago: Some(secs(4)),
+            finished_ago: None,
+        },
+        TaskView {
+            id: 9,
+            command: "python".to_string(),
+            cwd: dirs.home.clone(),
+            tagged: false,
+            group: None,
+            name: None,
+            lifecycle: Lifecycle::Idle,
+            parked: true,
+            preview: floor(">>>"),
+            started_ago: mins(48),
+            quiet_ago: Some(mins(41)),
+            finished_ago: None,
+        },
+        TaskView {
+            id: 10,
+            command: "brew update && brew upgrade".to_string(),
+            cwd: dirs.home.clone(),
+            tagged: false,
+            group: Some("desktop".to_string()),
+            name: None,
+            lifecycle: Lifecycle::Ok,
+            parked: false,
+            preview: frozen("Already up-to-date."),
+            started_ago: mins(14),
+            quiet_ago: None,
+            finished_ago: Some(mins(13)),
+        },
+        TaskView {
+            id: 11,
+            command: "grok".to_string(),
+            cwd: dirs.turret.clone(),
+            tagged: false,
+            group: Some("turret".to_string()),
+            name: Some("Game Infra Review".to_string()),
+            lifecycle: Lifecycle::Active,
+            parked: false,
+            preview: title("Turret Game Codebase Organization and Ex… - grok"),
+            started_ago: mins(8),
+            quiet_ago: Some(secs(5)),
+            finished_ago: None,
+        },
+        TaskView {
+            id: 12,
+            command: "codex".to_string(),
+            cwd: dirs.turret.clone(),
+            tagged: false,
+            group: Some("turret".to_string()),
+            name: Some("Missile Nerf".to_string()),
+            lifecycle: Lifecycle::Active,
+            parked: false,
+            preview: anchor(MISSILE_NERF, "codex:working"),
+            started_ago: mins(33),
+            quiet_ago: Some(secs(7)),
+            finished_ago: None,
+        },
+        TaskView {
+            id: 13,
+            command: "codex".to_string(),
+            cwd: dirs.turret.clone(),
+            tagged: false,
+            group: Some("turret".to_string()),
+            name: Some("EMP Nerf".to_string()),
+            lifecycle: Lifecycle::Active,
+            parked: false,
+            preview: anchor(EMP_NERF, "codex:working"),
+            started_ago: mins(35),
+            quiet_ago: Some(secs(3)),
+            finished_ago: None,
+        },
+        TaskView {
+            id: 14,
+            command: "cargo test".to_string(),
+            cwd: dirs.crabapple.clone(),
+            tagged: false,
+            group: Some("tests".to_string()),
+            name: None,
+            lifecycle: Lifecycle::Ok,
+            parked: false,
+            preview: frozen(CRABAPPLE_TESTS),
+            started_ago: mins(18),
+            quiet_ago: None,
+            finished_ago: Some(mins(17)),
+        },
+        TaskView {
+            id: 15,
+            command: "cargo test".to_string(),
+            cwd: dirs.crabstep.clone(),
+            tagged: false,
+            group: Some("tests".to_string()),
+            name: None,
+            lifecycle: Lifecycle::Ok,
+            parked: false,
+            preview: frozen(CRABSTEP_TESTS),
+            started_ago: mins(22),
+            quiet_ago: None,
+            finished_ago: Some(mins(21)),
+        },
+        TaskView {
+            id: 16,
+            command: "claude".to_string(),
+            cwd: dirs.imessage.clone(),
+            tagged: false,
+            group: None,
+            name: None,
+            lifecycle: Lifecycle::Active,
+            parked: false,
+            preview: anchor("✻ Review GitHub issue 780", "claude:action-row"),
+            started_ago: mins(6),
+            quiet_ago: Some(secs(2)),
+            finished_ago: None,
+        },
+        TaskView {
+            id: 17,
+            command: "cargo test".to_string(),
+            cwd: dirs.imessage.clone(),
+            tagged: false,
+            group: Some("tests".to_string()),
+            name: None,
+            lifecycle: Lifecycle::Ok,
+            parked: false,
+            preview: frozen(IMESSAGE_TESTS),
+            started_ago: mins(20),
+            quiet_ago: None,
+            finished_ago: Some(mins(19)),
+        },
+        TaskView {
+            id: 18,
+            command: "cargo test".to_string(),
+            cwd: dirs.logria.clone(),
+            tagged: false,
+            group: Some("tests".to_string()),
+            name: None,
+            lifecycle: Lifecycle::Ok,
+            parked: false,
+            preview: frozen(LOGRIA_TESTS),
+            started_ago: mins(32),
+            quiet_ago: None,
+            finished_ago: Some(mins(31)),
+        },
+        TaskView {
+            id: 20,
+            command: "cargo watch -x test".to_string(),
+            cwd: dirs.logria.clone(),
+            tagged: false,
+            group: Some("tests".to_string()),
+            name: None,
+            lifecycle: Lifecycle::Active,
+            parked: false,
+            preview: floor(LOGRIA_WATCH),
+            started_ago: secs(45),
+            quiet_ago: Some(secs(2)),
+            finished_ago: None,
+        },
+        TaskView {
+            id: 21,
+            command: "cargo doc --open".to_string(),
+            cwd: dirs.logria.clone(),
+            tagged: false,
+            group: Some("tests".to_string()),
+            name: None,
+            lifecycle: Lifecycle::Idle,
+            parked: true,
+            preview: floor(LOGRIA_DOC),
+            started_ago: mins(28),
+            quiet_ago: Some(mins(26)),
+            finished_ago: None,
+        },
+    ]
+}
+
+/// Per-task state for the quiet frame. Task identity remains in `live_fleet`;
+/// this table replaces lifecycle, age, and one preview.
+struct Quiet {
+    id: u64,
+    lifecycle: Lifecycle,
+    parked: bool,
+    started_ago: Duration,
+    quiet_ago: Option<Duration>,
+    finished_ago: Option<Duration>,
+    /// Replacement anchor preview as `(text, matcher id)`; `None` keeps the
+    /// live fleet's.
+    preview: Option<(&'static str, &'static str)>,
+}
+
+impl Quiet {
+    /// A live task quiet past `IDLE_AFTER`, timed from its last output.
+    const fn idle(id: u64, started: Duration, quiet: Duration) -> Quiet {
+        Quiet {
+            id,
+            lifecycle: Lifecycle::Idle,
+            parked: true,
+            started_ago: started,
+            quiet_ago: Some(quiet),
+            finished_ago: None,
+            preview: None,
+        }
+    }
+
+    /// A live task still inside `IDLE_AFTER`, timed from launch.
+    const fn active(id: u64, started: Duration, quiet: Duration) -> Quiet {
+        Quiet {
+            lifecycle: Lifecycle::Active,
+            parked: false,
+            ..Quiet::idle(id, started, quiet)
+        }
+    }
+
+    /// A task that exited cleanly, timed from the exit.
+    const fn done(id: u64, started: Duration, finished: Duration) -> Quiet {
+        Quiet {
+            lifecycle: Lifecycle::Ok,
+            parked: false,
+            quiet_ago: None,
+            finished_ago: Some(finished),
+            ..Quiet::idle(id, started, finished)
+        }
+    }
+
+    /// A task that exited non-zero, timed from the exit.
+    const fn failed(id: u64, started: Duration, finished: Duration) -> Quiet {
+        Quiet {
+            lifecycle: Lifecycle::Failed,
+            ..Quiet::done(id, started, finished)
+        }
+    }
+
+    /// Swap in a different status line.
+    const fn saying(mut self, text: &'static str, rule: &'static str) -> Quiet {
+        self.preview = Some((text, rule));
+        self
+    }
+}
+
+/// Quiet-frame overrides, one per task. The rendered ages include `32s` and
+/// `13s` for the tagged pair, `1m` for most idle agents, and `15m`–`21m` for
+/// finished tasks.
+const QUIET: [Quiet; 21] = [
+    Quiet::idle(1, mins(22), secs(32)),
+    Quiet::idle(2, mins(21), secs(13)).saying(SUMMARY_QUIET, "claude:action-row"),
+    Quiet::idle(3, mins(21), mins(1)),
+    Quiet::idle(4, mins(21), mins(1)),
+    Quiet::idle(5, mins(21), mins(1)),
+    Quiet::done(6, mins(21), mins(20)),
+    Quiet::idle(7, mins(21), mins(1)),
+    // Keep Zellij active so the Running section remains non-empty.
+    Quiet::active(8, mins(20), secs(4)),
+    Quiet::idle(9, mins(22), mins(20)),
+    Quiet::done(10, mins(16), mins(15)),
+    Quiet::idle(11, mins(21), mins(1)),
+    Quiet::idle(12, mins(21), mins(1)),
+    Quiet::idle(13, mins(21), mins(1)),
+    Quiet::done(14, mins(20), mins(19)),
+    Quiet::done(15, mins(21), mins(20)),
+    Quiet::idle(16, mins(21), mins(1)),
+    Quiet::done(17, mins(21), mins(20)),
+    Quiet::done(18, mins(21), mins(20)),
+    Quiet::failed(19, mins(24), mins(21)),
+    Quiet::idle(20, mins(4), mins(2)),
+    Quiet::idle(21, mins(30), mins(28)),
+];
+
+/// The quiet frame's 21 tasks: one active, 13 idle, and seven finished.
+/// `parked` follows `lifecycle` because the core derives both from the same
+/// `IDLE_AFTER` window.
+fn quiet_fleet(dirs: &Dirs) -> Vec<TaskView> {
+    let mut views = live_fleet(dirs);
+    assert_eq!(
+        views.len(),
+        QUIET.len(),
+        "every task needs a peek-frame override"
+    );
+    for v in &mut views {
+        let Some(q) = QUIET.iter().find(|q| q.id == v.id) else {
+            panic!("no peek-frame override for task {}", v.id);
+        };
+        v.lifecycle = q.lifecycle;
+        v.parked = q.parked;
+        v.started_ago = q.started_ago;
+        v.quiet_ago = q.quiet_ago;
+        v.finished_ago = q.finished_ago;
+        if let Some((text, rule)) = q.preview {
+            v.preview = anchor(text, rule);
+        }
+    }
+    views
+}
+
+// Preview texts long enough that the row cell truncates them. They are stored
+// whole: the `…` in the painted frame is the renderer's, not the fixture's.
+const CODEX_LANGUAGE: &str =
+    "gpt-5.6-sol high · fleetcom · feat/cs/interface-fixes · 387K used · 9.53M in · 61.2K out";
+const CODEX_REVIEW: &str =
+    "gpt-5.6-sol high · fleetcom · feat/cs/interface-fixes · 221K used · 4.41M in · 38.7K out";
+const MISSILE_NERF: &str = "gpt-5.6-sol high · turret · main · 129K used · 1.31M in · 10.1K out";
+const EMP_NERF: &str = "gpt-5.6-sol high · turret · main · 161K used · 1.64M in · 10.4K out";
+const FLEETCOM_TESTS: &str =
+    "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s";
+const LOGRIA_TESTS: &str = "test result: ok. 223 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.38s";
+const CRABAPPLE_TESTS: &str = "all doctests ran in 0.39s; merged doctests compilation took 0.38s";
+const CRABSTEP_TESTS: &str = "all doctests ran in 0.83s; merged doctests compilation took 0.81s";
+const IMESSAGE_TESTS: &str = "all doctests ran in 1.99s; merged doctests compilation took 1.95s";
+const FLEETCOM_CLIPPY: &str =
+    "error: could not compile `fleetcom` (lib test) due to 1 previous error";
+const LOGRIA_WATCH: &str = "[Running 'cargo test'] test result: ok. 223 passed; 0 failed";
+const LOGRIA_DOC: &str = "Finished `dev` profile [unoptimized + debuginfo] target(s) in 3.41s";
+/// Preview used only by the quiet frame.
+const SUMMARY_QUIET: &str = "✻ Review fleetcom preview design document";
+
+/// The peeked task's screen: the tail of a `cargo test` run. `render_peek`
+/// shows the last `inner_h` lines, so these are already the visible ones.
+fn cargo_test_screen(id: u64) -> ScreenView {
+    let lines = [
+        "test util::sanitizers::tests::test_length_clean ... ok",
+        "test util::sanitizers::tests::test_row_length_clean ... ok",
+        "test util::sanitizers::tests::test_length_dirty ... ok",
+        "test util::sanitizers::tests::test_length_wide_chars ... ok",
+        "test util::sanitizers::tests::test_sanitize_filename_clean ... ok",
+        "test util::sanitizers::tests::test_row_length_dirty ... ok",
+        "test util::sanitizers::tests::test_row_length_wide_chars ... ok",
+        "test util::sanitizers::tests::test_sanitize_filename_control_chars ... ok",
+        "test util::sanitizers::tests::test_sanitize_filename_trim ... ok",
+        "test util::sanitizers::tests::test_sanitize_filename_invalid_chars ... ok",
+        "test util::sanitizers::tests::test_sanitize_filename_long ... ok",
+        "",
+        LOGRIA_TESTS,
+        "",
+    ];
+    ScreenView {
+        id,
+        lines: lines.iter().map(|s| s.to_string()).collect(),
+        // Peek reads `lines` only; the attached path never runs here.
+        formatted: Vec::new(),
+        cursor: (0, 0),
+        hide_cursor: true,
+        wants_mouse: false,
+        alt_screen: false,
+        alt_scroll: false,
+        scrollback: 0,
+    }
+}
+
+/// Paint `app` once and return the frame bytes.
+fn frame(app: &mut App) -> Vec<u8> {
+    // OSC 0 keeps the captured window title independent of the printing shell.
+    let mut out = b"\x1b]0;fleetcom\x07".to_vec();
+    let painted = out.len();
+    crate::ui::render(&mut out, app).expect("a fixture frame always paints");
+    assert!(out.len() > painted, "a fresh App must emit its first frame");
+    // Park the cursor on the terminal's final row, outside centered overlays.
+    out.extend_from_slice(format!("\x1b[{};1H", app.rows).as_bytes());
+    out
+}
+
+/// Rewrite the four `docs/img/*.ansi` dashboard frames. This test is ignored
+/// because it writes repository fixtures.
+///
+/// Fixed durations and ordered inputs make the output deterministic for a
+/// given `$HOME`; `dir_label` abbreviates that path to `~` in section labels.
+#[test]
+#[ignore = "writes docs/img/*.ansi; run by hand to refresh the README screenshots"]
+fn write_readme_screenshot_fixtures() {
+    let home = std::env::var("HOME").expect("HOME must be set to abbreviate the section labels");
+    assert!(!home.is_empty(), "HOME must not be empty");
+    let dirs = Dirs::new(Path::new(&home));
+    let out_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("docs/img");
+
+    // Grouped by directory, selection on a live codex task.
+    let mut app = fixture_app(&dirs, GroupMode::Dir, live_fleet(&dirs));
+    app.selected_id = Some(4);
+    std::fs::write(out_dir.join("home.ansi"), frame(&mut app)).unwrap();
+
+    // State grouping with peek open over the first finished test. Directory
+    // ordering places id 14 first in Completed and beside the peek box.
+    let mut app = fixture_app(&dirs, GroupMode::State, quiet_fleet(&dirs));
+    app.mode = Mode::Peek;
+    app.selected_id = Some(14);
+    // Seed the watched screen directly because NoTransport emits no frames.
+    app.focused_screen = Some(cargo_test_screen(14));
+    std::fs::write(out_dir.join("quickpeek.ansi"), frame(&mut app)).unwrap();
+
+    // Custom grouping puts five directories in `tests` and splits fleetcom's
+    // directory between two sections.
+    let mut app = fixture_app(&dirs, GroupMode::Custom, live_fleet(&dirs));
+    app.selected_id = Some(4);
+    std::fs::write(out_dir.join("groups.ansi"), frame(&mut app)).unwrap();
+
+    // The `?` overlay over the same dir-grouped dashboard.
+    let mut app = fixture_app(&dirs, GroupMode::Dir, live_fleet(&dirs));
+    app.selected_id = Some(4);
+    app.mode = Mode::Controls;
+    std::fs::write(out_dir.join("controls.ansi"), frame(&mut app)).unwrap();
 }

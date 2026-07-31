@@ -29,14 +29,18 @@
 | `/` | Jump the selection to a task by name, command, or group (opens the [find palette](#the--find-palette)) |
 | `s` | Cycle grouping: by state / by directory / by custom group |
 | `m` | Tag the selected task "in use" (toggles) |
+| `M` | Select the next tagged task in dashboard order, wrapping at the end |
 | `g` | Assign the selected task to a group (opens the group picker) |
 | `R` | Rename the selected task: a display name shown in place of the command |
 | `r` | Rerun a finished task; supported agent tasks use the captured resume command |
 | `X` | Kill a running task (`TERM`, then `KILL` after 2 s), or remove a finished one |
 | `w` | Save the current tasks as a session |
 | `o` | Load a saved session or a recovery snapshot (opens the [session picker](#the-o-session-picker)) |
-| `q` (or `Ctrl-C`) | Disconnect; leave the daemon and tasks running |
+| `?` | Open the [controls overlay](#the--controls-overlay) |
+| `q` (or `Ctrl-C`) | Disconnect from the daemon; under `--foreground`, quit and stop the tasks |
 | `Q` | Quit; kill the tasks and stop the daemon |
+
+![`fleetcom` controls overlay](img/controls.png)
 
 ### Status glyphs
 
@@ -128,6 +132,8 @@ Groups belong to task state: an assignment survives client detach and rerun (`r`
 
 `m` toggles the "in use" tag and marks the task with `◆`. In state mode, tagged tasks form the In use section at the top. In custom mode, a tag moves the task to the top of its existing group rather than creating a global section. Within a dir or custom section, tasks sort as tagged, live, then completed; each class then sorts by directory and spawn order. Idle state does not affect row order in these modes, so a quiet task keeps its position and shows `∙`. State mode instead moves quiet tasks from Running to Idle.
 
+`M` cycles the selection through tagged tasks in dashboard order. It wraps after the last tagged task. With no tagged tasks, the selection does not move; with one, the selection moves to that task and stays there.
+
 In custom mode only, a new command inherits the selected task's group, through both `n` and the `@` picker. The spawn prompt shows the destination as `❯ dir ▸ group ▸ command`, each segment present only when it applies: the dir segment for a non-default directory, the group segment when a group will be inherited. State- and dir-mode spawns start unassigned.
 
 #### Renaming
@@ -142,11 +148,15 @@ The daemon removes control characters, trims surrounding whitespace, and limits 
 
 `@` opens a bottom panel containing a path field and its matching directories. `Enter` depends on the selected row type:
 
-- Current directory: run the command in that directory (`Enter`).
-- Recent directories: ones you've launched in before; `Enter` runs there, `Tab`/`→` browses into them.
-- Subdirectories of the current path: `Enter` or `Tab`/`→` descends into one.
+- Resolved path: run the command in that directory (`Enter`). Row 0 is always this row, so the list is never empty.
+- Current task directories: `Enter` runs there; `Tab`/`→` browses into them. These rows precede subdirectories.
+- Subdirectories of the resolved path: `Enter` or `Tab`/`→` descends into one.
 
-Typing filters the rows; `Backspace` deletes one character and the matches re-filter; `↑`/`↓` move the highlight; `Esc` cancels. Completion updates on each input, permitting navigation and launch without leaving the dashboard. `←`/`→` move the caret within the typed path (`→` descends only when the caret is at the end), and `Ctrl-A`/`Ctrl-E` (or `Home`/`End`) jump to either end; the same caret keys work in every `fleetcom` text field.
+Typing filters both lists under different rules. A subdirectory matches the fragment as a case-insensitive prefix. A current task directory matches a case-insensitive substring of its final path component: `log` finds `~/Documents/Code/Rust/Logria`, while `crab` finds both `crabapple` and `crabstep`. Parent components do not participate, so `doc` does not match every directory under `~/Documents/`.
+
+Once the field contains `/`, current task directory rows are omitted; the picker shows the resolved path and its matching subdirectories. Without `/`, a current task directory that is also a matching subdirectory appears once, with the current task row behavior.
+
+`Backspace` deletes one character and the matches re-filter; `↑`/`↓` move the highlight; `Esc` cancels. Completion updates on each input, permitting navigation and launch without leaving the dashboard. `←`/`→` move the caret within the typed path (`→` descends only when the caret is at the end), and `Ctrl-A`/`Ctrl-E` (or `Home`/`End`) jump to either end; the same caret keys work in every `fleetcom` text field.
 
 ## The `/` find palette
 
@@ -178,6 +188,16 @@ The daemon normalizes every group name received from the picker or a [session](s
 
 A recovery row reads `<age> ago · <tasks> task(s) · <label>`: the file's age, its command count, and its stored label (normally `autosaved <timestamp>`). `Enter` loads the highlighted snapshot; the status line confirms the load and suggests saving it. Press `w` to save the recovered fleet as a named session.
 
+## The `?` controls overlay
+
+The dashboard's two hint rows cover common actions: `↑↓ select · enter attach · space peek · ? controls` and `❯ n run · @ dir · / find · s sort`. `?` opens an expanded reference for dashboard actions and the attached-mode background chord.
+
+The overlay groups bindings by purpose in a centered box. It does not scroll. `?`, `Esc`, or `q` returns to the dashboard. Other keys do nothing in the overlay; `Ctrl-C` still disconnects.
+
+`?` is Shift-`/`. `fleetcom` accepts both event forms for this binding: `?`, or `/` with Shift. An unmodified `/` still opens the [find palette](#the--find-palette).
+
+The box uses a two-column layout. When height is limited, group headers drop first; if the entries still do not fit, the overlay clips the tail and reports `+N more` on the bottom border. Narrow terminals clip each row to the box width.
+
 ## Peek
 
 A centered box over the dashboard showing the selected task's live screen (the last screenful). `↑`/`↓` (or `k`/`j`) switch which task you're peeking at; `Enter` attaches to it; `r` reruns it if it has finished; `Space`, `Esc`, or `q` closes.
@@ -186,7 +206,7 @@ The footer's `preview:` segment names the source of the row's dashboard preview:
 
 ## Attached
 
-The task owns the terminal, and its status bar reads `[attached] <command>    Ctrl-\ background`, or `[attached] <name> · <command>` for a named task. `Ctrl-\` returns to the dashboard; every other key (control chords included) goes to the child.
+The task owns the terminal, and its status bar reads `[attached] <command>    Ctrl-\ background`, or `[attached] <name> · <command>` for a named task. `Ctrl-\` returns to the dashboard. Other supported input normally goes to the child; [scrollback](#scrollback) reserves its navigation keys.
 
 ## Connection loss
 
