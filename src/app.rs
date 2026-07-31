@@ -26,6 +26,7 @@ use crossterm::{
 
 use crate::{
     editbuf::EditBuffer,
+    format::collation_key,
     path,
     protocol::{
         ClipboardKind, Command, Event, Key, Lifecycle, Mods, MouseBtn, MouseKind, RecoveryEntry,
@@ -541,7 +542,7 @@ impl App {
                     }
                     GroupMode::Dir => {
                         let label = self.dir_label(&v.cwd);
-                        // Invocation dir sorts first; everything else alphabetical.
+                        // Invocation dir sorts first; the rest collate by name.
                         let rank = if label == self.invocation_label { 0 } else { 1 };
                         (rank, label)
                     }
@@ -558,8 +559,22 @@ impl App {
                 (rank, label, row_rank(v), self.dir_label(&v.cwd), v.id, i)
             })
             .collect();
-        labeled.sort();
+        // Both strings are human-readable names, so both collate. `cached_key`
+        // builds each element's key once; a comparator would rebuild it on
+        // every comparison.
+        labeled.sort_by_cached_key(|(rank, label, row, dir, id, i)| {
+            (
+                *rank,
+                collation_key(label),
+                *row,
+                collation_key(dir),
+                *id,
+                *i,
+            )
+        });
 
+        // Section boundaries compare the exact label, never the folded one:
+        // `API` and `api` sort adjacent and stay two sections.
         let mut out: Vec<(String, Vec<usize>)> = Vec::new();
         for (_, label, _, _, _, i) in labeled {
             match out.last_mut() {
@@ -1019,7 +1034,9 @@ impl App {
             .filter_map(|v| v.group.as_ref())
             .filter(|g| g.to_lowercase().starts_with(&needle))
             .collect();
-        names.sort();
+        names.sort_by_cached_key(|g| collation_key(g.as_str()));
+        // Exact duplicates share a key and stay adjacent under a stable sort,
+        // so `dedup` still collapses them — and only them.
         names.dedup();
         for name in names {
             cands.push(GroupCand {
@@ -1859,7 +1876,8 @@ fn split_input(input: &str) -> (&str, &str) {
 }
 
 /// Subdirectories of `base` whose name prefix-matches `partial` (case-
-/// insensitive), sorted. Hidden entries appear only when `partial` starts `.`.
+/// insensitive), collated case-insensitively so the order matches the filter.
+/// Hidden entries appear only when `partial` starts `.`.
 fn list_dirs(base: &Path, partial: &str) -> Vec<String> {
     let needle = partial.to_lowercase();
     let mut out: Vec<String> = Vec::new();
@@ -1878,7 +1896,9 @@ fn list_dirs(base: &Path, partial: &str) -> Vec<String> {
             }
         }
     }
-    out.sort();
+    // `read_dir` yields entries in arbitrary order, so this sort is also what
+    // makes the panel deterministic.
+    out.sort_by_cached_key(|n| collation_key(n));
     out
 }
 

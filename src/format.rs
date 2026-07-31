@@ -75,6 +75,25 @@ pub fn pad(s: &str, width: usize) -> String {
     t
 }
 
+/// Sort key for a human-readable name: case-folded first, exact bytes second.
+///
+/// `String` orders byte-wise, so every uppercase ASCII letter sorts before every
+/// lowercase one and `API` lands at the opposite end of a list from `api`, with
+/// everything else in between. Folding with `to_lowercase` — Unicode-aware, in
+/// std, no locale — puts them side by side. The exact name then breaks the tie,
+/// so two names differing only by case hold one fixed order across every render
+/// instead of an unspecified one.
+///
+/// The key never merges: distinct names produce distinct keys, so collation
+/// changes display order and nothing else. Identity comparisons stay exact.
+///
+/// Call-site details: each call allocates two `String`s, so compute the key once
+/// per element — `sort_by_cached_key`, or store it in the value being sorted —
+/// never inside a comparator, which would rebuild it O(n log n) times.
+pub(crate) fn collation_key(name: &str) -> (String, String) {
+    (name.to_lowercase(), name.to_string())
+}
+
 /// Convert days since 1970-01-01 to a proleptic Gregorian date.
 pub(crate) fn civil_from_days(days: i64) -> (i64, u32, u32) {
     let z = days + 719_468;
@@ -147,6 +166,43 @@ mod tests {
         assert_eq!(p.width(), 8);
         // Combining mark: 1 column, so 2 spaces of padding.
         assert_eq!(pad("e\u{0301}", 3), "e\u{0301}  ");
+    }
+
+    #[test]
+    fn collation_key_folds_then_breaks_ties_on_exact_bytes() {
+        assert_eq!(collation_key("API"), ("api".to_string(), "API".to_string()));
+        // Folded first: `api` beats `Zebra`, which byte order reverses.
+        assert!(collation_key("api") < collation_key("Zebra"));
+        // Exact bytes second: same fold, so the tiebreak decides, and it is
+        // total — the two keys are never equal, so a sort cannot merge them.
+        assert!(collation_key("API") < collation_key("api"));
+        assert_ne!(collation_key("API"), collation_key("api"));
+        // Folding is Unicode-aware, not ASCII-only.
+        assert_eq!(collation_key("ÉCOLE").0, "école");
+    }
+
+    #[test]
+    fn collation_is_deterministic_regardless_of_input_order() {
+        fn collate(mut v: Vec<&str>) -> Vec<&str> {
+            v.sort_by_cached_key(|s| collation_key(s));
+            v
+        }
+        let want = vec!["API", "api", "Apple", "banana", "Zebra"];
+        assert_eq!(
+            collate(vec!["Zebra", "api", "API", "banana", "Apple"]),
+            want
+        );
+        assert_eq!(
+            collate(vec!["API", "Apple", "banana", "api", "Zebra"]),
+            want
+        );
+        assert_eq!(collate(want.clone()), want, "already sorted is a fixpoint");
+
+        // The defect this replaces: byte order strands API and Apple at the
+        // far end of the list from api.
+        let mut bytewise = vec!["Zebra", "api", "API", "banana", "Apple"];
+        bytewise.sort();
+        assert_eq!(bytewise, vec!["API", "Apple", "Zebra", "api", "banana"]);
     }
 
     #[test]

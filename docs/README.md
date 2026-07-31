@@ -107,7 +107,7 @@ Each row is `glyph · tag · command · latest output · age`. The age counts fr
   ✻  npm run dev              VITE v5.0  ready in 312 ms        1m
 ```
 
-`s` cycles through state, directory, and custom grouping. The header renders the active mode in bold. In custom mode, `g` assigns the selected task to a named group. Named sections sort alphabetically; Unassigned appears last when at least one task has no group:
+`s` cycles through state, directory, and custom grouping. The header renders the active mode in bold. In custom mode, `g` assigns the selected task to a named group. Named sections sort by name and ignore case, so `API` files next to `api` rather than ahead of every lowercase name; the two remain separate sections, because group identity stays case-sensitive. Unassigned appears last when at least one task has no group:
 
 ```text
   fleetcom   2 running · 0 idle · 0 done      by state · dir · custom

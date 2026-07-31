@@ -119,8 +119,10 @@ A `TERM`-ignoring member can also survive when its leader exits during shutdown.
 `s` cycles three grouping modes: state, dir, custom. The header shows the strip `by state · dir · custom` with the active mode bold and the rest dim.
 
 - By state: In use / Running / Idle / Completed. A running task files under Idle after 10 s without output; Completed stays one section (`✓`/`✗` show exit status).
-- By dir: one section per working directory; the invocation directory first, the rest alphabetical.
+- By dir: one section per working directory; the invocation directory first, the rest sorted by name.
 - By custom group: one section per group name, sorted by name, with Unassigned last. Fresh spawns remain unassigned unless they inherit a group, and the Unassigned section exists only while it has a member.
+
+Every name sort ignores case, section labels and the within-section directory tiebreak alike: `API` files next to `api`, not ahead of every lowercase name. Names differing only by case sort adjacent and stay distinct — group comparison remains case-sensitive, so `API` and `api` are two sections, in a fixed order that does not shift between renders.
 
 Groups belong to task state: an assignment survives client detach and rerun (`r`), and switching grouping modes does not modify it. `g` reassigns the selected task through the [group picker](#the-g-group-picker).
 
@@ -158,7 +160,7 @@ The working directory is not matched. In a monorepo every task shares one direct
 
 ## The `g` group picker
 
-`g` on a selected task opens a bottom panel with the same structure as the `@` picker: a typed-name field plus the matching rows. Row 0 is always Unassigned, so the list is never empty; the fleet's existing group names follow, sorted, filtered by case-insensitive prefix as you type. The task's current group is marked `(current)`.
+`g` on a selected task opens a bottom panel with the same structure as the `@` picker: a typed-name field plus the matching rows. Row 0 is always Unassigned, so the list is never empty; the fleet's existing group names follow, sorted ignoring case to match the filter, filtered by case-insensitive prefix as you type. The task's current group is marked `(current)`.
 
 `Enter` acts on the highlighted row, and the hint line names the action:
 
@@ -172,7 +174,7 @@ The daemon normalizes every group name received from the picker or a [session](s
 
 ## The `o` session picker
 
-`o` opens a bottom panel listing the saved [sessions](sessions.md): `↑`/`↓` move the highlight, `Enter` loads, `Esc` cancels. While [recovery snapshots](sessions.md#recovery) exist, the hint adds `tab recovery (N)` and `Tab` (or `Shift-Tab`) flips the panel to them; `Tab` again returns to the saved list. Each list keeps its own highlight. With no snapshots, `Tab` does nothing and the hint omits it.
+`o` opens a bottom panel listing the saved [sessions](sessions.md), sorted by name ignoring case: `↑`/`↓` move the highlight, `Enter` loads, `Esc` cancels. While [recovery snapshots](sessions.md#recovery) exist, the hint adds `tab recovery (N)` and `Tab` (or `Shift-Tab`) flips the panel to them; `Tab` again returns to the saved list. Each list keeps its own highlight. With no snapshots, `Tab` does nothing and the hint omits it.
 
 A recovery row reads `<age> ago · <tasks> task(s) · <label>`: the file's age, its command count, and its stored label (normally `autosaved <timestamp>`). `Enter` loads the highlighted snapshot; the status line confirms the load and suggests saving it. Press `w` to save the recovered fleet as a named session.
 

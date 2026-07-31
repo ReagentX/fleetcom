@@ -125,6 +125,58 @@ fn dir_mode_groups_by_cwd() {
     assert_eq!(s[1].0, "/tmp");
 }
 
+/// Group sections collate case-insensitively. Byte order would read
+/// `API, Review, api, zebra`, stranding `API` at the opposite end of the list
+/// from `api`; folded order reads `API, api, Review, zebra`. The two `api`
+/// sections stay separate, because group identity remains case-sensitive:
+/// merging them would be a data bug, not a display change.
+#[test]
+fn custom_sections_collate_case_insensitively() {
+    let mut app = App::new_local(30, 100);
+    let inv = app.invocation_dir.clone();
+    app.spawn_grouped("sleep 5", inv.clone(), "zebra"); // id 1
+    app.spawn_grouped("sleep 5", inv.clone(), "API"); // id 2
+    app.spawn_grouped("sleep 5", inv.clone(), "Review"); // id 3
+    app.spawn_grouped("sleep 5", inv, "api"); // id 4
+    app.pump();
+    app.group_mode = GroupMode::Custom;
+
+    assert_eq!(
+        app.section_ids(),
+        vec![
+            ("API".to_string(), vec![2]),
+            ("api".to_string(), vec![4]),
+            ("Review".to_string(), vec![3]),
+            ("zebra".to_string(), vec![1]),
+        ],
+        "folded order, with API and api adjacent and still two sections"
+    );
+}
+
+/// Dir-mode section labels collate too. `Zed` and `apple` discriminate: byte
+/// order puts `Zed` first, folded order puts `apple` first.
+#[test]
+fn dir_sections_collate_case_insensitively() {
+    let mut app = App::new_local(30, 100);
+    let base = temp("app_dir_collate");
+    let (upper, lower) = (base.join("Zed"), base.join("apple"));
+    std::fs::create_dir_all(&upper).unwrap();
+    std::fs::create_dir_all(&lower).unwrap();
+    app.spawn_in("sleep 5", upper.clone()); // id 1
+    app.spawn_in("sleep 5", lower.clone()); // id 2
+    app.pump();
+    app.group_mode = GroupMode::Dir;
+
+    let (z, a) = (app.dir_label(&upper), app.dir_label(&lower));
+    assert!(z < a, "byte order must put Zed first for this test to bite");
+    assert_eq!(
+        app.section_ids(),
+        vec![(a, vec![2]), (z, vec![1])],
+        "apple before Zed once the label folds"
+    );
+    let _ = std::fs::remove_dir_all(&base);
+}
+
 /// `s` cycles through all grouping modes.
 #[test]
 fn group_mode_cycles_state_dir_custom() {
@@ -518,7 +570,11 @@ fn custom_mode_tagged_task_floats_and_holds_while_parked() {
 fn state_mode_ordering_survives_the_row_key_split() {
     let mut app = App::new_local(30, 100);
     let base = temp("app_state_order");
-    let (dir_a, dir_b) = (base.join("a"), base.join("b"));
+    // `apple` and `Zed` disagree between the two collations — byte order puts
+    // `Zed` first, folded order puts `apple` first — so this test also locks
+    // the half of the collation change that State mode is not neutral to: the
+    // within-section `dir_label` tiebreak.
+    let (dir_a, dir_b) = (base.join("apple"), base.join("Zed"));
     std::fs::create_dir_all(&dir_a).unwrap();
     std::fs::create_dir_all(&dir_b).unwrap();
 
@@ -560,7 +616,10 @@ fn state_mode_ordering_survives_the_row_key_split() {
     }
 
     let (a, b) = (app.dir_label(&dir_a), app.dir_label(&dir_b));
-    assert!(a < b, "dir a must sort before dir b for this test to bite");
+    assert!(
+        b < a,
+        "byte order must put dir b first, or this test cannot see the collation"
+    );
     assert_eq!(
         app.section_ids(),
         vec![
@@ -959,6 +1018,29 @@ fn picker_puts_current_dir_first_and_selected() {
     assert_eq!(app.dir_sel, 0, "current dir selected by default");
     assert_eq!(app.dir_candidates[0].kind, DirKind::Use);
     assert_eq!(app.dir_candidates[0].path, app.invocation_dir);
+}
+
+/// Subdirectory rows collate case-insensitively, matching the case-insensitive
+/// prefix filter above them. `read_dir` yields entries in arbitrary order, so
+/// this also pins the panel's determinism. The names differ by more than case:
+/// APFS is case-insensitive by default, so `API` and `api` cannot coexist as
+/// directories on this machine.
+#[test]
+fn list_dirs_collates_case_insensitively() {
+    let base = temp("app_list_dirs_collate");
+    for name in ["Zed", "apple", "Beta", "cider"] {
+        std::fs::create_dir_all(base.join(name)).unwrap();
+    }
+    // A file is not a directory row, and neither is a dotfile.
+    std::fs::write(base.join("Alpha.txt"), b"x").unwrap();
+    std::fs::create_dir_all(base.join(".hidden")).unwrap();
+
+    assert_eq!(
+        list_dirs(&base, ""),
+        vec!["apple", "Beta", "cider", "Zed"],
+        "byte order would read Beta, Zed, apple, cider"
+    );
+    let _ = std::fs::remove_dir_all(&base);
 }
 
 /// Focus is by id, so it points at the same task even after the list shifts
@@ -1547,7 +1629,7 @@ fn group_picker_opens_on_g_only_with_a_selection() {
     assert_eq!(app.group_target, Some(1));
 }
 
-/// Picker candidates are distinct byte-sorted groups after Unassigned, with
+/// Picker candidates are the distinct groups, collated, after Unassigned, with
 /// the target's assignment marked "(current)".
 #[test]
 fn group_candidates_are_distinct_sorted_and_marked() {
@@ -1580,6 +1662,41 @@ fn group_candidates_are_distinct_sorted_and_marked() {
     app.selected_id = Some(4);
     app.on_key_dashboard(key(KeyCode::Char('g')));
     assert_eq!(app.group_candidates[0].label, "Unassigned (current)");
+}
+
+/// The picker's group rows collate case-insensitively, matching the filter that
+/// already lowercases both sides. Unassigned stays pinned at row 0, and `API`
+/// and `api` both survive: the sort orders, `dedup` still removes only exact
+/// duplicates.
+#[test]
+fn group_candidates_collate_case_insensitively() {
+    let mut app = App::new_local(30, 100);
+    let inv = app.invocation_dir.clone();
+    app.spawn_grouped("sleep 5", inv.clone(), "zebra"); // id 1
+    app.spawn_grouped("sleep 5", inv.clone(), "API"); // id 2
+    app.spawn_grouped("sleep 5", inv.clone(), "Review"); // id 3
+    app.spawn_grouped("sleep 5", inv.clone(), "api"); // id 4
+    app.spawn_grouped("sleep 5", inv, "api"); // id 5, exact duplicate
+    app.pump();
+
+    app.selected_id = Some(1);
+    app.on_key_dashboard(key(KeyCode::Char('g')));
+    let groups: Vec<Option<&str>> = app
+        .group_candidates
+        .iter()
+        .map(|c| c.group.as_deref())
+        .collect();
+    assert_eq!(
+        groups,
+        vec![
+            None,
+            Some("API"),
+            Some("api"),
+            Some("Review"),
+            Some("zebra")
+        ],
+        "Unassigned pinned first; byte order would read API, Review, api, zebra"
+    );
 }
 
 /// Typing applies a case-insensitive prefix filter and selects the first
