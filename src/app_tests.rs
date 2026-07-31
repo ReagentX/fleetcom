@@ -1969,6 +1969,10 @@ fn ctrl(code: KeyCode) -> KeyEvent {
     KeyEvent::new(code, KeyModifiers::CONTROL)
 }
 
+fn shift(code: KeyCode) -> KeyEvent {
+    KeyEvent::new(code, KeyModifiers::SHIFT)
+}
+
 /// `g` opens the picker only when a task is selected, pinning the target
 /// to that task's id.
 #[test]
@@ -2434,6 +2438,146 @@ fn find_paste_filters_the_candidates() {
     app.on_paste("true");
     assert_eq!(app.find_input.as_str(), "true");
     assert_eq!(find_ids(&app), vec![2]);
+}
+
+// --- `?` controls overlay -----------------------------------------------
+
+/// Paint one frame of the current mode and return it as text.
+fn painted(app: &mut App) -> String {
+    app.last_frame.clear(); // identical frames are skipped
+    let mut out = Vec::new();
+    crate::ui::render(&mut out, app).unwrap();
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// `?` opens the overlay; `?`, `Esc`, and `q` each close it.
+#[test]
+fn controls_overlay_opens_on_question_and_closes_on_peeks_key_set() {
+    let mut app = App::new_local(30, 100);
+    for close in [KeyCode::Char('?'), KeyCode::Esc, KeyCode::Char('q')] {
+        app.on_key_dashboard(key(KeyCode::Char('?')));
+        assert!(app.mode == Mode::Controls, "? must open the overlay");
+        app.on_key_controls(key(close));
+        assert!(app.mode == Mode::Dashboard, "{close:?} must close it");
+    }
+}
+
+/// Both accepted Shift-`/` event forms, `?` and `/` with Shift, open and close
+/// the overlay.
+#[test]
+fn controls_overlay_accepts_both_spellings_of_the_chord() {
+    let mut app = App::new_local(30, 100);
+    for chord in [key(KeyCode::Char('?')), shift(KeyCode::Char('/'))] {
+        app.on_key_dashboard(chord);
+        assert!(
+            app.mode == Mode::Controls,
+            "{chord:?} must open the overlay"
+        );
+        app.on_key_controls(chord);
+        assert!(app.mode == Mode::Dashboard, "{chord:?} must close it");
+    }
+}
+
+/// Shift distinguishes the overlay from find: unmodified `/` still opens the
+/// find palette.
+#[test]
+fn plain_slash_still_opens_the_find_palette() {
+    let mut app = App::new_local(30, 100);
+    let inv = app.invocation_dir.clone();
+    app.spawn_in("sleep 5", inv);
+    app.pump();
+    app.on_key_dashboard(key(KeyCode::Char('/')));
+    assert!(app.mode == Mode::Find);
+}
+
+/// Dashboard bindings are inert while the controls overlay is open.
+#[test]
+fn controls_overlay_ignores_dashboard_keys() {
+    let mut app = App::new_local(30, 100);
+    let inv = app.invocation_dir.clone();
+    app.spawn_in("sleep 5", inv);
+    app.pump();
+    app.resolve_selection();
+
+    app.on_key_dashboard(key(KeyCode::Char('?')));
+    app.on_key_controls(key(KeyCode::Char('m')));
+    app.on_key_controls(key(KeyCode::Char('n')));
+    app.pump();
+    assert!(app.mode == Mode::Controls, "neither key closes the overlay");
+    assert!(!app.views[0].tagged, "m must not reach the task");
+    assert!(app.input.as_str().is_empty(), "n must not open the prompt");
+
+    // The same keys act once the overlay is closed.
+    app.on_key_controls(key(KeyCode::Esc));
+    app.on_key_dashboard(key(KeyCode::Char('m')));
+    app.pump();
+    assert!(app.views[0].tagged);
+}
+
+/// A 30-row terminal shows the group headings.
+#[test]
+fn controls_overlay_groups_its_entries_when_the_terminal_is_tall() {
+    let mut app = App::new_local(30, 100);
+    app.on_key_dashboard(key(KeyCode::Char('?')));
+    let f = painted(&mut app);
+    assert!(f.contains("┌─ controls "), "{f:?}");
+    assert!(f.contains("Navigate"), "{f:?}");
+    assert!(f.contains("w         save session"), "{f:?}");
+    assert!(f.contains("? esc close"), "{f:?}");
+}
+
+/// At 20 rows, the flat layout preserves every entry by dropping headings.
+#[test]
+fn controls_overlay_drops_the_group_headers_before_any_entry() {
+    let mut app = App::new_local(20, 100);
+    app.on_key_dashboard(key(KeyCode::Char('?')));
+    let f = painted(&mut app);
+    assert!(!f.contains("Navigate"), "the headers go first: {f:?}");
+    assert!(
+        f.contains("w         save session"),
+        "no entry is hidden: {f:?}"
+    );
+}
+
+/// At 12 rows, the overlay clips seven entries and reports the count.
+#[test]
+fn controls_overlay_reports_clipped_entries_on_its_border() {
+    let mut app = App::new_local(12, 100);
+    app.on_key_dashboard(key(KeyCode::Char('?')));
+    let f = painted(&mut app);
+    assert!(f.contains("? esc close · +7 more"), "{f:?}");
+    assert!(!f.contains("save session"), "the tail is clipped: {f:?}");
+}
+
+/// Foreground has no daemon to leave running, so `q` is labeled quit.
+#[test]
+fn controls_overlay_names_the_foreground_exit_a_quit() {
+    let mut app = App::new_local(30, 100);
+    app.on_key_dashboard(key(KeyCode::Char('?')));
+    let f = painted(&mut app);
+    assert!(!app.daemon_backed);
+    assert!(f.contains("q         quit "), "{f:?}");
+    assert!(!f.contains("detach"), "{f:?}");
+
+    app.daemon_backed = true;
+    let f = painted(&mut app);
+    assert!(f.contains("q         detach"), "{f:?}");
+}
+
+/// Dashboard hint rows show common actions and link to the controls overlay.
+#[test]
+fn dashboard_hints_defer_the_long_tail_to_the_overlay() {
+    let mut app = App::new_local(30, 100);
+    let f = painted(&mut app);
+    assert!(f.contains("  ❯ n run · @ dir · / find · s sort"), "{f:?}");
+    assert!(
+        f.contains("  ↑↓ select · enter attach · space peek · ? controls"),
+        "{f:?}"
+    );
+    assert!(
+        !f.contains("w save"),
+        "the tail moved to the overlay: {f:?}"
+    );
 }
 
 // --- `R` rename prompt --------------------------------------------------

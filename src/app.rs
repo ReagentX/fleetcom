@@ -96,6 +96,8 @@ pub enum Mode {
     LoadSession,
     /// Overlay preview of the selected task.
     Peek,
+    /// Read-only key-reference overlay.
+    Controls,
     /// Full-screen, keystrokes forwarded to the focused task's PTY.
     Attached,
     /// The daemon connection dropped; a banner offers reconnect or quit.
@@ -1155,6 +1157,7 @@ impl App {
             Mode::Rename => self.on_key_rename(k),
             Mode::LoadSession => self.on_key_loadsession(k),
             Mode::Peek => self.on_key_peek(k),
+            Mode::Controls => self.on_key_controls(k),
             Mode::Attached => self.on_key_attached(out, k)?,
             Mode::Disconnected => self.on_key_disconnected(k),
         }
@@ -1172,6 +1175,10 @@ impl App {
     }
 
     fn on_key_dashboard(&mut self, k: KeyEvent) {
+        if is_controls_key(k) {
+            self.mode = Mode::Controls;
+            return;
+        }
         match k.code {
             // `q` detaches (daemon + tasks live on); `Q` kills all and stops it.
             KeyCode::Char('q') => {
@@ -1433,6 +1440,13 @@ impl App {
             // Keep the peek overlay open while the restarted task streams output.
             KeyCode::Char('r') => self.rerun_selected(),
             _ => {}
+        }
+    }
+
+    /// Return from the controls overlay on `?`, Esc, or `q`.
+    fn on_key_controls(&mut self, k: KeyEvent) {
+        if is_controls_key(k) || matches!(k.code, KeyCode::Esc | KeyCode::Char('q')) {
+            self.mode = Mode::Dashboard;
         }
     }
 
@@ -1805,6 +1819,16 @@ fn key_event_to_key(ev: KeyEvent) -> Option<(Key, Mods)> {
         _ => return None,
     };
     Some((code, mods))
+}
+
+/// Match either accepted Shift-`/` event: `?`, or `/` with the Shift modifier.
+/// An unmodified `/` remains available to the find palette.
+fn is_controls_key(k: KeyEvent) -> bool {
+    match k.code {
+        KeyCode::Char('?') => true,
+        KeyCode::Char('/') => k.modifiers.contains(KeyModifiers::SHIFT),
+        _ => false,
+    }
 }
 
 /// Apply prompt editing keys. Returns `Some(true)` for text changes,

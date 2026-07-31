@@ -36,6 +36,7 @@
 | `X` | Kill a running task (`TERM`, then `KILL` after 2 s), or remove a finished one |
 | `w` | Save the current tasks as a session |
 | `o` | Load a saved session or a recovery snapshot (opens the [session picker](#the-o-session-picker)) |
+| `?` | Open the [controls overlay](#the--controls-overlay) |
 | `q` (or `Ctrl-C`) | Disconnect; leave the daemon and tasks running |
 | `Q` | Quit; kill the tasks and stop the daemon |
 
@@ -184,6 +185,16 @@ The daemon normalizes every group name received from the picker or a [session](s
 `o` opens a bottom panel listing the saved [sessions](sessions.md), sorted by name ignoring case: `↑`/`↓` move the highlight, `Enter` loads, `Esc` cancels. While [recovery snapshots](sessions.md#recovery) exist, the hint adds `tab recovery (N)` and `Tab` (or `Shift-Tab`) flips the panel to them; `Tab` again returns to the saved list. Each list keeps its own highlight. With no snapshots, `Tab` does nothing and the hint omits it.
 
 A recovery row reads `<age> ago · <tasks> task(s) · <label>`: the file's age, its command count, and its stored label (normally `autosaved <timestamp>`). `Enter` loads the highlighted snapshot; the status line confirms the load and suggests saving it. Press `w` to save the recovered fleet as a named session.
+
+## The `?` controls overlay
+
+The dashboard's two hint rows cover common actions: `↑↓ select · enter attach · space peek · ? controls` and `❯ n run · @ dir · / find · s sort`. `?` opens an expanded reference for dashboard actions and the attached-mode background chord.
+
+The overlay groups bindings by purpose in a centered box. It does not scroll. `?`, `Esc`, or `q` returns to the dashboard. Other overlay-local input is ignored; `Ctrl-C` retains its global disconnect behavior.
+
+`?` is Shift-`/`. `fleetcom` accepts both event forms for this binding: `?`, or `/` with Shift. An unmodified `/` still opens the [find palette](#the--find-palette).
+
+The box uses a two-column layout. When height is limited, group headers drop first; if the entries still do not fit, the overlay clips the tail and reports `+N more` on the bottom border. Narrow terminals clip each row to the box width.
 
 ## Peek
 

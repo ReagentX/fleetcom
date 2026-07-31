@@ -77,15 +77,12 @@ The first ordinary invocation starts the daemon when necessary. `--daemon` is an
 
 ### Dashboard
 
-| Key | Command |
-| -- | -- |
-| ↑ ↓ / `k` `j` | move the selection |
-| `Enter` | attach to the selected task |
-| `Space` | peek at the selected task |
-| `n` | new command in the invocation directory |
-| `@` | new command in a directory you pick (with completion) |
-| `q` | disconnect; leave the daemon and tasks running |
-| `Q` | quit; kill the tasks and stop the daemon |
+The dashboard shows two short key hints; `?` opens an expanded key reference:
+
+```text
+  ❯ n run · @ dir · / find · s sort
+  ↑↓ select · enter attach · space peek · ? controls
+```
 
 ### Attached
 
