@@ -280,8 +280,8 @@ pub fn load_in(dir: &Path, name: &str) -> io::Result<SessionConfig> {
     from_json(&fs::read_to_string(file)?).map(|(_, cfg)| cfg)
 }
 
-/// Return sorted recipe names under `dir`. Wrapped files use their stored name;
-/// flat files use the filename stem.
+/// Return recipe names under `dir`, collated case-insensitively. Wrapped files
+/// use their stored name; flat files use the filename stem.
 pub fn list_in(dir: &Path) -> Vec<String> {
     let mut names = Vec::new();
     if let Ok(entries) = fs::read_dir(dir) {
@@ -298,7 +298,7 @@ pub fn list_in(dir: &Path) -> Vec<String> {
             }
         }
     }
-    names.sort();
+    names.sort_by_cached_key(|n| crate::format::collation_key(n));
     names
 }
 
@@ -496,6 +496,22 @@ mod tests {
         save_in(&dir, "work", &cfg).unwrap();
         assert_eq!(load_in(&dir, "work").unwrap(), cfg);
         assert_eq!(list_in(&dir), vec!["work".to_string()]);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Saved session names use case-insensitive collation.
+    #[test]
+    fn list_in_collates_case_insensitively() {
+        let dir = temp("session_list_collate");
+        let mut cfg = SessionConfig::new();
+        cfg.insert("/tmp".into(), vec![e("top")]);
+        for name in ["Zed", "apple", "Beta"] {
+            save_in(&dir, name, &cfg).unwrap();
+        }
+        assert_eq!(
+            list_in(&dir),
+            vec!["apple".to_string(), "Beta".to_string(), "Zed".to_string()]
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 

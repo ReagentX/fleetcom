@@ -125,6 +125,54 @@ fn dir_mode_groups_by_cwd() {
     assert_eq!(s[1].0, "/tmp");
 }
 
+/// Custom-group labels sort case-insensitively without merging case-distinct
+/// groups.
+#[test]
+fn custom_sections_collate_case_insensitively() {
+    let mut app = App::new_local(30, 100);
+    let inv = app.invocation_dir.clone();
+    app.spawn_grouped("sleep 5", inv.clone(), "zebra"); // id 1
+    app.spawn_grouped("sleep 5", inv.clone(), "API"); // id 2
+    app.spawn_grouped("sleep 5", inv.clone(), "Review"); // id 3
+    app.spawn_grouped("sleep 5", inv, "api"); // id 4
+    app.pump();
+    app.group_mode = GroupMode::Custom;
+
+    assert_eq!(
+        app.section_ids(),
+        vec![
+            ("API".to_string(), vec![2]),
+            ("api".to_string(), vec![4]),
+            ("Review".to_string(), vec![3]),
+            ("zebra".to_string(), vec![1]),
+        ],
+        "folded order, with API and api adjacent and still two sections"
+    );
+}
+
+/// Directory-section labels use case-insensitive collation.
+#[test]
+fn dir_sections_collate_case_insensitively() {
+    let mut app = App::new_local(30, 100);
+    let base = temp("app_dir_collate");
+    let (upper, lower) = (base.join("Zed"), base.join("apple"));
+    std::fs::create_dir_all(&upper).unwrap();
+    std::fs::create_dir_all(&lower).unwrap();
+    app.spawn_in("sleep 5", upper.clone()); // id 1
+    app.spawn_in("sleep 5", lower.clone()); // id 2
+    app.pump();
+    app.group_mode = GroupMode::Dir;
+
+    let (z, a) = (app.dir_label(&upper), app.dir_label(&lower));
+    assert!(z < a, "byte order must put Zed first for this test to bite");
+    assert_eq!(
+        app.section_ids(),
+        vec![(a, vec![2]), (z, vec![1])],
+        "apple before Zed once the label folds"
+    );
+    let _ = std::fs::remove_dir_all(&base);
+}
+
 /// `s` cycles through all grouping modes.
 #[test]
 fn group_mode_cycles_state_dir_custom() {
@@ -376,10 +424,9 @@ fn selection_follows_task_across_parked_rebucket() {
     assert_eq!(app.views[app.selected_task().unwrap()].id, 1);
 }
 
-/// `bucket` doubles as the within-group tiebreak, so a parked task sinks
-/// below a running one inside a Custom group too, not only in State mode.
+/// Idle state does not affect row order within a custom group.
 #[test]
-fn custom_mode_parked_sinks_within_group() {
+fn custom_mode_parked_task_holds_its_row() {
     let mut app = App::new_local(30, 100);
     let inv = app.invocation_dir.clone();
     app.spawn_grouped("sleep 5", inv.clone(), "alpha"); // id 1
@@ -392,9 +439,178 @@ fn custom_mode_parked_sinks_within_group() {
     app.views[i].parked = true;
     assert_eq!(
         app.section_ids(),
-        vec![("alpha".to_string(), vec![2, 1])],
-        "parked id 1 sinks below running id 2 within alpha"
+        vec![("alpha".to_string(), vec![1, 2])],
+        "parked id 1 keeps its row above id 2 within alpha"
     );
+}
+
+/// Idle state does not affect row order within a directory section.
+#[test]
+fn dir_mode_parked_task_holds_its_row() {
+    let mut app = App::new_local(30, 100);
+    let inv = app.invocation_dir.clone();
+    app.spawn_in("sleep 5", inv.clone()); // id 1
+    app.spawn_in("sleep 5", inv); // id 2
+    app.pump();
+    app.group_mode = GroupMode::Dir;
+    let label = app.invocation_label.clone();
+    assert_eq!(app.section_ids(), vec![(label.clone(), vec![1, 2])]);
+
+    let i = app.views.iter().position(|v| v.id == 1).unwrap();
+    app.views[i].parked = true;
+    assert_eq!(
+        app.section_ids(),
+        vec![(label, vec![1, 2])],
+        "parked id 1 keeps its row above id 2 within its directory"
+    );
+}
+
+/// Entering and leaving idle state preserves row order.
+#[test]
+fn parked_round_trip_leaves_row_order_identical() {
+    let mut app = App::new_local(30, 100);
+    let inv = app.invocation_dir.clone();
+    app.spawn_grouped("sleep 5", inv.clone(), "alpha"); // id 1
+    app.spawn_grouped("sleep 5", inv.clone(), "alpha"); // id 2
+    app.spawn_grouped("sleep 5", inv, "alpha"); // id 3
+    app.pump();
+    app.group_mode = GroupMode::Custom;
+    let want = vec![("alpha".to_string(), vec![1, 2, 3])];
+    assert_eq!(app.section_ids(), want);
+
+    let i = app.views.iter().position(|v| v.id == 2).unwrap();
+    app.views[i].parked = true;
+    assert_eq!(app.section_ids(), want, "quiet does not move id 2");
+
+    app.views[i].parked = false;
+    assert_eq!(app.section_ids(), want, "waking does not move id 2 back");
+}
+
+/// Completed tasks sort after live tasks within a custom group.
+#[test]
+fn custom_mode_finished_sinks_within_group() {
+    let mut app = App::new_local(30, 100);
+    let inv = app.invocation_dir.clone();
+    app.spawn_grouped("true", inv.clone(), "alpha"); // id 1: exits ~immediately
+    app.spawn_grouped("sleep 30", inv, "alpha"); // id 2: stays live
+    wait_until(Duration::from_secs(5), || {
+        app.pump();
+        app.views
+            .iter()
+            .any(|v| v.id == 1 && matches!(v.lifecycle, Lifecycle::Ok | Lifecycle::Failed))
+    });
+    app.group_mode = GroupMode::Custom;
+    assert_eq!(
+        app.section_ids(),
+        vec![("alpha".to_string(), vec![2, 1])],
+        "finished id 1 sinks below live id 2 within alpha"
+    );
+}
+
+/// Completed tasks sort after live tasks within a directory section.
+#[test]
+fn dir_mode_finished_sinks_within_section() {
+    let mut app = App::new_local(30, 100);
+    let inv = app.invocation_dir.clone();
+    app.spawn_in("true", inv.clone()); // id 1: exits ~immediately
+    app.spawn_in("sleep 30", inv); // id 2: stays live
+    wait_until(Duration::from_secs(5), || {
+        app.pump();
+        app.views
+            .iter()
+            .any(|v| v.id == 1 && matches!(v.lifecycle, Lifecycle::Ok | Lifecycle::Failed))
+    });
+    app.group_mode = GroupMode::Dir;
+    assert_eq!(
+        app.section_ids(),
+        vec![(app.invocation_label.clone(), vec![2, 1])],
+        "finished id 1 sinks below live id 2 within its directory"
+    );
+}
+
+/// Tagged tasks sort first within a custom group, including while idle.
+#[test]
+fn custom_mode_tagged_task_floats_and_holds_while_parked() {
+    let mut app = App::new_local(30, 100);
+    let inv = app.invocation_dir.clone();
+    app.spawn_grouped("sleep 5", inv.clone(), "alpha"); // id 1
+    app.spawn_grouped("sleep 5", inv, "alpha"); // id 2: tagged
+    app.pump();
+    app.transport.send(Command::Tag { id: 2, on: true });
+    app.pump();
+    app.group_mode = GroupMode::Custom;
+    assert_eq!(app.section_ids(), vec![("alpha".to_string(), vec![2, 1])]);
+
+    let i = app.views.iter().position(|v| v.id == 2).unwrap();
+    app.views[i].parked = true;
+    assert_eq!(
+        app.section_ids(),
+        vec![("alpha".to_string(), vec![2, 1])],
+        "tagged id 2 stays at the top of alpha while parked"
+    );
+}
+
+/// State mode orders In use, Running, Idle, and Completed sections, with rows
+/// ordered by directory then task ID.
+#[test]
+fn state_mode_ordering_survives_the_row_key_split() {
+    let mut app = App::new_local(30, 100);
+    let base = temp("app_state_order");
+    // Mixed-case paths make the directory tiebreak observable.
+    let (dir_a, dir_b) = (base.join("apple"), base.join("Zed"));
+    std::fs::create_dir_all(&dir_a).unwrap();
+    std::fs::create_dir_all(&dir_b).unwrap();
+
+    app.spawn_in("sleep 30", dir_b.clone()); // id 1: running, dir b
+    app.spawn_in("sleep 30", dir_a.clone()); // id 2: running, dir a
+    app.spawn_in("sleep 30", dir_b.clone()); // id 3: parked -> Idle, dir b
+    app.spawn_in("sleep 30", dir_a.clone()); // id 4: parked -> Idle, dir a
+    app.spawn_in("sleep 30", dir_b.clone()); // id 5: tagged, dir b
+    app.spawn_in("sleep 30", dir_a.clone()); // id 6: tagged + parked, dir a
+    app.spawn_in("true", dir_b.clone()); // id 7: finished, dir b
+    app.spawn_in("true", dir_a.clone()); // id 8: finished, dir a
+    wait_until(Duration::from_secs(5), || {
+        app.pump();
+        [7u64, 8].iter().all(|id| {
+            app.views
+                .iter()
+                .any(|v| v.id == *id && matches!(v.lifecycle, Lifecycle::Ok | Lifecycle::Failed))
+        })
+    });
+    for id in [5u64, 6] {
+        app.transport.send(Command::Tag { id, on: true });
+    }
+    app.pump();
+
+    // Override the time-dependent idle state after the final snapshot.
+    for (id, parked) in [
+        (1u64, false),
+        (2, false),
+        (3, true),
+        (4, true),
+        (5, false),
+        (6, true),
+    ] {
+        let i = app.views.iter().position(|v| v.id == id).unwrap();
+        app.views[i].parked = parked;
+    }
+
+    let (a, b) = (app.dir_label(&dir_a), app.dir_label(&dir_b));
+    assert!(
+        b < a,
+        "byte order must put dir b first, or this test cannot see the collation"
+    );
+    assert_eq!(
+        app.section_ids(),
+        vec![
+            ("In use".to_string(), vec![6, 5]),
+            ("Running".to_string(), vec![2, 1]),
+            ("Idle".to_string(), vec![4, 3]),
+            ("Completed".to_string(), vec![8, 7]),
+        ],
+        "four sections in state order; within each, dir a before dir b, then id"
+    );
+    let _ = std::fs::remove_dir_all(&base);
 }
 
 /// `r` sends `Restart` only for a finished selection. On a running task
@@ -782,6 +998,25 @@ fn picker_puts_current_dir_first_and_selected() {
     assert_eq!(app.dir_sel, 0, "current dir selected by default");
     assert_eq!(app.dir_candidates[0].kind, DirKind::Use);
     assert_eq!(app.dir_candidates[0].path, app.invocation_dir);
+}
+
+/// Subdirectory rows use the same case-insensitive order as their filter.
+#[test]
+fn list_dirs_collates_case_insensitively() {
+    let base = temp("app_list_dirs_collate");
+    for name in ["Zed", "apple", "Beta", "cider"] {
+        std::fs::create_dir_all(base.join(name)).unwrap();
+    }
+    // Exclude files and hidden directories.
+    std::fs::write(base.join("Alpha.txt"), b"x").unwrap();
+    std::fs::create_dir_all(base.join(".hidden")).unwrap();
+
+    assert_eq!(
+        list_dirs(&base, ""),
+        vec!["apple", "Beta", "cider", "Zed"],
+        "byte order would read Beta, Zed, apple, cider"
+    );
+    let _ = std::fs::remove_dir_all(&base);
 }
 
 /// Focus is by id, so it points at the same task even after the list shifts
@@ -1370,8 +1605,8 @@ fn group_picker_opens_on_g_only_with_a_selection() {
     assert_eq!(app.group_target, Some(1));
 }
 
-/// Picker candidates are distinct byte-sorted groups after Unassigned, with
-/// the target's assignment marked "(current)".
+/// Group candidates are distinct, case-insensitively sorted, and follow
+/// Unassigned. The target's group is marked "(current)".
 #[test]
 fn group_candidates_are_distinct_sorted_and_marked() {
     let mut app = App::new_local(30, 100);
@@ -1403,6 +1638,39 @@ fn group_candidates_are_distinct_sorted_and_marked() {
     app.selected_id = Some(4);
     app.on_key_dashboard(key(KeyCode::Char('g')));
     assert_eq!(app.group_candidates[0].label, "Unassigned (current)");
+}
+
+/// Group candidates sort case-insensitively while preserving case-distinct
+/// names and removing exact duplicates.
+#[test]
+fn group_candidates_collate_case_insensitively() {
+    let mut app = App::new_local(30, 100);
+    let inv = app.invocation_dir.clone();
+    app.spawn_grouped("sleep 5", inv.clone(), "zebra"); // id 1
+    app.spawn_grouped("sleep 5", inv.clone(), "API"); // id 2
+    app.spawn_grouped("sleep 5", inv.clone(), "Review"); // id 3
+    app.spawn_grouped("sleep 5", inv.clone(), "api"); // id 4
+    app.spawn_grouped("sleep 5", inv, "api"); // id 5, exact duplicate
+    app.pump();
+
+    app.selected_id = Some(1);
+    app.on_key_dashboard(key(KeyCode::Char('g')));
+    let groups: Vec<Option<&str>> = app
+        .group_candidates
+        .iter()
+        .map(|c| c.group.as_deref())
+        .collect();
+    assert_eq!(
+        groups,
+        vec![
+            None,
+            Some("API"),
+            Some("api"),
+            Some("Review"),
+            Some("zebra")
+        ],
+        "Unassigned pinned first; byte order would read API, Review, api, zebra"
+    );
 }
 
 /// Typing applies a case-insensitive prefix filter and selects the first
@@ -1512,6 +1780,279 @@ fn group_esc_cancels_without_sending() {
     app.pump();
     let v = app.views.iter().find(|v| v.id == 1).unwrap();
     assert_eq!(v.group.as_deref(), Some("alpha"), "Esc must send nothing");
+}
+
+// --- `/` find palette ---------------------------------------------------
+
+/// Candidate IDs for the current palette state.
+fn find_ids(app: &App) -> Vec<u64> {
+    app.find_candidates.clone()
+}
+
+/// Type `text` into the open palette one key at a time.
+fn find_type(app: &mut App, text: &str) {
+    for c in text.chars() {
+        app.on_key_find(key(KeyCode::Char(c)));
+    }
+}
+
+/// The find palette requires at least one task but no current selection.
+#[test]
+fn find_palette_opens_on_slash_only_with_tasks() {
+    let mut app = App::new_local(30, 100);
+    app.on_key_dashboard(key(KeyCode::Char('/')));
+    assert!(app.mode == Mode::Dashboard, "empty fleet: / must no-op");
+    assert!(app.find_candidates.is_empty());
+
+    let inv = app.invocation_dir.clone();
+    app.spawn_in("sleep 5", inv);
+    app.pump();
+    assert_eq!(app.selected_id, None, "nothing selected yet");
+    app.on_key_dashboard(key(KeyCode::Char('/')));
+    assert!(app.mode == Mode::Find);
+    assert_eq!(find_ids(&app), vec![1]);
+}
+
+/// Find candidates follow dashboard order rather than task-ID order.
+#[test]
+fn find_candidates_follow_display_order() {
+    let mut app = App::new_local(30, 100);
+    let inv = app.invocation_dir.clone();
+    app.spawn_in("sleep 5", inv.clone()); // id 1
+    app.spawn_in("sleep 5", inv.clone()); // id 2
+    app.spawn_in("sleep 5", inv); // id 3
+    app.transport.send(Command::Tag { id: 3, on: true });
+    app.pump();
+    let order: Vec<u64> = app
+        .display_order()
+        .into_iter()
+        .map(|i| app.views[i].id)
+        .collect();
+    assert_eq!(order, vec![3, 1, 2], "tag floats id 3 first");
+
+    app.on_key_dashboard(key(KeyCode::Char('/')));
+    assert_eq!(find_ids(&app), order);
+    assert_eq!(app.find_sel, 0, "the first match is highlighted");
+}
+
+/// Empty input lists the whole fleet.
+#[test]
+fn find_empty_input_lists_every_task() {
+    let mut app = App::new_local(30, 100);
+    let inv = app.invocation_dir.clone();
+    app.spawn_in("sleep 5", inv.clone()); // id 1
+    app.spawn_grouped("sleep 5", inv, "alpha"); // id 2
+    app.pump();
+    app.on_key_dashboard(key(KeyCode::Char('/')));
+    assert_eq!(find_ids(&app), vec![1, 2]);
+
+    // Typing then deleting returns the full fleet.
+    find_type(&mut app, "alpha");
+    assert_eq!(find_ids(&app), vec![2]);
+    for _ in 0.."alpha".len() {
+        app.on_key_find(key(KeyCode::Backspace));
+    }
+    assert_eq!(find_ids(&app), vec![1, 2]);
+}
+
+/// Matching ignores case and hits substrings anywhere in the field, not just
+/// its prefix.
+#[test]
+fn find_matches_case_insensitive_substrings() {
+    let mut app = App::new_local(30, 100);
+    let inv = app.invocation_dir.clone();
+    app.spawn_in("sleep 5", inv.clone()); // id 1
+    app.spawn_in("true", inv); // id 2
+    app.pump();
+
+    app.on_key_dashboard(key(KeyCode::Char('/')));
+    find_type(&mut app, "SLEEP");
+    assert_eq!(find_ids(&app), vec![1], "case-insensitive");
+
+    app.on_key_find(key(KeyCode::Esc));
+    app.on_key_dashboard(key(KeyCode::Char('/')));
+    find_type(&mut app, "eep");
+    assert_eq!(find_ids(&app), vec![1], "matches mid-command, not a prefix");
+
+    app.on_key_find(key(KeyCode::Esc));
+    app.on_key_dashboard(key(KeyCode::Char('/')));
+    find_type(&mut app, "ru");
+    assert_eq!(find_ids(&app), vec![2], "matches mid-command of \"true\"");
+}
+
+/// A named task matches both its display name and command.
+#[test]
+fn find_matches_a_named_task_on_both_fields() {
+    let mut app = App::new_local(30, 100);
+    let inv = app.invocation_dir.clone();
+    app.spawn_in("sleep 5", inv.clone()); // id 1
+    app.spawn_in("true", inv); // id 2
+    app.transport.send(Command::SetName {
+        id: 1,
+        name: Some("api tests".to_string()),
+    });
+    app.pump();
+
+    app.on_key_dashboard(key(KeyCode::Char('/')));
+    find_type(&mut app, "api");
+    assert_eq!(find_ids(&app), vec![1], "matches the name");
+
+    app.on_key_find(key(KeyCode::Esc));
+    app.on_key_dashboard(key(KeyCode::Char('/')));
+    find_type(&mut app, "sleep");
+    assert_eq!(find_ids(&app), vec![1], "still matches the command");
+}
+
+/// Group names are a match field.
+#[test]
+fn find_matches_group_names() {
+    let mut app = App::new_local(30, 100);
+    let inv = app.invocation_dir.clone();
+    app.spawn_grouped("sleep 5", inv.clone(), "backend"); // id 1
+    app.spawn_in("sleep 5", inv); // id 2, no group
+    app.pump();
+
+    app.on_key_dashboard(key(KeyCode::Char('/')));
+    find_type(&mut app, "backend");
+    assert_eq!(find_ids(&app), vec![1]);
+}
+
+/// Find does not match working-directory names.
+#[test]
+fn find_does_not_match_the_directory() {
+    let mut app = App::new_local(30, 100);
+    let dir = temp("findpalettedir");
+    let name = dir.file_name().unwrap().to_string_lossy().into_owned();
+    app.spawn_in("sleep 5", dir); // id 1
+    app.pump();
+    assert!(name.contains("findpalettedir"), "scratch dir name: {name}");
+
+    app.on_key_dashboard(key(KeyCode::Char('/')));
+    find_type(&mut app, "findpalettedir");
+    assert!(
+        find_ids(&app).is_empty(),
+        "the directory must not match: {:?}",
+        find_ids(&app)
+    );
+
+    // The command remains searchable.
+    app.on_key_find(key(KeyCode::Esc));
+    app.on_key_dashboard(key(KeyCode::Char('/')));
+    find_type(&mut app, "sleep");
+    assert_eq!(find_ids(&app), vec![1]);
+}
+
+/// Enter jumps the dashboard selection to the highlighted task and closes.
+#[test]
+fn find_enter_jumps_the_selection() {
+    let mut app = App::new_local(30, 100);
+    let inv = app.invocation_dir.clone();
+    app.spawn_in("sleep 5", inv.clone()); // id 1
+    app.spawn_in("sleep 5", inv.clone()); // id 2
+    app.spawn_in("sleep 5", inv); // id 3
+    app.pump();
+    app.resolve_selection();
+    assert_eq!(app.selected_id, Some(1));
+
+    app.on_key_dashboard(key(KeyCode::Char('/')));
+    app.on_key_find(key(KeyCode::Down));
+    app.on_key_find(key(KeyCode::Down));
+    assert_eq!(app.find_sel, 2);
+    app.on_key_find(key(KeyCode::Enter));
+    assert!(
+        app.mode == Mode::Dashboard,
+        "Enter jumps, it never attaches"
+    );
+    assert_eq!(app.focused_id, None);
+    assert_eq!(app.selected_id, Some(3));
+    assert!(app.find_input.is_empty() && app.find_candidates.is_empty());
+}
+
+/// Esc closes the palette and leaves the selection where it was.
+#[test]
+fn find_esc_leaves_the_selection_alone() {
+    let mut app = App::new_local(30, 100);
+    let inv = app.invocation_dir.clone();
+    app.spawn_in("sleep 5", inv.clone()); // id 1
+    app.spawn_in("true", inv); // id 2
+    app.pump();
+    app.resolve_selection();
+    assert_eq!(app.selected_id, Some(1));
+
+    app.on_key_dashboard(key(KeyCode::Char('/')));
+    find_type(&mut app, "true");
+    assert_eq!(find_ids(&app), vec![2]);
+    app.on_key_find(key(KeyCode::Esc));
+    assert!(app.mode == Mode::Dashboard);
+    assert_eq!(app.selected_id, Some(1), "Esc must not move the selection");
+    assert!(app.find_input.is_empty() && app.find_candidates.is_empty());
+    assert_eq!(app.find_sel, 0);
+}
+
+/// Enter with no candidates keeps the palette open and preserves selection.
+#[test]
+fn find_enter_without_candidates_keeps_the_panel_open() {
+    let mut app = App::new_local(30, 100);
+    let inv = app.invocation_dir.clone();
+    app.spawn_in("sleep 5", inv);
+    app.pump();
+    app.resolve_selection();
+
+    app.on_key_dashboard(key(KeyCode::Char('/')));
+    find_type(&mut app, "zzz");
+    assert!(find_ids(&app).is_empty());
+    app.on_key_find(key(KeyCode::Enter));
+    assert!(app.mode == Mode::Find, "no match: Enter must not close");
+    assert_eq!(app.selected_id, Some(1), "selection is untouched");
+
+    // Editing the query refreshes candidates.
+    for _ in 0.."zzz".len() {
+        app.on_key_find(key(KeyCode::Backspace));
+    }
+    find_type(&mut app, "sleep");
+    assert_eq!(find_ids(&app), vec![1]);
+}
+
+/// Find rows include status, label, and section; empty results show a message.
+#[test]
+fn find_panel_rows_name_the_task_and_its_section() {
+    let mut app = App::new_local(30, 100);
+    let inv = app.invocation_dir.clone();
+    app.spawn_in("sleep 5", inv);
+    app.transport.send(Command::SetName {
+        id: 1,
+        name: Some("api tests".to_string()),
+    });
+    app.pump();
+    app.on_key_dashboard(key(KeyCode::Char('/')));
+
+    let mut out = Vec::new();
+    crate::ui::render(&mut out, &mut app).unwrap();
+    let frame = String::from_utf8_lossy(&out).into_owned();
+    assert!(frame.contains("✻ api tests · Running"), "{frame:?}");
+    assert!(frame.contains("enter jump · ↑↓ pick · esc"), "{frame:?}");
+
+    find_type(&mut app, "zzz");
+    app.last_frame.clear();
+    let mut out = Vec::new();
+    crate::ui::render(&mut out, &mut app).unwrap();
+    let frame = String::from_utf8_lossy(&out).into_owned();
+    assert!(frame.contains("(no matching tasks)"), "{frame:?}");
+}
+
+/// Pasting into the find field refreshes its candidates.
+#[test]
+fn find_paste_filters_the_candidates() {
+    let mut app = App::new_local(30, 100);
+    let inv = app.invocation_dir.clone();
+    app.spawn_in("sleep 5", inv.clone()); // id 1
+    app.spawn_in("true", inv); // id 2
+    app.pump();
+
+    app.on_key_dashboard(key(KeyCode::Char('/')));
+    app.on_paste("true");
+    assert_eq!(app.find_input.as_str(), "true");
+    assert_eq!(find_ids(&app), vec![2]);
 }
 
 // --- `R` rename prompt --------------------------------------------------

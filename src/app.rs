@@ -26,6 +26,7 @@ use crossterm::{
 
 use crate::{
     editbuf::EditBuffer,
+    format::collation_key,
     path,
     protocol::{
         ClipboardKind, Command, Event, Key, Lifecycle, Mods, MouseBtn, MouseKind, RecoveryEntry,
@@ -85,6 +86,8 @@ pub enum Mode {
     PickDir,
     /// Live group picker (the `g` flow) that reassigns the selected task's group.
     PickGroup,
+    /// Find palette for selecting a task from filtered results.
+    Find,
     /// Typing a name to save the current tasks as a session.
     SaveSession,
     /// Editing the display name of the task selected when the prompt opened.
@@ -217,6 +220,12 @@ pub struct App {
     pub group_sel: usize,
     /// Id of the task being reassigned by the open group picker.
     group_target: Option<u64>,
+    // `/` find-palette state (only meaningful in `Mode::Find`).
+    pub find_input: EditBuffer,
+    /// Matching task IDs in display order. IDs remain stable if a daemon
+    /// snapshot reorders `views` while the palette is open.
+    pub find_candidates: Vec<u64>,
+    pub find_sel: usize,
     /// Task ID captured when the rename prompt opens.
     rename_target: Option<u64>,
     // Load-session picker state.
@@ -290,18 +299,28 @@ fn step_down(sel: usize, len: usize) -> usize {
     (sel + 1).min(len.saturating_sub(1))
 }
 
-/// Dashboard grouping bucket: 0 tagged, 1 live, 2 parked live, 3 completed.
-/// Tagged wins over everything; completed is classified by `lifecycle`, never
-/// by trusting `parked == false`, so a core that ever shipped both signals
-/// still lands finished tasks in Completed. Placement follows `parked`, the
-/// core's debounced quiet signal: it shares the 10 s window with
-/// `Lifecycle::Idle`, so the idle glyph and the row's section flip together.
-fn bucket(v: &TaskView) -> u8 {
+/// State-section order: In use, Running, Idle, then Completed.
+/// Tags take precedence, completion follows `lifecycle`, and live tasks use
+/// `parked` to distinguish Running from Idle.
+fn section_rank(v: &TaskView) -> u8 {
     if v.tagged {
         0
     } else if matches!(v.lifecycle, Lifecycle::Ok | Lifecycle::Failed) {
         3
     } else if v.parked {
+        2
+    } else {
+        1
+    }
+}
+
+/// Within-section row order: tagged, live, then finished.
+/// `parked` does not affect row order, so transitions between active and idle
+/// preserve a task's position outside state grouping.
+fn row_rank(v: &TaskView) -> u8 {
+    if v.tagged {
+        0
+    } else if matches!(v.lifecycle, Lifecycle::Ok | Lifecycle::Failed) {
         2
     } else {
         1
@@ -410,6 +429,9 @@ impl App {
             group_candidates: Vec::new(),
             group_sel: 0,
             group_target: None,
+            find_input: EditBuffer::default(),
+            find_candidates: Vec::new(),
+            find_sel: 0,
             rename_target: None,
             session_names: Vec::new(),
             session_sel: 0,
@@ -496,7 +518,7 @@ impl App {
             .map(|(i, v)| {
                 let (rank, label) = match self.group_mode {
                     GroupMode::State => {
-                        let b = bucket(v);
+                        let b = section_rank(v);
                         let l = match b {
                             0 => "In use",
                             1 => "Running",
@@ -507,7 +529,7 @@ impl App {
                     }
                     GroupMode::Dir => {
                         let label = self.dir_label(&v.cwd);
-                        // Invocation dir sorts first; everything else alphabetical.
+                        // Keep the invocation directory first.
                         let rank = if label == self.invocation_label { 0 } else { 1 };
                         (rank, label)
                     }
@@ -517,13 +539,23 @@ impl App {
                         None => (1, "Unassigned".to_string()),
                     },
                 };
-                // Within each section, sort by tag/lifecycle bucket, directory,
-                // then task id.
-                (rank, label, bucket(v), self.dir_label(&v.cwd), v.id, i)
+                // Within each section, sort by row rank, directory, then task ID.
+                (rank, label, row_rank(v), self.dir_label(&v.cwd), v.id, i)
             })
             .collect();
-        labeled.sort();
+        // Apply the same case-insensitive collation to section and directory labels.
+        labeled.sort_by_cached_key(|(rank, label, row, dir, id, i)| {
+            (
+                *rank,
+                collation_key(label),
+                *row,
+                collation_key(dir),
+                *id,
+                *i,
+            )
+        });
 
+        // Case-distinct labels sort together but remain separate sections.
         let mut out: Vec<(String, Vec<usize>)> = Vec::new();
         for (_, label, _, _, _, i) in labeled {
             match out.last_mut() {
@@ -983,7 +1015,8 @@ impl App {
             .filter_map(|v| v.group.as_ref())
             .filter(|g| g.to_lowercase().starts_with(&needle))
             .collect();
-        names.sort();
+        names.sort_by_cached_key(|g| collation_key(g.as_str()));
+        // The exact-name tiebreak keeps duplicates adjacent for `dedup`.
         names.dedup();
         for name in names {
             cands.push(GroupCand {
@@ -1011,6 +1044,38 @@ impl App {
         self.group_input.clear();
         self.group_candidates.clear();
         self.group_target = None;
+        self.mode = Mode::Dashboard;
+    }
+
+    // --- `/` find palette -------------------------------------------------------
+
+    /// Open the `/` palette with every task listed.
+    fn open_find_palette(&mut self) {
+        if self.views.is_empty() {
+            return;
+        }
+        self.find_input.clear();
+        self.refresh_find_candidates();
+        self.mode = Mode::Find;
+    }
+
+    /// Rebuild matches in dashboard order and select the first result.
+    fn refresh_find_candidates(&mut self) {
+        let needle = self.find_input.to_lowercase();
+        self.find_candidates = self
+            .display_order()
+            .into_iter()
+            .filter(|&i| task_matches(&self.views[i], &needle))
+            .map(|i| self.views[i].id)
+            .collect();
+        self.find_sel = 0;
+    }
+
+    /// Clear the palette state and return to the dashboard.
+    fn close_find_palette(&mut self) {
+        self.find_input.clear();
+        self.find_candidates.clear();
+        self.find_sel = 0;
         self.mode = Mode::Dashboard;
     }
 
@@ -1052,6 +1117,7 @@ impl App {
             Mode::Spawn => self.on_key_spawn(k),
             Mode::PickDir => self.on_key_pickdir(k),
             Mode::PickGroup => self.on_key_pickgroup(k),
+            Mode::Find => self.on_key_find(k),
             Mode::SaveSession => self.on_key_savesession(k),
             Mode::Rename => self.on_key_rename(k),
             Mode::LoadSession => self.on_key_loadsession(k),
@@ -1100,6 +1166,7 @@ impl App {
                 }
             }
             KeyCode::Char('g') => self.open_group_picker(),
+            KeyCode::Char('/') => self.open_find_palette(),
             // Uppercase R renames; lowercase r reruns.
             KeyCode::Char('R') => self.open_rename_prompt(),
             KeyCode::Char('n') => {
@@ -1291,6 +1358,28 @@ impl App {
         }
     }
 
+    fn on_key_find(&mut self, k: KeyEvent) {
+        match k.code {
+            KeyCode::Esc => self.close_find_palette(),
+            KeyCode::Up => self.find_sel = self.find_sel.saturating_sub(1),
+            KeyCode::Down => self.find_sel = step_down(self.find_sel, self.find_candidates.len()),
+            KeyCode::Enter => {
+                // Select the highlighted task without attaching. An empty
+                // result set leaves the palette open.
+                if let Some(&id) = self.find_candidates.get(self.find_sel) {
+                    self.selected_id = Some(id);
+                    self.close_find_palette();
+                }
+            }
+            // Caret motion does not affect the matches.
+            _ => {
+                if on_key_edit(&mut self.find_input, k) == Some(true) {
+                    self.refresh_find_candidates();
+                }
+            }
+        }
+    }
+
     fn on_key_spawn(&mut self, k: KeyEvent) {
         self.on_key_textinput(k, |app, cmd| {
             if !cmd.is_empty() {
@@ -1406,6 +1495,10 @@ impl App {
             Mode::PickGroup => {
                 paste_into(&mut self.group_input, s);
                 self.refresh_group_candidates();
+            }
+            Mode::Find => {
+                paste_into(&mut self.find_input, s);
+                self.refresh_find_candidates();
             }
             _ => {}
         }
@@ -1722,6 +1815,20 @@ fn on_key_edit(buf: &mut EditBuffer, k: KeyEvent) -> Option<bool> {
     }
 }
 
+/// Match a lowercased query against a task's name, command, or group.
+/// Matching is substring-based; an empty query matches every task. The working
+/// directory is not a match field.
+fn task_matches(v: &TaskView, needle: &str) -> bool {
+    [
+        v.name.as_deref(),
+        Some(v.command.as_str()),
+        v.group.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .any(|field| field.to_lowercase().contains(needle))
+}
+
 /// Insert pasted text at the caret after removing control characters.
 fn paste_into(buf: &mut EditBuffer, s: &str) {
     for c in s.chars().filter(|c| !c.is_control()) {
@@ -1738,8 +1845,9 @@ fn split_input(input: &str) -> (&str, &str) {
     }
 }
 
-/// Subdirectories of `base` whose name prefix-matches `partial` (case-
-/// insensitive), sorted. Hidden entries appear only when `partial` starts `.`.
+/// Subdirectories of `base` whose names start with `partial`, ignoring case.
+/// Results use the same case-insensitive collation. Hidden entries appear only
+/// when `partial` starts with `.`.
 fn list_dirs(base: &Path, partial: &str) -> Vec<String> {
     let needle = partial.to_lowercase();
     let mut out: Vec<String> = Vec::new();
@@ -1758,7 +1866,8 @@ fn list_dirs(base: &Path, partial: &str) -> Vec<String> {
             }
         }
     }
-    out.sort();
+    // `read_dir` order is unspecified.
+    out.sort_by_cached_key(|n| collation_key(n));
     out
 }
 

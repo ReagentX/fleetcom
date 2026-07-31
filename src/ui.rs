@@ -43,6 +43,10 @@ pub fn render(out: &mut impl Write, app: &mut App) -> io::Result<bool> {
             render_dashboard(&mut buf, app)?;
             render_pickgroup(&mut buf, app)?;
         }
+        Mode::Find => {
+            render_dashboard(&mut buf, app)?;
+            render_find(&mut buf, app)?;
+        }
         Mode::LoadSession => {
             render_dashboard(&mut buf, app)?;
             render_session_picker(&mut buf, app)?;
@@ -201,7 +205,7 @@ fn render_dashboard(out: &mut impl Write, app: &App) -> io::Result<()> {
             None => dim(
                 out,
                 cmd_y,
-                "  ❯ n run · @ dir · s sort · w save · o load",
+                "  ❯ n run · @ dir · / find · s sort · w save · o load",
                 cols,
             )?,
         },
@@ -338,16 +342,21 @@ fn row_age(v: &TaskView) -> Duration {
     edge.unwrap_or(v.started_ago)
 }
 
-/// Split a task row into its leading, preview, and time cells so the preview
-/// can be styled independently. Each cell is padded to its display-column
-/// budget, and the budgets sum to `cols`.
-fn task_row_parts(v: &TaskView, cols: usize) -> (String, String, String) {
-    let glyph = match v.lifecycle {
+/// A task's lifecycle glyph, shared by the dashboard row and the `/` palette.
+fn status_glyph(v: &TaskView) -> &'static str {
+    match v.lifecycle {
         Lifecycle::Active => "✻",
         Lifecycle::Idle => "∙",
         Lifecycle::Ok => "✓",
         Lifecycle::Failed => "✗",
-    };
+    }
+}
+
+/// Split a task row into its leading, preview, and time cells so the preview
+/// can be styled independently. Each cell is padded to its display-column
+/// budget, and the budgets sum to `cols`.
+fn task_row_parts(v: &TaskView, cols: usize) -> (String, String, String) {
+    let glyph = status_glyph(v);
     let tag = if v.tagged { "◆" } else { " " };
     let time = rel_time(row_age(v));
     let title_w = 26.min(cols / 3);
@@ -605,6 +614,46 @@ fn render_pickgroup(out: &mut impl Write, app: &App) -> io::Result<()> {
             max_rows: 8,
             hint: format!("{action} · ↑↓ pick · esc"),
             empty: None,
+            cursor: Some(cx),
+        },
+    )
+}
+
+/// Render the `/` palette with matching tasks in dashboard order.
+fn render_find(out: &mut impl Write, app: &App) -> io::Result<()> {
+    let sections = app.sections();
+    let section_of = |id: u64| -> &str {
+        sections
+            .iter()
+            .find(|(_, idxs)| idxs.iter().any(|&i| app.views[i].id == id))
+            .map_or("", |(label, _)| label.as_str())
+    };
+    let labels: Vec<String> = app
+        .find_candidates
+        .iter()
+        .map(|&id| match app.views.iter().find(|v| v.id == id) {
+            Some(v) => format!(
+                "{} {} · {}",
+                status_glyph(v),
+                display_label(v),
+                section_of(id)
+            ),
+            // Preserve row alignment if a snapshot removed this task.
+            None => String::new(),
+        })
+        .collect();
+    let (line, cx) = caret_line("  / ", &app.find_input);
+    let cx = clamp_caret(cx, &line, app.cols as usize);
+    render_panel(
+        out,
+        app,
+        &Panel {
+            header: format!("  / {}   ", app.find_input.as_str()),
+            labels: &labels,
+            sel: app.find_sel,
+            max_rows: 8,
+            hint: "enter jump · ↑↓ pick · esc".to_string(),
+            empty: Some("    (no matching tasks)"),
             cursor: Some(cx),
         },
     )

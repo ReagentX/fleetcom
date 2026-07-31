@@ -75,6 +75,13 @@ pub fn pad(s: &str, width: usize) -> String {
     t
 }
 
+/// Sort key for human-readable names.
+/// The lowercase value provides case-insensitive collation; the exact value
+/// makes ordering deterministic and keeps case-distinct names separate.
+pub(crate) fn collation_key(name: &str) -> (String, String) {
+    (name.to_lowercase(), name.to_string())
+}
+
 /// Convert days since 1970-01-01 to a proleptic Gregorian date.
 pub(crate) fn civil_from_days(days: i64) -> (i64, u32, u32) {
     let z = days + 719_468;
@@ -147,6 +154,41 @@ mod tests {
         assert_eq!(p.width(), 8);
         // Combining mark: 1 column, so 2 spaces of padding.
         assert_eq!(pad("e\u{0301}", 3), "e\u{0301}  ");
+    }
+
+    #[test]
+    fn collation_key_folds_then_breaks_ties_on_exact_bytes() {
+        assert_eq!(collation_key("API"), ("api".to_string(), "API".to_string()));
+        // The lowercase component controls primary ordering.
+        assert!(collation_key("api") < collation_key("Zebra"));
+        // The exact component orders names with the same lowercase value.
+        assert!(collation_key("API") < collation_key("api"));
+        assert_ne!(collation_key("API"), collation_key("api"));
+        // `to_lowercase` handles Unicode characters.
+        assert_eq!(collation_key("ÉCOLE").0, "école");
+    }
+
+    #[test]
+    fn collation_is_deterministic_regardless_of_input_order() {
+        fn collate(mut v: Vec<&str>) -> Vec<&str> {
+            v.sort_by_cached_key(|s| collation_key(s));
+            v
+        }
+        let want = vec!["API", "api", "Apple", "banana", "Zebra"];
+        assert_eq!(
+            collate(vec!["Zebra", "api", "API", "banana", "Apple"]),
+            want
+        );
+        assert_eq!(
+            collate(vec!["API", "Apple", "banana", "api", "Zebra"]),
+            want
+        );
+        assert_eq!(collate(want.clone()), want, "already sorted is a fixpoint");
+
+        // Byte ordering produces a different order for mixed-case names.
+        let mut bytewise = vec!["Zebra", "api", "API", "banana", "Apple"];
+        bytewise.sort();
+        assert_eq!(bytewise, vec!["API", "Apple", "Zebra", "api", "banana"]);
     }
 
     #[test]
