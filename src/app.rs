@@ -141,9 +141,9 @@ pub enum SessionPage {
 /// What Enter does with a picker row.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum DirKind {
-    /// The current directory (row 0): Enter runs the command here.
+    /// The resolved path (row 0): Enter runs the command there.
     Use,
-    /// A recently-used dir: Enter runs the command there (one-press reuse).
+    /// A current task's directory: Enter runs there; Tab descends into it.
     Jump,
     /// A subdirectory: Enter and Tab descend into it.
     Into,
@@ -666,9 +666,9 @@ impl App {
         self.select_section_wrap(false);
     }
 
-    /// Select the next tagged task in display order, wrapping at the end.
-    /// Without a selection, select the first tagged task. Leave the selection
-    /// unchanged when no task is tagged.
+    /// Select the next tagged task in display order, wrapping as needed.
+    /// Start at the first tag when nothing is selected; preserve the selection
+    /// when no task is tagged.
     fn select_next_tagged(&mut self) {
         let order = self.display_order();
         if order.is_empty() {
@@ -1443,7 +1443,7 @@ impl App {
         }
     }
 
-    /// Return from the controls overlay on `?`, Esc, or `q`.
+    /// Close the controls overlay on `?`, Esc, or `q`.
     fn on_key_controls(&mut self, k: KeyEvent) {
         if is_controls_key(k) || matches!(k.code, KeyCode::Esc | KeyCode::Char('q')) {
             self.mode = Mode::Dashboard;
@@ -1821,7 +1821,7 @@ fn key_event_to_key(ev: KeyEvent) -> Option<(Key, Mods)> {
     Some((code, mods))
 }
 
-/// Match either accepted Shift-`/` event: `?`, or `/` with the Shift modifier.
+/// Recognize either Shift-`/` event: `?`, or `/` with the Shift modifier.
 /// An unmodified `/` remains available to the find palette.
 fn is_controls_key(k: KeyEvent) -> bool {
     match k.code {

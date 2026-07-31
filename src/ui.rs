@@ -210,7 +210,7 @@ fn render_dashboard(out: &mut impl Write, app: &App) -> io::Result<()> {
         },
     }
 
-    // Keep common actions visible; `?` opens the expanded key reference.
+    // Keep common actions visible and route the remaining bindings through `?`.
     dim(
         out,
         rows.saturating_sub(1),
@@ -465,8 +465,8 @@ fn preview_provenance(p: &Preview) -> String {
     s
 }
 
-/// One entry in the controls overlay. The grouped layout gives adjacent
-/// entries with the same `group` one heading.
+/// One controls-overlay entry. Adjacent entries with the same `group` share a
+/// heading in the grouped layout.
 struct Control {
     key: &'static str,
     desc: &'static str,
@@ -479,8 +479,8 @@ impl Control {
     }
 }
 
-/// Entries shown in the controls overlay. In the grouped layout, each group's
-/// first half fills the left column and its second half fills the right.
+/// Controls-overlay entries. Each group's first half fills the left column;
+/// the second half fills the right.
 const CONTROLS: [Control; 19] = [
     Control::new("↑↓ / kj", "move selection", "Navigate"),
     Control::new("Tab ⇧Tab", "jump section", "Navigate"),
@@ -503,8 +503,7 @@ const CONTROLS: [Control; 19] = [
     Control::new("Ctrl-\\", "background", "Attached"),
 ];
 
-/// Adjust the `q` label for foreground mode, where leaving the client also
-/// stops its in-process tasks.
+/// Label `q` as quit in foreground mode because it stops in-process tasks.
 fn control_desc(c: &Control, daemon_backed: bool) -> &'static str {
     match c.key {
         "q" if !daemon_backed => "quit",
@@ -525,7 +524,7 @@ fn control_groups() -> Vec<&'static [Control]> {
     groups
 }
 
-/// Body rows the grouped form needs: one header per group plus its entry rows.
+/// Rows required for group headings and their entries.
 fn grouped_rows() -> usize {
     control_groups()
         .iter()
@@ -533,19 +532,19 @@ fn grouped_rows() -> usize {
         .sum()
 }
 
-/// Body rows the flat form needs: the whole table in two columns.
+/// Rows required for the complete two-column table without headings.
 fn flat_rows() -> usize {
     CONTROLS.len().div_ceil(2)
 }
 
-/// Render the centered key reference. Limited height drops group headings
-/// before clipping entries.
+/// Render the centered key reference, dropping headings before entries when
+/// height is constrained.
 fn render_controls(out: &mut impl Write, app: &App) -> io::Result<()> {
     let cols = app.cols as usize;
     let rows = app.rows as usize;
 
-    // Size from the stored labels so foreground's shorter `q` description
-    // does not change the box width.
+    // Use stored descriptions so foreground's shorter `q` label does not resize
+    // the box.
     let key_w = CONTROLS.iter().map(|c| c.key.width()).max().unwrap_or(0);
     let desc_w = CONTROLS.iter().map(|c| c.desc.width()).max().unwrap_or(0);
     let cell_w = key_w + 2 + desc_w;
@@ -1229,8 +1228,7 @@ mod tests {
         assert_eq!(labels.len(), distinct, "a group must be one contiguous run");
     }
 
-    /// For the current table, the grouped form adds one heading row per group
-    /// to the same number of entry rows as the flat form.
+    /// The grouped form adds one heading row per group to the flat entry rows.
     #[test]
     fn control_forms_shrink_before_they_clip() {
         assert_eq!(flat_rows(), CONTROLS.len().div_ceil(2));

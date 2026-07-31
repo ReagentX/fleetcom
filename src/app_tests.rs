@@ -1620,8 +1620,7 @@ fn cycle_tagged_mutates_no_task_state() {
     for _ in 0..5 {
         app.on_key_dashboard(key(KeyCode::Char('M')));
     }
-    // Pump once so any command emitted by `M` updates task state before the
-    // comparison.
+    // Apply queued transport commands before comparing task state.
     app.pump();
 
     let after: Vec<_> = app
@@ -2508,7 +2507,6 @@ fn controls_overlay_ignores_dashboard_keys() {
     assert!(!app.views[0].tagged, "m must not reach the task");
     assert!(app.input.as_str().is_empty(), "n must not open the prompt");
 
-    // The same keys act once the overlay is closed.
     app.on_key_controls(key(KeyCode::Esc));
     app.on_key_dashboard(key(KeyCode::Char('m')));
     app.pump();
@@ -3857,16 +3855,13 @@ fn input_and_attached_echo_bypass_the_repaint_floor() {
     assert_eq!(wait_for_paint(false, Duration::ZERO), PAINT_MIN);
 }
 
-// --- README screenshot fixtures ---------------------------------------------
+// --- README frame fixtures --------------------------------------------------
 //
-// `docs/img/*.ansi` hold one frame each, produced by the real renderer over a
-// fabricated fleet. The bytes are what the running client writes, so a terminal
-// `cat`-ing one paints exactly what a live run paints — see `docs/img/README.md`
-// for the capture procedure.
+// The real renderer writes each fabricated fleet to `docs/img/*.ansi`. Printing
+// one of these files reproduces the corresponding dashboard frame.
 
-/// Fixture terminal size. 30 rows seat every section with one list row to
-/// spare; 107 columns give the 71-column preview cell and the 80-column peek
-/// box of the screenshots these frames replace.
+/// Fixture terminal size. The 30 rows fit every section plus one spare list
+/// row; 107 columns produce a 71-column preview cell and an 80-column peek box.
 const FIXTURE_ROWS: u16 = 30;
 const FIXTURE_COLS: u16 = 107;
 
@@ -3968,8 +3963,8 @@ impl Dirs {
 }
 
 /// A dashboard client over `views`, with `~/Documents/Code/Rust/fleetcom` as
-/// the invocation directory so dir mode ranks that section first. Daemon-backed
-/// because the header's ` · foreground` tag is not what the README advertises.
+/// the invocation directory so directory mode ranks that section first.
+/// Daemon-backed mode omits the foreground marker from generated frames.
 fn fixture_app(dirs: &Dirs, group_mode: GroupMode, views: Vec<TaskView>) -> App {
     let mut app = App::assemble(FIXTURE_ROWS, FIXTURE_COLS, |_, _, _| Box::new(NoTransport));
     app.daemon_backed = true;
@@ -3981,9 +3976,9 @@ fn fixture_app(dirs: &Dirs, group_mode: GroupMode, views: Vec<TaskView>) -> App 
     app
 }
 
-/// The fleet mid-flight: eleven live agents and builds, one idle REPL, six
-/// finished. Ids ascend in launch order, which is also the within-section row
-/// order once `row_rank` floats the tagged rows and sinks the finished ones.
+/// The active frame's 21 tasks: 12 active, two idle, and seven finished.
+/// Task IDs encode launch order; `row_rank` moves tagged tasks ahead of their
+/// peers and finished tasks behind them within a section.
 fn live_fleet(dirs: &Dirs) -> Vec<TaskView> {
     vec![
         TaskView {
@@ -4286,9 +4281,8 @@ fn live_fleet(dirs: &Dirs) -> Vec<TaskView> {
     ]
 }
 
-/// One task's differences between the two frames. The peek fixture is the live
-/// fleet after the agents went quiet, so only state, ages, and one status line
-/// move; everything identifying a task lives in `live_fleet` alone.
+/// Per-task state for the quiet frame. Task identity remains in `live_fleet`;
+/// this table replaces lifecycle, age, and one preview.
 struct Quiet {
     id: u64,
     lifecycle: Lifecycle,
@@ -4350,9 +4344,9 @@ impl Quiet {
     }
 }
 
-/// What the peek frame changes, one row per task. Ages are the fabricated
-/// spread the frame shows: `32s` and `13s` on the tagged pair, `1m` across the
-/// idled agents, `15m`–`20m` on the finished runs.
+/// Quiet-frame overrides, one per task. The rendered ages include `32s` and
+/// `13s` for the tagged pair, `1m` for most idle agents, and `15m`–`21m` for
+/// finished tasks.
 const QUIET: [Quiet; 21] = [
     Quiet::idle(1, mins(22), secs(32)),
     Quiet::idle(2, mins(21), secs(13)).saying(SUMMARY_QUIET, "claude:action-row"),
@@ -4361,7 +4355,7 @@ const QUIET: [Quiet; 21] = [
     Quiet::idle(5, mins(21), mins(1)),
     Quiet::done(6, mins(21), mins(20)),
     Quiet::idle(7, mins(21), mins(1)),
-    // Zellij is the lone row under `Running`: it never stops painting.
+    // Keep Zellij active so the Running section remains non-empty.
     Quiet::active(8, mins(20), secs(4)),
     Quiet::idle(9, mins(22), mins(20)),
     Quiet::done(10, mins(16), mins(15)),
@@ -4378,9 +4372,9 @@ const QUIET: [Quiet; 21] = [
     Quiet::idle(21, mins(30), mins(28)),
 ];
 
-/// The same fleet after the agents went quiet: one live task, thirteen idle,
-/// seven finished. `parked` tracks `lifecycle` because the core derives both from the
-/// one `IDLE_AFTER` window, so an Idle task is always a parked one.
+/// The quiet frame's 21 tasks: one active, 13 idle, and seven finished.
+/// `parked` follows `lifecycle` because the core derives both from the same
+/// `IDLE_AFTER` window.
 fn quiet_fleet(dirs: &Dirs) -> Vec<TaskView> {
     let mut views = live_fleet(dirs);
     assert_eq!(
@@ -4418,11 +4412,11 @@ const LOGRIA_TESTS: &str = "test result: ok. 223 passed; 0 failed; 0 ignored; 0 
 const CRABAPPLE_TESTS: &str = "all doctests ran in 0.39s; merged doctests compilation took 0.38s";
 const CRABSTEP_TESTS: &str = "all doctests ran in 0.83s; merged doctests compilation took 0.81s";
 const IMESSAGE_TESTS: &str = "all doctests ran in 1.99s; merged doctests compilation took 1.95s";
-/// The one status line that differs between the two frames.
 const FLEETCOM_CLIPPY: &str =
     "error: could not compile `fleetcom` (lib test) due to 1 previous error";
 const LOGRIA_WATCH: &str = "[Running 'cargo test'] test result: ok. 223 passed; 0 failed";
 const LOGRIA_DOC: &str = "Finished `dev` profile [unoptimized + debuginfo] target(s) in 3.41s";
+/// Preview used only by the quiet frame.
 const SUMMARY_QUIET: &str = "✻ Review fleetcom preview design document";
 
 /// The peeked task's screen: the tail of a `cargo test` run. `render_peek`
@@ -4460,28 +4454,21 @@ fn cargo_test_screen(id: u64) -> ScreenView {
 
 /// Paint `app` once and return the frame bytes.
 fn frame(app: &mut App) -> Vec<u8> {
-    // OSC 0 names the window. The shell titles it after whatever it is running,
-    // so a captured frame would otherwise wear the `cat` command line. The
-    // client sets no title of its own; this belongs to the capture.
+    // OSC 0 keeps the captured window title independent of the printing shell.
     let mut out = b"\x1b]0;fleetcom\x07".to_vec();
     let painted = out.len();
     crate::ui::render(&mut out, app).expect("a fixture frame always paints");
     assert!(out.len() > painted, "a fresh App must emit its first frame");
-    // Park the cursor on the last row. `render_peek` leaves it inside the peek
-    // box, so anything a shell prints after `cat` lands mid-frame; the running
-    // client never returns to a shell, so only these captures care.
+    // Park the cursor on the terminal's final row, outside centered overlays.
     out.extend_from_slice(format!("\x1b[{};1H", app.rows).as_bytes());
     out
 }
 
-/// Rewrite `docs/img/home.ansi` and `docs/img/quickpeek.ansi`, the frames the
-/// README screenshots are taken from. Ignored because it writes into the
-/// repository; run it by hand after a dashboard change, then recapture.
+/// Rewrite the four `docs/img/*.ansi` dashboard frames. This test is ignored
+/// because it writes repository fixtures.
 ///
-/// Every duration is a constant and no `HashMap` is iterated, so two runs
-/// produce identical bytes. `$HOME` is the one environment input: `dir_label`
-/// abbreviates it to `~`, which is what puts `~/Documents/…` in the section
-/// labels.
+/// Fixed durations and ordered inputs make the output deterministic for a
+/// given `$HOME`; `dir_label` abbreviates that path to `~` in section labels.
 #[test]
 #[ignore = "writes docs/img/*.ansi; run by hand to refresh the README screenshots"]
 fn write_readme_screenshot_fixtures() {
@@ -4495,21 +4482,17 @@ fn write_readme_screenshot_fixtures() {
     app.selected_id = Some(4);
     std::fs::write(out_dir.join("home.ansi"), frame(&mut app)).unwrap();
 
-    // Grouped by state, peek open over the first finished test run. Completed
-    // orders by directory, so id 14 is the first row of that section and sits
-    // beside the peek box rather than below it: the capture shows the overlay
-    // compositing over a selected row.
+    // State grouping with peek open over the first finished test. Directory
+    // ordering places id 14 first in Completed and beside the peek box.
     let mut app = fixture_app(&dirs, GroupMode::State, quiet_fleet(&dirs));
     app.mode = Mode::Peek;
     app.selected_id = Some(14);
-    // Private to `app`, and this module is a submodule of it: assigning the
-    // screen directly is what makes `screen_for` answer without a core.
+    // Seed the watched screen directly because NoTransport emits no frames.
     app.focused_screen = Some(cargo_test_screen(14));
     std::fs::write(out_dir.join("quickpeek.ansi"), frame(&mut app)).unwrap();
 
-    // Grouped by the assignments `g` makes. `tests` gathers five directories
-    // into one section and the fleetcom directory feeds two, so the frame shows
-    // an organization no filesystem can produce.
+    // Custom grouping puts five directories in `tests` and splits fleetcom's
+    // directory between two sections.
     let mut app = fixture_app(&dirs, GroupMode::Custom, live_fleet(&dirs));
     app.selected_id = Some(4);
     std::fs::write(out_dir.join("groups.ansi"), frame(&mut app)).unwrap();
