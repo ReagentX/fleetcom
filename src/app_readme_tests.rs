@@ -95,9 +95,9 @@ struct Dirs {
 }
 
 impl Dirs {
-    fn new(home: &Path) -> Dirs {
+    fn new(home: &Path) -> Self {
         let code = home.join("Documents/Code");
-        Dirs {
+        Self {
             home: home.to_path_buf(),
             fleetcom: code.join("Rust/fleetcom"),
             turret: code.join("Apple/turret"),
@@ -444,8 +444,8 @@ struct Quiet {
 
 impl Quiet {
     /// A live task quiet past `IDLE_AFTER`, timed from its last output.
-    const fn idle(id: u64, started: Duration, quiet: Duration) -> Quiet {
-        Quiet {
+    const fn idle(id: u64, started: Duration, quiet: Duration) -> Self {
+        Self {
             id,
             lifecycle: Lifecycle::Idle,
             parked: true,
@@ -457,35 +457,35 @@ impl Quiet {
     }
 
     /// A live task still inside `IDLE_AFTER`, timed from launch.
-    const fn active(id: u64, started: Duration, quiet: Duration) -> Quiet {
-        Quiet {
+    const fn active(id: u64, started: Duration, quiet: Duration) -> Self {
+        Self {
             lifecycle: Lifecycle::Active,
             parked: false,
-            ..Quiet::idle(id, started, quiet)
+            ..Self::idle(id, started, quiet)
         }
     }
 
     /// A task that exited cleanly, timed from the exit.
-    const fn done(id: u64, started: Duration, finished: Duration) -> Quiet {
-        Quiet {
+    const fn done(id: u64, started: Duration, finished: Duration) -> Self {
+        Self {
             lifecycle: Lifecycle::Ok,
             parked: false,
             quiet_ago: None,
             finished_ago: Some(finished),
-            ..Quiet::idle(id, started, finished)
+            ..Self::idle(id, started, finished)
         }
     }
 
     /// A task that exited non-zero, timed from the exit.
-    const fn failed(id: u64, started: Duration, finished: Duration) -> Quiet {
-        Quiet {
+    const fn failed(id: u64, started: Duration, finished: Duration) -> Self {
+        Self {
             lifecycle: Lifecycle::Failed,
-            ..Quiet::done(id, started, finished)
+            ..Self::done(id, started, finished)
         }
     }
 
     /// Swap in a different status line.
-    const fn saying(mut self, text: &'static str, rule: &'static str) -> Quiet {
+    const fn saying(mut self, text: &'static str, rule: &'static str) -> Self {
         self.preview = Some((text, rule));
         self
     }

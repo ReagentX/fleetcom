@@ -119,18 +119,18 @@ pub enum GroupMode {
 impl GroupMode {
     pub fn label(self) -> &'static str {
         match self {
-            GroupMode::State => "state",
-            GroupMode::Dir => "dir",
-            GroupMode::Custom => "custom",
+            Self::State => "state",
+            Self::Dir => "dir",
+            Self::Custom => "custom",
         }
     }
 
     /// Advance through State → Dir → Custom → State.
-    pub fn next(self) -> GroupMode {
+    pub fn next(self) -> Self {
         match self {
-            GroupMode::State => GroupMode::Dir,
-            GroupMode::Dir => GroupMode::Custom,
-            GroupMode::Custom => GroupMode::State,
+            Self::State => Self::Dir,
+            Self::Dir => Self::Custom,
+            Self::Custom => Self::State,
         }
     }
 }
@@ -341,12 +341,12 @@ impl App {
     /// complete the hello handshake, so tasks outlive the UI and run under
     /// *this* client's env. The core lives in `fleetcom --daemon`, reached over
     /// the socket.
-    pub fn connect(rows: u16, cols: u16) -> io::Result<App> {
+    pub fn connect(rows: u16, cols: u16) -> io::Result<Self> {
         let (stream, origin) = crate::daemon::connect_ready()?;
         // Split the stream here (the fallible part) so the transport factory in
         // `assemble` (which owns the wake sender) stays infallible.
         let read = stream.try_clone()?;
-        let mut app = App::assemble(rows, cols, move |_, _, wait_tx| {
+        let mut app = Self::assemble(rows, cols, move |_, _, wait_tx| {
             Box::new(SocketTransport::from_halves(stream, read, wait_tx))
         });
         app.daemon_backed = true;
@@ -385,8 +385,8 @@ impl App {
 
     /// `--foreground`: run the core in-process on a thread (no daemon). A
     /// non-daemon escape hatch, and the deterministic target the UI harnesses use.
-    pub fn new_foreground(rows: u16, cols: u16) -> App {
-        App::assemble(rows, cols, |pr, c, wait_tx| {
+    pub fn new_foreground(rows: u16, cols: u16) -> Self {
+        Self::assemble(rows, cols, |pr, c, wait_tx| {
             Box::new(ThreadTransport::foreground(pr, c, wait_tx))
         })
     }
@@ -396,7 +396,7 @@ impl App {
         rows: u16,
         cols: u16,
         make: impl FnOnce(u16, u16, Sender<()>) -> Box<dyn Transport>,
-    ) -> App {
+    ) -> Self {
         let invocation_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         let invocation_label = path::abbreviate(&invocation_dir);
         // The core runs every PTY at the *content* size: full height minus the
@@ -411,7 +411,7 @@ impl App {
             rows: pane_rows,
             cols,
         });
-        App {
+        Self {
             transport,
             views: Vec::new(),
             focused_screen: None,
@@ -1246,7 +1246,7 @@ impl App {
 
     /// Shared editing for the single-line text prompts: Enter runs `submit`
     /// with the trimmed input and closes; Esc closes without submitting.
-    fn on_key_textinput(&mut self, k: KeyEvent, submit: fn(&mut App, &str)) {
+    fn on_key_textinput(&mut self, k: KeyEvent, submit: fn(&mut Self, &str)) {
         match k.code {
             KeyCode::Enter => {
                 // Submit the text on both sides of the caret.

@@ -232,7 +232,7 @@ impl Task {
         scrollback: usize,
         env: &[(OsString, OsString)],
         waker: Waker,
-    ) -> io::Result<Task> {
+    ) -> io::Result<Self> {
         let pair = native_pty_system()
             .openpty(PtySize {
                 rows,
@@ -334,7 +334,7 @@ impl Task {
         // Process-group signalling and `waitid` use the leader PID directly.
         let pid = child.process_id();
         drop(child);
-        Ok(Task {
+        Ok(Self {
             id,
             command: command.to_string(),
             cwd: cwd.to_path_buf(),

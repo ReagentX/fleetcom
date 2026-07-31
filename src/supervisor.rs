@@ -194,8 +194,8 @@ struct Recovery {
 }
 
 impl Recovery {
-    fn new() -> Recovery {
-        Recovery {
+    fn new() -> Self {
+        Self {
             enabled: !cfg!(test),
             dirty: false,
             last_mutation: None,
@@ -257,8 +257,8 @@ pub struct Supervisor {
 }
 
 impl Supervisor {
-    pub fn new(rows: u16, cols: u16, scrollback: usize) -> Supervisor {
-        Supervisor {
+    pub fn new(rows: u16, cols: u16, scrollback: usize) -> Self {
+        Self {
             tasks: Vec::new(),
             graveyard: Vec::new(),
             next_id: 1,

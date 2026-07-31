@@ -29,8 +29,8 @@ pub struct LaunchContext {
 
 impl LaunchContext {
     /// Capture this process's environment and current directory.
-    pub fn here() -> LaunchContext {
-        LaunchContext {
+    pub fn here() -> Self {
+        Self {
             env: std::env::vars_os().collect(),
             cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
         }
@@ -228,9 +228,9 @@ impl ClipboardKind {
     /// a wire tag that drifted from the selector would rewrite the target.
     pub fn selector(self) -> &'static str {
         match self {
-            ClipboardKind::Clipboard => "c",
-            ClipboardKind::Primary => "p",
-            ClipboardKind::Selection => "s",
+            Self::Clipboard => "c",
+            Self::Primary => "p",
+            Self::Selection => "s",
         }
     }
 
@@ -238,11 +238,11 @@ impl ClipboardKind {
     /// [`ClipboardKind::selector`]). Takes bytes to serve both callers: the
     /// wire decoder hands over `str::as_bytes`, the emulator's OSC 52 handler
     /// a single raw selector byte.
-    pub fn from_selector(sel: &[u8]) -> Option<ClipboardKind> {
+    pub fn from_selector(sel: &[u8]) -> Option<Self> {
         match sel {
-            b"c" => Some(ClipboardKind::Clipboard),
-            b"p" => Some(ClipboardKind::Primary),
-            b"s" => Some(ClipboardKind::Selection),
+            b"c" => Some(Self::Clipboard),
+            b"p" => Some(Self::Primary),
+            b"s" => Some(Self::Selection),
             _ => None,
         }
     }
@@ -292,10 +292,10 @@ impl PreviewSource {
     /// Lowercase provenance identifier.
     pub fn label(self) -> &'static str {
         match self {
-            PreviewSource::Floor => "floor",
-            PreviewSource::Marker => "marker",
-            PreviewSource::Title => "title",
-            PreviewSource::Anchor => "anchor",
+            Self::Floor => "floor",
+            Self::Marker => "marker",
+            Self::Title => "title",
+            Self::Anchor => "anchor",
         }
     }
 }
@@ -314,8 +314,8 @@ pub struct Preview {
 
 impl Preview {
     /// An unfrozen `Floor` preview of `text`.
-    pub(crate) fn floor(text: String) -> Preview {
-        Preview {
+    pub(crate) fn floor(text: String) -> Self {
+        Self {
             text,
             source: PreviewSource::Floor,
             rule: None,

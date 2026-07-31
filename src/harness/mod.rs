@@ -128,8 +128,8 @@ impl Invocation {
     /// The session ID the command already targets.
     pub fn known_id(self) -> Option<String> {
         match self {
-            Invocation::Bare => None,
-            Invocation::Resume(id) => Some(id),
+            Self::Bare => None,
+            Self::Resume(id) => Some(id),
         }
     }
 }

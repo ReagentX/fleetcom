@@ -11,8 +11,8 @@ impl App {
     /// A synchronous App: the supervisor ticks inline on `poll`, so `send`
     /// then `pump` is deterministic with no core-thread timing to race.
     /// Uses this process's launch context.
-    fn new_local(rows: u16, cols: u16) -> App {
-        App::assemble(rows, cols, |pr, c, _wait_tx| {
+    fn new_local(rows: u16, cols: u16) -> Self {
+        Self::assemble(rows, cols, |pr, c, _wait_tx| {
             let mut sup = Supervisor::new(pr, c, 2000);
             sup.set_launch_context(crate::protocol::LaunchContext::here());
             Box::new(LocalTransport::new(sup))
@@ -21,8 +21,8 @@ impl App {
 
     /// `new_local` with an explicit launch context, for tests that must pin
     /// the core's session root instead of inheriting this process's env.
-    fn new_local_with_ctx(rows: u16, cols: u16, ctx: crate::protocol::LaunchContext) -> App {
-        App::assemble(rows, cols, move |pr, c, _wait_tx| {
+    fn new_local_with_ctx(rows: u16, cols: u16, ctx: crate::protocol::LaunchContext) -> Self {
+        Self::assemble(rows, cols, move |pr, c, _wait_tx| {
             let mut sup = Supervisor::new(pr, c, 2000);
             sup.set_launch_context(ctx);
             Box::new(LocalTransport::new(sup))
@@ -81,8 +81,8 @@ impl App {
     /// Spawn `cmd` in the invocation directory and attach to it, returning the
     /// attached id. `attach` targets the selection, so the spawn must land and
     /// `resolve_selection` must run before it has anything to grab.
-    fn attached(rows: u16, cols: u16, cmd: &str) -> (App, u64) {
-        let mut app = App::new_local(rows, cols);
+    fn attached(rows: u16, cols: u16, cmd: &str) -> (Self, u64) {
+        let mut app = Self::new_local(rows, cols);
         let dir = app.invocation_dir.clone();
         app.spawn_in(cmd, dir);
         app.pump();
@@ -3205,8 +3205,8 @@ fn release(row: u16, col: u16) -> MouseEvent {
 impl App {
     /// Attach to a freshly spawned inline child and install a screen whose
     /// `lines` the test controls.
-    fn attached_with_lines(lines: &[&str]) -> App {
-        let (mut app, id) = App::attached(30, 100, "sleep 5");
+    fn attached_with_lines(lines: &[&str]) -> Self {
+        let (mut app, id) = Self::attached(30, 100, "sleep 5");
         let mut lines: Vec<String> = lines.iter().map(|l| l.to_string()).collect();
         lines.resize(app.pane_rows() as usize, String::new());
         app.focused_screen = Some(ScreenView {
@@ -3225,8 +3225,8 @@ impl App {
     }
 
     /// Spawn `cmd`, attach, and wait for a `ScreenView` satisfying `ready`.
-    fn attached_watching(cmd: &str, ready: impl Fn(&ScreenView) -> bool) -> (App, u64) {
-        let (mut app, id) = App::attached(30, 100, cmd);
+    fn attached_watching(cmd: &str, ready: impl Fn(&ScreenView) -> bool) -> (Self, u64) {
+        let (mut app, id) = Self::attached(30, 100, cmd);
         app.set_watch(Some((id, true)));
         assert!(
             wait_until(Duration::from_secs(5), || {

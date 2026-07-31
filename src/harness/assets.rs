@@ -135,7 +135,7 @@ impl CaptureAssets {
     /// namespace uses mode `0700`; its Claude settings use `0600`, and its
     /// executable Codex notifier uses `0700`. Dead-owner namespaces are reaped
     /// before the new namespace is created; other root entries remain.
-    pub fn install(root: &Path, pid: u32) -> io::Result<CaptureAssets> {
+    pub fn install(root: &Path, pid: u32) -> io::Result<Self> {
         fs::DirBuilder::new()
             .recursive(true)
             .mode(0o700)
@@ -166,7 +166,7 @@ impl CaptureAssets {
         fs::write(&codex_notify, CODEX_NOTIFY_SCRIPT)?;
         fs::set_permissions(&codex_notify, fs::Permissions::from_mode(0o700))?;
 
-        Ok(CaptureAssets {
+        Ok(Self {
             dir,
             claude_settings,
             codex_notify,
