@@ -3991,7 +3991,7 @@ fn live_fleet(dirs: &Dirs) -> Vec<TaskView> {
             command: "claude".to_string(),
             cwd: dirs.fleetcom.clone(),
             tagged: true,
-            group: None,
+            group: Some("dashboard".to_string()),
             name: Some("Dashboard Refine".to_string()),
             lifecycle: Lifecycle::Active,
             parked: false,
@@ -4008,7 +4008,7 @@ fn live_fleet(dirs: &Dirs) -> Vec<TaskView> {
             command: "claude".to_string(),
             cwd: dirs.fleetcom.clone(),
             tagged: true,
-            group: None,
+            group: Some("dashboard".to_string()),
             name: Some("Summary Refine".to_string()),
             lifecycle: Lifecycle::Active,
             parked: false,
@@ -4022,7 +4022,7 @@ fn live_fleet(dirs: &Dirs) -> Vec<TaskView> {
             command: "grok".to_string(),
             cwd: dirs.fleetcom.clone(),
             tagged: false,
-            group: None,
+            group: Some("dashboard".to_string()),
             name: Some("Grok Language".to_string()),
             lifecycle: Lifecycle::Active,
             parked: false,
@@ -4036,7 +4036,7 @@ fn live_fleet(dirs: &Dirs) -> Vec<TaskView> {
             command: "codex".to_string(),
             cwd: dirs.fleetcom.clone(),
             tagged: false,
-            group: None,
+            group: Some("dashboard".to_string()),
             name: Some("Codex Language".to_string()),
             lifecycle: Lifecycle::Active,
             parked: false,
@@ -4050,7 +4050,7 @@ fn live_fleet(dirs: &Dirs) -> Vec<TaskView> {
             command: "codex".to_string(),
             cwd: dirs.fleetcom.clone(),
             tagged: false,
-            group: None,
+            group: Some("dashboard".to_string()),
             name: Some("Codex Review".to_string()),
             lifecycle: Lifecycle::Active,
             parked: false,
@@ -4064,7 +4064,7 @@ fn live_fleet(dirs: &Dirs) -> Vec<TaskView> {
             command: "cargo test".to_string(),
             cwd: dirs.fleetcom.clone(),
             tagged: false,
-            group: None,
+            group: Some("tests".to_string()),
             name: None,
             lifecycle: Lifecycle::Ok,
             parked: false,
@@ -4078,7 +4078,7 @@ fn live_fleet(dirs: &Dirs) -> Vec<TaskView> {
             command: "cargo clippy".to_string(),
             cwd: dirs.fleetcom.clone(),
             tagged: false,
-            group: None,
+            group: Some("tests".to_string()),
             name: None,
             lifecycle: Lifecycle::Failed,
             parked: false,
@@ -4092,7 +4092,7 @@ fn live_fleet(dirs: &Dirs) -> Vec<TaskView> {
             command: "claude".to_string(),
             cwd: dirs.home.clone(),
             tagged: false,
-            group: None,
+            group: Some("desktop".to_string()),
             name: Some("claude agents".to_string()),
             lifecycle: Lifecycle::Active,
             parked: false,
@@ -4106,7 +4106,7 @@ fn live_fleet(dirs: &Dirs) -> Vec<TaskView> {
             command: "zellij".to_string(),
             cwd: dirs.home.clone(),
             tagged: false,
-            group: None,
+            group: Some("desktop".to_string()),
             name: Some("Zellij".to_string()),
             lifecycle: Lifecycle::Active,
             parked: false,
@@ -4134,7 +4134,7 @@ fn live_fleet(dirs: &Dirs) -> Vec<TaskView> {
             command: "brew update && brew upgrade".to_string(),
             cwd: dirs.home.clone(),
             tagged: false,
-            group: None,
+            group: Some("desktop".to_string()),
             name: None,
             lifecycle: Lifecycle::Ok,
             parked: false,
@@ -4148,7 +4148,7 @@ fn live_fleet(dirs: &Dirs) -> Vec<TaskView> {
             command: "grok".to_string(),
             cwd: dirs.turret.clone(),
             tagged: false,
-            group: None,
+            group: Some("turret".to_string()),
             name: Some("Game Infra Review".to_string()),
             lifecycle: Lifecycle::Active,
             parked: false,
@@ -4162,7 +4162,7 @@ fn live_fleet(dirs: &Dirs) -> Vec<TaskView> {
             command: "codex".to_string(),
             cwd: dirs.turret.clone(),
             tagged: false,
-            group: None,
+            group: Some("turret".to_string()),
             name: Some("Missile Nerf".to_string()),
             lifecycle: Lifecycle::Active,
             parked: false,
@@ -4176,7 +4176,7 @@ fn live_fleet(dirs: &Dirs) -> Vec<TaskView> {
             command: "codex".to_string(),
             cwd: dirs.turret.clone(),
             tagged: false,
-            group: None,
+            group: Some("turret".to_string()),
             name: Some("EMP Nerf".to_string()),
             lifecycle: Lifecycle::Active,
             parked: false,
@@ -4190,7 +4190,7 @@ fn live_fleet(dirs: &Dirs) -> Vec<TaskView> {
             command: "cargo test".to_string(),
             cwd: dirs.crabapple.clone(),
             tagged: false,
-            group: None,
+            group: Some("tests".to_string()),
             name: None,
             lifecycle: Lifecycle::Ok,
             parked: false,
@@ -4204,7 +4204,7 @@ fn live_fleet(dirs: &Dirs) -> Vec<TaskView> {
             command: "cargo test".to_string(),
             cwd: dirs.crabstep.clone(),
             tagged: false,
-            group: None,
+            group: Some("tests".to_string()),
             name: None,
             lifecycle: Lifecycle::Ok,
             parked: false,
@@ -4232,7 +4232,7 @@ fn live_fleet(dirs: &Dirs) -> Vec<TaskView> {
             command: "cargo test".to_string(),
             cwd: dirs.imessage.clone(),
             tagged: false,
-            group: None,
+            group: Some("tests".to_string()),
             name: None,
             lifecycle: Lifecycle::Ok,
             parked: false,
@@ -4246,7 +4246,7 @@ fn live_fleet(dirs: &Dirs) -> Vec<TaskView> {
             command: "cargo test".to_string(),
             cwd: dirs.logria.clone(),
             tagged: false,
-            group: None,
+            group: Some("tests".to_string()),
             name: None,
             lifecycle: Lifecycle::Ok,
             parked: false,
@@ -4260,7 +4260,7 @@ fn live_fleet(dirs: &Dirs) -> Vec<TaskView> {
             command: "cargo watch -x test".to_string(),
             cwd: dirs.logria.clone(),
             tagged: false,
-            group: None,
+            group: Some("tests".to_string()),
             name: None,
             lifecycle: Lifecycle::Active,
             parked: false,
@@ -4274,7 +4274,7 @@ fn live_fleet(dirs: &Dirs) -> Vec<TaskView> {
             command: "cargo doc --open".to_string(),
             cwd: dirs.logria.clone(),
             tagged: false,
-            group: None,
+            group: Some("tests".to_string()),
             name: None,
             lifecycle: Lifecycle::Idle,
             parked: true,
@@ -4506,4 +4506,17 @@ fn write_readme_screenshot_fixtures() {
     // screen directly is what makes `screen_for` answer without a core.
     app.focused_screen = Some(cargo_test_screen(14));
     std::fs::write(out_dir.join("quickpeek.ansi"), frame(&mut app)).unwrap();
+
+    // Grouped by the assignments `g` makes. `tests` gathers five directories
+    // into one section and the fleetcom directory feeds two, so the frame shows
+    // an organization no filesystem can produce.
+    let mut app = fixture_app(&dirs, GroupMode::Custom, live_fleet(&dirs));
+    app.selected_id = Some(4);
+    std::fs::write(out_dir.join("groups.ansi"), frame(&mut app)).unwrap();
+
+    // The `?` overlay over the same dir-grouped dashboard.
+    let mut app = fixture_app(&dirs, GroupMode::Dir, live_fleet(&dirs));
+    app.selected_id = Some(4);
+    app.mode = Mode::Controls;
+    std::fs::write(out_dir.join("controls.ansi"), frame(&mut app)).unwrap();
 }

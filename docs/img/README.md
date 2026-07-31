@@ -1,8 +1,18 @@
 # README screenshots
 
-`home.ansi` and `quickpeek.ansi` are single dashboard frames written by the real
-renderer over a fabricated fleet, so a terminal `cat`-ing one paints exactly what
-a live run paints. Screenshot the frame, not a real fleet.
+Each `.ansi` file is one dashboard frame written by the real renderer over a
+fabricated fleet, so a terminal `cat`-ing it paints exactly what a live run
+paints. Screenshot the frame, not a real fleet.
+
+| Frame | Shows |
+| -- | -- |
+| `home.ansi` | grouped by directory, the list outgrowing its region |
+| `quickpeek.ansi` | grouped by state, peek open over a finished run |
+| `groups.ansi` | grouped by custom group: one section spans five directories, and one directory feeds two sections |
+| `controls.ansi` | the `?` overlay over the dir-grouped dashboard |
+
+All four render the same 21 tasks. `attach.png` is captured from a live session,
+since it presupposes one.
 
 The fixture is `write_readme_screenshot_fixtures` in `src/app_tests.rs`. Edit the
 fleet there — task names, previews, ages, tags, selection — then regenerate:
