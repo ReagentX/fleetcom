@@ -29,6 +29,7 @@ use std::{
 };
 
 use super::CapturePaths;
+use crate::task::{pid_is_dead, positive_pid};
 
 /// Notify program injected into `codex`. It writes the capture payload when a
 /// path exists, then replaces itself with the configured notifier when present.
@@ -98,7 +99,7 @@ fn reap_dead_namespaces(root: &Path) {
         let Some(pid) = namespace_owner(name.to_str().unwrap_or("")) else {
             continue;
         };
-        if owner_is_dead(pid) {
+        if pid_is_dead(pid) {
             let _ = fs::remove_dir_all(entry.path());
         }
     }
@@ -117,13 +118,7 @@ fn namespace_owner(name: &str) -> Option<i32> {
     {
         return None;
     }
-    pid.parse::<i32>().ok().filter(|p| *p > 0)
-}
-
-/// Return true only when signal 0 reports that `pid` does not exist.
-fn owner_is_dead(pid: i32) -> bool {
-    use nix::{errno::Errno, sys::signal::kill, unistd::Pid};
-    matches!(kill(Pid::from_raw(pid), None), Err(Errno::ESRCH))
+    positive_pid(pid)
 }
 
 /// Capture assets owned by one supervisor process.

@@ -15,7 +15,11 @@ use std::{
     time::{Duration, Instant, SystemTime},
 };
 
-use crate::{emulator::Emulator, format::civil_from_days};
+use crate::{
+    emulator::Emulator,
+    format::civil_from_days,
+    task::{pid_is_dead, positive_pid},
+};
 
 /// Versioned prefix for scratch directories eligible for sweeping.
 const SCRATCH_PREFIX: &str = "fleetcom_test2_";
@@ -69,14 +73,7 @@ fn scratch_pid(suffix: &str) -> Option<i32> {
     if !digits(seq) || !digits(pid) {
         return None;
     }
-    pid.parse::<i32>().ok().filter(|p| *p > 0)
-}
-
-/// Whether a PID is known to be dead. Only `ESRCH` proves death, so a live
-/// process and one owned by another user both keep their directory.
-fn pid_is_dead(pid: i32) -> bool {
-    use nix::{errno::Errno, sys::signal::kill, unistd::Pid};
-    matches!(kill(Pid::from_raw(pid), None), Err(Errno::ESRCH))
+    positive_pid(pid)
 }
 
 /// Parse valid suffixes and reject malformed PID or sequence fields.

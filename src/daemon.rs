@@ -392,7 +392,7 @@ pub fn run_kill() -> io::Result<()> {
 
     let mut pid_str = String::new();
     file.read_to_string(&mut pid_str)?;
-    let Some(pid) = pid_str.trim().parse::<i32>().ok().filter(|p| *p > 0) else {
+    let Some(pid) = crate::task::positive_pid(pid_str.trim()) else {
         // Without a usable pid, fall back to a Shutdown frame over the socket.
         // Bound the fallback because an attached client can keep the daemon
         // from accepting this connection.

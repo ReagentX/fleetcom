@@ -11,7 +11,10 @@ use std::{
     time::SystemTime,
 };
 
-use crate::protocol::{RecoveryEntry, insert_opt_str, opt_str};
+use crate::{
+    protocol::{RecoveryEntry, insert_opt_str, opt_str},
+    task::{pid_is_dead, positive_pid},
+};
 
 /// One recipe entry. Entries without a group or name serialize as strings;
 /// other entries use objects whose optional fields are written only when set.
@@ -385,14 +388,13 @@ fn stem_pid(stem: &str) -> Option<i32> {
     if pid.is_empty() || !pid.bytes().all(|b| b.is_ascii_digit()) {
         return None;
     }
-    pid.parse::<i32>().ok().filter(|p| *p > 0)
+    positive_pid(pid)
 }
 
 /// Return whether a valid PID suffix is not known to be dead. Only `ESRCH`
 /// proves death; invalid suffixes receive no liveness protection.
 fn stem_names_live_writer(stem: &str) -> bool {
-    use nix::{errno::Errno, sys::signal::kill, unistd::Pid};
-    stem_pid(stem).is_some_and(|pid| !matches!(kill(Pid::from_raw(pid), None), Err(Errno::ESRCH)))
+    stem_pid(stem).is_some_and(|pid| !pid_is_dead(pid))
 }
 
 /// Best-effort pruning that protects `keep_stem` and snapshots whose PID is

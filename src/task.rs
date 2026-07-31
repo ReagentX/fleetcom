@@ -15,7 +15,8 @@ use std::{
 
 use alacritty_terminal::sync::FairMutex;
 use nix::{
-    sys::signal::{Signal, killpg},
+    errno::Errno,
+    sys::signal::{Signal, kill, killpg},
     unistd::Pid,
 };
 use portable_pty::{CommandBuilder, MasterPty, PtySize, native_pty_system};
@@ -45,6 +46,29 @@ pub struct WriteRefused {
 /// the whole crate speaks stdlib `io::Result` and never grows an `anyhow` dep.
 fn io_err(e: impl std::fmt::Display) -> io::Error {
     io::Error::other(e.to_string())
+}
+
+/// Whether signal 0 proves `pid` gone. ESRCH is the only proof: a live process
+/// answers Ok, and one owned by another user answers EPERM, so both read as not
+/// dead. That asymmetry is the point, not a rounding error — every caller gates
+/// deleting someone else's files on this, and an owner they merely cannot signal
+/// must keep them. Signal 0 delivers nothing, so probing a recycled ID harms
+/// nothing; it can only overstate liveness, which retains. [`Task::group_gone`]
+/// runs the same rule over a whole process group.
+pub(crate) fn pid_is_dead(pid: i32) -> bool {
+    matches!(kill(Pid::from_raw(pid), None), Err(Errno::ESRCH))
+}
+
+/// Parse a strictly positive decimal PID out of one already-isolated field.
+/// Positivity is signal safety, not tidiness: `kill` reads 0 as the caller's own
+/// process group and `-n` as group `n`, so a non-positive parse aims at the
+/// sender (`daemon::run_kill` sends a real SIGTERM to what this returns). The
+/// field is taken verbatim — no trim — because the filename-derived callers
+/// carve it out of a directory or file name, where surrounding whitespace is
+/// part of the name and must not parse. A caller reading a whole file trims at
+/// its own site, where a trailing newline is a fact of that format.
+pub(crate) fn positive_pid(field: &str) -> Option<i32> {
+    field.parse::<i32>().ok().filter(|p| *p > 0)
 }
 
 pub struct Task {
@@ -712,7 +736,7 @@ impl Task {
         // a member that exists but is beyond our signals. Both hold the wait.
         matches!(
             killpg(Pid::from_raw(pid as i32), None::<Signal>),
-            Err(nix::errno::Errno::ESRCH)
+            Err(Errno::ESRCH)
         )
     }
 }
