@@ -57,7 +57,7 @@ cargo install fleetcom
 
 ## Usage
 
-Connect to the daemon, autostarting it when necessary, and open the dashboard.
+Connect to the daemon, autostarting it when necessary, and open the dashboard by invoking:
 
 ```sh
 fleetcom
