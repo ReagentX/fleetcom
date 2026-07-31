@@ -4370,7 +4370,7 @@ const SUMMARY_QUIET: &str = "✻ Review fleetcom preview design document";
 
 /// The peeked task's screen: the tail of a `cargo test` run. `render_peek`
 /// shows the last `inner_h` lines, so these are already the visible ones.
-fn logria_screen(id: u64) -> ScreenView {
+fn cargo_test_screen(id: u64) -> ScreenView {
     let lines = [
         "test util::sanitizers::tests::test_length_clean ... ok",
         "test util::sanitizers::tests::test_row_length_clean ... ok",
@@ -4434,12 +4434,15 @@ fn write_readme_screenshot_fixtures() {
     app.selected_id = Some(4);
     std::fs::write(out_dir.join("home.ansi"), frame(&mut app)).unwrap();
 
-    // Grouped by state, peek open over the finished Logria test run.
+    // Grouped by state, peek open over the first finished test run. Completed
+    // orders by directory, so id 14 is the first row of that section and sits
+    // beside the peek box rather than below it: the capture shows the overlay
+    // compositing over a selected row.
     let mut app = fixture_app(&dirs, GroupMode::State, quiet_fleet(&dirs));
     app.mode = Mode::Peek;
-    app.selected_id = Some(18);
+    app.selected_id = Some(14);
     // Private to `app`, and this module is a submodule of it: assigning the
     // screen directly is what makes `screen_for` answer without a core.
-    app.focused_screen = Some(logria_screen(18));
+    app.focused_screen = Some(cargo_test_screen(14));
     std::fs::write(out_dir.join("quickpeek.ansi"), frame(&mut app)).unwrap();
 }
