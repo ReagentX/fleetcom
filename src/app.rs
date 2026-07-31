@@ -908,8 +908,8 @@ impl App {
     // --- `@` directory picker -------------------------------------------------
 
     /// Recompute picker rows: the current directory first (row 0, "run here"),
-    /// then, before you've typed anything, the in-use dirs for one-press
-    /// reuse, then the subdirectories of the current dir matching the fragment.
+    /// then the in-use dirs whose name matches the fragment, then the
+    /// subdirectories of the current dir matching it.
     fn refresh_dir_candidates(&mut self) {
         let (base_str, partial) = split_input(&self.dir_input);
         let base = self.resolve(base_str);
@@ -920,20 +920,38 @@ impl App {
             kind: DirKind::Use,
         }];
 
-        if self.dir_input.is_empty() {
+        // A `/` in the field means the user has committed to path navigation:
+        // the `Into` rows below already list the resolved base, so recents
+        // would double-list it. `split_input` leaves `base_str` empty exactly
+        // when the input holds no `/`, so that emptiness is the test.
+        if base_str.is_empty() {
+            let needle = partial.to_lowercase();
             for p in self.in_use_dirs() {
-                if p != base {
-                    cands.push(DirCand {
-                        label: path::abbreviate(&p),
-                        path: p,
-                        kind: DirKind::Jump,
-                    });
+                let label = path::abbreviate(&p);
+                // Match the final component, not the whole label: recents
+                // under one parent all carry it, so `doc` would answer for
+                // every `~/Documents/…` row and steal row 1 from `docs/`.
+                if p == base || !label_leaf(&label).to_lowercase().contains(&needle) {
+                    continue;
                 }
+                cands.push(DirCand {
+                    label,
+                    path: p,
+                    kind: DirKind::Jump,
+                });
             }
         }
 
         for name in list_dirs(&base, partial) {
             let path = base.join(&name);
+            // A recent that is also a subdirectory of `base` already has a row,
+            // and that row does strictly more: Enter runs there, Tab descends.
+            if cands
+                .iter()
+                .any(|c| c.kind == DirKind::Jump && c.path == path)
+            {
+                continue;
+            }
             cands.push(DirCand {
                 label: name,
                 path,
@@ -1866,6 +1884,18 @@ fn split_input(input: &str) -> (&str, &str) {
         Some(pos) => (&input[..=pos], &input[pos + 1..]),
         None => ("", input),
     }
+}
+
+/// The final path component of a display label: what reads as the directory's
+/// own name. `~/Documents/Code/Rust/Logria` yields `Logria`, and a trailing
+/// slash is ignored, so `/tmp/` and `/tmp` both yield `tmp`. The home row `~`
+/// is its own final component. The root `/` has none and yields itself, which
+/// costs nothing: a `/` in the field suppresses recents before this is called.
+fn label_leaf(label: &str) -> &str {
+    Path::new(label)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(label)
 }
 
 /// Subdirectories of `base` whose names start with `partial`, ignoring case.

@@ -145,11 +145,15 @@ The daemon removes control characters, trims surrounding whitespace, and limits 
 
 `@` opens a bottom panel containing a path field and its matching directories. `Enter` depends on the selected row type:
 
-- Current directory: run the command in that directory (`Enter`).
-- Recent directories: ones you've launched in before; `Enter` runs there, `Tab`/`→` browses into them.
+- Current directory: run the command in that directory (`Enter`). Row 0 is always this row, so the list is never empty.
+- Recent directories: ones you've launched in before; `Enter` runs there, `Tab`/`→` browses into them. They sort above the subdirectories: with several projects running, a directory you already work in is the likelier target.
 - Subdirectories of the current path: `Enter` or `Tab`/`→` descends into one.
 
-Typing filters the rows; `Backspace` deletes one character and the matches re-filter; `↑`/`↓` move the highlight; `Esc` cancels. Completion updates on each input, permitting navigation and launch without leaving the dashboard. `←`/`→` move the caret within the typed path (`→` descends only when the caret is at the end), and `Ctrl-A`/`Ctrl-E` (or `Home`/`End`) jump to either end; the same caret keys work in every `fleetcom` text field.
+Typing filters both lists, under different rules. A subdirectory matches the fragment as a case-insensitive prefix. A recent matches it as a case-insensitive substring of its final path component alone, the way the [find palette](#the--find-palette) matches a task: `log` finds `~/Documents/Code/Rust/Logria`, and `crab` finds both `crabapple` and `crabstep`. Matching the whole label instead would let a shared parent answer for everything under it — `doc` would return every `~/Documents/…` recent and take the row the `docs/` subdirectory should hold.
+
+A `/` in the field drops the recents. The slash commits the panel to path navigation, and the subdirectory rows of the resolved base already list what those recents would repeat. For the same reason, a recent that is also a subdirectory of the current path takes one row, the recent's.
+
+`Backspace` deletes one character and the matches re-filter; `↑`/`↓` move the highlight; `Esc` cancels. Completion updates on each input, permitting navigation and launch without leaving the dashboard. `←`/`→` move the caret within the typed path (`→` descends only when the caret is at the end), and `Ctrl-A`/`Ctrl-E` (or `Home`/`End`) jump to either end; the same caret keys work in every `fleetcom` text field.
 
 ## The `/` find palette
 

@@ -1019,6 +1019,214 @@ fn list_dirs_collates_case_insensitively() {
     let _ = std::fs::remove_dir_all(&base);
 }
 
+/// Build the `@`-picker fixture: `<root>/Documents/Code/Rust/{fleetcom,Logria,
+/// crabapple,crabstep}` plus `fleetcom/docs`, a task running in each project
+/// but `fleetcom`, and the app invoked from `fleetcom`. Every recent is a
+/// sibling of the invocation dir — never a subdirectory — and every one of them
+/// carries `Documents` as a middle component. Returns the app and the root to
+/// remove.
+fn recents_fixture(tag: &str) -> (App, PathBuf) {
+    let root = temp(tag);
+    let rust = root.join("Documents/Code/Rust");
+    for name in ["fleetcom", "Logria", "crabapple", "crabstep"] {
+        std::fs::create_dir_all(rust.join(name)).unwrap();
+    }
+    std::fs::create_dir_all(rust.join("fleetcom/docs")).unwrap();
+
+    let mut app = App::new_local(30, 100);
+    app.invocation_dir = rust.join("fleetcom");
+    // Oldest first, so `in_use_dirs` reports Logria, crabapple, crabstep.
+    for name in ["crabstep", "crabapple", "Logria"] {
+        app.spawn_in("sleep 5", rust.join(name));
+    }
+    app.pump();
+    (app, root)
+}
+
+/// Open the `@` picker and type `fragment` one key at a time.
+fn type_pickdir(app: &mut App, fragment: &str) {
+    app.on_key_dashboard(key(KeyCode::Char('@')));
+    for c in fragment.chars() {
+        app.on_key_pickdir(key(KeyCode::Char(c)));
+    }
+}
+
+/// The paths of the picker's recent rows, in display order.
+fn jump_paths(app: &App) -> Vec<PathBuf> {
+    app.dir_candidates
+        .iter()
+        .filter(|c| c.kind == DirKind::Jump)
+        .map(|c| c.path.clone())
+        .collect()
+}
+
+/// A typed fragment matches a recent by its final path component, so a sibling
+/// of the invocation dir — which `list_dirs` can never reach — is still one
+/// keypress away.
+#[test]
+fn pickdir_fragment_surfaces_a_sibling_recent() {
+    let (mut app, root) = recents_fixture("pickdir_recent_sibling");
+    let rust = root.join("Documents/Code/Rust");
+
+    type_pickdir(&mut app, "log");
+
+    assert_eq!(app.dir_candidates[0].kind, DirKind::Use);
+    assert_eq!(app.dir_candidates[0].path, app.invocation_dir);
+    assert_eq!(
+        jump_paths(&app),
+        vec![rust.join("Logria")],
+        "`log` matches the Logria leaf"
+    );
+    assert!(
+        !rust.join("Logria").starts_with(&app.invocation_dir),
+        "the match must be a sibling, not a subdirectory"
+    );
+    assert_eq!(app.dir_sel, 1, "the recent is preselected for Enter");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Recent matching folds case and matches anywhere in the component, like the
+/// `/` palette rather than the prefix-matched subdirectory rows.
+#[test]
+fn pickdir_recent_match_folds_case() {
+    let (mut app, root) = recents_fixture("pickdir_recent_case");
+    let rust = root.join("Documents/Code/Rust");
+
+    type_pickdir(&mut app, "LOG");
+    assert_eq!(app.dir_candidates[0].kind, DirKind::Use);
+    assert_eq!(
+        jump_paths(&app),
+        vec![rust.join("Logria")],
+        "an uppercase fragment matches a capitalized name"
+    );
+
+    // Mid-component: `ria` sits at the end of `Logria`, past any prefix.
+    app.on_key_pickdir(key(KeyCode::Esc));
+    type_pickdir(&mut app, "ria");
+    assert_eq!(jump_paths(&app), vec![rust.join("Logria")]);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// One fragment can match several recents; all of them appear.
+#[test]
+fn pickdir_fragment_surfaces_every_matching_recent() {
+    let (mut app, root) = recents_fixture("pickdir_recent_many");
+    let rust = root.join("Documents/Code/Rust");
+
+    type_pickdir(&mut app, "crab");
+
+    assert_eq!(app.dir_candidates[0].kind, DirKind::Use);
+    assert_eq!(
+        jump_paths(&app),
+        vec![rust.join("crabapple"), rust.join("crabstep")],
+        "recents keep their newest-first order"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Matching is on the final component alone. `doc` is a middle component of
+/// every recent here, so it matches none of them and leaves the `docs/`
+/// subdirectory the user is completing selected.
+#[test]
+fn pickdir_middle_component_matches_no_recent() {
+    let (mut app, root) = recents_fixture("pickdir_recent_middle");
+
+    type_pickdir(&mut app, "doc");
+
+    assert_eq!(app.dir_candidates[0].kind, DirKind::Use);
+    assert!(
+        jump_paths(&app).is_empty(),
+        "a shared parent must not flood the panel"
+    );
+    assert_eq!(app.dir_candidates.len(), 2);
+    assert_eq!(app.dir_candidates[1].kind, DirKind::Into);
+    assert_eq!(app.dir_candidates[1].label, "docs");
+    assert_eq!(app.dir_sel, 1, "the subdirectory keeps row 1");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A `/` hands the panel to path navigation: the subdirectory rows already
+/// list the resolved base, so recents drop out rather than double-listing it.
+#[test]
+fn pickdir_slash_suppresses_recents() {
+    let (mut app, root) = recents_fixture("pickdir_recent_slash");
+    let rust = root.join("Documents/Code/Rust");
+
+    // `..` resolves to the parent every recent lives in: without the rule,
+    // each one would appear as both a recent and a subdirectory.
+    type_pickdir(&mut app, "../");
+    assert_eq!(app.dir_candidates[0].kind, DirKind::Use);
+    assert_eq!(app.dir_candidates[0].path, rust);
+    assert!(jump_paths(&app).is_empty(), "a `/` drops the recents");
+    assert!(
+        app.dir_candidates[1..]
+            .iter()
+            .all(|c| c.kind == DirKind::Into)
+    );
+    assert_eq!(
+        app.dir_candidates
+            .iter()
+            .filter(|c| c.path == rust.join("Logria"))
+            .count(),
+        1,
+        "Logria is listed once, as a subdirectory"
+    );
+
+    // Filtering under a base keeps the same rule.
+    for c in "log".chars() {
+        app.on_key_pickdir(key(KeyCode::Char(c)));
+    }
+    assert!(jump_paths(&app).is_empty());
+    assert_eq!(app.dir_candidates[1].path, rust.join("Logria"));
+    assert_eq!(app.dir_candidates[1].kind, DirKind::Into);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// An empty field still lists every recent.
+#[test]
+fn pickdir_empty_input_lists_every_recent() {
+    let (mut app, root) = recents_fixture("pickdir_recent_empty");
+    let rust = root.join("Documents/Code/Rust");
+
+    type_pickdir(&mut app, "");
+
+    assert_eq!(app.dir_candidates[0].kind, DirKind::Use);
+    assert_eq!(app.dir_candidates[0].path, app.invocation_dir);
+    assert_eq!(
+        jump_paths(&app),
+        vec![
+            rust.join("Logria"),
+            rust.join("crabapple"),
+            rust.join("crabstep"),
+        ]
+    );
+    assert_eq!(app.dir_sel, 0, "an empty field keeps the current dir");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A recent that is also a subdirectory of the base gets one row, not two.
+/// The recent row wins: Enter runs there and Tab still descends.
+#[test]
+fn pickdir_dedupes_a_recent_that_is_also_a_subdirectory() {
+    let (mut app, root) = recents_fixture("pickdir_recent_dedupe");
+    let docs = root.join("Documents/Code/Rust/fleetcom/docs");
+    app.spawn_in("sleep 5", docs.clone());
+    app.pump();
+
+    type_pickdir(&mut app, "doc");
+
+    assert_eq!(app.dir_candidates[0].kind, DirKind::Use);
+    assert_eq!(
+        app.dir_candidates.iter().filter(|c| c.path == docs).count(),
+        1,
+        "one row per directory"
+    );
+    assert_eq!(app.dir_candidates.len(), 2);
+    assert_eq!(app.dir_candidates[1].kind, DirKind::Jump);
+    assert_eq!(app.dir_candidates[1].path, docs);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 /// Focus is by id, so it points at the same task even after the list shifts
 /// (a lower-id task is removed) and reports gone once it's removed.
 #[test]
