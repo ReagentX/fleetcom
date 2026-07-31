@@ -20,6 +20,7 @@ use crate::{
     app::{App, DirKind, GroupMode, Mode, Row, SessionPage},
     editbuf::EditBuffer,
     format::{pad, rel_time, truncate},
+    path,
     protocol::{Lifecycle, Preview, PreviewSource, RecoveryEntry, TaskView},
     selection::Selection,
 };
@@ -39,7 +40,7 @@ pub fn render(out: &mut impl Write, app: &mut App) -> io::Result<bool> {
             render_dashboard(&mut buf, app)?;
             render_pickdir(&mut buf, app)?;
         }
-        Mode::PickGroup => {
+        Mode::PickGroup { .. } => {
             render_dashboard(&mut buf, app)?;
             render_pickgroup(&mut buf, app)?;
         }
@@ -56,7 +57,7 @@ pub fn render(out: &mut impl Write, app: &mut App) -> io::Result<bool> {
             render_session_picker(&mut buf, app)?;
         }
         Mode::Disconnected => render_disconnected(&mut buf, app)?,
-        Mode::Dashboard | Mode::Spawn | Mode::SaveSession | Mode::Rename => {
+        Mode::Dashboard | Mode::Spawn | Mode::SaveSession | Mode::Rename(_) => {
             render_dashboard(&mut buf, app)?
         }
     }
@@ -237,7 +238,7 @@ fn cmdline(app: &App) -> Option<(String, u16)> {
     let prefix = match app.mode {
         Mode::Spawn => spawn_prefix(app),
         Mode::SaveSession => "  save session as: ".to_string(),
-        Mode::Rename => "  rename task: ".to_string(),
+        Mode::Rename(_) => "  rename task: ".to_string(),
         _ => return None,
     };
     Some(caret_line(&prefix, &app.input, app.cols as usize))
@@ -258,7 +259,7 @@ fn caret_line(prefix: &str, buf: &EditBuffer, cols: usize) -> (String, u16) {
 
 /// The `❯` prompt prefix with optional directory and group destinations.
 fn spawn_prefix(app: &App) -> String {
-    let dir = (app.spawn_cwd != app.invocation_dir).then(|| app.dir_label(&app.spawn_cwd));
+    let dir = (app.spawn_cwd != app.invocation_dir).then(|| path::abbreviate(&app.spawn_cwd));
     prompt_line(dir.as_deref(), app.spawn_group.as_deref(), "")
 }
 

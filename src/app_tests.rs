@@ -164,7 +164,7 @@ fn dir_sections_collate_case_insensitively() {
     app.pump();
     app.group_mode = GroupMode::Dir;
 
-    let (z, a) = (app.dir_label(&upper), app.dir_label(&lower));
+    let (z, a) = (path::abbreviate(&upper), path::abbreviate(&lower));
     assert!(z < a, "byte order must put Zed first for this test to bite");
     assert_eq!(
         app.section_ids(),
@@ -596,7 +596,7 @@ fn state_mode_ordering_survives_the_row_key_split() {
         app.views[i].parked = parked;
     }
 
-    let (a, b) = (app.dir_label(&dir_a), app.dir_label(&dir_b));
+    let (a, b) = (path::abbreviate(&dir_a), path::abbreviate(&dir_b));
     assert!(
         b < a,
         "byte order must put dir b first, or this test cannot see the collation"
@@ -1915,24 +1915,21 @@ fn scroll_view_entry_and_exit() {
     app.on_key_attached(
         &mut out,
         KeyEvent::new(KeyCode::PageUp, KeyModifiers::SHIFT),
-    )
-    .unwrap();
+    );
     assert!(app.view_scroll, "Shift+PageUp must enter the scroll view");
-    app.on_key_attached(&mut out, key(KeyCode::Esc)).unwrap();
+    app.on_key_attached(&mut out, key(KeyCode::Esc));
     assert!(!app.view_scroll, "Esc must return to live");
 
     app.on_key_attached(
         &mut out,
         KeyEvent::new(KeyCode::PageUp, KeyModifiers::CONTROL),
-    )
-    .unwrap();
+    );
     assert!(app.view_scroll, "Ctrl+PageUp is an entry fallback");
-    app.on_key_attached(&mut out, key(KeyCode::Char('x')))
-        .unwrap();
+    app.on_key_attached(&mut out, key(KeyCode::Char('x')));
     assert!(!app.view_scroll, "typing must snap back to live");
 
     // Plain PageUp is forwarded to the child.
-    app.on_key_attached(&mut out, key(KeyCode::PageUp)).unwrap();
+    app.on_key_attached(&mut out, key(KeyCode::PageUp));
     assert!(!app.view_scroll);
 }
 
@@ -1986,8 +1983,7 @@ fn group_picker_opens_on_g_only_with_a_selection() {
     app.pump();
     app.resolve_selection();
     app.on_key_dashboard(key(KeyCode::Char('g')));
-    assert!(app.mode == Mode::PickGroup);
-    assert_eq!(app.group_target, Some(1));
+    assert!(app.mode == Mode::PickGroup { target: 1 });
 }
 
 /// Group candidates are distinct, case-insensitively sorted, and follow
@@ -2161,7 +2157,6 @@ fn group_esc_cancels_without_sending() {
     app.on_key_pickgroup(key(KeyCode::Esc));
     assert!(app.mode == Mode::Dashboard);
     assert!(app.group_input.is_empty() && app.group_candidates.is_empty());
-    assert_eq!(app.group_target, None);
     app.pump();
     let v = app.views.iter().find(|v| v.id == 1).unwrap();
     assert_eq!(v.group.as_deref(), Some("alpha"), "Esc must send nothing");
@@ -2587,15 +2582,13 @@ fn rename_prompt_opens_on_shift_r_only_with_a_selection() {
     let mut app = App::new_local(30, 100);
     app.on_key_dashboard(key(KeyCode::Char('R')));
     assert!(app.mode == Mode::Dashboard, "no selection: R must no-op");
-    assert_eq!(app.rename_target, None);
 
     let inv = app.invocation_dir.clone();
     app.spawn_in("sleep 5", inv);
     app.pump();
     app.resolve_selection();
     app.on_key_dashboard(key(KeyCode::Char('R')));
-    assert!(app.mode == Mode::Rename);
-    assert_eq!(app.rename_target, Some(1));
+    assert!(app.mode == Mode::Rename(1));
     assert_eq!(app.input.as_str(), "", "an unnamed task prefills empty");
 
     // A named task prefills its name.
@@ -2623,7 +2616,7 @@ fn rename_enter_sends_the_typed_name() {
     }
     app.on_key_rename(key(KeyCode::Enter));
     assert!(app.mode == Mode::Dashboard);
-    assert!(app.input.is_empty() && app.rename_target.is_none());
+    assert!(app.input.is_empty());
     app.pump();
     let v = app.views.iter().find(|v| v.id == 1).unwrap();
     assert_eq!(v.name.as_deref(), Some("api server"));
@@ -2671,7 +2664,6 @@ fn rename_esc_cancels_without_sending() {
     app.on_key_rename(key(KeyCode::Esc));
     assert!(app.mode == Mode::Dashboard);
     assert!(app.input.is_empty());
-    assert_eq!(app.rename_target, None);
     app.pump();
     let v = app.views.iter().find(|v| v.id == 1).unwrap();
     assert_eq!(v.name.as_deref(), Some("api"), "Esc must send nothing");
@@ -3390,8 +3382,7 @@ fn coordinate_invalidation_clears_the_selection() {
 
     let mut app = App::attached_with_lines(&["hello world"]);
     start(&mut app);
-    app.on_key_attached(&mut out, ctrl(KeyCode::Char('\\')))
-        .unwrap();
+    app.on_key_attached(&mut out, ctrl(KeyCode::Char('\\')));
     assert!(app.mode == Mode::Dashboard, "ctrl-\\ detaches");
     assert!(app.selection.is_none(), "detach must clear");
 
@@ -3400,8 +3391,7 @@ fn coordinate_invalidation_clears_the_selection() {
     app.on_key_attached(
         &mut out,
         KeyEvent::new(KeyCode::PageUp, KeyModifiers::SHIFT),
-    )
-    .unwrap();
+    );
     assert!(app.view_scroll);
     assert!(app.selection.is_none(), "scrollback entry must clear");
 
@@ -3694,14 +3684,12 @@ fn scrollback_keys_clear_the_drag() {
     app.on_mouse(press(0, 0));
     app.on_mouse(drag_to(0, 4));
     assert!(app.selection.is_some(), "premise: a drag is live");
-    app.on_key_attached(&mut out, KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE))
-        .unwrap();
+    app.on_key_attached(&mut out, KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE));
     assert!(app.selection.is_none(), "navigation must drop the drag");
 
     app.on_mouse(press(0, 0));
     app.on_mouse(drag_to(0, 4));
-    app.on_key_attached(&mut out, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
-        .unwrap();
+    app.on_key_attached(&mut out, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
     assert!(!app.view_scroll, "Esc exits to live");
     assert!(app.selection.is_none(), "the exit must drop the drag");
 }
@@ -3936,7 +3924,7 @@ fn frozen(text: &str) -> Preview {
 }
 
 /// The fleet's working directories, keyed as they appear in the section labels.
-/// `dir_label` abbreviates `$HOME` to `~`, so these must be built from it.
+/// `path::abbreviate` renders `$HOME` as `~`, so these must be built from it.
 struct Dirs {
     home: PathBuf,
     fleetcom: PathBuf,
@@ -3968,7 +3956,7 @@ impl Dirs {
 fn fixture_app(dirs: &Dirs, group_mode: GroupMode, views: Vec<TaskView>) -> App {
     let mut app = App::assemble(FIXTURE_ROWS, FIXTURE_COLS, |_, _, _| Box::new(NoTransport));
     app.daemon_backed = true;
-    app.invocation_label = app.dir_label(&dirs.fleetcom);
+    app.invocation_label = path::abbreviate(&dirs.fleetcom);
     app.invocation_dir = dirs.fleetcom.clone();
     app.spawn_cwd = dirs.fleetcom.clone();
     app.group_mode = group_mode;
@@ -4468,7 +4456,7 @@ fn frame(app: &mut App) -> Vec<u8> {
 /// because it writes repository fixtures.
 ///
 /// Fixed durations and ordered inputs make the output deterministic for a
-/// given `$HOME`; `dir_label` abbreviates that path to `~` in section labels.
+/// given `$HOME`; `path::abbreviate` renders that path as `~` in section labels.
 #[test]
 #[ignore = "writes docs/img/*.ansi; run by hand to refresh the README screenshots"]
 fn write_readme_screenshot_fixtures() {
