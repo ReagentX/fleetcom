@@ -12,18 +12,17 @@ paints.
 | `controls.ansi` | the `?` overlay over the dir-grouped dashboard |
 
 All four render the same 21 tasks. `attach.png` is captured from a live session,
-since it presupposes one.
+because it needs a live attach.
 
 The fixture is `write_readme_screenshot_fixtures` in `src/app_tests.rs`. Edit the
-fleet there — task names, previews, ages, tags, selection — then regenerate:
+fleet there (task names, previews, ages, tags, selection), then regenerate:
 
 ```sh
 cargo test -- --ignored write_readme_screenshot_fixtures
 ```
 
-Every duration in the fixture is a constant, so two runs write identical bytes.
-`$HOME` is the one environment input: the section labels come from abbreviating
-it to `~`.
+Every duration in the fixture is constant. With the same `$HOME`, two runs write
+identical bytes; section labels abbreviate that path to `~`.
 
 ## Capturing
 
@@ -36,12 +35,12 @@ clear; cat docs/img/controls.ansi;  read -rsk 1; printf '\033[?25h'
 
 `read` blocks until a keypress, so the screenshot is taken with nothing emitted
 after the frame; the trailing `printf` restores the cursor, which the frame
-hides. The flags are zsh's — bash spells the same thing `read -rs -n1`, and
+hides. The flags are zsh's; bash spells the same thing `read -rs -n1`, and
 `read -r` waits for Enter in both.
 
-Each frame ends by parking the cursor on its last row. Without that,
-`render_peek` would leave it inside the peek box and a shell prompt would print
-through the middle of the capture.
+Each frame parks the cursor on the terminal's last row, outside centered
+overlays. This matters for `render_peek`, which otherwise leaves the cursor
+inside the peek box while `read` waits.
 
 The terminal must be at least 107×30, the size the frames are painted at. `clear`
 first: a frame only paints its own rows, so a taller window would show stale

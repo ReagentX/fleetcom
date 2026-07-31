@@ -37,10 +37,10 @@
 | `w` | Save the current tasks as a session |
 | `o` | Load a saved session or a recovery snapshot (opens the [session picker](#the-o-session-picker)) |
 | `?` | Open the [controls overlay](#the--controls-overlay) |
-| `q` (or `Ctrl-C`) | Disconnect; leave the daemon and tasks running |
+| `q` (or `Ctrl-C`) | Disconnect from the daemon; under `--foreground`, quit and stop the tasks |
 | `Q` | Quit; kill the tasks and stop the daemon |
 
-![`fleetcom` fleet view](img/controls.png)
+![`fleetcom` controls overlay](img/controls.png)
 
 ### Status glyphs
 
@@ -192,7 +192,7 @@ A recovery row reads `<age> ago · <tasks> task(s) · <label>`: the file's age, 
 
 The dashboard's two hint rows cover common actions: `↑↓ select · enter attach · space peek · ? controls` and `❯ n run · @ dir · / find · s sort`. `?` opens an expanded reference for dashboard actions and the attached-mode background chord.
 
-The overlay groups bindings by purpose in a centered box. It does not scroll. `?`, `Esc`, or `q` returns to the dashboard. Other overlay-local input is ignored; `Ctrl-C` retains its global disconnect behavior.
+The overlay groups bindings by purpose in a centered box. It does not scroll. `?`, `Esc`, or `q` returns to the dashboard. Other keys do nothing in the overlay; `Ctrl-C` still disconnects.
 
 `?` is Shift-`/`. `fleetcom` accepts both event forms for this binding: `?`, or `/` with Shift. An unmodified `/` still opens the [find palette](#the--find-palette).
 
@@ -206,7 +206,7 @@ The footer's `preview:` segment names the source of the row's dashboard preview:
 
 ## Attached
 
-The task owns the terminal, and its status bar reads `[attached] <command>    Ctrl-\ background`, or `[attached] <name> · <command>` for a named task. `Ctrl-\` returns to the dashboard; every other key (control chords included) goes to the child.
+The task owns the terminal, and its status bar reads `[attached] <command>    Ctrl-\ background`, or `[attached] <name> · <command>` for a named task. `Ctrl-\` returns to the dashboard. Other supported input normally goes to the child; [scrollback](#scrollback) reserves its navigation keys.
 
 ## Connection loss
 
