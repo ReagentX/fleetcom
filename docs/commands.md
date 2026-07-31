@@ -29,7 +29,7 @@
 | `/` | Jump the selection to a task by name, command, or group (opens the [find palette](#the--find-palette)) |
 | `s` | Cycle grouping: by state / by directory / by custom group |
 | `m` | Tag the selected task "in use" (toggles) |
-| `M` | Move the selection to the next tagged task, wrapping at the end |
+| `M` | Select the next tagged task in dashboard order, wrapping at the end |
 | `g` | Assign the selected task to a group (opens the group picker) |
 | `R` | Rename the selected task: a display name shown in place of the command |
 | `r` | Rerun a finished task; supported agent tasks use the captured resume command |
@@ -129,7 +129,7 @@ Groups belong to task state: an assignment survives client detach and rerun (`r`
 
 `m` toggles the "in use" tag and marks the task with `◆`. In state mode, tagged tasks form the In use section at the top. In custom mode, a tag moves the task to the top of its existing group rather than creating a global section. Within a dir or custom section, tasks sort as tagged, live, then completed; each class then sorts by directory and spawn order. Idle state does not affect row order in these modes, so a quiet task keeps its position and shows `∙`. State mode instead moves quiet tasks from Running to Idle.
 
-`M` moves the selection to the next tagged task in dashboard order, wrapping at the end; tagging marks a context, `M` switches between them. Untagged tasks are skipped, so the cycle visits only tagged rows regardless of how many lie between them. With nothing tagged the key does nothing: the selection stays put and no mode changes. One tagged task wraps onto itself, leaving the selection unchanged.
+`M` cycles the selection through tagged tasks in dashboard order. It wraps after the last tagged task. With no tagged tasks, the selection does not move; with one, the selection moves to that task and stays there.
 
 In custom mode only, a new command inherits the selected task's group, through both `n` and the `@` picker. The spawn prompt shows the destination as `❯ dir ▸ group ▸ command`, each segment present only when it applies: the dir segment for a non-default directory, the group segment when a group will be inherited. State- and dir-mode spawns start unassigned.
 
@@ -145,13 +145,13 @@ The daemon removes control characters, trims surrounding whitespace, and limits 
 
 `@` opens a bottom panel containing a path field and its matching directories. `Enter` depends on the selected row type:
 
-- Current directory: run the command in that directory (`Enter`). Row 0 is always this row, so the list is never empty.
-- Recent directories: ones you've launched in before; `Enter` runs there, `Tab`/`→` browses into them. They sort above the subdirectories: with several projects running, a directory you already work in is the likelier target.
-- Subdirectories of the current path: `Enter` or `Tab`/`→` descends into one.
+- Resolved path: run the command in that directory (`Enter`). Row 0 is always this row, so the list is never empty.
+- Current task directories: `Enter` runs there; `Tab`/`→` browses into them. These rows precede subdirectories.
+- Subdirectories of the resolved path: `Enter` or `Tab`/`→` descends into one.
 
-Typing filters both lists, under different rules. A subdirectory matches the fragment as a case-insensitive prefix. A recent matches it as a case-insensitive substring of its final path component alone, the way the [find palette](#the--find-palette) matches a task: `log` finds `~/Documents/Code/Rust/Logria`, and `crab` finds both `crabapple` and `crabstep`. Matching the whole label instead would let a shared parent answer for everything under it — `doc` would return every `~/Documents/…` recent and take the row the `docs/` subdirectory should hold.
+Typing filters both lists under different rules. A subdirectory matches the fragment as a case-insensitive prefix. A current task directory matches a case-insensitive substring of its final path component: `log` finds `~/Documents/Code/Rust/Logria`, while `crab` finds both `crabapple` and `crabstep`. Parent components do not participate, so `doc` does not match every directory under `~/Documents/`.
 
-A `/` in the field drops the recents. The slash commits the panel to path navigation, and the subdirectory rows of the resolved base already list what those recents would repeat. For the same reason, a recent that is also a subdirectory of the current path takes one row, the recent's.
+Once the field contains `/`, current task directory rows are omitted; the picker shows the resolved path and its matching subdirectories. Without `/`, a current task directory that is also a matching subdirectory appears once, with the current task row behavior.
 
 `Backspace` deletes one character and the matches re-filter; `↑`/`↓` move the highlight; `Esc` cancels. Completion updates on each input, permitting navigation and launch without leaving the dashboard. `←`/`→` move the caret within the typed path (`→` descends only when the caret is at the end), and `Ctrl-A`/`Ctrl-E` (or `Home`/`End`) jump to either end; the same caret keys work in every `fleetcom` text field.
 

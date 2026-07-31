@@ -1019,12 +1019,8 @@ fn list_dirs_collates_case_insensitively() {
     let _ = std::fs::remove_dir_all(&base);
 }
 
-/// Build the `@`-picker fixture: `<root>/Documents/Code/Rust/{fleetcom,Logria,
-/// crabapple,crabstep}` plus `fleetcom/docs`, a task running in each project
-/// but `fleetcom`, and the app invoked from `fleetcom`. Every recent is a
-/// sibling of the invocation dir — never a subdirectory — and every one of them
-/// carries `Documents` as a middle component. Returns the app and the root to
-/// remove.
+/// Build an `@`-picker fixture with `fleetcom` as the invocation directory,
+/// three sibling task directories, and a `fleetcom/docs` subdirectory.
 fn recents_fixture(tag: &str) -> (App, PathBuf) {
     let root = temp(tag);
     let rust = root.join("Documents/Code/Rust");
@@ -1035,7 +1031,7 @@ fn recents_fixture(tag: &str) -> (App, PathBuf) {
 
     let mut app = App::new_local(30, 100);
     app.invocation_dir = rust.join("fleetcom");
-    // Oldest first, so `in_use_dirs` reports Logria, crabapple, crabstep.
+    // Spawn oldest first so `in_use_dirs` returns Logria, crabapple, crabstep.
     for name in ["crabstep", "crabapple", "Logria"] {
         app.spawn_in("sleep 5", rust.join(name));
     }
@@ -1051,7 +1047,7 @@ fn type_pickdir(app: &mut App, fragment: &str) {
     }
 }
 
-/// The paths of the picker's recent rows, in display order.
+/// Current-task directory paths in picker order.
 fn jump_paths(app: &App) -> Vec<PathBuf> {
     app.dir_candidates
         .iter()
@@ -1060,9 +1056,8 @@ fn jump_paths(app: &App) -> Vec<PathBuf> {
         .collect()
 }
 
-/// A typed fragment matches a recent by its final path component, so a sibling
-/// of the invocation dir — which `list_dirs` can never reach — is still one
-/// keypress away.
+/// Final-component matching includes task directories outside the invocation
+/// directory.
 #[test]
 fn pickdir_fragment_surfaces_a_sibling_recent() {
     let (mut app, root) = recents_fixture("pickdir_recent_sibling");
@@ -1085,8 +1080,7 @@ fn pickdir_fragment_surfaces_a_sibling_recent() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
-/// Recent matching folds case and matches anywhere in the component, like the
-/// `/` palette rather than the prefix-matched subdirectory rows.
+/// Current-task directories use case-insensitive substring matching.
 #[test]
 fn pickdir_recent_match_folds_case() {
     let (mut app, root) = recents_fixture("pickdir_recent_case");
@@ -1107,7 +1101,7 @@ fn pickdir_recent_match_folds_case() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
-/// One fragment can match several recents; all of them appear.
+/// A fragment includes every matching current-task directory.
 #[test]
 fn pickdir_fragment_surfaces_every_matching_recent() {
     let (mut app, root) = recents_fixture("pickdir_recent_many");
@@ -1124,9 +1118,7 @@ fn pickdir_fragment_surfaces_every_matching_recent() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
-/// Matching is on the final component alone. `doc` is a middle component of
-/// every recent here, so it matches none of them and leaves the `docs/`
-/// subdirectory the user is completing selected.
+/// Parent components do not match current-task directories.
 #[test]
 fn pickdir_middle_component_matches_no_recent() {
     let (mut app, root) = recents_fixture("pickdir_recent_middle");
@@ -1145,15 +1137,13 @@ fn pickdir_middle_component_matches_no_recent() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
-/// A `/` hands the panel to path navigation: the subdirectory rows already
-/// list the resolved base, so recents drop out rather than double-listing it.
+/// A `/` omits current-task directories from the picker.
 #[test]
 fn pickdir_slash_suppresses_recents() {
     let (mut app, root) = recents_fixture("pickdir_recent_slash");
     let rust = root.join("Documents/Code/Rust");
 
-    // `..` resolves to the parent every recent lives in: without the rule,
-    // each one would appear as both a recent and a subdirectory.
+    // `..` resolves to the parent containing every fixture task directory.
     type_pickdir(&mut app, "../");
     assert_eq!(app.dir_candidates[0].kind, DirKind::Use);
     assert_eq!(app.dir_candidates[0].path, rust);
@@ -1172,7 +1162,7 @@ fn pickdir_slash_suppresses_recents() {
         "Logria is listed once, as a subdirectory"
     );
 
-    // Filtering under a base keeps the same rule.
+    // Filtering the resolved path still omits current-task directory rows.
     for c in "log".chars() {
         app.on_key_pickdir(key(KeyCode::Char(c)));
     }
@@ -1182,7 +1172,7 @@ fn pickdir_slash_suppresses_recents() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
-/// An empty field still lists every recent.
+/// An empty field lists every current-task directory.
 #[test]
 fn pickdir_empty_input_lists_every_recent() {
     let (mut app, root) = recents_fixture("pickdir_recent_empty");
@@ -1204,8 +1194,8 @@ fn pickdir_empty_input_lists_every_recent() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
-/// A recent that is also a subdirectory of the base gets one row, not two.
-/// The recent row wins: Enter runs there and Tab still descends.
+/// A current-task directory that is also a subdirectory appears once, using
+/// current-task row behavior.
 #[test]
 fn pickdir_dedupes_a_recent_that_is_also_a_subdirectory() {
     let (mut app, root) = recents_fixture("pickdir_recent_dedupe");
@@ -1472,8 +1462,7 @@ fn section_nav_defaults_without_selection() {
 
 // --- `M` cycle tagged tasks -------------------------------------------
 
-/// Four running tasks with ids 2 and 4 tagged. State mode floats the tagged
-/// pair into In use, so the cycle order is [2, 4] ahead of the untagged rest.
+/// Build four state-grouped tasks with ids 2 and 4 tagged.
 fn app_with_tagged_pair() -> App {
     let mut app = App::new_local(30, 100);
     let inv = app.invocation_dir.clone();
@@ -1495,9 +1484,7 @@ fn app_with_tagged_pair() -> App {
     app
 }
 
-/// Two groups of two, tagged at the head of each. Custom mode keeps a tag
-/// inside its group, so an untagged row sits between the two tagged ones and
-/// the display order is [1, 2, 3, 4].
+/// Build two custom groups with the first task in each group tagged.
 fn app_with_tags_split_across_groups() -> App {
     let mut app = App::new_local(30, 100);
     let inv = app.invocation_dir.clone();
@@ -1538,7 +1525,7 @@ fn cycle_tagged_advances_and_wraps() {
     );
 }
 
-/// Untagged rows between two tags are skipped, however many there are.
+/// `M` skips untagged rows between tagged tasks.
 #[test]
 fn cycle_tagged_skips_untagged_tasks() {
     let mut app = app_with_tags_split_across_groups();
@@ -1554,7 +1541,7 @@ fn cycle_tagged_skips_untagged_tasks() {
     );
 }
 
-/// Nothing tagged means nothing to move to: the key is inert.
+/// `M` leaves the dashboard unchanged when no task is tagged.
 #[test]
 fn cycle_tagged_is_noop_without_tags() {
     let mut app = App::new_local(30, 100);
@@ -1571,7 +1558,7 @@ fn cycle_tagged_is_noop_without_tags() {
     assert!(app.notice().is_none() && app.status.is_none());
 }
 
-/// From an untagged row, `M` lands on the first tag after it, wrapping.
+/// From an untagged row, `M` selects the next tagged task.
 #[test]
 fn cycle_tagged_from_untagged_selection_jumps_forward() {
     let mut app = app_with_tags_split_across_groups();
@@ -1580,13 +1567,13 @@ fn cycle_tagged_from_untagged_selection_jumps_forward() {
     app.on_key_dashboard(key(KeyCode::Char('M')));
     assert_eq!(app.selected_id, Some(3), "next tag after the untagged row");
 
-    // Past the last tag, the scan wraps to the first.
+    // A selection after the last tagged task wraps to the first.
     app.selected_id = Some(4);
     app.on_key_dashboard(key(KeyCode::Char('M')));
     assert_eq!(app.selected_id, Some(1), "no tag below: wrap to the first");
 }
 
-/// One tag, already selected: the scan wraps onto itself and holds.
+/// With one tagged task selected, `M` leaves it selected.
 #[test]
 fn cycle_tagged_with_one_tag_holds_the_selection() {
     let mut app = App::new_local(30, 100);
@@ -1605,8 +1592,7 @@ fn cycle_tagged_with_one_tag_holds_the_selection() {
     assert_eq!(app.selected_id, Some(2), "selection is held, not cleared");
 }
 
-/// Without a selection, `M` takes the first tag; with no tasks at all it does
-/// nothing.
+/// Without a selection, `M` selects the first tagged task.
 #[test]
 fn cycle_tagged_without_selection_takes_the_first_tag() {
     let mut app = app_with_tagged_pair();
@@ -1619,7 +1605,7 @@ fn cycle_tagged_without_selection_takes_the_first_tag() {
     assert_eq!(empty.selected_id, None, "empty fleet: nothing to select");
 }
 
-/// `M` is pure navigation: it moves the cursor and touches no task state.
+/// `M` changes only the dashboard selection.
 #[test]
 fn cycle_tagged_mutates_no_task_state() {
     let mut app = app_with_tags_split_across_groups();
@@ -1633,8 +1619,8 @@ fn cycle_tagged_mutates_no_task_state() {
     for _ in 0..5 {
         app.on_key_dashboard(key(KeyCode::Char('M')));
     }
-    // A command would have landed on the core by now: the local transport
-    // ticks the supervisor inline on every poll.
+    // Pump once so any command emitted by `M` updates task state before the
+    // comparison.
     app.pump();
 
     let after: Vec<_> = app

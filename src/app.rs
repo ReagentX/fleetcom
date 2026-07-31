@@ -665,10 +665,8 @@ impl App {
     }
 
     /// Select the next tagged task in display order, wrapping at the end.
-    /// Untagged tasks are skipped, so the cycle visits only the contexts `m`
-    /// marked. Nothing tagged means nothing to move to: the selection stands.
-    /// With one tagged task the scan wraps back onto it, leaving the selection
-    /// where it is rather than clearing it.
+    /// Without a selection, select the first tagged task. Leave the selection
+    /// unchanged when no task is tagged.
     fn select_next_tagged(&mut self) {
         let order = self.display_order();
         if order.is_empty() {
@@ -907,9 +905,9 @@ impl App {
 
     // --- `@` directory picker -------------------------------------------------
 
-    /// Recompute picker rows: the current directory first (row 0, "run here"),
-    /// then the in-use dirs whose name matches the fragment, then the
-    /// subdirectories of the current dir matching it.
+    /// Rebuild directory-picker rows with the resolved path first. When the
+    /// input has no slash, matching current-task directories follow. Matching
+    /// subdirectories of the resolved path come last.
     fn refresh_dir_candidates(&mut self) {
         let (base_str, partial) = split_input(&self.dir_input);
         let base = self.resolve(base_str);
@@ -920,17 +918,14 @@ impl App {
             kind: DirKind::Use,
         }];
 
-        // A `/` in the field means the user has committed to path navigation:
-        // the `Into` rows below already list the resolved base, so recents
-        // would double-list it. `split_input` leaves `base_str` empty exactly
-        // when the input holds no `/`, so that emptiness is the test.
+        // Include current-task directories only when the input contains no `/`.
+        // `split_input` leaves `base_str` empty exactly in that case.
         if base_str.is_empty() {
             let needle = partial.to_lowercase();
             for p in self.in_use_dirs() {
                 let label = path::abbreviate(&p);
-                // Match the final component, not the whole label: recents
-                // under one parent all carry it, so `doc` would answer for
-                // every `~/Documents/…` row and steal row 1 from `docs/`.
+                // Match the final component so shared parent components do not
+                // match every sibling directory.
                 if p == base || !label_leaf(&label).to_lowercase().contains(&needle) {
                     continue;
                 }
@@ -944,8 +939,8 @@ impl App {
 
         for name in list_dirs(&base, partial) {
             let path = base.join(&name);
-            // A recent that is also a subdirectory of `base` already has a row,
-            // and that row does strictly more: Enter runs there, Tab descends.
+            // A current-task directory that is also a subdirectory already has
+            // a row: Enter runs there, and Tab descends.
             if cands
                 .iter()
                 .any(|c| c.kind == DirKind::Jump && c.path == path)
@@ -959,8 +954,8 @@ impl App {
             });
         }
 
-        // Nothing typed → keep the current dir selected (row 0). Filtering →
-        // jump to the first match so Tab/Enter drills straight in.
+        // An empty trailing fragment selects the resolved path. Otherwise,
+        // select the first matching row when one exists.
         self.dir_sel = if partial.is_empty() || cands.len() < 2 {
             0
         } else {
@@ -969,8 +964,7 @@ impl App {
         self.dir_candidates = cands;
     }
 
-    /// Distinct working directories of current tasks, most-recently-spawned
-    /// first: the "recent" quick-pick list.
+    /// Distinct task working directories, ordered by the newest task in each.
     fn in_use_dirs(&self) -> Vec<PathBuf> {
         let mut order: Vec<usize> = (0..self.views.len()).collect();
         order.sort_by_key(|&i| std::cmp::Reverse(self.views[i].id));
@@ -1198,7 +1192,7 @@ impl App {
                 }
             }
             KeyCode::Enter => self.attach(),
-            // Lowercase `m` marks; uppercase `M` moves between marks.
+            // `m` toggles a tag; `M` cycles through tagged tasks.
             KeyCode::Char('m') => {
                 if let Some(i) = self.selected_task() {
                     let (id, tagged) = (self.views[i].id, self.views[i].tagged);
@@ -1331,7 +1325,8 @@ impl App {
     fn on_key_pickdir(&mut self, k: KeyEvent) {
         // Tab descends; Right descends at the end and moves the caret elsewhere.
         if k.code == KeyCode::Tab || (k.code == KeyCode::Right && self.dir_input.at_end()) {
-            // Descend into the highlighted dir; a no-op on the current-dir row.
+            // Descend into the highlighted directory; the resolved-path row is
+            // a no-op.
             if let Some(c) = self.dir_candidates.get(self.dir_sel)
                 && c.kind != DirKind::Use
             {
@@ -1352,9 +1347,9 @@ impl App {
                 if let Some(c) = self.dir_candidates.get(self.dir_sel) {
                     let path = c.path.clone();
                     match c.kind {
-                        // Current dir or a recent dir: run the command there.
+                        // Resolved path or current-task directory: run there.
                         DirKind::Use | DirKind::Jump => self.confirm_dir(path),
-                        // Subdirectory: descend and select it (one keypress).
+                        // Subdirectory: descend and select its resolved-path row.
                         DirKind::Into => self.enter_dir(path),
                     }
                 }
@@ -1877,8 +1872,8 @@ fn paste_into(buf: &mut EditBuffer, s: &str) {
     }
 }
 
-/// Split a typed path into (directory-so-far, trailing fragment). The fragment
-/// is prefix-matched against candidates; the directory is what we list.
+/// Split a typed path into its directory prefix and trailing search fragment.
+/// Candidate types apply their own matching rules to the fragment.
 fn split_input(input: &str) -> (&str, &str) {
     match input.rfind('/') {
         Some(pos) => (&input[..=pos], &input[pos + 1..]),
@@ -1886,11 +1881,9 @@ fn split_input(input: &str) -> (&str, &str) {
     }
 }
 
-/// The final path component of a display label: what reads as the directory's
-/// own name. `~/Documents/Code/Rust/Logria` yields `Logria`, and a trailing
-/// slash is ignored, so `/tmp/` and `/tmp` both yield `tmp`. The home row `~`
-/// is its own final component. The root `/` has none and yields itself, which
-/// costs nothing: a `/` in the field suppresses recents before this is called.
+/// Return the final path component of an abbreviated display label.
+/// Trailing slashes are ignored. Labels without a final component, such as
+/// `/`, are returned unchanged.
 fn label_leaf(label: &str) -> &str {
     Path::new(label)
         .file_name()
