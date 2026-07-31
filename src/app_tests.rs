@@ -1262,6 +1262,193 @@ fn section_nav_defaults_without_selection() {
     assert_eq!(empty.selected_id, None);
 }
 
+// --- `M` cycle tagged tasks -------------------------------------------
+
+/// Four running tasks with ids 2 and 4 tagged. State mode floats the tagged
+/// pair into In use, so the cycle order is [2, 4] ahead of the untagged rest.
+fn app_with_tagged_pair() -> App {
+    let mut app = App::new_local(30, 100);
+    let inv = app.invocation_dir.clone();
+    for _ in 0..4 {
+        app.spawn_in("sleep 5", inv.clone());
+    }
+    app.pump();
+    app.transport.send(Command::Tag { id: 2, on: true });
+    app.transport.send(Command::Tag { id: 4, on: true });
+    app.pump();
+    assert_eq!(
+        app.section_ids(),
+        vec![
+            ("In use".to_string(), vec![2, 4]),
+            ("Running".to_string(), vec![1, 3]),
+        ],
+        "tagging reorders: the cycle runs 2 -> 4, then wraps"
+    );
+    app
+}
+
+/// Two groups of two, tagged at the head of each. Custom mode keeps a tag
+/// inside its group, so an untagged row sits between the two tagged ones and
+/// the display order is [1, 2, 3, 4].
+fn app_with_tags_split_across_groups() -> App {
+    let mut app = App::new_local(30, 100);
+    let inv = app.invocation_dir.clone();
+    app.spawn_grouped("sleep 5", inv.clone(), "alpha"); // id 1
+    app.spawn_grouped("sleep 5", inv.clone(), "alpha"); // id 2
+    app.spawn_grouped("sleep 5", inv.clone(), "beta"); // id 3
+    app.spawn_grouped("sleep 5", inv, "beta"); // id 4
+    app.pump();
+    app.group_mode = GroupMode::Custom;
+    app.transport.send(Command::Tag { id: 1, on: true });
+    app.transport.send(Command::Tag { id: 3, on: true });
+    app.pump();
+    assert_eq!(
+        app.section_ids(),
+        vec![
+            ("alpha".to_string(), vec![1, 2]),
+            ("beta".to_string(), vec![3, 4]),
+        ],
+        "tags head their own groups: display order is 1, 2, 3, 4"
+    );
+    app
+}
+
+/// `M` advances through the tagged tasks in display order and wraps.
+#[test]
+fn cycle_tagged_advances_and_wraps() {
+    let mut app = app_with_tagged_pair();
+    app.resolve_selection();
+    assert_eq!(app.selected_id, Some(2), "first row is the first tag");
+
+    app.on_key_dashboard(key(KeyCode::Char('M')));
+    assert_eq!(app.selected_id, Some(4), "forward to the second tag");
+    app.on_key_dashboard(key(KeyCode::Char('M')));
+    assert_eq!(
+        app.selected_id,
+        Some(2),
+        "past the last tag wraps to the first"
+    );
+}
+
+/// Untagged rows between two tags are skipped, however many there are.
+#[test]
+fn cycle_tagged_skips_untagged_tasks() {
+    let mut app = app_with_tags_split_across_groups();
+    app.selected_id = Some(1);
+
+    app.on_key_dashboard(key(KeyCode::Char('M')));
+    assert_eq!(app.selected_id, Some(3), "untagged id 2 is skipped");
+    app.on_key_dashboard(key(KeyCode::Char('M')));
+    assert_eq!(
+        app.selected_id,
+        Some(1),
+        "untagged id 4 is skipped on the wrap"
+    );
+}
+
+/// Nothing tagged means nothing to move to: the key is inert.
+#[test]
+fn cycle_tagged_is_noop_without_tags() {
+    let mut app = App::new_local(30, 100);
+    let inv = app.invocation_dir.clone();
+    app.spawn_in("sleep 5", inv.clone()); // id 1
+    app.spawn_in("sleep 5", inv); // id 2
+    app.pump();
+    app.resolve_selection();
+    assert_eq!(app.selected_id, Some(1));
+
+    app.on_key_dashboard(key(KeyCode::Char('M')));
+    assert_eq!(app.selected_id, Some(1), "no tags: the selection stands");
+    assert!(app.mode == Mode::Dashboard, "no tags: the mode stands");
+    assert!(app.notice().is_none() && app.status.is_none());
+}
+
+/// From an untagged row, `M` lands on the first tag after it, wrapping.
+#[test]
+fn cycle_tagged_from_untagged_selection_jumps_forward() {
+    let mut app = app_with_tags_split_across_groups();
+
+    app.selected_id = Some(2);
+    app.on_key_dashboard(key(KeyCode::Char('M')));
+    assert_eq!(app.selected_id, Some(3), "next tag after the untagged row");
+
+    // Past the last tag, the scan wraps to the first.
+    app.selected_id = Some(4);
+    app.on_key_dashboard(key(KeyCode::Char('M')));
+    assert_eq!(app.selected_id, Some(1), "no tag below: wrap to the first");
+}
+
+/// One tag, already selected: the scan wraps onto itself and holds.
+#[test]
+fn cycle_tagged_with_one_tag_holds_the_selection() {
+    let mut app = App::new_local(30, 100);
+    let inv = app.invocation_dir.clone();
+    app.spawn_in("sleep 5", inv.clone()); // id 1
+    app.spawn_in("sleep 5", inv.clone()); // id 2
+    app.spawn_in("sleep 5", inv); // id 3
+    app.pump();
+    app.transport.send(Command::Tag { id: 2, on: true });
+    app.pump();
+    app.resolve_selection();
+    assert_eq!(app.selected_id, Some(2), "the only tag heads the list");
+
+    app.on_key_dashboard(key(KeyCode::Char('M')));
+    app.on_key_dashboard(key(KeyCode::Char('M')));
+    assert_eq!(app.selected_id, Some(2), "selection is held, not cleared");
+}
+
+/// Without a selection, `M` takes the first tag; with no tasks at all it does
+/// nothing.
+#[test]
+fn cycle_tagged_without_selection_takes_the_first_tag() {
+    let mut app = app_with_tagged_pair();
+    app.selected_id = None;
+    app.on_key_dashboard(key(KeyCode::Char('M')));
+    assert_eq!(app.selected_id, Some(2), "no selection: first tag in order");
+
+    let mut empty = App::new_local(30, 100);
+    empty.on_key_dashboard(key(KeyCode::Char('M')));
+    assert_eq!(empty.selected_id, None, "empty fleet: nothing to select");
+}
+
+/// `M` is pure navigation: it moves the cursor and touches no task state.
+#[test]
+fn cycle_tagged_mutates_no_task_state() {
+    let mut app = app_with_tags_split_across_groups();
+    app.resolve_selection();
+    let before: Vec<_> = app
+        .views
+        .iter()
+        .map(|v| (v.id, v.tagged, v.group.clone(), v.lifecycle))
+        .collect();
+
+    for _ in 0..5 {
+        app.on_key_dashboard(key(KeyCode::Char('M')));
+    }
+    // A command would have landed on the core by now: the local transport
+    // ticks the supervisor inline on every poll.
+    app.pump();
+
+    let after: Vec<_> = app
+        .views
+        .iter()
+        .map(|v| (v.id, v.tagged, v.group.clone(), v.lifecycle))
+        .collect();
+    assert_eq!(before, after, "tags, groups, and lifecycles are untouched");
+    assert_eq!(
+        app.section_ids(),
+        vec![
+            ("alpha".to_string(), vec![1, 2]),
+            ("beta".to_string(), vec![3, 4]),
+        ],
+        "order is unchanged, so nothing reordered the list"
+    );
+    assert!(app.notice().is_none() && app.status.is_none());
+    assert!(app.mode == Mode::Dashboard);
+    // Five presses over two tags: an odd count lands on the second.
+    assert_eq!(app.selected_id, Some(3));
+}
+
 /// Supported crossterm keys and modifiers map to their wire representation.
 #[test]
 fn key_event_maps_to_semantic_key() {

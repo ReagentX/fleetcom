@@ -29,6 +29,7 @@
 | `/` | Jump the selection to a task by name, command, or group (opens the [find palette](#the--find-palette)) |
 | `s` | Cycle grouping: by state / by directory / by custom group |
 | `m` | Tag the selected task "in use" (toggles) |
+| `M` | Move the selection to the next tagged task, wrapping at the end |
 | `g` | Assign the selected task to a group (opens the group picker) |
 | `R` | Rename the selected task: a display name shown in place of the command |
 | `r` | Rerun a finished task; supported agent tasks use the captured resume command |
@@ -127,6 +128,8 @@ Dashboard section labels and within-section directory tiebreaks use the same cas
 Groups belong to task state: an assignment survives client detach and rerun (`r`), and switching grouping modes does not modify it. `g` reassigns the selected task through the [group picker](#the-g-group-picker).
 
 `m` toggles the "in use" tag and marks the task with `◆`. In state mode, tagged tasks form the In use section at the top. In custom mode, a tag moves the task to the top of its existing group rather than creating a global section. Within a dir or custom section, tasks sort as tagged, live, then completed; each class then sorts by directory and spawn order. Idle state does not affect row order in these modes, so a quiet task keeps its position and shows `∙`. State mode instead moves quiet tasks from Running to Idle.
+
+`M` moves the selection to the next tagged task in dashboard order, wrapping at the end; tagging marks a context, `M` switches between them. Untagged tasks are skipped, so the cycle visits only tagged rows regardless of how many lie between them. With nothing tagged the key does nothing: the selection stays put and no mode changes. One tagged task wraps onto itself, leaving the selection unchanged.
 
 In custom mode only, a new command inherits the selected task's group, through both `n` and the `@` picker. The spawn prompt shows the destination as `❯ dir ▸ group ▸ command`, each segment present only when it applies: the dir segment for a non-default directory, the group segment when a group will be inherited. State- and dir-mode spawns start unassigned.
 

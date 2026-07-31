@@ -664,6 +664,27 @@ impl App {
         self.select_section_wrap(false);
     }
 
+    /// Select the next tagged task in display order, wrapping at the end.
+    /// Untagged tasks are skipped, so the cycle visits only the contexts `m`
+    /// marked. Nothing tagged means nothing to move to: the selection stands.
+    /// With one tagged task the scan wraps back onto it, leaving the selection
+    /// where it is rather than clearing it.
+    fn select_next_tagged(&mut self) {
+        let order = self.display_order();
+        if order.is_empty() {
+            return;
+        }
+        // Start one past the selection so a tagged selection advances; without
+        // a selection, start at the top of the list.
+        let start = self.selected_pos(&order).map_or(0, |pos| pos + 1);
+        let next = (0..order.len())
+            .map(|off| order[(start + off) % order.len()])
+            .find(|&i| self.views[i].tagged);
+        if let Some(i) = next {
+            self.selected_id = Some(self.views[i].id);
+        }
+    }
+
     /// Send the desired watch state when its target or attachment mode changes.
     fn set_watch(&mut self, want: Option<(u64, bool)>) {
         if want != self.watched {
@@ -1159,12 +1180,14 @@ impl App {
                 }
             }
             KeyCode::Enter => self.attach(),
+            // Lowercase `m` marks; uppercase `M` moves between marks.
             KeyCode::Char('m') => {
                 if let Some(i) = self.selected_task() {
                     let (id, tagged) = (self.views[i].id, self.views[i].tagged);
                     self.transport.send(Command::Tag { id, on: !tagged });
                 }
             }
+            KeyCode::Char('M') => self.select_next_tagged(),
             KeyCode::Char('g') => self.open_group_picker(),
             KeyCode::Char('/') => self.open_find_palette(),
             // Uppercase R renames; lowercase r reruns.
