@@ -22,6 +22,7 @@ mod task;
 
 // Daemon transport, sessions, and wire protocol.
 mod daemon;
+mod frame;
 mod protocol;
 mod session;
 mod transport;
@@ -35,7 +36,7 @@ mod terminal;
 #[cfg(test)]
 mod testutil;
 
-pub(crate) use terminal::{ansi, emulator, frame, input};
+pub(crate) use terminal::{ansi, emulator, input};
 
 use std::{
     io::{self, IsTerminal},
