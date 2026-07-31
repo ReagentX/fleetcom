@@ -63,9 +63,18 @@ pub trait Harness: Sync {
         }
     }
 
+    /// The tool's program word and its resume selector: `codex` spells the
+    /// selector as a subcommand, the others as a flag. The default
+    /// [`Harness::detect`] and [`Harness::resume_command`] derive from this
+    /// pair, so it is the one place a harness declares its command shape.
+    fn shape(&self) -> (&'static str, &'static str);
+
     /// Classify a command. Return `None` for another tool or an unsupported
     /// command shape.
-    fn detect(&self, cmd: &str) -> Option<Invocation>;
+    fn detect(&self, cmd: &str) -> Option<Invocation> {
+        let (program, selector) = self.shape();
+        detect_shape(cmd, program, selector)
+    }
 
     /// Build spawn-time command and environment additions. `home` is resolved
     /// from the launch environment; `None` uses the harness's platform-home
@@ -89,7 +98,10 @@ pub trait Harness: Sync {
 
     /// Rewrite an accepted `cmd` into the canonical command that resumes
     /// `id`.
-    fn resume_command(&self, cmd: &str, id: &str) -> String;
+    fn resume_command(&self, cmd: &str, id: &str) -> String {
+        let (program, selector) = self.shape();
+        resume_shape(cmd, program, selector, id)
+    }
 }
 
 /// Harness registry in detection order.
@@ -363,30 +375,28 @@ mod tests {
         *,
     };
 
-    /// Harness, program word, selector, and path prefix for the shape tests
-    /// shared by every harness. Codex's resume selector is a subcommand, not
-    /// a flag.
-    static SHAPES: [(&dyn Harness, &str, &str, &str); 3] = [
-        (&Claude, "claude", "--resume", "/usr/local/bin"),
-        (&Codex, "codex", "resume", "/opt/bin"),
-        (&Grok, "grok", "--resume", "/usr/local/bin"),
-    ];
+    /// Path prefix for the shape tests' path-form program words. Detection
+    /// matches by basename, so one prefix covers every harness.
+    const BIN: &str = "/usr/local/bin";
 
     /// Each harness accepts exactly its bare program word (plain or path
-    /// form) and its canonical resume form (bare or quoted ID).
+    /// form) and its canonical resume form (bare or quoted ID). Driving these
+    /// shape tests off [`HARNESSES`] keeps a later harness from being added
+    /// untested.
     #[test]
     fn every_harness_detects_the_two_authored_shapes() {
-        for &(h, prog, sel, path) in &SHAPES {
+        for &h in HARNESSES {
+            let (prog, sel) = h.shape();
             assert_eq!(h.detect(prog), Some(Invocation::Bare), "{prog}");
             assert_eq!(
-                h.detect(&format!("{path}/{prog}")),
+                h.detect(&format!("{BIN}/{prog}")),
                 Some(Invocation::Bare),
                 "{prog}"
             );
             for cmd in [
                 format!("{prog} {sel} {ID}"),
                 format!("{prog} {sel} '{ID}'"),
-                format!("{path}/{prog} {sel} '{ID}'"),
+                format!("{BIN}/{prog} {sel} '{ID}'"),
             ] {
                 assert_eq!(h.detect(&cmd), Some(Invocation::Resume(ID.into())), "{cmd}");
             }
@@ -398,12 +408,13 @@ mod tests {
     /// unchanged.
     #[test]
     fn every_harness_regenerates_the_canonical_resume_form() {
-        for &(h, prog, sel, path) in &SHAPES {
+        for &h in HARNESSES {
+            let (prog, sel) = h.shape();
             let canonical = format!("{prog} {sel} '{ID}'");
             assert_eq!(h.resume_command(prog, ID), canonical, "{prog}");
             assert_eq!(
-                h.resume_command(&format!("{path}/{prog}"), ID),
-                format!("{path}/{prog} {sel} '{ID}'")
+                h.resume_command(&format!("{BIN}/{prog}"), ID),
+                format!("{BIN}/{prog} {sel} '{ID}'")
             );
             assert_eq!(
                 h.resume_command(&format!("{prog} {sel} '{OTHER}'"), ID),
@@ -426,7 +437,8 @@ mod tests {
     /// opacity cases stay in each harness's own test module.
     #[test]
     fn every_harness_keeps_shared_shell_syntax_opaque() {
-        for &(h, prog, sel, _) in &SHAPES {
+        for &h in HARNESSES {
+            let (prog, sel) = h.shape();
             let opaque = [
                 format!("{prog} 'fix the tests'"),
                 format!("{prog} {sel}"),
@@ -449,7 +461,7 @@ mod tests {
                 );
             }
             // Another tool's program word never matches.
-            for other in ["claude", "codex", "grok"] {
+            for other in HARNESSES.iter().map(|o| o.shape().0) {
                 if other != prog {
                     assert_eq!(h.detect(other), None, "{other:?} is not {prog}");
                 }

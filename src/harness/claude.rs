@@ -7,8 +7,8 @@
 use std::{path::Path, time::SystemTime};
 
 use super::{
-    CAPTURE_ENV, CapturePaths, Harness, Invocation, SpawnPlan, detect_shape, is_uuid, last_hint,
-    pin_plan, resume_shape, shell_quote, unique_in_window,
+    CAPTURE_ENV, CapturePaths, Harness, Invocation, SpawnPlan, is_uuid, last_hint, pin_plan,
+    shell_quote, unique_in_window,
 };
 
 pub struct Claude;
@@ -22,8 +22,8 @@ impl Harness for Claude {
         ".claude"
     }
 
-    fn detect(&self, cmd: &str) -> Option<Invocation> {
-        detect_shape(cmd, "claude", "--resume")
+    fn shape(&self) -> (&'static str, &'static str) {
+        ("claude", "--resume")
     }
 
     fn instrument(
@@ -65,10 +65,6 @@ impl Harness for Claude {
             }
             Some(path.file_stem()?.to_str()?.to_string())
         })
-    }
-
-    fn resume_command(&self, cmd: &str, id: &str) -> String {
-        resume_shape(cmd, "claude", "--resume", id)
     }
 }
 

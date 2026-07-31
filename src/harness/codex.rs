@@ -13,8 +13,8 @@ use std::{
 };
 
 use super::{
-    CAPTURE_ENV, CapturePaths, Harness, Invocation, NOTIFY_CHAIN_ENV, SpawnPlan, detect_shape,
-    is_uuid, last_hint, leading_uuid, resume_shape, shell_quote, within_window_ms,
+    CAPTURE_ENV, CapturePaths, Harness, Invocation, NOTIFY_CHAIN_ENV, SpawnPlan, is_uuid,
+    last_hint, leading_uuid, shell_quote, within_window_ms,
 };
 
 pub struct Codex;
@@ -28,8 +28,8 @@ impl Harness for Codex {
         ".codex"
     }
 
-    fn detect(&self, cmd: &str) -> Option<Invocation> {
-        detect_shape(cmd, "codex", "resume")
+    fn shape(&self) -> (&'static str, &'static str) {
+        ("codex", "resume")
     }
 
     fn instrument(
@@ -151,10 +151,6 @@ impl Harness for Codex {
             [only] => Some(only.clone()),
             _ => None,
         }
-    }
-
-    fn resume_command(&self, cmd: &str, id: &str) -> String {
-        resume_shape(cmd, "codex", "resume", id)
     }
 }
 

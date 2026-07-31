@@ -101,12 +101,11 @@ Every captured value eventually enters a shell command, which makes validation t
 
 Each tool implements the `Harness` trait in [`src/harness/mod.rs`](../src/harness/mod.rs). The methods keep detection, evidence collection, and command construction separate:
 
-- `detect` classifies the accepted command shapes.
+- `shape` declares the program word and its resume selector. `detect` and `resume_command` default to deriving the accepted command shapes and the canonical resume form from that pair, so a harness states its shape once.
 - `instrument` returns spawn-time arguments, environment entries, and an optional pinned ID.
 - `parse_capture` reads an ID from hook or notify JSON.
 - `scrape_exit` reads an ID from retained terminal text.
 - `correlate_fs` finds one matching on-disk session.
-- `resume_command` builds the canonical resume form.
 
 The supervisor resolves each harness home from the task's launch environment: the tool-specific variable first, then `$HOME` plus the tool's dot directory. That resolved path remains attached to the task for later filesystem correlation.
 
