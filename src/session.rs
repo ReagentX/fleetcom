@@ -476,7 +476,6 @@ mod tests {
         save_in(&dir, "work", &cfg).unwrap();
         assert_eq!(load_in(&dir, "work").unwrap(), cfg);
         assert_eq!(list_in(&dir), vec!["work".to_string()]);
-        let _ = fs::remove_dir_all(&dir);
     }
 
     /// Saved session names use case-insensitive collation.
@@ -492,7 +491,6 @@ mod tests {
             list_in(&dir),
             vec!["apple".to_string(), "Beta".to_string(), "Zed".to_string()]
         );
-        let _ = fs::remove_dir_all(&dir);
     }
 
     /// Mixed string and object entries survive one serialization round trip.
@@ -507,7 +505,6 @@ mod tests {
 
         save_in(&dir, "mixed", &cfg).unwrap();
         assert_eq!(load_in(&dir, "mixed").unwrap(), cfg);
-        let _ = fs::remove_dir_all(&dir);
     }
 
     /// Every group/name combination survives serialization.
@@ -527,7 +524,6 @@ mod tests {
 
         save_in(&dir, "named", &cfg).unwrap();
         assert_eq!(load_in(&dir, "named").unwrap(), cfg);
-        let _ = fs::remove_dir_all(&dir);
     }
 
     /// String members parse as unadorned entries; flat files have no stored name.
@@ -572,7 +568,6 @@ mod tests {
                 .contains("\"version\": 1")
         );
         assert_eq!(load_in(&dir, "versioned").unwrap(), cfg);
-        let _ = fs::remove_dir_all(&dir);
     }
 
     /// A missing version is interpreted as version 1.
@@ -637,7 +632,6 @@ mod tests {
         let err = load_in(&dir, "future").unwrap_err();
         assert!(err.to_string().contains("version 3"), "{err}");
         assert!(err.to_string().contains("supports 1"), "{err}");
-        let _ = fs::remove_dir_all(&dir);
     }
 
     /// A flat schema treats `version` as metadata, not a directory.
@@ -715,7 +709,6 @@ mod tests {
         let file = save_in(&dir, &name, &cfg).unwrap();
         assert_eq!(file.file_name().unwrap().len(), 255);
         assert_eq!(load_in(&dir, &name).unwrap(), cfg);
-        let _ = fs::remove_dir_all(&dir);
     }
 
     /// Recipe files are owner-only, including after replacing a 0644 file.
@@ -732,7 +725,6 @@ mod tests {
         fs::set_permissions(&file, fs::Permissions::from_mode(0o644)).unwrap();
         save_in(&dir, "keys", &cfg).unwrap();
         assert_eq!(mode(&file), 0o600);
-        let _ = fs::remove_dir_all(&dir);
     }
 
     /// Session directories are created private and existing permissive session
@@ -754,7 +746,6 @@ mod tests {
         fs::set_permissions(&loose, fs::Permissions::from_mode(0o755)).unwrap();
         save_in(&loose, "old", &cfg).unwrap();
         assert_eq!(mode(&loose), 0o700);
-        let _ = fs::remove_dir_all(&base);
     }
 
     /// The temp is renamed away on success; only the recipe remains.
@@ -765,12 +756,11 @@ mod tests {
         cfg.insert("~/p".into(), vec![e("vim")]);
 
         save_in(&dir, "clean", &cfg).unwrap();
-        let names: Vec<String> = fs::read_dir(&dir)
+        let names: Vec<String> = fs::read_dir(&*dir)
             .unwrap()
             .map(|e| e.unwrap().file_name().into_string().unwrap())
             .collect();
         assert_eq!(names, vec!["clean.json".to_string()]);
-        let _ = fs::remove_dir_all(&dir);
     }
 
     /// Saves reject a different name that sanitizes to an occupied filename.
@@ -788,7 +778,6 @@ mod tests {
         assert!(err.to_string().contains("\"a.b\""), "{err}");
         assert!(err.to_string().contains("\"a/b\""), "{err}");
         assert_eq!(load_in(&dir, "a/b").unwrap(), first);
-        let _ = fs::remove_dir_all(&dir);
     }
 
     /// Flat-schema files load and list by filename stem.
@@ -802,7 +791,6 @@ mod tests {
             vec![e("cargo test")]
         );
         assert_eq!(list_in(&dir), vec!["old".to_string()]);
-        let _ = fs::remove_dir_all(&dir);
     }
 
     /// A flat-schema file can be replaced under its filename stem.
@@ -815,7 +803,6 @@ mod tests {
         cfg.insert("~/new".into(), vec![e("top")]);
         save_in(&dir, "mine", &cfg).unwrap();
         assert_eq!(load_in(&dir, "mine").unwrap(), cfg);
-        let _ = fs::remove_dir_all(&dir);
     }
 
     /// Wrapped files list by stored name; flat files list by filename stem.
@@ -831,7 +818,6 @@ mod tests {
         for n in list_in(&dir) {
             load_in(&dir, &n).unwrap();
         }
-        let _ = fs::remove_dir_all(&dir);
     }
 
     /// Fixed instant at 2026-07-14 09:30:15 UTC.
@@ -877,7 +863,6 @@ mod tests {
         let mode = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode(&rec), 0o700);
         assert_eq!(mode(&file), 0o600);
-        let _ = fs::remove_dir_all(&base);
     }
 
     /// Pruning keeps the lexically greatest [`RECOVERY_KEEP`] filenames.
@@ -902,7 +887,6 @@ mod tests {
             .map(|i| format!("20260714-0930{i:02}-{DEAD_FIXTURE_PID}.json"))
             .collect();
         assert_eq!(names, expected, "prune must drop exactly the oldest two");
-        let _ = fs::remove_dir_all(&base);
     }
 
     /// Pruning retains the just-written stem even when it is the oldest.
@@ -936,7 +920,6 @@ mod tests {
             names, expected,
             "the active file plus the nine newest others must remain"
         );
-        let _ = fs::remove_dir_all(&base);
     }
 
     /// Below [`RECOVERY_KEEP`] files, pruning removes nothing.
@@ -956,7 +939,6 @@ mod tests {
             5,
             "no file may be pruned below the retention limit"
         );
-        let _ = fs::remove_dir_all(&base);
     }
 
     /// Pruning retains an older snapshot whose PID is still live.
@@ -987,7 +969,6 @@ mod tests {
             names, expected,
             "the live writer's file must survive; the oldest dead file must not"
         );
-        let _ = fs::remove_dir_all(&base);
     }
 
     /// A snapshot from an exited process is eligible for pruning.
@@ -1013,7 +994,6 @@ mod tests {
             RECOVERY_KEEP,
             "dead-stem retention must converge to the bound"
         );
-        let _ = fs::remove_dir_all(&base);
     }
 
     /// Invalid PID suffixes receive no liveness protection.
@@ -1048,7 +1028,6 @@ mod tests {
             RECOVERY_KEEP,
             "only the well-formed newest files may remain"
         );
-        let _ = fs::remove_dir_all(&base);
     }
 
     /// The recovery directory is excluded from named-session listings.
@@ -1067,7 +1046,6 @@ mod tests {
         .unwrap();
 
         assert_eq!(list_in(&dir), vec!["real".to_string()]);
-        let _ = fs::remove_dir_all(&dir);
     }
 
     /// Listing sorts by descending stem and skips corrupt files.
@@ -1117,7 +1095,6 @@ mod tests {
             entries.iter().all(|en| en.age_secs < 3600),
             "just-written files must read near-zero ages: {entries:?}"
         );
-        let _ = fs::remove_dir_all(&base);
     }
 
     /// Recovery loads reject empty, dotted, or path-shaped stems.
@@ -1150,6 +1127,5 @@ mod tests {
                 .kind(),
             io::ErrorKind::NotFound
         );
-        let _ = fs::remove_dir_all(&base);
     }
 }

@@ -252,7 +252,6 @@ mod tests {
         assert_eq!(assets.codex_notify, ns.join("codex-notify.sh"));
         assert_eq!(mode(&assets.claude_settings), 0o600);
         assert_eq!(mode(&assets.codex_notify), 0o700);
-        let _ = fs::remove_dir_all(&base);
     }
 
     /// Installation creates a distinct namespace, reapplies the root mode, and
@@ -262,7 +261,7 @@ mod tests {
         let root = temp("assets_fresh");
         let first = CaptureAssets::install(&root, std::process::id()).unwrap();
         fs::write(&first.claude_settings, "garbage").unwrap();
-        fs::set_permissions(&root, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::set_permissions(&*root, fs::Permissions::from_mode(0o755)).unwrap();
 
         let second = CaptureAssets::install(&root, std::process::id()).unwrap();
         assert_ne!(
@@ -286,7 +285,6 @@ mod tests {
         assert_eq!(mode(&root), 0o700);
         assert_eq!(mode(&second.claude_settings), 0o600);
         assert_eq!(mode(&second.codex_notify), 0o700);
-        let _ = fs::remove_dir_all(&root);
     }
 
     /// Installation retains live-owner namespaces and non-namespace entries.
@@ -320,7 +318,6 @@ mod tests {
         );
         assert!(assets.claude_settings.exists());
         assert!(assets.codex_notify.exists());
-        let _ = fs::remove_dir_all(&root);
     }
 
     /// A live matching PID retains its namespace and receives a distinct nonce.
@@ -359,7 +356,6 @@ mod tests {
             CODEX_NOTIFY_SCRIPT
         );
         assert_eq!(mode(&ns), 0o700);
-        let _ = fs::remove_dir_all(&root);
     }
 
     /// Installation removes a dead owner's namespace and its contents.
@@ -373,20 +369,18 @@ mod tests {
         let assets = CaptureAssets::install(&root, std::process::id()).unwrap();
         assert!(!dead.exists(), "a dead owner's namespace must be reaped");
         assert!(assets.claude_settings.exists());
-        let _ = fs::remove_dir_all(&root);
     }
 
     /// A namespace-shaped file is not reaped.
     #[test]
     fn install_keeps_a_file_named_like_a_dead_namespace() {
         let root = temp("assets_reap_file");
-        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(&*root).unwrap();
         let decoy = root.join(format!("{}-0123456789ab", dead_pid()));
         fs::write(&decoy, "not a namespace").unwrap();
 
         let _assets = CaptureAssets::install(&root, std::process::id()).unwrap();
         assert!(decoy.exists(), "a file is never a reap candidate");
-        let _ = fs::remove_dir_all(&root);
     }
 
     /// Malformed namespace names are not reaped.
@@ -411,7 +405,6 @@ mod tests {
         for name in names {
             assert!(root.join(name).exists(), "{name:?} must be kept");
         }
-        let _ = fs::remove_dir_all(&root);
     }
 
     /// The notifier overwrites the capture file with its first argument. With
@@ -459,7 +452,6 @@ mod tests {
             .unwrap();
         assert!(out.status.success());
         assert_eq!(fs::read(&cap).unwrap(), second.as_bytes());
-        let _ = fs::remove_dir_all(&root);
     }
 
     /// A configured chain runs after capture and receives its original argv
@@ -490,7 +482,6 @@ mod tests {
             format!("turn-ended\n{payload}\n"),
             "the notifier must receive its original args, payload last"
         );
-        let _ = fs::remove_dir_all(&root);
     }
 
     /// The capture write precedes the chained notifier, whose exit status
@@ -512,7 +503,6 @@ mod tests {
             .unwrap();
         assert!(!out.status.success(), "exec forwards the notifier's status");
         assert_eq!(fs::read(&cap).unwrap(), payload.as_bytes());
-        let _ = fs::remove_dir_all(&root);
     }
 
     /// Without a capture path, the script still execs the configured chain.
@@ -532,7 +522,6 @@ mod tests {
             .unwrap();
         assert!(out.status.success());
         assert_eq!(fs::read_to_string(&record).unwrap(), "payload\n");
-        let _ = fs::remove_dir_all(&root);
     }
 
     /// The hook command serialized into the settings file copies stdin into
@@ -568,7 +557,6 @@ mod tests {
             .unwrap();
         assert!(child.wait().unwrap().success());
         assert_eq!(fs::read_to_string(&cap).unwrap(), payload);
-        let _ = fs::remove_dir_all(&root);
     }
 
     /// Drop removes only the owned namespace and its contents.
@@ -591,7 +579,6 @@ mod tests {
             sibling.join("task-1-0.json").exists(),
             "drop must never touch another process's namespace"
         );
-        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -608,6 +595,5 @@ mod tests {
         );
         assert_eq!(paths.claude_settings, ns.join("claude-settings.json"));
         assert_eq!(paths.codex_notify, ns.join("codex-notify.sh"));
-        let _ = fs::remove_dir_all(&root);
     }
 }

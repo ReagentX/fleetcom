@@ -2,7 +2,7 @@ use super::*;
 use crate::{
     protocol::{Preview, PreviewSource},
     supervisor::Supervisor,
-    testutil::{temp, wait_until},
+    testutil::{Scratch, temp, wait_until},
     transport::LocalTransport,
     ui::scroll_window,
 };
@@ -198,7 +198,6 @@ fn dir_sections_collate_case_insensitively() {
         vec![(a, vec![2]), (z, vec![1])],
         "apple before Zed once the label folds"
     );
-    let _ = std::fs::remove_dir_all(&base);
 }
 
 /// `s` cycles through all grouping modes.
@@ -323,7 +322,6 @@ fn custom_mode_clusters_by_dir_within_group() {
         vec![("alpha".to_string(), vec![2, 3, 1])],
         "dir a's tasks cluster (in id order) ahead of dir b's"
     );
-    let _ = std::fs::remove_dir_all(&base);
 }
 
 /// A manual tag must pull a task out of Completed into In use, even after it
@@ -638,7 +636,6 @@ fn state_mode_ordering_survives_the_row_key_split() {
         ],
         "four sections in state order; within each, dir a before dir b, then id"
     );
-    let _ = std::fs::remove_dir_all(&base);
 }
 
 /// `r` sends `Restart` only for a finished selection. On a running task
@@ -650,8 +647,11 @@ fn rerun_key_is_gated_to_finished_tasks() {
     let mut app = App::new_local(30, 100);
     let dir = temp("app_rerun");
     let marker = dir.join("marker");
-    app.spawn_in("sleep 30", dir.clone()); // id 1: stays running
-    app.spawn_in(&format!("echo run >> {}", marker.display()), dir.clone()); // id 2
+    app.spawn_in("sleep 30", dir.to_path_buf()); // id 1: stays running
+    app.spawn_in(
+        &format!("echo run >> {}", marker.display()),
+        dir.to_path_buf(),
+    ); // id 2
     wait_until(Duration::from_secs(5), || {
         app.pump();
         app.views
@@ -689,11 +689,10 @@ fn rerun_key_is_gated_to_finished_tasks() {
         app.views.iter().any(|v| v.id == 2),
         "rerun must keep the id"
     );
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// Scratch config dir with the given pre-written (empty) session recipes.
-fn session_scratch(tag: &str, names: &[&str]) -> PathBuf {
+fn session_scratch(tag: &str, names: &[&str]) -> Scratch {
     let dir = temp(&format!("app_{tag}"));
     std::fs::create_dir_all(dir.join("sessions")).unwrap();
     for n in names {
@@ -743,7 +742,6 @@ fn o_key_round_trips_the_session_list_through_the_core() {
         vec!["a".to_string(), "b".to_string()],
         "the Sessions reply populates the picker, sorted"
     );
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// A shorter list arriving while the picker is open clamps the selection so
@@ -771,7 +769,6 @@ fn session_selection_clamps_when_a_shorter_list_arrives() {
     app.pump();
     assert!(app.session_names.is_empty());
     assert_eq!(app.session_sel, 0);
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// Write a recovery fixture whose commands run in `dir`.
@@ -832,7 +829,6 @@ fn sessions_reply_populates_and_clamps_both_lists() {
     assert_eq!(app.session_recovery.len(), 1);
     assert_eq!(app.recovery_sel, 0, "recovery selection must clamp");
     assert_eq!(app.session_sel, 0);
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// Reopening the picker resets its page and recovery state.
@@ -860,7 +856,6 @@ fn o_key_resets_the_picker_to_the_saved_page() {
         app.session_recovery.is_empty(),
         "the picker opens empty until the reply lands"
     );
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// Tab does not leave the saved page when no recovery entries exist.
@@ -876,7 +871,6 @@ fn tab_is_a_no_op_without_recovery_entries() {
     assert_eq!(app.session_page, SessionPage::Saved);
     app.on_key_loadsession(key(KeyCode::BackTab));
     assert_eq!(app.session_page, SessionPage::Saved);
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// Tab switches available pages without resetting either selection.
@@ -911,7 +905,6 @@ fn tab_toggles_pages_and_selections_stay_independent() {
     app.on_key_loadsession(key(KeyCode::BackTab));
     assert_eq!(app.session_page, SessionPage::Recovery);
     assert_eq!(app.recovery_sel, 1, "the recovery selection survives too");
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// An empty recovery refresh returns the picker to the saved page.
@@ -940,7 +933,6 @@ fn emptied_recovery_list_returns_to_the_saved_page() {
     app.pump();
     assert!(app.session_recovery.is_empty());
     assert_eq!(app.session_page, SessionPage::Saved);
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// Enter loads the selected recovery stem and displays the resulting status.
@@ -979,7 +971,6 @@ fn enter_on_the_recovery_page_loads_the_selected_stem() {
     );
     assert_eq!(app.views.len(), 1);
     assert_eq!(app.views[0].command, "sleep 7");
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// Esc closes the recovery page.
@@ -999,7 +990,6 @@ fn esc_closes_the_picker_from_the_recovery_page() {
     assert_eq!(app.session_page, SessionPage::Recovery);
     app.on_key_loadsession(key(KeyCode::Esc));
     assert!(matches!(app.mode, Mode::Dashboard));
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// The `@` recent list is the distinct task cwds, newest first.
@@ -1044,12 +1034,11 @@ fn list_dirs_collates_case_insensitively() {
         vec!["apple", "Beta", "cider", "Zed"],
         "byte order would read Beta, Zed, apple, cider"
     );
-    let _ = std::fs::remove_dir_all(&base);
 }
 
 /// Build an `@`-picker fixture with `fleetcom` as the invocation directory,
 /// three sibling task directories, and a `fleetcom/docs` subdirectory.
-fn recents_fixture(tag: &str) -> (App, PathBuf) {
+fn recents_fixture(tag: &str) -> (App, Scratch) {
     let root = temp(tag);
     let rust = root.join("Documents/Code/Rust");
     for name in ["fleetcom", "Logria", "crabapple", "crabstep"] {
@@ -1105,7 +1094,6 @@ fn pickdir_fragment_surfaces_a_sibling_recent() {
         "the match must be a sibling, not a subdirectory"
     );
     assert_eq!(app.dir_sel, 1, "the recent is preselected for Enter");
-    let _ = std::fs::remove_dir_all(&root);
 }
 
 /// Current-task directories use case-insensitive substring matching.
@@ -1126,7 +1114,6 @@ fn pickdir_recent_match_folds_case() {
     app.on_key_pickdir(key(KeyCode::Esc));
     type_pickdir(&mut app, "ria");
     assert_eq!(jump_paths(&app), vec![rust.join("Logria")]);
-    let _ = std::fs::remove_dir_all(&root);
 }
 
 /// A fragment includes every matching current-task directory.
@@ -1143,13 +1130,14 @@ fn pickdir_fragment_surfaces_every_matching_recent() {
         vec![rust.join("crabapple"), rust.join("crabstep")],
         "recents keep their newest-first order"
     );
-    let _ = std::fs::remove_dir_all(&root);
 }
 
 /// Parent components do not match current-task directories.
 #[test]
 fn pickdir_middle_component_matches_no_recent() {
-    let (mut app, root) = recents_fixture("pickdir_recent_middle");
+    // `type_pickdir` scans the fixture tree, so the guard must outlive it.
+    // `_root` stays bound to the end of the scope; bare `_` would drop it here.
+    let (mut app, _root) = recents_fixture("pickdir_recent_middle");
 
     type_pickdir(&mut app, "doc");
 
@@ -1162,7 +1150,6 @@ fn pickdir_middle_component_matches_no_recent() {
     assert_eq!(app.dir_candidates[1].kind, DirKind::Into);
     assert_eq!(app.dir_candidates[1].label, "docs");
     assert_eq!(app.dir_sel, 1, "the subdirectory keeps row 1");
-    let _ = std::fs::remove_dir_all(&root);
 }
 
 /// A `/` omits current-task directories from the picker.
@@ -1197,7 +1184,6 @@ fn pickdir_slash_suppresses_recents() {
     assert!(jump_paths(&app).is_empty());
     assert_eq!(app.dir_candidates[1].path, rust.join("Logria"));
     assert_eq!(app.dir_candidates[1].kind, DirKind::Into);
-    let _ = std::fs::remove_dir_all(&root);
 }
 
 /// An empty field lists every current-task directory.
@@ -1219,7 +1205,6 @@ fn pickdir_empty_input_lists_every_recent() {
         ]
     );
     assert_eq!(app.dir_sel, 0, "an empty field keeps the current dir");
-    let _ = std::fs::remove_dir_all(&root);
 }
 
 /// A current-task directory that is also a subdirectory appears once, using
@@ -1242,7 +1227,6 @@ fn pickdir_dedupes_a_recent_that_is_also_a_subdirectory() {
     assert_eq!(app.dir_candidates.len(), 2);
     assert_eq!(app.dir_candidates[1].kind, DirKind::Jump);
     assert_eq!(app.dir_candidates[1].path, docs);
-    let _ = std::fs::remove_dir_all(&root);
 }
 
 /// Focus is by id, so it points at the same task even after the list shifts
@@ -1911,7 +1895,6 @@ fn attached_wheel_honors_the_childs_1007_veto() {
         run(false, 9, dir.join("dflt")),
         b"\x1b[A\x1b[A\x1b[A".to_vec()
     );
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// Scrollback opens with modified PageUp and closes on Esc or typing.
@@ -2294,7 +2277,7 @@ fn find_does_not_match_the_directory() {
     let mut app = App::new_local(30, 100);
     let dir = temp("findpalettedir");
     let name = dir.file_name().unwrap().to_string_lossy().into_owned();
-    app.spawn_in("sleep 5", dir); // id 1
+    app.spawn_in("sleep 5", dir.to_path_buf()); // id 1
     app.pump();
     assert!(name.contains("findpalettedir"), "scratch dir name: {name}");
 
@@ -2743,7 +2726,7 @@ fn pickdir_right_descends_only_from_the_end() {
     let dir = temp("caret_pickdir");
     std::fs::create_dir_all(dir.join("alpha")).unwrap();
     let mut app = App::new_local(30, 100);
-    app.invocation_dir = dir.clone();
+    app.invocation_dir = dir.to_path_buf();
 
     app.on_key_dashboard(key(KeyCode::Char('@')));
     for c in "al".chars() {
@@ -2767,7 +2750,6 @@ fn pickdir_right_descends_only_from_the_end() {
         "Right at end descends: {:?}",
         app.dir_input.as_str()
     );
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// Typing after caret motion still refreshes the `@` candidates; the
@@ -2777,7 +2759,7 @@ fn pickdir_refreshes_on_edits_not_caret_motion() {
     let dir = temp("caret_pickdir_refresh");
     std::fs::create_dir_all(dir.join("alpha")).unwrap();
     let mut app = App::new_local(30, 100);
-    app.invocation_dir = dir.clone();
+    app.invocation_dir = dir.to_path_buf();
 
     app.on_key_dashboard(key(KeyCode::Char('@')));
     app.on_key_pickdir(key(KeyCode::Char('l')));
@@ -2793,7 +2775,6 @@ fn pickdir_refreshes_on_edits_not_caret_motion() {
         app.dir_candidates.iter().any(|c| c.label == "alpha"),
         "an edit at the caret refreshes the candidates"
     );
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// Caret-positioned edits refresh the group filter like end-of-line ones.
@@ -3069,7 +3050,6 @@ fn set_watch_resends_on_kind_change_with_the_same_id() {
         app.pending_clipboard,
         vec![(ClipboardKind::Clipboard, "post".to_string())]
     );
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// Pending stores emit in order, and the notice counts the last store's characters.
@@ -3185,7 +3165,6 @@ fn attached_status_event_mirrors_into_the_notice() {
     app.pump();
     assert_eq!(app.status.as_deref(), Some("saved 'mirror': 0 command(s)"));
     assert_eq!(app.notice(), Some("saved 'mirror': 0 command(s)"));
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// Dashboard status events do not create an ephemeral notice.
@@ -3197,7 +3176,6 @@ fn dashboard_status_event_sets_only_the_status() {
     app.pump();
     assert_eq!(app.status.as_deref(), Some("saved 'dash': 0 command(s)"));
     assert!(app.notice().is_none(), "no mirror outside attached mode");
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 // --- drag-copy selection ------------------------------------------------
@@ -3478,7 +3456,6 @@ fn mid_drag_mouse_enable_reroutes_the_gesture_to_the_child() {
         got.len() >= 19
     });
     assert_eq!(got, b"\x1b[<32;6;2M\x1b[<0;6;2m".to_vec());
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// Concealed (SGR 8) text reaches the client as the blanks the screen shows,
@@ -3717,7 +3694,6 @@ fn wants_mouse_child_keeps_the_left_button() {
     });
     // SGR: press `\x1b[<0;col+1;row+1M`, drag adds 32, release ends in `m`.
     assert_eq!(got, b"\x1b[<0;3;2M\x1b[<32;6;2M\x1b[<0;6;2m".to_vec());
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 // Frame emission: overlay modes composite by overdraw, so the emulator must

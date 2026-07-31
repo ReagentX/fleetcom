@@ -94,8 +94,8 @@ fn spawn_claude_pins_an_id_and_layers_settings() {
     let dir = scratch("cap_claude");
     let (bin, runtime) = (dir.join("bin"), dir.join("run"));
     install_stub(&bin, "claude", &dir);
-    let mut s = sup_ctx(agent_ctx(&bin, &runtime, dir.clone()));
-    spawn(&mut s, "claude", dir.clone());
+    let mut s = sup_ctx(agent_ctx(&bin, &runtime, dir.to_path_buf()));
+    spawn(&mut s, "claude", dir.to_path_buf());
 
     let argv = wait_argv(&mut s, &dir.join("argv"));
     let si = argv
@@ -159,7 +159,6 @@ fn spawn_claude_pins_an_id_and_layers_settings() {
     );
     assert_eq!(t.resume_id.as_deref(), Some(id.as_str()));
     assert!(t.harness.is_some());
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// An unrecognized command spawns without capture state or assets.
@@ -167,8 +166,8 @@ fn spawn_claude_pins_an_id_and_layers_settings() {
 fn spawn_non_agent_command_is_not_instrumented() {
     let dir = scratch("cap_plain");
     let runtime = dir.join("run");
-    let mut s = sup_ctx(agent_ctx(&dir.join("bin"), &runtime, dir.clone()));
-    spawn(&mut s, "printf ok", dir.clone());
+    let mut s = sup_ctx(agent_ctx(&dir.join("bin"), &runtime, dir.to_path_buf()));
+    spawn(&mut s, "printf ok", dir.to_path_buf());
     let t = &s.tasks[0];
     assert!(t.harness.is_none());
     assert!(t.capture_file.is_none());
@@ -178,7 +177,6 @@ fn spawn_non_agent_command_is_not_instrumented() {
         "a non-agent spawn must not install capture assets"
     );
     assert!(!runtime.exists());
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// A resuming `claude` launch retains its target ID and adds only the
@@ -188,8 +186,12 @@ fn spawn_resuming_claude_injects_only_the_capture_channel() {
     let dir = scratch("cap_resume");
     let (bin, runtime) = (dir.join("bin"), dir.join("run"));
     install_stub(&bin, "claude", &dir);
-    let mut s = sup_ctx(agent_ctx(&bin, &runtime, dir.clone()));
-    spawn(&mut s, format!("claude --resume {CAP_ID}"), dir.clone());
+    let mut s = sup_ctx(agent_ctx(&bin, &runtime, dir.to_path_buf()));
+    spawn(
+        &mut s,
+        format!("claude --resume {CAP_ID}"),
+        dir.to_path_buf(),
+    );
 
     let argv = wait_argv(&mut s, &dir.join("argv"));
     assert!(
@@ -203,7 +205,6 @@ fn spawn_resuming_claude_injects_only_the_capture_channel() {
     let t = &s.tasks[0];
     assert_eq!(t.command, format!("claude --resume {CAP_ID}"));
     assert_eq!(t.resume_id.as_deref(), Some(CAP_ID));
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// Rerun prefers the capture-file ID, stores the resulting resume command,
@@ -214,8 +215,8 @@ fn rerun_resumes_the_captured_conversation() {
     let dir = scratch("cap_rerun");
     let (bin, runtime) = (dir.join("bin"), dir.join("run"));
     install_stub(&bin, "claude", &dir);
-    let mut s = sup_ctx(agent_ctx(&bin, &runtime, dir.clone()));
-    spawn(&mut s, "claude", dir.clone());
+    let mut s = sup_ctx(agent_ctx(&bin, &runtime, dir.to_path_buf()));
+    spawn(&mut s, "claude", dir.to_path_buf());
     let _ = wait_argv(&mut s, &dir.join("argv"));
     let id = s.tasks[0].id;
     wait_for_lifecycle(&mut s, id, |l| l == Lifecycle::Ok);
@@ -256,7 +257,6 @@ fn rerun_resumes_the_captured_conversation() {
         !cap.exists(),
         "rerun must delete the displaced run's capture file"
     );
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// A rerun uses a new capture path, so the displaced run's payload and
@@ -274,10 +274,10 @@ fn rerun_cannot_read_the_old_runs_stale_capture() {
     let mut s = sup_ctx(agent_ctx_plus(
         &bin,
         &runtime,
-        dir.clone(),
+        dir.to_path_buf(),
         &[("FLEETCOM_CONFIG_DIR", &config)],
     ));
-    spawn(&mut s, "claude", dir.clone());
+    spawn(&mut s, "claude", dir.to_path_buf());
     let id = s.tasks[0].id;
     // The capture file still holds the pre-drift session.
     let stale = format!(
@@ -310,7 +310,6 @@ fn rerun_cannot_read_the_old_runs_stale_capture() {
         !text.contains(CAP_OTHER),
         "the old run's stale capture must be unreachable; got {text}"
     );
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// Removing a task also removes its capture file.
@@ -320,8 +319,8 @@ fn remove_deletes_the_capture_file() {
     let dir = scratch("cap_remove");
     let (bin, runtime) = (dir.join("bin"), dir.join("run"));
     install_stub(&bin, "claude", &dir);
-    let mut s = sup_ctx(agent_ctx(&bin, &runtime, dir.clone()));
-    spawn(&mut s, "claude", dir.clone());
+    let mut s = sup_ctx(agent_ctx(&bin, &runtime, dir.to_path_buf()));
+    spawn(&mut s, "claude", dir.to_path_buf());
     let _ = wait_argv(&mut s, &dir.join("argv"));
     let id = s.tasks[0].id;
     wait_for_lifecycle(&mut s, id, |l| l == Lifecycle::Ok);
@@ -330,7 +329,6 @@ fn remove_deletes_the_capture_file() {
 
     s.apply(Command::Remove { id });
     assert!(!cap.exists(), "Remove must delete the task's capture file");
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// Reconnecting with the active root reuses installed assets and preserves
@@ -340,20 +338,19 @@ fn reconnect_with_unchanged_root_preserves_capture_files() {
     let dir = scratch("cap_reconnect");
     let (bin, runtime) = (dir.join("bin"), dir.join("run"));
     install_stub(&bin, "claude", &dir);
-    let mut s = sup_ctx(agent_ctx(&bin, &runtime, dir.clone()));
-    spawn(&mut s, "claude", dir.clone());
+    let mut s = sup_ctx(agent_ctx(&bin, &runtime, dir.to_path_buf()));
+    spawn(&mut s, "claude", dir.to_path_buf());
     let cap = s.tasks[0].capture_file.clone().expect("capture file set");
     std::fs::write(&cap, "{}").unwrap();
 
     // The client reconnects with an identical env and spawns again.
-    s.set_launch_context(agent_ctx(&bin, &runtime, dir.clone()));
-    spawn(&mut s, "claude", dir.clone());
+    s.set_launch_context(agent_ctx(&bin, &runtime, dir.to_path_buf()));
+    spawn(&mut s, "claude", dir.to_path_buf());
     assert_eq!(s.tasks.len(), 2);
     assert!(
         cap.exists(),
         "an unchanged root must not disturb live capture files"
     );
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// Returning to an installed root preserves its live capture files.
@@ -363,17 +360,17 @@ fn returning_to_a_prior_root_preserves_its_live_captures() {
     let (bin, root_a, root_b) = (dir.join("bin"), dir.join("run-a"), dir.join("run-b"));
     install_stub(&bin, "claude", &dir);
     let mut s = Supervisor::new(24, 80, 2000);
-    s.set_launch_context(agent_ctx(&bin, &root_a, dir.clone()));
-    spawn(&mut s, "claude", dir.clone());
+    s.set_launch_context(agent_ctx(&bin, &root_a, dir.to_path_buf()));
+    spawn(&mut s, "claude", dir.to_path_buf());
     let cap_a = s.tasks[0].capture_file.clone().expect("capture file set");
     std::fs::write(&cap_a, "{}").unwrap();
 
     // The client reconnects under root B, spawns, then returns to A and
     // spawns again.
-    s.set_launch_context(agent_ctx(&bin, &root_b, dir.clone()));
-    spawn(&mut s, "claude", dir.clone());
-    s.set_launch_context(agent_ctx(&bin, &root_a, dir.clone()));
-    spawn(&mut s, "claude", dir.clone());
+    s.set_launch_context(agent_ctx(&bin, &root_b, dir.to_path_buf()));
+    spawn(&mut s, "claude", dir.to_path_buf());
+    s.set_launch_context(agent_ctx(&bin, &root_a, dir.to_path_buf()));
+    spawn(&mut s, "claude", dir.to_path_buf());
 
     assert_eq!(s.tasks.len(), 3);
     assert!(
@@ -390,7 +387,6 @@ fn returning_to_a_prior_root_preserves_its_live_captures() {
         ns_b.join("claude-settings.json").is_file(),
         "the interleaved root must keep its own namespaced assets"
     );
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// Remove deletes the capture file under the root the task spawned in,
@@ -402,8 +398,8 @@ fn remove_deletes_the_capture_file_under_the_spawn_root() {
     let (bin, root_a, root_b) = (dir.join("bin"), dir.join("run-a"), dir.join("run-b"));
     install_stub(&bin, "claude", &dir);
     let mut s = Supervisor::new(24, 80, 2000);
-    s.set_launch_context(agent_ctx(&bin, &root_a, dir.clone()));
-    spawn(&mut s, "claude", dir.clone());
+    s.set_launch_context(agent_ctx(&bin, &root_a, dir.to_path_buf()));
+    spawn(&mut s, "claude", dir.to_path_buf());
     let _ = wait_argv(&mut s, &dir.join("argv"));
     let id = s.tasks[0].id;
     wait_for_lifecycle(&mut s, id, |l| l == Lifecycle::Ok);
@@ -412,8 +408,8 @@ fn remove_deletes_the_capture_file_under_the_spawn_root() {
 
     // Root B is installed by a newer spawn; a same-id file under it must
     // survive the A task's removal.
-    s.set_launch_context(agent_ctx(&bin, &root_b, dir.clone()));
-    spawn(&mut s, "claude", dir.clone());
+    s.set_launch_context(agent_ctx(&bin, &root_b, dir.to_path_buf()));
+    spawn(&mut s, "claude", dir.to_path_buf());
     let decoy = s.tasks[1]
         .capture_file
         .as_deref()
@@ -431,7 +427,6 @@ fn remove_deletes_the_capture_file_under_the_spawn_root() {
         decoy.exists(),
         "Remove must not touch the same id under another root"
     );
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// A `codex` spawn receives a `notify=[...]` override naming an executable
@@ -446,10 +441,10 @@ fn spawn_codex_installs_the_notify_override() {
     let mut s = sup_ctx(agent_ctx_plus(
         &bin,
         &runtime,
-        dir.clone(),
+        dir.to_path_buf(),
         &[("CODEX_HOME", &dir.join("codex_home"))],
     ));
-    spawn(&mut s, "codex", dir.clone());
+    spawn(&mut s, "codex", dir.to_path_buf());
 
     let argv = wait_argv(&mut s, &dir.join("argv"));
     let ci = argv
@@ -469,7 +464,6 @@ fn spawn_codex_installs_the_notify_override() {
     assert_eq!(t.command, "codex");
     assert!(t.resume_id.is_none(), "codex cannot pin an id at launch");
     assert!(t.capture_file.is_some());
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// A `grok` spawn receives exactly the pinned ID: no settings overlay,
@@ -484,13 +478,13 @@ fn spawn_grok_pins_an_id_and_injects_nothing_else() {
     let mut s = sup_ctx(agent_ctx_plus(
         &bin,
         &runtime,
-        dir.clone(),
+        dir.to_path_buf(),
         &[
             ("FLEETCOM_CONFIG_DIR", &config),
             ("GROK_HOME", &dir.join("grok_home")),
         ],
     ));
-    spawn(&mut s, "grok", dir.clone());
+    spawn(&mut s, "grok", dir.to_path_buf());
 
     let argv = wait_argv(&mut s, &dir.join("argv"));
     assert_eq!(
@@ -522,7 +516,6 @@ fn spawn_grok_pins_an_id_and_injects_nothing_else() {
         text.contains(&format!("grok --resume '{id}'")),
         "the recipe must resume the pinned session; got {text}"
     );
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// A `claude` exit hint becomes the session ID used by the saved recipe.
@@ -538,10 +531,10 @@ fn exit_hint_is_scraped_and_saved_as_a_resume() {
     let mut s = sup_ctx(agent_ctx_plus(
         &bin,
         &runtime,
-        dir.clone(),
+        dir.to_path_buf(),
         &[("FLEETCOM_CONFIG_DIR", &config)],
     ));
-    spawn(&mut s, "claude", dir.clone());
+    spawn(&mut s, "claude", dir.to_path_buf());
     // No pre-exit synchronization: the scrape's reader-EOF gate means
     // reap can run against the exiting stub at any point and the hint
     // still lands.
@@ -555,7 +548,6 @@ fn exit_hint_is_scraped_and_saved_as_a_resume() {
         text.contains(&format!("claude --resume '{CAP_ID}'")),
         "the recipe must resume the scraped session; got {text}"
     );
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// Saving between process exit and the next reap tick still captures the
@@ -572,10 +564,10 @@ fn save_scrapes_a_finished_task_without_reap() {
     let mut s = sup_ctx(agent_ctx_plus(
         &bin,
         &runtime,
-        dir.clone(),
+        dir.to_path_buf(),
         &[("FLEETCOM_CONFIG_DIR", &config)],
     ));
-    spawn(&mut s, "claude", dir.clone());
+    spawn(&mut s, "claude", dir.to_path_buf());
 
     // Wait out only the residual reader-drain race: after EOF the sole
     // remaining gate is the exit latch, which save's own pass must flip.
@@ -591,7 +583,6 @@ fn save_scrapes_a_finished_task_without_reap() {
         "save must scrape the finished task itself; got {text}"
     );
     assert_eq!(s.tasks[0].scraped_id.as_deref(), Some(CAP_ID));
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// Rerunning between process exit and the next reap tick latches the exit,
@@ -605,8 +596,8 @@ fn rerun_scrapes_a_finished_task_without_reap() {
         "claude",
         &format!("printf 'Resume this session with:\\nclaude --resume {CAP_ID}\\n'"),
     );
-    let mut s = sup_ctx(agent_ctx(&bin, &runtime, dir.clone()));
-    spawn(&mut s, "claude", dir.clone());
+    let mut s = sup_ctx(agent_ctx(&bin, &runtime, dir.to_path_buf()));
+    spawn(&mut s, "claude", dir.to_path_buf());
     let id = s.tasks[0].id;
 
     assert!(
@@ -621,7 +612,6 @@ fn rerun_scrapes_a_finished_task_without_reap() {
         format!("claude --resume '{CAP_ID}'"),
         "rerun must compute its resume command from the exit scrape"
     );
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// Session-ID precedence is exit scrape, capture file, then spawn-time ID.
@@ -644,10 +634,10 @@ fn resume_id_precedence_scrape_over_capture_over_spawn() {
     let mut s = sup_ctx(agent_ctx_plus(
         &bin,
         &runtime,
-        dir.clone(),
+        dir.to_path_buf(),
         &[("FLEETCOM_CONFIG_DIR", &config)],
     ));
-    spawn(&mut s, "claude", dir.clone());
+    spawn(&mut s, "claude", dir.to_path_buf());
     let injected = s.tasks[0]
         .resume_id
         .clone()
@@ -683,7 +673,6 @@ fn resume_id_precedence_scrape_over_capture_over_spawn() {
         text.contains(&format!("claude --resume '{CAP_ID}'")),
         "post-exit the scraped hint must beat the capture file; got {text}"
     );
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// A silent Codex task falls back to one matching rollout under
@@ -701,13 +690,13 @@ fn save_falls_back_to_fs_correlation_for_a_silent_codex() {
     let mut s = sup_ctx(agent_ctx_plus(
         &bin,
         &runtime,
-        dir.clone(),
+        dir.to_path_buf(),
         &[
             ("FLEETCOM_CONFIG_DIR", &config),
             ("CODEX_HOME", &codex_home),
         ],
     ));
-    spawn(&mut s, "codex", dir.clone());
+    spawn(&mut s, "codex", dir.to_path_buf());
     assert!(reap_until(&mut s, Duration::from_secs(5), |s| s.tasks[0]
         .finished
         .is_some()));
@@ -722,7 +711,6 @@ fn save_falls_back_to_fs_correlation_for_a_silent_codex() {
         text.contains(&format!("codex resume '{id}'")),
         "save must fall back to filesystem correlation; got {text}"
     );
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// Save-time correlation uses the task's spawn-time `CODEX_HOME`, even
@@ -741,10 +729,10 @@ fn save_correlates_against_the_spawn_time_home() {
     let mut s = sup_ctx(agent_ctx_plus(
         &bin,
         &runtime,
-        dir.clone(),
+        dir.to_path_buf(),
         &[("FLEETCOM_CONFIG_DIR", &config), ("CODEX_HOME", &home_a)],
     ));
-    spawn(&mut s, "codex", dir.clone());
+    spawn(&mut s, "codex", dir.to_path_buf());
     assert!(reap_until(&mut s, Duration::from_secs(5), |s| s.tasks[0]
         .finished
         .is_some()));
@@ -753,7 +741,7 @@ fn save_correlates_against_the_spawn_time_home() {
     s.set_launch_context(agent_ctx_plus(
         &bin,
         &runtime,
-        dir.clone(),
+        dir.to_path_buf(),
         &[("FLEETCOM_CONFIG_DIR", &config), ("CODEX_HOME", &home_b)],
     ));
     let text = save_and_read(&mut s, &config, "homepin");
@@ -765,7 +753,6 @@ fn save_correlates_against_the_spawn_time_home() {
         !text.contains(&id_b),
         "the reconnect store's decoy must not correlate; got {text}"
     );
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// Home resolution order: the tool's own var, then the launch env's HOME
@@ -823,10 +810,10 @@ fn home_only_launch_env_targets_the_clients_dot_codex() {
     let mut s = sup_ctx(agent_ctx_plus(
         &bin,
         &runtime,
-        dir.clone(),
+        dir.to_path_buf(),
         &[("FLEETCOM_CONFIG_DIR", &config), ("HOME", &home)],
     ));
-    spawn(&mut s, "codex", dir.clone());
+    spawn(&mut s, "codex", dir.to_path_buf());
     assert_eq!(
         s.tasks[0].harness_home.as_deref(),
         Some(codex_home.as_path()),
@@ -846,7 +833,6 @@ fn home_only_launch_env_targets_the_clients_dot_codex() {
         text.contains(&format!("codex resume '{id}'")),
         "correlation must read <home>/.codex; got {text}"
     );
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// With no configured notifier, instrumentation clears an inherited
@@ -871,13 +857,18 @@ fn stale_inherited_notify_chain_is_never_executed() {
         &format!("\"${{FLEETCOM_CAPTURE_FILE%/*}}/codex-notify.sh\" '{payload}'"),
     );
     let mut s = Supervisor::new(24, 80, 2000);
-    let mut ctx = agent_ctx_plus(&bin, &runtime, dir.clone(), &[("CODEX_HOME", &codex_home)]);
+    let mut ctx = agent_ctx_plus(
+        &bin,
+        &runtime,
+        dir.to_path_buf(),
+        &[("CODEX_HOME", &codex_home)],
+    );
     ctx.env.push((
         crate::harness::NOTIFY_CHAIN_ENV.into(),
         stale.as_os_str().to_os_string(),
     ));
     s.set_launch_context(ctx);
-    spawn(&mut s, "codex", dir.clone());
+    spawn(&mut s, "codex", dir.to_path_buf());
     assert!(reap_until(&mut s, Duration::from_secs(5), |s| s.tasks[0]
         .finished
         .is_some()));
@@ -891,7 +882,6 @@ fn stale_inherited_notify_chain_is_never_executed() {
         !record.exists(),
         "the stale inherited chain must not execute"
     );
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// Without a live or filesystem ID, an agent recipe retains the original
@@ -907,13 +897,13 @@ fn agent_save_without_any_id_keeps_the_plain_command() {
     let mut s = sup_ctx(agent_ctx_plus(
         &bin,
         &runtime,
-        dir.clone(),
+        dir.to_path_buf(),
         &[
             ("FLEETCOM_CONFIG_DIR", &config),
             ("CODEX_HOME", &codex_home),
         ],
     ));
-    spawn(&mut s, "codex", dir.clone());
+    spawn(&mut s, "codex", dir.to_path_buf());
     assert!(reap_until(&mut s, Duration::from_secs(5), |s| s.tasks[0]
         .finished
         .is_some()));
@@ -927,7 +917,6 @@ fn agent_save_without_any_id_keeps_the_plain_command() {
         !text.contains("resume"),
         "no id exists, so nothing may be rewritten; got {text}"
     );
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// A representable `notify` assignment runs through the injected notifier
@@ -966,10 +955,10 @@ fn config_toml_notify_chains_through_the_injected_script() {
     let mut s = sup_ctx(agent_ctx_plus(
         &bin,
         &runtime,
-        dir.clone(),
+        dir.to_path_buf(),
         &[("CODEX_HOME", &codex_home)],
     ));
-    spawn(&mut s, "codex", dir.clone());
+    spawn(&mut s, "codex", dir.to_path_buf());
     let argv = wait_argv(&mut s, &dir.join("argv"));
     assert!(
         argv.iter().any(|a| a.starts_with("notify=[")),
@@ -996,7 +985,6 @@ fn config_toml_notify_chains_through_the_injected_script() {
         payload,
         "the capture write must precede the chain handoff"
     );
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// An unrepresentable `notify` value disables injection, while a commented
@@ -1017,10 +1005,10 @@ fn unrepresentable_config_notify_suppresses_injection() {
     let mut s = sup_ctx(agent_ctx_plus(
         &bin,
         &runtime,
-        dir.clone(),
+        dir.to_path_buf(),
         &[("CODEX_HOME", &codex_home)],
     ));
-    spawn(&mut s, "codex", dir.clone());
+    spawn(&mut s, "codex", dir.to_path_buf());
     let argv = wait_argv(&mut s, &dir.join("argv"));
     assert!(
         !argv.iter().any(|a| a.contains("notify=")),
@@ -1034,13 +1022,12 @@ fn unrepresentable_config_notify_suppresses_injection() {
     )
     .unwrap();
     std::fs::remove_file(dir.join("argv")).unwrap();
-    spawn(&mut s, "codex", dir.clone());
+    spawn(&mut s, "codex", dir.to_path_buf());
     let argv = wait_argv(&mut s, &dir.join("argv"));
     assert!(
         argv.iter().any(|a| a.starts_with("notify=[")),
         "a commented notify must not suppress the injection; argv: {argv:?}"
     );
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// Non-agent commands remain plain string entries in persisted JSON.
@@ -1048,8 +1035,12 @@ fn unrepresentable_config_notify_suppresses_injection() {
 fn non_agent_entries_survive_save_as_plain_strings() {
     let dir = scratch("plain_save");
     let config = dir.join("config");
-    let mut s = sup_ctx(config_ctx(&config, dir.clone(), &[("SHELL", "/bin/sh")]));
-    spawn(&mut s, "sleep 30", dir.clone());
+    let mut s = sup_ctx(config_ctx(
+        &config,
+        dir.to_path_buf(),
+        &[("SHELL", "/bin/sh")],
+    ));
+    spawn(&mut s, "sleep 30", dir.to_path_buf());
     let text = save_and_read(&mut s, &config, "plain");
     assert!(
         text.contains("\"sleep 30\""),
@@ -1068,7 +1059,6 @@ fn non_agent_entries_survive_save_as_plain_strings() {
             name: None,
         }]
     );
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// Cadence passes persist changed capture IDs without rewriting stable recipes.
@@ -1080,11 +1070,11 @@ fn recovery_cadence_rewrites_on_capture_drift_and_skips_when_static() {
     let mut s = sup_ctx(agent_ctx_plus(
         &bin,
         &runtime,
-        dir.clone(),
+        dir.to_path_buf(),
         &[("FLEETCOM_CONFIG_DIR", &config)],
     ));
     s.set_recovery_timing(Duration::from_millis(20), Duration::from_millis(100));
-    spawn(&mut s, "claude", dir.clone());
+    spawn(&mut s, "claude", dir.to_path_buf());
     let _ = wait_argv(&mut s, &dir.join("argv"));
 
     let rec = config.join("sessions").join("recovery");
@@ -1133,5 +1123,4 @@ fn recovery_cadence_rewrites_on_capture_drift_and_skips_when_static() {
     );
     let names: Vec<_> = std::fs::read_dir(&rec).unwrap().flatten().collect();
     assert_eq!(names.len(), 1, "one incarnation owns one snapshot file");
-    let _ = std::fs::remove_dir_all(&dir);
 }

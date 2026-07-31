@@ -773,7 +773,6 @@ mod tests {
         let link = base.join("runtime");
         std::os::unix::fs::symlink(&target, &link).unwrap();
         assert!(ensure_runtime_dir(&link).is_err());
-        let _ = fs::remove_dir_all(&base);
     }
 
     #[test]
@@ -782,7 +781,6 @@ mod tests {
         let path = base.join("runtime");
         fs::write(&path, b"x").unwrap();
         assert!(ensure_runtime_dir(&path).is_err());
-        let _ = fs::remove_dir_all(&base);
     }
 
     /// Connection setup rejects symlinked and non-directory runtime paths.
@@ -798,7 +796,6 @@ mod tests {
         let file = base.join("file");
         fs::write(&file, b"x").unwrap();
         assert!(connect_or_autostart_in(&file).is_err());
-        let _ = fs::remove_dir_all(&base);
     }
 
     /// Oversized events are skipped without preventing subsequent writes.
@@ -898,7 +895,6 @@ mod tests {
         let mode = fs::symlink_metadata(&path).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o700, "dir must be private");
         ensure_runtime_dir(&path).unwrap();
-        let _ = fs::remove_dir_all(&base);
     }
 
     /// Reject group- or other-writable directories because they may already
@@ -916,7 +912,6 @@ mod tests {
                 0o700 | bits
             );
         }
-        let _ = fs::remove_dir_all(&base);
     }
 
     /// The notice requires both a flag and an already-running daemon.
@@ -937,7 +932,7 @@ mod tests {
     #[test]
     fn kill_via_socket_bounds_the_handshake_wait() {
         let base = temp("kill_socket_mute");
-        fs::create_dir_all(&base).unwrap();
+        fs::create_dir_all(&*base).unwrap();
         let sock = base.join("mute.sock");
         // Leave the connection queued in the listener backlog.
         let _listener = UnixListener::bind(&sock).unwrap();
@@ -949,14 +944,13 @@ mod tests {
             start.elapsed() < Duration::from_secs(5),
             "the deadline must fire, not the test's timeout"
         );
-        let _ = fs::remove_dir_all(&base);
     }
 
     /// A blocked hello write reports the kill-handshake timeout.
     #[test]
     fn kill_exchange_maps_a_write_timeout() {
         let base = temp("kill_socket_bigenv");
-        fs::create_dir_all(&base).unwrap();
+        fs::create_dir_all(&*base).unwrap();
         let sock = base.join("mute.sock");
         let _listener = UnixListener::bind(&sock).unwrap();
         let mut s = UnixStream::connect(&sock).unwrap();
@@ -965,14 +959,13 @@ mod tests {
         let err = kill_exchange(&mut s, Duration::from_millis(200), 0, &oversized).unwrap_err();
         assert_eq!(err.kind(), ErrorKind::TimedOut);
         assert!(err.to_string().contains("kill handshake"), "{err}");
-        let _ = fs::remove_dir_all(&base);
     }
 
     /// A daemon that keeps the socket open after Shutdown times out the drain.
     #[test]
     fn kill_via_socket_bounds_the_drain_wait() {
         let base = temp("kill_socket_drain");
-        fs::create_dir_all(&base).unwrap();
+        fs::create_dir_all(&*base).unwrap();
         let sock = base.join("stuck.sock");
         let listener = UnixListener::bind(&sock).unwrap();
         let server = thread::spawn(move || {
@@ -987,16 +980,14 @@ mod tests {
         let err = kill_via_socket_at(&sock, Duration::from_millis(300)).unwrap_err();
         assert_eq!(err.kind(), ErrorKind::TimedOut);
         server.join().unwrap();
-        let _ = fs::remove_dir_all(&base);
     }
 
     /// A missing socket makes the fallback a no-op.
     #[test]
     fn kill_via_socket_without_a_socket_is_a_noop() {
         let base = temp("kill_socket_absent");
-        fs::create_dir_all(&base).unwrap();
+        fs::create_dir_all(&*base).unwrap();
         assert!(kill_via_socket_at(&base.join("absent.sock"), Duration::from_millis(100)).is_ok());
-        let _ = fs::remove_dir_all(&base);
     }
 
     /// Remove group and other read/execute permissions from a valid directory.
@@ -1013,6 +1004,5 @@ mod tests {
             0o700,
             "harmless bits must be tightened to 0700"
         );
-        let _ = fs::remove_dir_all(&base);
     }
 }

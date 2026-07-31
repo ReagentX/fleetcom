@@ -352,7 +352,7 @@ mod tests {
     use super::*;
     use crate::{
         harness::fixtures::{OTHER, assert_all_opaque, assert_corpus_scrape, paths},
-        testutil::{temp, v7_at, write_rollout},
+        testutil::{Scratch, temp, v7_at, write_rollout},
     };
 
     /// Codex's own launch and resume commands carry v7 IDs; the shared v4
@@ -391,7 +391,7 @@ mod tests {
     }
 
     /// Scratch home without a `config.toml`.
-    fn no_config_home() -> PathBuf {
+    fn no_config_home() -> Scratch {
         temp("codex_no_config_home")
     }
 
@@ -467,7 +467,6 @@ mod tests {
             assert!(!plan.args_suffix.is_empty(), "{inert:?}");
             assert_eq!(chained(&plan), Some("".into()), "{inert:?}");
         }
-        let _ = fs::remove_dir_all(&home);
     }
 
     /// The newline-joined chain preserves spaces within argv elements.
@@ -490,7 +489,6 @@ mod tests {
             "/Applications/Codex Computer Use.app/Contents/MacOS/SkyComputerUseClient\nturn-ended"
                 .into()
         )));
-        let _ = fs::remove_dir_all(&home);
     }
 
     /// An unrepresentable route disables capture injection.
@@ -522,7 +520,6 @@ mod tests {
                 "{opaque:?}"
             );
         }
-        let _ = fs::remove_dir_all(&home);
     }
 
     #[test]
@@ -700,8 +697,6 @@ mod tests {
         // A missing profile file leaves only the base config.
         fs::write(&cfg, "profile = \"ghost\"\n").unwrap();
         assert_eq!(config_notify_route(Some(&home)), NotifyRoute::Vacant);
-
-        let _ = fs::remove_dir_all(&home);
     }
 
     #[test]
@@ -736,7 +731,6 @@ mod tests {
             Codex.correlate_fs(Path::new("/work/proj"), spawned, Some(&home)),
             None
         );
-        let _ = fs::remove_dir_all(&home);
     }
 
     /// The ±2-day probe includes a rollout in the adjacent day directory.
@@ -768,7 +762,6 @@ mod tests {
                 .as_deref(),
             Some(id.as_str())
         );
-        let _ = fs::remove_dir_all(&home);
     }
 
     /// The scraper recovers an SGR-split exit hint from the corpus bytes after

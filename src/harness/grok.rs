@@ -200,7 +200,6 @@ mod tests {
         // A second in-window session makes the match ambiguous.
         fs::create_dir_all(dir.join(OTHER)).unwrap();
         assert_eq!(Grok.correlate_fs(cwd, now, Some(&home)), None);
-        let _ = fs::remove_dir_all(&home);
     }
 
     #[test]
@@ -210,7 +209,6 @@ mod tests {
         let dir = home.join("sessions").join("%2Fw");
         fs::create_dir_all(dir.join("not-a-session")).unwrap();
         assert_eq!(Grok.correlate_fs(cwd, SystemTime::now(), Some(&home)), None);
-        let _ = fs::remove_dir_all(&home);
     }
 
     /// The scraper recovers the exit-hint ID from the corpus terminal bytes.

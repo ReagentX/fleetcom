@@ -203,7 +203,6 @@ mod tests {
         // A second in-window transcript makes the match ambiguous.
         fs::write(dir.join(format!("{OTHER}.jsonl")), "{}").unwrap();
         assert_eq!(Claude.correlate_fs(cwd, now, Some(&home)), None);
-        let _ = fs::remove_dir_all(&home);
     }
 
     #[test]
@@ -217,7 +216,6 @@ mod tests {
             Claude.correlate_fs(cwd, SystemTime::now(), Some(&home)),
             None
         );
-        let _ = fs::remove_dir_all(&home);
     }
 
     /// The scraper recovers the exit-hint ID from the corpus terminal bytes.
