@@ -4460,9 +4460,13 @@ fn cargo_test_screen(id: u64) -> ScreenView {
 
 /// Paint `app` once and return the frame bytes.
 fn frame(app: &mut App) -> Vec<u8> {
-    let mut out = Vec::new();
+    // OSC 0 names the window. The shell titles it after whatever it is running,
+    // so a captured frame would otherwise wear the `cat` command line. The
+    // client sets no title of its own; this belongs to the capture.
+    let mut out = b"\x1b]0;fleetcom\x07".to_vec();
+    let painted = out.len();
     crate::ui::render(&mut out, app).expect("a fixture frame always paints");
-    assert!(!out.is_empty(), "a fresh App must emit its first frame");
+    assert!(out.len() > painted, "a fresh App must emit its first frame");
     // Park the cursor on the last row. `render_peek` leaves it inside the peek
     // box, so anything a shell prints after `cat` lands mid-frame; the running
     // client never returns to a shell, so only these captures care.
