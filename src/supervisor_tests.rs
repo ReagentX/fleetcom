@@ -2334,7 +2334,7 @@ fn recovery_failed_write_retries_until_success() {
     );
     assert!(
         s.recovery.last_written.is_none(),
-        "a failed write must not advance the dedup pair"
+        "a failed write must not advance the dedup record"
     );
 
     // Remove the blocker; a cadence pass retries the unchanged content.

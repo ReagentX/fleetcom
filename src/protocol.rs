@@ -17,9 +17,6 @@ pub const PROTOCOL_VERSION: u32 = 10;
 /// Dashboard label for a task with no group. The core reserves this exact
 /// spelling so a user-created group can never shadow the section it names:
 /// respell one side only and the reservation stops guarding the label.
-// Nothing references it until `app` and `supervisor` adopt it; `expect` turns
-// into an error the moment they do, so the attribute cannot outlive its cause.
-#[expect(dead_code)]
 pub const UNASSIGNED: &str = "Unassigned";
 
 /// Environment and working directory supplied by the launching client.

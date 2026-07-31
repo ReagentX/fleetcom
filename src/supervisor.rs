@@ -17,7 +17,9 @@ use crate::{
     core::{Wake, Waker},
     harness::{self, assets},
     path,
-    protocol::{Command, Event, LaunchContext, ScreenView, ScrollAction, TaskView, env_get},
+    protocol::{
+        Command, Event, LaunchContext, ScreenView, ScrollAction, TaskView, UNASSIGNED, env_get,
+    },
     session::{self, SessionConfig, SessionEntry},
     task::{Task, WriteRefused},
 };
@@ -117,9 +119,9 @@ fn normalize_label(label: Option<String>) -> Option<String> {
 }
 
 /// Normalize a group assignment and map the case-sensitive reserved label
-/// `Unassigned` to `None`. Display names do not reserve this label.
+/// [`UNASSIGNED`] to `None`. Display names do not reserve this label.
 fn normalize_group(name: Option<String>) -> Option<String> {
-    normalize_label(name).filter(|g| g != "Unassigned")
+    normalize_label(name).filter(|g| g != UNASSIGNED)
 }
 
 /// Return the 64-bit FNV-1a hash used to separate fallback capture roots. The
@@ -176,9 +178,12 @@ struct Recovery {
     last_mutation: Option<Instant>,
     /// The start of the most recent cadence interval.
     last_cadence: Instant,
-    /// Sessions root and recipe fingerprint of the last successful write.
-    /// A match is skipped only while the corresponding snapshot still exists.
-    last_written: Option<(PathBuf, String)>,
+    /// Sessions root, written snapshot path, and recipe fingerprint of the last
+    /// successful write. A match is skipped only while that snapshot still
+    /// exists. The path comes back from `save_recovery_in` rather than being
+    /// rebuilt here: a rebuilt path that stopped matching `session`'s naming
+    /// rule would miss forever and silently rewrite on every pass.
+    last_written: Option<(PathBuf, PathBuf, String)>,
     /// Filename stem reused for this supervisor's recovery writes.
     stem: String,
     /// Whether a write failure has been reported since the last successful write.
@@ -347,16 +352,9 @@ impl Supervisor {
             } => self.spawn(&command, cwd, group),
             Command::Kill { id } => self.with_task(id, Task::terminate),
             Command::Remove { id } => {
-                // Keep removed tasks for TERM→KILL escalation and reaping.
                 if let Some(i) = self.index_of(id) {
-                    let mut t = self.tasks.remove(i);
-                    t.terminate();
-                    // Remove the task's own capture file; the current client
-                    // may use a different capture root.
-                    if let Some(cap) = &t.capture_file {
-                        let _ = std::fs::remove_file(cap);
-                    }
-                    self.graveyard.push(t);
+                    let t = self.tasks.remove(i);
+                    self.retire(t);
                 }
             }
             Command::Restart { id } => self.rerun(id),
@@ -609,13 +607,14 @@ impl Supervisor {
         let hash = fnv1a_hex(session::fingerprint_json(&cfg).as_bytes());
         // Deduplication is scoped to the current root and requires the snapshot
         // to remain on disk, so a removed snapshot is recreated on a due pass.
-        let dest = session::recovery_dir(&root).join(format!("{}.json", self.recovery.stem));
+        // The root is compared as well as the path because a reconnecting
+        // client can move the sessions root; the recorded path belongs to
+        // whichever root was current when it was written.
         if self
             .recovery
             .last_written
             .as_ref()
-            .is_some_and(|(r, h)| *r == root && *h == hash)
-            && std::fs::metadata(&dest).is_ok()
+            .is_some_and(|(r, dest, h)| *r == root && *h == hash && std::fs::metadata(dest).is_ok())
         {
             self.recovery.dirty = false;
             return;
@@ -627,8 +626,8 @@ impl Supervisor {
             &label,
             &cfg,
         ) {
-            Ok(_) => {
-                self.recovery.last_written = Some((root, hash));
+            Ok(dest) => {
+                self.recovery.last_written = Some((root, dest, hash));
                 self.recovery.failing = false;
             }
             Err(e) => {
@@ -666,6 +665,19 @@ impl Supervisor {
         if let Some(t) = self.by_id_mut(id) {
             f(t);
         }
+    }
+
+    /// Retire a task already lifted out of the set: TERM now, unlink its
+    /// capture, then the graveyard for grace-then-KILL escalation and reaping.
+    /// Unlink through the task's own `capture_file` because the current
+    /// client's capture root can differ from the one that spawned it. Never
+    /// drop the task instead: that straight-SIGKILLs stragglers of its run.
+    fn retire(&mut self, mut t: Task) {
+        t.terminate();
+        if let Some(cap) = &t.capture_file {
+            let _ = std::fs::remove_file(cap);
+        }
+        self.graveyard.push(t);
     }
 
     /// Route one input send to task `id`, reporting a bounded-queue refusal.
@@ -863,17 +875,11 @@ impl Supervisor {
                 fresh.tagged = self.tasks[i].tagged;
                 fresh.group = self.tasks[i].group.clone();
                 fresh.name = self.tasks[i].name.clone();
-                // The displaced task exits like a Remove: TERM now, the
-                // graveyard's grace-then-KILL behind it. Dropping it here
-                // would straight-SIGKILL stragglers of the old run.
-                let mut old = std::mem::replace(&mut self.tasks[i], fresh);
-                old.terminate();
-                // Delete the displaced run's capture after deriving its resume
-                // command. Use the task's path because capture roots can vary.
-                if let Some(cap) = &old.capture_file {
-                    let _ = std::fs::remove_file(cap);
-                }
-                self.graveyard.push(old);
+                // The displaced task exits like a Remove. Retire it only after
+                // the resume command above is derived: `retire` unlinks the
+                // capture that command's ID may have come from.
+                let old = std::mem::replace(&mut self.tasks[i], fresh);
+                self.retire(old);
                 // Reset the fingerprint for the replacement task's screen.
                 if self.watched == Some(id) {
                     self.last_screen = None;
@@ -1038,7 +1044,8 @@ impl Supervisor {
         let Some((spawned, skipped, failed)) = self.materialize(&cfg) else {
             return;
         };
-        // Omit zero buckets, except report zero tasks for an empty recipe.
+        // Omit a zero task count too, except for an empty recipe: with no other
+        // clause to carry it, the notice would report nothing at all.
         let mut parts = Vec::new();
         if spawned > 0 || (skipped == 0 && failed == 0) {
             parts.push(format!("{spawned} task(s)"));
@@ -1062,6 +1069,8 @@ impl Supervisor {
         let Some((_, skipped, failed)) = self.materialize(&cfg) else {
             return;
         };
+        // A fixed head always precedes these clauses, so each takes the
+        // separator; `load_session` joins because its head can be absent.
         let mut msg = String::from("loaded recovery snapshot; save to name it");
         if skipped > 0 {
             msg.push_str(&format!(", {skipped} skipped ({SKIP_REASONS})"));
