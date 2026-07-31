@@ -22,11 +22,15 @@ Press `Enter` to take control of a task, then `Ctrl-\` to return to the dashboar
 
 ![`fleetcom` attach](docs/img/attach.png)
 
+### Custom groups
+
+Organize related tasks into named groups, even when they run in different directories.
+
+![`fleetcom` custom-group view](docs/img/groups.png)
+
 ### Resume agent sessions
 
 Start `claude`, `codex`, or `grok` normally. When you rerun the task or reload a saved session, `fleetcom` resumes the same conversation automatically.
-
-![`fleetcom` group view](docs/img/groups.png)
 
 ## Operational model
 
@@ -55,7 +59,7 @@ For normal use, install the published crate from [crates.io](https://crates.io/c
 cargo install fleetcom
 ```
 
-[`docs/commands.md`](docs/README.md#installation-from-source) covers advanced installation.
+[Source installation](docs/README.md#installation-from-source) covers builds from a repository clone.
 
 ## Usage
 
@@ -65,7 +69,7 @@ Connect to the daemon, autostarting it when necessary, and open the dashboard by
 fleetcom
 ```
 
-[`docs/commands.md`](docs/commands.md#invocation) covers advanced usage.
+The [invocation reference](docs/commands.md#invocation) covers sessions, foreground mode, scrollback, and daemon shutdown.
 
 ## Key Commands
 
@@ -81,7 +85,7 @@ The dashboard shows two short key hints; `?` opens an expanded key reference:
 ### Attached
 
 - `Ctrl-\` backgrounds the task and returns to the dashboard.
-- Every other key reaches the task's PTY.
+- Other supported input is forwarded to the task's PTY.
 
 [`docs/commands.md`](docs/commands.md#dashboard) covers every key and launch flag, including the routing mechanics.
 
