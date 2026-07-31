@@ -119,14 +119,14 @@ A `TERM`-ignoring member can also survive when its leader exits during shutdown.
 `s` cycles three grouping modes: state, dir, custom. The header shows the strip `by state · dir · custom` with the active mode bold and the rest dim.
 
 - By state: In use / Running / Idle / Completed. A running task files under Idle after 10 s without output; Completed stays one section (`✓`/`✗` show exit status).
-- By dir: one section per working directory; the invocation directory first, the rest sorted by name.
-- By custom group: one section per group name, sorted by name, with Unassigned last. Fresh spawns remain unassigned unless they inherit a group, and the Unassigned section exists only while it has a member.
+- By dir: one section per working directory; the invocation directory first, then the remaining labels sorted without regard to case.
+- By custom group: one section per group name, sorted without regard to case, with Unassigned last. Fresh spawns remain unassigned unless they inherit a group, and the Unassigned section exists only while it has a member.
 
-Every name sort ignores case, section labels and the within-section directory tiebreak alike: `API` files next to `api`, not ahead of every lowercase name. Names differing only by case sort adjacent and stay distinct — group comparison remains case-sensitive, so `API` and `api` are two sections, in a fixed order that does not shift between renders.
+Dashboard section labels and within-section directory tiebreaks use the same case-insensitive order. Names that differ only by case sort next to each other in a deterministic order. Group identity remains case-sensitive, so `API` and `api` stay separate sections.
 
 Groups belong to task state: an assignment survives client detach and rerun (`r`), and switching grouping modes does not modify it. `g` reassigns the selected task through the [group picker](#the-g-group-picker).
 
-`m` toggles the "in use" tag and marks the task with `◆`. In state mode, tagged tasks form the In use section at the top. In custom mode, a tag moves the task to the top of its existing group rather than creating a global section. Within a dir or custom section, the order is tagged, live, completed; each bucket then sorts by directory and spawn order. The idle transition is absent from that order by design: it reverses on its 10-second timer, so ranking on it moved a row twice per interaction, both times off screen. A task that goes quiet keeps its row and shows `∙`. State mode still separates Running from Idle, because there the split is the section, not the row order.
+`m` toggles the "in use" tag and marks the task with `◆`. In state mode, tagged tasks form the In use section at the top. In custom mode, a tag moves the task to the top of its existing group rather than creating a global section. Within a dir or custom section, tasks sort as tagged, live, then completed; each class then sorts by directory and spawn order. Idle state does not affect row order in these modes, so a quiet task keeps its position and shows `∙`. State mode instead moves quiet tasks from Running to Idle.
 
 In custom mode only, a new command inherits the selected task's group, through both `n` and the `@` picker. The spawn prompt shows the destination as `❯ dir ▸ group ▸ command`, each segment present only when it applies: the dir segment for a non-default directory, the group segment when a group will be inherited. State- and dir-mode spawns start unassigned.
 
@@ -150,17 +150,17 @@ Typing filters the rows; `Backspace` deletes one character and the matches re-fi
 
 ## The `/` find palette
 
-`/` opens a bottom panel over the dashboard listing the tasks that match what you type. Each row reads `<glyph> <label> · <section>`: the task's status glyph, its name (or its command when unnamed), and the section it currently sits in. Empty input lists the whole fleet, and every list is in dashboard order, so the panel reads the same way as the list behind it. With no tasks, `/` does nothing.
+`/` opens a bottom panel listing tasks that match the query. Each row reads `<glyph> <label> · <section>`: the status glyph, display name (or command when unnamed), and current section. Empty input lists the whole fleet. Results follow dashboard order. With no tasks, `/` does nothing.
 
-Matching is a case-insensitive substring of three fields: name, command, and group. Substring, not prefix: `eep` finds `sleep 5`. A name adds a field rather than replacing one, so a task renamed `api tests` is still reachable by typing `cargo`.
+Matching checks case-insensitive substrings in the name, command, and group. For example, `eep` finds `sleep 5`. A display name adds a searchable field without replacing the command, so a task named `api tests` can still match `cargo`.
 
-The working directory is not matched. In a monorepo every task shares one directory, and cross-repo tasks often carry `~` as their base, so the directory separates nothing.
+The working directory is not a match field.
 
-`Enter` moves the dashboard selection to the highlighted task and closes the panel. It does not attach: `Enter` attaches from the dashboard, so `/api` `Enter` `Enter` attaches and `/api` `Enter` `Space` peeks. With nothing matched, `Enter` leaves the panel open so the query can be corrected. `↑`/`↓` move the highlight; `Esc` closes and leaves the selection where it was. The palette changes nothing else: no task is spawned, tagged, grouped, renamed, or killed through it.
+`Enter` moves the dashboard selection to the highlighted task and closes the panel; it does not attach. Press `Enter` again from the dashboard to attach, or `Space` to peek. With no matches, `Enter` leaves the panel open. `↑`/`↓` move the highlight. `Esc` closes the panel without changing the selection.
 
 ## The `g` group picker
 
-`g` on a selected task opens a bottom panel with the same structure as the `@` picker: a typed-name field plus the matching rows. Row 0 is always Unassigned, so the list is never empty; the fleet's existing group names follow, sorted ignoring case to match the filter, filtered by case-insensitive prefix as you type. The task's current group is marked `(current)`.
+`g` on a selected task opens a bottom panel with a typed-name field and matching rows. Row 0 is always Unassigned, so the list is never empty. Existing group names follow in case-insensitive order and are filtered by case-insensitive prefix. The task's current group is marked `(current)`.
 
 `Enter` acts on the highlighted row, and the hint line names the action:
 

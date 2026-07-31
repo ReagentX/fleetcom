@@ -619,9 +619,7 @@ fn render_pickgroup(out: &mut impl Write, app: &App) -> io::Result<()> {
     )
 }
 
-/// The `/` palette: a bottom panel with the typed text and the matching tasks,
-/// `find_sel` highlighted. Each row names the task and the section it sits in,
-/// so a jump is aimed at a known place in the list behind the panel.
+/// Render the `/` palette with matching tasks in dashboard order.
 fn render_find(out: &mut impl Write, app: &App) -> io::Result<()> {
     let sections = app.sections();
     let section_of = |id: u64| -> &str {
@@ -640,8 +638,7 @@ fn render_find(out: &mut impl Write, app: &App) -> io::Result<()> {
                 display_label(v),
                 section_of(id)
             ),
-            // A snapshot removed the task after the last refresh. Keep the row
-            // so the highlight still lines up with `find_candidates`.
+            // Preserve row alignment if a snapshot removed this task.
             None => String::new(),
         })
         .collect();

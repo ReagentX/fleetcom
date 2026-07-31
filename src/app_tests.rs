@@ -125,11 +125,8 @@ fn dir_mode_groups_by_cwd() {
     assert_eq!(s[1].0, "/tmp");
 }
 
-/// Group sections collate case-insensitively. Byte order would read
-/// `API, Review, api, zebra`, stranding `API` at the opposite end of the list
-/// from `api`; folded order reads `API, api, Review, zebra`. The two `api`
-/// sections stay separate, because group identity remains case-sensitive:
-/// merging them would be a data bug, not a display change.
+/// Custom-group labels sort case-insensitively without merging case-distinct
+/// groups.
 #[test]
 fn custom_sections_collate_case_insensitively() {
     let mut app = App::new_local(30, 100);
@@ -153,8 +150,7 @@ fn custom_sections_collate_case_insensitively() {
     );
 }
 
-/// Dir-mode section labels collate too. `Zed` and `apple` discriminate: byte
-/// order puts `Zed` first, folded order puts `apple` first.
+/// Directory-section labels use case-insensitive collation.
 #[test]
 fn dir_sections_collate_case_insensitively() {
     let mut app = App::new_local(30, 100);
@@ -428,9 +424,7 @@ fn selection_follows_task_across_parked_rebucket() {
     assert_eq!(app.views[app.selected_task().unwrap()].id, 1);
 }
 
-/// Row order ignores `parked`, so going quiet does not move a task inside its
-/// Custom group. The flip reverses on the 10 s window; ranking on it made a row
-/// travel twice per interaction, out of sight of a user attached elsewhere.
+/// Idle state does not affect row order within a custom group.
 #[test]
 fn custom_mode_parked_task_holds_its_row() {
     let mut app = App::new_local(30, 100);
@@ -450,8 +444,7 @@ fn custom_mode_parked_task_holds_its_row() {
     );
 }
 
-/// Same guarantee one section wider: dir mode also holds a row through the
-/// quiet transition.
+/// Idle state does not affect row order within a directory section.
 #[test]
 fn dir_mode_parked_task_holds_its_row() {
     let mut app = App::new_local(30, 100);
@@ -472,8 +465,7 @@ fn dir_mode_parked_task_holds_its_row() {
     );
 }
 
-/// `parked` round trip: the row sits in the same place before, during, and
-/// after the quiet window. This is the property the sort key now guarantees.
+/// Entering and leaving idle state preserves row order.
 #[test]
 fn parked_round_trip_leaves_row_order_identical() {
     let mut app = App::new_local(30, 100);
@@ -494,8 +486,7 @@ fn parked_round_trip_leaves_row_order_identical() {
     assert_eq!(app.section_ids(), want, "waking does not move id 2 back");
 }
 
-/// Finished is monotonic, so it stays in the row key: a completed task sinks
-/// below its live siblings inside a Custom group.
+/// Completed tasks sort after live tasks within a custom group.
 #[test]
 fn custom_mode_finished_sinks_within_group() {
     let mut app = App::new_local(30, 100);
@@ -516,7 +507,7 @@ fn custom_mode_finished_sinks_within_group() {
     );
 }
 
-/// The same monotonic sink in dir mode.
+/// Completed tasks sort after live tasks within a directory section.
 #[test]
 fn dir_mode_finished_sinks_within_section() {
     let mut app = App::new_local(30, 100);
@@ -537,8 +528,7 @@ fn dir_mode_finished_sinks_within_section() {
     );
 }
 
-/// A tag is user-controlled, so it stays in the row key: the tagged task floats
-/// to the top of its Custom group and holds that row when it goes quiet.
+/// Tagged tasks sort first within a custom group, including while idle.
 #[test]
 fn custom_mode_tagged_task_floats_and_holds_while_parked() {
     let mut app = App::new_local(30, 100);
@@ -560,20 +550,13 @@ fn custom_mode_tagged_task_floats_and_holds_while_parked() {
     );
 }
 
-/// State mode is unchanged by the row-key split, because within a State section
-/// every member shares one `row_rank`: In use all tagged, Running and Idle all
-/// live, Completed all finished. A constant contributes nothing to the sort, so
-/// section order and within-section order (directory, then id) stand exactly as
-/// before. Asserting the whole shape catches a collapsed Running/Idle split or
-/// a `dir_label` dropped from the sort key.
+/// State mode orders In use, Running, Idle, and Completed sections, with rows
+/// ordered by directory then task ID.
 #[test]
 fn state_mode_ordering_survives_the_row_key_split() {
     let mut app = App::new_local(30, 100);
     let base = temp("app_state_order");
-    // `apple` and `Zed` disagree between the two collations — byte order puts
-    // `Zed` first, folded order puts `apple` first — so this test also locks
-    // the half of the collation change that State mode is not neutral to: the
-    // within-section `dir_label` tiebreak.
+    // Mixed-case paths make the directory tiebreak observable.
     let (dir_a, dir_b) = (base.join("apple"), base.join("Zed"));
     std::fs::create_dir_all(&dir_a).unwrap();
     std::fs::create_dir_all(&dir_b).unwrap();
@@ -599,10 +582,7 @@ fn state_mode_ordering_survives_the_row_key_split() {
     }
     app.pump();
 
-    // Pin `parked` in both directions after the last pump. Later than the last
-    // pump because a fresh core snapshot would overwrite it; both directions
-    // because ids 1, 2, and 5 print nothing, so on a loaded machine they would
-    // cross the real 10 s window and desert Running before the assert.
+    // Override the time-dependent idle state after the final snapshot.
     for (id, parked) in [
         (1u64, false),
         (2, false),
@@ -1020,18 +1000,14 @@ fn picker_puts_current_dir_first_and_selected() {
     assert_eq!(app.dir_candidates[0].path, app.invocation_dir);
 }
 
-/// Subdirectory rows collate case-insensitively, matching the case-insensitive
-/// prefix filter above them. `read_dir` yields entries in arbitrary order, so
-/// this also pins the panel's determinism. The names differ by more than case:
-/// APFS is case-insensitive by default, so `API` and `api` cannot coexist as
-/// directories on this machine.
+/// Subdirectory rows use the same case-insensitive order as their filter.
 #[test]
 fn list_dirs_collates_case_insensitively() {
     let base = temp("app_list_dirs_collate");
     for name in ["Zed", "apple", "Beta", "cider"] {
         std::fs::create_dir_all(base.join(name)).unwrap();
     }
-    // A file is not a directory row, and neither is a dotfile.
+    // Exclude files and hidden directories.
     std::fs::write(base.join("Alpha.txt"), b"x").unwrap();
     std::fs::create_dir_all(base.join(".hidden")).unwrap();
 
@@ -1629,8 +1605,8 @@ fn group_picker_opens_on_g_only_with_a_selection() {
     assert_eq!(app.group_target, Some(1));
 }
 
-/// Picker candidates are the distinct groups, collated, after Unassigned, with
-/// the target's assignment marked "(current)".
+/// Group candidates are distinct, case-insensitively sorted, and follow
+/// Unassigned. The target's group is marked "(current)".
 #[test]
 fn group_candidates_are_distinct_sorted_and_marked() {
     let mut app = App::new_local(30, 100);
@@ -1664,10 +1640,8 @@ fn group_candidates_are_distinct_sorted_and_marked() {
     assert_eq!(app.group_candidates[0].label, "Unassigned (current)");
 }
 
-/// The picker's group rows collate case-insensitively, matching the filter that
-/// already lowercases both sides. Unassigned stays pinned at row 0, and `API`
-/// and `api` both survive: the sort orders, `dedup` still removes only exact
-/// duplicates.
+/// Group candidates sort case-insensitively while preserving case-distinct
+/// names and removing exact duplicates.
 #[test]
 fn group_candidates_collate_case_insensitively() {
     let mut app = App::new_local(30, 100);
@@ -1810,7 +1784,7 @@ fn group_esc_cancels_without_sending() {
 
 // --- `/` find palette ---------------------------------------------------
 
-/// Candidate ids for the current palette state.
+/// Candidate IDs for the current palette state.
 fn find_ids(app: &App) -> Vec<u64> {
     app.find_candidates.clone()
 }
@@ -1822,8 +1796,7 @@ fn find_type(app: &mut App, text: &str) {
     }
 }
 
-/// `/` needs tasks, not a selection: it no-ops on an empty fleet and opens
-/// before anything is selected.
+/// The find palette requires at least one task but no current selection.
 #[test]
 fn find_palette_opens_on_slash_only_with_tasks() {
     let mut app = App::new_local(30, 100);
@@ -1840,8 +1813,7 @@ fn find_palette_opens_on_slash_only_with_tasks() {
     assert_eq!(find_ids(&app), vec![1]);
 }
 
-/// Candidates arrive in display order, not id order: tagging id 3 floats it
-/// to the top of the list and to the top of the palette with it.
+/// Find candidates follow dashboard order rather than task-ID order.
 #[test]
 fn find_candidates_follow_display_order() {
     let mut app = App::new_local(30, 100);
@@ -1908,8 +1880,7 @@ fn find_matches_case_insensitive_substrings() {
     assert_eq!(find_ids(&app), vec![2], "matches mid-command of \"true\"");
 }
 
-/// A renamed task keeps matching its command: the name is another haystack,
-/// not a replacement for one.
+/// A named task matches both its display name and command.
 #[test]
 fn find_matches_a_named_task_on_both_fields() {
     let mut app = App::new_local(30, 100);
@@ -1946,8 +1917,7 @@ fn find_matches_group_names() {
     assert_eq!(find_ids(&app), vec![1]);
 }
 
-/// The working directory is not a match field: a task spawned in a uniquely
-/// named directory is unreachable by that name.
+/// Find does not match working-directory names.
 #[test]
 fn find_does_not_match_the_directory() {
     let mut app = App::new_local(30, 100);
@@ -1965,7 +1935,7 @@ fn find_does_not_match_the_directory() {
         find_ids(&app)
     );
 
-    // The same task is reachable through a field that is matched.
+    // The command remains searchable.
     app.on_key_find(key(KeyCode::Esc));
     app.on_key_dashboard(key(KeyCode::Char('/')));
     find_type(&mut app, "sleep");
@@ -2019,8 +1989,7 @@ fn find_esc_leaves_the_selection_alone() {
     assert_eq!(app.find_sel, 0);
 }
 
-/// Enter on an empty candidate list changes nothing and keeps the panel open,
-/// so a typo can be corrected in place.
+/// Enter with no candidates keeps the palette open and preserves selection.
 #[test]
 fn find_enter_without_candidates_keeps_the_panel_open() {
     let mut app = App::new_local(30, 100);
@@ -2036,7 +2005,7 @@ fn find_enter_without_candidates_keeps_the_panel_open() {
     assert!(app.mode == Mode::Find, "no match: Enter must not close");
     assert_eq!(app.selected_id, Some(1), "selection is untouched");
 
-    // Correcting the query recovers a match.
+    // Editing the query refreshes candidates.
     for _ in 0.."zzz".len() {
         app.on_key_find(key(KeyCode::Backspace));
     }
@@ -2044,8 +2013,7 @@ fn find_enter_without_candidates_keeps_the_panel_open() {
     assert_eq!(find_ids(&app), vec![1]);
 }
 
-/// The panel paints its rows as `<glyph> <label> · <section>`, and says so
-/// when a query matches nothing.
+/// Find rows include status, label, and section; empty results show a message.
 #[test]
 fn find_panel_rows_name_the_task_and_its_section() {
     let mut app = App::new_local(30, 100);
@@ -2072,7 +2040,7 @@ fn find_panel_rows_name_the_task_and_its_section() {
     assert!(frame.contains("(no matching tasks)"), "{frame:?}");
 }
 
-/// A paste lands in the palette field and re-filters, like the other pickers.
+/// Pasting into the find field refreshes its candidates.
 #[test]
 fn find_paste_filters_the_candidates() {
     let mut app = App::new_local(30, 100);

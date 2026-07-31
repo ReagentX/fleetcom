@@ -8,7 +8,7 @@
 - [How it works](how-it-works.md): the PTY emulation, input routing, and activity grouping
 - [Sessions](sessions.md): the task recipe format and where it lives
 - [Agent session resume](agent-resume.md): how `fleetcom` captures and resumes supported `claude`, `codex`, and `grok` sessions
-- [Storage paths](#storage-paths): the socket, the lock, and the session paths
+- [Storage paths](#storage-paths): runtime and session paths
 - [First-run walkthrough](#first-run-walkthrough): a first run, start to finish
 - [Security](#security): the trust boundary, on-disk state, and what is not protected
 - [Operational constraints](#operational-constraints): process and protocol boundaries
@@ -25,9 +25,9 @@ From a repository clone:
 
 ## Storage paths
 
-Runtime state contains the daemon socket and lock. Configuration contains durable session recipes. The paths resolve independently.
+Runtime state contains the daemon socket, lock, and log. Configuration contains durable session recipes. The paths resolve independently.
 
-### Runtime directory (socket + lock)
+### Runtime directory (socket + lock + log)
 
 The runtime directory holds `default.sock`, the client↔daemon socket; `daemon.lock`, the single-instance `flock`; and `daemon.log`, the stderr of an autostarted daemon. The daemon records its PID in the lock file; `--kill` uses that PID rather than waiting for the socket. [Security](#security) documents the permissions and the ownership checks this directory must satisfy.
 
@@ -107,7 +107,7 @@ Each row is `glyph · tag · command · latest output · age`. The age counts fr
   ✻  npm run dev              VITE v5.0  ready in 312 ms        1m
 ```
 
-`s` cycles through state, directory, and custom grouping. The header renders the active mode in bold. In custom mode, `g` assigns the selected task to a named group. Named sections sort by name and ignore case, so `API` files next to `api` rather than ahead of every lowercase name; the two remain separate sections, because group identity stays case-sensitive. Unassigned appears last when at least one task has no group:
+`s` cycles through state, directory, and custom grouping. The header renders the active mode in bold. In custom mode, `g` assigns the selected task to a named group. Named sections sort without regard to case, so `API` and `api` are adjacent. They remain separate because group identity is case-sensitive. Unassigned appears last when at least one task has no group:
 
 ```text
   fleetcom   2 running · 0 idle · 0 done      by state · dir · custom
@@ -145,7 +145,7 @@ The attached status bar shows both: `[attached] api tests · cargo watch -x test
 
 | Path | Mode | Contents |
 | -- | -- | -- |
-| [runtime directory](#runtime-directory-socket--lock) | `0700` | the socket, lock, daemon log, and any capture roots resolved beneath it |
+| [runtime directory](#runtime-directory-socket--lock--log) | `0700` | the socket, lock, daemon log, and any capture roots resolved beneath it |
 | `<runtime>/default.sock` | `0600` | the client↔daemon socket |
 | `<runtime>/daemon.lock` | `0666 & ~umask` when new; otherwise unchanged | the owning daemon's PID, trustworthy only while its `flock` is held |
 | `<runtime>/daemon.log` | `0666 & ~umask` when new; otherwise unchanged | stderr from the autostarted daemon |
@@ -187,7 +187,7 @@ Because the daemon holds each PTY master, daemon termination closes the terminal
 
 ### Environment and directory
 
-Each launch uses the launching client's environment and working directory, sent once per connection during the hello handshake. Connect from a venv terminal and your spawns, reruns, and session loads all see that venv, whichever client originally autostarted the daemon. [Security](#security) covers what that context does and does not persist.
+Each client sends its environment and working directory once during the connection handshake. Spawns, reruns, and session loads initiated by that client use the same launch context. [Security](#security) covers what persists.
 
 ### Scrollback depth is fixed per supervisor
 

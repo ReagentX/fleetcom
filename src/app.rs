@@ -86,7 +86,7 @@ pub enum Mode {
     PickDir,
     /// Live group picker (the `g` flow) that reassigns the selected task's group.
     PickGroup,
-    /// Live find palette (the `/` flow) that jumps the selection to a task.
+    /// Find palette for selecting a task from filtered results.
     Find,
     /// Typing a name to save the current tasks as a session.
     SaveSession,
@@ -222,9 +222,8 @@ pub struct App {
     group_target: Option<u64>,
     // `/` find-palette state (only meaningful in `Mode::Find`).
     pub find_input: EditBuffer,
-    /// Matching task *ids*, in display order. Ids, not `views` indices: a
-    /// daemon snapshot can land while the panel is open and reorder `views`,
-    /// which would point a stored index at a different task.
+    /// Matching task IDs in display order. IDs remain stable if a daemon
+    /// snapshot reorders `views` while the palette is open.
     pub find_candidates: Vec<u64>,
     pub find_sel: usize,
     /// Task ID captured when the rename prompt opens.
@@ -300,12 +299,9 @@ fn step_down(sel: usize, len: usize) -> usize {
     (sel + 1).min(len.saturating_sub(1))
 }
 
-/// State-grouping section identity: 0 In use, 1 Running, 2 Idle, 3 Completed.
-/// Tagged wins over everything; completed is classified by `lifecycle`, never
-/// by trusting `parked == false`, so a core that ever shipped both signals
-/// still lands finished tasks in Completed. The Running/Idle split follows
-/// `parked`, the core's debounced quiet signal: it shares the 10 s window with
-/// `Lifecycle::Idle`, so the idle glyph and the row's section flip together.
+/// State-section order: In use, Running, Idle, then Completed.
+/// Tags take precedence, completion follows `lifecycle`, and live tasks use
+/// `parked` to distinguish Running from Idle.
 fn section_rank(v: &TaskView) -> u8 {
     if v.tagged {
         0
@@ -318,18 +314,9 @@ fn section_rank(v: &TaskView) -> u8 {
     }
 }
 
-/// Within-section row order: 0 tagged, 1 live, 2 finished. Applies in every
-/// grouping mode. Finished is classified by `lifecycle`, for the same reason
-/// `section_rank` does it that way.
-///
-/// `parked` is deliberately absent. It reverses on a 10 s timer, so ranking on
-/// it moved a row twice per interaction: up the moment the child echoed a
-/// keystroke, back down ten seconds after the typing stopped. Both moves landed
-/// while the user was attached to some other task, so the dashboard they
-/// returned to had silently reindexed itself — worst for the tasks they touched
-/// most. A row's rank now moves only on a monotonic edge (`finished`) or a
-/// deliberate one (`tagged`). The idle signal keeps its glyph, and in State mode
-/// its own section.
+/// Within-section row order: tagged, live, then finished.
+/// `parked` does not affect row order, so transitions between active and idle
+/// preserve a task's position outside state grouping.
 fn row_rank(v: &TaskView) -> u8 {
     if v.tagged {
         0
@@ -542,7 +529,7 @@ impl App {
                     }
                     GroupMode::Dir => {
                         let label = self.dir_label(&v.cwd);
-                        // Invocation dir sorts first; the rest collate by name.
+                        // Keep the invocation directory first.
                         let rank = if label == self.invocation_label { 0 } else { 1 };
                         (rank, label)
                     }
@@ -552,16 +539,11 @@ impl App {
                         None => (1, "Unassigned".to_string()),
                     },
                 };
-                // Within each section: tagged first, finished last, then
-                // directory, then task id. In State mode `row_rank` is constant
-                // across a section (the section *is* the bucket), so it drops
-                // out and the order stays directory-then-id.
+                // Within each section, sort by row rank, directory, then task ID.
                 (rank, label, row_rank(v), self.dir_label(&v.cwd), v.id, i)
             })
             .collect();
-        // Both strings are human-readable names, so both collate. `cached_key`
-        // builds each element's key once; a comparator would rebuild it on
-        // every comparison.
+        // Apply the same case-insensitive collation to section and directory labels.
         labeled.sort_by_cached_key(|(rank, label, row, dir, id, i)| {
             (
                 *rank,
@@ -573,8 +555,7 @@ impl App {
             )
         });
 
-        // Section boundaries compare the exact label, never the folded one:
-        // `API` and `api` sort adjacent and stay two sections.
+        // Case-distinct labels sort together but remain separate sections.
         let mut out: Vec<(String, Vec<usize>)> = Vec::new();
         for (_, label, _, _, _, i) in labeled {
             match out.last_mut() {
@@ -1035,8 +1016,7 @@ impl App {
             .filter(|g| g.to_lowercase().starts_with(&needle))
             .collect();
         names.sort_by_cached_key(|g| collation_key(g.as_str()));
-        // Exact duplicates share a key and stay adjacent under a stable sort,
-        // so `dedup` still collapses them — and only them.
+        // The exact-name tiebreak keeps duplicates adjacent for `dedup`.
         names.dedup();
         for name in names {
             cands.push(GroupCand {
@@ -1069,8 +1049,7 @@ impl App {
 
     // --- `/` find palette -------------------------------------------------------
 
-    /// Open the `/` palette with the whole fleet listed. A no-op on an empty
-    /// fleet: there is nothing to find, so the panel would be a dead end.
+    /// Open the `/` palette with every task listed.
     fn open_find_palette(&mut self) {
         if self.views.is_empty() {
             return;
@@ -1080,8 +1059,7 @@ impl App {
         self.mode = Mode::Find;
     }
 
-    /// Rebuild the palette rows in display order, so the panel reads in the
-    /// same order as the list behind it, and highlight the first match.
+    /// Rebuild matches in dashboard order and select the first result.
     fn refresh_find_candidates(&mut self) {
         let needle = self.find_input.to_lowercase();
         self.find_candidates = self
@@ -1386,11 +1364,8 @@ impl App {
             KeyCode::Up => self.find_sel = self.find_sel.saturating_sub(1),
             KeyCode::Down => self.find_sel = step_down(self.find_sel, self.find_candidates.len()),
             KeyCode::Enter => {
-                // Enter moves the dashboard selection and nothing else. It
-                // deliberately does not attach: Enter attaches *from* the
-                // dashboard, so `/api` Enter Enter attaches and `/api` Enter
-                // Space peeks. With nothing matched the panel stays open, so a
-                // mistyped query can be corrected instead of being cancelled.
+                // Select the highlighted task without attaching. An empty
+                // result set leaves the palette open.
                 if let Some(&id) = self.find_candidates.get(self.find_sel) {
                     self.selected_id = Some(id);
                     self.close_find_palette();
@@ -1840,14 +1815,9 @@ fn on_key_edit(buf: &mut EditBuffer, k: KeyEvent) -> Option<bool> {
     }
 }
 
-/// Whether a task matches the find palette's lowercased `needle`: a
-/// case-insensitive substring of its name, command, or group. A named task
-/// still matches its command, so a task renamed "api tests" is found by typing
-/// `cargo`. The empty needle matches everything.
-///
-/// The working directory is deliberately absent. In a monorepo every task
-/// shares one directory and cross-repo tasks often carry `~` as their base, so
-/// the directory separates nothing and would only dilute the matches.
+/// Match a lowercased query against a task's name, command, or group.
+/// Matching is substring-based; an empty query matches every task. The working
+/// directory is not a match field.
 fn task_matches(v: &TaskView, needle: &str) -> bool {
     [
         v.name.as_deref(),
@@ -1875,9 +1845,9 @@ fn split_input(input: &str) -> (&str, &str) {
     }
 }
 
-/// Subdirectories of `base` whose name prefix-matches `partial` (case-
-/// insensitive), collated case-insensitively so the order matches the filter.
-/// Hidden entries appear only when `partial` starts `.`.
+/// Subdirectories of `base` whose names start with `partial`, ignoring case.
+/// Results use the same case-insensitive collation. Hidden entries appear only
+/// when `partial` starts with `.`.
 fn list_dirs(base: &Path, partial: &str) -> Vec<String> {
     let needle = partial.to_lowercase();
     let mut out: Vec<String> = Vec::new();
@@ -1896,8 +1866,7 @@ fn list_dirs(base: &Path, partial: &str) -> Vec<String> {
             }
         }
     }
-    // `read_dir` yields entries in arbitrary order, so this sort is also what
-    // makes the panel deterministic.
+    // `read_dir` order is unspecified.
     out.sort_by_cached_key(|n| collation_key(n));
     out
 }

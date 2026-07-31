@@ -499,11 +499,7 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
-    /// The `o` picker's saved list collates case-insensitively: byte order
-    /// would read `Beta, Zed, apple`, stranding every capitalized name ahead of
-    /// every lowercase one. The names differ by more than case because APFS is
-    /// case-insensitive by default, so `API.json` and `api.json` cannot coexist
-    /// on this machine.
+    /// Saved session names use case-insensitive collation.
     #[test]
     fn list_in_collates_case_insensitively() {
         let dir = temp("session_list_collate");

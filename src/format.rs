@@ -75,21 +75,9 @@ pub fn pad(s: &str, width: usize) -> String {
     t
 }
 
-/// Sort key for a human-readable name: case-folded first, exact bytes second.
-///
-/// `String` orders byte-wise, so every uppercase ASCII letter sorts before every
-/// lowercase one and `API` lands at the opposite end of a list from `api`, with
-/// everything else in between. Folding with `to_lowercase` — Unicode-aware, in
-/// std, no locale — puts them side by side. The exact name then breaks the tie,
-/// so two names differing only by case hold one fixed order across every render
-/// instead of an unspecified one.
-///
-/// The key never merges: distinct names produce distinct keys, so collation
-/// changes display order and nothing else. Identity comparisons stay exact.
-///
-/// Call-site details: each call allocates two `String`s, so compute the key once
-/// per element — `sort_by_cached_key`, or store it in the value being sorted —
-/// never inside a comparator, which would rebuild it O(n log n) times.
+/// Sort key for human-readable names.
+/// The lowercase value provides case-insensitive collation; the exact value
+/// makes ordering deterministic and keeps case-distinct names separate.
 pub(crate) fn collation_key(name: &str) -> (String, String) {
     (name.to_lowercase(), name.to_string())
 }
@@ -171,13 +159,12 @@ mod tests {
     #[test]
     fn collation_key_folds_then_breaks_ties_on_exact_bytes() {
         assert_eq!(collation_key("API"), ("api".to_string(), "API".to_string()));
-        // Folded first: `api` beats `Zebra`, which byte order reverses.
+        // The lowercase component controls primary ordering.
         assert!(collation_key("api") < collation_key("Zebra"));
-        // Exact bytes second: same fold, so the tiebreak decides, and it is
-        // total — the two keys are never equal, so a sort cannot merge them.
+        // The exact component orders names with the same lowercase value.
         assert!(collation_key("API") < collation_key("api"));
         assert_ne!(collation_key("API"), collation_key("api"));
-        // Folding is Unicode-aware, not ASCII-only.
+        // `to_lowercase` handles Unicode characters.
         assert_eq!(collation_key("ÉCOLE").0, "école");
     }
 
@@ -198,8 +185,7 @@ mod tests {
         );
         assert_eq!(collate(want.clone()), want, "already sorted is a fixpoint");
 
-        // The defect this replaces: byte order strands API and Apple at the
-        // far end of the list from api.
+        // Byte ordering produces a different order for mixed-case names.
         let mut bytewise = vec!["Zebra", "api", "API", "banana", "Apple"];
         bytewise.sort();
         assert_eq!(bytewise, vec!["API", "Apple", "Zebra", "api", "banana"]);
