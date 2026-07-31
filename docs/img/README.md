@@ -27,8 +27,13 @@ it to `~`.
 
 ## Capturing
 
+One line per frame, so each is a single copy-paste:
+
 ```sh
-clear; cat docs/img/home.ansi; read -rsk 1; printf '\033[?25h'
+clear; cat docs/img/home.ansi;      read -rsk 1; printf '\033[?25h'
+clear; cat docs/img/quickpeek.ansi; read -rsk 1; printf '\033[?25h'
+clear; cat docs/img/groups.ansi;    read -rsk 1; printf '\033[?25h'
+clear; cat docs/img/controls.ansi;  read -rsk 1; printf '\033[?25h'
 ```
 
 `read` blocks until a keypress, so the screenshot is taken with nothing emitted
