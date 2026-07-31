@@ -4406,6 +4406,10 @@ fn frame(app: &mut App) -> Vec<u8> {
     let mut out = Vec::new();
     crate::ui::render(&mut out, app).expect("a fixture frame always paints");
     assert!(!out.is_empty(), "a fresh App must emit its first frame");
+    // Park the cursor on the last row. `render_peek` leaves it inside the peek
+    // box, so anything a shell prints after `cat` lands mid-frame; the running
+    // client never returns to a shell, so only these captures care.
+    out.extend_from_slice(format!("\x1b[{};1H", app.rows).as_bytes());
     out
 }
 

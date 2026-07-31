@@ -18,13 +18,17 @@ it to `~`.
 ## Capturing
 
 ```sh
-clear; cat docs/img/home.ansi; read -rs -n1; printf '\033[?25h'
+clear; cat docs/img/home.ansi; read -rsk 1; printf '\033[?25h'
 ```
 
-The frame's last paint hides the cursor and leaves it on the footer row, so a
-returning shell prompt would overwrite the footer. `read` blocks until a
-keypress, so the screenshot is taken with nothing emitted after the frame; the
-trailing `printf` restores the cursor.
+`read` blocks until a keypress, so the screenshot is taken with nothing emitted
+after the frame; the trailing `printf` restores the cursor, which the frame
+hides. The flags are zsh's — bash spells the same thing `read -rs -n1`, and
+`read -r` waits for Enter in both.
+
+Each frame ends by parking the cursor on its last row. Without that,
+`render_peek` would leave it inside the peek box and a shell prompt would print
+through the middle of the capture.
 
 The terminal must be at least 107×30, the size the frames are painted at. `clear`
 first: a frame only paints its own rows, so a taller window would show stale
