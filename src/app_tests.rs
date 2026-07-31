@@ -3999,8 +3999,8 @@ fn live_fleet(dirs: &Dirs) -> Vec<TaskView> {
                 "✻ Scope small fixes for dashboard and CLI",
                 "claude:action-row",
             ),
-            started_ago: mins(18),
-            quiet_ago: Some(secs(2)),
+            started_ago: mins(2),
+            quiet_ago: Some(secs(3)),
             finished_ago: None,
         },
         TaskView {
@@ -4013,8 +4013,8 @@ fn live_fleet(dirs: &Dirs) -> Vec<TaskView> {
             lifecycle: Lifecycle::Active,
             parked: false,
             preview: anchor("Inferring… · thinking with high effort", "claude:spinner"),
-            started_ago: mins(18),
-            quiet_ago: Some(secs(1)),
+            started_ago: mins(5),
+            quiet_ago: Some(secs(8)),
             finished_ago: None,
         },
         TaskView {
@@ -4027,8 +4027,8 @@ fn live_fleet(dirs: &Dirs) -> Vec<TaskView> {
             lifecycle: Lifecycle::Active,
             parked: false,
             preview: anchor("Grok 4.5 (xhigh) · Responding…", "grok:spinner"),
-            started_ago: mins(18),
-            quiet_ago: Some(secs(3)),
+            started_ago: mins(12),
+            quiet_ago: Some(secs(4)),
             finished_ago: None,
         },
         TaskView {
@@ -4042,7 +4042,7 @@ fn live_fleet(dirs: &Dirs) -> Vec<TaskView> {
             parked: false,
             preview: anchor(CODEX_LANGUAGE, "codex:working"),
             started_ago: mins(18),
-            quiet_ago: Some(secs(1)),
+            quiet_ago: Some(secs(2)),
             finished_ago: None,
         },
         TaskView {
@@ -4055,8 +4055,8 @@ fn live_fleet(dirs: &Dirs) -> Vec<TaskView> {
             lifecycle: Lifecycle::Active,
             parked: false,
             preview: anchor(CODEX_REVIEW, "codex:working"),
-            started_ago: mins(18),
-            quiet_ago: Some(secs(4)),
+            started_ago: mins(24),
+            quiet_ago: Some(secs(6)),
             finished_ago: None,
         },
         TaskView {
@@ -4069,9 +4069,23 @@ fn live_fleet(dirs: &Dirs) -> Vec<TaskView> {
             lifecycle: Lifecycle::Ok,
             parked: false,
             preview: frozen(FLEETCOM_TESTS),
-            started_ago: mins(19),
+            started_ago: mins(2),
             quiet_ago: None,
-            finished_ago: Some(mins(18)),
+            finished_ago: Some(secs(12)),
+        },
+        TaskView {
+            id: 19,
+            command: "cargo clippy".to_string(),
+            cwd: dirs.fleetcom.clone(),
+            tagged: false,
+            group: None,
+            name: None,
+            lifecycle: Lifecycle::Failed,
+            parked: false,
+            preview: frozen(FLEETCOM_CLIPPY),
+            started_ago: mins(5),
+            quiet_ago: None,
+            finished_ago: Some(mins(3)),
         },
         TaskView {
             id: 7,
@@ -4083,8 +4097,8 @@ fn live_fleet(dirs: &Dirs) -> Vec<TaskView> {
             lifecycle: Lifecycle::Active,
             parked: false,
             preview: title("2 awaiting input · claude agents"),
-            started_ago: mins(18),
-            quiet_ago: Some(secs(6)),
+            started_ago: mins(63),
+            quiet_ago: Some(secs(9)),
             finished_ago: None,
         },
         TaskView {
@@ -4097,8 +4111,8 @@ fn live_fleet(dirs: &Dirs) -> Vec<TaskView> {
             lifecycle: Lifecycle::Active,
             parked: false,
             preview: title("Desktop ¦ Utility"),
-            started_ago: mins(18),
-            quiet_ago: Some(secs(2)),
+            started_ago: mins(126),
+            quiet_ago: Some(secs(4)),
             finished_ago: None,
         },
         TaskView {
@@ -4111,8 +4125,8 @@ fn live_fleet(dirs: &Dirs) -> Vec<TaskView> {
             lifecycle: Lifecycle::Idle,
             parked: true,
             preview: floor(">>>"),
-            started_ago: mins(20),
-            quiet_ago: Some(mins(18)),
+            started_ago: mins(48),
+            quiet_ago: Some(mins(41)),
             finished_ago: None,
         },
         TaskView {
@@ -4139,7 +4153,7 @@ fn live_fleet(dirs: &Dirs) -> Vec<TaskView> {
             lifecycle: Lifecycle::Active,
             parked: false,
             preview: title("Turret Game Codebase Organization and Ex… - grok"),
-            started_ago: mins(18),
+            started_ago: mins(8),
             quiet_ago: Some(secs(5)),
             finished_ago: None,
         },
@@ -4153,8 +4167,8 @@ fn live_fleet(dirs: &Dirs) -> Vec<TaskView> {
             lifecycle: Lifecycle::Active,
             parked: false,
             preview: anchor(MISSILE_NERF, "codex:working"),
-            started_ago: mins(18),
-            quiet_ago: Some(secs(2)),
+            started_ago: mins(33),
+            quiet_ago: Some(secs(7)),
             finished_ago: None,
         },
         TaskView {
@@ -4167,7 +4181,7 @@ fn live_fleet(dirs: &Dirs) -> Vec<TaskView> {
             lifecycle: Lifecycle::Active,
             parked: false,
             preview: anchor(EMP_NERF, "codex:working"),
-            started_ago: mins(18),
+            started_ago: mins(35),
             quiet_ago: Some(secs(3)),
             finished_ago: None,
         },
@@ -4195,9 +4209,9 @@ fn live_fleet(dirs: &Dirs) -> Vec<TaskView> {
             lifecycle: Lifecycle::Ok,
             parked: false,
             preview: frozen(CRABSTEP_TESTS),
-            started_ago: mins(19),
+            started_ago: mins(22),
             quiet_ago: None,
-            finished_ago: Some(mins(18)),
+            finished_ago: Some(mins(21)),
         },
         TaskView {
             id: 16,
@@ -4209,8 +4223,8 @@ fn live_fleet(dirs: &Dirs) -> Vec<TaskView> {
             lifecycle: Lifecycle::Active,
             parked: false,
             preview: anchor("✻ Review GitHub issue 780", "claude:action-row"),
-            started_ago: mins(18),
-            quiet_ago: Some(secs(1)),
+            started_ago: mins(6),
+            quiet_ago: Some(secs(2)),
             finished_ago: None,
         },
         TaskView {
@@ -4223,9 +4237,9 @@ fn live_fleet(dirs: &Dirs) -> Vec<TaskView> {
             lifecycle: Lifecycle::Ok,
             parked: false,
             preview: frozen(IMESSAGE_TESTS),
-            started_ago: mins(19),
+            started_ago: mins(20),
             quiet_ago: None,
-            finished_ago: Some(mins(18)),
+            finished_ago: Some(mins(19)),
         },
         TaskView {
             id: 18,
@@ -4237,9 +4251,37 @@ fn live_fleet(dirs: &Dirs) -> Vec<TaskView> {
             lifecycle: Lifecycle::Ok,
             parked: false,
             preview: frozen(LOGRIA_TESTS),
-            started_ago: mins(19),
+            started_ago: mins(32),
             quiet_ago: None,
-            finished_ago: Some(mins(18)),
+            finished_ago: Some(mins(31)),
+        },
+        TaskView {
+            id: 20,
+            command: "cargo watch -x test".to_string(),
+            cwd: dirs.logria.clone(),
+            tagged: false,
+            group: None,
+            name: None,
+            lifecycle: Lifecycle::Active,
+            parked: false,
+            preview: floor(LOGRIA_WATCH),
+            started_ago: secs(45),
+            quiet_ago: Some(secs(2)),
+            finished_ago: None,
+        },
+        TaskView {
+            id: 21,
+            command: "cargo doc --open".to_string(),
+            cwd: dirs.logria.clone(),
+            tagged: false,
+            group: None,
+            name: None,
+            lifecycle: Lifecycle::Idle,
+            parked: true,
+            preview: floor(LOGRIA_DOC),
+            started_ago: mins(28),
+            quiet_ago: Some(mins(26)),
+            finished_ago: None,
         },
     ]
 }
@@ -4293,6 +4335,14 @@ impl Quiet {
         }
     }
 
+    /// A task that exited non-zero, timed from the exit.
+    const fn failed(id: u64, started: Duration, finished: Duration) -> Quiet {
+        Quiet {
+            lifecycle: Lifecycle::Failed,
+            ..Quiet::done(id, started, finished)
+        }
+    }
+
     /// Swap in a different status line.
     const fn saying(mut self, text: &'static str, rule: &'static str) -> Quiet {
         self.preview = Some((text, rule));
@@ -4303,7 +4353,7 @@ impl Quiet {
 /// What the peek frame changes, one row per task. Ages are the fabricated
 /// spread the frame shows: `32s` and `13s` on the tagged pair, `1m` across the
 /// idled agents, `15m`–`20m` on the finished runs.
-const QUIET: [Quiet; 18] = [
+const QUIET: [Quiet; 21] = [
     Quiet::idle(1, mins(22), secs(32)),
     Quiet::idle(2, mins(21), secs(13)).saying(SUMMARY_QUIET, "claude:action-row"),
     Quiet::idle(3, mins(21), mins(1)),
@@ -4323,10 +4373,13 @@ const QUIET: [Quiet; 18] = [
     Quiet::idle(16, mins(21), mins(1)),
     Quiet::done(17, mins(21), mins(20)),
     Quiet::done(18, mins(21), mins(20)),
+    Quiet::failed(19, mins(24), mins(21)),
+    Quiet::idle(20, mins(4), mins(2)),
+    Quiet::idle(21, mins(30), mins(28)),
 ];
 
-/// The same fleet after the agents went quiet: one live task, eleven idle, six
-/// finished. `parked` tracks `lifecycle` because the core derives both from the
+/// The same fleet after the agents went quiet: one live task, thirteen idle,
+/// seven finished. `parked` tracks `lifecycle` because the core derives both from the
 /// one `IDLE_AFTER` window, so an Idle task is always a parked one.
 fn quiet_fleet(dirs: &Dirs) -> Vec<TaskView> {
     let mut views = live_fleet(dirs);
@@ -4366,6 +4419,10 @@ const CRABAPPLE_TESTS: &str = "all doctests ran in 0.39s; merged doctests compil
 const CRABSTEP_TESTS: &str = "all doctests ran in 0.83s; merged doctests compilation took 0.81s";
 const IMESSAGE_TESTS: &str = "all doctests ran in 1.99s; merged doctests compilation took 1.95s";
 /// The one status line that differs between the two frames.
+const FLEETCOM_CLIPPY: &str =
+    "error: could not compile `fleetcom` (lib test) due to 1 previous error";
+const LOGRIA_WATCH: &str = "[Running 'cargo test'] test result: ok. 223 passed; 0 failed";
+const LOGRIA_DOC: &str = "Finished `dev` profile [unoptimized + debuginfo] target(s) in 3.41s";
 const SUMMARY_QUIET: &str = "✻ Review fleetcom preview design document";
 
 /// The peeked task's screen: the tail of a `cargo test` run. `render_peek`
