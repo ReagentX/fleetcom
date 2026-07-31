@@ -1,5 +1,6 @@
 use super::*;
 use crate::{
+    protocol::{Preview, PreviewSource},
     supervisor::Supervisor,
     testutil::{temp, wait_until},
     transport::LocalTransport,
@@ -3854,4 +3855,587 @@ fn input_and_attached_echo_bypass_the_repaint_floor() {
     );
     // Before the floor elapses, wait for its remaining duration.
     assert_eq!(wait_for_paint(false, Duration::ZERO), PAINT_MIN);
+}
+
+// --- README screenshot fixtures ---------------------------------------------
+//
+// `docs/img/*.ansi` hold one frame each, produced by the real renderer over a
+// fabricated fleet. The bytes are what the running client writes, so a terminal
+// `cat`-ing one paints exactly what a live run paints — see `docs/img/README.md`
+// for the capture procedure.
+
+/// Fixture terminal size. 30 rows seat every section with one list row to
+/// spare; 107 columns give the 71-column preview cell and the 80-column peek
+/// box of the screenshots these frames replace.
+const FIXTURE_ROWS: u16 = 30;
+const FIXTURE_COLS: u16 = 107;
+
+/// A client with no core behind it. The fixture assigns `views` and
+/// `focused_screen` directly, so no command is sent and no event arrives.
+struct NoTransport;
+
+impl Transport for NoTransport {
+    fn send(&mut self, _cmd: Command) {}
+
+    fn poll(&mut self) -> Vec<Event> {
+        Vec::new()
+    }
+
+    fn connected(&self) -> bool {
+        true
+    }
+
+    fn shutdown(&mut self, _intent: ExitIntent) {}
+}
+
+/// Fabricated seconds. Every fixture duration is a constant: a clock reading
+/// would change the bytes between runs. `const` so the `QUIET` table can hold
+/// them directly.
+const fn secs(n: u64) -> Duration {
+    Duration::from_secs(n)
+}
+
+/// Fabricated minutes.
+const fn mins(n: u64) -> Duration {
+    Duration::from_secs(n * 60)
+}
+
+/// Live summary-adapter preview, carrying the matcher id the peek footer names.
+fn anchor(text: &str, rule: &'static str) -> Preview {
+    Preview {
+        text: text.to_string(),
+        source: PreviewSource::Anchor,
+        rule: Some(rule),
+        frozen: false,
+    }
+}
+
+/// Live window-title preview.
+fn title(text: &str) -> Preview {
+    Preview {
+        text: text.to_string(),
+        source: PreviewSource::Title,
+        rule: None,
+        frozen: false,
+    }
+}
+
+/// Live last-row preview.
+fn floor(text: &str) -> Preview {
+    Preview {
+        text: text.to_string(),
+        source: PreviewSource::Floor,
+        rule: None,
+        frozen: false,
+    }
+}
+
+/// The last-row preview a finished task froze on.
+fn frozen(text: &str) -> Preview {
+    Preview {
+        text: text.to_string(),
+        source: PreviewSource::Floor,
+        rule: None,
+        frozen: true,
+    }
+}
+
+/// The fleet's working directories, keyed as they appear in the section labels.
+/// `dir_label` abbreviates `$HOME` to `~`, so these must be built from it.
+struct Dirs {
+    home: PathBuf,
+    fleetcom: PathBuf,
+    turret: PathBuf,
+    crabapple: PathBuf,
+    crabstep: PathBuf,
+    imessage: PathBuf,
+    logria: PathBuf,
+}
+
+impl Dirs {
+    fn new(home: &Path) -> Dirs {
+        let code = home.join("Documents/Code");
+        Dirs {
+            home: home.to_path_buf(),
+            fleetcom: code.join("Rust/fleetcom"),
+            turret: code.join("Apple/turret"),
+            crabapple: code.join("Rust/crabapple"),
+            crabstep: code.join("Rust/crabstep"),
+            imessage: code.join("Rust/imessage-exporter"),
+            logria: code.join("Rust/Logria"),
+        }
+    }
+}
+
+/// A dashboard client over `views`, with `~/Documents/Code/Rust/fleetcom` as
+/// the invocation directory so dir mode ranks that section first. Daemon-backed
+/// because the header's ` · foreground` tag is not what the README advertises.
+fn fixture_app(dirs: &Dirs, group_mode: GroupMode, views: Vec<TaskView>) -> App {
+    let mut app = App::assemble(FIXTURE_ROWS, FIXTURE_COLS, |_, _, _| Box::new(NoTransport));
+    app.daemon_backed = true;
+    app.invocation_label = app.dir_label(&dirs.fleetcom);
+    app.invocation_dir = dirs.fleetcom.clone();
+    app.spawn_cwd = dirs.fleetcom.clone();
+    app.group_mode = group_mode;
+    app.views = views;
+    app
+}
+
+/// The fleet mid-flight: eleven live agents and builds, one idle REPL, six
+/// finished. Ids ascend in launch order, which is also the within-section row
+/// order once `row_rank` floats the tagged rows and sinks the finished ones.
+fn live_fleet(dirs: &Dirs) -> Vec<TaskView> {
+    vec![
+        TaskView {
+            id: 1,
+            command: "claude".to_string(),
+            cwd: dirs.fleetcom.clone(),
+            tagged: true,
+            group: None,
+            name: Some("Dashboard Refine".to_string()),
+            lifecycle: Lifecycle::Active,
+            parked: false,
+            preview: anchor(
+                "✻ Scope small fixes for dashboard and CLI",
+                "claude:action-row",
+            ),
+            started_ago: mins(18),
+            quiet_ago: Some(secs(2)),
+            finished_ago: None,
+        },
+        TaskView {
+            id: 2,
+            command: "claude".to_string(),
+            cwd: dirs.fleetcom.clone(),
+            tagged: true,
+            group: None,
+            name: Some("Summary Refine".to_string()),
+            lifecycle: Lifecycle::Active,
+            parked: false,
+            preview: anchor("Inferring… · thinking with high effort", "claude:spinner"),
+            started_ago: mins(18),
+            quiet_ago: Some(secs(1)),
+            finished_ago: None,
+        },
+        TaskView {
+            id: 3,
+            command: "grok".to_string(),
+            cwd: dirs.fleetcom.clone(),
+            tagged: false,
+            group: None,
+            name: Some("Grok Language".to_string()),
+            lifecycle: Lifecycle::Active,
+            parked: false,
+            preview: anchor("Grok 4.5 (xhigh) · Responding…", "grok:spinner"),
+            started_ago: mins(18),
+            quiet_ago: Some(secs(3)),
+            finished_ago: None,
+        },
+        TaskView {
+            id: 4,
+            command: "codex".to_string(),
+            cwd: dirs.fleetcom.clone(),
+            tagged: false,
+            group: None,
+            name: Some("Codex Language".to_string()),
+            lifecycle: Lifecycle::Active,
+            parked: false,
+            preview: anchor(CODEX_LANGUAGE, "codex:working"),
+            started_ago: mins(18),
+            quiet_ago: Some(secs(1)),
+            finished_ago: None,
+        },
+        TaskView {
+            id: 5,
+            command: "codex".to_string(),
+            cwd: dirs.fleetcom.clone(),
+            tagged: false,
+            group: None,
+            name: Some("Codex Review".to_string()),
+            lifecycle: Lifecycle::Active,
+            parked: false,
+            preview: anchor(CODEX_REVIEW, "codex:working"),
+            started_ago: mins(18),
+            quiet_ago: Some(secs(4)),
+            finished_ago: None,
+        },
+        TaskView {
+            id: 6,
+            command: "cargo test".to_string(),
+            cwd: dirs.fleetcom.clone(),
+            tagged: false,
+            group: None,
+            name: None,
+            lifecycle: Lifecycle::Ok,
+            parked: false,
+            preview: frozen(FLEETCOM_TESTS),
+            started_ago: mins(19),
+            quiet_ago: None,
+            finished_ago: Some(mins(18)),
+        },
+        TaskView {
+            id: 7,
+            command: "claude".to_string(),
+            cwd: dirs.home.clone(),
+            tagged: false,
+            group: None,
+            name: Some("claude agents".to_string()),
+            lifecycle: Lifecycle::Active,
+            parked: false,
+            preview: title("2 awaiting input · claude agents"),
+            started_ago: mins(18),
+            quiet_ago: Some(secs(6)),
+            finished_ago: None,
+        },
+        TaskView {
+            id: 8,
+            command: "zellij".to_string(),
+            cwd: dirs.home.clone(),
+            tagged: false,
+            group: None,
+            name: Some("Zellij".to_string()),
+            lifecycle: Lifecycle::Active,
+            parked: false,
+            preview: title("Desktop ¦ Utility"),
+            started_ago: mins(18),
+            quiet_ago: Some(secs(2)),
+            finished_ago: None,
+        },
+        TaskView {
+            id: 9,
+            command: "python".to_string(),
+            cwd: dirs.home.clone(),
+            tagged: false,
+            group: None,
+            name: None,
+            lifecycle: Lifecycle::Idle,
+            parked: true,
+            preview: floor(">>>"),
+            started_ago: mins(20),
+            quiet_ago: Some(mins(18)),
+            finished_ago: None,
+        },
+        TaskView {
+            id: 10,
+            command: "brew update && brew upgrade".to_string(),
+            cwd: dirs.home.clone(),
+            tagged: false,
+            group: None,
+            name: None,
+            lifecycle: Lifecycle::Ok,
+            parked: false,
+            preview: frozen("Already up-to-date."),
+            started_ago: mins(14),
+            quiet_ago: None,
+            finished_ago: Some(mins(13)),
+        },
+        TaskView {
+            id: 11,
+            command: "grok".to_string(),
+            cwd: dirs.turret.clone(),
+            tagged: false,
+            group: None,
+            name: Some("Game Infra Review".to_string()),
+            lifecycle: Lifecycle::Active,
+            parked: false,
+            preview: title("Turret Game Codebase Organization and Ex… - grok"),
+            started_ago: mins(18),
+            quiet_ago: Some(secs(5)),
+            finished_ago: None,
+        },
+        TaskView {
+            id: 12,
+            command: "codex".to_string(),
+            cwd: dirs.turret.clone(),
+            tagged: false,
+            group: None,
+            name: Some("Missile Nerf".to_string()),
+            lifecycle: Lifecycle::Active,
+            parked: false,
+            preview: anchor(MISSILE_NERF, "codex:working"),
+            started_ago: mins(18),
+            quiet_ago: Some(secs(2)),
+            finished_ago: None,
+        },
+        TaskView {
+            id: 13,
+            command: "codex".to_string(),
+            cwd: dirs.turret.clone(),
+            tagged: false,
+            group: None,
+            name: Some("EMP Nerf".to_string()),
+            lifecycle: Lifecycle::Active,
+            parked: false,
+            preview: anchor(EMP_NERF, "codex:working"),
+            started_ago: mins(18),
+            quiet_ago: Some(secs(3)),
+            finished_ago: None,
+        },
+        TaskView {
+            id: 14,
+            command: "cargo test".to_string(),
+            cwd: dirs.crabapple.clone(),
+            tagged: false,
+            group: None,
+            name: None,
+            lifecycle: Lifecycle::Ok,
+            parked: false,
+            preview: frozen(CRABAPPLE_TESTS),
+            started_ago: mins(18),
+            quiet_ago: None,
+            finished_ago: Some(mins(17)),
+        },
+        TaskView {
+            id: 15,
+            command: "cargo test".to_string(),
+            cwd: dirs.crabstep.clone(),
+            tagged: false,
+            group: None,
+            name: None,
+            lifecycle: Lifecycle::Ok,
+            parked: false,
+            preview: frozen(CRABSTEP_TESTS),
+            started_ago: mins(19),
+            quiet_ago: None,
+            finished_ago: Some(mins(18)),
+        },
+        TaskView {
+            id: 16,
+            command: "claude".to_string(),
+            cwd: dirs.imessage.clone(),
+            tagged: false,
+            group: None,
+            name: None,
+            lifecycle: Lifecycle::Active,
+            parked: false,
+            preview: anchor("✻ Review GitHub issue 780", "claude:action-row"),
+            started_ago: mins(18),
+            quiet_ago: Some(secs(1)),
+            finished_ago: None,
+        },
+        TaskView {
+            id: 17,
+            command: "cargo test".to_string(),
+            cwd: dirs.imessage.clone(),
+            tagged: false,
+            group: None,
+            name: None,
+            lifecycle: Lifecycle::Ok,
+            parked: false,
+            preview: frozen(IMESSAGE_TESTS),
+            started_ago: mins(19),
+            quiet_ago: None,
+            finished_ago: Some(mins(18)),
+        },
+        TaskView {
+            id: 18,
+            command: "cargo test".to_string(),
+            cwd: dirs.logria.clone(),
+            tagged: false,
+            group: None,
+            name: None,
+            lifecycle: Lifecycle::Ok,
+            parked: false,
+            preview: frozen(LOGRIA_TESTS),
+            started_ago: mins(19),
+            quiet_ago: None,
+            finished_ago: Some(mins(18)),
+        },
+    ]
+}
+
+/// One task's differences between the two frames. The peek fixture is the live
+/// fleet after the agents went quiet, so only state, ages, and one status line
+/// move; everything identifying a task lives in `live_fleet` alone.
+struct Quiet {
+    id: u64,
+    lifecycle: Lifecycle,
+    parked: bool,
+    started_ago: Duration,
+    quiet_ago: Option<Duration>,
+    finished_ago: Option<Duration>,
+    /// Replacement anchor preview as `(text, matcher id)`; `None` keeps the
+    /// live fleet's.
+    preview: Option<(&'static str, &'static str)>,
+}
+
+impl Quiet {
+    /// A live task quiet past `IDLE_AFTER`, timed from its last output.
+    const fn idle(id: u64, started: Duration, quiet: Duration) -> Quiet {
+        Quiet {
+            id,
+            lifecycle: Lifecycle::Idle,
+            parked: true,
+            started_ago: started,
+            quiet_ago: Some(quiet),
+            finished_ago: None,
+            preview: None,
+        }
+    }
+
+    /// A live task still inside `IDLE_AFTER`, timed from launch.
+    const fn active(id: u64, started: Duration, quiet: Duration) -> Quiet {
+        Quiet {
+            lifecycle: Lifecycle::Active,
+            parked: false,
+            ..Quiet::idle(id, started, quiet)
+        }
+    }
+
+    /// A task that exited cleanly, timed from the exit.
+    const fn done(id: u64, started: Duration, finished: Duration) -> Quiet {
+        Quiet {
+            lifecycle: Lifecycle::Ok,
+            parked: false,
+            quiet_ago: None,
+            finished_ago: Some(finished),
+            ..Quiet::idle(id, started, finished)
+        }
+    }
+
+    /// Swap in a different status line.
+    const fn saying(mut self, text: &'static str, rule: &'static str) -> Quiet {
+        self.preview = Some((text, rule));
+        self
+    }
+}
+
+/// What the peek frame changes, one row per task. Ages are the fabricated
+/// spread the frame shows: `32s` and `13s` on the tagged pair, `1m` across the
+/// idled agents, `15m`–`20m` on the finished runs.
+const QUIET: [Quiet; 18] = [
+    Quiet::idle(1, mins(22), secs(32)),
+    Quiet::idle(2, mins(21), secs(13)).saying(SUMMARY_QUIET, "claude:action-row"),
+    Quiet::idle(3, mins(21), mins(1)),
+    Quiet::idle(4, mins(21), mins(1)),
+    Quiet::idle(5, mins(21), mins(1)),
+    Quiet::done(6, mins(21), mins(20)),
+    Quiet::idle(7, mins(21), mins(1)),
+    // Zellij is the lone row under `Running`: it never stops painting.
+    Quiet::active(8, mins(20), secs(4)),
+    Quiet::idle(9, mins(22), mins(20)),
+    Quiet::done(10, mins(16), mins(15)),
+    Quiet::idle(11, mins(21), mins(1)),
+    Quiet::idle(12, mins(21), mins(1)),
+    Quiet::idle(13, mins(21), mins(1)),
+    Quiet::done(14, mins(20), mins(19)),
+    Quiet::done(15, mins(21), mins(20)),
+    Quiet::idle(16, mins(21), mins(1)),
+    Quiet::done(17, mins(21), mins(20)),
+    Quiet::done(18, mins(21), mins(20)),
+];
+
+/// The same fleet after the agents went quiet: one live task, eleven idle, six
+/// finished. `parked` tracks `lifecycle` because the core derives both from the
+/// one `IDLE_AFTER` window, so an Idle task is always a parked one.
+fn quiet_fleet(dirs: &Dirs) -> Vec<TaskView> {
+    let mut views = live_fleet(dirs);
+    assert_eq!(
+        views.len(),
+        QUIET.len(),
+        "every task needs a peek-frame override"
+    );
+    for v in &mut views {
+        let Some(q) = QUIET.iter().find(|q| q.id == v.id) else {
+            panic!("no peek-frame override for task {}", v.id);
+        };
+        v.lifecycle = q.lifecycle;
+        v.parked = q.parked;
+        v.started_ago = q.started_ago;
+        v.quiet_ago = q.quiet_ago;
+        v.finished_ago = q.finished_ago;
+        if let Some((text, rule)) = q.preview {
+            v.preview = anchor(text, rule);
+        }
+    }
+    views
+}
+
+// Preview texts long enough that the row cell truncates them. They are stored
+// whole: the `…` in the painted frame is the renderer's, not the fixture's.
+const CODEX_LANGUAGE: &str =
+    "gpt-5.6-sol high · fleetcom · feat/cs/interface-fixes · 387K used · 9.53M in · 61.2K out";
+const CODEX_REVIEW: &str =
+    "gpt-5.6-sol high · fleetcom · feat/cs/interface-fixes · 221K used · 4.41M in · 38.7K out";
+const MISSILE_NERF: &str = "gpt-5.6-sol high · turret · main · 129K used · 1.31M in · 10.1K out";
+const EMP_NERF: &str = "gpt-5.6-sol high · turret · main · 161K used · 1.64M in · 10.4K out";
+const FLEETCOM_TESTS: &str =
+    "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s";
+const LOGRIA_TESTS: &str = "test result: ok. 223 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.38s";
+const CRABAPPLE_TESTS: &str = "all doctests ran in 0.39s; merged doctests compilation took 0.38s";
+const CRABSTEP_TESTS: &str = "all doctests ran in 0.83s; merged doctests compilation took 0.81s";
+const IMESSAGE_TESTS: &str = "all doctests ran in 1.99s; merged doctests compilation took 1.95s";
+/// The one status line that differs between the two frames.
+const SUMMARY_QUIET: &str = "✻ Review fleetcom preview design document";
+
+/// The peeked task's screen: the tail of a `cargo test` run. `render_peek`
+/// shows the last `inner_h` lines, so these are already the visible ones.
+fn logria_screen(id: u64) -> ScreenView {
+    let lines = [
+        "test util::sanitizers::tests::test_length_clean ... ok",
+        "test util::sanitizers::tests::test_row_length_clean ... ok",
+        "test util::sanitizers::tests::test_length_dirty ... ok",
+        "test util::sanitizers::tests::test_length_wide_chars ... ok",
+        "test util::sanitizers::tests::test_sanitize_filename_clean ... ok",
+        "test util::sanitizers::tests::test_row_length_dirty ... ok",
+        "test util::sanitizers::tests::test_row_length_wide_chars ... ok",
+        "test util::sanitizers::tests::test_sanitize_filename_control_chars ... ok",
+        "test util::sanitizers::tests::test_sanitize_filename_trim ... ok",
+        "test util::sanitizers::tests::test_sanitize_filename_invalid_chars ... ok",
+        "test util::sanitizers::tests::test_sanitize_filename_long ... ok",
+        "",
+        LOGRIA_TESTS,
+        "",
+    ];
+    ScreenView {
+        id,
+        lines: lines.iter().map(|s| s.to_string()).collect(),
+        // Peek reads `lines` only; the attached path never runs here.
+        formatted: Vec::new(),
+        cursor: (0, 0),
+        hide_cursor: true,
+        wants_mouse: false,
+        alt_screen: false,
+        alt_scroll: false,
+        scrollback: 0,
+    }
+}
+
+/// Paint `app` once and return the frame bytes.
+fn frame(app: &mut App) -> Vec<u8> {
+    let mut out = Vec::new();
+    crate::ui::render(&mut out, app).expect("a fixture frame always paints");
+    assert!(!out.is_empty(), "a fresh App must emit its first frame");
+    out
+}
+
+/// Rewrite `docs/img/home.ansi` and `docs/img/quickpeek.ansi`, the frames the
+/// README screenshots are taken from. Ignored because it writes into the
+/// repository; run it by hand after a dashboard change, then recapture.
+///
+/// Every duration is a constant and no `HashMap` is iterated, so two runs
+/// produce identical bytes. `$HOME` is the one environment input: `dir_label`
+/// abbreviates it to `~`, which is what puts `~/Documents/…` in the section
+/// labels.
+#[test]
+#[ignore = "writes docs/img/*.ansi; run by hand to refresh the README screenshots"]
+fn write_readme_screenshot_fixtures() {
+    let home = std::env::var("HOME").expect("HOME must be set to abbreviate the section labels");
+    assert!(!home.is_empty(), "HOME must not be empty");
+    let dirs = Dirs::new(Path::new(&home));
+    let out_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("docs/img");
+
+    // Grouped by directory, selection on a live codex task.
+    let mut app = fixture_app(&dirs, GroupMode::Dir, live_fleet(&dirs));
+    app.selected_id = Some(4);
+    std::fs::write(out_dir.join("home.ansi"), frame(&mut app)).unwrap();
+
+    // Grouped by state, peek open over the finished Logria test run.
+    let mut app = fixture_app(&dirs, GroupMode::State, quiet_fleet(&dirs));
+    app.mode = Mode::Peek;
+    app.selected_id = Some(18);
+    // Private to `app`, and this module is a submodule of it: assigning the
+    // screen directly is what makes `screen_for` answer without a core.
+    app.focused_screen = Some(logria_screen(18));
+    std::fs::write(out_dir.join("quickpeek.ansi"), frame(&mut app)).unwrap();
 }
