@@ -40,6 +40,8 @@
 | `q` (or `Ctrl-C`) | Disconnect; leave the daemon and tasks running |
 | `Q` | Quit; kill the tasks and stop the daemon |
 
+![`fleetcom` fleet view](img/controls.png)
+
 ### Status glyphs
 
 | Glyph | Meaning |

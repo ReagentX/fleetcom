@@ -26,6 +26,8 @@ Press `Enter` to take control of a task, then `Ctrl-\` to return to the dashboar
 
 Start `claude`, `codex`, or `grok` normally. When you rerun the task or reload a saved session, `fleetcom` resumes the same conversation automatically.
 
+![`fleetcom` group view](docs/img/groups.png)
+
 ## Operational model
 
 Running several long-lived commands is pesky once they span terminal panes or need to survive a disconnect. `fleetcom`:
