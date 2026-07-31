@@ -18,9 +18,18 @@ use std::{
 use crate::{emulator::Emulator, format::civil_from_days};
 
 /// Scratch-directory name prefix, shared by creation and the sweep.
-const SCRATCH_PREFIX: &str = "fleetcom_test_";
+///
+/// The `2` is a format version. Release-era names were
+/// `fleetcom_test_<tag>_<pid>`, with no sequence field, and a tag whose own name
+/// ends in digits makes the two shapes indistinguishable when read from the
+/// right: legacy `fleetcom_test_app_1007_456` parses as pid 1007 and seq 456,
+/// when 456 is the real owner. Sweeping on that misread deletes scratch
+/// belonging to a live process. The versioned prefix is disjoint from the old
+/// one — the byte after `fleetcom_test` is `2`, never `_` — so a legacy name
+/// cannot reach the parser at all.
+const SCRATCH_PREFIX: &str = "fleetcom_test2_";
 
-/// Create an empty `fleetcom_test_<tag>_<pid>_<seq>` directory under the system
+/// Create an empty `fleetcom_test2_<tag>_<pid>_<seq>` directory under the system
 /// temp directory. The PID separates test processes, and the sequence separates
 /// calls within one process. Any existing path with the same name is removed.
 pub(crate) fn temp(tag: &str) -> PathBuf {
@@ -48,14 +57,22 @@ fn sweep_dead_scratch() {
         };
         for entry in entries.flatten() {
             let name = entry.file_name();
-            let Some(suffix) = name.to_str().and_then(|n| n.strip_prefix(SCRATCH_PREFIX)) else {
-                continue;
-            };
-            if scratch_pid(suffix).is_some_and(pid_is_dead) {
+            if name
+                .to_str()
+                .and_then(scratch_pid_of)
+                .is_some_and(pid_is_dead)
+            {
                 let _ = fs::remove_dir_all(entry.path());
             }
         }
     });
+}
+
+/// Parse the owning PID from a whole scratch directory name, or `None` when the
+/// name is not one of ours. The prefix check is the version gate: release-era
+/// `fleetcom_test_` names fail it, so they are never parsed and never swept.
+fn scratch_pid_of(name: &str) -> Option<i32> {
+    scratch_pid(name.strip_prefix(SCRATCH_PREFIX)?)
 }
 
 /// Parse the `<pid>` from a `<tag>_<pid>_<seq>` scratch suffix. Tags contain
@@ -88,6 +105,20 @@ fn scratch_pid_reads_the_pid_field() {
     // A suffix without all three components is invalid.
     assert_eq!(scratch_pid("tag_123"), None);
     assert_eq!(scratch_pid("tag_0_4"), None);
+}
+
+/// A release-era name never reaches the parser, so it is never swept. Read from
+/// the right, legacy `fleetcom_test_app_1007_456` looks like pid 1007 and seq
+/// 456 — 1007 being the tag's own digits, from the DECSET-1007 test — while 456
+/// is the process that actually owns the directory. Sweeping on that misread
+/// would delete scratch out from under a live test run.
+#[test]
+fn legacy_scratch_names_are_rejected_by_the_prefix() {
+    assert_eq!(scratch_pid_of("fleetcom_test_app_1007_456"), None);
+    assert_eq!(scratch_pid_of("fleetcom_test_tag_123"), None);
+    // The current format still parses, and to the pid rather than the tag.
+    assert_eq!(scratch_pid_of("fleetcom_test2_app_1007_456_0"), Some(456));
+    assert_eq!(scratch_pid_of("unrelated_dir_123_4"), None);
 }
 
 /// Poll `pred` until it holds or `budget` elapses; returns the final answer.
