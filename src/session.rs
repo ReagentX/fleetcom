@@ -11,7 +11,7 @@ use std::{
     time::SystemTime,
 };
 
-use crate::protocol::RecoveryEntry;
+use crate::protocol::{RecoveryEntry, insert_opt_str, opt_str};
 
 /// One recipe entry. Entries without a group or name serialize as strings;
 /// other entries use objects whose optional fields are written only when set.
@@ -52,18 +52,6 @@ fn sanitize(name: &str) -> String {
     out
 }
 
-/// Longest prefix of `s` at most `max` bytes long, on a char boundary.
-fn prefix_bytes(s: &str, max: usize) -> &str {
-    if s.len() <= max {
-        return s;
-    }
-    let mut end = max;
-    while !s.is_char_boundary(end) {
-        end -= 1;
-    }
-    &s[..end]
-}
-
 /// Session-recipe directory: `<config root>/sessions`. A caller-supplied
 /// `root` wins (the supervisor passes the connecting client's
 /// [`FLEETCOM_CONFIG_DIR`]); otherwise the same var from this process's env,
@@ -88,14 +76,9 @@ fn dirs_json(cfg: &SessionConfig) -> jzon::JsonValue {
                 // Entries without optional labels use the string form.
                 jzon::JsonValue::from(e.cmd.as_str())
             } else {
-                let mut m = jzon::JsonValue::new_object();
-                let _ = m.insert("cmd", e.cmd.as_str());
-                if let Some(g) = &e.group {
-                    let _ = m.insert("group", g.as_str());
-                }
-                if let Some(n) = &e.name {
-                    let _ = m.insert("name", n.as_str());
-                }
+                let mut m = jzon::object! { "cmd": e.cmd.as_str() };
+                insert_opt_str(&mut m, "group", &e.group);
+                insert_opt_str(&mut m, "name", &e.name);
                 m
             };
             let _ = arr.push(member);
@@ -108,11 +91,12 @@ fn dirs_json(cfg: &SessionConfig) -> jzon::JsonValue {
 /// Serialize the versioned wrapped schema. The stored name distinguishes
 /// names that sanitize to the same filename.
 fn to_json(name: &str, cfg: &SessionConfig) -> String {
-    let mut obj = jzon::JsonValue::new_object();
-    let _ = obj.insert("version", FORMAT_VERSION);
-    let _ = obj.insert("name", name);
-    let _ = obj.insert("dirs", dirs_json(cfg));
-    obj.pretty(2)
+    jzon::object! {
+        "version": FORMAT_VERSION,
+        "name": name,
+        "dirs": dirs_json(cfg),
+    }
+    .pretty(2)
 }
 
 /// Serialize the recipe body for content-based change detection.
@@ -173,14 +157,8 @@ fn from_json(text: &str) -> io::Result<(Option<String>, SessionConfig)> {
                 }
                 // Indexing a non-object yields Null, so malformed members drop here.
                 let cmd = m["cmd"].as_str()?.to_string();
-                let group = match &m["group"] {
-                    g if g.is_null() => None,
-                    g => Some(g.as_str()?.to_string()),
-                };
-                let name = match &m["name"] {
-                    n if n.is_null() => None,
-                    n => Some(n.as_str()?.to_string()),
-                };
+                let group = opt_str(&m["group"])?;
+                let name = opt_str(&m["name"])?;
                 Some(SessionEntry { cmd, group, name })
             })
             .collect();
@@ -220,7 +198,7 @@ fn write_atomic(dir: &Path, file_name: &str, contents: &str) -> io::Result<PathB
         // Shorten the target portion so the decorated temporary filename stays
         // within the 255-byte component limit.
         let suffix = format!(".{pid}.{n}.tmp");
-        let stem = prefix_bytes(file_name, 254 - suffix.len());
+        let stem = crate::format::prefix_bytes(file_name, 254 - suffix.len());
         let candidate = dir.join(format!(".{stem}{suffix}"));
         match fs::OpenOptions::new()
             .write(true)

@@ -75,6 +75,20 @@ pub fn pad(s: &str, width: usize) -> String {
     t
 }
 
+/// Longest prefix of `s` at most `max` bytes long, on a char boundary.
+/// Bytes, not columns: this bounds a filesystem or protocol field, where
+/// [`truncate`] bounds a rendered column count.
+pub(crate) fn prefix_bytes(s: &str, max: usize) -> &str {
+    if s.len() <= max {
+        return s;
+    }
+    let mut end = max;
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
 /// Sort key for human-readable names.
 /// The lowercase value provides case-insensitive collation; the exact value
 /// makes ordering deterministic and keeps case-distinct names separate.
