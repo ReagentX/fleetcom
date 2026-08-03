@@ -357,8 +357,7 @@ fn spawn_daemon() -> io::Result<()> {
     Ok(())
 }
 
-/// Report that `--kill` found nothing to kill. Absence is the requested end
-/// state, so the exit is a success.
+/// Report a successful no-op when `--kill` finds no daemon.
 fn no_daemon() -> io::Result<()> {
     eprintln!("fleetcom: no daemon running");
     Ok(())
@@ -454,10 +453,8 @@ fn deadline_mapped(e: io::Error) -> io::Error {
     }
 }
 
-/// Send `Shutdown` over the socket at `path`, the fallback when the lock file
-/// has no usable pid. Complete the handshake first, then wait for the daemon to
-/// close the socket after stopping its tasks; `budget` bounds every blocking
-/// operation on the way.
+/// When the lock lacks a valid PID, send `Shutdown` over the socket and bound
+/// handshake and completion I/O by `budget`.
 fn kill_via_socket_at(path: &Path, budget: Duration) -> io::Result<()> {
     match UnixStream::connect(path) {
         Ok(mut s) => {
@@ -532,7 +529,7 @@ pub fn run_daemon() -> io::Result<()> {
     // `lock` is held for the whole function, so the flock lives until this
     // daemon exits, then releases on drop.
     let Ok(mut lock) = Flock::lock(lock_file, FlockArg::LockExclusiveNonblock) else {
-        return Ok(()); // another daemon already owns the socket
+        return Ok(()); // another daemon already holds the lock
     };
     // Sole owner: advertise our pid inside the lock file, the signal target for
     // `--kill`. Trustworthy only while the flock is held. A stale pid from a

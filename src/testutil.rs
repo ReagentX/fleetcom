@@ -24,9 +24,8 @@ use crate::{
 /// Versioned prefix for scratch directories eligible for sweeping.
 const SCRATCH_PREFIX: &str = "fleetcom_test2_";
 
-/// Scratch directory removed on drop, except while the thread is unwinding: a
-/// failed test's tree is the evidence, so a panic leaves it in place.
-/// `sweep_dead_scratch` reclaims the leak on the next run.
+/// Scratch directory removed on drop. A panic preserves it for inspection;
+/// later runs reclaim it after the owner exits.
 pub(crate) struct Scratch(PathBuf);
 
 impl std::ops::Deref for Scratch {

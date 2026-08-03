@@ -101,7 +101,7 @@ Every captured value eventually enters a shell command, which makes validation t
 
 Each tool implements the `Harness` trait in [`src/harness/mod.rs`](../src/harness/mod.rs). The methods keep detection, evidence collection, and command construction separate:
 
-- `shape` declares the program word and its resume selector. `detect` and `resume_command` default to deriving the accepted command shapes and the canonical resume form from that pair, so a harness states its shape once.
+- `shape` supplies the program word and resume selector. The default `detect` and `resume_command` methods derive the accepted and canonical forms from that pair.
 - `instrument` returns spawn-time arguments, environment entries, and an optional pinned ID.
 - `parse_capture` reads an ID from hook or notify JSON.
 - `scrape_exit` reads an ID from retained terminal text.

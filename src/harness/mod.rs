@@ -63,10 +63,8 @@ pub trait Harness: Sync {
         }
     }
 
-    /// The tool's program word and its resume selector: `codex` spells the
-    /// selector as a subcommand, the others as a flag. The default
-    /// [`Harness::detect`] and [`Harness::resume_command`] derive from this
-    /// pair, so it is the one place a harness declares its command shape.
+    /// Program word and canonical resume selector. The default detection and
+    /// resume rewriting derive from this pair.
     fn shape(&self) -> (&'static str, &'static str);
 
     /// Classify a command. Return `None` for another tool or an unsupported
@@ -375,14 +373,11 @@ mod tests {
         *,
     };
 
-    /// Path prefix for the shape tests' path-form program words. Detection
-    /// matches by basename, so one prefix covers every harness.
+    /// Path prefix used to verify basename matching.
     const BIN: &str = "/usr/local/bin";
 
-    /// Each harness accepts exactly its bare program word (plain or path
-    /// form) and its canonical resume form (bare or quoted ID). Driving these
-    /// shape tests off [`HARNESSES`] keeps a later harness from being added
-    /// untested.
+    /// Each registered harness accepts bare and canonical resume forms,
+    /// including path-qualified programs and quoted IDs.
     #[test]
     fn every_harness_detects_the_two_authored_shapes() {
         for &h in HARNESSES {

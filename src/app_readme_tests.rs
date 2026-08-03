@@ -1,19 +1,16 @@
-//! Generator for the four `docs/img/*.ansi` dashboard frames the README shows.
+//! Generates the four README dashboard fixtures under `docs/img`.
 //!
-//! Nothing here pins app behavior. The single `#[test]` is `#[ignore]`d because
-//! it writes repository fixtures: run it by hand when a render change makes the
-//! screenshots stale. Every fleet is fabricated and every duration is a
-//! constant, so one `$HOME` yields byte-identical frames across runs.
+//! The ignored test writes repository files on demand. Fabricated tasks and
+//! fixed durations keep its output deterministic for a given `$HOME`.
 
 use super::*;
 
-/// Fixture terminal size. The 30 rows fit every section plus one spare list
-/// row; 107 columns produce a 71-column preview cell and an 80-column peek box.
+/// Fixture dimensions. Thirty rows fit every section; 107 columns produce a
+/// 71-column preview cell and an 80-column peek box.
 const FIXTURE_ROWS: u16 = 30;
 const FIXTURE_COLS: u16 = 107;
 
-/// A client with no core behind it. The fixture assigns `views` and
-/// `focused_screen` directly, so no command is sent and no event arrives.
+/// Transport stub for fixtures that assign app state directly.
 struct NoTransport;
 
 impl Transport for NoTransport {
@@ -30,19 +27,17 @@ impl Transport for NoTransport {
     fn shutdown(&mut self, _intent: ExitIntent) {}
 }
 
-/// Fabricated seconds. Every fixture duration is a constant: a clock reading
-/// would change the bytes between runs. `const` so the `QUIET` table can hold
-/// them directly.
+/// Constant fixture duration in seconds.
 const fn secs(n: u64) -> Duration {
     Duration::from_secs(n)
 }
 
-/// Fabricated minutes.
+/// Constant fixture duration in minutes.
 const fn mins(n: u64) -> Duration {
     Duration::from_secs(n * 60)
 }
 
-/// Live summary-adapter preview, carrying the matcher id the peek footer names.
+/// Live anchor preview with its matcher ID.
 fn anchor(text: &str, rule: &'static str) -> Preview {
     Preview {
         text: text.to_string(),
@@ -72,7 +67,7 @@ fn floor(text: &str) -> Preview {
     }
 }
 
-/// The last-row preview a finished task froze on.
+/// Frozen last-row preview for a finished task.
 fn frozen(text: &str) -> Preview {
     Preview {
         text: text.to_string(),
@@ -82,8 +77,7 @@ fn frozen(text: &str) -> Preview {
     }
 }
 
-/// The fleet's working directories, keyed as they appear in the section labels.
-/// `path::abbreviate` renders `$HOME` as `~`, so these must be built from it.
+/// Working directories rooted at `$HOME` for `~`-abbreviated section labels.
 struct Dirs {
     home: PathBuf,
     fleetcom: PathBuf,
@@ -109,9 +103,7 @@ impl Dirs {
     }
 }
 
-/// A dashboard client over `views`, with `~/Documents/Code/Rust/fleetcom` as
-/// the invocation directory so directory mode ranks that section first.
-/// Daemon-backed mode omits the foreground marker from generated frames.
+/// Build a daemon-backed fixture with fleetcom as the invocation directory.
 fn fixture_app(dirs: &Dirs, group_mode: GroupMode, views: Vec<TaskView>) -> App {
     let mut app = App::assemble(FIXTURE_ROWS, FIXTURE_COLS, |_, _, _| Box::new(NoTransport));
     app.daemon_backed = true;
@@ -123,9 +115,8 @@ fn fixture_app(dirs: &Dirs, group_mode: GroupMode, views: Vec<TaskView>) -> App 
     app
 }
 
-/// The active frame's 21 tasks: 12 active, two idle, and seven finished.
-/// Task IDs encode launch order; `row_rank` moves tagged tasks ahead of their
-/// peers and finished tasks behind them within a section.
+/// Active fixture: 12 active, two idle, and seven finished tasks. IDs encode
+/// launch order; tags and completion determine row rank within each section.
 fn live_fleet(dirs: &Dirs) -> Vec<TaskView> {
     vec![
         TaskView {
@@ -428,8 +419,7 @@ fn live_fleet(dirs: &Dirs) -> Vec<TaskView> {
     ]
 }
 
-/// Per-task state for the quiet frame. Task identity remains in `live_fleet`;
-/// this table replaces lifecycle, age, and one preview.
+/// Per-task state overrides for the quiet fixture.
 struct Quiet {
     id: u64,
     lifecycle: Lifecycle,
@@ -437,13 +427,12 @@ struct Quiet {
     started_ago: Duration,
     quiet_ago: Option<Duration>,
     finished_ago: Option<Duration>,
-    /// Replacement anchor preview as `(text, matcher id)`; `None` keeps the
-    /// live fleet's.
+    /// Optional replacement anchor preview as `(text, matcher ID)`.
     preview: Option<(&'static str, &'static str)>,
 }
 
 impl Quiet {
-    /// A live task quiet past `IDLE_AFTER`, timed from its last output.
+    /// Idle task timed from its last output.
     const fn idle(id: u64, started: Duration, quiet: Duration) -> Self {
         Self {
             id,
@@ -456,7 +445,7 @@ impl Quiet {
         }
     }
 
-    /// A live task still inside `IDLE_AFTER`, timed from launch.
+    /// Active task timed from launch.
     const fn active(id: u64, started: Duration, quiet: Duration) -> Self {
         Self {
             lifecycle: Lifecycle::Active,
@@ -465,7 +454,7 @@ impl Quiet {
         }
     }
 
-    /// A task that exited cleanly, timed from the exit.
+    /// Successful task timed from exit.
     const fn done(id: u64, started: Duration, finished: Duration) -> Self {
         Self {
             lifecycle: Lifecycle::Ok,
@@ -476,7 +465,7 @@ impl Quiet {
         }
     }
 
-    /// A task that exited non-zero, timed from the exit.
+    /// Failed task timed from exit.
     const fn failed(id: u64, started: Duration, finished: Duration) -> Self {
         Self {
             lifecycle: Lifecycle::Failed,
@@ -484,16 +473,14 @@ impl Quiet {
         }
     }
 
-    /// Swap in a different status line.
+    /// Replace the anchor preview.
     const fn saying(mut self, text: &'static str, rule: &'static str) -> Self {
         self.preview = Some((text, rule));
         self
     }
 }
 
-/// Quiet-frame overrides, one per task. The rendered ages include `32s` and
-/// `13s` for the tagged pair, `1m` for most idle agents, and `15m`–`21m` for
-/// finished tasks.
+/// Overrides for every task in the quiet fixture.
 const QUIET: [Quiet; 21] = [
     Quiet::idle(1, mins(22), secs(32)),
     Quiet::idle(2, mins(21), secs(13)).saying(SUMMARY_QUIET, "claude:action-row"),
@@ -519,9 +506,7 @@ const QUIET: [Quiet; 21] = [
     Quiet::idle(21, mins(30), mins(28)),
 ];
 
-/// The quiet frame's 21 tasks: one active, 13 idle, and seven finished.
-/// `parked` follows `lifecycle` because the core derives both from the same
-/// `IDLE_AFTER` window.
+/// Quiet fixture: one active, 13 idle, and seven finished tasks.
 fn quiet_fleet(dirs: &Dirs) -> Vec<TaskView> {
     let mut views = live_fleet(dirs);
     assert_eq!(
@@ -545,8 +530,7 @@ fn quiet_fleet(dirs: &Dirs) -> Vec<TaskView> {
     views
 }
 
-// Preview texts long enough that the row cell truncates them. They are stored
-// whole: the `…` in the painted frame is the renderer's, not the fixture's.
+// Store full preview text so truncation comes from the renderer.
 const CODEX_LANGUAGE: &str =
     "gpt-5.6-sol high · fleetcom · feat/cs/interface-fixes · 387K used · 9.53M in · 61.2K out";
 const CODEX_REVIEW: &str =
@@ -563,11 +547,10 @@ const FLEETCOM_CLIPPY: &str =
     "error: could not compile `fleetcom` (lib test) due to 1 previous error";
 const LOGRIA_WATCH: &str = "[Running 'cargo test'] test result: ok. 223 passed; 0 failed";
 const LOGRIA_DOC: &str = "Finished `dev` profile [unoptimized + debuginfo] target(s) in 3.41s";
-/// Preview used only by the quiet frame.
+/// Quiet-fixture summary preview.
 const SUMMARY_QUIET: &str = "✻ Review fleetcom preview design document";
 
-/// The peeked task's screen: the tail of a `cargo test` run. `render_peek`
-/// shows the last `inner_h` lines, so these are already the visible ones.
+/// Visible `cargo test` tail used by the peek fixture.
 fn cargo_test_screen(id: u64) -> ScreenView {
     let lines = [
         "test util::sanitizers::tests::test_length_clean ... ok",
@@ -588,7 +571,7 @@ fn cargo_test_screen(id: u64) -> ScreenView {
     ScreenView {
         id,
         lines: lines.iter().map(|s| s.to_string()).collect(),
-        // Peek reads `lines` only; the attached path never runs here.
+        // Peek reads plain lines; formatted bytes are unused.
         formatted: Vec::new(),
         cursor: (0, 0),
         hide_cursor: true,
@@ -599,23 +582,19 @@ fn cargo_test_screen(id: u64) -> ScreenView {
     }
 }
 
-/// Paint `app` once and return the frame bytes.
+/// Render one fixture frame.
 fn frame(app: &mut App) -> Vec<u8> {
-    // OSC 0 keeps the captured window title independent of the printing shell.
+    // Set a stable captured window title.
     let mut out = b"\x1b]0;fleetcom\x07".to_vec();
     let painted = out.len();
     crate::ui::render(&mut out, app).expect("a fixture frame always paints");
     assert!(out.len() > painted, "a fresh App must emit its first frame");
-    // Park the cursor on the terminal's final row, outside centered overlays.
+    // Park the cursor outside centered overlays.
     out.extend_from_slice(format!("\x1b[{};1H", app.rows).as_bytes());
     out
 }
 
-/// Rewrite the four `docs/img/*.ansi` dashboard frames. This test is ignored
-/// because it writes repository fixtures.
-///
-/// Fixed durations and ordered inputs make the output deterministic for a
-/// given `$HOME`; `path::abbreviate` renders that path as `~` in section labels.
+/// Rewrite the four deterministic README dashboard fixtures under `docs/img`.
 #[test]
 #[ignore = "writes docs/img/*.ansi; run by hand to refresh the README screenshots"]
 fn write_readme_screenshot_fixtures() {
@@ -624,27 +603,25 @@ fn write_readme_screenshot_fixtures() {
     let dirs = Dirs::new(Path::new(&home));
     let out_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("docs/img");
 
-    // Grouped by directory, selection on a live codex task.
+    // Directory grouping with a live Codex task selected.
     let mut app = fixture_app(&dirs, GroupMode::Dir, live_fleet(&dirs));
     app.selected_id = Some(4);
     std::fs::write(out_dir.join("home.ansi"), frame(&mut app)).unwrap();
 
-    // State grouping with peek open over the first finished test. Directory
-    // ordering places id 14 first in Completed and beside the peek box.
+    // State grouping with a completed test selected in peek.
     let mut app = fixture_app(&dirs, GroupMode::State, quiet_fleet(&dirs));
     app.mode = Mode::Peek;
     app.selected_id = Some(14);
-    // Seed the watched screen directly because NoTransport emits no frames.
+    // Seed the watched screen because NoTransport emits no frames.
     app.focused_screen = Some(cargo_test_screen(14));
     std::fs::write(out_dir.join("quickpeek.ansi"), frame(&mut app)).unwrap();
 
-    // Custom grouping puts five directories in `tests` and splits fleetcom's
-    // directory between two sections.
+    // Custom grouping splits fleetcom tasks between dashboard and tests.
     let mut app = fixture_app(&dirs, GroupMode::Custom, live_fleet(&dirs));
     app.selected_id = Some(4);
     std::fs::write(out_dir.join("groups.ansi"), frame(&mut app)).unwrap();
 
-    // The `?` overlay over the same dir-grouped dashboard.
+    // Controls overlay on the directory-grouped fixture.
     let mut app = fixture_app(&dirs, GroupMode::Dir, live_fleet(&dirs));
     app.selected_id = Some(4);
     app.mode = Mode::Controls;

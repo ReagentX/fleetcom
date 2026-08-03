@@ -814,8 +814,7 @@ impl Handler for ObservedTerm<'_> {
     }
     /// Capture supported OSC 52 stores while preserving their selector.
     fn clipboard_store(&mut self, a0: u8, a1: &[u8]) {
-        // Ignore selectors without a forwarding target. An empty selector never
-        // reaches here: the vte dispatcher substitutes `c` before the call.
+        // Ignore unsupported selectors; the dispatcher maps an empty one to `c`.
         let Some(selector) = ClipboardKind::from_selector(&[a0]) else {
             return;
         };

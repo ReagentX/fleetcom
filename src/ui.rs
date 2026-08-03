@@ -244,12 +244,8 @@ fn cmdline(app: &App) -> Option<(String, u16)> {
     Some(caret_line(&prefix, &app.input, app.cols as usize))
 }
 
-/// Compose `prefix` + the buffer text with the caret's display column: the
-/// width of the prefix plus the width of the text before the caret, bounded to
-/// the painted, `cols`-truncated line. Widths are terminal columns (wide glyphs
-/// count 2), not scalar counts. An overflowing prompt keeps its plain
-/// truncation, so a caret past the cut pins at the right edge rather than
-/// scrolling the line to stay visible.
+/// Compose the prompt and return its caret column, clamped to the truncated
+/// rendered width. Widths are terminal columns, not scalar counts.
 fn caret_line(prefix: &str, buf: &EditBuffer, cols: usize) -> (String, u16) {
     let line = format!("{prefix}{}", buf.as_str());
     let cx = (prefix.width() + buf.before_caret().width()) as u16;
@@ -389,26 +385,23 @@ fn top_border(label: &str, inner_w: usize) -> String {
     border
 }
 
-/// A centered box overlay: labeled top border, padded body rows, and a dim
-/// footer overwriting the bottom border. It owns placement.
+/// Centered overlay with a labeled border, padded body, and dim footer.
 struct Overlay<'a> {
-    /// Terminal to center within: columns, then rows.
+    /// Terminal dimensions: columns, then rows.
     cols: usize,
     rows: usize,
-    /// Box size, both borders included: columns, then rows.
+    /// Box dimensions including borders: columns, then rows.
     bw: usize,
     bh: usize,
-    /// Set into the top border, truncated to fit.
+    /// Top-border label, truncated to fit.
     label: &'a str,
-    /// Body lines. Rows past its end paint blank, so a box taller than its
-    /// content still frames cleanly.
+    /// Body lines; missing rows render blank.
     body: &'a [String],
-    /// Written over the bottom border, two columns in.
+    /// Footer written over the bottom border.
     footer: &'a str,
 }
 
-/// Paint a centered box. The footer is queued after the bottom border because
-/// it overwrites that border's left end.
+/// Paint a centered overlay, then overwrite the bottom border with its footer.
 fn render_overlay(out: &mut impl Write, o: &Overlay) -> io::Result<()> {
     // Saturating: a box larger than the terminal pins to the origin.
     let x0 = o.cols.saturating_sub(o.bw) / 2;
@@ -453,10 +446,9 @@ fn render_peek(out: &mut impl Write, app: &App) -> io::Result<()> {
     let bw = (cols * 3 / 4).clamp(24, cols.max(24));
     let bh = rows.saturating_sub(6).clamp(5, 16);
 
-    // Screen lines for the selected task, once the core has streamed them. Empty
-    // until then (or if the watch just switched); the box still frames cleanly.
+    // Use an empty body until the selected task's screen arrives.
     let lines: &[String] = app.screen_for(v.id).map_or(&[], |s| &s.lines);
-    // Peek frames the screen's tail, so it needs the interior height too.
+    // Show the newest lines that fit inside the overlay.
     let start = lines.len().saturating_sub(bh.saturating_sub(2));
     let tail = &lines[start..];
 
@@ -731,8 +723,7 @@ fn render_pickdir(out: &mut impl Write, app: &App) -> io::Result<()> {
         Some(DirKind::Into) => "enter/tab open",
         None => "",
     };
-    // The header is the caret line plus three columns of reverse-video tail.
-    // The caret clamps against the line without that tail, so it stays on text.
+    // Add three styled columns after the text without moving the caret.
     let (line, cx) = caret_line("  @ ", &app.dir_input, app.cols as usize);
     render_panel(
         out,
@@ -845,8 +836,7 @@ fn saved_page_hint(recovery: usize) -> String {
 
 /// Render the saved-session or recovery page of the session picker.
 fn render_session_picker(out: &mut impl Write, app: &App) -> io::Result<()> {
-    // Bind the recovery rows outside the match so the borrow outlives it. The
-    // Saved page pays for a few short strings it will not paint.
+    // Preformat recovery rows for the recovery page.
     let recovery: Vec<String> = app.session_recovery.iter().map(recovery_row).collect();
     let (header, labels, sel, hint, empty) = match app.session_page {
         SessionPage::Saved => (

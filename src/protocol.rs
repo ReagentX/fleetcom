@@ -14,9 +14,7 @@ use crate::frame::{KIND_CONTROL, KIND_HELLO, KIND_SCREEN};
 /// Wire-protocol version; the handshake rejects mismatched peers.
 pub const PROTOCOL_VERSION: u32 = 10;
 
-/// Dashboard label for a task with no group. The core reserves this exact
-/// spelling so a user-created group can never shadow the section it names:
-/// respell one side only and the reservation stops guarding the label.
+/// Reserved dashboard label for tasks without a custom group.
 pub const UNASSIGNED: &str = "Unassigned";
 
 /// Environment and working directory supplied by the launching client.
@@ -222,10 +220,7 @@ pub enum ClipboardKind {
 }
 
 impl ClipboardKind {
-    /// The OSC 52 selector byte naming this target, which is also the `clip`
-    /// frame's `k` tag: one alphabet, by design. The frame relays the child's
-    /// own selector to the client, which re-emits it in an outbound OSC 52, so
-    /// a wire tag that drifted from the selector would rewrite the target.
+    /// OSC 52 selector used for this target and the protocol `clip` tag.
     pub fn selector(self) -> &'static str {
         match self {
             Self::Clipboard => "c",
@@ -234,10 +229,7 @@ impl ClipboardKind {
         }
     }
 
-    /// Parse a selector, rejecting anything but exactly `c`, `p`, or `s` (see
-    /// [`ClipboardKind::selector`]). Takes bytes to serve both callers: the
-    /// wire decoder hands over `str::as_bytes`, the emulator's OSC 52 handler
-    /// a single raw selector byte.
+    /// Parse an exact `c`, `p`, or `s` selector from bytes.
     pub fn from_selector(sel: &[u8]) -> Option<Self> {
         match sel {
             b"c" => Some(Self::Clipboard),
@@ -595,7 +587,7 @@ pub fn encode_command(cmd: &Command) -> (u8, Vec<u8>) {
             "cols": *cols as u64,
         },
         Command::Watch { id, attached } => {
-            // An absent watch ID encodes as explicit JSON null.
+            // Preserve an absent watch ID as JSON null.
             jzon::object! { "t": "watch", "id": *id, "attached": *attached }
         }
         // Encode both byte-carrying commands as base64. The paste-size bound in

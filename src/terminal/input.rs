@@ -190,10 +190,8 @@ fn f_bytes(n: u8, m: Option<u8>) -> Option<Vec<u8>> {
     })
 }
 
-/// ESC-prefix `base` when `meta` holds: the meta convention for keys with no
-/// CSI modifier form. Enter takes the prefix on Shift as well as Alt, so the
-/// caller passes the condition rather than `Mods`; BackTab's base is the
-/// three-byte CSI Z, so `base` is a slice rather than a byte.
+/// Prefix `base` with ESC when `meta` is set. `base` may be a multibyte
+/// sequence, such as BackTab's CSI Z.
 fn meta_bytes(meta: bool, base: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(base.len() + 1);
     if meta {

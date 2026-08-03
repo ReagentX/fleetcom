@@ -75,9 +75,8 @@ pub fn pad(s: &str, width: usize) -> String {
     t
 }
 
-/// Longest prefix of `s` at most `max` bytes long, on a char boundary.
-/// Bytes, not columns: this bounds a filesystem or protocol field, where
-/// [`truncate`] bounds a rendered column count.
+/// Return the longest UTF-8 prefix no longer than `max` bytes. Unlike
+/// [`truncate`], this limits bytes rather than display columns.
 pub(crate) fn prefix_bytes(s: &str, max: usize) -> &str {
     if s.len() <= max {
         return s;

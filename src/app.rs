@@ -84,9 +84,8 @@ pub enum Mode {
     Spawn,
     /// Live directory picker (the `@` flow) that sets `spawn_cwd`.
     PickDir,
-    /// Live group picker (the `g` flow) reassigning `target`'s group. The id is
-    /// pinned at open, so a snapshot that moves the dashboard selection cannot
-    /// retarget the open picker.
+    /// Live group picker (the `g` flow). Its target remains fixed if a snapshot
+    /// reorders the dashboard selection.
     PickGroup {
         target: u64,
     },
@@ -295,8 +294,7 @@ fn desired_mouse_capture(attached: Option<&ScreenView>, view_scroll: bool) -> bo
     }
 }
 
-/// The row a picker opens highlighted on: row 0 (the resolved path, or
-/// Unassigned) unless a nonempty filter matched, which preselects the first
+/// Select row 0 for an empty filter or no match; otherwise select the first
 /// match on row 1.
 fn preselected_row(filter_empty: bool, cands: usize) -> usize {
     usize::from(!filter_empty && cands >= 2)
@@ -512,8 +510,7 @@ impl App {
         self.rows.saturating_sub(1).max(1)
     }
 
-    /// Clamp a pointer coordinate into the child pane: the bottom row is
-    /// fleetcom's status bar, not the child's.
+    /// Clamp a pointer to the child pane, excluding fleetcom's status row.
     fn clamp_to_pane(&self, row: u16, col: u16) -> (u16, u16) {
         (
             row.min(self.pane_rows().saturating_sub(1)),
@@ -961,7 +958,7 @@ impl App {
             });
         }
 
-        // An empty trailing fragment selects the resolved path.
+        // Empty trailing input keeps the resolved path selected.
         self.dir_sel = preselected_row(partial.is_empty(), cands.len());
         self.dir_candidates = cands;
     }
@@ -1014,8 +1011,7 @@ impl App {
     /// Open the `g` picker on the selected task; a no-op with no selection.
     fn open_group_picker(&mut self) {
         if let Some(i) = self.selected_task() {
-            // Set the mode first: `refresh_group_candidates` reads the target
-            // out of it.
+            // Store the target before building its candidate list.
             self.mode = Mode::PickGroup {
                 target: self.views[i].id,
             };
@@ -1274,8 +1270,7 @@ impl App {
             // Whitespace-only input clears the name; the supervisor applies
             // the remaining label normalization.
             let name = Some(name.to_string()).filter(|s| !s.is_empty());
-            // `on_key_textinput` submits before it closes, so the mode still
-            // carries the target.
+            // The mode retains the target until submission closes the prompt.
             if let Mode::Rename(id) = app.mode {
                 app.transport.send(Command::SetName { id, name });
             }

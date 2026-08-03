@@ -118,8 +118,7 @@ fn normalize_label(label: Option<String>) -> Option<String> {
     Some(capped)
 }
 
-/// Normalize a group assignment and map the case-sensitive reserved label
-/// [`UNASSIGNED`] to `None`. Display names do not reserve this label.
+/// Normalize a group and map the reserved [`UNASSIGNED`] label to `None`.
 fn normalize_group(name: Option<String>) -> Option<String> {
     normalize_label(name).filter(|g| g != UNASSIGNED)
 }
@@ -178,11 +177,8 @@ struct Recovery {
     last_mutation: Option<Instant>,
     /// The start of the most recent cadence interval.
     last_cadence: Instant,
-    /// Sessions root, written snapshot path, and recipe fingerprint of the last
-    /// successful write. A match is skipped only while that snapshot still
-    /// exists. The path comes back from `save_recovery_in` rather than being
-    /// rebuilt here: a rebuilt path that stopped matching `session`'s naming
-    /// rule would miss forever and silently rewrite on every pass.
+    /// Sessions root, snapshot path, and recipe fingerprint from the last
+    /// successful write. Deduplication requires all three and an existing file.
     last_written: Option<(PathBuf, PathBuf, String)>,
     /// Filename stem reused for this supervisor's recovery writes.
     stem: String,
@@ -607,9 +603,7 @@ impl Supervisor {
         let hash = fnv1a_hex(session::fingerprint_json(&cfg).as_bytes());
         // Deduplication is scoped to the current root and requires the snapshot
         // to remain on disk, so a removed snapshot is recreated on a due pass.
-        // The root is compared as well as the path because a reconnecting
-        // client can move the sessions root; the recorded path belongs to
-        // whichever root was current when it was written.
+        // A reconnect can change the sessions root, so include it in the match.
         if self
             .recovery
             .last_written
@@ -667,11 +661,8 @@ impl Supervisor {
         }
     }
 
-    /// Retire a task already lifted out of the set: TERM now, unlink its
-    /// capture, then the graveyard for grace-then-KILL escalation and reaping.
-    /// Unlink through the task's own `capture_file` because the current
-    /// client's capture root can differ from the one that spawned it. Never
-    /// drop the task instead: that straight-SIGKILLs stragglers of its run.
+    /// Terminate a removed task, unlink its capture, and retain it for
+    /// escalation and reaping.
     fn retire(&mut self, mut t: Task) {
         t.terminate();
         if let Some(cap) = &t.capture_file {
@@ -875,9 +866,8 @@ impl Supervisor {
                 fresh.tagged = self.tasks[i].tagged;
                 fresh.group = self.tasks[i].group.clone();
                 fresh.name = self.tasks[i].name.clone();
-                // The displaced task exits like a Remove. Retire it only after
-                // the resume command above is derived: `retire` unlinks the
-                // capture that command's ID may have come from.
+                // Derive the resume command before retirement removes the
+                // displaced run's capture file.
                 let old = std::mem::replace(&mut self.tasks[i], fresh);
                 self.retire(old);
                 // Reset the fingerprint for the replacement task's screen.
@@ -1044,8 +1034,7 @@ impl Supervisor {
         let Some((spawned, skipped, failed)) = self.materialize(&cfg) else {
             return;
         };
-        // Omit a zero task count too, except for an empty recipe: with no other
-        // clause to carry it, the notice would report nothing at all.
+        // Report zero tasks only for an empty recipe.
         let mut parts = Vec::new();
         if spawned > 0 || (skipped == 0 && failed == 0) {
             parts.push(format!("{spawned} task(s)"));
@@ -1069,8 +1058,7 @@ impl Supervisor {
         let Some((_, skipped, failed)) = self.materialize(&cfg) else {
             return;
         };
-        // A fixed head always precedes these clauses, so each takes the
-        // separator; `load_session` joins because its head can be absent.
+        // Append optional clauses to the fixed message prefix.
         let mut msg = String::from("loaded recovery snapshot; save to name it");
         if skipped > 0 {
             msg.push_str(&format!(", {skipped} skipped ({SKIP_REASONS})"));

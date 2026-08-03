@@ -78,9 +78,7 @@ impl App {
             .collect()
     }
 
-    /// Spawn `cmd` in the invocation directory and attach to it, returning the
-    /// attached id. `attach` targets the selection, so the spawn must land and
-    /// `resolve_selection` must run before it has anything to grab.
+    /// Spawn `cmd`, resolve its dashboard selection, and attach to it.
     fn attached(rows: u16, cols: u16, cmd: &str) -> (Self, u64) {
         let mut app = Self::new_local(rows, cols);
         let dir = app.invocation_dir.clone();
@@ -1135,8 +1133,7 @@ fn pickdir_fragment_surfaces_every_matching_recent() {
 /// Parent components do not match current-task directories.
 #[test]
 fn pickdir_middle_component_matches_no_recent() {
-    // `type_pickdir` scans the fixture tree, so the guard must outlive it.
-    // `_root` stays bound to the end of the scope; bare `_` would drop it here.
+    // Keep the scratch guard alive while `type_pickdir` scans the fixture tree.
     let (mut app, _root) = recents_fixture("pickdir_recent_middle");
 
     type_pickdir(&mut app, "doc");
