@@ -78,7 +78,7 @@ impl ThreadTransport {
     /// Build the in-process core at `rows`×`cols` and run it on its own
     /// thread. `wait_tx` wakes the *client's* run loop when an event is
     /// produced, so the loop reacts without polling.
-    pub fn foreground(rows: u16, cols: u16, wait_tx: Sender<()>) -> ThreadTransport {
+    pub fn foreground(rows: u16, cols: u16, wait_tx: Sender<()>) -> Self {
         let mut sup = Supervisor::new(rows, cols, resolve_scrollback());
         let (wake_tx, wake_rx) = channel::<Wake>();
         let (evt_tx, evt_rx) = channel::<Event>();
@@ -102,7 +102,7 @@ impl ThreadTransport {
             // Loop returned (Shutdown or client gone): `sup` drops here, and with
             // it every Task (Task::drop → killpg), so no task outlives the core.
         });
-        ThreadTransport {
+        Self {
             wake_tx,
             evt_rx,
             handle: Some(handle),
@@ -167,11 +167,7 @@ impl SocketTransport {
     /// can fail is the caller's job: done outside the transport so the App's
     /// transport factory stays infallible. `wait_tx` wakes the client's run loop
     /// on each inbound event.
-    pub fn from_halves(
-        write: UnixStream,
-        read: UnixStream,
-        wait_tx: Sender<()>,
-    ) -> SocketTransport {
+    pub fn from_halves(write: UnixStream, read: UnixStream, wait_tx: Sender<()>) -> Self {
         // Keep construction infallible; if this best-effort setup fails, the
         // stream retains its existing write-timeout setting.
         let _ = write.set_write_timeout(Some(SEND_TIMEOUT));
@@ -192,7 +188,7 @@ impl SocketTransport {
             // the drop (via `poll` → disconnected) now, not on the idle backstop.
             let _ = wait_tx.send(());
         });
-        SocketTransport {
+        Self {
             write,
             evt_rx,
             reader: Some(reader),
@@ -254,8 +250,8 @@ pub struct LocalTransport {
 
 #[cfg(test)]
 impl LocalTransport {
-    pub fn new(sup: Supervisor) -> LocalTransport {
-        LocalTransport { sup }
+    pub fn new(sup: Supervisor) -> Self {
+        Self { sup }
     }
 }
 

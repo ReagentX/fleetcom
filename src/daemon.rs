@@ -357,6 +357,12 @@ fn spawn_daemon() -> io::Result<()> {
     Ok(())
 }
 
+/// Report a successful no-op when `--kill` finds no daemon.
+fn no_daemon() -> io::Result<()> {
+    eprintln!("fleetcom: no daemon running");
+    Ok(())
+}
+
 /// `fleetcom --kill`: stop the daemon and every task it owns. Signal path, not
 /// socket: the daemon serves one client at a time, so a `Shutdown` *frame*
 /// would sit in the accept backlog until an attached client detached.
@@ -375,25 +381,21 @@ pub fn run_kill() -> io::Result<()> {
         .write(true)
         .open(&lock_path)
     else {
-        eprintln!("fleetcom: no daemon running");
-        return Ok(());
+        return no_daemon();
     };
     // Probe the single-instance lock: acquirable means no daemon holds it.
     let mut file = match Flock::lock(file, FlockArg::LockExclusiveNonblock) {
-        Ok(_held) => {
-            eprintln!("fleetcom: no daemon running");
-            return Ok(());
-        }
+        Ok(_held) => return no_daemon(),
         Err((file, _)) => file,
     };
 
     let mut pid_str = String::new();
     file.read_to_string(&mut pid_str)?;
-    let Some(pid) = pid_str.trim().parse::<i32>().ok().filter(|p| *p > 0) else {
+    let Some(pid) = crate::task::positive_pid(pid_str.trim()) else {
         // Without a usable pid, fall back to a Shutdown frame over the socket.
         // Bound the fallback because an attached client can keep the daemon
         // from accepting this connection.
-        return kill_via_socket();
+        return kill_via_socket_at(&socket_path(), KILL_SOCKET_TIMEOUT);
     };
 
     // ESRCH means the daemon exited between the lock probe and here; the flock
@@ -451,27 +453,16 @@ fn deadline_mapped(e: io::Error) -> io::Error {
     }
 }
 
-/// Send `Shutdown` when the lock file has no usable pid. Complete the handshake
-/// first, then wait for the daemon to close the socket after stopping its tasks.
-fn kill_via_socket() -> io::Result<()> {
-    kill_via_socket_at(&socket_path(), KILL_SOCKET_TIMEOUT)
-}
-
-/// Run the socket-fallback kill exchange at `path` using `budget` for I/O.
+/// When the lock lacks a valid PID, send `Shutdown` over the socket and bound
+/// handshake and completion I/O by `budget`.
 fn kill_via_socket_at(path: &Path, budget: Duration) -> io::Result<()> {
     match UnixStream::connect(path) {
-        Ok(mut s) => kill_over_stream(&mut s, budget),
-        Err(_) => {
-            eprintln!("fleetcom: no daemon running");
-            Ok(())
+        Ok(mut s) => {
+            let (kind, payload) = encode_hello(&LaunchContext::here());
+            kill_exchange(&mut s, budget, kind, &payload)
         }
+        Err(_) => no_daemon(),
     }
-}
-
-/// Drive the Shutdown exchange with bounded writes and a shared read deadline.
-fn kill_over_stream(s: &mut UnixStream, budget: Duration) -> io::Result<()> {
-    let (kind, payload) = encode_hello(&LaunchContext::here());
-    kill_exchange(s, budget, kind, &payload)
 }
 
 /// Drive the bounded Shutdown exchange with a pre-encoded hello frame.
@@ -537,9 +528,8 @@ pub fn run_daemon() -> io::Result<()> {
         .open(dir.join("daemon.lock"))?;
     // `lock` is held for the whole function, so the flock lives until this
     // daemon exits, then releases on drop.
-    let mut lock = match Flock::lock(lock_file, FlockArg::LockExclusiveNonblock) {
-        Ok(l) => l,
-        Err(_) => return Ok(()), // another daemon already owns the socket
+    let Ok(mut lock) = Flock::lock(lock_file, FlockArg::LockExclusiveNonblock) else {
+        return Ok(()); // another daemon already holds the lock
     };
     // Sole owner: advertise our pid inside the lock file, the signal target for
     // `--kill`. Trustworthy only while the flock is held. A stale pid from a
@@ -780,7 +770,6 @@ mod tests {
         let link = base.join("runtime");
         std::os::unix::fs::symlink(&target, &link).unwrap();
         assert!(ensure_runtime_dir(&link).is_err());
-        let _ = fs::remove_dir_all(&base);
     }
 
     #[test]
@@ -789,7 +778,6 @@ mod tests {
         let path = base.join("runtime");
         fs::write(&path, b"x").unwrap();
         assert!(ensure_runtime_dir(&path).is_err());
-        let _ = fs::remove_dir_all(&base);
     }
 
     /// Connection setup rejects symlinked and non-directory runtime paths.
@@ -805,7 +793,6 @@ mod tests {
         let file = base.join("file");
         fs::write(&file, b"x").unwrap();
         assert!(connect_or_autostart_in(&file).is_err());
-        let _ = fs::remove_dir_all(&base);
     }
 
     /// Oversized events are skipped without preventing subsequent writes.
@@ -905,7 +892,6 @@ mod tests {
         let mode = fs::symlink_metadata(&path).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o700, "dir must be private");
         ensure_runtime_dir(&path).unwrap();
-        let _ = fs::remove_dir_all(&base);
     }
 
     /// Reject group- or other-writable directories because they may already
@@ -923,7 +909,6 @@ mod tests {
                 0o700 | bits
             );
         }
-        let _ = fs::remove_dir_all(&base);
     }
 
     /// The notice requires both a flag and an already-running daemon.
@@ -944,7 +929,7 @@ mod tests {
     #[test]
     fn kill_via_socket_bounds_the_handshake_wait() {
         let base = temp("kill_socket_mute");
-        fs::create_dir_all(&base).unwrap();
+        fs::create_dir_all(&*base).unwrap();
         let sock = base.join("mute.sock");
         // Leave the connection queued in the listener backlog.
         let _listener = UnixListener::bind(&sock).unwrap();
@@ -956,14 +941,13 @@ mod tests {
             start.elapsed() < Duration::from_secs(5),
             "the deadline must fire, not the test's timeout"
         );
-        let _ = fs::remove_dir_all(&base);
     }
 
     /// A blocked hello write reports the kill-handshake timeout.
     #[test]
     fn kill_exchange_maps_a_write_timeout() {
         let base = temp("kill_socket_bigenv");
-        fs::create_dir_all(&base).unwrap();
+        fs::create_dir_all(&*base).unwrap();
         let sock = base.join("mute.sock");
         let _listener = UnixListener::bind(&sock).unwrap();
         let mut s = UnixStream::connect(&sock).unwrap();
@@ -972,14 +956,13 @@ mod tests {
         let err = kill_exchange(&mut s, Duration::from_millis(200), 0, &oversized).unwrap_err();
         assert_eq!(err.kind(), ErrorKind::TimedOut);
         assert!(err.to_string().contains("kill handshake"), "{err}");
-        let _ = fs::remove_dir_all(&base);
     }
 
     /// A daemon that keeps the socket open after Shutdown times out the drain.
     #[test]
     fn kill_via_socket_bounds_the_drain_wait() {
         let base = temp("kill_socket_drain");
-        fs::create_dir_all(&base).unwrap();
+        fs::create_dir_all(&*base).unwrap();
         let sock = base.join("stuck.sock");
         let listener = UnixListener::bind(&sock).unwrap();
         let server = thread::spawn(move || {
@@ -994,16 +977,14 @@ mod tests {
         let err = kill_via_socket_at(&sock, Duration::from_millis(300)).unwrap_err();
         assert_eq!(err.kind(), ErrorKind::TimedOut);
         server.join().unwrap();
-        let _ = fs::remove_dir_all(&base);
     }
 
     /// A missing socket makes the fallback a no-op.
     #[test]
     fn kill_via_socket_without_a_socket_is_a_noop() {
         let base = temp("kill_socket_absent");
-        fs::create_dir_all(&base).unwrap();
+        fs::create_dir_all(&*base).unwrap();
         assert!(kill_via_socket_at(&base.join("absent.sock"), Duration::from_millis(100)).is_ok());
-        let _ = fs::remove_dir_all(&base);
     }
 
     /// Remove group and other read/execute permissions from a valid directory.
@@ -1020,6 +1001,5 @@ mod tests {
             0o700,
             "harmless bits must be tightened to 0700"
         );
-        let _ = fs::remove_dir_all(&base);
     }
 }

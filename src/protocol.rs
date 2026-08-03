@@ -14,6 +14,9 @@ use crate::frame::{KIND_CONTROL, KIND_HELLO, KIND_SCREEN};
 /// Wire-protocol version; the handshake rejects mismatched peers.
 pub const PROTOCOL_VERSION: u32 = 10;
 
+/// Reserved dashboard label for tasks without a custom group.
+pub const UNASSIGNED: &str = "Unassigned";
+
 /// Environment and working directory supplied by the launching client.
 #[derive(Debug, Clone, PartialEq)]
 pub struct LaunchContext {
@@ -24,8 +27,8 @@ pub struct LaunchContext {
 
 impl LaunchContext {
     /// Capture this process's environment and current directory.
-    pub fn here() -> LaunchContext {
-        LaunchContext {
+    pub fn here() -> Self {
+        Self {
             env: std::env::vars_os().collect(),
             cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
         }
@@ -216,6 +219,27 @@ pub enum ClipboardKind {
     Selection,
 }
 
+impl ClipboardKind {
+    /// OSC 52 selector used for this target and the protocol `clip` tag.
+    pub fn selector(self) -> &'static str {
+        match self {
+            Self::Clipboard => "c",
+            Self::Primary => "p",
+            Self::Selection => "s",
+        }
+    }
+
+    /// Parse an exact `c`, `p`, or `s` selector from bytes.
+    pub fn from_selector(sel: &[u8]) -> Option<Self> {
+        match sel {
+            b"c" => Some(Self::Clipboard),
+            b"p" => Some(Self::Primary),
+            b"s" => Some(Self::Selection),
+            _ => None,
+        }
+    }
+}
+
 /// Recovery-snapshot metadata sent to the session picker.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RecoveryEntry {
@@ -260,10 +284,10 @@ impl PreviewSource {
     /// Lowercase provenance identifier.
     pub fn label(self) -> &'static str {
         match self {
-            PreviewSource::Floor => "floor",
-            PreviewSource::Marker => "marker",
-            PreviewSource::Title => "title",
-            PreviewSource::Anchor => "anchor",
+            Self::Floor => "floor",
+            Self::Marker => "marker",
+            Self::Title => "title",
+            Self::Anchor => "anchor",
         }
     }
 }
@@ -282,8 +306,8 @@ pub struct Preview {
 
 impl Preview {
     /// An unfrozen `Floor` preview of `text`.
-    pub(crate) fn floor(text: String) -> Preview {
-        Preview {
+    pub(crate) fn floor(text: String) -> Self {
+        Self {
             text,
             source: PreviewSource::Floor,
             rule: None,
@@ -385,7 +409,7 @@ fn bool_flag(v: &jzon::JsonValue) -> Option<bool> {
 /// Decode an optional-string field: missing and null both mean the cleared
 /// state (`Some(None)`), a string is the set state, and any other type
 /// rejects the message (`None`).
-fn opt_str(v: &jzon::JsonValue) -> Option<Option<String>> {
+pub(crate) fn opt_str(v: &jzon::JsonValue) -> Option<Option<String>> {
     if v.is_null() {
         return Some(None);
     }
@@ -394,7 +418,7 @@ fn opt_str(v: &jzon::JsonValue) -> Option<Option<String>> {
 
 /// Insert `key` only when the optional field is set; absence encodes `None`
 /// on the wire (see [`opt_str`]).
-fn insert_opt_str(o: &mut jzon::JsonValue, key: &str, val: &Option<String>) {
+pub(crate) fn insert_opt_str(o: &mut jzon::JsonValue, key: &str, val: &Option<String>) {
     if let Some(s) = val {
         let _ = o.insert(key, s.as_str());
     }
@@ -480,17 +504,15 @@ fn source_from(s: &str) -> Option<PreviewSource> {
 
 /// Serialize a launch context as a `KIND_HELLO` frame.
 pub fn encode_hello(ctx: &LaunchContext) -> (u8, Vec<u8>) {
-    let mut o = jzon::JsonValue::new_object();
-    let _ = o.insert("v", PROTOCOL_VERSION);
-    let _ = o.insert("cwd", path_b64(&ctx.cwd));
     let mut pairs = jzon::JsonValue::new_array();
     for (k, v) in &ctx.env {
-        let mut pair = jzon::JsonValue::new_array();
-        let _ = pair.push(os_b64(k));
-        let _ = pair.push(os_b64(v));
-        let _ = pairs.push(pair);
+        let _ = pairs.push(jzon::array![os_b64(k), os_b64(v)]);
     }
-    let _ = o.insert("env", pairs);
+    let o = jzon::object! {
+        "v": PROTOCOL_VERSION,
+        "cwd": path_b64(&ctx.cwd),
+        "env": pairs,
+    };
     (KIND_HELLO, o.dump().into_bytes())
 }
 
@@ -529,73 +551,58 @@ pub fn hello_version(kind: u8, payload: &[u8]) -> Option<u32> {
 /// Serialize a command to `(kind, payload)` for [`crate::frame::write_frame`].
 /// Every command is a jzon control frame tagged by a `"t"` discriminant.
 pub fn encode_command(cmd: &Command) -> (u8, Vec<u8>) {
-    let mut o = jzon::JsonValue::new_object();
-    match cmd {
+    let o = match cmd {
         Command::Spawn {
             command,
             cwd,
             group,
         } => {
-            let _ = o.insert("t", "spawn");
-            let _ = o.insert("command", command.as_str());
-            let _ = o.insert("cwd", path_b64(cwd));
+            let mut o = jzon::object! {
+                "t": "spawn",
+                "command": command.as_str(),
+                "cwd": path_b64(cwd),
+            };
             insert_opt_str(&mut o, "group", group);
+            o
         }
-        Command::Kill { id } => {
-            let _ = o.insert("t", "kill");
-            let _ = o.insert("id", *id);
-        }
-        Command::Remove { id } => {
-            let _ = o.insert("t", "remove");
-            let _ = o.insert("id", *id);
-        }
-        Command::Restart { id } => {
-            let _ = o.insert("t", "restart");
-            let _ = o.insert("id", *id);
-        }
-        Command::Tag { id, on } => {
-            let _ = o.insert("t", "tag");
-            let _ = o.insert("id", *id);
-            let _ = o.insert("on", *on);
-        }
+        Command::Kill { id } => jzon::object! { "t": "kill", "id": *id },
+        Command::Remove { id } => jzon::object! { "t": "remove", "id": *id },
+        Command::Restart { id } => jzon::object! { "t": "restart", "id": *id },
+        Command::Tag { id, on } => jzon::object! { "t": "tag", "id": *id, "on": *on },
         Command::SetGroup { id, group } => {
-            let _ = o.insert("t", "group");
-            let _ = o.insert("id", *id);
+            let mut o = jzon::object! { "t": "group", "id": *id };
             // Absence of `g` encodes an unassigned task.
             insert_opt_str(&mut o, "g", group);
+            o
         }
         Command::SetName { id, name } => {
-            let _ = o.insert("t", "name");
-            let _ = o.insert("id", *id);
+            let mut o = jzon::object! { "t": "name", "id": *id };
             // Absence of `n` encodes an unnamed task.
             insert_opt_str(&mut o, "n", name);
+            o
         }
-        Command::Resize { rows, cols } => {
-            let _ = o.insert("t", "resize");
-            let _ = o.insert("rows", *rows as u64);
-            let _ = o.insert("cols", *cols as u64);
-        }
+        Command::Resize { rows, cols } => jzon::object! {
+            "t": "resize",
+            "rows": *rows as u64,
+            "cols": *cols as u64,
+        },
         Command::Watch { id, attached } => {
-            let _ = o.insert("t", "watch");
-            // Encode an absent watch ID as explicit JSON null.
-            let _ = o.insert("id", *id);
-            let _ = o.insert("attached", *attached);
+            // Preserve an absent watch ID as JSON null.
+            jzon::object! { "t": "watch", "id": *id, "attached": *attached }
         }
         // Encode both byte-carrying commands as base64. The paste-size bound in
         // `app` accounts for base64 expansion and the frame limit.
-        Command::Input { id, bytes } => {
-            let _ = o.insert("t", "input");
-            let _ = o.insert("id", *id);
-            let _ = o.insert("bytes", B64.encode(bytes));
-        }
-        Command::Paste { id, bytes } => {
-            let _ = o.insert("t", "paste");
-            let _ = o.insert("id", *id);
-            let _ = o.insert("bytes", B64.encode(bytes));
-        }
+        Command::Input { id, bytes } => jzon::object! {
+            "t": "input",
+            "id": *id,
+            "bytes": B64.encode(bytes),
+        },
+        Command::Paste { id, bytes } => jzon::object! {
+            "t": "paste",
+            "id": *id,
+            "bytes": B64.encode(bytes),
+        },
         Command::Mouse { id, kind, col, row } => {
-            let _ = o.insert("t", "mouse");
-            let _ = o.insert("id", *id);
             let (k, btn) = match kind {
                 MouseKind::WheelUp => ("wu", None),
                 MouseKind::WheelDown => ("wd", None),
@@ -603,16 +610,16 @@ pub fn encode_command(cmd: &Command) -> (u8, Vec<u8>) {
                 MouseKind::Drag(b) => ("d", Some(*b)),
                 MouseKind::Release(b) => ("r", Some(*b)),
             };
-            let _ = o.insert("k", k);
+            let mut o = jzon::object! { "t": "mouse", "id": *id, "k": k };
             if let Some(b) = btn {
                 let _ = o.insert("b", b as u64);
             }
             let _ = o.insert("col", *col as u64);
             let _ = o.insert("row", *row as u64);
+            o
         }
         Command::Key { id, code, mods } => {
-            let _ = o.insert("t", "key");
-            let _ = o.insert("id", *id);
+            let mut o = jzon::object! { "t": "key", "id": *id };
             // A short tag names the variant; `Char`/`F` carry an extra field.
             let tag = match code {
                 Key::Char(c) => {
@@ -651,40 +658,27 @@ pub fn encode_command(cmd: &Command) -> (u8, Vec<u8>) {
             if mods.ctrl {
                 let _ = o.insert("ct", true);
             }
+            o
         }
         Command::Scrollback { id, action } => {
-            let _ = o.insert("t", "sb");
-            let _ = o.insert("id", *id);
             let (a, n) = match action {
                 ScrollAction::Up(n) => ("u", Some(*n)),
                 ScrollAction::Down(n) => ("d", Some(*n)),
                 ScrollAction::Top => ("t", None),
                 ScrollAction::Live => ("l", None),
             };
-            let _ = o.insert("a", a);
+            let mut o = jzon::object! { "t": "sb", "id": *id, "a": a };
             if let Some(n) = n {
                 let _ = o.insert("n", n as u64);
             }
+            o
         }
-        Command::SaveSession { name } => {
-            let _ = o.insert("t", "save");
-            let _ = o.insert("name", name.as_str());
-        }
-        Command::LoadSession { name } => {
-            let _ = o.insert("t", "load");
-            let _ = o.insert("name", name.as_str());
-        }
-        Command::LoadRecovery { stem } => {
-            let _ = o.insert("t", "recover");
-            let _ = o.insert("stem", stem.as_str());
-        }
-        Command::ListSessions => {
-            let _ = o.insert("t", "list");
-        }
-        Command::Shutdown => {
-            let _ = o.insert("t", "shutdown");
-        }
-    }
+        Command::SaveSession { name } => jzon::object! { "t": "save", "name": name.as_str() },
+        Command::LoadSession { name } => jzon::object! { "t": "load", "name": name.as_str() },
+        Command::LoadRecovery { stem } => jzon::object! { "t": "recover", "stem": stem.as_str() },
+        Command::ListSessions => jzon::object! { "t": "list" },
+        Command::Shutdown => jzon::object! { "t": "shutdown" },
+    };
     (KIND_CONTROL, o.dump().into_bytes())
 }
 
@@ -840,8 +834,7 @@ pub fn decode_command(kind: u8, payload: &[u8]) -> Option<Command> {
 pub fn encode_event(ev: &Event) -> (u8, Vec<u8>) {
     match ev {
         Event::HelloOk => {
-            let mut o = jzon::JsonValue::new_object();
-            let _ = o.insert("t", "hello_ok");
+            let o = jzon::object! { "t": "hello_ok" };
             (KIND_CONTROL, o.dump().into_bytes())
         }
         Event::Tasks(views) => {
@@ -868,70 +861,51 @@ pub fn encode_event(ev: &Event) -> (u8, Vec<u8>) {
                 insert_opt_ms(&mut o, "finished_ms", tv.finished_ago);
                 let _ = arr.push(o);
             }
-            let mut root = jzon::JsonValue::new_object();
-            let _ = root.insert("t", "tasks");
-            let _ = root.insert("tasks", arr);
+            let root = jzon::object! { "t": "tasks", "tasks": arr };
             (KIND_CONTROL, root.dump().into_bytes())
         }
         Event::Status(msg) => {
-            let mut o = jzon::JsonValue::new_object();
-            let _ = o.insert("t", "status");
-            let _ = o.insert("msg", msg.as_str());
+            let o = jzon::object! { "t": "status", "msg": msg.as_str() };
             (KIND_CONTROL, o.dump().into_bytes())
         }
         Event::Sessions { names, recovery } => {
-            let mut arr = jzon::JsonValue::new_array();
-            for n in names {
-                let _ = arr.push(n.as_str());
-            }
             let mut rec = jzon::JsonValue::new_array();
             for r in recovery {
-                let mut m = jzon::JsonValue::new_object();
-                let _ = m.insert("stem", r.stem.as_str());
-                let _ = m.insert("label", r.label.as_str());
-                let _ = m.insert("tasks", u64::from(r.tasks));
-                let _ = m.insert("age", r.age_secs);
-                let _ = rec.push(m);
+                let _ = rec.push(jzon::object! {
+                    "stem": r.stem.as_str(),
+                    "label": r.label.as_str(),
+                    "tasks": u64::from(r.tasks),
+                    "age": r.age_secs,
+                });
             }
-            let mut o = jzon::JsonValue::new_object();
-            let _ = o.insert("t", "sessions");
-            let _ = o.insert("names", arr);
-            let _ = o.insert("recovery", rec);
+            let o = jzon::object! {
+                "t": "sessions",
+                "names": names.iter().map(String::as_str).collect::<Vec<_>>(),
+                "recovery": rec,
+            };
             (KIND_CONTROL, o.dump().into_bytes())
         }
         // Base64 preserves arbitrary clipboard text in the JSON frame.
         Event::ClipboardCopy { id, kind, text } => {
-            let mut o = jzon::JsonValue::new_object();
-            let _ = o.insert("t", "clip");
-            let _ = o.insert("id", *id);
-            let _ = o.insert(
-                "k",
-                match kind {
-                    ClipboardKind::Clipboard => "c",
-                    ClipboardKind::Primary => "p",
-                    ClipboardKind::Selection => "s",
-                },
-            );
-            let _ = o.insert("text", B64.encode(text.as_bytes()));
+            let o = jzon::object! {
+                "t": "clip",
+                "id": *id,
+                "k": kind.selector(),
+                "text": B64.encode(text.as_bytes()),
+            };
             (KIND_CONTROL, o.dump().into_bytes())
         }
         Event::Screen(sv) => {
-            let mut header = jzon::JsonValue::new_object();
-            let _ = header.insert("id", sv.id);
-            let mut cur = jzon::JsonValue::new_array();
-            let _ = cur.push(sv.cursor.0 as u64);
-            let _ = cur.push(sv.cursor.1 as u64);
-            let _ = header.insert("cursor", cur);
-            let _ = header.insert("hide", sv.hide_cursor);
-            let _ = header.insert("mouse", sv.wants_mouse);
-            let _ = header.insert("alt", sv.alt_screen);
-            let _ = header.insert("ascr", sv.alt_scroll);
-            let _ = header.insert("sb", sv.scrollback as u64);
-            let mut lines = jzon::JsonValue::new_array();
-            for l in &sv.lines {
-                let _ = lines.push(l.as_str());
-            }
-            let _ = header.insert("lines", lines);
+            let header = jzon::object! {
+                "id": sv.id,
+                "cursor": [sv.cursor.0 as u64, sv.cursor.1 as u64],
+                "hide": sv.hide_cursor,
+                "mouse": sv.wants_mouse,
+                "alt": sv.alt_screen,
+                "ascr": sv.alt_scroll,
+                "sb": sv.scrollback as u64,
+                "lines": sv.lines.iter().map(String::as_str).collect::<Vec<_>>(),
+            };
             let hbytes = header.dump().into_bytes();
 
             let mut payload = Vec::with_capacity(4 + hbytes.len() + sv.formatted.len());
@@ -1001,12 +975,7 @@ pub fn decode_event(kind: u8, payload: &[u8]) -> Option<Event> {
                 }),
                 "clip" => {
                     let id = v["id"].as_u64()?;
-                    let kind = match v["k"].as_str()? {
-                        "c" => ClipboardKind::Clipboard,
-                        "p" => ClipboardKind::Primary,
-                        "s" => ClipboardKind::Selection,
-                        _ => return None,
-                    };
+                    let kind = ClipboardKind::from_selector(v["k"].as_str()?.as_bytes())?;
                     // Reject clipboard payloads that are not valid UTF-8.
                     let text = String::from_utf8(B64.decode(v["text"].as_str()?).ok()?).ok()?;
                     Some(Event::ClipboardCopy { id, kind, text })

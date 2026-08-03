@@ -19,7 +19,7 @@ use alacritty_terminal::{
 };
 use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
 
-use crate::protocol::ClipboardKind;
+use crate::{format::prefix_bytes, protocol::ClipboardKind};
 
 /// Mouse event classes requested by the child through DECSET 1000/1002/1003.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -163,13 +163,8 @@ fn sanitize_title(raw: &str) -> String {
         }
         out.push(c);
     }
-    if out.len() > TITLE_MAX_BYTES {
-        let mut cut = TITLE_MAX_BYTES;
-        while !out.is_char_boundary(cut) {
-            cut -= 1;
-        }
-        out.truncate(cut);
-    }
+    let cut = prefix_bytes(&out, TITLE_MAX_BYTES).len();
+    out.truncate(cut);
     // Runs are already collapsed, so at most one trailing space survives
     // (possibly exposed by the truncation).
     if out.ends_with(' ') {
@@ -819,12 +814,9 @@ impl Handler for ObservedTerm<'_> {
     }
     /// Capture supported OSC 52 stores while preserving their selector.
     fn clipboard_store(&mut self, a0: u8, a1: &[u8]) {
-        // Ignore selectors without a forwarding target.
-        let selector = match a0 {
-            b'c' => ClipboardKind::Clipboard,
-            b'p' => ClipboardKind::Primary,
-            b's' => ClipboardKind::Selection,
-            _ => return,
+        // Ignore unsupported selectors; the dispatcher maps an empty one to `c`.
+        let Some(selector) = ClipboardKind::from_selector(&[a0]) else {
+            return;
         };
         // Accept padded standard base64 containing UTF-8 text.
         let Ok(bytes) = B64.decode(a1) else { return };

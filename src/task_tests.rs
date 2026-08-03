@@ -165,7 +165,6 @@ fn terminate_reaches_stragglers_after_leader_exit() {
         wait_until(Duration::from_secs(5), || kill(straggler, None).is_err()),
         "TERM after leader exit never reached the straggler"
     );
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// `collect` reports SIGKILL as shell exit code 137.
@@ -227,7 +226,6 @@ fn group_gone_holds_while_a_member_survives() {
         wait_until(Duration::from_secs(5), || t.group_gone()),
         "the group must probe gone once its last member dies"
     );
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// `finished` gates the zombie-spending reap: a leader that has not
@@ -462,7 +460,6 @@ fn finalize_preview_freezes_the_final_primary_line() {
         (p.text.as_str(), p.source, p.frozen),
         ("test result: ok", PreviewSource::Floor, true)
     );
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// A resolution after 1049l but before reader EOF retains and freezes the
@@ -521,7 +518,6 @@ fn finalize_preview_keeps_the_last_render_across_alt_teardown() {
         (p.text.as_str(), p.source, p.frozen),
         ("working", PreviewSource::Title, true)
     );
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// Alternate-screen teardown followed by primary output freezes the
@@ -561,7 +557,6 @@ fn finalize_preview_freezes_primary_output_after_alt_teardown() {
         ("done", PreviewSource::Floor, true),
         "the post-teardown line must win over the stale title"
     );
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// End-to-end adapter path: a PTY screen resolves as a Codex anchor while
@@ -615,7 +610,6 @@ fn summary_adapter_anchors_live_and_freezes_completion_at_exit() {
             true
         )
     );
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// A child's cursor-position probe is answered on the wire: the reply
@@ -651,5 +645,4 @@ fn probe_replies_reach_the_child_through_the_allowlist() {
         "CPR reply must follow the DA reply; got {got:?}"
     );
     t.terminate();
-    let _ = std::fs::remove_dir_all(&dir);
 }

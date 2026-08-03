@@ -30,7 +30,7 @@ use crate::{
     path,
     protocol::{
         ClipboardKind, Command, Event, Key, Lifecycle, Mods, MouseBtn, MouseKind, RecoveryEntry,
-        ScreenView, ScrollAction, TaskView,
+        ScreenView, ScrollAction, TaskView, UNASSIGNED,
     },
     selection::Selection,
     transport::{ExitIntent, SocketTransport, ThreadTransport, Transport},
@@ -84,14 +84,17 @@ pub enum Mode {
     Spawn,
     /// Live directory picker (the `@` flow) that sets `spawn_cwd`.
     PickDir,
-    /// Live group picker (the `g` flow) that reassigns the selected task's group.
-    PickGroup,
+    /// Live group picker (the `g` flow). Its target remains fixed if a snapshot
+    /// reorders the dashboard selection.
+    PickGroup {
+        target: u64,
+    },
     /// Find palette for selecting a task from filtered results.
     Find,
     /// Typing a name to save the current tasks as a session.
     SaveSession,
     /// Editing the display name of the task selected when the prompt opened.
-    Rename,
+    Rename(u64),
     /// Picking a saved session to load.
     LoadSession,
     /// Overlay preview of the selected task.
@@ -115,18 +118,18 @@ pub enum GroupMode {
 impl GroupMode {
     pub fn label(self) -> &'static str {
         match self {
-            GroupMode::State => "state",
-            GroupMode::Dir => "dir",
-            GroupMode::Custom => "custom",
+            Self::State => "state",
+            Self::Dir => "dir",
+            Self::Custom => "custom",
         }
     }
 
     /// Advance through State → Dir → Custom → State.
-    pub fn next(self) -> GroupMode {
+    pub fn next(self) -> Self {
         match self {
-            GroupMode::State => GroupMode::Dir,
-            GroupMode::Dir => GroupMode::Custom,
-            GroupMode::Custom => GroupMode::State,
+            Self::State => Self::Dir,
+            Self::Dir => Self::Custom,
+            Self::Custom => Self::State,
         }
     }
 }
@@ -220,16 +223,12 @@ pub struct App {
     pub group_input: EditBuffer,
     pub group_candidates: Vec<GroupCand>,
     pub group_sel: usize,
-    /// Id of the task being reassigned by the open group picker.
-    group_target: Option<u64>,
     // `/` find-palette state (only meaningful in `Mode::Find`).
     pub find_input: EditBuffer,
     /// Matching task IDs in display order. IDs remain stable if a daemon
     /// snapshot reorders `views` while the palette is open.
     pub find_candidates: Vec<u64>,
     pub find_sel: usize,
-    /// Task ID captured when the rename prompt opens.
-    rename_target: Option<u64>,
     // Load-session picker state.
     pub session_names: Vec<String>,
     pub session_sel: usize,
@@ -295,6 +294,12 @@ fn desired_mouse_capture(attached: Option<&ScreenView>, view_scroll: bool) -> bo
     }
 }
 
+/// Select row 0 for an empty filter or no match; otherwise select the first
+/// match on row 1.
+fn preselected_row(filter_empty: bool, cands: usize) -> usize {
+    usize::from(!filter_empty && cands >= 2)
+}
+
 /// One Down keypress over a picker list: advance, clamped to the last row.
 /// Safe on an empty list because every picker pins its selection to 0 there.
 fn step_down(sel: usize, len: usize) -> usize {
@@ -334,12 +339,12 @@ impl App {
     /// complete the hello handshake, so tasks outlive the UI and run under
     /// *this* client's env. The core lives in `fleetcom --daemon`, reached over
     /// the socket.
-    pub fn connect(rows: u16, cols: u16) -> io::Result<App> {
+    pub fn connect(rows: u16, cols: u16) -> io::Result<Self> {
         let (stream, origin) = crate::daemon::connect_ready()?;
         // Split the stream here (the fallible part) so the transport factory in
         // `assemble` (which owns the wake sender) stays infallible.
         let read = stream.try_clone()?;
-        let mut app = App::assemble(rows, cols, move |_, _, wait_tx| {
+        let mut app = Self::assemble(rows, cols, move |_, _, wait_tx| {
             Box::new(SocketTransport::from_halves(stream, read, wait_tx))
         });
         app.daemon_backed = true;
@@ -378,8 +383,8 @@ impl App {
 
     /// `--foreground`: run the core in-process on a thread (no daemon). A
     /// non-daemon escape hatch, and the deterministic target the UI harnesses use.
-    pub fn new_foreground(rows: u16, cols: u16) -> App {
-        App::assemble(rows, cols, |pr, c, wait_tx| {
+    pub fn new_foreground(rows: u16, cols: u16) -> Self {
+        Self::assemble(rows, cols, |pr, c, wait_tx| {
             Box::new(ThreadTransport::foreground(pr, c, wait_tx))
         })
     }
@@ -389,7 +394,7 @@ impl App {
         rows: u16,
         cols: u16,
         make: impl FnOnce(u16, u16, Sender<()>) -> Box<dyn Transport>,
-    ) -> App {
+    ) -> Self {
         let invocation_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         let invocation_label = path::abbreviate(&invocation_dir);
         // The core runs every PTY at the *content* size: full height minus the
@@ -404,7 +409,7 @@ impl App {
             rows: pane_rows,
             cols,
         });
-        App {
+        Self {
             transport,
             views: Vec::new(),
             focused_screen: None,
@@ -430,11 +435,9 @@ impl App {
             group_input: EditBuffer::default(),
             group_candidates: Vec::new(),
             group_sel: 0,
-            group_target: None,
             find_input: EditBuffer::default(),
             find_candidates: Vec::new(),
             find_sel: 0,
-            rename_target: None,
             session_names: Vec::new(),
             session_sel: 0,
             session_recovery: Vec::new(),
@@ -501,14 +504,18 @@ impl App {
         self.selection.as_ref()
     }
 
-    pub fn dir_label(&self, path: &Path) -> String {
-        path::abbreviate(path)
-    }
-
     /// Height of a task's PTY grid: full screen minus the one-row status bar
     /// that attached mode paints. Uniform across tasks so attach never reflows.
     fn pane_rows(&self) -> u16 {
         self.rows.saturating_sub(1).max(1)
+    }
+
+    /// Clamp a pointer to the child pane, excluding fleetcom's status row.
+    fn clamp_to_pane(&self, row: u16, col: u16) -> (u16, u16) {
+        (
+            row.min(self.pane_rows().saturating_sub(1)),
+            col.min(self.cols.saturating_sub(1)),
+        )
     }
 
     /// Task sections in render order. Navigation uses their flattened order.
@@ -530,7 +537,7 @@ impl App {
                         (b, l.to_string())
                     }
                     GroupMode::Dir => {
-                        let label = self.dir_label(&v.cwd);
+                        let label = path::abbreviate(&v.cwd);
                         // Keep the invocation directory first.
                         let rank = if label == self.invocation_label { 0 } else { 1 };
                         (rank, label)
@@ -538,11 +545,11 @@ impl App {
                     GroupMode::Custom => match &v.group {
                         Some(g) => (0, g.clone()),
                         // Named groups sort before Unassigned.
-                        None => (1, "Unassigned".to_string()),
+                        None => (1, UNASSIGNED.to_string()),
                     },
                 };
                 // Within each section, sort by row rank, directory, then task ID.
-                (rank, label, row_rank(v), self.dir_label(&v.cwd), v.id, i)
+                (rank, label, row_rank(v), path::abbreviate(&v.cwd), v.id, i)
             })
             .collect();
         // Apply the same case-insensitive collation to section and directory labels.
@@ -777,12 +784,7 @@ impl App {
         }
         let mut last = 0;
         for (kind, text) in self.pending_clipboard.drain(..) {
-            let k = match kind {
-                ClipboardKind::Clipboard => 'c',
-                ClipboardKind::Primary => 'p',
-                ClipboardKind::Selection => 's',
-            };
-            write!(out, "\x1b]52;{k};{}\x07", B64.encode(&text))?;
+            write!(out, "\x1b]52;{};{}\x07", kind.selector(), B64.encode(&text))?;
             last = text.chars().count();
         }
         out.flush()?;
@@ -872,7 +874,7 @@ impl App {
                     CtEvent::Key(k)
                         if matches!(k.kind, KeyEventKind::Press | KeyEventKind::Repeat) =>
                     {
-                        self.on_key(out, k)?;
+                        self.on_key(out, k);
                     }
                     CtEvent::Resize(cols, rows) => self.on_resize(rows, cols),
                     CtEvent::Paste(s) => self.on_paste(&s),
@@ -956,13 +958,8 @@ impl App {
             });
         }
 
-        // An empty trailing fragment selects the resolved path. Otherwise,
-        // select the first matching row when one exists.
-        self.dir_sel = if partial.is_empty() || cands.len() < 2 {
-            0
-        } else {
-            1
-        };
+        // Empty trailing input keeps the resolved path selected.
+        self.dir_sel = preselected_row(partial.is_empty(), cands.len());
         self.dir_candidates = cands;
     }
 
@@ -1014,10 +1011,12 @@ impl App {
     /// Open the `g` picker on the selected task; a no-op with no selection.
     fn open_group_picker(&mut self) {
         if let Some(i) = self.selected_task() {
-            self.group_target = Some(self.views[i].id);
+            // Store the target before building its candidate list.
+            self.mode = Mode::PickGroup {
+                target: self.views[i].id,
+            };
             self.group_input.clear();
             self.refresh_group_candidates();
-            self.mode = Mode::PickGroup;
         }
     }
 
@@ -1025,10 +1024,12 @@ impl App {
     /// byte order.
     fn refresh_group_candidates(&mut self) {
         // Mark the pinned target's group even if dashboard selection changes.
-        let current = self
-            .group_target
-            .and_then(|id| self.task_index(id))
-            .and_then(|i| self.views[i].group.clone());
+        let current = match self.mode {
+            Mode::PickGroup { target } => self
+                .task_index(target)
+                .and_then(|i| self.views[i].group.clone()),
+            _ => None,
+        };
         let mark = |name: &str, is_current: bool| {
             if is_current {
                 format!("{name} (current)")
@@ -1038,7 +1039,7 @@ impl App {
         };
 
         let mut cands = vec![GroupCand {
-            label: mark("Unassigned", current.is_none()),
+            label: mark(UNASSIGNED, current.is_none()),
             group: None,
         }];
 
@@ -1060,12 +1061,7 @@ impl App {
             });
         }
 
-        // Empty input selects Unassigned; matched input selects the first group.
-        self.group_sel = if self.group_input.is_empty() || cands.len() < 2 {
-            0
-        } else {
-            1
-        };
+        self.group_sel = preselected_row(self.group_input.is_empty(), cands.len());
         self.group_candidates = cands;
     }
 
@@ -1078,7 +1074,6 @@ impl App {
     fn close_group_picker(&mut self) {
         self.group_input.clear();
         self.group_candidates.clear();
-        self.group_target = None;
         self.mode = Mode::Dashboard;
     }
 
@@ -1119,22 +1114,18 @@ impl App {
     /// Open the rename prompt for the selected task, prefilled with its name.
     fn open_rename_prompt(&mut self) {
         if let Some(i) = self.selected_task() {
-            self.rename_target = Some(self.views[i].id);
             self.input = EditBuffer::seeded(self.views[i].name.clone().unwrap_or_default());
-            self.mode = Mode::Rename;
+            self.mode = Mode::Rename(self.views[i].id);
         }
     }
 
-    /// Clear the text-prompt state and return to the dashboard. Dropping
-    /// `rename_target` is a no-op for the other prompts: only the rename flow
-    /// sets it, and it re-arms on every open.
+    /// Clear the text-prompt state and return to the dashboard.
     fn close_prompt(&mut self) {
         self.input.clear();
-        self.rename_target = None;
         self.mode = Mode::Dashboard;
     }
 
-    fn on_key(&mut self, out: &mut Stdout, k: KeyEvent) -> io::Result<()> {
+    fn on_key(&mut self, out: &mut Stdout, k: KeyEvent) {
         // Any key dismisses a lingering save/load notice.
         self.status = None;
         // Global escape hatch, except while attached (Ctrl-C belongs to the child).
@@ -1145,23 +1136,22 @@ impl App {
         {
             self.exit_intent = ExitIntent::Disconnect;
             self.should_quit = true;
-            return Ok(());
+            return;
         }
         match self.mode {
             Mode::Dashboard => self.on_key_dashboard(k),
             Mode::Spawn => self.on_key_spawn(k),
             Mode::PickDir => self.on_key_pickdir(k),
-            Mode::PickGroup => self.on_key_pickgroup(k),
+            Mode::PickGroup { .. } => self.on_key_pickgroup(k),
             Mode::Find => self.on_key_find(k),
             Mode::SaveSession => self.on_key_savesession(k),
-            Mode::Rename => self.on_key_rename(k),
+            Mode::Rename(_) => self.on_key_rename(k),
             Mode::LoadSession => self.on_key_loadsession(k),
             Mode::Peek => self.on_key_peek(k),
             Mode::Controls => self.on_key_controls(k),
-            Mode::Attached => self.on_key_attached(out, k)?,
+            Mode::Attached => self.on_key_attached(out, k),
             Mode::Disconnected => self.on_key_disconnected(k),
         }
-        Ok(())
     }
 
     fn on_key_disconnected(&mut self, k: KeyEvent) {
@@ -1252,7 +1242,7 @@ impl App {
 
     /// Shared editing for the single-line text prompts: Enter runs `submit`
     /// with the trimmed input and closes; Esc closes without submitting.
-    fn on_key_textinput(&mut self, k: KeyEvent, submit: fn(&mut App, &str)) {
+    fn on_key_textinput(&mut self, k: KeyEvent, submit: fn(&mut Self, &str)) {
         match k.code {
             KeyCode::Enter => {
                 // Submit the text on both sides of the caret.
@@ -1280,7 +1270,8 @@ impl App {
             // Whitespace-only input clears the name; the supervisor applies
             // the remaining label normalization.
             let name = Some(name.to_string()).filter(|s| !s.is_empty());
-            if let Some(id) = app.rename_target {
+            // The mode retains the target until submission closes the prompt.
+            if let Mode::Rename(id) = app.mode {
                 app.transport.send(Command::SetName { id, name });
             }
         });
@@ -1387,8 +1378,8 @@ impl App {
                         .get(self.group_sel)
                         .and_then(|c| c.group.clone())
                 };
-                if let Some(id) = self.group_target {
-                    self.transport.send(Command::SetGroup { id, group });
+                if let Mode::PickGroup { target } = self.mode {
+                    self.transport.send(Command::SetGroup { id: target, group });
                 }
                 self.close_group_picker();
             }
@@ -1450,7 +1441,7 @@ impl App {
         }
     }
 
-    fn on_key_attached(&mut self, out: &mut Stdout, k: KeyEvent) -> io::Result<()> {
+    fn on_key_attached(&mut self, out: &mut Stdout, k: KeyEvent) {
         // Ctrl-\ backgrounds the task; crossterm may report it as Ctrl-4.
         let detach = k.modifiers.contains(KeyModifiers::CONTROL)
             && matches!(k.code, KeyCode::Char('\\') | KeyCode::Char('4'));
@@ -1462,7 +1453,7 @@ impl App {
             self.selection = None;
             // Repaint from scratch next tick; wipe the child's screen now.
             let _ = execute!(out, Clear(ClearType::All), MoveTo(0, 0));
-            return Ok(());
+            return;
         }
         // Keep one row of overlap between pages.
         let page = self.pane_rows().saturating_sub(1).max(1);
@@ -1486,7 +1477,7 @@ impl App {
                     self.forward_key(k);
                 }
             }
-            return Ok(());
+            return;
         }
         // Ctrl/Alt provide alternatives when the terminal intercepts Shift.
         if k.code == KeyCode::PageUp
@@ -1497,10 +1488,9 @@ impl App {
             // Entering scrollback replaces the selected live rows.
             self.selection = None;
             self.send_scrollback(ScrollAction::Up(page));
-            return Ok(());
+            return;
         }
         self.forward_key(k);
-        Ok(())
     }
 
     /// Forward an encodable keystroke to the focused task's PTY.
@@ -1535,14 +1525,14 @@ impl App {
                     });
                 }
             }
-            Mode::Spawn | Mode::SaveSession | Mode::Rename => {
+            Mode::Spawn | Mode::SaveSession | Mode::Rename(_) => {
                 paste_into(&mut self.input, s);
             }
             Mode::PickDir => {
                 paste_into(&mut self.dir_input, s);
                 self.refresh_dir_candidates();
             }
-            Mode::PickGroup => {
+            Mode::PickGroup { .. } => {
                 paste_into(&mut self.group_input, s);
                 self.refresh_group_candidates();
             }
@@ -1629,10 +1619,7 @@ impl App {
                         self.send_scrollback(ScrollAction::Up(3));
                         return;
                     }
-                    // Keep the pointer coordinate within the child pane: the
-                    // bottom row is fleetcom's status bar, not the child's.
-                    let row = m.row.min(self.pane_rows().saturating_sub(1));
-                    let col = m.column.min(self.cols.saturating_sub(1));
+                    let (row, col) = self.clamp_to_pane(m.row, m.column);
                     self.transport.send(Command::Mouse { id, kind, col, row });
                 }
             }
@@ -1653,23 +1640,18 @@ impl App {
                         .then(|| Selection::begin(row, col.min(self.cols.saturating_sub(1))));
                 self.selection.is_some()
             }
-            MouseKind::Drag(MouseBtn::Left) if self.selection.is_some() => {
-                let row = row.min(self.pane_rows().saturating_sub(1));
-                let col = col.min(self.cols.saturating_sub(1));
-                if let Some(sel) = self.selection.as_mut() {
-                    sel.extend(row, col);
-                }
-                true
-            }
-            MouseKind::Release(MouseBtn::Left) if self.selection.is_some() => {
+            MouseKind::Drag(MouseBtn::Left) | MouseKind::Release(MouseBtn::Left)
+                if self.selection.is_some() =>
+            {
                 // The release cell is the final head, including for flicks
                 // with no intermediate drag event.
-                let row = row.min(self.pane_rows().saturating_sub(1));
-                let col = col.min(self.cols.saturating_sub(1));
+                let (row, col) = self.clamp_to_pane(row, col);
                 if let Some(sel) = self.selection.as_mut() {
                     sel.extend(row, col);
                 }
-                self.finish_selection(id);
+                if matches!(kind, MouseKind::Release(MouseBtn::Left)) {
+                    self.finish_selection(id);
+                }
                 true
             }
             _ => false,

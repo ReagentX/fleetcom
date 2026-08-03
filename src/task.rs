@@ -15,7 +15,8 @@ use std::{
 
 use alacritty_terminal::sync::FairMutex;
 use nix::{
-    sys::signal::{Signal, killpg},
+    errno::Errno,
+    sys::signal::{Signal, kill, killpg},
     unistd::Pid,
 };
 use portable_pty::{CommandBuilder, MasterPty, PtySize, native_pty_system};
@@ -45,6 +46,18 @@ pub struct WriteRefused {
 /// the whole crate speaks stdlib `io::Result` and never grows an `anyhow` dep.
 fn io_err(e: impl std::fmt::Display) -> io::Error {
     io::Error::other(e.to_string())
+}
+
+/// Return true only when signal 0 reports `ESRCH`. `EPERM` remains potentially
+/// live so callers do not delete another owner's files.
+pub(crate) fn pid_is_dead(pid: i32) -> bool {
+    matches!(kill(Pid::from_raw(pid), None), Err(Errno::ESRCH))
+}
+
+/// Parse an untrimmed, strictly positive decimal PID. Rejecting zero and
+/// negatives avoids `kill` process-group semantics.
+pub(crate) fn positive_pid(field: &str) -> Option<i32> {
+    field.parse::<i32>().ok().filter(|p| *p > 0)
 }
 
 pub struct Task {
@@ -208,7 +221,7 @@ impl Task {
         scrollback: usize,
         env: &[(OsString, OsString)],
         waker: Waker,
-    ) -> io::Result<Task> {
+    ) -> io::Result<Self> {
         let pair = native_pty_system()
             .openpty(PtySize {
                 rows,
@@ -310,7 +323,7 @@ impl Task {
         // Process-group signalling and `waitid` use the leader PID directly.
         let pid = child.process_id();
         drop(child);
-        Ok(Task {
+        Ok(Self {
             id,
             command: command.to_string(),
             cwd: cwd.to_path_buf(),
@@ -712,7 +725,7 @@ impl Task {
         // a member that exists but is beyond our signals. Both hold the wait.
         matches!(
             killpg(Pid::from_raw(pid as i32), None::<Signal>),
-            Err(nix::errno::Errno::ESRCH)
+            Err(Errno::ESRCH)
         )
     }
 }

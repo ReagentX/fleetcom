@@ -5,10 +5,7 @@
 
 use std::{path::Path, time::SystemTime};
 
-use super::{
-    CapturePaths, Harness, Invocation, SpawnPlan, detect_shape, last_hint, pin_plan, resume_shape,
-    unique_in_window,
-};
+use super::{CapturePaths, Harness, Invocation, SpawnPlan, last_hint, pin_plan, unique_in_window};
 
 pub struct Grok;
 
@@ -21,8 +18,8 @@ impl Harness for Grok {
         ".grok"
     }
 
-    fn detect(&self, cmd: &str) -> Option<Invocation> {
-        detect_shape(cmd, "grok", "--resume")
+    fn shape(&self) -> (&'static str, &'static str) {
+        ("grok", "--resume")
     }
 
     fn instrument(
@@ -58,10 +55,6 @@ impl Harness for Grok {
             }
             Some(entry.file_name().to_str()?.to_string())
         })
-    }
-
-    fn resume_command(&self, cmd: &str, id: &str) -> String {
-        resume_shape(cmd, "grok", "--resume", id)
     }
 }
 
@@ -207,7 +200,6 @@ mod tests {
         // A second in-window session makes the match ambiguous.
         fs::create_dir_all(dir.join(OTHER)).unwrap();
         assert_eq!(Grok.correlate_fs(cwd, now, Some(&home)), None);
-        let _ = fs::remove_dir_all(&home);
     }
 
     #[test]
@@ -217,7 +209,6 @@ mod tests {
         let dir = home.join("sessions").join("%2Fw");
         fs::create_dir_all(dir.join("not-a-session")).unwrap();
         assert_eq!(Grok.correlate_fs(cwd, SystemTime::now(), Some(&home)), None);
-        let _ = fs::remove_dir_all(&home);
     }
 
     /// The scraper recovers the exit-hint ID from the corpus terminal bytes.

@@ -75,6 +75,19 @@ pub fn pad(s: &str, width: usize) -> String {
     t
 }
 
+/// Return the longest UTF-8 prefix no longer than `max` bytes. Unlike
+/// [`truncate`], this limits bytes rather than display columns.
+pub(crate) fn prefix_bytes(s: &str, max: usize) -> &str {
+    if s.len() <= max {
+        return s;
+    }
+    let mut end = max;
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
 /// Sort key for human-readable names.
 /// The lowercase value provides case-insensitive collation; the exact value
 /// makes ordering deterministic and keeps case-distinct names separate.

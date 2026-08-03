@@ -4,8 +4,8 @@ use super::*;
 use crate::{
     protocol::{ClipboardKind, Key, Mods},
     testutil::{
-        here, install_fake_notifier, now_ms, read_pid, sh_env, wait_until, write_executable,
-        write_rollout,
+        Scratch, here, install_fake_notifier, now_ms, read_pid, sh_env, wait_until,
+        write_executable, write_rollout,
     },
 };
 
@@ -200,7 +200,6 @@ fn decset_1007_flip_resends_watched_screen() {
             .any(|e| matches!(e, Event::Screen(sv) if sv.alt_screen && !sv.alt_scroll))
     });
     assert!(closed, "the ?1007l flip never re-sent the screen");
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// A periodic tick flushes an expired synchronized update from a child
@@ -270,7 +269,6 @@ fn watched_task_clipboard_stores_are_forwarded() {
             (id, ClipboardKind::Selection, "world".to_string()),
         ]
     );
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// Starting a watch discards stores captured before the watch.
@@ -460,7 +458,6 @@ fn peeked_stores_never_forward_and_die_at_the_attach_transition() {
         copies,
         vec![(id, ClipboardKind::Clipboard, "post".to_string())]
     );
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// An oversized store produces a status notice instead of a clipboard event.
@@ -505,11 +502,10 @@ fn oversized_watched_store_yields_notice_and_no_copy() {
         notice.as_deref(),
         Some("clipboard copy dropped: 3 MiB exceeds the 1 MiB limit")
     );
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// Scratch dir for tests that sync through marker files.
-fn scratch(tag: &str) -> PathBuf {
+fn scratch(tag: &str) -> Scratch {
     crate::testutil::temp(&format!("sup_{tag}"))
 }
 
@@ -591,13 +587,12 @@ fn kill_delivers_term_before_kill() {
             t = trapped.display(),
             r = ready.display()
         ),
-        dir.clone(),
+        dir.to_path_buf(),
         &ready,
     );
     s.apply(Command::Kill { id });
     wait_for_lifecycle(&mut s, id, |l| l == Lifecycle::Ok);
     assert!(trapped.exists(), "the TERM trap never ran");
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// A task that ignores SIGTERM is SIGKILLed once the grace elapses, via the
@@ -615,12 +610,11 @@ fn term_ignoring_task_escalates_to_kill() {
             "trap '' TERM; echo r > {r}; while :; do sleep 0.1; done",
             r = ready.display()
         ),
-        dir.clone(),
+        dir.to_path_buf(),
         &ready,
     );
     s.apply(Command::Kill { id });
     wait_for_lifecycle(&mut s, id, |l| l == Lifecycle::Failed);
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// `Shutdown` exits as soon as TERM-respecting tasks die: well inside the
@@ -720,7 +714,7 @@ fn shutdown_is_bounded_by_grace() {
             "trap '' TERM; echo r > {r}; while :; do sleep 0.1; done",
             r = ready.display()
         ),
-        dir.clone(),
+        dir.to_path_buf(),
         &ready,
     );
     let t0 = Instant::now();
@@ -736,7 +730,6 @@ fn shutdown_is_bounded_by_grace() {
             .iter()
             .any(|e| matches!(e, Event::Tasks(v) if v.is_empty()))
     );
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// `clear_watch` (the client-disconnect path) must stop the `Screen` stream
@@ -823,7 +816,7 @@ fn rerun_replaces_finished_task_in_place() {
     spawn(
         &mut s,
         format!("echo run >> {}", marker.display()),
-        dir.clone(),
+        dir.to_path_buf(),
     );
     let id = first_id(&mut s);
     s.apply(Command::Tag { id, on: true });
@@ -840,7 +833,6 @@ fn rerun_replaces_finished_task_in_place() {
         .iter()
         .any(|e| matches!(e, Event::Tasks(v) if v.iter().any(|t| t.id == id && t.tagged)));
     assert!(tagged, "rerun must carry the tag over");
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// Group normalization strips controls, trims whitespace, caps by character,
@@ -1297,7 +1289,7 @@ fn remove_sweeps_stragglers_of_an_exited_leader() {
     let dir = scratch("remove_sweep");
     let (spid, ready) = (dir.join("spid"), dir.join("ready"));
     let mut s = sup(24, 80);
-    hello_with_sh(&mut s, dir.clone());
+    hello_with_sh(&mut s, dir.to_path_buf());
     let id = spawn_ready(
         &mut s,
         format!(
@@ -1305,7 +1297,7 @@ fn remove_sweeps_stragglers_of_an_exited_leader() {
             sp = spid.display(),
             r = ready.display()
         ),
-        dir.clone(),
+        dir.to_path_buf(),
         &ready,
     );
     let straggler = read_pid(&spid);
@@ -1325,7 +1317,6 @@ fn remove_sweeps_stragglers_of_an_exited_leader() {
         reap_until(&mut s, Duration::from_secs(5), |s| s.graveyard.is_empty()),
         "graveyard entry was never collected"
     );
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// Rerun must give the displaced task the same graceful exit as Remove:
@@ -1338,7 +1329,7 @@ fn rerun_sweeps_stragglers_of_the_old_run() {
     let dir = scratch("rerun_sweep");
     let (spid, ready) = (dir.join("spid"), dir.join("ready"));
     let mut s = sup(24, 80);
-    hello_with_sh(&mut s, dir.clone());
+    hello_with_sh(&mut s, dir.to_path_buf());
     let id = spawn_ready(
         &mut s,
         format!(
@@ -1346,7 +1337,7 @@ fn rerun_sweeps_stragglers_of_the_old_run() {
             sp = spid.display(),
             r = ready.display()
         ),
-        dir.clone(),
+        dir.to_path_buf(),
         &ready,
     );
     let old_straggler = read_pid(&spid);
@@ -1368,7 +1359,6 @@ fn rerun_sweeps_stragglers_of_the_old_run() {
     // The fresh run exists under the same id; its own straggler dies with
     // the supervisor (Task::drop backstop).
     assert!(s.tasks.iter().any(|t| t.id == id));
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// The escalation must reach a TERM-ignoring straggler *after the leader
@@ -1381,7 +1371,7 @@ fn kill_escalation_reaches_term_ignoring_straggler_after_leader_exit() {
     let (spid, ready) = (dir.join("spid"), dir.join("ready"));
     let mut s = sup(24, 80);
     s.set_kill_grace(Duration::from_millis(150));
-    hello_with_sh(&mut s, dir.clone());
+    hello_with_sh(&mut s, dir.to_path_buf());
     // The leader ignores HUP (inherited by the `&` child, so it survives
     // the leader's exit); the subshell ignores TERM, then execs sleep,
     // which inherits both. Only the KILL can end it.
@@ -1392,7 +1382,7 @@ fn kill_escalation_reaches_term_ignoring_straggler_after_leader_exit() {
             sp = spid.display(),
             r = ready.display()
         ),
-        dir.clone(),
+        dir.to_path_buf(),
         &ready,
     );
     let straggler = read_pid(&spid);
@@ -1406,7 +1396,6 @@ fn kill_escalation_reaches_term_ignoring_straggler_after_leader_exit() {
             .is_err()),
         "reap-driven escalation never KILLed the straggler"
     );
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// Shutdown after removal preserves the removed task's TERM grace.
@@ -1417,7 +1406,7 @@ fn shutdown_waits_for_graveyard_grace() {
     let (spid, ready) = (dir.join("spid"), dir.join("ready"));
     let mut s = sup(24, 80);
     s.set_kill_grace(Duration::from_millis(400));
-    hello_with_sh(&mut s, dir.clone());
+    hello_with_sh(&mut s, dir.to_path_buf());
     // The background process ignores HUP and TERM.
     let id = spawn_ready(
         &mut s,
@@ -1426,7 +1415,7 @@ fn shutdown_waits_for_graveyard_grace() {
             sp = spid.display(),
             r = ready.display()
         ),
-        dir.clone(),
+        dir.to_path_buf(),
         &ready,
     );
     let straggler = read_pid(&spid);
@@ -1450,7 +1439,6 @@ fn shutdown_waits_for_graveyard_grace() {
             .is_err()),
         "straggler survived shutdown"
     );
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// The defect the group probe fixes: every leader exits at birth after
@@ -1466,7 +1454,7 @@ fn shutdown_holds_the_grace_for_members_of_an_exited_leader() {
     let (spid, ready) = (dir.join("spid"), dir.join("ready"));
     let mut s = sup(24, 80);
     s.set_kill_grace(Duration::from_millis(400));
-    hello_with_sh(&mut s, dir.clone());
+    hello_with_sh(&mut s, dir.to_path_buf());
     let id = spawn_ready(
         &mut s,
         format!(
@@ -1474,7 +1462,7 @@ fn shutdown_holds_the_grace_for_members_of_an_exited_leader() {
             sp = spid.display(),
             r = ready.display()
         ),
-        dir.clone(),
+        dir.to_path_buf(),
         &ready,
     );
     let straggler = read_pid(&spid);
@@ -1501,7 +1489,6 @@ fn shutdown_holds_the_grace_for_members_of_an_exited_leader() {
         survived,
         "the straggler was KILLed instead of receiving the TERM grace"
     );
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// Prompt exit, pinned: leaders exited long ago and left empty groups,
@@ -1532,7 +1519,7 @@ fn shutdown_is_prompt_when_every_group_is_already_empty() {
 fn session_commands_use_the_launch_context_config_dir() {
     let dir = scratch("sess_root");
     let config = dir.join("config");
-    let mut s = sup_ctx(config_ctx(&config, dir.clone(), &[]));
+    let mut s = sup_ctx(config_ctx(&config, dir.to_path_buf(), &[]));
 
     s.apply(Command::SaveSession { name: "ctx".into() });
     assert!(
@@ -1560,7 +1547,6 @@ fn session_commands_use_the_launch_context_config_dir() {
             .any(|e| matches!(e, Event::Status(m) if m.starts_with("loaded 'ctx'"))),
         "load must find the recipe under the same root; got {evs:?}"
     );
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// Saving and loading preserve independent group and display-name fields.
@@ -1568,15 +1554,15 @@ fn session_commands_use_the_launch_context_config_dir() {
 fn load_session_restores_saved_groups_and_names() {
     let dir = scratch("sess_labels");
     let config = dir.join("config");
-    let ctx = config_ctx(&config, dir.clone(), &[]);
+    let ctx = config_ctx(&config, dir.to_path_buf(), &[]);
     let mut s = sup_ctx(ctx.clone());
-    spawn(&mut s, "sleep 31", dir.clone());
+    spawn(&mut s, "sleep 31", dir.to_path_buf());
     let id = first_id(&mut s);
     s.apply(Command::SetName {
         id,
         name: Some("web".into()),
     });
-    spawn_grouped(&mut s, "sleep 30", dir.clone(), "api");
+    spawn_grouped(&mut s, "sleep 30", dir.to_path_buf(), "api");
     s.apply(Command::SaveSession {
         name: "fleet".into(),
     });
@@ -1617,7 +1603,6 @@ fn load_session_restores_saved_groups_and_names() {
         (None, Some("web".into())),
         "the {{cmd,name}} member must restore its name and stay ungrouped"
     );
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// Loaded recipe groups and names are normalized before assignment.
@@ -1634,7 +1619,7 @@ fn load_session_renormalizes_hand_edited_groups() {
         ),
     )
     .unwrap();
-    let mut s = sup_ctx(config_ctx(&config, dir.clone(), &[]));
+    let mut s = sup_ctx(config_ctx(&config, dir.to_path_buf(), &[]));
     s.apply(Command::LoadSession {
         name: "edited".into(),
     });
@@ -1649,7 +1634,6 @@ fn load_session_renormalizes_hand_edited_groups() {
         restored,
         "loaded group and name must come back normalized; got {evs:?}"
     );
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// Broken JSON reports a load error rather than a missing session.
@@ -1659,7 +1643,7 @@ fn load_surfaces_parse_errors_instead_of_absence() {
     let config = dir.join("config");
     std::fs::create_dir_all(config.join("sessions")).unwrap();
     std::fs::write(config.join("sessions").join("broken.json"), "{not json").unwrap();
-    let mut s = sup_ctx(config_ctx(&config, dir.clone(), &[]));
+    let mut s = sup_ctx(config_ctx(&config, dir.to_path_buf(), &[]));
     s.apply(Command::LoadSession {
         name: "broken".into(),
     });
@@ -1675,7 +1659,6 @@ fn load_surfaces_parse_errors_instead_of_absence() {
             .any(|e| matches!(e, Event::Status(m) if m.contains("not found"))),
         "a parse failure must not read as absence; got {evs:?}"
     );
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// Missing recipes report "not found".
@@ -1683,7 +1666,7 @@ fn load_surfaces_parse_errors_instead_of_absence() {
 fn load_missing_session_reads_as_not_found() {
     let dir = scratch("sess_missing");
     let config = dir.join("config");
-    let mut s = sup_ctx(config_ctx(&config, dir.clone(), &[]));
+    let mut s = sup_ctx(config_ctx(&config, dir.to_path_buf(), &[]));
     s.apply(Command::LoadSession {
         name: "ghost".into(),
     });
@@ -1693,7 +1676,6 @@ fn load_missing_session_reads_as_not_found() {
             .any(|e| matches!(e, Event::Status(m) if m == "session 'ghost' not found")),
         "a missing recipe must still read as not found"
     );
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// Spawn failures have their own status bucket. An invalid `SHELL` makes both
@@ -1710,7 +1692,7 @@ fn load_reports_admit_failures_not_clean_success() {
     .unwrap();
     let mut s = sup_ctx(config_ctx(
         &config,
-        dir.clone(),
+        dir.to_path_buf(),
         &[("SHELL", "/nonexistent/no-such-shell")],
     ));
     s.apply(Command::LoadSession {
@@ -1729,7 +1711,6 @@ fn load_reports_admit_failures_not_clean_success() {
             .any(|e| matches!(e, Event::Tasks(v) if v.is_empty())),
         "no task may exist when every spawn failed"
     );
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// Direct spawns reject commands above `MAX_COMMAND_LEN` without creating a task.
@@ -1771,7 +1752,7 @@ fn load_skips_over_length_commands() {
         ),
     )
     .unwrap();
-    let mut s = sup_ctx(config_ctx(&config, dir.clone(), &[]));
+    let mut s = sup_ctx(config_ctx(&config, dir.to_path_buf(), &[]));
     s.apply(Command::LoadSession { name: "big".into() });
     let evs = s.drain();
     assert!(
@@ -1779,7 +1760,6 @@ fn load_skips_over_length_commands() {
                 if m.contains("1 task(s)") && m.contains("1 skipped"))),
         "the over-length entry must be counted as skipped; got {evs:?}"
     );
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// Spawns inherit only the installed launch-context environment.
@@ -1793,7 +1773,7 @@ fn spawn_uses_the_launch_context_env_not_the_process_env() {
     let out = dir.join("out");
     let mut s = sup_ctx(LaunchContext {
         env: vec![("FLEETCOM_MARKER".into(), "xyzzy".into())],
-        cwd: dir.clone(),
+        cwd: dir.to_path_buf(),
     });
     spawn(
         &mut s,
@@ -1801,14 +1781,13 @@ fn spawn_uses_the_launch_context_env_not_the_process_env() {
             "printf '%s:%s' \"$FLEETCOM_MARKER\" \"${{USER:-unset}}\" > {}",
             out.display()
         ),
-        dir.clone(),
+        dir.to_path_buf(),
     );
     let ok = reap_until(&mut s, Duration::from_secs(5), |_| {
         std::fs::read_to_string(&out).is_ok_and(|c| !c.is_empty())
     });
     assert!(ok, "the marker task never wrote its output");
     assert_eq!(std::fs::read_to_string(&out).unwrap(), "xyzzy:unset");
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// A supervisor with no launch context refuses every launch path (spawn,
@@ -1846,7 +1825,7 @@ fn key_command_encodes_against_live_cursor_mode() {
     let dir = scratch("key_live_mode");
     let (ready, out) = (dir.join("ready"), dir.join("out"));
     let mut s = sup(24, 80);
-    hello_with_sh(&mut s, dir.clone());
+    hello_with_sh(&mut s, dir.to_path_buf());
 
     // Raw mode lets `cat` receive ESC-prefixed keys without a newline. The
     // child enables DECCKM before alternate-screen mode, so observing the
@@ -1858,7 +1837,7 @@ fn key_command_encodes_against_live_cursor_mode() {
             r = ready.display(),
             o = out.display()
         ),
-        dir.clone(),
+        dir.to_path_buf(),
         &ready,
     );
 
@@ -1907,7 +1886,6 @@ fn key_command_encodes_against_live_cursor_mode() {
     );
 
     s.apply(Command::Kill { id });
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 // --- recovery-snapshot writer -------------------------------------------
@@ -1988,7 +1966,7 @@ fn recovery_arms_on_structural_mutations_not_tag() {
 fn list_sessions_includes_recovery_snapshots_newest_first() {
     let dir = scratch("recovery_list_wire");
     let config = dir.join("config");
-    let mut s = sup_ctx(config_ctx(&config, dir.clone(), &[]));
+    let mut s = sup_ctx(config_ctx(&config, dir.to_path_buf(), &[]));
 
     let rec = config.join("sessions").join("recovery");
     let entry = |cmd: &str| SessionEntry {
@@ -2037,7 +2015,6 @@ fn list_sessions_includes_recovery_snapshots_newest_first() {
         ],
         "snapshots must list newest first with labels and task counts"
     );
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// Recovery loading restores commands, groups, and names and reports success.
@@ -2045,7 +2022,7 @@ fn list_sessions_includes_recovery_snapshots_newest_first() {
 fn load_recovery_materializes_the_fleet_and_notices() {
     let dir = scratch("recovery_load_wire");
     let config = dir.join("config");
-    let mut s = sup_ctx(config_ctx(&config, dir.clone(), &[]));
+    let mut s = sup_ctx(config_ctx(&config, dir.to_path_buf(), &[]));
 
     let mut cfg = SessionConfig::new();
     cfg.insert(
@@ -2093,7 +2070,6 @@ fn load_recovery_materializes_the_fleet_and_notices() {
     };
     assert_eq!(by_cmd(&s, "sleep 30"), (Some("api".into()), None));
     assert_eq!(by_cmd(&s, "sleep 31"), (None, Some("web".into())));
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// Unknown and path-shaped recovery stems fail without spawning tasks.
@@ -2101,7 +2077,7 @@ fn load_recovery_materializes_the_fleet_and_notices() {
 fn load_recovery_refuses_unknown_and_traversal_stems() {
     let dir = scratch("recovery_load_refuse");
     let config = dir.join("config");
-    let mut s = sup_ctx(config_ctx(&config, dir.clone(), &[]));
+    let mut s = sup_ctx(config_ctx(&config, dir.to_path_buf(), &[]));
 
     s.apply(Command::LoadRecovery {
         stem: "20990101-000000-1".into(),
@@ -2125,7 +2101,6 @@ fn load_recovery_refuses_unknown_and_traversal_stems() {
         "a traversal stem must be refused, not probed"
     );
     assert!(s.tasks.is_empty(), "refused loads must spawn nothing");
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// Debouncing coalesces a mutation burst into one complete snapshot.
@@ -2135,13 +2110,13 @@ fn recovery_debounce_coalesces_a_mutation_burst() {
     let config = dir.join("config");
     let mut s = recovery_sup(
         &config,
-        dir.clone(),
+        dir.to_path_buf(),
         Duration::from_millis(500),
         Duration::from_secs(600),
     );
-    spawn(&mut s, "sleep 30", dir.clone());
-    spawn(&mut s, "sleep 31", dir.clone());
-    spawn(&mut s, "sleep 32", dir.clone());
+    spawn(&mut s, "sleep 30", dir.to_path_buf());
+    spawn(&mut s, "sleep 31", dir.to_path_buf());
+    spawn(&mut s, "sleep 32", dir.to_path_buf());
     s.tick();
     assert!(
         recovery_files(&config).is_empty(),
@@ -2167,7 +2142,6 @@ fn recovery_debounce_coalesces_a_mutation_burst() {
         assert!(text.contains(cmd), "snapshot must carry {cmd:?}: {text}");
     }
     assert!(!s.recovery.dirty, "a completed pass clears the flag");
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// Empty fleets do not create or replace recovery snapshots.
@@ -2177,7 +2151,7 @@ fn recovery_empty_fleet_never_writes() {
     let config = dir.join("config");
     let mut s = recovery_sup(
         &config,
-        dir.clone(),
+        dir.to_path_buf(),
         Duration::from_millis(100),
         Duration::from_millis(200),
     );
@@ -2191,7 +2165,7 @@ fn recovery_empty_fleet_never_writes() {
     );
 
     // Remove the only task before the debounced pass runs.
-    spawn(&mut s, "sleep 30", dir.clone());
+    spawn(&mut s, "sleep 30", dir.to_path_buf());
     let id = s.tasks[0].id;
     s.apply(Command::Remove { id });
     assert!(
@@ -2201,7 +2175,6 @@ fn recovery_empty_fleet_never_writes() {
         }),
         "a fleet emptied before the pass must never write"
     );
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// Persistent write failures emit one notice and do not interrupt supervision.
@@ -2214,11 +2187,11 @@ fn recovery_write_failure_notices_once_and_keeps_supervising() {
     std::fs::write(config.join("sessions").join("recovery"), "not a dir").unwrap();
     let mut s = recovery_sup(
         &config,
-        dir.clone(),
+        dir.to_path_buf(),
         Duration::from_millis(10),
         Duration::from_millis(50),
     );
-    spawn(&mut s, "sleep 30", dir.clone());
+    spawn(&mut s, "sleep 30", dir.to_path_buf());
 
     // Count notices across several debounce and cadence intervals.
     let mut notices = 0usize;
@@ -2241,7 +2214,6 @@ fn recovery_write_failure_notices_once_and_keeps_supervising() {
             .any(|e| matches!(e, Event::Tasks(v) if v.len() == 1)),
         "a failing writer must never disturb supervision"
     );
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// Detached recovery maintenance writes without queuing client events.
@@ -2251,11 +2223,11 @@ fn recovery_maintenance_writes_detached_and_queues_nothing() {
     let config = dir.join("config");
     let mut s = recovery_sup(
         &config,
-        dir.clone(),
+        dir.to_path_buf(),
         Duration::from_millis(50),
         Duration::from_secs(600),
     );
-    spawn(&mut s, "sleep 30", dir.clone());
+    spawn(&mut s, "sleep 30", dir.to_path_buf());
     // Match the daemon's detached reap-and-maintain loop.
     assert!(
         wait_until(Duration::from_secs(5), || {
@@ -2269,7 +2241,6 @@ fn recovery_maintenance_writes_detached_and_queues_nothing() {
         s.drain().is_empty(),
         "the idle path must not queue events; nothing drains them"
     );
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// Deduplication treats the destination root as part of snapshot identity.
@@ -2279,11 +2250,11 @@ fn recovery_dedup_is_per_destination_root() {
     let (config_a, config_b) = (dir.join("cfg_a"), dir.join("cfg_b"));
     let mut s = recovery_sup(
         &config_a,
-        dir.clone(),
+        dir.to_path_buf(),
         Duration::from_millis(50),
         Duration::from_secs(600),
     );
-    spawn(&mut s, "sleep 30", dir.clone());
+    spawn(&mut s, "sleep 30", dir.to_path_buf());
     assert!(
         wait_until(Duration::from_secs(5), || {
             s.recovery_maintenance();
@@ -2293,7 +2264,7 @@ fn recovery_dedup_is_per_destination_root() {
     );
 
     // Move the unchanged recipe to a new destination and arm recovery.
-    s.set_launch_context(config_ctx(&config_b, dir.clone(), &[]));
+    s.set_launch_context(config_ctx(&config_b, dir.to_path_buf(), &[]));
     s.recovery.dirty = true;
     s.recovery.last_mutation = Some(Instant::now());
     assert!(
@@ -2307,7 +2278,6 @@ fn recovery_dedup_is_per_destination_root() {
         !recovery_files(&config_a).is_empty(),
         "the old root keeps its snapshot"
     );
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// A failed write remains eligible for a later cadence retry.
@@ -2320,11 +2290,11 @@ fn recovery_failed_write_retries_until_success() {
     std::fs::write(config.join("sessions").join("recovery"), "not a dir").unwrap();
     let mut s = recovery_sup(
         &config,
-        dir.clone(),
+        dir.to_path_buf(),
         Duration::from_millis(10),
         Duration::from_millis(50),
     );
-    spawn(&mut s, "sleep 30", dir.clone());
+    spawn(&mut s, "sleep 30", dir.to_path_buf());
     assert!(
         wait_until(Duration::from_secs(5), || {
             s.recovery_maintenance();
@@ -2334,7 +2304,7 @@ fn recovery_failed_write_retries_until_success() {
     );
     assert!(
         s.recovery.last_written.is_none(),
-        "a failed write must not advance the dedup pair"
+        "a failed write must not advance the dedup record"
     );
 
     // Remove the blocker; a cadence pass retries the unchanged content.
@@ -2347,7 +2317,6 @@ fn recovery_failed_write_retries_until_success() {
         "the cadence never retried after the root became writable"
     );
     assert!(!s.recovery.failing, "a successful write clears the latch");
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// A cadence pass recreates a missing snapshot even when its recipe is unchanged.
@@ -2357,11 +2326,11 @@ fn recovery_rewrites_after_a_sibling_prune_deletes_the_snapshot() {
     let config = dir.join("config");
     let mut s = recovery_sup(
         &config,
-        dir.clone(),
+        dir.to_path_buf(),
         Duration::from_millis(50),
         Duration::from_millis(100),
     );
-    spawn(&mut s, "sleep 30", dir.clone());
+    spawn(&mut s, "sleep 30", dir.to_path_buf());
     assert!(
         wait_until(Duration::from_secs(5), || {
             s.recovery_maintenance();
@@ -2384,7 +2353,6 @@ fn recovery_rewrites_after_a_sibling_prune_deletes_the_snapshot() {
         }),
         "an unchanged recipe must rewrite an externally deleted snapshot"
     );
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[path = "supervisor_capture_tests.rs"]

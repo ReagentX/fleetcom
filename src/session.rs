@@ -11,7 +11,10 @@ use std::{
     time::SystemTime,
 };
 
-use crate::protocol::RecoveryEntry;
+use crate::{
+    protocol::{RecoveryEntry, insert_opt_str, opt_str},
+    task::{pid_is_dead, positive_pid},
+};
 
 /// One recipe entry. Entries without a group or name serialize as strings;
 /// other entries use objects whose optional fields are written only when set.
@@ -52,18 +55,6 @@ fn sanitize(name: &str) -> String {
     out
 }
 
-/// Longest prefix of `s` at most `max` bytes long, on a char boundary.
-fn prefix_bytes(s: &str, max: usize) -> &str {
-    if s.len() <= max {
-        return s;
-    }
-    let mut end = max;
-    while !s.is_char_boundary(end) {
-        end -= 1;
-    }
-    &s[..end]
-}
-
 /// Session-recipe directory: `<config root>/sessions`. A caller-supplied
 /// `root` wins (the supervisor passes the connecting client's
 /// [`FLEETCOM_CONFIG_DIR`]); otherwise the same var from this process's env,
@@ -88,14 +79,9 @@ fn dirs_json(cfg: &SessionConfig) -> jzon::JsonValue {
                 // Entries without optional labels use the string form.
                 jzon::JsonValue::from(e.cmd.as_str())
             } else {
-                let mut m = jzon::JsonValue::new_object();
-                let _ = m.insert("cmd", e.cmd.as_str());
-                if let Some(g) = &e.group {
-                    let _ = m.insert("group", g.as_str());
-                }
-                if let Some(n) = &e.name {
-                    let _ = m.insert("name", n.as_str());
-                }
+                let mut m = jzon::object! { "cmd": e.cmd.as_str() };
+                insert_opt_str(&mut m, "group", &e.group);
+                insert_opt_str(&mut m, "name", &e.name);
                 m
             };
             let _ = arr.push(member);
@@ -108,11 +94,12 @@ fn dirs_json(cfg: &SessionConfig) -> jzon::JsonValue {
 /// Serialize the versioned wrapped schema. The stored name distinguishes
 /// names that sanitize to the same filename.
 fn to_json(name: &str, cfg: &SessionConfig) -> String {
-    let mut obj = jzon::JsonValue::new_object();
-    let _ = obj.insert("version", FORMAT_VERSION);
-    let _ = obj.insert("name", name);
-    let _ = obj.insert("dirs", dirs_json(cfg));
-    obj.pretty(2)
+    jzon::object! {
+        "version": FORMAT_VERSION,
+        "name": name,
+        "dirs": dirs_json(cfg),
+    }
+    .pretty(2)
 }
 
 /// Serialize the recipe body for content-based change detection.
@@ -173,14 +160,8 @@ fn from_json(text: &str) -> io::Result<(Option<String>, SessionConfig)> {
                 }
                 // Indexing a non-object yields Null, so malformed members drop here.
                 let cmd = m["cmd"].as_str()?.to_string();
-                let group = match &m["group"] {
-                    g if g.is_null() => None,
-                    g => Some(g.as_str()?.to_string()),
-                };
-                let name = match &m["name"] {
-                    n if n.is_null() => None,
-                    n => Some(n.as_str()?.to_string()),
-                };
+                let group = opt_str(&m["group"])?;
+                let name = opt_str(&m["name"])?;
                 Some(SessionEntry { cmd, group, name })
             })
             .collect();
@@ -220,7 +201,7 @@ fn write_atomic(dir: &Path, file_name: &str, contents: &str) -> io::Result<PathB
         // Shorten the target portion so the decorated temporary filename stays
         // within the 255-byte component limit.
         let suffix = format!(".{pid}.{n}.tmp");
-        let stem = prefix_bytes(file_name, 254 - suffix.len());
+        let stem = crate::format::prefix_bytes(file_name, 254 - suffix.len());
         let candidate = dir.join(format!(".{stem}{suffix}"));
         match fs::OpenOptions::new()
             .write(true)
@@ -407,14 +388,13 @@ fn stem_pid(stem: &str) -> Option<i32> {
     if pid.is_empty() || !pid.bytes().all(|b| b.is_ascii_digit()) {
         return None;
     }
-    pid.parse::<i32>().ok().filter(|p| *p > 0)
+    positive_pid(pid)
 }
 
 /// Return whether a valid PID suffix is not known to be dead. Only `ESRCH`
 /// proves death; invalid suffixes receive no liveness protection.
 fn stem_names_live_writer(stem: &str) -> bool {
-    use nix::{errno::Errno, sys::signal::kill, unistd::Pid};
-    stem_pid(stem).is_some_and(|pid| !matches!(kill(Pid::from_raw(pid), None), Err(Errno::ESRCH)))
+    stem_pid(stem).is_some_and(|pid| !pid_is_dead(pid))
 }
 
 /// Best-effort pruning that protects `keep_stem` and snapshots whose PID is
@@ -496,7 +476,6 @@ mod tests {
         save_in(&dir, "work", &cfg).unwrap();
         assert_eq!(load_in(&dir, "work").unwrap(), cfg);
         assert_eq!(list_in(&dir), vec!["work".to_string()]);
-        let _ = fs::remove_dir_all(&dir);
     }
 
     /// Saved session names use case-insensitive collation.
@@ -512,7 +491,6 @@ mod tests {
             list_in(&dir),
             vec!["apple".to_string(), "Beta".to_string(), "Zed".to_string()]
         );
-        let _ = fs::remove_dir_all(&dir);
     }
 
     /// Mixed string and object entries survive one serialization round trip.
@@ -527,7 +505,6 @@ mod tests {
 
         save_in(&dir, "mixed", &cfg).unwrap();
         assert_eq!(load_in(&dir, "mixed").unwrap(), cfg);
-        let _ = fs::remove_dir_all(&dir);
     }
 
     /// Every group/name combination survives serialization.
@@ -547,7 +524,6 @@ mod tests {
 
         save_in(&dir, "named", &cfg).unwrap();
         assert_eq!(load_in(&dir, "named").unwrap(), cfg);
-        let _ = fs::remove_dir_all(&dir);
     }
 
     /// String members parse as unadorned entries; flat files have no stored name.
@@ -592,7 +568,6 @@ mod tests {
                 .contains("\"version\": 1")
         );
         assert_eq!(load_in(&dir, "versioned").unwrap(), cfg);
-        let _ = fs::remove_dir_all(&dir);
     }
 
     /// A missing version is interpreted as version 1.
@@ -657,7 +632,6 @@ mod tests {
         let err = load_in(&dir, "future").unwrap_err();
         assert!(err.to_string().contains("version 3"), "{err}");
         assert!(err.to_string().contains("supports 1"), "{err}");
-        let _ = fs::remove_dir_all(&dir);
     }
 
     /// A flat schema treats `version` as metadata, not a directory.
@@ -735,7 +709,6 @@ mod tests {
         let file = save_in(&dir, &name, &cfg).unwrap();
         assert_eq!(file.file_name().unwrap().len(), 255);
         assert_eq!(load_in(&dir, &name).unwrap(), cfg);
-        let _ = fs::remove_dir_all(&dir);
     }
 
     /// Recipe files are owner-only, including after replacing a 0644 file.
@@ -752,7 +725,6 @@ mod tests {
         fs::set_permissions(&file, fs::Permissions::from_mode(0o644)).unwrap();
         save_in(&dir, "keys", &cfg).unwrap();
         assert_eq!(mode(&file), 0o600);
-        let _ = fs::remove_dir_all(&dir);
     }
 
     /// Session directories are created private and existing permissive session
@@ -774,7 +746,6 @@ mod tests {
         fs::set_permissions(&loose, fs::Permissions::from_mode(0o755)).unwrap();
         save_in(&loose, "old", &cfg).unwrap();
         assert_eq!(mode(&loose), 0o700);
-        let _ = fs::remove_dir_all(&base);
     }
 
     /// The temp is renamed away on success; only the recipe remains.
@@ -785,12 +756,11 @@ mod tests {
         cfg.insert("~/p".into(), vec![e("vim")]);
 
         save_in(&dir, "clean", &cfg).unwrap();
-        let names: Vec<String> = fs::read_dir(&dir)
+        let names: Vec<String> = fs::read_dir(&*dir)
             .unwrap()
             .map(|e| e.unwrap().file_name().into_string().unwrap())
             .collect();
         assert_eq!(names, vec!["clean.json".to_string()]);
-        let _ = fs::remove_dir_all(&dir);
     }
 
     /// Saves reject a different name that sanitizes to an occupied filename.
@@ -808,7 +778,6 @@ mod tests {
         assert!(err.to_string().contains("\"a.b\""), "{err}");
         assert!(err.to_string().contains("\"a/b\""), "{err}");
         assert_eq!(load_in(&dir, "a/b").unwrap(), first);
-        let _ = fs::remove_dir_all(&dir);
     }
 
     /// Flat-schema files load and list by filename stem.
@@ -822,7 +791,6 @@ mod tests {
             vec![e("cargo test")]
         );
         assert_eq!(list_in(&dir), vec!["old".to_string()]);
-        let _ = fs::remove_dir_all(&dir);
     }
 
     /// A flat-schema file can be replaced under its filename stem.
@@ -835,7 +803,6 @@ mod tests {
         cfg.insert("~/new".into(), vec![e("top")]);
         save_in(&dir, "mine", &cfg).unwrap();
         assert_eq!(load_in(&dir, "mine").unwrap(), cfg);
-        let _ = fs::remove_dir_all(&dir);
     }
 
     /// Wrapped files list by stored name; flat files list by filename stem.
@@ -851,7 +818,6 @@ mod tests {
         for n in list_in(&dir) {
             load_in(&dir, &n).unwrap();
         }
-        let _ = fs::remove_dir_all(&dir);
     }
 
     /// Fixed instant at 2026-07-14 09:30:15 UTC.
@@ -897,7 +863,6 @@ mod tests {
         let mode = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode(&rec), 0o700);
         assert_eq!(mode(&file), 0o600);
-        let _ = fs::remove_dir_all(&base);
     }
 
     /// Pruning keeps the lexically greatest [`RECOVERY_KEEP`] filenames.
@@ -922,7 +887,6 @@ mod tests {
             .map(|i| format!("20260714-0930{i:02}-{DEAD_FIXTURE_PID}.json"))
             .collect();
         assert_eq!(names, expected, "prune must drop exactly the oldest two");
-        let _ = fs::remove_dir_all(&base);
     }
 
     /// Pruning retains the just-written stem even when it is the oldest.
@@ -956,7 +920,6 @@ mod tests {
             names, expected,
             "the active file plus the nine newest others must remain"
         );
-        let _ = fs::remove_dir_all(&base);
     }
 
     /// Below [`RECOVERY_KEEP`] files, pruning removes nothing.
@@ -976,7 +939,6 @@ mod tests {
             5,
             "no file may be pruned below the retention limit"
         );
-        let _ = fs::remove_dir_all(&base);
     }
 
     /// Pruning retains an older snapshot whose PID is still live.
@@ -1007,7 +969,6 @@ mod tests {
             names, expected,
             "the live writer's file must survive; the oldest dead file must not"
         );
-        let _ = fs::remove_dir_all(&base);
     }
 
     /// A snapshot from an exited process is eligible for pruning.
@@ -1033,7 +994,6 @@ mod tests {
             RECOVERY_KEEP,
             "dead-stem retention must converge to the bound"
         );
-        let _ = fs::remove_dir_all(&base);
     }
 
     /// Invalid PID suffixes receive no liveness protection.
@@ -1068,7 +1028,6 @@ mod tests {
             RECOVERY_KEEP,
             "only the well-formed newest files may remain"
         );
-        let _ = fs::remove_dir_all(&base);
     }
 
     /// The recovery directory is excluded from named-session listings.
@@ -1087,7 +1046,6 @@ mod tests {
         .unwrap();
 
         assert_eq!(list_in(&dir), vec!["real".to_string()]);
-        let _ = fs::remove_dir_all(&dir);
     }
 
     /// Listing sorts by descending stem and skips corrupt files.
@@ -1137,7 +1095,6 @@ mod tests {
             entries.iter().all(|en| en.age_secs < 3600),
             "just-written files must read near-zero ages: {entries:?}"
         );
-        let _ = fs::remove_dir_all(&base);
     }
 
     /// Recovery loads reject empty, dotted, or path-shaped stems.
@@ -1170,6 +1127,5 @@ mod tests {
                 .kind(),
             io::ErrorKind::NotFound
         );
-        let _ = fs::remove_dir_all(&base);
     }
 }

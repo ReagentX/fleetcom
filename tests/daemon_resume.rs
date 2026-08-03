@@ -30,7 +30,7 @@ struct Scratch {
 }
 
 impl Scratch {
-    fn new(tag: &str) -> Scratch {
+    fn new(tag: &str) -> Self {
         // Keep the scratch tree separate from start_daemon_raw's directory,
         // which is cleared during daemon setup.
         let root = std::env::temp_dir().join(format!(
@@ -41,7 +41,7 @@ impl Scratch {
         for sub in ["bin", "run", "config", "claude-home", "codex-home", "work"] {
             std::fs::create_dir_all(root.join(sub)).unwrap();
         }
-        Scratch { root }
+        Self { root }
     }
 
     fn bin(&self) -> PathBuf {

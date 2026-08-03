@@ -190,6 +190,17 @@ fn f_bytes(n: u8, m: Option<u8>) -> Option<Vec<u8>> {
     })
 }
 
+/// Prefix `base` with ESC when `meta` is set. `base` may be a multibyte
+/// sequence, such as BackTab's CSI Z.
+fn meta_bytes(meta: bool, base: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(base.len() + 1);
+    if meta {
+        out.push(0x1b);
+    }
+    out.extend_from_slice(base);
+    out
+}
+
 /// Encode a key for the child. Application-cursor mode selects SS3 for
 /// unmodified cursor and Home/End keys; their modified forms use CSI.
 /// Unsupported key combinations return `None`.
@@ -229,35 +240,15 @@ pub fn key_bytes(app_cursor: bool, code: Key, mods: Mods) -> Option<Vec<u8>> {
             })
         }
         // Enter uses ESC CR for Shift or Alt; Control does not change plain CR.
-        Key::Enter => Some(if mods.shift || mods.alt {
-            vec![0x1b, 0x0d]
-        } else {
-            vec![0x0d]
-        }),
+        Key::Enter => Some(meta_bytes(mods.shift || mods.alt, b"\x0d")),
         // Alt prefixes Tab with ESC; Control and Shift do not change HT.
-        Key::Tab => Some(if mods.alt {
-            vec![0x1b, 0x09]
-        } else {
-            vec![0x09]
-        }),
+        Key::Tab => Some(meta_bytes(mods.alt, b"\x09")),
         // Alt prefixes BackTab's CSI Z sequence; Control and Shift are ignored.
-        Key::BackTab => Some(if mods.alt {
-            b"\x1b\x1b[Z".to_vec()
-        } else {
-            b"\x1b[Z".to_vec()
-        }),
+        Key::BackTab => Some(meta_bytes(mods.alt, b"\x1b[Z")),
         // Backspace is DEL; Alt prefixes ESC, and Control/Shift leave it unchanged.
-        Key::Backspace => Some(if mods.alt {
-            vec![0x1b, 0x7f]
-        } else {
-            vec![0x7f]
-        }),
+        Key::Backspace => Some(meta_bytes(mods.alt, b"\x7f")),
         // Alt+Esc is the ESC-ESC meta form; Ctrl/Shift fold into a plain ESC.
-        Key::Esc => Some(if mods.alt {
-            vec![0x1b, 0x1b]
-        } else {
-            vec![0x1b]
-        }),
+        Key::Esc => Some(meta_bytes(mods.alt, b"\x1b")),
     }
 }
 

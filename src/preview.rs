@@ -39,31 +39,31 @@ pub trait ScreenFacts {
 
 impl ScreenFacts for Emulator {
     fn revision(&self) -> u64 {
-        Emulator::revision(self)
+        Self::revision(self)
     }
 
     fn alt_epoch(&self) -> u64 {
-        Emulator::alt_epoch(self)
+        Self::alt_epoch(self)
     }
 
     fn alternate_screen(&self) -> bool {
-        Emulator::alternate_screen(self)
+        Self::alternate_screen(self)
     }
 
     fn title(&self) -> Option<&str> {
-        Emulator::title(self)
+        Self::title(self)
     }
 
     fn live_floor(&self) -> String {
-        Emulator::live_floor(self)
+        Self::live_floor(self)
     }
 
     fn live_rows(&self) -> Vec<String> {
-        Emulator::live_rows(self)
+        Self::live_rows(self)
     }
 
     fn alt_leave_floor(&self) -> Option<&str> {
-        Emulator::alt_leave_floor(self)
+        Self::alt_leave_floor(self)
     }
 }
 
@@ -174,15 +174,15 @@ pub struct PreviewState {
 }
 
 impl Default for PreviewState {
-    fn default() -> PreviewState {
-        PreviewState::new()
+    fn default() -> Self {
+        Self::new()
     }
 }
 
 impl PreviewState {
-    pub fn new() -> PreviewState {
+    pub fn new() -> Self {
         let empty = Preview::floor(String::new());
-        PreviewState {
+        Self {
             rendered: empty.clone(),
             candidate: empty,
             pending_candidate: None,
@@ -343,8 +343,8 @@ mod tests {
     }
 
     impl FakeScreen {
-        fn primary(floor: &str) -> FakeScreen {
-            FakeScreen {
+        fn primary(floor: &str) -> Self {
+            Self {
                 revision: 1,
                 alt_epoch: 0,
                 alt: false,

@@ -15,14 +15,38 @@ use std::{
     time::{Duration, Instant, SystemTime},
 };
 
-use crate::{emulator::Emulator, format::civil_from_days};
+use crate::{
+    emulator::Emulator,
+    format::civil_from_days,
+    task::{pid_is_dead, positive_pid},
+};
 
 /// Versioned prefix for scratch directories eligible for sweeping.
 const SCRATCH_PREFIX: &str = "fleetcom_test2_";
 
+/// Scratch directory removed on drop. A panic preserves it for inspection;
+/// later runs reclaim it after the owner exits.
+pub(crate) struct Scratch(PathBuf);
+
+impl std::ops::Deref for Scratch {
+    type Target = Path;
+    fn deref(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            return;
+        }
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
 /// Create an empty `<prefix><tag>_<pid>_<seq>` directory under the system temp
 /// directory. The PID separates processes; the sequence separates calls.
-pub(crate) fn temp(tag: &str) -> PathBuf {
+pub(crate) fn temp(tag: &str) -> Scratch {
     static SEQ: AtomicU32 = AtomicU32::new(0);
     sweep_dead_scratch();
     let seq = SEQ.fetch_add(1, Ordering::Relaxed);
@@ -32,7 +56,7 @@ pub(crate) fn temp(tag: &str) -> PathBuf {
     ));
     let _ = fs::remove_dir_all(&d);
     fs::create_dir_all(&d).unwrap();
-    d
+    Scratch(d)
 }
 
 /// Once per process, remove scratch directories owned by dead processes.
@@ -69,14 +93,7 @@ fn scratch_pid(suffix: &str) -> Option<i32> {
     if !digits(seq) || !digits(pid) {
         return None;
     }
-    pid.parse::<i32>().ok().filter(|p| *p > 0)
-}
-
-/// Whether a PID is known to be dead. Only `ESRCH` proves death, so a live
-/// process and one owned by another user both keep their directory.
-fn pid_is_dead(pid: i32) -> bool {
-    use nix::{errno::Errno, sys::signal::kill, unistd::Pid};
-    matches!(kill(Pid::from_raw(pid), None), Err(Errno::ESRCH))
+    positive_pid(pid)
 }
 
 /// Parse valid suffixes and reject malformed PID or sequence fields.

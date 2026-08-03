@@ -20,6 +20,7 @@ use crate::{
     app::{App, DirKind, GroupMode, Mode, Row, SessionPage},
     editbuf::EditBuffer,
     format::{pad, rel_time, truncate},
+    path,
     protocol::{Lifecycle, Preview, PreviewSource, RecoveryEntry, TaskView},
     selection::Selection,
 };
@@ -39,7 +40,7 @@ pub fn render(out: &mut impl Write, app: &mut App) -> io::Result<bool> {
             render_dashboard(&mut buf, app)?;
             render_pickdir(&mut buf, app)?;
         }
-        Mode::PickGroup => {
+        Mode::PickGroup { .. } => {
             render_dashboard(&mut buf, app)?;
             render_pickgroup(&mut buf, app)?;
         }
@@ -56,7 +57,7 @@ pub fn render(out: &mut impl Write, app: &mut App) -> io::Result<bool> {
             render_session_picker(&mut buf, app)?;
         }
         Mode::Disconnected => render_disconnected(&mut buf, app)?,
-        Mode::Dashboard | Mode::Spawn | Mode::SaveSession | Mode::Rename => {
+        Mode::Dashboard | Mode::Spawn | Mode::SaveSession | Mode::Rename(_) => {
             render_dashboard(&mut buf, app)?
         }
     }
@@ -219,10 +220,7 @@ fn render_dashboard(out: &mut impl Write, app: &App) -> io::Result<()> {
     )?;
 
     match &cmd {
-        Some((line, cx)) => {
-            let cx = clamp_caret(*cx, line, cols);
-            queue!(out, MoveTo(cx, cmd_y), Show)?;
-        }
+        Some((_, cx)) => queue!(out, MoveTo(*cx, cmd_y), Show)?,
         None => queue!(out, Hide)?,
     }
     Ok(())
@@ -240,31 +238,24 @@ fn cmdline(app: &App) -> Option<(String, u16)> {
     let prefix = match app.mode {
         Mode::Spawn => spawn_prefix(app),
         Mode::SaveSession => "  save session as: ".to_string(),
-        Mode::Rename => "  rename task: ".to_string(),
+        Mode::Rename(_) => "  rename task: ".to_string(),
         _ => return None,
     };
-    Some(caret_line(&prefix, &app.input))
+    Some(caret_line(&prefix, &app.input, app.cols as usize))
 }
 
-/// Compose `prefix` + the buffer text with the caret's display column: the
-/// width of the prefix plus the width of the text before the caret. Widths are
-/// terminal columns (wide glyphs count 2), not scalar counts. The column is
-/// unclamped; `clamp_caret` bounds it to what actually gets painted.
-fn caret_line(prefix: &str, buf: &EditBuffer) -> (String, u16) {
+/// Compose the prompt and return its caret column, clamped to the truncated
+/// rendered width. Widths are terminal columns, not scalar counts.
+fn caret_line(prefix: &str, buf: &EditBuffer, cols: usize) -> (String, u16) {
+    let line = format!("{prefix}{}", buf.as_str());
     let cx = (prefix.width() + buf.before_caret().width()) as u16;
-    (format!("{prefix}{}", buf.as_str()), cx)
-}
-
-/// Bound a caret column to the painted, `cols`-truncated line. An overflowing
-/// prompt keeps its plain truncation, so a caret past the cut pins at the right
-/// edge rather than scrolling the line to stay visible.
-fn clamp_caret(cx: u16, line: &str, cols: usize) -> u16 {
-    cx.min(truncate(line, cols).width() as u16)
+    let cx = cx.min(truncate(&line, cols).width() as u16);
+    (line, cx)
 }
 
 /// The `❯` prompt prefix with optional directory and group destinations.
 fn spawn_prefix(app: &App) -> String {
-    let dir = (app.spawn_cwd != app.invocation_dir).then(|| app.dir_label(&app.spawn_cwd));
+    let dir = (app.spawn_cwd != app.invocation_dir).then(|| path::abbreviate(&app.spawn_cwd));
     prompt_line(dir.as_deref(), app.spawn_group.as_deref(), "")
 }
 
@@ -384,14 +375,64 @@ fn dim_preview_row(out: &mut impl Write, y: u16, v: &TaskView, cols: usize) -> i
     )
 }
 
-/// Build a labeled peek-box border exactly `inner_w` display columns wide.
-fn peek_top_border(label: &str, inner_w: usize) -> String {
+/// Build a labeled overlay top border exactly `inner_w` display columns wide.
+fn top_border(label: &str, inner_w: usize) -> String {
     let mut border = format!("─ {} ", truncate(label, inner_w.saturating_sub(4)));
     let w = border.width();
     if w < inner_w {
         border.extend(std::iter::repeat_n('─', inner_w - w));
     }
     border
+}
+
+/// Centered overlay with a labeled border, padded body, and dim footer.
+struct Overlay<'a> {
+    /// Terminal dimensions: columns, then rows.
+    cols: usize,
+    rows: usize,
+    /// Box dimensions including borders: columns, then rows.
+    bw: usize,
+    bh: usize,
+    /// Top-border label, truncated to fit.
+    label: &'a str,
+    /// Body lines; missing rows render blank.
+    body: &'a [String],
+    /// Footer written over the bottom border.
+    footer: &'a str,
+}
+
+/// Paint a centered overlay, then overwrite the bottom border with its footer.
+fn render_overlay(out: &mut impl Write, o: &Overlay) -> io::Result<()> {
+    // Saturating: a box larger than the terminal pins to the origin.
+    let x0 = o.cols.saturating_sub(o.bw) / 2;
+    let y0 = o.rows.saturating_sub(o.bh) / 2;
+    let (inner_w, inner_h) = (o.bw.saturating_sub(2), o.bh.saturating_sub(2));
+    queue!(
+        out,
+        MoveTo(x0 as u16, y0 as u16),
+        Print(format!("┌{}┐", top_border(o.label, inner_w)))
+    )?;
+    for k in 0..inner_h {
+        let line = o.body.get(k).map_or("", String::as_str);
+        queue!(
+            out,
+            MoveTo(x0 as u16, (y0 + 1 + k) as u16),
+            Print(format!("│{}│", pad(line, inner_w)))
+        )?;
+    }
+    let by = (y0 + 1 + inner_h) as u16;
+    queue!(
+        out,
+        MoveTo(x0 as u16, by),
+        Print(format!("└{}┘", "─".repeat(inner_w)))
+    )?;
+    queue!(
+        out,
+        MoveTo((x0 + 2) as u16, by),
+        SetAttribute(Attribute::Dim),
+        Print(truncate(o.footer, inner_w)),
+        SetAttribute(Attribute::Reset)
+    )
 }
 
 fn render_peek(out: &mut impl Write, app: &App) -> io::Result<()> {
@@ -404,51 +445,30 @@ fn render_peek(out: &mut impl Write, app: &App) -> io::Result<()> {
 
     let bw = (cols * 3 / 4).clamp(24, cols.max(24));
     let bh = rows.saturating_sub(6).clamp(5, 16);
-    let x0 = cols.saturating_sub(bw) / 2;
-    let y0 = rows.saturating_sub(bh) / 2;
-    let inner_w = bw.saturating_sub(2);
-    let inner_h = bh.saturating_sub(2);
 
-    // Screen lines for the selected task, once the core has streamed them. Empty
-    // until then (or if the watch just switched); the box still frames cleanly.
+    // Use an empty body until the selected task's screen arrives.
     let lines: &[String] = app.screen_for(v.id).map_or(&[], |s| &s.lines);
-    let start = lines.len().saturating_sub(inner_h);
+    // Show the newest lines that fit inside the overlay.
+    let start = lines.len().saturating_sub(bh.saturating_sub(2));
     let tail = &lines[start..];
 
-    queue!(
-        out,
-        MoveTo(x0 as u16, y0 as u16),
-        Print(format!("┌{}┐", peek_top_border(display_label(v), inner_w)))
-    )?;
-
-    for k in 0..inner_h {
-        let line = tail.get(k).map(String::as_str).unwrap_or("");
-        queue!(
-            out,
-            MoveTo(x0 as u16, (y0 + 1 + k) as u16),
-            Print(format!("│{}│", pad(line, inner_w)))
-        )?;
-    }
-
-    let by = (y0 + 1 + inner_h) as u16;
-    queue!(
-        out,
-        MoveTo(x0 as u16, by),
-        Print(format!("└{}┘", "─".repeat(inner_w)))
-    )?;
     // The peek footer identifies the preview source and in-process matcher.
     let footer = format!(
         " space/esc close · enter attach · preview: {} ",
         preview_provenance(&v.preview)
     );
-    queue!(
+    render_overlay(
         out,
-        MoveTo((x0 + 2) as u16, by),
-        SetAttribute(Attribute::Dim),
-        Print(truncate(&footer, inner_w)),
-        SetAttribute(Attribute::Reset)
-    )?;
-    Ok(())
+        &Overlay {
+            cols,
+            rows,
+            bw,
+            bh,
+            label: display_label(v),
+            body: tail,
+            footer: &footer,
+        },
+    )
 }
 
 /// The peek footer's provenance label: source, then the matcher rule when
@@ -592,43 +612,25 @@ fn render_controls(out: &mut impl Write, app: &App) -> io::Result<()> {
     let content_w = body.iter().map(|s| s.width()).max().unwrap_or(0);
     let bw = (content_w + 3).min(cols.max(4));
     let bh = body.len() + 2;
-    let inner_w = bw - 2;
-    let x0 = cols.saturating_sub(bw) / 2;
-    let y0 = rows.saturating_sub(bh) / 2;
 
-    queue!(
-        out,
-        MoveTo(x0 as u16, y0 as u16),
-        Print(format!("┌{}┐", peek_top_border("controls", inner_w)))
-    )?;
-    for (k, line) in body.iter().enumerate() {
-        queue!(
-            out,
-            MoveTo(x0 as u16, (y0 + 1 + k) as u16),
-            Print(format!("│{}│", pad(line, inner_w)))
-        )?;
-    }
-
-    let by = (y0 + 1 + body.len()) as u16;
-    queue!(
-        out,
-        MoveTo(x0 as u16, by),
-        Print(format!("└{}┘", "─".repeat(inner_w)))
-    )?;
     // Report omitted entries on the bottom border.
     let more = if hidden > 0 {
         format!(" · +{hidden} more")
     } else {
         String::new()
     };
-    queue!(
+    render_overlay(
         out,
-        MoveTo((x0 + 2) as u16, by),
-        SetAttribute(Attribute::Dim),
-        Print(truncate(&format!(" ? esc close{more} "), inner_w)),
-        SetAttribute(Attribute::Reset)
-    )?;
-    Ok(())
+        &Overlay {
+            cols,
+            rows,
+            bw,
+            bh,
+            label: "controls",
+            body: &body,
+            footer: &format!(" ? esc close{more} "),
+        },
+    )
 }
 
 /// The varying content of a bottom-panel picker; `render_panel` owns the
@@ -721,13 +723,13 @@ fn render_pickdir(out: &mut impl Write, app: &App) -> io::Result<()> {
         Some(DirKind::Into) => "enter/tab open",
         None => "",
     };
-    let (line, cx) = caret_line("  @ ", &app.dir_input);
-    let cx = clamp_caret(cx, &line, app.cols as usize);
+    // Add three styled columns after the text without moving the caret.
+    let (line, cx) = caret_line("  @ ", &app.dir_input, app.cols as usize);
     render_panel(
         out,
         app,
         &Panel {
-            header: format!("  @ {}   ", app.dir_input.as_str()),
+            header: format!("{line}   "),
             labels: &labels,
             sel: app.dir_sel,
             max_rows: 8,
@@ -757,13 +759,12 @@ fn render_pickgroup(out: &mut impl Write, app: &App) -> io::Result<()> {
             None => "",
         }
     };
-    let (line, cx) = caret_line("  g ", &app.group_input);
-    let cx = clamp_caret(cx, &line, app.cols as usize);
+    let (line, cx) = caret_line("  g ", &app.group_input, app.cols as usize);
     render_panel(
         out,
         app,
         &Panel {
-            header: format!("  g {}   ", app.group_input.as_str()),
+            header: format!("{line}   "),
             labels: &labels,
             sel: app.group_sel,
             max_rows: 8,
@@ -797,13 +798,12 @@ fn render_find(out: &mut impl Write, app: &App) -> io::Result<()> {
             None => String::new(),
         })
         .collect();
-    let (line, cx) = caret_line("  / ", &app.find_input);
-    let cx = clamp_caret(cx, &line, app.cols as usize);
+    let (line, cx) = caret_line("  / ", &app.find_input, app.cols as usize);
     render_panel(
         out,
         app,
         &Panel {
-            header: format!("  / {}   ", app.find_input.as_str()),
+            header: format!("{line}   "),
             labels: &labels,
             sel: app.find_sel,
             max_rows: 8,
@@ -836,40 +836,37 @@ fn saved_page_hint(recovery: usize) -> String {
 
 /// Render the saved-session or recovery page of the session picker.
 fn render_session_picker(out: &mut impl Write, app: &App) -> io::Result<()> {
-    match app.session_page {
-        SessionPage::Saved => {
-            let hint = saved_page_hint(app.session_recovery.len());
-            render_panel(
-                out,
-                app,
-                &Panel {
-                    header: "  load session".to_string(),
-                    labels: &app.session_names,
-                    sel: app.session_sel,
-                    max_rows: 10,
-                    hint,
-                    empty: Some("    (no saved sessions)"),
-                    cursor: None,
-                },
-            )
-        }
-        SessionPage::Recovery => {
-            let labels: Vec<String> = app.session_recovery.iter().map(recovery_row).collect();
-            render_panel(
-                out,
-                app,
-                &Panel {
-                    header: "  recovery".to_string(),
-                    labels: &labels,
-                    sel: app.recovery_sel,
-                    max_rows: 10,
-                    hint: "↑↓ pick · enter load · tab saved · esc".to_string(),
-                    empty: None,
-                    cursor: None,
-                },
-            )
-        }
-    }
+    // Preformat recovery rows for the recovery page.
+    let recovery: Vec<String> = app.session_recovery.iter().map(recovery_row).collect();
+    let (header, labels, sel, hint, empty) = match app.session_page {
+        SessionPage::Saved => (
+            "  load session",
+            app.session_names.as_slice(),
+            app.session_sel,
+            saved_page_hint(recovery.len()),
+            Some("    (no saved sessions)"),
+        ),
+        SessionPage::Recovery => (
+            "  recovery",
+            recovery.as_slice(),
+            app.recovery_sel,
+            "↑↓ pick · enter load · tab saved · esc".to_string(),
+            None,
+        ),
+    };
+    render_panel(
+        out,
+        app,
+        &Panel {
+            header: header.to_string(),
+            labels,
+            sel,
+            max_rows: 10,
+            hint,
+            empty,
+            cursor: None,
+        },
+    )
 }
 
 /// Center `s` in `width` columns (a full-width string, so it overwrites the row).
@@ -880,9 +877,7 @@ fn center(s: &str, width: usize) -> String {
     }
     let mut out = " ".repeat((width - len) / 2);
     out.push_str(s);
-    let cur = out.width();
-    out.push_str(&" ".repeat(width - cur));
-    out
+    pad(&out, width)
 }
 
 /// Full-screen reconnect prompt shown after a daemon connection drops.
@@ -1235,15 +1230,15 @@ mod tests {
         assert_eq!(grouped_rows(), flat_rows() + control_groups().len());
     }
 
-    /// Peek borders remain column-exact for wide and overlong labels.
+    /// Overlay borders remain column-exact for wide and overlong labels.
     #[test]
-    fn peek_top_border_fills_to_inner_width() {
+    fn top_border_fills_to_inner_width() {
         for label in ["cargo test", "日本語のテスト", "🚀 build", "e\u{0301}", ""] {
-            let b = peek_top_border(label, 40);
+            let b = top_border(label, 40);
             assert_eq!(b.width(), 40, "label {label:?}: {b:?}");
         }
         // Overlong labels truncate inside the border rather than widening it.
-        let b = peek_top_border(&"長".repeat(40), 40);
+        let b = top_border(&"長".repeat(40), 40);
         assert_eq!(b.width(), 40, "{b:?}");
     }
 
