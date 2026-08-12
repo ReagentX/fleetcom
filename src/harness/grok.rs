@@ -59,7 +59,7 @@ impl Harness for Grok {
 /// Byte-wise URL-encode of a working directory as Grok's session group name.
 /// RFC 3986 unreserved bytes stay literal; every other byte becomes uppercase
 /// `%XX`. Non-UTF-8 paths have no key. The path is encoded as given.
-fn encode_cwd(cwd: &Path) -> Option<String> {
+pub(crate) fn encode_cwd(cwd: &Path) -> Option<String> {
     let s = cwd.to_str()?;
     let mut out = String::with_capacity(s.len() * 3);
     for &b in s.as_bytes() {
