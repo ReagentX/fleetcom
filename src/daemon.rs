@@ -45,6 +45,7 @@ use nix::{
 use crate::{
     core::{LoopExit, Wake, run_loop},
     frame::{MAX_FRAME, SEND_TIMEOUT, read_frame, write_frame},
+    path::FLEETCOM_RUNTIME_DIR,
     protocol::{
         Command, Event, LaunchContext, PROTOCOL_VERSION, decode_command, decode_event,
         decode_hello, encode_command, encode_event, encode_hello, hello_version,
@@ -61,15 +62,11 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 /// in microseconds.
 const HELLO_PROBE: Duration = Duration::from_secs(1);
 
-/// Env var overriding the per-user runtime directory (socket, lock, and the
-/// capture-asset root the supervisor derives from it).
-pub const FLEETCOM_RUNTIME_DIR: &str = "FLEETCOM_RUNTIME_DIR";
-
-/// Per-user directory holding the socket. `FLEETCOM_RUNTIME_DIR` overrides it
-/// (tests point it at an isolated temp dir); else `$XDG_RUNTIME_DIR/fleetcom`
-/// (per-user on Linux); else `$TMPDIR/fleetcom-$uid`, the macOS path, where
-/// `$TMPDIR` is already per-user and the uid suffix covers a shared `/tmp` on an
-/// XDG-less Linux.
+/// Socket/lock directory. `FLEETCOM_RUNTIME_DIR` overrides it (tests point it
+/// at an isolated temp dir); else `$XDG_RUNTIME_DIR/fleetcom` (per-user on
+/// Linux); else `$TMPDIR/fleetcom-$uid`, the macOS path, where `$TMPDIR` is
+/// already per-user and the uid suffix covers a shared `/tmp` on an XDG-less
+/// Linux.
 fn runtime_dir() -> PathBuf {
     resolve_runtime_dir(
         std::env::var(FLEETCOM_RUNTIME_DIR).ok(),
@@ -79,7 +76,8 @@ fn runtime_dir() -> PathBuf {
     )
 }
 
-/// Resolve the runtime directory from explicit inputs.
+/// Socket/lock resolver: override verbatim, else nonempty
+/// `$XDG_RUNTIME_DIR/fleetcom`, else `$TMPDIR/fleetcom-$uid`.
 fn resolve_runtime_dir(
     override_dir: Option<String>,
     xdg: Option<String>,

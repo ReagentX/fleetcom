@@ -35,12 +35,11 @@ use crate::preview::SummaryAdapter;
 /// independent of session-capture instrumentation.
 pub fn select(command: &str) -> Option<&'static dyn SummaryAdapter> {
     let first = command.split_whitespace().next()?;
-    match Path::new(first).file_name()?.to_str()? {
-        "claude" => Some(&ClaudeSummary),
-        "codex" => Some(&CodexSummary),
-        "grok" => Some(&GrokSummary),
-        _ => None,
-    }
+    let name = Path::new(first).file_name()?.to_str()?;
+    super::AGENTS
+        .iter()
+        .find(|a| a.harness.shape().0 == name)
+        .map(|a| a.summary)
 }
 
 /// Whether `row` is a full-width horizontal rule: nothing but `─`, long

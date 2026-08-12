@@ -66,6 +66,15 @@ fn select_matches_first_word_basenames_only() {
     }
 }
 
+/// Every registered program word selects a dashboard adapter.
+#[test]
+fn select_covers_every_registered_shape() {
+    for a in crate::harness::AGENTS {
+        let name = a.harness.shape().0;
+        assert!(select(name).is_some(), "{name} must select an adapter");
+    }
+}
+
 /// Each program word routes to its own CLI's matchers: the selected
 /// adapter fires that CLI's rule on that CLI's screen shape.
 #[test]

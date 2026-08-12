@@ -72,8 +72,10 @@ fn claude_settings_json() -> String {
     .dump()
 }
 
-/// Resolve the capture root from an explicit runtime directory, the platform
-/// runtime directory, or the platform cache directory, in that order.
+/// Capture-root resolver. An explicit override is what the supervisor passes
+/// when `FLEETCOM_RUNTIME_DIR` is set; otherwise `dirs::runtime_dir()/fleetcom`,
+/// then `dirs::cache_dir()/fleetcom/run`. Those fallbacks are not
+/// `daemon::resolve_runtime_dir`.
 pub fn runtime_root(override_dir: Option<&Path>) -> Option<PathBuf> {
     if let Some(dir) = override_dir {
         return Some(dir.to_path_buf());
