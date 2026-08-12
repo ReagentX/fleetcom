@@ -1287,36 +1287,36 @@ impl App {
             }
             return;
         }
-        match self.session_page {
-            SessionPage::Saved => match k.code {
-                KeyCode::Esc => self.mode = Mode::Dashboard,
-                KeyCode::Up => self.session_sel = self.session_sel.saturating_sub(1),
-                KeyCode::Down => {
-                    self.session_sel = step_down(self.session_sel, self.session_names.len())
-                }
-                KeyCode::Enter => {
-                    if let Some(name) = self.session_names.get(self.session_sel).cloned() {
-                        self.load_session(&name);
+        match k.code {
+            KeyCode::Esc => self.mode = Mode::Dashboard,
+            KeyCode::Up | KeyCode::Down => {
+                let (sel, len) = match self.session_page {
+                    SessionPage::Saved => (&mut self.session_sel, self.session_names.len()),
+                    SessionPage::Recovery => (&mut self.recovery_sel, self.session_recovery.len()),
+                };
+                *sel = if k.code == KeyCode::Up {
+                    sel.saturating_sub(1)
+                } else {
+                    step_down(*sel, len)
+                };
+            }
+            KeyCode::Enter => {
+                match self.session_page {
+                    SessionPage::Saved => {
+                        if let Some(name) = self.session_names.get(self.session_sel).cloned() {
+                            self.load_session(&name);
+                        }
                     }
-                    self.mode = Mode::Dashboard;
-                }
-                _ => {}
-            },
-            SessionPage::Recovery => match k.code {
-                KeyCode::Esc => self.mode = Mode::Dashboard,
-                KeyCode::Up => self.recovery_sel = self.recovery_sel.saturating_sub(1),
-                KeyCode::Down => {
-                    self.recovery_sel = step_down(self.recovery_sel, self.session_recovery.len())
-                }
-                KeyCode::Enter => {
-                    if let Some(e) = self.session_recovery.get(self.recovery_sel) {
-                        let stem = e.stem.clone();
-                        self.transport.send(Command::LoadRecovery { stem });
+                    SessionPage::Recovery => {
+                        if let Some(e) = self.session_recovery.get(self.recovery_sel) {
+                            let stem = e.stem.clone();
+                            self.transport.send(Command::LoadRecovery { stem });
+                        }
                     }
-                    self.mode = Mode::Dashboard;
                 }
-                _ => {}
-            },
+                self.mode = Mode::Dashboard;
+            }
+            _ => {}
         }
     }
 
