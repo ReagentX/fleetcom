@@ -102,14 +102,33 @@ pub trait Harness: Sync {
     }
 }
 
-/// Harness registry in detection order.
-pub static HARNESSES: &[&dyn Harness] = &[&Claude, &Codex, &Grok];
+/// One registered agent CLI: capture harness and display adapter.
+struct Agent {
+    harness: &'static dyn Harness,
+    summary: &'static dyn crate::preview::SummaryAdapter,
+}
+
+/// Registered CLIs in detection order.
+static AGENTS: &[Agent] = &[
+    Agent {
+        harness: &Claude,
+        summary: &summary::ClaudeSummary,
+    },
+    Agent {
+        harness: &Codex,
+        summary: &summary::CodexSummary,
+    },
+    Agent {
+        harness: &Grok,
+        summary: &summary::GrokSummary,
+    },
+];
 
 /// Return the first harness that recognizes `cmd`.
 pub fn detect(cmd: &str) -> Option<(&'static dyn Harness, Invocation)> {
-    HARNESSES
+    AGENTS
         .iter()
-        .find_map(|h| h.detect(cmd).map(|inv| (*h, inv)))
+        .find_map(|a| a.harness.detect(cmd).map(|inv| (a.harness, inv)))
 }
 
 /// Classification of an accepted agent-CLI command.
@@ -380,7 +399,8 @@ mod tests {
     /// including path-qualified programs and quoted IDs.
     #[test]
     fn every_harness_detects_the_two_authored_shapes() {
-        for &h in HARNESSES {
+        for a in AGENTS {
+            let h = a.harness;
             let (prog, sel) = h.shape();
             assert_eq!(h.detect(prog), Some(Invocation::Bare), "{prog}");
             assert_eq!(
@@ -403,7 +423,8 @@ mod tests {
     /// unchanged.
     #[test]
     fn every_harness_regenerates_the_canonical_resume_form() {
-        for &h in HARNESSES {
+        for a in AGENTS {
+            let h = a.harness;
             let (prog, sel) = h.shape();
             let canonical = format!("{prog} {sel} '{ID}'");
             assert_eq!(h.resume_command(prog, ID), canonical, "{prog}");
@@ -432,7 +453,8 @@ mod tests {
     /// opacity cases stay in each harness's own test module.
     #[test]
     fn every_harness_keeps_shared_shell_syntax_opaque() {
-        for &h in HARNESSES {
+        for a in AGENTS {
+            let h = a.harness;
             let (prog, sel) = h.shape();
             let opaque = [
                 format!("{prog} 'fix the tests'"),
@@ -456,7 +478,7 @@ mod tests {
                 );
             }
             // Another tool's program word never matches.
-            for other in HARNESSES.iter().map(|o| o.shape().0) {
+            for other in AGENTS.iter().map(|o| o.harness.shape().0) {
                 if other != prog {
                     assert_eq!(h.detect(other), None, "{other:?} is not {prog}");
                 }
