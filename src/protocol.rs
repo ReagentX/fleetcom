@@ -319,8 +319,8 @@ impl Preview {
 /// A read-only snapshot of one task: everything a dashboard row needs, with no
 /// handle into the live process. Time is pre-reduced to the `*_ago` durations
 /// and `lifecycle`/`parked` are pre-computed by the core (it owns the clock
-/// and both idle windows), so nothing here depends on a process-local
-/// `Instant` that a socket peer could not interpret.
+/// and the one idle window both fields share), so nothing here depends on a
+/// process-local `Instant` that a socket peer could not interpret.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TaskView {
     pub id: u64,
@@ -332,8 +332,9 @@ pub struct TaskView {
     /// Custom display name; `None` means unnamed.
     pub name: Option<String>,
     pub lifecycle: Lifecycle,
-    /// Quiet past the placement window, a much longer edge than `lifecycle`'s
-    /// idle threshold; `false` once finished.
+    /// Quiet past the core's idle window while live; `false` once finished.
+    /// Same threshold as `Lifecycle::Idle`: the glyph reads `lifecycle`,
+    /// state-section placement reads this field.
     pub parked: bool,
     /// The dashboard preview, resolved by the core at snapshot time.
     pub preview: Preview,
@@ -932,6 +933,8 @@ pub fn decode_event(kind: u8, payload: &[u8]) -> Option<Event> {
                         // A frame from a daemon predating `parked` derives it
                         // from the idle lifecycle: skew degrades to the
                         // pre-`parked` signal, never to a dropped frame.
+                        // Current cores compute `parked` from that same window,
+                        // so the fallback matches a modern frame.
                         let parked = if tv["parked"].is_null() {
                             lifecycle == Lifecycle::Idle
                         } else {
