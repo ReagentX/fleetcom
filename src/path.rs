@@ -2,6 +2,11 @@
 
 use std::path::{Component, Path, PathBuf};
 
+/// Shared env key for the runtime directory. Both the socket/lock resolver
+/// (`resolve_runtime_dir`) and the capture-root resolver (`runtime_root`)
+/// honor it; their fallbacks differ.
+pub const FLEETCOM_RUNTIME_DIR: &str = "FLEETCOM_RUNTIME_DIR";
+
 /// Shorten a path for display: `$HOME` collapses to `~`. Everything else stays
 /// absolute, so two directories never render as the same label.
 pub fn abbreviate(path: &Path) -> String {

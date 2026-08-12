@@ -720,7 +720,7 @@ impl Supervisor {
     /// and installation failure disables instrumentation for the spawn.
     fn ensure_capture_assets(&mut self) -> Option<&assets::CaptureAssets> {
         let root = self
-            .launch_env_path(crate::daemon::FLEETCOM_RUNTIME_DIR)
+            .launch_env_path(path::FLEETCOM_RUNTIME_DIR)
             .or_else(|| {
                 assets::runtime_root(None).map(|base| {
                     let key = self
