@@ -72,7 +72,7 @@ The exit scraper accepts `codex resume <uuid>` and `codex resume, then select <n
 
 Grok accepts a launch-time ID but exposes no injectable live-capture channel. A bare command therefore receives `--session-id '<uuid>'`, while a canonical resume command needs no instrumentation.
 
-After exit, the harness scans retained terminal text for the last `grok -r <uuid>` or `grok --resume <uuid>` hint. Save-time filesystem correlation checks `<grok-home>/sessions/<encoded-cwd>/<uuid>/`, where `/` is encoded as `%2F` and `%` as `%25`.
+After exit, the harness scans retained terminal text for the last `grok -r <uuid>` or `grok --resume <uuid>` hint. Save-time filesystem correlation checks `<grok-home>/sessions/<encoded-cwd>/<uuid>/`, percent-encoding the canonical working directory, falling back to a group whose `.cwd` file names that path when the encoded name is too long, and ignoring `session_kind: subagent` directories.
 
 ## ID precedence
 
