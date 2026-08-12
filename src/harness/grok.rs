@@ -51,8 +51,8 @@ impl Harness for Grok {
     }
 
     fn correlate_fs(&self, cwd: &Path, spawned: SystemTime, home: Option<&Path>) -> Option<String> {
-        let group = unique_group(&self.home_root(home)?.join("sessions"), cwd)?;
-        unique_session(&group, spawned)
+        let groups = matching_groups(&self.home_root(home)?.join("sessions"), cwd);
+        unique_session(&groups, spawned)
     }
 }
 
@@ -75,9 +75,11 @@ pub(crate) fn encode_cwd(cwd: &Path) -> Option<String> {
     Some(out)
 }
 
-/// The one sessions subdirectory for `cwd`. Several distinct matches cannot
-/// be told apart: a wrong group is worse than none.
-fn unique_group(sessions: &Path, cwd: &Path) -> Option<PathBuf> {
+/// Session-store groups that name `cwd`: the encoded given path, the encoded
+/// canonical path when it differs, and any directory whose `.cwd` record is
+/// that path. Same path through two aliases is one group. Distinct folders
+/// stay in the list; uniqueness is decided on in-window sessions, not here.
+fn matching_groups(sessions: &Path, cwd: &Path) -> Vec<PathBuf> {
     let mut found: Vec<PathBuf> = Vec::new();
 
     if let Some(p) = encoded_dir(sessions, cwd) {
@@ -101,17 +103,22 @@ fn unique_group(sessions: &Path, cwd: &Path) -> Option<PathBuf> {
             let Ok(text) = fs::read_to_string(entry.path().join(".cwd")) else {
                 continue;
             };
-            let trimmed = text.trim();
-            if given == Some(trimmed) || canon_s == Some(trimmed) {
+            let record = cwd_record(&text);
+            if given == Some(record) || canon_s == Some(record) {
                 push_unique(&mut found, entry.path());
             }
         }
     }
+    found
+}
 
-    match found.as_slice() {
-        [only] => Some(only.clone()),
-        _ => None,
-    }
+/// The path grok stored in `.cwd`: the file bytes minus one trailing `\n`,
+/// and a `\r` immediately before that `\n` if present. Interior and leading
+/// spaces stay; they are part of the directory name.
+fn cwd_record(text: &str) -> &str {
+    text.strip_suffix('\n')
+        .map(|s| s.strip_suffix('\r').unwrap_or(s))
+        .unwrap_or(text)
 }
 
 fn push_unique(found: &mut Vec<PathBuf>, p: PathBuf) {
@@ -125,41 +132,49 @@ fn encoded_dir(sessions: &Path, cwd: &Path) -> Option<PathBuf> {
     p.is_dir().then_some(p)
 }
 
-/// The one in-window top-level session directory under `group`. Subagent
-/// siblings do not count. A unique non-uuid name still yields `None`.
-fn unique_session(group: &Path, spawned: SystemTime) -> Option<String> {
+/// The one in-window top-level session across `groups`. Subagent siblings
+/// do not count. The same uuid in two groups is one candidate. A unique
+/// non-uuid name still yields `None`.
+fn unique_session(groups: &[PathBuf], spawned: SystemTime) -> Option<String> {
     let mut candidates: Vec<String> = Vec::new();
-    for entry in fs::read_dir(group).ok()?.flatten() {
-        // One directory per session, named by its uuid. Files such as
-        // the `prompt_history.jsonl` sibling are not sessions.
-        if !entry.file_type().is_ok_and(|t| t.is_dir()) {
-            continue;
-        }
-        let summary = fs::read_to_string(entry.path().join("summary.json"))
-            .ok()
-            .and_then(|text| jzon::parse(&text).ok());
-        if summary
-            .as_ref()
-            .is_some_and(|v| v["session_kind"].as_str() == Some("subagent"))
-        {
-            continue;
-        }
-        let ts = summary
-            .as_ref()
-            .and_then(|v| v["created_at"].as_str())
-            .and_then(parse_created_at)
-            .or_else(|| entry.metadata().ok()?.created().ok());
-        let Some(ts) = ts else {
+    for group in groups {
+        let Ok(entries) = fs::read_dir(group) else {
             continue;
         };
-        if !within_window(ts, spawned) {
-            continue;
+        for entry in entries.flatten() {
+            // One directory per session, named by its uuid. Files such as
+            // the `prompt_history.jsonl` sibling are not sessions.
+            if !entry.file_type().is_ok_and(|t| t.is_dir()) {
+                continue;
+            }
+            let summary = fs::read_to_string(entry.path().join("summary.json"))
+                .ok()
+                .and_then(|text| jzon::parse(&text).ok());
+            if summary
+                .as_ref()
+                .is_some_and(|v| v["session_kind"].as_str() == Some("subagent"))
+            {
+                continue;
+            }
+            let ts = summary
+                .as_ref()
+                .and_then(|v| v["created_at"].as_str())
+                .and_then(parse_created_at)
+                .or_else(|| entry.metadata().ok()?.created().ok());
+            let Some(ts) = ts else {
+                continue;
+            };
+            if !within_window(ts, spawned) {
+                continue;
+            }
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else {
+                continue;
+            };
+            if !candidates.iter().any(|c| c == name) {
+                candidates.push(name.to_string());
+            }
         }
-        let name = entry.file_name();
-        let Some(name) = name.to_str() else {
-            continue;
-        };
-        candidates.push(name.to_string());
     }
     match candidates.as_slice() {
         [only] if is_uuid(only) => Some(only.clone()),
@@ -469,6 +484,58 @@ mod tests {
             Grok.correlate_fs(cwd, spec_spawned(), Some(&home))
                 .as_deref(),
             Some(ID)
+        );
+    }
+
+    /// A leftover group that also names `cwd` does not hide the one
+    /// in-window session in the other group.
+    #[test]
+    fn correlate_fs_accepts_one_in_window_session_across_two_groups() {
+        let home = temp("grok_stale_group");
+        let cwd = Path::new("/work/proj.rs");
+        let live = home.join("sessions").join("%2Fwork%2Fproj.rs");
+        let stale = home.join("sessions").join("stale-alias-0123456789abcdef");
+        fs::create_dir_all(live.join(ID)).unwrap();
+        fs::create_dir_all(&stale).unwrap();
+        fs::write(stale.join(".cwd"), "/work/proj.rs\n").unwrap();
+        write_summary(&live.join(ID), ID, "/work/proj.rs", false);
+        assert_eq!(
+            Grok.correlate_fs(cwd, spec_spawned(), Some(&home))
+                .as_deref(),
+            Some(ID)
+        );
+
+        fs::create_dir_all(stale.join(OTHER)).unwrap();
+        write_summary(&stale.join(OTHER), OTHER, "/work/proj.rs", false);
+        assert_eq!(Grok.correlate_fs(cwd, spec_spawned(), Some(&home)), None);
+    }
+
+    #[test]
+    fn cwd_record_strips_only_one_newline_terminator() {
+        assert_eq!(cwd_record("/work/proj.rs"), "/work/proj.rs");
+        assert_eq!(cwd_record("/work/proj.rs\n"), "/work/proj.rs");
+        assert_eq!(cwd_record("/work/proj.rs\r\n"), "/work/proj.rs");
+        assert_eq!(cwd_record("/work/project  \n"), "/work/project  ");
+        assert_eq!(cwd_record("  /work/lead"), "  /work/lead");
+    }
+
+    /// A `.cwd` path with trailing spaces is a different directory.
+    #[test]
+    fn correlate_fs_does_not_trim_cwd_record_spaces() {
+        let home = temp("grok_cwd_spaces");
+        let spaced = Path::new("/work/project  ");
+        let group = home.join("sessions").join("spaced-cwd-0123456789abcdef");
+        fs::create_dir_all(group.join(ID)).unwrap();
+        fs::write(group.join(".cwd"), "/work/project  \n").unwrap();
+        write_summary(&group.join(ID), ID, "/work/project  ", false);
+        assert_eq!(
+            Grok.correlate_fs(spaced, spec_spawned(), Some(&home))
+                .as_deref(),
+            Some(ID)
+        );
+        assert_eq!(
+            Grok.correlate_fs(Path::new("/work/project"), spec_spawned(), Some(&home)),
+            None
         );
     }
 
