@@ -681,6 +681,73 @@ fn grok_status_shapes() {
     assert_eq!(GrokSummary.model_label(&plain), None);
 }
 
+/// Still-running chrome: `◎` plus a count phrase or `waiting`. The
+/// interrupt hint drops; body-shaped lookalikes and pre-0.2.109 wording
+/// do not match. A closer Worked-for row wins: no upward scan.
+#[test]
+fn grok_still_running_shapes() {
+    let boxed = [
+        "  ╭──────────────────────╮",
+        "  │ ❯                    │",
+        "  ╰── Grok 4.5 (xhigh) · always-approve ─╯",
+    ];
+    let probe = |status: &str| {
+        let mut rows = vec![status, ""];
+        rows.extend(boxed);
+        GrokSummary.live_preview(&rs(&rows))
+    };
+    assert_eq!(
+        probe("    ◎ 1 subagent still running"),
+        Some(("1 subagent still running".to_string(), "grok:still-running"))
+    );
+    assert_eq!(
+        probe("    ◎ 1 command · 2 monitors · 1 loop · 1 subagent still running"),
+        Some((
+            "1 command · 2 monitors · 1 loop · 1 subagent still running".to_string(),
+            "grok:still-running"
+        ))
+    );
+    assert_eq!(
+        probe("    ◎ 1 command still running · send a message to interrupt"),
+        Some(("1 command still running".to_string(), "grok:still-running"))
+    );
+    assert_eq!(
+        probe("    ◎ waiting · send a message to interrupt"),
+        Some(("waiting".to_string(), "grok:still-running"))
+    );
+    assert_eq!(
+        probe("    ◎ waiting"),
+        Some(("waiting".to_string(), "grok:still-running"))
+    );
+
+    for row in [
+        "    1 subagent still running",
+        "     watching · 1 subagent",
+        "  Subagent running: \"do the thing\"",
+        "    ◎ still running",
+        "    ◎ 1 to finish",
+        "    ◎ 1 command still running · leftover",
+        "    ◎ 1 still running",
+        "    ◎ command still running",
+        "    ◎ 1 a b c d still running",
+    ] {
+        assert_eq!(probe(row), None, "{row:?}");
+    }
+
+    // The probe is a single row: Worked-for closer to the box wins.
+    let mut rows = vec![
+        "    ◎ 1 subagent still running",
+        "",
+        "     Worked for 8.7s",
+        "",
+    ];
+    rows.extend(boxed);
+    assert_eq!(
+        GrokSummary.live_preview(&rs(&rows)),
+        Some(("Worked for 8.7s".to_string(), "grok:worked"))
+    );
+}
+
 // ------------------------------------------------------- corpus replay --
 
 /// Positive per-state fixtures at capture geometry (40×120): exact
@@ -790,6 +857,13 @@ fn corpus_positive_states_anchor_exactly() {
             "Grok 4.5 (xhigh) · Worked for 8.7s",
             "grok:worked",
         ),
+        Case(
+            "preview_grok_still_running",
+            include_bytes!("../../tests/corpus/preview_grok_still_running.bin"),
+            &GrokSummary,
+            "Grok 4.5 (xhigh) · 1 subagent still running",
+            "grok:still-running",
+        ),
     ];
     for Case(name, bytes, adapter, text, rule) in cases {
         let got = corpus(bytes, adapter, 120);
@@ -887,6 +961,15 @@ fn corpus_body_shaped_text_never_extracts() {
         120,
     );
     assert_eq!(got, anchor("gpt-5.6-sol high · Working", "codex:working"));
+
+    // Grok scrollback `Subagent running:` with no `◎` chrome: the probe
+    // is that body row and refuses, same marker fall-through as idle.
+    let got = corpus(
+        include_bytes!("../../tests/corpus/preview_grok_subagent_scrollback.bin"),
+        &GrokSummary,
+        120,
+    );
+    assert_eq!(got, marker());
 }
 
 /// 80-column truncation: the CLIs cut their status rows at a word

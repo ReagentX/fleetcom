@@ -32,6 +32,8 @@ use std::{
 pub use claude::Claude;
 pub use codex::Codex;
 pub use grok::Grok;
+#[cfg(test)]
+pub(crate) use grok::encode_cwd;
 
 /// Environment variable naming the capture file used by injected assets.
 pub const CAPTURE_ENV: &str = "FLEETCOM_CAPTURE_FILE";

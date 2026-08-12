@@ -419,8 +419,9 @@ fn codex_working(after_paren: &str) -> String {
 // ------------------------------------------------------------------ grok --
 
 /// grok (alt screen). The pin is its bordered input box; the status row
-/// (braille spinner while working, `Worked for {n}s` after a turn) is the
-/// first painted row above the box's top border.
+/// (braille spinner while working, `Worked for {n}s` after a turn, or
+/// `◎ … still running` / `◎ waiting` while background work is live) is
+/// the first painted row above the box's top border.
 pub struct GrokSummary;
 
 impl SummaryAdapter for GrokSummary {
@@ -436,7 +437,11 @@ impl SummaryAdapter for GrokSummary {
         if let Some(text) = spinner_text(t, |c| ('\u{2800}'..='\u{28FF}').contains(&c)) {
             return Some((text, "grok:spinner"));
         }
-        grok_worked(t).then(|| (t.to_string(), "grok:worked"))
+        // Still-running is the same probe, never a scan: a closer spinner
+        // or Worked-for row already returned above.
+        grok_worked(t)
+            .then(|| (t.to_string(), "grok:worked"))
+            .or_else(|| grok_still_running(t).map(|text| (text, "grok:still-running")))
     }
 
     fn model_label(&self, rows: &[String]) -> Option<String> {
@@ -474,6 +479,36 @@ fn grok_worked(t: &str) -> bool {
                 && n.chars()
                     .all(|c| c.is_ascii_digit() || matches!(c, '.' | ' ' | 'm' | 'h'))
         })
+}
+
+/// Background-task chrome grok paints above the box while the main turn
+/// looks idle. The `◎` head and the ` · send a message to interrupt` hint
+/// drop; `waiting` and `{count} still running` stay. Scrollback such as
+/// `Subagent running:` has no `◎` and never matches.
+fn grok_still_running(t: &str) -> Option<String> {
+    let rest = t.strip_prefix("◎ ")?;
+    let rest = rest
+        .strip_suffix(" · send a message to interrupt")
+        .unwrap_or(rest);
+    if rest == "waiting" {
+        return Some(rest.to_string());
+    }
+    let body = rest.strip_suffix(" still running")?;
+    body.split(" · ")
+        .all(grok_still_running_count)
+        .then(|| rest.to_string())
+}
+
+/// One count segment: ascii digits, a space, then one to three words.
+fn grok_still_running_count(seg: &str) -> bool {
+    let digits = seg.chars().take_while(char::is_ascii_digit).count();
+    if digits == 0 {
+        return false;
+    }
+    let Some(words) = seg[digits..].strip_prefix(' ') else {
+        return false;
+    };
+    (1..=3).contains(&words.split_whitespace().count())
 }
 
 /// `╰──── Grok 4.5 (xhigh) · always-approve ─╯` → `Grok 4.5 (xhigh)`: the

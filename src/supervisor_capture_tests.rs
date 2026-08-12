@@ -518,6 +518,247 @@ fn spawn_grok_pins_an_id_and_injects_nothing_else() {
     );
 }
 
+/// A `grok` exit hint becomes the session ID used by the saved recipe.
+/// The spawn pin stays; scrape must outrank it.
+#[test]
+fn grok_exit_hint_is_scraped_and_saved_as_a_resume() {
+    let dir = scratch("grok_scrape_exit");
+    let (bin, runtime, config) = (dir.join("bin"), dir.join("run"), dir.join("config"));
+    install_script(
+        &bin,
+        "grok",
+        &format!("printf 'Resume this session with:\\ngrok --resume {CAP_ID}\\n'"),
+    );
+    let mut s = sup_ctx(agent_ctx_plus(
+        &bin,
+        &runtime,
+        dir.to_path_buf(),
+        &[
+            ("FLEETCOM_CONFIG_DIR", &config),
+            ("GROK_HOME", &dir.join("grok_home")),
+        ],
+    ));
+    spawn(&mut s, "grok", dir.to_path_buf());
+    assert!(reap_until(&mut s, Duration::from_secs(5), |s| s.tasks[0]
+        .scraped_id
+        .is_some()));
+    assert_eq!(s.tasks[0].scraped_id.as_deref(), Some(CAP_ID));
+    assert!(
+        s.tasks[0].resume_id.is_some(),
+        "the spawn pin stays; scrape must outrank it"
+    );
+    assert_ne!(s.tasks[0].resume_id.as_deref(), Some(CAP_ID));
+
+    let text = save_and_read(&mut s, &config, "hint");
+    assert!(
+        text.contains(&format!("grok --resume '{CAP_ID}'")),
+        "the recipe must resume the scraped session; got {text}"
+    );
+}
+
+/// Saving between process exit and the next reap tick still captures the
+/// grok exit hint because `save_session` performs its own ready scrape.
+#[test]
+fn save_scrapes_a_finished_grok_task_without_reap() {
+    let dir = scratch("grok_save_sync_scrape");
+    let (bin, runtime, config) = (dir.join("bin"), dir.join("run"), dir.join("config"));
+    install_script(
+        &bin,
+        "grok",
+        &format!("printf 'Resume this session with:\\ngrok --resume {CAP_ID}\\n'"),
+    );
+    let mut s = sup_ctx(agent_ctx_plus(
+        &bin,
+        &runtime,
+        dir.to_path_buf(),
+        &[
+            ("FLEETCOM_CONFIG_DIR", &config),
+            ("GROK_HOME", &dir.join("grok_home")),
+        ],
+    ));
+    spawn(&mut s, "grok", dir.to_path_buf());
+
+    assert!(
+        wait_until(Duration::from_secs(5), || s.tasks[0].reader_done()),
+        "the stub never reached EOF"
+    );
+    assert!(s.tasks[0].finished.is_none(), "no reap may have run yet");
+
+    let text = save_and_read(&mut s, &config, "syncsave");
+    assert!(
+        text.contains(&format!("grok --resume '{CAP_ID}'")),
+        "save must scrape the finished task itself; got {text}"
+    );
+    assert_eq!(s.tasks[0].scraped_id.as_deref(), Some(CAP_ID));
+}
+
+/// Rerunning between process exit and the next reap tick latches the exit,
+/// scrapes the grok hint, and resumes that session.
+#[test]
+fn rerun_scrapes_a_finished_grok_task_without_reap() {
+    let dir = scratch("grok_rerun_sync_scrape");
+    let (bin, runtime, config) = (dir.join("bin"), dir.join("run"), dir.join("config"));
+    install_script(
+        &bin,
+        "grok",
+        &format!("printf 'Resume this session with:\\ngrok --resume {CAP_ID}\\n'"),
+    );
+    let mut s = sup_ctx(agent_ctx_plus(
+        &bin,
+        &runtime,
+        dir.to_path_buf(),
+        &[
+            ("FLEETCOM_CONFIG_DIR", &config),
+            ("GROK_HOME", &dir.join("grok_home")),
+        ],
+    ));
+    spawn(&mut s, "grok", dir.to_path_buf());
+    let id = s.tasks[0].id;
+
+    assert!(
+        wait_until(Duration::from_secs(5), || s.tasks[0].reader_done()),
+        "the stub never reached EOF"
+    );
+    assert!(s.tasks[0].finished.is_none(), "no reap may have run yet");
+
+    s.apply(Command::Restart { id });
+    assert_eq!(
+        s.tasks[0].command,
+        format!("grok --resume '{CAP_ID}'"),
+        "rerun must compute its resume command from the exit scrape"
+    );
+}
+
+/// A silent grok task falls back to one in-window top-level session dir
+/// under `GROK_HOME` when live channels produce no ID.
+#[test]
+fn save_falls_back_to_fs_correlation_for_a_silent_grok() {
+    let dir = scratch("grok_correlate_save");
+    let (bin, runtime, config, grok_home) = (
+        dir.join("bin"),
+        dir.join("run"),
+        dir.join("config"),
+        dir.join("grok_home"),
+    );
+    install_stub(&bin, "grok", &dir);
+    let mut s = sup_ctx(agent_ctx_plus(
+        &bin,
+        &runtime,
+        dir.to_path_buf(),
+        &[("FLEETCOM_CONFIG_DIR", &config), ("GROK_HOME", &grok_home)],
+    ));
+    spawn(&mut s, "grok", dir.to_path_buf());
+    assert!(reap_until(&mut s, Duration::from_secs(5), |s| s.tasks[0]
+        .finished
+        .is_some()));
+    assert!(s.tasks[0].scraped_id.is_none(), "a silent exit has no hint");
+    // Bare grok always pins; recipe_command would take that ID and never
+    // reach correlate_fs unless the pin is absent.
+    s.tasks[0].resume_id = None;
+    assert!(
+        current_resume_id(&s.tasks[0]).is_none(),
+        "clearing the pin is what exposes filesystem correlation"
+    );
+
+    let group = grok_home
+        .join("sessions")
+        .join(crate::harness::encode_cwd(&s.tasks[0].cwd).expect("task cwd is UTF-8"));
+    std::fs::create_dir_all(group.join(CAP_ID)).unwrap();
+
+    let text = save_and_read(&mut s, &config, "corr");
+    assert!(
+        text.contains(&format!("grok --resume '{CAP_ID}'")),
+        "save must fall back to filesystem correlation; got {text}"
+    );
+}
+
+/// An in-window `session_kind: subagent` sibling does not steal uniqueness
+/// from the top-level session directory.
+#[test]
+fn save_ignores_an_in_window_grok_subagent_sibling() {
+    let dir = scratch("grok_correlate_subagent");
+    let (bin, runtime, config, grok_home) = (
+        dir.join("bin"),
+        dir.join("run"),
+        dir.join("config"),
+        dir.join("grok_home"),
+    );
+    install_stub(&bin, "grok", &dir);
+    let mut s = sup_ctx(agent_ctx_plus(
+        &bin,
+        &runtime,
+        dir.to_path_buf(),
+        &[("FLEETCOM_CONFIG_DIR", &config), ("GROK_HOME", &grok_home)],
+    ));
+    spawn(&mut s, "grok", dir.to_path_buf());
+    assert!(reap_until(&mut s, Duration::from_secs(5), |s| s.tasks[0]
+        .finished
+        .is_some()));
+    assert!(s.tasks[0].scraped_id.is_none(), "a silent exit has no hint");
+    s.tasks[0].resume_id = None;
+
+    let group = grok_home
+        .join("sessions")
+        .join(crate::harness::encode_cwd(&s.tasks[0].cwd).expect("task cwd is UTF-8"));
+    std::fs::create_dir_all(group.join(CAP_ID)).unwrap();
+    // No created_at: birthtime is in-window, so the skip is session_kind.
+    let other = group.join(CAP_OTHER);
+    std::fs::create_dir_all(&other).unwrap();
+    std::fs::write(other.join("summary.json"), r#"{"session_kind":"subagent"}"#).unwrap();
+
+    let text = save_and_read(&mut s, &config, "subagent");
+    assert!(
+        text.contains(&format!("grok --resume '{CAP_ID}'")),
+        "the recipe must resume the top-level session; got {text}"
+    );
+    assert!(
+        !text.contains(CAP_OTHER),
+        "an in-window subagent sibling must not correlate; got {text}"
+    );
+}
+
+/// A spawn through a symlink cwd correlates against the canonical group's
+/// encoded name.
+#[test]
+fn save_follows_a_symlink_cwd_to_the_canonical_grok_group() {
+    let dir = scratch("grok_correlate_symlink");
+    let (bin, runtime, config, grok_home, real, link) = (
+        dir.join("bin"),
+        dir.join("run"),
+        dir.join("config"),
+        dir.join("grok_home"),
+        dir.join("real"),
+        dir.join("link"),
+    );
+    std::fs::create_dir_all(&real).unwrap();
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    install_stub(&bin, "grok", &dir);
+    let mut s = sup_ctx(agent_ctx_plus(
+        &bin,
+        &runtime,
+        dir.to_path_buf(),
+        &[("FLEETCOM_CONFIG_DIR", &config), ("GROK_HOME", &grok_home)],
+    ));
+    spawn(&mut s, "grok", link);
+    assert!(reap_until(&mut s, Duration::from_secs(5), |s| s.tasks[0]
+        .finished
+        .is_some()));
+    assert!(s.tasks[0].scraped_id.is_none(), "a silent exit has no hint");
+    s.tasks[0].resume_id = None;
+
+    let canonical = real.canonicalize().unwrap();
+    let group = grok_home
+        .join("sessions")
+        .join(crate::harness::encode_cwd(&canonical).expect("canonical path is UTF-8"));
+    std::fs::create_dir_all(group.join(CAP_ID)).unwrap();
+
+    let text = save_and_read(&mut s, &config, "symlink");
+    assert!(
+        text.contains(&format!("grok --resume '{CAP_ID}'")),
+        "save must correlate through the canonical group; got {text}"
+    );
+}
+
 /// A `claude` exit hint becomes the session ID used by the saved recipe.
 #[test]
 fn exit_hint_is_scraped_and_saved_as_a_resume() {
