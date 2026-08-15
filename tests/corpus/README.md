@@ -34,9 +34,9 @@ feed the bytes to the emulator verbatim.
 The `preview_*.bin` fixtures pin summary-adapter extraction, normalization,
 and fallback behavior. Each fixture is a constructed repaint stream: optional
 alternate-screen entry, clear, home, then sanitized screen rows joined with
-CRLF. Claude and Grok use the alternate screen; Codex is inline. Identifying
-and user-configured text is replaced with alignment-preserving synthetic
-values. Geometry is 40×120 unless noted.
+CRLF. Claude and Grok use the alternate screen; Codex and omp are inline.
+Identifying and user-configured text is replaced with alignment-preserving
+synthetic values. Geometry is 40×120 unless noted.
 
 `preview_codex_reasoning.bin` uses 40×80 geometry, and
 `preview_codex_queued.bin` uses 40×36. Both are bottom-anchored on a 40-row
@@ -48,7 +48,10 @@ omits the welcome box and includes agent-roster rows below the input box. The
 Claude task-list fixtures use generic phase names in a task-list layout; both
 omit the welcome box. The Claude workflow-wait fixture uses generic wording,
 omits the welcome box, and includes a long blank gap above the input box and a
-roster below it.
+roster below it. The omp fixtures replace the local model path and the working
+directory in the status line with same-length synthetic values, and their
+status rows carry a streamed intent phrase rather than omp's default
+`Working…`.
 
 | Fixture | Scenario | Coverage |
 | --- | --- | --- |
@@ -79,6 +82,10 @@ roster below it.
 | `preview_grok_subagent_scrollback.bin` | grok idle with `Subagent running:` in the body, no `◎` row | fall-through; body-shaped text is not status |
 | `preview_grok_idle.bin` | grok idle session | fall-through to the marker |
 | `preview_grok_splash.bin` | grok launch splash with resume hint above the box | fall-through; distinct views never anchor |
+| `preview_omp_working.bin` | omp status row carrying the model's streamed intent phrase above the input box | `omp:spinner`; padding, spinner frame, and interrupt hint stripped |
+| `preview_omp_approval.bin` | omp approval selector, input box replaced, tool-call preview box and a live status row still above it | `omp:approval-menu` synthesizes `awaiting approval` while the status row keeps animating |
+| `preview_omp_idle.bin` | omp idle with the welcome box and tip above the input box | fall-through to the floor tier; an inline UI reaches no marker |
+| `preview_omp_body_hint.bin` | status-shaped row quoted in the transcript, prose between it and an idle input box | negative: the pin is the row above the box, not a substring search |
 | `preview_trunc_claude.bin` | synthetic 40×80: spinner row truncated inside its parenthetical | head match still extracts `Hashing…` |
 | `preview_trunc_codex.bin` | synthetic 40×80: working row truncated inside the `/ps` hint | the head still matches and the key-hint suffix is omitted |
 | `preview_trunc_grok.bin` | synthetic 40×80: spinner label truncated with the CLI's ellipsis | extraction keeps the CLI's own `…` verbatim |

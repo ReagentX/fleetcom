@@ -1473,3 +1473,185 @@ fn corpus_non_agent_tuis_keep_their_tiers() {
         assert_eq!(with.source, PreviewSource::Marker, "{name}");
     }
 }
+
+// -------------------------------------------------------------------- omp --
+
+/// Place transcript rows above an omp input box: the status border directly
+/// over the row the user types on, with no row between them.
+fn omp_screen<S: AsRef<str>>(above: &[S]) -> Vec<String> {
+    let mut rows: Vec<String> = above.iter().map(|s| s.as_ref().to_string()).collect();
+    rows.push("╭── π  > ⬢ model · ◒ high > ◫ 12.2%/131K ▶──╮".to_string());
+    rows.push("╰─                                         ─╯".to_string());
+    rows
+}
+
+/// omp's approval screen: the selector replaces the input box while the
+/// status row keeps animating above it. `head` is the row that names the
+/// tool.
+fn omp_selector(head: &str) -> Vec<String> {
+    let rule = "─".repeat(120);
+    rs(&[
+        " ⠴ Listing directory contents ⟦esc⟧",
+        "",
+        &rule,
+        "",
+        head,
+        " Command: ls -la",
+        "",
+        " ❯ Approve",
+        "   Deny",
+        "",
+        " up/down navigate  enter select  esc cancel",
+        "",
+        &rule,
+    ])
+}
+
+/// The intent phrase survives verbatim across every bracket theme and both
+/// spinner presets, the CLI's own truncating ellipsis included.
+#[test]
+fn omp_status_row_extracts_the_intent_phrase() {
+    let probe = |row: &str| OmpSummary.live_preview(&omp_screen(&[row, ""]));
+    for hint in ["⟦esc⟧", "⟨esc⟩", "[esc]"] {
+        assert_eq!(
+            probe(&format!(" ⠴ Listing directory contents {hint}")),
+            Some(("Listing directory contents".to_string(), "omp:spinner")),
+            "{hint:?}"
+        );
+    }
+    // The ascii spinner preset, and omp's default phrase when the model
+    // streams no intent of its own.
+    for frame in ['-', '\\', '|', '/'] {
+        assert_eq!(
+            probe(&format!(" {frame} Working… [esc]")),
+            Some(("Working…".to_string(), "omp:spinner")),
+            "{frame:?}"
+        );
+    }
+    assert_eq!(
+        probe(" ⠋ Reading the fixture corpus rea… ⟦esc⟧"),
+        Some(("Reading the fixture corpus rea…".to_string(), "omp:spinner")),
+        "a phrase the CLI truncated keeps its own ellipsis"
+    );
+    // The model text is a user-configured status-line segment: never read.
+    assert_eq!(
+        OmpSummary.model_label(&omp_screen(&[" ⠴ Listing directory contents ⟦esc⟧", ""])),
+        None
+    );
+}
+
+/// The status row needs its frame, its separating space, a phrase, and the
+/// interrupt hint. A row whose hint wrapped onto the next line fails here
+/// rather than surfacing half a phrase.
+#[test]
+fn omp_status_row_requires_the_whole_skeleton() {
+    let probe = |row: &str| OmpSummary.live_preview(&omp_screen(&[row, ""]));
+    for row in [
+        " ⠴ Listing directory contents",
+        " ⠴Listing directory contents ⟦esc⟧",
+        " ⠴ ⟦esc⟧",
+        " ⠴ · queued ⟦esc⟧",
+        " Listing directory contents ⟦esc⟧",
+        " Press ⟦esc⟧ to interrupt",
+    ] {
+        assert_eq!(probe(row), None, "{row:?}");
+    }
+}
+
+/// The pin is the row above the input box, not a substring search: a
+/// status-shaped row parked in the transcript never anchors, and the
+/// tool-call preview box's matching corners are not the input box.
+#[test]
+fn omp_pins_the_status_row_to_the_input_box() {
+    let quoted = omp_screen(&[
+        " ⠴ Listing directory contents ⟦esc⟧",
+        "",
+        " That row is chrome, not transcript.",
+        "",
+    ]);
+    assert_eq!(OmpSummary.live_preview(&quoted), None);
+
+    // The preview box fences a `│`-headed command row between the same
+    // corners, so the pair is not adjacent and the pin fails.
+    let preview_box = rs(&[
+        " ⠴ Listing directory contents ⟦esc⟧",
+        "",
+        "╭──────────────────╮",
+        "│ $ ls -la         │",
+        "╰──────────────────╯",
+    ]);
+    assert_eq!(OmpSummary.live_preview(&preview_box), None);
+}
+
+/// The selector synthesizes its label from the `Allow tool:` head, the
+/// selection, and the `Deny` sibling below it. The status row keeps
+/// painting throughout and never wins.
+#[test]
+fn omp_approval_requires_the_selector_shape() {
+    assert_eq!(
+        OmpSummary.live_preview(&omp_selector(" Allow tool: bash")),
+        Some(("awaiting approval".to_string(), "omp:approval-menu"))
+    );
+    for head in [" Allow tool: ", " Reviewing the plan"] {
+        assert_eq!(
+            OmpSummary.live_preview(&omp_selector(head)),
+            None,
+            "{head:?}"
+        );
+    }
+
+    // `Deny` must be the next painted row below the selection.
+    let lone = rs(&[" Allow tool: bash", "", " ❯ Approve", "", " esc cancel"]);
+    assert_eq!(OmpSummary.live_preview(&lone), None);
+
+    // The selection must sit in the bottom of the painted rows.
+    let mut buried = omp_selector(" Allow tool: bash");
+    buried.extend(std::iter::repeat_n(" tool output".to_string(), 6));
+    assert_eq!(OmpSummary.live_preview(&buried), None);
+
+    // The same block quoted in the transcript keeps the live input box
+    // below it; the box routes to the status probe, which sees prose.
+    let mut quoted = omp_selector(" Allow tool: bash");
+    quoted.push(String::new());
+    assert_eq!(OmpSummary.live_preview(&omp_screen(&quoted)), None);
+}
+
+/// omp corpus replay at capture geometry (40×120): exact status text,
+/// Anchor provenance, and the matcher id. Kept in its own table so the omp
+/// and codex fixture sets can land independently.
+#[test]
+fn corpus_omp_states_anchor_exactly() {
+    for (name, bytes, want) in [
+        (
+            "preview_omp_working",
+            &include_bytes!("../../tests/corpus/preview_omp_working.bin")[..],
+            anchor("Listing directory contents", "omp:spinner"),
+        ),
+        (
+            "preview_omp_approval",
+            &include_bytes!("../../tests/corpus/preview_omp_approval.bin")[..],
+            anchor("awaiting approval", "omp:approval-menu"),
+        ),
+    ] {
+        assert_eq!(corpus(bytes, &OmpSummary, 120), want, "{name}");
+    }
+}
+
+/// omp is an inline UI, so a screen with no anchor falls through to the
+/// floor tier — its input row — never the alternate-screen marker.
+#[test]
+fn corpus_omp_states_fall_through_to_the_floor() {
+    let input_row = floor(&format!("╰─{}─╯", " ".repeat(116)));
+    for (name, bytes) in [
+        (
+            "preview_omp_idle",
+            &include_bytes!("../../tests/corpus/preview_omp_idle.bin")[..],
+        ),
+        (
+            "preview_omp_body_hint",
+            &include_bytes!("../../tests/corpus/preview_omp_body_hint.bin")[..],
+        ),
+    ] {
+        assert_eq!(corpus(bytes, &OmpSummary, 120), input_row, "{name}");
+    }
+}

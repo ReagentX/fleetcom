@@ -1,0 +1,39 @@
+[2J[H
+╭─── omp v17.3.4 ──────────────────────────────────────────────────────────────────────────────────╮
+│                                                                                                  │
+│                                          Welcome back!                                           │
+│                                                                                                  │
+│                                           ▀██████████▀                                           │
+│                                            ╘██    ██                                             │
+│                                             ██    ██                                             │
+│                                             ██    ██                                             │
+│                                            ▄██▄  ▄██▄                                            │
+│                                                                                                  │
+│                  /Users/dev/Projects/fixtures/qwen3/Qwen3.8-27B-UD-Q8_K_XL.gguf                  │
+│                                            llama.cpp                                             │
+╰──────────────────────────────────────────────────────────────────────────────────────────────────╯
+ Tip: Run `omp auth-broker serve` once and every machine pulls live tokens over the wire — refresh
+      keys never leave the host; `omp auth-gateway` fronts it as a drop-in proxy any
+      OpenAI-compatible client can hit
+
+ Use the bash tool to run: ls -la
+
+ While a turn runs, omp paints its status row as:
+
+ ⠴ Listing directory contents ⟦esc⟧
+
+ That row is chrome, not transcript: quoting it must not anchor.
+
+╭── π  > ⬢ /Users/dev/Projects/fixtures/qwen3/Qwen3.8-27B-UD-Q8_K_XL.gguf · ◒ high > 🗑 …tures/proj > ◫ 12.2%/131K ⟲ ▶──╮
+╰─                                                                                                                    ─╯
+
+
+
+
+
+
+
+
+
+
+
