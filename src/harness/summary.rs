@@ -314,9 +314,29 @@ impl SummaryAdapter for CodexSummary {
     }
 
     fn model_label(&self, rows: &[String]) -> Option<String> {
-        let token = codex_token_line(rows)?;
-        // `codex_token_line` guarantees a non-empty first segment.
-        Some(rows[token].trim().split(" · ").next()?.to_string())
+        let row = codex_model_row(rows)?;
+        // `codex_model_row` guarantees a non-empty first segment.
+        Some(rows[row].trim().split(" · ").next()?.to_string())
+    }
+
+    /// Canonicalize codex's two title animations so the rendered text holds
+    /// still: the ten-frame braille spinner folds to `⠋`, and the blocked-on-
+    /// user blink folds its `[ . ]` phase into `[ ! ]`. The spinner advances
+    /// every 100 ms and the blink runs at 1 Hz, both far inside the preview's
+    /// 500 ms minimum hold, so without this the dashboard re-renders on every
+    /// frame. `⠋` is the spinner's first frame; claude normalizes to `✻`
+    /// instead, and that difference is what keeps the two agents' titles
+    /// distinguishable on the dashboard. Other titles pass through unchanged.
+    fn normalize_title(&self, title: &str) -> Option<String> {
+        for phase in CODEX_TITLE_BLINK {
+            if let Some(rest) = title.strip_prefix(phase) {
+                return Some(format!("{}{rest}", CODEX_TITLE_BLINK[0]));
+            }
+        }
+        let mut chars = title.chars();
+        let frame = chars.next()?;
+        (('\u{2800}'..='\u{28FF}').contains(&frame) && chars.next()? == ' ')
+            .then(|| format!("⠋ {}", chars.as_str()))
     }
 }
 
@@ -333,6 +353,18 @@ const CODEX_QUEUED_HEADS: &[&str] = &[
     "• Messages to be submitted at end of turn",
     "• Queued follow-up inputs",
 ];
+
+/// Reasoning-effort words the `model-with-reasoning` status-line item renders
+/// after the model slug. `default` is one of them: it is the word codex prints
+/// when the profile names no effort, not the absence of a word.
+const CODEX_EFFORT: &[&str] = &[
+    "none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra", "default",
+];
+
+/// The two phases codex blinks between, at 1 Hz, while it is blocked on the
+/// user. The first is the canonical one: `[ ! ]` is the phase that reads as an
+/// alarm, so it is the one worth freezing on the dashboard.
+const CODEX_TITLE_BLINK: &[&str] = &["[ ! ] ", "[ . ] "];
 
 /// Maximum indented rows crossed between the composer and the status row.
 /// Queued-message blocks are exempt: their height is the user's queue
@@ -375,19 +407,45 @@ fn codex_approval(rows: &[String]) -> Option<(String, &'static str)> {
         .then(|| ("awaiting approval".to_string(), "codex:approval-menu"))
 }
 
-/// The token/status bar, when painted: the bottom-most
-/// `{model} · {…} in · {…} out` row among the last six painted rows.
-/// Independent of the composer pin because the bar may be absent; without it,
-/// the anchor has no model prefix.
-fn codex_token_line(rows: &[String]) -> Option<usize> {
+/// The status line, when painted: the bottom-most row among the last six
+/// painted ones whose ` · `-joined items open with the model. Independent of
+/// the composer pin because the line is user-configured and may be absent —
+/// or may omit the model entirely, in which case there is no model prefix.
+///
+/// Two shapes qualify, because the items are a `[tui] status_line` array the
+/// user orders and codex drops unavailable ones silently:
+///
+/// - the opt-in `total-input-tokens`/`total-output-tokens` pair closing the
+///   row as `{…} in · {…} out`, which pins the model to the first item;
+/// - the default `model-with-reasoning` head, `{model} {effort}` with an
+///   optional service tier appended, matched by [`codex_model_with_reasoning`].
+///
+/// Neither present means the model is not on the row, and no label is read: a
+/// label lifted off `status_line = ["current-dir", "model"]` would name the
+/// directory as the model.
+fn codex_model_row(rows: &[String]) -> Option<usize> {
     let last = rows.iter().rposition(|r| !r.is_empty())?;
     (last.saturating_sub(5)..=last).rev().find(|&i| {
         let segs: Vec<&str> = rows[i].trim().split(" · ").collect();
-        segs.len() >= 3
-            && !segs[0].is_empty()
+        if segs[0].is_empty() {
+            return false;
+        }
+        let in_out = segs.len() >= 3
             && segs[segs.len() - 2].ends_with(" in")
-            && segs[segs.len() - 1].ends_with(" out")
+            && segs[segs.len() - 1].ends_with(" out");
+        in_out || codex_model_with_reasoning(segs[0])
     })
+}
+
+/// Whether an item is `model-with-reasoning`: `{model} {effort}`, plus the
+/// service tier codex appends when the account has one (`gpt-5.4 xhigh fast`,
+/// where the effort word is no longer last). Exactly two or three words, with
+/// the effort word second — the render has no other shape, and holding the
+/// count that tight is what keeps prose ending in an effort word (`I'll use
+/// medium effort`) from being read as a model.
+fn codex_model_with_reasoning(item: &str) -> bool {
+    let words: Vec<&str> = item.split_whitespace().collect();
+    matches!(words.len(), 2 | 3) && CODEX_EFFORT.contains(&words[1])
 }
 
 /// The composer: the bottom-most column-0 [`CODEX_PROMPT`] row — the glyph

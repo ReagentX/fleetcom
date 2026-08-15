@@ -511,6 +511,92 @@ fn codex_working_normalization() {
     );
 }
 
+/// The status line is a user-ordered item array, so the label reads either
+/// shape that puts the model first: the opt-in `{…} in · {…} out` tail, or
+/// the default `model-with-reasoning` head. A row carrying neither yields no
+/// label rather than a guess.
+#[test]
+fn codex_label_reads_either_status_line_shape() {
+    let label = |row: &str| CodexSummary.model_label(&rs(&["›", "", row]));
+    for (row, want) in [
+        // Rows codex 0.147.0's own snapshots render.
+        (
+            "  gpt-5.6-sol default · /tmp/project",
+            "gpt-5.6-sol default",
+        ),
+        ("  gpt-5.4 high · feature-branch", "gpt-5.4 high"),
+        (
+            "  gpt-5.4 xhigh fast · Context 100% left · /tmp/project",
+            "gpt-5.4 xhigh fast",
+        ),
+        // The in/out tail still qualifies a row on its own, including one
+        // whose model item carries no effort word.
+        ("  gpt-5.6-sol high · 0 in · 0 out", "gpt-5.6-sol high"),
+        ("  gpt-5.6-sol · 28.2K in · 78 out", "gpt-5.6-sol"),
+        (
+            "  gpt-5.6-sol high · 5.26K used · 28.2K in · 78 out",
+            "gpt-5.6-sol high",
+        ),
+    ] {
+        assert_eq!(label(row), Some(want.to_string()), "{row:?}");
+    }
+
+    for effort in CODEX_EFFORT {
+        assert_eq!(
+            label(&format!("  gpt-5.6-sol {effort} · /tmp/project")),
+            Some(format!("gpt-5.6-sol {effort}")),
+            "{effort:?}"
+        );
+    }
+
+    for row in [
+        // `status_line = ["current-dir", "model"]`: naming the directory as
+        // the model is worse than naming nothing.
+        "  /tmp/project · gpt-5.6-sol",
+        // An effort word outside the first item does not qualify the row.
+        "  /tmp/project · gpt-5.4 high",
+        // The plain `model` item, with no effort word to structure it.
+        "  gpt-5.6-sol · /tmp/project",
+        // Prose ending in an effort word.
+        "  I'll use medium effort · /tmp/project",
+        // The effort word with no model before it.
+        "  high · /tmp/project",
+    ] {
+        assert_eq!(label(row), None, "{row:?}");
+    }
+}
+
+/// The braille spinner and the blocked-on-user blink each canonicalize to a
+/// single string; idle and foreign titles pass through.
+#[test]
+fn codex_title_animations_canonicalize_to_constant_text() {
+    for frame in ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'] {
+        assert_eq!(
+            CodexSummary.normalize_title(&format!("{frame} fleetcom")),
+            Some("⠋ fleetcom".to_string()),
+            "{frame:?}"
+        );
+    }
+
+    // The blink's two phases differ only in the bracketed glyph.
+    let on = CodexSummary.normalize_title("[ ! ] Action Required | fleetcom");
+    let off = CodexSummary.normalize_title("[ . ] Action Required | fleetcom");
+    assert_eq!(on, off, "both blink phases must normalize identically");
+    assert_eq!(on, Some("[ ! ] Action Required | fleetcom".to_string()));
+
+    // codex and claude fold braille to different glyphs on purpose: the
+    // dashboard's titles stay attributable to the CLI that painted them.
+    assert_ne!(
+        CodexSummary.normalize_title("⠹ fleetcom"),
+        ClaudeSummary.normalize_title("⠹ fleetcom")
+    );
+
+    // Idle drops the spinner, and foreign titles are not codex's to rewrite.
+    assert_eq!(CodexSummary.normalize_title("fleetcom"), None);
+    assert_eq!(CodexSummary.normalize_title("zellij: main"), None);
+    assert_eq!(CodexSummary.normalize_title("⠹"), None, "frame alone");
+}
+
 /// The status row anchors on its parenthetical, not on a literal verb:
 /// the activity glyph blinks, drops to `◦`, or vanishes with animations
 /// off; the header is whatever the CLI put there; the interrupt key is
@@ -1208,14 +1294,17 @@ fn corpus_codex_0_147_rows_anchor() {
     assert_eq!(got, anchor("Investigating rendering code", "codex:working"));
 
     // Sixteen queued messages separate the status row from the composer.
-    // `gpt-5.6-sol default · /tmp/project` is not the token bar's
-    // `{model} · {…} in · {…} out`, so no model label is read.
+    // The status line below is codex's default pair, `model-with-reasoning ·
+    // current-dir`, so the label reads off its first item.
     let got = corpus(
         include_bytes!("../../tests/corpus/preview_codex_queued.bin"),
         &CodexSummary,
         36,
     );
-    assert_eq!(got, anchor("Working", "codex:working"));
+    assert_eq!(
+        got,
+        anchor("gpt-5.6-sol default · Working", "codex:working")
+    );
 }
 
 /// At 30 columns, a wrapped status ellipsis fails the structure check and
