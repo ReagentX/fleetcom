@@ -1,8 +1,17 @@
 //! Codex does not let the caller select an ID at launch. This harness instead
 //! injects a `notify` override, chains compatible configured notifiers, and
-//! scans both exit-hint forms. When neither channel yields an ID, it correlates
-//! rollout files under
+//! scans every exit line that carries an ID. When neither channel yields an ID,
+//! it correlates rollout files under
 //! `<codex-home>/sessions/YYYY/MM/DD/rollout-<local-ts>-<uuid>.jsonl`.
+//!
+//! Those files are created lazily: `RolloutRecorder::new` precomputes the path
+//! and defers creation until the first persisted item, so a session that never
+//! received a prompt leaves no rollout at all and [`Codex::correlate_fs`]
+//! returns `None`. That is the right answer — there is no conversation to
+//! resume. Creation opens the path `O_APPEND|O_CREAT` in place rather than
+//! writing a temp file and renaming it, so a zero-byte or half-written first
+//! line is briefly observable; the `jzon::parse` guard in [`line1_admits`]
+//! rejects one.
 
 use std::{
     fmt::Write as _,
@@ -79,6 +88,21 @@ impl Harness for Codex {
     fn scrape_exit(&self, text: &str) -> Option<String> {
         let mut last = None;
         for line in text.lines() {
+            // Fatal exit with no hint: codex `println!`s a bare
+            // `Session ID: <uuid>`, the last channel left once the notify hook
+            // has not fired and the rollout may be empty. Only a whole row
+            // counts. The phrase carries no program word to narrow it, so an
+            // unanchored match would let any scrollback line quoting it decide
+            // the resume ID of a task killed before codex printed an exit line
+            // at all — a wrong ID where the fall through to `correlate_fs`
+            // would have been provenance-checked. Rendered model output always
+            // carries a `• ` head or a two-space continuation indent, so it
+            // cannot reach offset 0.
+            if let Some(rest) = line.strip_prefix("Session ID: ")
+                && let Some(id) = leading_uuid(rest)
+            {
+                last = Some(id.to_string());
+            }
             // Plain hint: `... run codex resume <uuid>`.
             if let Some(id) = last_hint(line, &["codex resume "]) {
                 last = Some(id);
@@ -129,9 +153,16 @@ impl Harness for Codex {
                 else {
                     continue;
                 };
-                let Some(id) = stem.get(stem.len().saturating_sub(36)..) else {
+                // The stem opens with 19 timestamp characters
+                // (`YYYY-MM-DDTHH-MM-SS`) and one `-`; the thread ID runs from
+                // there to the first `_` or to the end. Reading the trailing 36
+                // instead would return the rollout ID of a reverted thread's
+                // `rollout-<ts>-<thread_id>_<rollout_id>.jsonl` — a valid UUID
+                // naming the wrong conversation.
+                let Some(ids) = stem.get(20..) else {
                     continue;
                 };
+                let id = ids.split_once('_').map_or(ids, |(thread, _)| thread);
                 if !is_uuid(id) {
                     continue;
                 }
@@ -141,7 +172,7 @@ impl Harness for Codex {
                 if !within_window_ms(u128::from(ms), spawn_ms) {
                     continue;
                 }
-                if !line1_cwd_matches(&entry.path(), cwd) {
+                if !line1_admits(&entry.path(), cwd) {
                     continue;
                 }
                 survivors.push(id.to_string());
@@ -166,28 +197,28 @@ enum NotifyRoute {
     Opaque,
 }
 
-/// Classify the effective `notify` route from `config.toml` and its selected
-/// profile. The first line-based `profile` assignment selects the profile, and
-/// its notify assignment takes precedence over the base file. Because this is
+/// Classify the effective `notify` route from `config.toml`. Because this is
 /// deliberately line-based rather than TOML-aware, two `notify` lines in one
 /// file are ambiguous and produce [`NotifyRoute::Opaque`].
+///
+/// `config.toml` is the only file read, and the injected `-c` override is why
+/// that suffices: it lands in codex's `SessionFlags` layer at precedence 30,
+/// outranking every layer a user config can occupy — user config 20,
+/// user-with-profile 21, project 25. Only managed and enterprise config, at 40
+/// and 50, beat it.
 fn config_notify_route(home: Option<&Path>) -> NotifyRoute {
     let Some(root) = Codex.home_root(home) else {
         return NotifyRoute::Vacant;
     };
-    let config_text = fs::read_to_string(root.join("config.toml")).unwrap_or_default();
-    let profile_text = config_profile(&config_text)
-        .and_then(|p| fs::read_to_string(root.join(format!("{p}.config.toml"))).ok())
-        .unwrap_or_default();
-    for text in [&profile_text, &config_text] {
-        let mut values = text.lines().filter_map(notify_value);
-        let Some(value) = values.next() else { continue };
-        if values.next().is_some() {
-            return NotifyRoute::Opaque;
-        }
-        return route_for(value);
+    let text = fs::read_to_string(root.join("config.toml")).unwrap_or_default();
+    let mut values = text.lines().filter_map(notify_value);
+    let Some(value) = values.next() else {
+        return NotifyRoute::Vacant;
+    };
+    if values.next().is_some() {
+        return NotifyRoute::Opaque;
     }
-    NotifyRoute::Vacant
+    route_for(value)
 }
 
 /// Classify one notify assignment for the newline-delimited chain transport.
@@ -202,36 +233,6 @@ fn route_for(value: &str) -> NotifyRoute {
         }
         _ => NotifyRoute::Opaque,
     }
-}
-
-/// Return the first line-based `profile = name` assignment. Bare and quoted
-/// values are valid; trailing comments are ignored.
-fn config_profile(text: &str) -> Option<String> {
-    for line in text.lines() {
-        let Some(rest) = line.trim_start().strip_prefix("profile") else {
-            continue;
-        };
-        let Some(rest) = rest.trim_start_matches([' ', '\t']).strip_prefix('=') else {
-            continue;
-        };
-        let val = unquote_toml(rest.trim());
-        if !val.is_empty() {
-            return Some(val);
-        }
-    }
-    None
-}
-
-/// Extract a quoted value or the first whitespace/`#`-delimited bare token.
-fn unquote_toml(s: &str) -> String {
-    for q in ['"', '\''] {
-        if let Some(rest) = s.strip_prefix(q)
-            && let Some(end) = rest.find(q)
-        {
-            return rest[..end].to_string();
-        }
-    }
-    s.split([' ', '\t', '#']).next().unwrap_or("").to_string()
 }
 
 /// Value after `=` of an uncommented bare `notify` assignment, or `None`.
@@ -324,9 +325,19 @@ fn v7_millis(id: &str) -> Option<u64> {
     u64::from_str_radix(&format!("{}{}", &id[..8], &id[9..13]), 16).ok()
 }
 
-/// Check whether the rollout's first record names `cwd`. Reads stop at 64 KiB
-/// because later records do not participate in correlation.
-fn line1_cwd_matches(path: &Path, cwd: &Path) -> bool {
+/// Check whether the rollout's first record names `cwd` and belongs to a thread
+/// the user started. Subagent and guardian-review threads inherit the parent's
+/// cwd and are minted within seconds of it, so cwd and the window alone leave
+/// several rollouts standing and correlation collapses to `None`;
+/// `thread_source: "subagent"` and a `parent_thread_id` are what separate them.
+///
+/// The test rejects rather than admits by name: codex's `ThreadSource`
+/// deserializer turns any unknown string into `Feature(String)`, so requiring
+/// `"user"` would silently drop legitimate future thread kinds. Absence is a
+/// pass for the same reason — both fields are omitted when empty and neither
+/// existed before 0.147.0, so pre-0.147 sessions stay resumable. Reads stop at
+/// 64 KiB because later records do not participate in correlation.
+fn line1_admits(path: &Path, cwd: &Path) -> bool {
     let Ok(file) = fs::File::open(path) else {
         return false;
     };
@@ -340,9 +351,13 @@ fn line1_cwd_matches(path: &Path, cwd: &Path) -> bool {
     let Ok(meta) = jzon::parse(&line) else {
         return false;
     };
-    meta["payload"]["cwd"]
-        .as_str()
-        .is_some_and(|c| Path::new(c) == cwd)
+    let payload = &meta["payload"];
+    if payload["thread_source"].as_str() == Some("subagent")
+        || !payload["parent_thread_id"].is_null()
+    {
+        return false;
+    }
+    payload["cwd"].as_str().is_some_and(|c| Path::new(c) == cwd)
 }
 
 #[cfg(test)]
@@ -352,7 +367,7 @@ mod tests {
     use super::*;
     use crate::{
         harness::fixtures::{OTHER, assert_all_opaque, assert_corpus_scrape, paths},
-        testutil::{Scratch, temp, v7_at, write_rollout},
+        testutil::{CORPUS_COLS, Scratch, temp, v7_at, write_rollout, write_rollout_named},
     };
 
     /// Codex's own launch and resume commands carry v7 IDs; the shared v4
@@ -654,49 +669,63 @@ mod tests {
         assert_eq!(Codex.scrape_exit(&both).as_deref(), Some(ID));
     }
 
+    /// A fatal exit prints no resume hint and names the ID outright. Nothing
+    /// else recovers it: the notify hook never fired and the rollout may be
+    /// empty.
     #[test]
-    fn config_notify_route_resolves_profiles() {
-        let home = temp("codex_profile_notify");
-        let cfg = home.join("config.toml");
-        let team = home.join("team.config.toml");
-        let team_route = NotifyRoute::Chain(vec!["/team/hook".to_string()]);
-
-        // notify lives in the profile file selected by config.toml's own
-        // `profile` key.
-        fs::write(&cfg, "profile = \"team\"\n").unwrap();
-        fs::write(&team, "notify = [\"/team/hook\"]\n").unwrap();
-        assert_eq!(config_notify_route(Some(&home)), team_route);
-        let inv = Codex.detect("codex").unwrap();
-        let plan = Codex.instrument(&inv, &paths(), Some(&home));
-        assert!(
-            plan.env
-                .contains(&(NOTIFY_CHAIN_ENV.into(), "/team/hook".into())),
-            "{:?}",
-            plan.env
+    fn scrape_exit_reads_the_fatal_session_id_line() {
+        assert_eq!(
+            Codex.scrape_exit(&format!("Session ID: {ID}")).as_deref(),
+            Some(ID)
         );
 
-        // Bare (unquoted) value with a trailing comment resolves too.
-        fs::write(&cfg, "profile = team # mine\n").unwrap();
-        assert_eq!(config_notify_route(Some(&home)), team_route);
+        // The label alone, a name, and a token-extending ID yield nothing.
+        assert_eq!(Codex.scrape_exit("Session ID:"), None);
+        assert_eq!(Codex.scrape_exit("Session ID: my session"), None);
+        assert_eq!(Codex.scrape_exit(&format!("Session ID: {ID}ff")), None);
 
-        // The profile file's assignment overrides the base file's.
+        // Off the start of the row the phrase is quoted text, not codex's own
+        // line. A task killed before any exit line would otherwise resume on
+        // it; refusing costs only the fall through to `correlate_fs`.
+        for quoted in [
+            format!("the log said Session ID: {ID}"),
+            format!("• Session ID: {ID}"),
+            format!("  Session ID: {ID}"),
+        ] {
+            assert_eq!(Codex.scrape_exit(&quoted), None, "{quoted:?}");
+        }
+
+        // Across lines, the last channel to speak wins, either way round.
+        let hint_last = format!("Session ID: {OTHER}\nrun codex resume {ID}");
+        assert_eq!(Codex.scrape_exit(&hint_last).as_deref(), Some(ID));
+        let id_last = format!("run codex resume {OTHER}\nSession ID: {ID}");
+        assert_eq!(Codex.scrape_exit(&id_last).as_deref(), Some(ID));
+    }
+
+    /// A half-migrated home — a legacy `profile` key beside the file it once
+    /// selected — must not chain the profile's notifier: 0.147.0 refuses to
+    /// start on that key at all, and layers `<profile>.config.toml` only under
+    /// `-p`, a command this harness never instruments. Chaining it would run a
+    /// notifier codex itself would not.
+    #[test]
+    fn config_notify_route_reads_config_toml_alone() {
+        let home = temp("codex_profile_notify");
+        let cfg = home.join("config.toml");
+        fs::write(home.join("team.config.toml"), "notify = [\"/team/hook\"]\n").unwrap();
+
+        fs::write(&cfg, "profile = \"team\"\n").unwrap();
+        assert_eq!(config_notify_route(Some(&home)), NotifyRoute::Vacant);
+
+        // The base file's own assignment is the only one that counts.
         fs::write(&cfg, "profile = \"team\"\nnotify = [\"/base/hook\"]\n").unwrap();
-        assert_eq!(config_notify_route(Some(&home)), team_route);
-
-        // Commented out in the profile file: the base assignment stands.
-        fs::write(&team, "# notify = [\"/team/hook\"]\n").unwrap();
         assert_eq!(
             config_notify_route(Some(&home)),
             NotifyRoute::Chain(vec!["/base/hook".to_string()])
         );
 
-        // No assignment anywhere: vacant, plain injection.
-        fs::write(&cfg, "profile = \"team\"\n").unwrap();
-        assert_eq!(config_notify_route(Some(&home)), NotifyRoute::Vacant);
-
-        // A missing profile file leaves only the base config.
-        fs::write(&cfg, "profile = \"ghost\"\n").unwrap();
-        assert_eq!(config_notify_route(Some(&home)), NotifyRoute::Vacant);
+        // Two assignment lines remain ambiguous.
+        fs::write(&cfg, "notify = [\"/a\"]\nnotify = [\"/b\"]\n").unwrap();
+        assert_eq!(config_notify_route(Some(&home)), NotifyRoute::Opaque);
     }
 
     #[test]
@@ -733,6 +762,96 @@ mod tests {
         );
     }
 
+    /// Subagent and guardian-review threads mint their own ID, write their own
+    /// rollout, and inherit the parent's cwd, so cwd and the window alone leave
+    /// several rollouts standing. Line 1's provenance fields are what separate
+    /// them, and either one alone disqualifies a file.
+    #[test]
+    fn correlate_fs_excludes_spawned_threads() {
+        let home = temp("codex_subagent");
+        let spawn_ms: u64 = 1_785_000_000_000;
+        let spawned = SystemTime::UNIX_EPOCH + std::time::Duration::from_millis(spawn_ms);
+        let cwd = Path::new("/work/proj");
+        let parent = write_rollout(&home, spawn_ms + 1_000, 1, cwd);
+        let resolves = |home: &Path| Codex.correlate_fs(cwd, spawned, Some(home));
+
+        // `thread_source` alone, as 0.147.0 writes it for a spawned thread.
+        write_rollout_named(
+            &home,
+            spawn_ms + 3_000,
+            2,
+            cwd,
+            "",
+            r#","source":{"subagent":{"other":"guardian"}},"thread_source":"subagent""#,
+        );
+        assert_eq!(resolves(&home).as_deref(), Some(parent.as_str()));
+
+        // `parent_thread_id` alone: any value at all names a spawning thread.
+        write_rollout_named(
+            &home,
+            spawn_ms + 5_000,
+            3,
+            cwd,
+            "",
+            &format!(r#","parent_thread_id":"{parent}""#),
+        );
+        assert_eq!(resolves(&home).as_deref(), Some(parent.as_str()));
+
+        // A second rollout carrying neither field is a real sibling, and
+        // uniqueness fails as it always has.
+        write_rollout(&home, spawn_ms + 7_000, 4, cwd);
+        assert_eq!(resolves(&home), None);
+    }
+
+    /// Disqualify by field rather than requiring `thread_source: "user"`:
+    /// codex's deserializer turns any unknown string into `Feature(String)`, so
+    /// an allow-list would drop future thread kinds. Absence passes too, which
+    /// is what keeps pre-0.147 rollouts resumable — the case above already
+    /// leans on it.
+    #[test]
+    fn correlate_fs_admits_thread_sources_it_does_not_know() {
+        let spawn_ms: u64 = 1_785_000_000_000;
+        let spawned = SystemTime::UNIX_EPOCH + std::time::Duration::from_millis(spawn_ms);
+        let cwd = Path::new("/work/proj");
+        for source in ["user", "some_future_kind"] {
+            let home = temp("codex_thread_source");
+            let id = write_rollout_named(
+                &home,
+                spawn_ms + 1_000,
+                1,
+                cwd,
+                "",
+                &format!(r#","thread_source":"{source}""#),
+            );
+            assert_eq!(
+                Codex.correlate_fs(cwd, spawned, Some(&home)).as_deref(),
+                Some(id.as_str()),
+                "{source:?}"
+            );
+        }
+    }
+
+    /// A thread created by `thread/revert` carries a second ID in its filename.
+    /// The trailing 36 characters are then the rollout ID — a valid UUID naming
+    /// a different object — so the thread ID is read from a fixed offset.
+    #[test]
+    fn correlate_fs_reads_the_thread_id_not_the_rollout_id() {
+        let spawn_ms: u64 = 1_785_000_000_000;
+        let spawned = SystemTime::UNIX_EPOCH + std::time::Duration::from_millis(spawn_ms);
+        let cwd = Path::new("/work/proj");
+        let rollout_id = v7_at(spawn_ms + 1_000, 9);
+        for suffix in [String::new(), format!("_{rollout_id}")] {
+            let home = temp("codex_revert_name");
+            let thread = write_rollout_named(&home, spawn_ms + 1_000, 1, cwd, &suffix, "");
+            assert_ne!(thread, rollout_id);
+            assert_eq!(
+                Codex.correlate_fs(cwd, spawned, Some(&home)).as_deref(),
+                Some(thread.as_str()),
+                "{suffix:?}"
+            );
+        }
+    }
+
     /// The ±2-day probe includes a rollout in the adjacent day directory.
     #[test]
     fn correlate_fs_spans_adjacent_day_directories() {
@@ -762,6 +881,16 @@ mod tests {
                 .as_deref(),
             Some(id.as_str())
         );
+    }
+
+    /// The anchor has to survive emulation, not just `str::lines`.
+    /// `text_with_history` joins soft-wrapped rows into one logical line, so a
+    /// preceding row that exactly fills the width is the case that could push
+    /// the fatal line off offset 0.
+    #[test]
+    fn fatal_session_id_holds_offset_zero_after_a_full_width_row() {
+        let bytes = format!("{}\r\nSession ID: {ID}\r\n", "x".repeat(CORPUS_COLS));
+        assert_corpus_scrape(&Codex, bytes.as_bytes(), ID);
     }
 
     /// The scraper recovers an SGR-split exit hint from the corpus bytes after
