@@ -511,6 +511,182 @@ fn codex_working_normalization() {
     );
 }
 
+/// The status row anchors on its parenthetical, not on a literal verb:
+/// the activity glyph blinks, drops to `◦`, or vanishes with animations
+/// off; the header is whatever the CLI put there; the interrupt key is
+/// remappable and its hint can be switched off entirely.
+#[test]
+fn codex_status_anchors_on_the_interrupt_parenthetical() {
+    let probe = |row: &str| CodexSummary.live_preview(&rs(&[row, "", "›"]));
+    for row in [
+        "• Working (0s • esc to interrupt)",
+        // The blink's off frame.
+        "◦ Working (0s • esc to interrupt)",
+        // Animations off: the glyph and its space are omitted.
+        "Working (0s • esc to interrupt)",
+        // The interrupt key is remappable.
+        "• Working (0s • f12 to interrupt)",
+        // The hint is off: the parenthetical is the counter alone.
+        "• Working (0s)",
+    ] {
+        assert_eq!(
+            probe(row),
+            Some(("Working".to_string(), "codex:working")),
+            "{row:?}"
+        );
+    }
+
+    // Every elapsed shape codex formats, from a fresh turn to a day-long one.
+    for elapsed in [
+        "0s",
+        "59s",
+        "1m 00s",
+        "59m 59s",
+        "1h 00m 00s",
+        "25h 02m 03s",
+    ] {
+        assert_eq!(
+            probe(&format!("• Working ({elapsed} • esc to interrupt)")),
+            Some(("Working".to_string(), "codex:working")),
+            "{elapsed:?}"
+        );
+    }
+
+    // The header is a free-form String; `Working` is only its default.
+    for header in [
+        "Investigating rendering code",
+        "Reviewing approval request",
+        "Reviewing 2 approval requests",
+        "Waiting for background terminal",
+        "Booting MCP server: my-server",
+        // The header carries parentheses of its own: `(1/3)` is not a
+        // counter, so the anchor is the parenthetical after it.
+        "Starting MCP servers (1/3): a, b, c",
+        "Setting up sandbox...",
+        // Stream errors reach the header verbatim.
+        "Reconnecting... 1/5",
+    ] {
+        assert_eq!(
+            probe(&format!("{header} (7s • esc to interrupt)")),
+            Some((header.to_string(), "codex:working")),
+            "{header:?}"
+        );
+    }
+
+    // The suffix and truncation rules hold for a non-default header.
+    assert_eq!(
+        probe(
+            "• Reviewing 2 approval requests (7s • esc to interrupt) · 1 background terminal running · /ps to view"
+        ),
+        Some((
+            "Reviewing 2 approval requests · 1 background terminal running".to_string(),
+            "codex:working"
+        ))
+    );
+    assert_eq!(
+        probe("• Investigating rendering code (7s • esc to…"),
+        Some(("Investigating rendering code".to_string(), "codex:working")),
+        "an unclosed parenthetical drops to the end of the row"
+    );
+}
+
+/// Status-shaped rows whose counter is malformed refuse: the elapsed token
+/// is the whole anchor, because the header above it is unconstrained.
+#[test]
+fn codex_status_rejects_malformed_counters() {
+    let probe = |row: &str| CodexSummary.live_preview(&rs(&[row, "", "›"]));
+    for row in [
+        "• Working (soon • esc to interrupt)",
+        // claude's fractional seconds, not codex's zero-padded fields.
+        "• Working (9.9s • esc to interrupt)",
+        // The counter ends at the seconds field.
+        "• Working (1m • esc to interrupt)",
+        "• Working (0sx • esc to interrupt)",
+        // Units descend h → m → s.
+        "• Working (2m 1h • esc to interrupt)",
+        // No space before the paren, an empty header, and a header that
+        // does not open alphanumeric.
+        "• Working(0s • esc to interrupt)",
+        "• (0s • esc to interrupt)",
+        "• → Working (0s • esc to interrupt)",
+    ] {
+        assert_eq!(probe(row), None, "{row:?}");
+    }
+}
+
+/// Every composer glyph pins the adapter: `!` in bash mode, `»` at `ultra`
+/// reasoning effort, `›` otherwise. The glyph stands alone or heads a
+/// space; glued to text it is body content and the pin fails.
+#[test]
+fn codex_composer_accepts_every_prompt_glyph() {
+    let status = "• Working (3s • esc to interrupt)";
+    for glyph in ['›', '»', '!'] {
+        for composer in [glyph.to_string(), format!("{glyph} Write tests")] {
+            assert_eq!(
+                CodexSummary.live_preview(&rs(&[status, "", &composer])),
+                Some(("Working".to_string(), "codex:working")),
+                "{composer:?}"
+            );
+        }
+        assert_eq!(
+            CodexSummary.live_preview(&rs(&[status, "", &format!("{glyph}Write tests")])),
+            None,
+            "{glyph:?} glued to text is not the composer"
+        );
+    }
+}
+
+/// Queued-message blocks sit between the status row and the composer.
+/// Their heads are walked past and their items never count against the
+/// window: the queue's depth is the user's, not the CLI's. Nothing else
+/// earns that pass.
+#[test]
+fn codex_status_walks_past_queued_message_blocks() {
+    for head in [
+        "• Messages to be submitted after next tool call",
+        "• Messages to be submitted at end of turn",
+        "• Queued follow-up inputs",
+    ] {
+        let mut rows = vec![
+            "• Working (0s • esc to interrupt)".to_string(),
+            String::new(),
+            head.to_string(),
+        ];
+        rows.extend((0..24).map(|i| format!("  ↳ Hello, world! {i}")));
+        rows.extend([String::new(), "› ".to_string()]);
+        assert_eq!(
+            CodexSummary.live_preview(&rows),
+            Some(("Working".to_string(), "codex:working")),
+            "{head:?}"
+        );
+    }
+
+    // A near-miss head is a foreign column-0 row and aborts the scan.
+    let foreign = rs(&[
+        "• Working (0s • esc to interrupt)",
+        "",
+        "• Queued thoughts",
+        "  ↳ one",
+        "",
+        "› ",
+    ]);
+    assert_eq!(CodexSummary.live_preview(&foreign), None);
+
+    // Outside a queued block, indented rows still bound the scan.
+    let deep = |gap: usize| {
+        let mut rows = vec!["• Working (0s • esc to interrupt)".to_string()];
+        rows.extend((0..gap).map(|i| format!("  └ line {i}")));
+        rows.push("› ".to_string());
+        CodexSummary.live_preview(&rows)
+    };
+    assert_eq!(
+        deep(10),
+        Some(("Working".to_string(), "codex:working")),
+        "ten indented rows fill the window"
+    );
+    assert_eq!(deep(11), None, "eleven exhaust it");
+}
+
 /// `• Ran` extracts through its indented attachment, but never through a
 /// foreign column-0 row: scrollback `• Ran` rows from prior turns sit
 /// behind reply bullets and separators, and skipping those would
@@ -607,17 +783,22 @@ fn codex_approval_modal_synthesizes_on_any_selection() {
 /// anchor, floor tier.
 #[test]
 fn codex_quoted_menu_with_a_live_composer_is_not_a_modal() {
-    let quoted = rs(&[
-        "• I found these options in the doc:",
-        "",
-        "› 1. Yes, proceed (y)",
-        "  2. No, cancel (esc)",
-        "",
-        "›",
-        "",
-        "  gpt-5.6-sol high · 0 in · 0 out",
-    ]);
-    assert_eq!(CodexSummary.live_preview(&quoted), None);
+    // Every prompt glyph suppresses: the modal selector is always `›`
+    // whatever the composer renders, so a `»` or `!` composer below a
+    // quoted menu is still a live composer and still disqualifies it.
+    for composer in ["›", "»", "!"] {
+        let quoted = rs(&[
+            "• I found these options in the doc:",
+            "",
+            "› 1. Yes, proceed (y)",
+            "  2. No, cancel (esc)",
+            "",
+            composer,
+            "",
+            "  gpt-5.6-sol high · 0 in · 0 out",
+        ]);
+        assert_eq!(CodexSummary.live_preview(&quoted), None, "{composer}");
+    }
 }
 
 /// Without any composer row (codex exited; its resume hint owns the
@@ -1010,6 +1191,31 @@ fn corpus_truncated_rows_still_anchor() {
             "grok:spinner"
         )
     );
+}
+
+/// codex 0.147.0 rows, replayed from the CLI's own snapshot tests at the
+/// geometry those snapshots were taken at.
+#[test]
+fn corpus_codex_0_147_rows_anchor() {
+    // The header is the model's first reasoning chunk, kept verbatim, and
+    // the `•`-headed transcript rows above it never surface. This frame
+    // paints no status line, so nothing prefixes the text.
+    let got = corpus(
+        include_bytes!("../../tests/corpus/preview_codex_reasoning.bin"),
+        &CodexSummary,
+        80,
+    );
+    assert_eq!(got, anchor("Investigating rendering code", "codex:working"));
+
+    // Sixteen queued messages separate the status row from the composer.
+    // `gpt-5.6-sol default · /tmp/project` is not the token bar's
+    // `{model} · {…} in · {…} out`, so no model label is read.
+    let got = corpus(
+        include_bytes!("../../tests/corpus/preview_codex_queued.bin"),
+        &CodexSummary,
+        36,
+    );
+    assert_eq!(got, anchor("Working", "codex:working"));
 }
 
 /// At 30 columns, a wrapped status ellipsis fails the structure check and
