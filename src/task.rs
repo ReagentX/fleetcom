@@ -35,6 +35,15 @@ use crate::{
 /// input when a child stops reading.
 const MAX_PENDING_WRITE: usize = 16 * 1024 * 1024;
 
+/// Minimum interval between harness blocked-status probes for one task. The
+/// probe reads the CLI's registry off disk, and `resolve_preview` runs for
+/// every task on every snapshot tick, which range from the 8 ms frame minimum
+/// to the 200 ms idle backstop: unthrottled, that is a syscall per task per
+/// frame. 250 ms buys nothing back in exchange, because the state is
+/// human-facing and already sits far below the 500 ms title hold and the
+/// 600 ms demotion hold the preview passes through afterward.
+const BLOCKED_PROBE_INTERVAL: Duration = Duration::from_millis(250);
+
 /// A whole-message refusal from the bounded writer queue.
 #[derive(Debug)]
 pub struct WriteRefused {
@@ -113,6 +122,12 @@ pub struct Task {
     /// Dashboard-preview resolution state; resets with the task on rerun
     /// because a rerun replaces the whole `Task`.
     preview: PreviewState,
+    /// Latest harness blocked-on-user probe, held between refreshes so the
+    /// preview cascade sees it on every tick without a filesystem read.
+    blocked: Option<(String, &'static str)>,
+    /// When `blocked` was last read: the [`BLOCKED_PROBE_INTERVAL`] deadline
+    /// base. `None` until the first probe.
+    blocked_probed: Option<Instant>,
     /// Wall-clock spawn time used for filesystem correlation.
     pub spawned_at: SystemTime,
     exit_code: Option<i32>,
@@ -346,6 +361,8 @@ impl Task {
             scraped_id: None,
             scraped: false,
             preview: PreviewState::new(),
+            blocked: None,
+            blocked_probed: None,
             spawned_at: SystemTime::now(),
             exit_code: None,
             started: Instant::now(),
@@ -514,10 +531,39 @@ impl Task {
     /// the grid lock (see [`crate::preview`]). `now` is the caller's tick
     /// instant so every task in one snapshot resolves against the same clock.
     pub fn resolve_preview(&mut self, now: Instant) -> Preview {
+        self.refresh_blocked(now);
         let emu = grid(&self.parser);
+        let blocked = self.blocked.as_ref().map(|(text, rule)| (&**text, *rule));
         self.preview
-            .resolve(now, &*emu, self.summary_adapter)
+            .resolve(now, &*emu, self.summary_adapter, blocked)
             .clone()
+    }
+
+    /// Re-read the harness's blocked-on-user claim, at most once per
+    /// [`BLOCKED_PROBE_INTERVAL`]. Three states never probe: no harness (the
+    /// command is opaque, or its tool publishes no status), no pid, and an
+    /// exited leader, whose record — if the CLI left one behind at all —
+    /// claims a state the process can no longer be in. The last of those also
+    /// drops the cached claim, so the ticks between exit and freeze do not
+    /// render a dead session as blocked.
+    fn refresh_blocked(&mut self, now: Instant) {
+        let (Some(h), Some(pid), None) = (self.harness, self.pid, self.finished) else {
+            self.blocked = None;
+            return;
+        };
+        if self
+            .blocked_probed
+            .is_some_and(|t| now.duration_since(t) < BLOCKED_PROBE_INTERVAL)
+        {
+            return;
+        }
+        self.blocked_probed = Some(now);
+        self.blocked = h.live_blocked_status(
+            pid,
+            &self.cwd,
+            self.spawned_at,
+            self.harness_home.as_deref(),
+        );
     }
 
     /// Freeze the preview once output is complete. Any open `?2026` frame is

@@ -13,7 +13,8 @@
 //! `correlate_fs` eventually enters a shell command. These methods must
 //! therefore return only strings accepted by [`is_uuid`]. Free-text names,
 //! paths, and malformed IDs yield `None`. Summary adapters are display-only and
-//! do not return session IDs.
+//! do not return session IDs, and so is `live_blocked_status`: its text reaches
+//! the dashboard, never a command.
 
 pub mod assets;
 mod claude;
@@ -105,6 +106,33 @@ pub trait Harness: Sync {
         _spawned: SystemTime,
         _home: Option<&Path>,
     ) -> Option<String> {
+        None
+    }
+
+    /// Read the tool's own claim that it is blocked on the user, as preview
+    /// text and the matcher ID naming the claim: the same
+    /// `(text, rule)` shape [`crate::preview::SummaryAdapter::live_preview`]
+    /// returns, so the cascade treats a registry-derived anchor and a
+    /// screen-derived one alike. Parameters identify the live process exactly
+    /// as [`Harness::live_session_id`] does.
+    ///
+    /// Only a blocked state answers `Some`. A tool's working and idle states
+    /// already resolve to a title carrying the CLI's own per-turn summary
+    /// (claude's OSC title is model-generated text such as
+    /// `✻ Run sleep command for 25 seconds`), and replacing that with the bare
+    /// word `busy` or `idle` would remove information rather than add it.
+    /// Being blocked on the user is the one state the screen cascade cannot
+    /// see reliably.
+    ///
+    /// Defaults to `None`: a tool that publishes no live status has nothing to
+    /// read.
+    fn live_blocked_status(
+        &self,
+        _pid: u32,
+        _cwd: &Path,
+        _spawned: SystemTime,
+        _home: Option<&Path>,
+    ) -> Option<(String, &'static str)> {
         None
     }
 

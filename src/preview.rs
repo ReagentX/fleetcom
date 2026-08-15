@@ -88,17 +88,32 @@ pub trait SummaryAdapter: Sync {
 }
 
 /// Resolve the instantaneous candidate in descending priority:
-/// 1. summary adapter: the normalized live status when the CLI's working
-///    structure is present, `{model label} · `-prefixed when the adapter
-///    reads one from stable chrome
-/// 2. alternate screen: the title while its epoch is current, else the marker
-/// 3. primary screen: the live floor
-fn cascade(screen: &impl ScreenFacts, adapter: Option<&dyn SummaryAdapter>) -> Preview {
-    if let Some(a) = adapter {
-        // Both probes use the same viewport snapshot.
+/// 1. harness registry: `blocked`, the CLI's own claim that it is blocked on
+///    the user, as passed by the caller
+/// 2. summary adapter: the normalized live status when the CLI's working
+///    structure is present
+/// 3. alternate screen: the title while its epoch is current, else the marker
+/// 4. primary screen: the live floor
+///
+/// Tiers 1 and 2 both produce an Anchor and are both `{model label} · `-
+/// prefixed when the adapter reads a label from stable chrome.
+fn cascade(
+    screen: &impl ScreenFacts,
+    adapter: Option<&dyn SummaryAdapter>,
+    blocked: Option<(&str, &'static str)>,
+) -> Preview {
+    if adapter.is_some() || blocked.is_some() {
+        // Both probes and the label read the same viewport snapshot.
         let rows = screen.live_rows();
-        if let Some((text, rule)) = a.live_preview(&rows) {
-            let text = match a.model_label(&rows) {
+        // The registry claim is consulted first: what the CLI says about
+        // itself outranks a structural guess at its screen. It also lands
+        // about a second before the dialog finishes painting and holds at any
+        // terminal width, for every dialog shape the CLI draws.
+        let hit = blocked
+            .map(|(text, rule)| (text.to_string(), rule))
+            .or_else(|| adapter?.live_preview(&rows));
+        if let Some((text, rule)) = hit {
+            let text = match adapter.and_then(|a| a.model_label(&rows)) {
                 Some(label) => format!("{label} · {text}"),
                 None => text,
             };
@@ -145,8 +160,19 @@ fn cascade(screen: &impl ScreenFacts, adapter: Option<&dyn SummaryAdapter>) -> P
     })
 }
 
-/// State that invalidates the cached preview candidate.
-type ResolveKey = (u64, u64, bool, Option<String>);
+/// State that invalidates the cached preview candidate: the screen facts the
+/// cascade reads, plus the harness blocked-status probe. The probe belongs
+/// here because it moves independently of the screen — a session enters and
+/// leaves `waiting` with no repaint, and a repaint changes no status — so a
+/// key built from screen facts alone would strand a probe result that appeared
+/// or cleared while the grid stood still.
+type ResolveKey = (
+    u64,
+    u64,
+    bool,
+    Option<String>,
+    Option<(String, &'static str)>,
+);
 
 /// Per-task preview resolution state. A rerun replaces the `Task` and resets
 /// this state.
@@ -204,12 +230,14 @@ impl PreviewState {
     /// synthetic instants. The candidate is recomputed only when the
     /// resolution key changed; hold expiries commit the carried value
     /// without a rescan. `adapter` is the task's summary adapter, fixed for
-    /// the task's life, so it needs no slot in the resolution key.
+    /// the task's life, so it needs no slot in the resolution key; `blocked`
+    /// is the caller's latest harness blocked-status probe, which does.
     pub fn resolve(
         &mut self,
         now: Instant,
         screen: &impl ScreenFacts,
         adapter: Option<&dyn SummaryAdapter>,
+        blocked: Option<(&str, &'static str)>,
     ) -> &Preview {
         if self.finalized {
             return &self.rendered;
@@ -219,9 +247,10 @@ impl PreviewState {
             screen.alt_epoch(),
             screen.alternate_screen(),
             screen.title().map(str::to_owned),
+            blocked.map(|(text, rule)| (text.to_string(), rule)),
         );
         if self.last_key.as_ref() != Some(&key) {
-            self.candidate = cascade(screen, adapter);
+            self.candidate = cascade(screen, adapter, blocked);
             self.last_key = Some(key);
         }
         self.step(now, screen.alternate_screen());
@@ -316,7 +345,10 @@ impl PreviewState {
             self.rendered.frozen = true;
             return;
         }
-        let mut fin = cascade(screen, adapter);
+        // No blocked probe: finalization runs once output is complete, and a
+        // record the exited process left behind claims a state it can no
+        // longer be in.
+        let mut fin = cascade(screen, adapter, None);
         fin.frozen = true;
         self.rendered = fin;
     }
@@ -451,7 +483,7 @@ mod tests {
             live: Some(("Working", "stub:working")),
             label: Some("model-x"),
         };
-        let p = st.resolve(now, &s, Some(&adapter)).clone();
+        let p = st.resolve(now, &s, Some(&adapter), None).clone();
         assert_eq!(
             (p.text.as_str(), p.source, p.rule),
             (
@@ -467,8 +499,77 @@ mod tests {
             label: None,
         };
         let mut st = PreviewState::new();
-        let p = st.resolve(now, &s, Some(&bare)).clone();
+        let p = st.resolve(now, &s, Some(&bare), None).clone();
         assert_eq!(p.text, "Working");
+    }
+
+    /// The harness probe is the top tier: it outranks the adapter's screen
+    /// anchor and takes the model label exactly as a screen anchor does.
+    #[test]
+    fn a_registry_anchor_outranks_the_adapters_anchor() {
+        let now = Instant::now();
+        let mut st = PreviewState::new();
+        let mut s = FakeScreen::primary("shell");
+        s.enter_alt();
+        s.set_title("app");
+        let adapter = StubAdapter {
+            live: Some(("Working", "stub:working")),
+            label: Some("model-x"),
+        };
+        let p = st
+            .resolve(
+                now,
+                &s,
+                Some(&adapter),
+                Some(("awaiting approval", "stub:registry")),
+            )
+            .clone();
+        assert_eq!(
+            (p.text.as_str(), p.source, p.rule),
+            (
+                "model-x · awaiting approval",
+                PreviewSource::Anchor,
+                Some("stub:registry")
+            )
+        );
+    }
+
+    /// The probe belongs in the resolution key. A task can enter and leave the
+    /// blocked state with no repaint, so a key built from screen facts alone
+    /// carries the stale candidate and the probe never reaches the cascade:
+    /// both halves of this test fail without it.
+    #[test]
+    fn a_probe_that_changes_on_a_static_screen_reaches_the_cascade() {
+        let t0 = Instant::now();
+        let mut st = PreviewState::new();
+        let s = FakeScreen::primary("last row");
+        assert_eq!(
+            st.resolve(t0, &s, None, None).source,
+            PreviewSource::Floor,
+            "premise: no probe, no anchor"
+        );
+
+        // Same screen, same revision: only the probe changed. A rank increase
+        // renders on the resolution that observes it.
+        let probe = Some(("awaiting approval", "claude:registry-approval"));
+        let p = st.resolve(t0, &s, None, probe).clone();
+        assert_eq!(
+            (p.text.as_str(), p.source, p.rule),
+            (
+                "awaiting approval",
+                PreviewSource::Anchor,
+                Some("claude:registry-approval")
+            )
+        );
+
+        // Clearing it is a rank drop like any other, so the floor returns at
+        // the hold's expiry rather than instantly.
+        assert_eq!(st.resolve(t0, &s, None, None).source, PreviewSource::Anchor);
+        let p = st.resolve(t0 + DEMOTION_HOLD, &s, None, None).clone();
+        assert_eq!(
+            (p.text.as_str(), p.source),
+            ("last row", PreviewSource::Floor)
+        );
     }
 
     /// A lost anchor is a demotion: the title returns only after the hold,
@@ -484,7 +585,7 @@ mod tests {
             live: Some(("Working", "stub:working")),
             label: None,
         };
-        st.resolve(t0, &s, Some(&working));
+        st.resolve(t0, &s, Some(&working), None);
 
         let idle = StubAdapter {
             live: None,
@@ -492,11 +593,13 @@ mod tests {
         };
         s.advance();
         assert_eq!(
-            st.resolve(t0, &s, Some(&idle)).source,
+            st.resolve(t0, &s, Some(&idle), None).source,
             PreviewSource::Anchor,
             "a lost anchor must not demote instantly"
         );
-        let p = st.resolve(t0 + DEMOTION_HOLD, &s, Some(&idle)).clone();
+        let p = st
+            .resolve(t0 + DEMOTION_HOLD, &s, Some(&idle), None)
+            .clone();
         assert_eq!((p.text.as_str(), p.source), ("app", PreviewSource::Title));
     }
 
@@ -511,11 +614,11 @@ mod tests {
             live: Some(("Ran echo ok", "stub:ran")),
             label: None,
         };
-        st.resolve(t0, &s, None);
+        st.resolve(t0, &s, None, None);
 
         s.advance();
         st.finalize(&s, Some(&adapter));
-        let p = st.resolve(t0, &s, Some(&adapter)).clone();
+        let p = st.resolve(t0, &s, Some(&adapter), None).clone();
         assert_eq!(
             (p.text.as_str(), p.source, p.rule, p.frozen),
             ("Ran echo ok", PreviewSource::Anchor, Some("stub:ran"), true)
@@ -529,7 +632,7 @@ mod tests {
 
         let mut st = PreviewState::new();
         let s = FakeScreen::primary("last row");
-        let p = st.resolve(now, &s, None).clone();
+        let p = st.resolve(now, &s, None, None).clone();
         assert_eq!(
             (p.text.as_str(), p.source, p.frozen),
             ("last row", PreviewSource::Floor, false)
@@ -539,18 +642,18 @@ mod tests {
         let mut s = FakeScreen::primary("shell");
         s.enter_alt();
         s.set_title("app");
-        let p = st.resolve(now, &s, None).clone();
+        let p = st.resolve(now, &s, None, None).clone();
         assert_eq!((p.text.as_str(), p.source), ("app", PreviewSource::Title));
 
         let mut st = PreviewState::new();
         let mut s = FakeScreen::primary("shell");
         s.enter_alt();
-        let p = st.resolve(now, &s, None).clone();
+        let p = st.resolve(now, &s, None, None).clone();
         assert_eq!((p.text.as_str(), p.source), (MARKER, PreviewSource::Marker));
 
         let mut st = PreviewState::new();
         let s = FakeScreen::primary("");
-        let p = st.resolve(now, &s, None).clone();
+        let p = st.resolve(now, &s, None, None).clone();
         assert_eq!((p.text.as_str(), p.source), ("", PreviewSource::Floor));
     }
 
@@ -560,14 +663,14 @@ mod tests {
         let now = Instant::now();
         let mut st = PreviewState::new();
         let mut s = FakeScreen::primary("building");
-        assert_eq!(st.resolve(now, &s, None).source, PreviewSource::Floor);
+        assert_eq!(st.resolve(now, &s, None, None).source, PreviewSource::Floor);
 
         s.enter_alt();
-        let p = st.resolve(now, &s, None).clone();
+        let p = st.resolve(now, &s, None, None).clone();
         assert_eq!((p.text.as_str(), p.source), (MARKER, PreviewSource::Marker));
 
         s.set_title("app");
-        let p = st.resolve(now, &s, None).clone();
+        let p = st.resolve(now, &s, None, None).clone();
         assert_eq!((p.text.as_str(), p.source), ("app", PreviewSource::Title));
     }
 
@@ -580,17 +683,20 @@ mod tests {
         let mut s = FakeScreen::primary("shell");
         s.enter_alt();
         s.set_title("app");
-        st.resolve(t0, &s, None);
+        st.resolve(t0, &s, None, None);
 
         s.clear_title();
         assert_eq!(
-            st.resolve(t0, &s, None).source,
+            st.resolve(t0, &s, None, None).source,
             PreviewSource::Title,
             "a demotion must not render instantly"
         );
         let inside = t0 + DEMOTION_HOLD - Duration::from_millis(1);
-        assert_eq!(st.resolve(inside, &s, None).source, PreviewSource::Title);
-        let p = st.resolve(t0 + DEMOTION_HOLD, &s, None).clone();
+        assert_eq!(
+            st.resolve(inside, &s, None, None).source,
+            PreviewSource::Title
+        );
+        let p = st.resolve(t0 + DEMOTION_HOLD, &s, None, None).clone();
         assert_eq!((p.text.as_str(), p.source), (MARKER, PreviewSource::Marker));
     }
 
@@ -604,25 +710,25 @@ mod tests {
         let mut s = FakeScreen::primary("shell");
         s.enter_alt();
         s.set_title("app");
-        st.resolve(t0, &s, None);
+        st.resolve(t0, &s, None, None);
 
         s.clear_title();
-        st.resolve(t0, &s, None);
+        st.resolve(t0, &s, None, None);
         // The title returns inside the hold: cancel, no visible change.
         s.set_title("app");
-        let p = st.resolve(t0 + ms(300), &s, None).clone();
+        let p = st.resolve(t0 + ms(300), &s, None, None).clone();
         assert_eq!((p.text.as_str(), p.source), ("app", PreviewSource::Title));
 
         // The next demotion starts a new hold interval.
         s.clear_title();
-        st.resolve(t0 + ms(400), &s, None);
+        st.resolve(t0 + ms(400), &s, None, None);
         assert_eq!(
-            st.resolve(t0 + ms(900), &s, None).source,
+            st.resolve(t0 + ms(900), &s, None, None).source,
             PreviewSource::Title,
             "the canceled hold must not shorten the fresh one"
         );
         assert_eq!(
-            st.resolve(t0 + ms(1_000), &s, None).source,
+            st.resolve(t0 + ms(1_000), &s, None, None).source,
             PreviewSource::Marker
         );
     }
@@ -636,19 +742,20 @@ mod tests {
         let mut s = FakeScreen::primary("shell");
         s.enter_alt();
         s.set_title("app");
-        st.resolve(t0, &s, None);
+        st.resolve(t0, &s, None, None);
 
         // First demoted candidate: the marker.
         s.clear_title();
-        st.resolve(t0, &s, None);
+        st.resolve(t0, &s, None, None);
         // The pending candidate flaps to a floor; the timer keeps t0.
         s.leave_alt();
         s.set_floor("done 3 tests");
         assert_eq!(
-            st.resolve(t0 + Duration::from_millis(300), &s, None).source,
+            st.resolve(t0 + Duration::from_millis(300), &s, None, None)
+                .source,
             PreviewSource::Title
         );
-        let p = st.resolve(t0 + DEMOTION_HOLD, &s, None).clone();
+        let p = st.resolve(t0 + DEMOTION_HOLD, &s, None, None).clone();
         assert_eq!(
             (p.text.as_str(), p.source),
             ("done 3 tests", PreviewSource::Floor),
@@ -666,14 +773,14 @@ mod tests {
         let mut s = FakeScreen::primary("shell");
         s.enter_alt();
         s.set_title("one");
-        assert_eq!(st.resolve(t0, &s, None).text, "one");
+        assert_eq!(st.resolve(t0, &s, None, None).text, "one");
 
         s.set_title("two");
-        assert_eq!(st.resolve(t0 + ms(200), &s, None).text, "one");
+        assert_eq!(st.resolve(t0 + ms(200), &s, None, None).text, "one");
         s.set_title("three");
-        assert_eq!(st.resolve(t0 + ms(300), &s, None).text, "one");
+        assert_eq!(st.resolve(t0 + ms(300), &s, None, None).text, "one");
         assert_eq!(
-            st.resolve(t0 + TITLE_MIN_HOLD, &s, None).text,
+            st.resolve(t0 + TITLE_MIN_HOLD, &s, None, None).text,
             "three",
             "the newest candidate wins at the deadline"
         );
@@ -685,9 +792,9 @@ mod tests {
         let t0 = Instant::now();
         let mut st = PreviewState::new();
         let mut s = FakeScreen::primary("compiling foo");
-        assert_eq!(st.resolve(t0, &s, None).text, "compiling foo");
+        assert_eq!(st.resolve(t0, &s, None, None).text, "compiling foo");
         s.set_floor("compiling bar");
-        assert_eq!(st.resolve(t0, &s, None).text, "compiling bar");
+        assert_eq!(st.resolve(t0, &s, None, None).text, "compiling bar");
     }
 
     /// An unchanged resolution key carries the candidate without re-reading
@@ -698,14 +805,14 @@ mod tests {
         let ms = Duration::from_millis;
         let mut st = PreviewState::new();
         let mut s = FakeScreen::primary("steady");
-        st.resolve(t0, &s, None);
+        st.resolve(t0, &s, None, None);
         assert_eq!(s.floor_calls.get(), 1);
 
-        st.resolve(t0 + ms(200), &s, None);
+        st.resolve(t0 + ms(200), &s, None, None);
         assert_eq!(s.floor_calls.get(), 1, "unchanged key must not re-read");
 
         s.advance();
-        st.resolve(t0 + ms(400), &s, None);
+        st.resolve(t0 + ms(400), &s, None, None);
         assert_eq!(s.floor_calls.get(), 2, "a revision bump must recompute");
     }
 
@@ -716,11 +823,11 @@ mod tests {
         let t0 = Instant::now();
         let mut st = PreviewState::new();
         let mut s = FakeScreen::primary("a long row that fit");
-        assert_eq!(st.resolve(t0, &s, None).text, "a long row that fit");
+        assert_eq!(st.resolve(t0, &s, None, None).text, "a long row that fit");
 
         s.set_floor("a long row");
         assert_eq!(
-            st.resolve(t0, &s, None).text,
+            st.resolve(t0, &s, None, None).text,
             "a long row",
             "the reflowed floor must render, not the carried candidate"
         );
@@ -733,11 +840,11 @@ mod tests {
         let t0 = Instant::now();
         let mut st = PreviewState::new();
         let mut s = FakeScreen::primary("running");
-        st.resolve(t0, &s, None);
+        st.resolve(t0, &s, None, None);
 
         s.set_floor("test result: ok");
         st.finalize(&s, None);
-        let p = st.resolve(t0, &s, None).clone();
+        let p = st.resolve(t0, &s, None, None).clone();
         assert_eq!(
             (p.text.as_str(), p.source, p.frozen),
             ("test result: ok", PreviewSource::Floor, true)
@@ -753,12 +860,12 @@ mod tests {
         let mut s = FakeScreen::primary("prelaunch junk");
         s.enter_alt();
         s.set_title("agent: working");
-        st.resolve(t0, &s, None);
+        st.resolve(t0, &s, None, None);
 
         // The exit's 1049l lands with no live resolution in between.
         s.leave_alt();
         st.finalize(&s, None);
-        let p = st.resolve(t0, &s, None).clone();
+        let p = st.resolve(t0, &s, None, None).clone();
         assert_eq!(
             (p.text.as_str(), p.source, p.frozen),
             ("agent: working", PreviewSource::Title, true)
@@ -766,7 +873,7 @@ mod tests {
 
         s.set_floor("stray");
         assert_eq!(
-            st.resolve(t0 + Duration::from_secs(5), &s, None).text,
+            st.resolve(t0 + Duration::from_secs(5), &s, None, None).text,
             "agent: working",
             "resolution must short-circuit to the frozen value"
         );
@@ -781,11 +888,11 @@ mod tests {
         let mut s = FakeScreen::primary("prelaunch junk");
         s.enter_alt();
         s.set_title("agent: working");
-        st.resolve(t0, &s, None);
+        st.resolve(t0, &s, None, None);
 
         // Teardown lands and a tick resolves before output completes.
         s.leave_alt();
-        let p = st.resolve(t0, &s, None).clone();
+        let p = st.resolve(t0, &s, None, None).clone();
         assert_eq!(
             p.source,
             PreviewSource::Title,
@@ -793,7 +900,7 @@ mod tests {
         );
 
         st.finalize(&s, None);
-        let p = st.resolve(t0, &s, None).clone();
+        let p = st.resolve(t0, &s, None, None).clone();
         assert_eq!(
             (p.text.as_str(), p.source, p.frozen),
             ("agent: working", PreviewSource::Title, true)
@@ -809,14 +916,14 @@ mod tests {
         let mut s = FakeScreen::primary("prelaunch junk");
         s.enter_alt();
         s.set_title("agent: working");
-        st.resolve(t0, &s, None);
+        st.resolve(t0, &s, None, None);
 
         // The child returns to the primary screen and keeps printing; the
         // hold expires and commits the floor, stamped primary.
         s.leave_alt();
         s.set_floor("wrote 12 files");
-        st.resolve(t0, &s, None);
-        let p = st.resolve(t0 + DEMOTION_HOLD, &s, None).clone();
+        st.resolve(t0, &s, None, None);
+        let p = st.resolve(t0 + DEMOTION_HOLD, &s, None, None).clone();
         assert_eq!(
             (p.text.as_str(), p.source),
             ("wrote 12 files", PreviewSource::Floor),
@@ -825,7 +932,7 @@ mod tests {
 
         s.set_floor("exit summary");
         st.finalize(&s, None);
-        let p = st.resolve(t0 + DEMOTION_HOLD, &s, None).clone();
+        let p = st.resolve(t0 + DEMOTION_HOLD, &s, None, None).clone();
         assert_eq!(
             (p.text.as_str(), p.source, p.frozen),
             ("exit summary", PreviewSource::Floor, true),
@@ -842,16 +949,16 @@ mod tests {
         let mut s = FakeScreen::primary("prelaunch junk");
         s.enter_alt();
         s.set_title("agent: working");
-        st.resolve(t0, &s, None);
+        st.resolve(t0, &s, None, None);
 
         // Teardown observed (snapshot: "prelaunch junk"), title still held.
         s.leave_alt();
-        assert_eq!(st.resolve(t0, &s, None).source, PreviewSource::Title);
+        assert_eq!(st.resolve(t0, &s, None, None).source, PreviewSource::Title);
 
         // A real final line lands before exit, inside the hold.
         s.set_floor("done");
         st.finalize(&s, None);
-        let p = st.resolve(t0, &s, None).clone();
+        let p = st.resolve(t0, &s, None, None).clone();
         assert_eq!(
             (p.text.as_str(), p.source, p.frozen),
             ("done", PreviewSource::Floor, true),
@@ -869,18 +976,18 @@ mod tests {
         let mut s = FakeScreen::primary("prelaunch junk");
         s.enter_alt();
         s.set_title("agent: working");
-        st.resolve(t0, &s, None);
+        st.resolve(t0, &s, None, None);
 
         s.leave_alt();
-        assert_eq!(st.resolve(t0, &s, None).source, PreviewSource::Title);
+        assert_eq!(st.resolve(t0, &s, None, None).source, PreviewSource::Title);
 
         // A later advance changes the revision (and drops the title) but
         // leaves the floor untouched: nothing visible moved.
         s.clear_title();
-        assert_eq!(st.resolve(t0, &s, None).source, PreviewSource::Title);
+        assert_eq!(st.resolve(t0, &s, None, None).source, PreviewSource::Title);
 
         st.finalize(&s, None);
-        let p = st.resolve(t0, &s, None).clone();
+        let p = st.resolve(t0, &s, None, None).clone();
         assert_eq!(
             (p.text.as_str(), p.source, p.frozen),
             ("agent: working", PreviewSource::Title, true),
@@ -898,7 +1005,7 @@ mod tests {
         emu.process(b"prelaunch junk\r\n");
         emu.process(b"\x1b[?1049h\x1b]0;working\x07app body");
         assert_eq!(
-            st.resolve(t0, &emu, None).source,
+            st.resolve(t0, &emu, None, None).source,
             PreviewSource::Title,
             "premise: the title rendered under the alt screen"
         );
@@ -911,7 +1018,7 @@ mod tests {
             "premise: the snapshot is the restore, not the successor line"
         );
         st.finalize(&emu, None);
-        let p = st.resolve(t0, &emu, None).clone();
+        let p = st.resolve(t0, &emu, None, None).clone();
         assert_eq!(
             (p.text.as_str(), p.source, p.frozen),
             ("done", PreviewSource::Floor, true)
@@ -927,7 +1034,10 @@ mod tests {
         let mut emu = Emulator::new(24, 40, 100);
         emu.process(b"prelaunch junk that will wrap\r\n");
         emu.process(b"\x1b[?1049h\x1b]0;working\x07app body");
-        assert_eq!(st.resolve(t0, &emu, None).source, PreviewSource::Title);
+        assert_eq!(
+            st.resolve(t0, &emu, None, None).source,
+            PreviewSource::Title
+        );
 
         emu.process(b"\x1b[?1049l");
         let before = emu.live_floor();
@@ -938,7 +1048,7 @@ mod tests {
             "premise: the reflow moved the floor"
         );
         st.finalize(&emu, None);
-        let p = st.resolve(t0, &emu, None).clone();
+        let p = st.resolve(t0, &emu, None, None).clone();
         assert_eq!(
             (p.text.as_str(), p.source, p.frozen),
             ("working", PreviewSource::Title, true),
@@ -955,13 +1065,16 @@ mod tests {
         let mut emu = Emulator::new(24, 40, 100);
         emu.process(b"prelaunch junk that will wrap\r\n");
         emu.process(b"\x1b[?1049h\x1b]0;working\x07app body");
-        assert_eq!(st.resolve(t0, &emu, None).source, PreviewSource::Title);
+        assert_eq!(
+            st.resolve(t0, &emu, None, None).source,
+            PreviewSource::Title
+        );
 
         emu.process(b"\x1b[?1049l");
         emu.process(b"done\r\n");
         emu.resize(24, 20);
         st.finalize(&emu, None);
-        let p = st.resolve(t0, &emu, None).clone();
+        let p = st.resolve(t0, &emu, None, None).clone();
         assert_eq!(
             (p.text.as_str(), p.source, p.frozen),
             ("done", PreviewSource::Floor, true),
@@ -978,11 +1091,11 @@ mod tests {
         let mut s = FakeScreen::primary("shell");
         s.enter_alt();
         s.set_title("step 1");
-        st.resolve(t0, &s, None);
+        st.resolve(t0, &s, None, None);
 
         s.set_title("step 2: done");
         st.finalize(&s, None);
-        let p = st.resolve(t0, &s, None).clone();
+        let p = st.resolve(t0, &s, None, None).clone();
         assert_eq!(
             (p.text.as_str(), p.source, p.frozen),
             ("step 2: done", PreviewSource::Title, true)
@@ -995,7 +1108,7 @@ mod tests {
         let mut st = PreviewState::new();
         let t0 = Instant::now();
         let s = FakeScreen::primary("  gpt-5.6-sol high · fleetcom · 89.9K used");
-        let p = st.resolve(t0, &s, None).clone();
+        let p = st.resolve(t0, &s, None, None).clone();
         assert_eq!(
             (p.text.as_str(), p.source),
             (

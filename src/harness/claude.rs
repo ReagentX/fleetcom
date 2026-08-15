@@ -15,7 +15,6 @@ use super::{
     CAPTURE_ENV, CapturePaths, Harness, Invocation, SpawnPlan, is_uuid, last_hint, pin_plan,
     shell_quote, unique_in_window, within_window_ms,
 };
-use crate::task::pid_is_dead;
 
 pub struct Claude;
 
@@ -71,6 +70,22 @@ impl Harness for Claude {
         Some(record_for_pid(home, pid, cwd, spawned)?.id)
     }
 
+    fn live_blocked_status(
+        &self,
+        pid: u32,
+        cwd: &Path,
+        spawned: SystemTime,
+        home: Option<&Path>,
+    ) -> Option<(String, &'static str)> {
+        let rec = record_for_pid(home, pid, cwd, spawned)?;
+        // `Waiting` alone: see the trait doc. The registry beats the screen to
+        // this one state by about a second and reports it at any terminal
+        // width and for every dialog shape, including the ones
+        // `ClaudeSummary`'s `❯ 1. `/`2. ` selector match does not cover.
+        (rec.status == Some(SessionStatus::Waiting))
+            .then(|| waiting_preview(rec.waiting_for.as_deref()))
+    }
+
     fn correlate_fs(&self, cwd: &Path, spawned: SystemTime, home: Option<&Path>) -> Option<String> {
         let dir = self.home_root(home)?.join("projects").join(slug(cwd)?);
         unique_in_window(dir, spawned, |entry| {
@@ -88,11 +103,6 @@ impl Harness for Claude {
 /// rewrites it in place as the session changes; it removes it on a clean exit
 /// but leaves it behind when the process dies on a signal, so a record on disk
 /// is a claim about a pid, not proof of a live session.
-///
-/// `status` and `waiting_for` have no reader outside tests yet: the phase that
-/// surfaces live status in the dashboard consumes them. The expectation breaks
-/// the build once that reader lands, which is what removes this attribute.
-#[cfg_attr(not(test), expect(dead_code, reason = "status pair awaits its reader"))]
 struct SessionRecord {
     /// `sessionId`, already through [`is_uuid`].
     id: String,
@@ -130,6 +140,22 @@ fn status_of(status: &str) -> Option<SessionStatus> {
         "waiting" => SessionStatus::Waiting,
         _ => return None,
     })
+}
+
+/// Preview text and matcher ID for a `waiting` record's `waitingFor` reason.
+/// The CLI's dialog-label map spells five reasons: `permission prompt` (its
+/// default for any dialog), `input needed`, `dialog open`, `sandbox request`,
+/// and `worker request`. Only the first is rewritten, to the string
+/// `ClaudeSummary::claude_approval` already synthesizes for the same
+/// condition; the rest are claude's own words and are kept verbatim, as is any
+/// reason a later version adds. A record that reports `waiting` without a
+/// reason still names a user-blocking state, so it renders as one.
+fn waiting_preview(reason: Option<&str>) -> (String, &'static str) {
+    match reason.filter(|r| !r.is_empty()) {
+        Some("permission prompt") => ("awaiting approval".to_string(), "claude:registry-approval"),
+        Some(other) => (other.to_string(), "claude:registry-waiting"),
+        None => ("awaiting input".to_string(), "claude:registry-waiting"),
+    }
 }
 
 /// The registry directory: one `<pid>.json` record per live session.
@@ -186,21 +212,6 @@ fn record_for_pid(
         .then_some(rec)
 }
 
-/// Find the live record naming `id`. A record whose process is gone is skipped
-/// because signal deaths leave records behind. No `cwd` guard: the caller
-/// already holds the ID, and the ID is itself the pin. A non-UUID `id` cannot
-/// match, since [`parse_record`] validates every ID it returns.
-#[cfg_attr(not(test), expect(dead_code, reason = "awaits its dashboard caller"))]
-fn record_for_session(home: Option<&Path>, id: &str) -> Option<SessionRecord> {
-    fs::read_dir(sessions_dir(home)?)
-        .ok()?
-        .flatten()
-        .find_map(|entry| {
-            let rec = parse_record(&fs::read_to_string(entry.path()).ok()?)?;
-            (rec.id == id && !pid_is_dead(rec.pid)).then_some(rec)
-        })
-}
-
 /// Convert an absolute working directory to Claude's project slug by replacing
 /// `/` and `.` with `-` (`/a/b.c` becomes `-a-b-c`). Non-UTF-8 paths have no
 /// representable slug.
@@ -220,7 +231,7 @@ mod tests {
     use super::*;
     use crate::{
         harness::fixtures::{ID, OTHER, assert_all_opaque, assert_corpus_scrape, paths},
-        testutil::{dead_pid, temp},
+        testutil::temp,
     };
 
     /// One record a live `claude` 2.1.233 published. Field order and spelling
@@ -564,37 +575,92 @@ mod tests {
         }
     }
 
-    /// Lookup by ID needs no directory: the caller already holds the ID and the
-    /// ID is the pin. Liveness still comes from the pid, because a signal death
-    /// leaves the record behind.
+    /// The blocked-status probe speaks the `waitingFor` vocabulary the CLI's
+    /// own dialog-label map defines. `permission prompt` is its default for
+    /// any dialog and is the one value rewritten, to the string the screen
+    /// scraper synthesizes for the same condition; every other reason is
+    /// claude's wording and survives verbatim, a reason this reader predates
+    /// included. A `waiting` record with no reason still blocks the user.
     #[test]
-    fn record_for_session_finds_a_live_record_and_skips_a_dead_pid() {
-        let home = temp("claude_registry_session");
-        let live = std::process::id() as i32;
-        let dead = dead_pid() as i32;
-        install_record(
-            &home,
-            live,
-            &record(live, ID, "/w", LIVE_STARTED, "interactive", ""),
-        );
-        install_record(
-            &home,
-            dead,
-            &record(dead, OTHER, "/elsewhere", LIVE_STARTED, "interactive", ""),
-        );
+    fn live_blocked_status_maps_every_waiting_reason() {
+        let home = temp("claude_blocked_reasons");
+        let cwd = Path::new("/w");
+        let spawned = at_ms(LIVE_STARTED);
+        let probe = |tail: &str| {
+            install_record(
+                &home,
+                7,
+                &record(7, ID, "/w", LIVE_STARTED, "interactive", tail),
+            );
+            Claude.live_blocked_status(7, cwd, spawned, Some(&home))
+        };
 
         assert_eq!(
-            record_for_session(Some(&home), ID).map(|r| r.id).as_deref(),
-            Some(ID)
+            probe(r#","status":"waiting","waitingFor":"permission prompt""#),
+            Some(("awaiting approval".to_string(), "claude:registry-approval"))
         );
-        assert!(
-            record_for_session(Some(&home), OTHER).is_none(),
-            "a dead pid's record is stale"
+        for reason in [
+            "input needed",
+            "dialog open",
+            "sandbox request",
+            "worker request",
+            // Not in today's map: a later CLI version's wording is still
+            // claude's own and reads better than a synthesized stand-in.
+            "quantum entanglement request",
+        ] {
+            assert_eq!(
+                probe(&format!(r#","status":"waiting","waitingFor":"{reason}""#)),
+                Some((reason.to_string(), "claude:registry-waiting")),
+                "{reason}"
+            );
+        }
+        for tail in [
+            r#","status":"waiting""#,
+            r#","status":"waiting","waitingFor":"""#,
+        ] {
+            assert_eq!(
+                probe(tail),
+                Some(("awaiting input".to_string(), "claude:registry-waiting")),
+                "{tail:?}"
+            );
+        }
+    }
+
+    /// Only `waiting` answers. `busy` and `shell` resolve to a title carrying
+    /// claude's own per-turn summary, and `idle` to whatever the screen shows;
+    /// replacing either with the bare status word would lose information. An
+    /// absent status, an unreadable one, and a record that fails the identity
+    /// guards are all no evidence.
+    #[test]
+    fn live_blocked_status_answers_for_waiting_alone() {
+        let home = temp("claude_blocked_states");
+        let cwd = Path::new("/w");
+        let spawned = at_ms(LIVE_STARTED);
+        for tail in [
+            r#","status":"busy""#,
+            r#","status":"shell""#,
+            r#","status":"idle""#,
+            r#","status":"hibernating""#,
+            "",
+            // A reason without the status it belongs to is not a claim.
+            r#","waitingFor":"permission prompt""#,
+        ] {
+            install_record(
+                &home,
+                7,
+                &record(7, ID, "/w", LIVE_STARTED, "interactive", tail),
+            );
+            assert_eq!(
+                Claude.live_blocked_status(7, cwd, spawned, Some(&home)),
+                None,
+                "{tail:?}"
+            );
+        }
+        // No record for this pid at all.
+        assert_eq!(
+            Claude.live_blocked_status(9, cwd, spawned, Some(&home)),
+            None
         );
-        assert!(record_for_session(Some(&home), "00000000-0000-4000-8000-000000000000").is_none());
-        assert!(record_for_session(Some(&home), "not-a-uuid").is_none());
-        let bare = temp("claude_registry_session_bare");
-        assert!(record_for_session(Some(&bare), ID).is_none());
     }
 
     /// The scraper recovers the exit-hint ID from the corpus terminal bytes.

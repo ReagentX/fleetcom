@@ -29,7 +29,7 @@ fn corpus(
     let mut emu = Emulator::new(40, cols, 2000);
     emu.process(bytes);
     let mut st = PreviewState::new();
-    let p = st.resolve(Instant::now(), &emu, Some(adapter));
+    let p = st.resolve(Instant::now(), &emu, Some(adapter), None);
     (p.text.clone(), p.source, p.rule)
 }
 
@@ -313,6 +313,57 @@ fn claude_title_frames_canonicalize_to_constant_text() {
     assert_eq!(ClaudeSummary.normalize_title("✻"), None, "frame alone");
 }
 
+/// Cascade-level: the harness's blocked-status probe outranks the adapter's
+/// screen scrape on the very screen the scrape would anchor on, keeps its own
+/// rule, and takes the welcome box's model label like any other anchor. The
+/// registry reports `waiting` about a second before the dialog finishes
+/// painting, so the two disagree exactly while that repaint is in flight.
+#[test]
+fn a_registry_anchor_outranks_the_claude_spinner() {
+    let rule = "─".repeat(60);
+    let screen = [
+        "╭─── Claude Code v2.1.233 ────────────╮",
+        "│ Fable 5 with high effort · Claude Max ·  │ notes │",
+        "╰──────────────────────────────────────╯",
+        "",
+        "✻ Hashing… (6s · ↓ 87 tokens)",
+        &rule,
+        "❯",
+        &rule,
+    ]
+    .join("\r\n");
+    let mut emu = Emulator::new(24, 80, 100);
+    emu.process(screen.as_bytes());
+
+    let mut st = PreviewState::new();
+    let p = st
+        .resolve(Instant::now(), &emu, Some(&ClaudeSummary), None)
+        .clone();
+    assert_eq!(
+        (p.text.as_str(), p.rule),
+        ("Fable 5 (high) · Hashing…", Some("claude:spinner")),
+        "premise: this screen anchors on the spinner"
+    );
+
+    let mut st = PreviewState::new();
+    let p = st
+        .resolve(
+            Instant::now(),
+            &emu,
+            Some(&ClaudeSummary),
+            Some(("awaiting approval", "claude:registry-approval")),
+        )
+        .clone();
+    assert_eq!(
+        (p.text.as_str(), p.source, p.rule),
+        (
+            "Fable 5 (high) · awaiting approval",
+            PreviewSource::Anchor,
+            Some("claude:registry-approval")
+        )
+    );
+}
+
 /// Cascade-level: with the claude adapter installed and no anchor on
 /// the screen, a frame-led title renders canonicalized under the Title
 /// tier; without an adapter it renders verbatim.
@@ -322,7 +373,7 @@ fn title_tier_renders_the_normalized_title() {
     emu.process(b"\x1b[?1049h\x1b]0;\xe2\x9c\xa2 Claude Code\x07conversation body");
     let mut st = PreviewState::new();
     let p = st
-        .resolve(Instant::now(), &emu, Some(&ClaudeSummary))
+        .resolve(Instant::now(), &emu, Some(&ClaudeSummary), None)
         .clone();
     assert_eq!(
         (p.text.as_str(), p.source, p.rule),
@@ -330,7 +381,7 @@ fn title_tier_renders_the_normalized_title() {
     );
 
     let mut st = PreviewState::new();
-    let p = st.resolve(Instant::now(), &emu, None).clone();
+    let p = st.resolve(Instant::now(), &emu, None, None).clone();
     assert_eq!(
         (p.text.as_str(), p.source),
         ("✢ Claude Code", PreviewSource::Title),
@@ -345,7 +396,7 @@ fn title_tier_renders_the_normalized_title() {
     );
     let mut st = PreviewState::new();
     let p = st
-        .resolve(Instant::now(), &quadrant, Some(&ClaudeSummary))
+        .resolve(Instant::now(), &quadrant, Some(&ClaudeSummary), None)
         .clone();
     assert_eq!(
         (p.text.as_str(), p.source, p.rule),
@@ -1428,10 +1479,10 @@ fn corpus_non_agent_tuis_keep_their_tiers() {
         assert!(emu.alternate_screen(), "{name}: alt screen active at cut");
         let mut st = PreviewState::new();
         let with = st
-            .resolve(Instant::now(), &emu, Some(&ClaudeSummary))
+            .resolve(Instant::now(), &emu, Some(&ClaudeSummary), None)
             .clone();
         let mut st = PreviewState::new();
-        let without = st.resolve(Instant::now(), &emu, None).clone();
+        let without = st.resolve(Instant::now(), &emu, None, None).clone();
         assert_eq!(with, without, "{name}: the adapter must change nothing");
         assert_eq!(with.source, PreviewSource::Marker, "{name}");
     }
