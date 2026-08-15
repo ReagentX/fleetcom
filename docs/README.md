@@ -7,7 +7,7 @@
 - [Commands](commands.md): every key and launch flag, including the routing mechanics
 - [How it works](how-it-works.md): the PTY emulation, input routing, and activity grouping
 - [Sessions](sessions.md): the task recipe format and where it lives
-- [Agent session resume](agent-resume.md): how `fleetcom` captures and resumes supported `claude`, `codex`, and `grok` sessions
+- [Agent session resume](agent-resume.md): how `fleetcom` captures and resumes supported `claude`, `codex`, `grok`, and `omp` sessions
 - [Storage paths](#storage-paths): runtime and session paths
 - [First-run walkthrough](#first-run-walkthrough): a first run, start to finish
 - [Security](#security): the trust boundary, on-disk state, and what is not protected

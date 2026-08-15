@@ -104,7 +104,7 @@ Destroy is Shift-gated: only uppercase `X` acts. It kills a running task or remo
 
 `r` acts only on a finished task. A running task remains untouched because rerunning it would first require a destructive kill.
 
-The replacement starts in the same directory using the requesting client's environment. Most tasks reuse their stored command. A supported `claude`, `codex`, or `grok` task instead uses its captured resume command when a valid conversation ID is available.
+The replacement starts in the same directory using the requesting client's environment. Most tasks reuse their stored command. A supported `claude`, `codex`, `grok`, or `omp` task instead uses its captured resume command when a valid conversation ID is available.
 
 Rerunning preserves the task's ID, `◆` tag, group, name, and spawn order; its clock and screen reset. Since lifecycle affects sorting, the task may move to another section when it starts. The same key works inside peek, which remains open while the replacement starts.
 

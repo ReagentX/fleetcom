@@ -1,13 +1,13 @@
 # Agent session resume
 
-Session files preserve launch commands, not process state. Relaunching a bare `claude`, `codex`, or `grok` command ordinarily starts another conversation. For accepted commands, `fleetcom` captures a validated conversation ID when available and builds a canonical resume command when saving a session or rerunning a finished task (`r`).
+Session files preserve launch commands, not process state. Relaunching a bare `claude`, `codex`, `grok`, or `omp` command ordinarily starts another conversation. For accepted commands, `fleetcom` captures a validated conversation ID when available and builds a canonical resume command when saving a session or rerunning a finished task (`r`).
 
 ## Workflow
 
 Start a supported agent without flags:
 
-1. Press `n` and run `claude`, `codex`, or `grok`. The task appears in the dashboard under the command you typed. Instrumentation changes only the string executed through `$SHELL -c`, so a direct spawn still displays the requested command.
-2. Work in it. `Enter` attaches; `Ctrl-\` returns to the dashboard. Depending on the agent, `fleetcom` pins an ID at launch and may update it from a hook or notifier while the task runs or from terminal output after it exits.
+1. Press `n` and run `claude`, `codex`, `grok`, or `omp`. The task appears in the dashboard under the command you typed. Instrumentation changes only the string executed through `$SHELL -c`, so a direct spawn still displays the requested command.
+2. Work in it. `Enter` attaches; `Ctrl-\` returns to the dashboard. Depending on the agent, `fleetcom` pins an ID at launch and may update it from a hook, notifier, or extension while the task runs or from terminal output after it exits.
 3. Press `w`, enter a session name, and press `Enter`. If the earlier sources produced no ID, the save also checks the agent's on-disk session store. A captured bare command becomes its canonical resume form, such as `claude --resume '<uuid>'`.
 4. Run `fleetcom <session>`, or press `o` in the dashboard, to start new processes from the saved commands. A stored resume command reopens its captured conversation.
 
@@ -19,10 +19,11 @@ Capture is best-effort and narrow by design. A command carrying a prompt, extra 
 
 The capture boundary is intentionally narrow. Only these forms participate:
 
-- `claude`, `codex`, or `grok`
+- `claude`, `codex`, `grok`, or `omp`
 - `claude --resume <uuid>`
 - `codex resume <uuid>`
 - `grok --resume <uuid>`
+- `omp --resume <uuid>`
 
 The program word may be a path such as `/usr/local/bin/claude` when its basename matches and the token contains no shell syntax. A resume UUID may be bare or single-quoted, but it must be the final argument.
 
@@ -30,12 +31,13 @@ Everything else remains opaque and runs, displays, and saves verbatim. This incl
 
 ## Capture state and isolation
 
-Hooks and notifiers run outside the supervisor, so they need stable paths. The supervisor installs those assets once for each runtime root. An explicit `FLEETCOM_RUNTIME_DIR` becomes that root. Otherwise, `fleetcom` uses the platform runtime or cache directory and partitions it by session directory.
+Hooks, notifiers, and extension modules are loaded by the agent rather than the supervisor, so they need stable paths. The supervisor installs those assets once for each runtime root. An explicit `FLEETCOM_RUNTIME_DIR` becomes that root. Otherwise, `fleetcom` uses the platform runtime or cache directory and partitions it by session directory.
 
 Each supervisor installation creates a private mode-`0700` `<root>/<pid>-<nonce>` namespace containing:
 
 - `claude-settings.json`, mode `0600`
 - `codex-notify.sh`, mode `0700`
+- `omp-capture.js`, mode `0600`: omp imports the module rather than executing it, so it needs no executable bit
 - `task-<id>-<run>.json` capture paths
 
 The random nonce separates concurrent supervisors and prevents PID reuse from selecting an existing namespace. The run number gives each rerun a distinct capture file, so a displaced process cannot overwrite the replacement run's session state. Installation leaves every other root entry unchanged.
@@ -78,6 +80,24 @@ Grok accepts a launch-time ID but exposes no injectable live-capture channel. A 
 
 After exit, the harness scans retained terminal text for the last `grok -r <uuid>` or `grok --resume <uuid>` hint. Save-time filesystem correlation checks `<grok-home>/sessions/<encoded-cwd>/<uuid>/`, percent-encoding the canonical working directory, falling back to a group whose `.cwd` file names that path when the encoded name is too long, and ignoring `session_kind: subagent` directories.
 
+### `omp`
+
+omp can pin no ID at launch: it ships no `--session-id`, and `--resume` rejects an ID that does not already exist, so a generated UUID would name a session the resume command could never reach. Both accepted forms therefore take the same injection, and neither carries a pinned ID:
+
+```text
+-e '<namespace>/omp-capture.js'
+```
+
+That asset is a JavaScript module, and `-e` loads it into the agent's own process at startup, appending to the user's own extensions rather than replacing them. Its `session_start` and `session_switch` handlers write the session ID as JSON to `FLEETCOM_CAPTURE_FILE`; the harness reads `sessionId`. `session_switch` is what covers omp's in-TUI `/resume`, which changes the session ID of a process `fleetcom` has already launched.
+
+No other harness runs code inside the agent: Claude's asset is a settings file and Codex's is a shell script the agent execs after a turn. Two things bound that. The module no-ops when `FLEETCOM_CAPTURE_FILE` is unset or empty, and it swallows every error it raises; omp's own extension runner then calls each handler under a timeout inside a `catch`, reporting a throw to its extension error channel instead of propagating it. `--trusted-extension` fills the same slot and is never used: it is mutually exclusive with `-e` and replaces the user's entire extension discovery, omp's own bridges included.
+
+After exit, the harness scans retained terminal text for the last `omp --resume <uuid>` hint. omp prints it as `Resume this session with omp --resume <uuid>`, and a crash prints the same command inside a `[Recovery]` block, so one matcher reads both. omp also resumes through `-r`, `--session`, and `-c`; those spellings stay opaque, because a command `fleetcom` cannot rewrite exactly is left verbatim.
+
+Save-time filesystem correlation reads `<sessions root>/<encoded-cwd>/<iso-ts>_<uuid>.jsonl`, where the sessions root comes from omp's own variable chain rather than one home override; the [environment-variable table](#environment-variables) lists it. Correlation does not reproduce the bucket name. omp encodes a working directory through three scopes — under `$HOME`, under the temporary directory, otherwise absolute — after realpath-canonicalizing the working directory, `$HOME`, and `$TMPDIR`, and it changed that scheme three times inside the 17.2.x line, each change shipping an on-disk migration. The scan enumerates the buckets instead and confirms the directory from the session header's own `cwd` field, which records the resolved path while the bucket is named from the canonical one, so both forms are compared. A candidate must be the sole file whose UUIDv7 creation instant falls within the 30-second spawn window; an ID that is not v7 is skipped rather than dated from metadata omp did not write.
+
+A session with no assistant message leaves no file at all, because omp holds it in memory until the model replies. Correlation therefore cannot find a just-launched session, and an empty bucket is ordinary rather than an error: a session with no reply has nothing worth resuming.
+
 ## ID precedence
 
 Several channels can identify different conversations during one task. To make the result deterministic, `fleetcom` chooses the first available ID in this order:
@@ -96,6 +116,7 @@ Saving and rerunning rewrite accepted commands to one of these forms:
 claude --resume '<uuid>'
 codex resume '<uuid>'
 grok --resume '<uuid>'
+omp --resume '<uuid>'
 ```
 
 The program word is preserved as typed. If no valid ID is available, the original command remains unchanged. A rerun increments the run number before spawning its replacement, so capture data from the displaced run cannot affect the new run.
@@ -110,21 +131,28 @@ Each tool implements the `Harness` trait in [`src/harness/mod.rs`](../src/harnes
 
 - `shape` supplies the program word and resume selector. The default `detect` and `resume_command` methods derive the accepted and canonical forms from that pair.
 - `instrument` returns spawn-time arguments, environment entries, and an optional pinned ID.
-- `parse_capture` reads an ID from hook or notify JSON.
+- `parse_capture` reads an ID from hook, notify, or extension JSON.
 - `scrape_exit` reads an ID from retained terminal text.
 - `live_session_id` reads the ID a live session publishes on disk. It defaults to `None` for tools that publish no registry.
 - `live_blocked_status` reads that same registry for one display fact: whether the tool says it is blocked on the user. It returns preview text, never an ID, and defaults to `None`.
 - `correlate_fs` finds one matching on-disk session.
+- `resolve_home` turns the task's launch environment into the tool's store root.
 
-The supervisor resolves each harness home from the task's launch environment: the tool-specific variable first, then `$HOME` plus the tool's dot directory. That resolved path remains attached to the task for later filesystem correlation.
+The supervisor supplies the launch environment and delegates the decision to `resolve_home`. Its default is the two-step rule three of the four tools follow: the tool-specific variable first, then `$HOME` plus the tool's dot directory. omp overrides it, because its store root comes from a chain of variables and a filesystem-conditional XDG branch that no single override can express. Either way, the resolved path remains attached to the task for later filesystem correlation.
 
 ## Environment variables
 
 | Variable | Meaning |
 | -- | -- |
 | `FLEETCOM_RUNTIME_DIR` | Explicit capture-asset root as well as the daemon runtime override. |
-| `FLEETCOM_CAPTURE_FILE` | Per-run capture file used by the injected hook or notifier. |
+| `FLEETCOM_CAPTURE_FILE` | Per-run capture file used by the injected hook, notifier, or extension module. |
 | `FLEETCOM_NOTIFY_CHAIN` | Newline-joined argv for the configured Codex notifier; empty when none is active. |
 | `CLAUDE_CONFIG_DIR` | Claude home holding the `sessions/<pid>.json` registry and the transcripts used for correlation; defaults to `$HOME/.claude`. |
 | `CODEX_HOME` | Codex home used for notify routing and rollout correlation; defaults to `$HOME/.codex`. |
 | `GROK_HOME` | Grok home used for session-directory correlation; defaults to `$HOME/.grok`. |
+| `PI_CODING_AGENT_SESSION_DIR` | omp sessions root, used verbatim for correlation. The rest of omp's chain builds that path instead of naming it. |
+| `PI_CODING_AGENT_DIR` | omp agent directory, whose `sessions` subdirectory is the store. A selected profile ignores it. |
+| `PI_CONFIG_DIR` | omp config directory name under `$HOME`; defaults to `.omp`. An absolute value diverges from omp's own joining and correlation then finds nothing rather than the wrong session. |
+| `OMP_PROFILE` | omp profile, read by presence: it selects a profile when non-empty and suppresses `PI_PROFILE` when empty. |
+| `PI_PROFILE` | omp profile used only when `OMP_PROFILE` is absent. A profile inserts `profiles/<name>` under the config directory. |
+| `XDG_DATA_HOME` | Redirects the still-default omp agent directory to `<value>/omp`, flattening the `agent/` level, and only when that directory already exists. |
