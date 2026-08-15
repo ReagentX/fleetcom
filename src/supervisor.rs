@@ -135,8 +135,13 @@ fn fnv1a_hex(bytes: &[u8]) -> String {
 }
 
 /// Resolve the best session ID in precedence order: exit scrape, capture file,
-/// then spawn-time ID. Exit and capture data outrank the launch value because
-/// either can reflect a conversation selected later.
+/// live session registry, then spawn-time ID. Exit and capture data outrank the
+/// launch value because either can reflect a conversation selected later. The
+/// registry outranks the launch value for the same reason and by a stronger
+/// one: the pin records what fleetcom asked for, while the registry records
+/// what the tool is running, and `/clear` mints a fresh ID mid-session. It
+/// ranks under the capture file only because that file is fleetcom's own hook
+/// output, and the two agree whenever both exist.
 fn current_resume_id(task: &Task) -> Option<String> {
     if let Some(id) = &task.scraped_id {
         return Some(id.clone());
@@ -144,6 +149,16 @@ fn current_resume_id(task: &Task) -> Option<String> {
     if let (Some(h), Some(path)) = (task.harness, &task.capture_file)
         && let Ok(payload) = std::fs::read_to_string(path)
         && let Some(id) = h.parse_capture(&payload)
+    {
+        return Some(id);
+    }
+    if let (Some(h), Some(pid)) = (task.harness, task.pid())
+        && let Some(id) = h.live_session_id(
+            pid,
+            &task.cwd,
+            task.spawned_at,
+            task.harness_home.as_deref(),
+        )
     {
         return Some(id);
     }

@@ -356,6 +356,13 @@ impl Task {
         })
     }
 
+    /// The session leader's PID. `$SHELL -c` execs an accepted agent command in
+    /// place, so for those tasks this is the agent process itself: the pid its
+    /// live session registry is keyed by.
+    pub fn pid(&self) -> Option<u32> {
+        self.pid
+    }
+
     /// Latch the exit code and finish time if the leader has exited, without
     /// reaping it. `WNOWAIT` leaves the zombie in place, which is what keeps
     /// the pid (and therefore the pgid) reserved so the group stays signalable

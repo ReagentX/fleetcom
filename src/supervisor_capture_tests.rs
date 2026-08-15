@@ -916,6 +916,80 @@ fn resume_id_precedence_scrape_over_capture_over_spawn() {
     );
 }
 
+/// Claude's live session registry outranks the ID pinned at spawn: the pin
+/// records what fleetcom asked for, the registry what the CLI is running, and
+/// `/clear` moves the conversation on the same process. Fleetcom's own hook
+/// output still outranks the registry.
+#[test]
+fn resume_id_precedence_registry_over_spawn_under_capture() {
+    let dir = scratch("registry_precedence");
+    let (bin, runtime, config) = (dir.join("bin"), dir.join("run"), dir.join("config"));
+    let (claude_home, done) = (dir.join("claude_home"), dir.join("done"));
+    install_script(
+        &bin,
+        "claude",
+        &format!(
+            "until [ -e '{d}' ]; do sleep 0.05; done",
+            d = done.display()
+        ),
+    );
+    let mut s = sup_ctx(agent_ctx_plus(
+        &bin,
+        &runtime,
+        dir.to_path_buf(),
+        &[
+            ("FLEETCOM_CONFIG_DIR", &config),
+            ("CLAUDE_CONFIG_DIR", &claude_home),
+        ],
+    ));
+    spawn(&mut s, "claude", dir.to_path_buf());
+    let injected = s.tasks[0]
+        .resume_id
+        .clone()
+        .expect("a fresh claude launch pins an id");
+    assert_ne!(injected.as_str(), CAP_ID);
+    // `$SHELL -c` execs the accepted command in place, so the task's pid names
+    // the registry record.
+    let pid = s.tasks[0].pid().expect("a live task has a pid");
+
+    let sessions = claude_home.join("sessions");
+    std::fs::create_dir_all(&sessions).unwrap();
+    std::fs::write(
+        sessions.join(format!("{pid}.json")),
+        format!(
+            r#"{{"pid":{pid},"sessionId":"{CAP_ID}","cwd":"{cwd}","startedAt":{started},"kind":"interactive","status":"idle"}}"#,
+            cwd = dir.display(),
+            started = now_ms()
+        ),
+    )
+    .unwrap();
+    let text = save_and_read(&mut s, &config, "registry");
+    assert!(
+        text.contains(&format!("claude --resume '{CAP_ID}'")),
+        "the registry must beat the injected id; got {text}"
+    );
+    assert!(
+        !text.contains(&injected),
+        "the injected id must not survive the registry; got {text}"
+    );
+
+    // The hook fired: fleetcom's own capture channel wins.
+    let cap = s.tasks[0].capture_file.clone().expect("capture file set");
+    std::fs::write(
+        &cap,
+        format!(
+            r#"{{"session_id":"{CAP_OTHER}","hook_event_name":"SessionStart","source":"clear"}}"#
+        ),
+    )
+    .unwrap();
+    let text = save_and_read(&mut s, &config, "capture");
+    assert!(
+        text.contains(&format!("claude --resume '{CAP_OTHER}'")),
+        "the capture file must beat the registry; got {text}"
+    );
+    std::fs::write(&done, b"").unwrap();
+}
+
 /// A silent Codex task falls back to one matching rollout under
 /// `CODEX_HOME` when live channels produce no ID.
 #[test]

@@ -9,11 +9,11 @@
 //!
 //! # Security invariant
 //!
-//! Every ID returned by `parse_capture`, `scrape_exit`, or `correlate_fs`
-//! eventually enters a shell command. These methods must therefore return only
-//! strings accepted by [`is_uuid`]. Free-text names, paths, and malformed IDs
-//! yield `None`. Summary adapters are display-only and do not return session
-//! IDs.
+//! Every ID returned by `parse_capture`, `scrape_exit`, `live_session_id`, or
+//! `correlate_fs` eventually enters a shell command. These methods must
+//! therefore return only strings accepted by [`is_uuid`]. Free-text names,
+//! paths, and malformed IDs yield `None`. Summary adapters are display-only and
+//! do not return session IDs.
 
 pub mod assets;
 mod claude;
@@ -91,6 +91,22 @@ pub trait Harness: Sync {
 
     /// Extract a session ID from final terminal text, including scrollback.
     fn scrape_exit(&self, text: &str) -> Option<String>;
+
+    /// Read the ID the tool is running right now from the live registry it
+    /// publishes on disk. `pid` is the task's session leader, which for every
+    /// accepted command shape is the tool's own process. `cwd` and `spawned`
+    /// identify that process, since a registry record can outlive its writer.
+    /// Defaults to `None`: a tool that publishes no registry has nothing to
+    /// read.
+    fn live_session_id(
+        &self,
+        _pid: u32,
+        _cwd: &Path,
+        _spawned: SystemTime,
+        _home: Option<&Path>,
+    ) -> Option<String> {
+        None
+    }
 
     /// Find one session ID in the tool's on-disk store. Missing or ambiguous
     /// matches return `None`. `home` follows the `instrument` contract.

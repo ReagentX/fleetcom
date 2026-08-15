@@ -1,15 +1,21 @@
-//! Claude exposes three useful session signals: a launch-time `--session-id`, a
-//! `SessionStart` hook, and an exit-time resume hint. Bare launches pin a v4
-//! UUID; every accepted launch receives the hook through `--settings`. The
-//! filesystem fallback correlates
-//! `<claude-home>/projects/<cwd-slug>/<uuid>.jsonl` transcripts.
+//! Claude exposes four useful session signals: a launch-time `--session-id`, a
+//! `SessionStart` hook, a live session registry, and an exit-time resume hint.
+//! Bare launches pin a v4 UUID; every accepted launch receives the hook through
+//! `--settings`. The CLI itself publishes one `<claude-home>/sessions/<pid>.json`
+//! record per live session, with no instrumentation. The filesystem fallback
+//! correlates `<claude-home>/projects/<cwd-slug>/<uuid>.jsonl` transcripts.
 
-use std::{path::Path, time::SystemTime};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use super::{
     CAPTURE_ENV, CapturePaths, Harness, Invocation, SpawnPlan, is_uuid, last_hint, pin_plan,
-    shell_quote, unique_in_window,
+    shell_quote, unique_in_window, within_window_ms,
 };
+use crate::task::pid_is_dead;
 
 pub struct Claude;
 
@@ -55,6 +61,16 @@ impl Harness for Claude {
         last_hint(text, &["claude --resume "])
     }
 
+    fn live_session_id(
+        &self,
+        pid: u32,
+        cwd: &Path,
+        spawned: SystemTime,
+        home: Option<&Path>,
+    ) -> Option<String> {
+        Some(record_for_pid(home, pid, cwd, spawned)?.id)
+    }
+
     fn correlate_fs(&self, cwd: &Path, spawned: SystemTime, home: Option<&Path>) -> Option<String> {
         let dir = self.home_root(home)?.join("projects").join(slug(cwd)?);
         unique_in_window(dir, spawned, |entry| {
@@ -66,6 +82,123 @@ impl Harness for Claude {
             Some(path.file_stem()?.to_str()?.to_string())
         })
     }
+}
+
+/// One record from the live session registry. The CLI writes it on launch and
+/// rewrites it in place as the session changes; it removes it on a clean exit
+/// but leaves it behind when the process dies on a signal, so a record on disk
+/// is a claim about a pid, not proof of a live session.
+///
+/// `status` and `waiting_for` have no reader outside tests yet: the phase that
+/// surfaces live status in the dashboard consumes them. The expectation breaks
+/// the build once that reader lands, which is what removes this attribute.
+#[cfg_attr(not(test), expect(dead_code, reason = "status pair awaits its reader"))]
+struct SessionRecord {
+    /// `sessionId`, already through [`is_uuid`].
+    id: String,
+    /// `pid`, which also names the record's file.
+    pid: i32,
+    /// `cwd` the session runs in.
+    cwd: PathBuf,
+    /// `startedAt`: the process's start in epoch milliseconds. `procStart`
+    /// names the same instant in human-readable form.
+    started_at: u128,
+    /// `status`, absent from records written by non-interactive entrypoints.
+    status: Option<SessionStatus>,
+    /// `waitingFor`: why a `Waiting` session waits. Present only while the CLI
+    /// holds a dialog open.
+    waiting_for: Option<String>,
+}
+
+/// The `status` vocabulary the CLI validates its own records against.
+#[derive(Debug, PartialEq, Eq)]
+enum SessionStatus {
+    Busy,
+    Shell,
+    Idle,
+    Waiting,
+}
+
+/// Map one `status` string. An unrecognized value yields `None` instead of
+/// rejecting the record: a later CLI version can extend the vocabulary, and the
+/// session ID stays valid either way.
+fn status_of(status: &str) -> Option<SessionStatus> {
+    Some(match status {
+        "busy" => SessionStatus::Busy,
+        "shell" => SessionStatus::Shell,
+        "idle" => SessionStatus::Idle,
+        "waiting" => SessionStatus::Waiting,
+        _ => return None,
+    })
+}
+
+/// The registry directory: one `<pid>.json` record per live session.
+fn sessions_dir(home: Option<&Path>) -> Option<PathBuf> {
+    Some(Claude.home_root(home)?.join("sessions"))
+}
+
+/// Parse one registry record. The CLI rewrites the file in place with a plain
+/// write rather than a temp-and-rename, so a reader can catch it truncated:
+/// unparseable text yields `None` and the caller simply has no evidence this
+/// time. `bg`, `daemon`, and `daemon-worker` records name conversations no user
+/// is driving, so only `interactive` survives.
+fn parse_record(text: &str) -> Option<SessionRecord> {
+    let v = jzon::parse(text).ok()?;
+    if v["kind"].as_str()? != "interactive" {
+        return None;
+    }
+    let id = v["sessionId"].as_str().filter(|id| is_uuid(id))?;
+    Some(SessionRecord {
+        id: id.to_string(),
+        pid: v["pid"].as_i32().filter(|p| *p > 0)?,
+        cwd: PathBuf::from(v["cwd"].as_str()?),
+        started_at: u128::from(v["startedAt"].as_u64()?),
+        status: v["status"].as_str().and_then(status_of),
+        waiting_for: v["waitingFor"].as_str().map(str::to_string),
+    })
+}
+
+/// Read the record `pid` publishes, requiring it to name that pid, that `cwd`,
+/// and a process started within [`super::CORRELATE_WINDOW`] of `spawned`.
+///
+/// The two extra guards close a stale-record hazard: a `claude` killed by a
+/// signal leaves its record behind, and only the next `claude` launch sweeps
+/// it, so a recycled pid can find a stranger's record filed under its own name.
+/// `cwd` separates two directories; `startedAt` separates two processes in one
+/// directory. That window does not decay with session age, because `startedAt`
+/// records the process start: `/clear` mints a fresh `sessionId` in place and
+/// leaves `startedAt` untouched, so a session running for hours still matches
+/// its original spawn instant.
+///
+/// Call-site details: `/cd` inside claude moves the session's `cwd` and fails
+/// this check, which loses the record. Failing closed there is deliberate.
+fn record_for_pid(
+    home: Option<&Path>,
+    pid: u32,
+    cwd: &Path,
+    spawned: SystemTime,
+) -> Option<SessionRecord> {
+    let pid = i32::try_from(pid).ok()?;
+    let text = fs::read_to_string(sessions_dir(home)?.join(format!("{pid}.json"))).ok()?;
+    let rec = parse_record(&text)?;
+    let spawned_ms = spawned.duration_since(UNIX_EPOCH).ok()?.as_millis();
+    (rec.pid == pid && rec.cwd == cwd && within_window_ms(rec.started_at, spawned_ms))
+        .then_some(rec)
+}
+
+/// Find the live record naming `id`. A record whose process is gone is skipped
+/// because signal deaths leave records behind. No `cwd` guard: the caller
+/// already holds the ID, and the ID is itself the pin. A non-UUID `id` cannot
+/// match, since [`parse_record`] validates every ID it returns.
+#[cfg_attr(not(test), expect(dead_code, reason = "awaits its dashboard caller"))]
+fn record_for_session(home: Option<&Path>, id: &str) -> Option<SessionRecord> {
+    fs::read_dir(sessions_dir(home)?)
+        .ok()?
+        .flatten()
+        .find_map(|entry| {
+            let rec = parse_record(&fs::read_to_string(entry.path()).ok()?)?;
+            (rec.id == id && !pid_is_dead(rec.pid)).then_some(rec)
+        })
 }
 
 /// Convert an absolute working directory to Claude's project slug by replacing
@@ -87,8 +220,45 @@ mod tests {
     use super::*;
     use crate::{
         harness::fixtures::{ID, OTHER, assert_all_opaque, assert_corpus_scrape, paths},
-        testutil::temp,
+        testutil::{dead_pid, temp},
     };
+
+    /// One record a live `claude` 2.1.233 published. Field order and spelling
+    /// are as written; its `sessionId` is [`OTHER`], and the middle of `cwd` is
+    /// elided, which the reader never inspects.
+    const LIVE_RECORD: &str = concat!(
+        r#"{"pid":83849,"sessionId":"11111111-2222-4333-8444-555555555555","#,
+        r#""cwd":"/private/tmp/.../scratchpad/live-claude","startedAt":1786834960302,"#,
+        r#""procStart":"Sat Aug 15 23:02:39 2026","version":"2.1.233","peerProtocol":1,"#,
+        r#""kind":"interactive","entrypoint":"cli","#,
+        r#""messagingSocketPath":"/tmp/cc-socks/83849.sock","#,
+        r#""name":"live-claude-66","nameSource":"derived","nameSince":1786834960303,"#,
+        r#""status":"idle","updatedAt":1786834960352,"statusUpdatedAt":1786834960352}"#,
+    );
+    /// The pid, directory, and process start [`LIVE_RECORD`] names.
+    const LIVE_PID: u32 = 83849;
+    const LIVE_CWD: &str = "/private/tmp/.../scratchpad/live-claude";
+    const LIVE_STARTED: u64 = 1_786_834_960_302;
+
+    /// A registry record carrying every field the reader validates. `tail`
+    /// appends raw JSON for the optional status pair.
+    fn record(pid: i32, id: &str, cwd: &str, started: u64, kind: &str, tail: &str) -> String {
+        format!(
+            r#"{{"pid":{pid},"sessionId":"{id}","cwd":"{cwd}","startedAt":{started},"version":"2.1.233","kind":"{kind}","entrypoint":"cli"{tail}}}"#
+        )
+    }
+
+    /// File `body` as the registry record for `pid`, creating the store.
+    fn install_record(home: &Path, pid: i32, body: &str) {
+        let dir = home.join("sessions");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join(format!("{pid}.json")), body).unwrap();
+    }
+
+    /// The instant `ms` epoch milliseconds names.
+    fn at_ms(ms: u64) -> SystemTime {
+        UNIX_EPOCH + std::time::Duration::from_millis(ms)
+    }
 
     /// Claude-specific opaque shapes: flags, `--continue`/`-c`, subcommands,
     /// the short/`=` resume spellings, and `--session-id`. The syntax shared
@@ -216,6 +386,215 @@ mod tests {
             Claude.correlate_fs(cwd, SystemTime::now(), Some(&home)),
             None
         );
+    }
+
+    /// The record a live session published parses whole, and the harness
+    /// surfaces its ID through the trait.
+    #[test]
+    fn record_for_pid_reads_a_live_record() {
+        let home = temp("claude_registry");
+        install_record(&home, LIVE_PID as i32, LIVE_RECORD);
+        let cwd = Path::new(LIVE_CWD);
+        let rec = record_for_pid(Some(&home), LIVE_PID, cwd, at_ms(LIVE_STARTED))
+            .expect("the live record must parse");
+        assert_eq!(rec.id, OTHER);
+        assert_eq!(rec.status, Some(SessionStatus::Idle));
+        assert_eq!(rec.waiting_for, None);
+        assert_eq!(
+            Claude
+                .live_session_id(LIVE_PID, cwd, at_ms(LIVE_STARTED), Some(&home))
+                .as_deref(),
+            Some(OTHER)
+        );
+    }
+
+    /// The record must claim the pid whose file it sits in and the directory
+    /// the task runs in.
+    #[test]
+    fn record_for_pid_requires_the_records_own_pid_and_cwd() {
+        let home = temp("claude_registry_ident");
+        let cwd = Path::new("/w");
+        let spawned = at_ms(LIVE_STARTED);
+
+        install_record(
+            &home,
+            4242,
+            &record(4242, ID, "/w", LIVE_STARTED, "interactive", ""),
+        );
+        assert!(record_for_pid(Some(&home), 4242, cwd, spawned).is_some());
+
+        // A record filed under one pid while naming another is not this task's.
+        install_record(
+            &home,
+            4242,
+            &record(99, ID, "/w", LIVE_STARTED, "interactive", ""),
+        );
+        assert!(record_for_pid(Some(&home), 4242, cwd, spawned).is_none());
+
+        install_record(
+            &home,
+            4242,
+            &record(4242, ID, "/elsewhere", LIVE_STARTED, "interactive", ""),
+        );
+        assert!(record_for_pid(Some(&home), 4242, cwd, spawned).is_none());
+    }
+
+    /// A `claude` killed by a signal leaves its record behind until the next
+    /// launch sweeps it. A task later assigned that pid in the same directory
+    /// satisfies both identity guards, so the process start is what rejects it.
+    #[test]
+    fn record_for_pid_rejects_a_recycled_pids_stale_record() {
+        let home = temp("claude_registry_recycled");
+        let cwd = Path::new("/w");
+        install_record(
+            &home,
+            4242,
+            &record(4242, ID, "/w", LIVE_STARTED, "interactive", ""),
+        );
+
+        // The same process: its start is inside the correlation window.
+        assert!(record_for_pid(Some(&home), 4242, cwd, at_ms(LIVE_STARTED + 30_000)).is_some());
+        assert!(record_for_pid(Some(&home), 4242, cwd, at_ms(LIVE_STARTED - 30_000)).is_some());
+        // A later process under the recycled pid: minutes apart, or one
+        // millisecond outside the window.
+        assert!(record_for_pid(Some(&home), 4242, cwd, at_ms(LIVE_STARTED + 30_001)).is_none());
+        assert!(record_for_pid(Some(&home), 4242, cwd, at_ms(LIVE_STARTED + 600_000)).is_none());
+    }
+
+    /// Only an `interactive` record names a conversation a user is driving,
+    /// and only a strict UUID may leave the reader.
+    #[test]
+    fn record_for_pid_requires_an_interactive_kind_and_a_strict_id() {
+        let home = temp("claude_registry_kind");
+        let cwd = Path::new("/w");
+        let spawned = at_ms(LIVE_STARTED);
+        for kind in ["bg", "daemon", "daemon-worker"] {
+            install_record(&home, 7, &record(7, ID, "/w", LIVE_STARTED, kind, ""));
+            assert!(
+                record_for_pid(Some(&home), 7, cwd, spawned).is_none(),
+                "{kind}"
+            );
+        }
+        for id in ["NOT-A-UUID", "", "c8c4a5cc-0b32-4ba0-a6b4-6ed08c218e0dff"] {
+            install_record(
+                &home,
+                7,
+                &record(7, id, "/w", LIVE_STARTED, "interactive", ""),
+            );
+            assert!(
+                record_for_pid(Some(&home), 7, cwd, spawned).is_none(),
+                "{id:?}"
+            );
+        }
+        // A record missing `kind` is unclassifiable.
+        install_record(
+            &home,
+            7,
+            &format!(r#"{{"pid":7,"sessionId":"{ID}","cwd":"/w","startedAt":{LIVE_STARTED}}}"#),
+        );
+        assert!(record_for_pid(Some(&home), 7, cwd, spawned).is_none());
+    }
+
+    /// The CLI rewrites the record in place rather than renaming a temporary,
+    /// so a reader can catch it truncated. That, an absent record, and an
+    /// absent store all mean no evidence this time.
+    #[test]
+    fn record_for_pid_tolerates_a_torn_file_and_a_missing_store() {
+        let home = temp("claude_registry_torn");
+        let cwd = Path::new(LIVE_CWD);
+        let spawned = at_ms(LIVE_STARTED);
+        for body in [&LIVE_RECORD[..LIVE_RECORD.len() / 2], "", "\0"] {
+            install_record(&home, LIVE_PID as i32, body);
+            assert!(
+                record_for_pid(Some(&home), LIVE_PID, cwd, spawned).is_none(),
+                "{body:?}"
+            );
+        }
+        // No record for this pid, and no store at all.
+        assert!(record_for_pid(Some(&home), 1, cwd, spawned).is_none());
+        let bare = temp("claude_registry_bare");
+        assert!(record_for_pid(Some(&bare), LIVE_PID, cwd, spawned).is_none());
+    }
+
+    /// The status vocabulary the CLI validates its own records against, the
+    /// absent status a non-interactive entrypoint writes, and the reason a
+    /// waiting session carries.
+    #[test]
+    fn record_for_pid_reads_the_status_vocabulary() {
+        let home = temp("claude_registry_status");
+        let cwd = Path::new("/w");
+        let spawned = at_ms(LIVE_STARTED);
+        let read = || record_for_pid(Some(&home), 7, cwd, spawned).expect("the record must parse");
+        let install = |tail: &str| {
+            install_record(
+                &home,
+                7,
+                &record(7, ID, "/w", LIVE_STARTED, "interactive", tail),
+            );
+        };
+
+        for (status, want) in [
+            ("busy", SessionStatus::Busy),
+            ("shell", SessionStatus::Shell),
+            ("idle", SessionStatus::Idle),
+            ("waiting", SessionStatus::Waiting),
+        ] {
+            install(&format!(r#","status":"{status}""#));
+            assert_eq!(read().status, Some(want), "{status}");
+        }
+        // A status absent, or from a vocabulary this reader predates, still
+        // yields the ID.
+        for tail in ["", r#","status":"hibernating""#] {
+            install(tail);
+            let rec = read();
+            assert_eq!(rec.status, None, "{tail:?}");
+            assert_eq!(rec.id, ID);
+        }
+        for reason in [
+            "permission prompt",
+            "input needed",
+            "dialog open",
+            "sandbox request",
+            "worker request",
+        ] {
+            install(&format!(r#","status":"waiting","waitingFor":"{reason}""#));
+            let rec = read();
+            assert_eq!(rec.status, Some(SessionStatus::Waiting));
+            assert_eq!(rec.waiting_for.as_deref(), Some(reason));
+        }
+    }
+
+    /// Lookup by ID needs no directory: the caller already holds the ID and the
+    /// ID is the pin. Liveness still comes from the pid, because a signal death
+    /// leaves the record behind.
+    #[test]
+    fn record_for_session_finds_a_live_record_and_skips_a_dead_pid() {
+        let home = temp("claude_registry_session");
+        let live = std::process::id() as i32;
+        let dead = dead_pid() as i32;
+        install_record(
+            &home,
+            live,
+            &record(live, ID, "/w", LIVE_STARTED, "interactive", ""),
+        );
+        install_record(
+            &home,
+            dead,
+            &record(dead, OTHER, "/elsewhere", LIVE_STARTED, "interactive", ""),
+        );
+
+        assert_eq!(
+            record_for_session(Some(&home), ID).map(|r| r.id).as_deref(),
+            Some(ID)
+        );
+        assert!(
+            record_for_session(Some(&home), OTHER).is_none(),
+            "a dead pid's record is stale"
+        );
+        assert!(record_for_session(Some(&home), "00000000-0000-4000-8000-000000000000").is_none());
+        assert!(record_for_session(Some(&home), "not-a-uuid").is_none());
+        let bare = temp("claude_registry_session_bare");
+        assert!(record_for_session(Some(&bare), ID).is_none());
     }
 
     /// The scraper recovers the exit-hint ID from the corpus terminal bytes.
