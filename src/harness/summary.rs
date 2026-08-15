@@ -676,6 +676,23 @@ fn grok_border_label(row: &str) -> Option<String> {
     (!label.is_empty()).then(|| label.to_string())
 }
 
+// -------------------------------------------------------------------- omp --
+
+/// omp placeholder. The row matchers land in a later phase; returning `None`
+/// from both probes keeps [`select`] resolving for `omp` while its tasks fall
+/// through to the existing preview tiers.
+pub struct OmpSummary;
+
+impl SummaryAdapter for OmpSummary {
+    fn live_preview(&self, _rows: &[String]) -> Option<(String, &'static str)> {
+        None
+    }
+
+    fn model_label(&self, _rows: &[String]) -> Option<String> {
+        None
+    }
+}
+
 #[cfg(test)]
 #[path = "summary_tests.rs"]
 mod tests;

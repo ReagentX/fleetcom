@@ -18,6 +18,7 @@ feed the bytes to the emulator verbatim.
 | `claude_resume.bin` | `claude --session-id`: one prompt, reply, `/exit` | alternate-screen exit followed by the primary-screen resume hint (`claude --resume <uuid>`); the scrape target for harness exit capture |
 | `codex_resume.bin` | `codex resume` | top-anchored DECSTBM scroll regions (`CSI 1;N r`), reverse index, inline-TUI history insertion, and an SGR-split resume hint for harness exit capture |
 | `grok_resume.bin` | `grok --session-id`: one prompt, reply, `/exit` | primary-screen exit followed by the resume hint (`grok --resume <uuid>`); the scrape target for harness exit capture |
+| `omp_resume.bin` | `omp`: one launch, `/exit` | primary-screen exit followed by the resume hint (`omp --resume <uuid>`); the scrape target for harness exit capture. At 143 KB it dwarfs its neighbours: omp's welcome box paints a per-character truecolor gradient logo |
 | `tmux_split.bin` | `tmux` session with two splits and one command per pane | scroll regions, pane borders, full redraws |
 | `vim_session.bin` | `vim -u NONE`: insert, navigate, `:set number`, `:q!` | alternate screen, cursor addressing, line editing |
 | `less_altscreen.bin` | `less` over `/usr/share/dict/words`: page, `G`, `g`, `q` | alternate-screen entry and exit, full-screen paging |
@@ -93,10 +94,10 @@ The fixtures provide evidence for three distinct boundaries:
 - `codex_resume`, `wide_emoji`, `dec_scrollregion`, and `topregion_scroll` pin
   parser semantics: scrollback retention, intensity stacking, charset
   translation, and VS16 width.
-- `claude_resume`, `codex_resume`, and `grok_resume` verify that retained
-  terminal text preserves the exit hints consumed by their harnesses.
+- `claude_resume`, `codex_resume`, `grok_resume`, and `omp_resume` verify that
+  retained terminal text preserves the exit hints consumed by their harnesses.
 
 `src/golden.rs` contains the absolute display and parser expectations.
-`src/harness/claude.rs`, `src/harness/codex.rs`, and `src/harness/grok.rs`
-contain the agent-resume scrape expectations. `src/harness/summary.rs`
-contains the preview-fixture expectations.
+`src/harness/claude.rs`, `src/harness/codex.rs`, `src/harness/grok.rs`, and
+`src/harness/omp.rs` contain the agent-resume scrape expectations.
+`src/harness/summary.rs` contains the preview-fixture expectations.

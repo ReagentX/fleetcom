@@ -18,6 +18,7 @@ pub mod assets;
 mod claude;
 mod codex;
 mod grok;
+mod omp;
 pub mod summary;
 
 use std::{
@@ -33,6 +34,7 @@ pub use codex::Codex;
 pub use grok::Grok;
 #[cfg(test)]
 pub(crate) use grok::encode_cwd;
+pub use omp::Omp;
 
 /// Environment variable naming the capture file used by injected assets.
 pub const CAPTURE_ENV: &str = "FLEETCOM_CAPTURE_FILE";
@@ -148,6 +150,10 @@ static AGENTS: &[Agent] = &[
     Agent {
         harness: &Grok,
         summary: &summary::GrokSummary,
+    },
+    Agent {
+        harness: &Omp,
+        summary: &summary::OmpSummary,
     },
 ];
 
@@ -614,9 +620,13 @@ mod tests {
         assert_eq!(Claude.home_env_var(), "CLAUDE_CONFIG_DIR");
         assert_eq!(Codex.home_env_var(), "CODEX_HOME");
         assert_eq!(Grok.home_env_var(), "GROK_HOME");
+        assert_eq!(Omp.home_env_var(), "PI_CODING_AGENT_DIR");
         assert_eq!(Claude.home_dot_dir(), ".claude");
         assert_eq!(Codex.home_dot_dir(), ".codex");
         assert_eq!(Grok.home_dot_dir(), ".grok");
+        // omp's store sits one level below its config root; both components
+        // reach `home_root`'s join.
+        assert_eq!(Omp.home_dot_dir(), ".omp/agent");
     }
 
     #[test]
