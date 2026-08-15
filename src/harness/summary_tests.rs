@@ -284,6 +284,20 @@ fn claude_title_frames_canonicalize_to_constant_text() {
     let b = ClaudeSummary.normalize_title("✽ Claude Code");
     assert_eq!(a, b, "two frames must normalize identically");
 
+    // Spinner and quadrant-circle frames animate the same title, so the whole
+    // vocabulary must land on one rendered string.
+    let rendered: std::collections::BTreeSet<Option<String>> = CLAUDE_SPINNER
+        .iter()
+        .copied()
+        .chain('\u{25D0}'..='\u{25D3}')
+        .map(|frame| ClaudeSummary.normalize_title(&format!("{frame} Run sleep command")))
+        .collect();
+    assert_eq!(
+        rendered,
+        std::collections::BTreeSet::from([Some("✻ Run sleep command".to_string())]),
+        "spinner and quadrant frames must render one string"
+    );
+
     // A braille frame plus the session summary.
     assert_eq!(
         ClaudeSummary.normalize_title("⠐ Review fleetcom preview design document"),
@@ -321,6 +335,25 @@ fn title_tier_renders_the_normalized_title() {
         (p.text.as_str(), p.source),
         ("✢ Claude Code", PreviewSource::Title),
         "no adapter: verbatim"
+    );
+
+    // The quadrant frames animate a title that carries the task summary, so
+    // the tier renders the summary once rather than alternating with it.
+    let mut quadrant = Emulator::new(24, 80, 100);
+    quadrant.process(
+        b"\x1b[?1049h\x1b]0;\xe2\x97\x90 Run sleep command for 25 seconds\x07conversation body",
+    );
+    let mut st = PreviewState::new();
+    let p = st
+        .resolve(Instant::now(), &quadrant, Some(&ClaudeSummary))
+        .clone();
+    assert_eq!(
+        (p.text.as_str(), p.source, p.rule),
+        (
+            "✻ Run sleep command for 25 seconds",
+            PreviewSource::Title,
+            None
+        )
     );
 }
 
@@ -461,18 +494,49 @@ fn claude_approval_requires_the_dialog_shape() {
 }
 
 /// The model label comes from the welcome box and reads as
-/// `{model} ({effort})`; no box, no label.
+/// `{model} ({effort})`. Both cell spellings are live: the box's left pane is
+/// fixed near 50 columns, so a short model name keeps its trailing `effort`
+/// and a long one loses it to the CLI's own ellipsis. A cut landing inside
+/// the effort word refuses instead of guessing. No box, no label.
 #[test]
 fn claude_label_reads_the_welcome_box() {
-    let boxed = rs(&[
-        "╭─── Claude Code v2.1.215 ────────────╮",
-        "│ Fable 5 with high effort · Claude Max ·  │ notes │",
-        "╰──────────────────────────────────────╯",
-    ]);
-    assert_eq!(
-        ClaudeSummary.model_label(&boxed),
-        Some("Fable 5 (high)".to_string())
-    );
+    let boxed = |cell: &str| {
+        rs(&[
+            "╭─── Claude Code v2.1.233 ────────────╮",
+            cell,
+            "╰──────────────────────────────────────╯",
+        ])
+    };
+    // Verbatim from a live session, and byte-identical at 100 and 160
+    // columns: the left pane is fixed near 50 columns, so a model name that
+    // overruns it truncates at every terminal width.
+    let fixed_pane = "│ Opus 5 (1M context) with high… · Claude Max ·      │ Added opt-in memory cgroup support for Bas… │";
+    for (cell, want) in [
+        (
+            "│ Fable 5 with high effort · Claude Max ·  │ notes │",
+            Some("Fable 5 (high)"),
+        ),
+        // Parentheses in the model name double up under the
+        // `{model} ({effort})` contract. Deliberate: the contract is applied
+        // as written.
+        (
+            "│ Opus 5 (1M context) with high effort · Claude Max ·  │ notes │",
+            Some("Opus 5 (1M context) (high)"),
+        ),
+        (fixed_pane, Some("Opus 5 (1M context) (high)")),
+        // `hi` is a cut through the effort word, not a level; `(hi)` would
+        // name an effort the session is not running at.
+        ("│ Opus 5 (1M context) with hi… │ notes │", None),
+        ("│ Opus 5 (1M context) with … │ notes │", None),
+        // Neither spelling: no trailing `effort`, no ellipsis.
+        ("│ Some Model with high │ notes │", None),
+    ] {
+        assert_eq!(
+            ClaudeSummary.model_label(&boxed(cell)),
+            want.map(str::to_string),
+            "{cell:?}"
+        );
+    }
     assert_eq!(ClaudeSummary.model_label(&rs(&["no box here"])), None);
 }
 

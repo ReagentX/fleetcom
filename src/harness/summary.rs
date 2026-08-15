@@ -118,13 +118,20 @@ impl SummaryAdapter for ClaudeSummary {
         claude_welcome_label(rows)
     }
 
-    /// Canonicalize a leading claude spinner or braille frame to `✻` so title
-    /// animation does not change the rendered text. Other titles pass through
-    /// unchanged.
+    /// Canonicalize a leading claude spinner, braille, or quadrant-circle
+    /// frame to `✻` so title animation does not change the rendered text.
+    /// Other titles pass through unchanged.
     fn normalize_title(&self, title: &str) -> Option<String> {
         let mut chars = title.chars();
         let frame = chars.next()?;
-        let framed = CLAUDE_SPINNER.contains(&frame) || ('\u{2800}'..='\u{28FF}').contains(&frame);
+        // An animation frame set is only neutralized when every member
+        // collapses to one rendered string; a frame left out reanimates the
+        // title. The quadrant circles are taken as the whole contiguous
+        // block for that reason: `◐` and `◑` are the observed pair, and the
+        // other two cost nothing to cover ahead of a four-phase cycle.
+        let framed = CLAUDE_SPINNER.contains(&frame)
+            || ('\u{2800}'..='\u{28FF}').contains(&frame)
+            || ('\u{25D0}'..='\u{25D3}').contains(&frame);
         (framed && chars.next()? == ' ').then(|| format!("✻ {}", chars.as_str()))
     }
 }
@@ -267,6 +274,12 @@ fn claude_approval(rows: &[String]) -> Option<(String, &'static str)> {
         .then(|| ("awaiting approval".to_string(), "claude:approval-menu"))
 }
 
+/// The levels claude documents for `--effort`. A truncated cell is only
+/// trusted when its effort token is a complete member: `with hi…` is a cut
+/// landing inside the word, and rendering `(hi)` would state an effort the
+/// session is not running at.
+const CLAUDE_EFFORT: &[&str] = &["low", "medium", "high", "xhigh", "max"];
+
 /// `Fable 5 with high effort` from the welcome box → `Fable 5 (high)`. The
 /// welcome box is the stable source; user-configurable statusline rows are not
 /// parsed. When the box scrolls away, the label is unavailable.
@@ -284,15 +297,33 @@ fn claude_welcome_label(rows: &[String]) -> Option<String> {
             continue;
         };
         let head = cell.trim().split(" · ").next().unwrap_or("");
-        if let Some(model_effort) = head.strip_suffix(" effort")
-            && let Some((model, effort)) = model_effort.rsplit_once(" with ")
-            && !model.is_empty()
-            && !effort.is_empty()
-        {
-            return Some(format!("{model} ({effort})"));
+        if let Some(label) = claude_model_effort(head) {
+            return Some(label);
         }
     }
     None
+}
+
+/// `Fable 5 with high effort` → `Fable 5 (high)`, and the same for the
+/// spelling the CLI truncates itself: `Opus 5 (1M context) with high…`. The
+/// welcome box's left pane is fixed near 50 columns whatever the terminal
+/// width, so a model name that overruns the pane loses its trailing ` effort`
+/// to the CLI's own ellipsis and no terminal is wide enough to bring it back.
+/// The full spelling needs no vocabulary check — the trailing word proves the
+/// token is whole — while the truncated one is refused unless the token is a
+/// complete [`CLAUDE_EFFORT`] level. A model name carrying its own
+/// parentheses reads as `Opus 5 (1M context) (high)`; the
+/// `{model} ({effort})` contract is applied as written rather than
+/// special-cased.
+fn claude_model_effort(head: &str) -> Option<String> {
+    let (model, effort) = match head.strip_suffix(" effort") {
+        Some(full) => full.rsplit_once(" with ")?,
+        None => {
+            let (model, effort) = head.strip_suffix('…')?.rsplit_once(" with ")?;
+            CLAUDE_EFFORT.contains(&effort).then_some((model, effort))?
+        }
+    };
+    (!model.is_empty() && !effort.is_empty()).then(|| format!("{model} ({effort})"))
 }
 
 // ----------------------------------------------------------------- codex --
