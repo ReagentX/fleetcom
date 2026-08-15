@@ -1,11 +1,12 @@
 //! omp cannot pin a session ID at launch: it has no `--session-id` flag, and
 //! `--resume` rejects an ID that does not already exist, so a pinned UUID would
 //! name a session the resume command could never reach. Capture therefore has
-//! to come from omp itself — instrumentation in a later phase, and meanwhile
-//! the hint it prints to stderr on exit, `Resume this session with omp
-//! --resume <uuid>`. A crash repeats the same command inside a `[Recovery]`
-//! block as `Main: omp --resume <uuid>`; both carry the command substring, so
-//! one matcher reads both.
+//! to come from omp itself, through two channels. Live: `-e` loads an
+//! extension module in omp's own process, and its `session_start` and
+//! `session_switch` handlers write the ID to the capture file. At exit: the
+//! hint omp prints, `Resume this session with omp --resume <uuid>`. A crash
+//! repeats the same command inside a `[Recovery]` block as `Main: omp --resume
+//! <uuid>`; both carry the command substring, so one matcher reads both.
 //!
 //! omp's IDs are UUIDv7. [`is_uuid`](super::is_uuid) validates the 8-4-4-4-12
 //! lowercase-hex shape and not the version field, so they pass unchanged.
@@ -34,7 +35,10 @@ use std::{
     time::SystemTime,
 };
 
-use super::{CapturePaths, Harness, Invocation, SpawnPlan, is_uuid, last_hint, within_window_ms};
+use super::{
+    CAPTURE_ENV, CapturePaths, Harness, Invocation, SpawnPlan, is_uuid, last_hint, shell_quote,
+    within_window_ms,
+};
 
 pub struct Omp;
 
@@ -116,22 +120,42 @@ impl Harness for Omp {
         ("omp", "--resume")
     }
 
+    /// Load the capture extension with `-e`, which omp accepts on both shapes
+    /// and applies silently: no trust prompt, and the module is *appended* to
+    /// the user's own extensions. `--trusted-extension` would fit the same
+    /// slot and must never be used — it is mutually exclusive with `-e` and
+    /// replaces the user's entire extension discovery, omp's own bridges
+    /// included.
     fn instrument(
         &self,
-        // Nothing distinguishes the two accepted shapes yet: omp cannot pin an
-        // ID at launch, and no capture channel is injected.
+        // Both accepted shapes take the same injection: omp has no
+        // `--session-id`, so neither can pin an ID and only the extension
+        // reports one.
         _inv: &Invocation,
-        _capture: &CapturePaths,
+        capture: &CapturePaths,
+        // The module is self-contained and reads nothing from the store.
         _home: Option<&Path>,
     ) -> SpawnPlan {
-        // Capture injection lands in a later phase. Until then the command
-        // runs unmodified and `scrape_exit` is the only channel.
-        SpawnPlan::default()
+        SpawnPlan {
+            args_suffix: format!(
+                " -e {}",
+                shell_quote(&capture.omp_capture.to_string_lossy())
+            ),
+            env: vec![(
+                CAPTURE_ENV.into(),
+                capture.capture_file.clone().into_os_string(),
+            )],
+            injected_id: None,
+        }
     }
 
-    /// No capture channel is injected yet, so no payload is ever trusted.
-    fn parse_capture(&self, _payload: &str) -> Option<String> {
-        None
+    /// Read the ID out of the extension's payload. The module writes one JSON
+    /// object per event; anything else on that path came from somewhere else
+    /// and is discarded.
+    fn parse_capture(&self, payload: &str) -> Option<String> {
+        let v = jzon::parse(payload).ok()?;
+        let id = v["sessionId"].as_str()?;
+        is_uuid(id).then(|| id.to_string())
     }
 
     fn scrape_exit(&self, text: &str) -> Option<String> {
@@ -250,6 +274,8 @@ mod tests {
     const SPAWN_MS: u64 = 1_786_000_000_000;
     /// Working directory recorded in the generated headers.
     const CWD: &str = "/work/proj";
+    /// The ID omp 17.3.4 reported through the extension on 2026-08-15.
+    const CAPTURED: &str = "01a0077c-e18e-7000-ae0b-016f4834b6e9";
 
     fn spawned() -> SystemTime {
         SystemTime::UNIX_EPOCH + Duration::from_millis(SPAWN_MS)
@@ -318,23 +344,51 @@ mod tests {
         assert_all_opaque(&Omp, ID, &opaque);
     }
 
-    /// Neither accepted shape gains an ID: omp has no `--session-id`, so a
-    /// pinned UUID would name a session `--resume` cannot reach.
+    /// Both accepted shapes load the extension and name the capture file, and
+    /// neither gains an ID: omp has no `--session-id`, so a pinned UUID would
+    /// name a session `--resume` cannot reach. The fixture's asset path
+    /// carries a space, so the quoting has to hold it to one word.
     #[test]
-    fn instrument_pins_no_id_for_either_accepted_shape() {
+    fn instrument_loads_the_extension_for_either_accepted_shape() {
         for cmd in ["omp".to_string(), format!("omp --resume {ID}")] {
             let inv = Omp.detect(&cmd).unwrap();
             let plan = Omp.instrument(&inv, &paths(), None);
-            assert!(plan.injected_id.is_none(), "{cmd}");
-            assert_eq!(plan, SpawnPlan::default(), "{cmd}");
+            assert_eq!(plan.injected_id, None, "{cmd}");
+            assert_eq!(
+                plan.args_suffix, " -e '/tmp/Application Support/omp-capture.js'",
+                "{cmd}"
+            );
+            assert_eq!(
+                plan.env,
+                vec![(
+                    CAPTURE_ENV.into(),
+                    PathBuf::from("/tmp/cap/session.json").into_os_string()
+                )],
+                "{cmd}"
+            );
         }
     }
 
+    /// The extension's payload yields an ID only when it validates; every
+    /// other payload on that path came from somewhere else.
     #[test]
-    fn parse_capture_is_unconditionally_none() {
-        // No injected channel exists, so no payload is ever trusted.
-        let payload = format!(r#"{{"session_id":"{ID}"}}"#);
-        assert_eq!(Omp.parse_capture(&payload), None);
+    fn parse_capture_returns_only_strict_ids() {
+        for reason in ["session_start", "session_switch"] {
+            let payload = format!(
+                r#"{{"reason":"{reason}","sessionId":"{CAPTURED}","sessionFile":"/s/2026-08-15T22-13-39-854Z_{CAPTURED}.jsonl","cwd":"/work/proj"}}"#
+            );
+            assert_eq!(Omp.parse_capture(&payload).as_deref(), Some(CAPTURED));
+        }
+
+        assert_eq!(Omp.parse_capture("not json"), None);
+        assert_eq!(Omp.parse_capture("{}"), None);
+        assert_eq!(Omp.parse_capture(r#"{"sessionId":"my session"}"#), None);
+        assert_eq!(Omp.parse_capture(r#"{"sessionId":"x'; rm -rf ~'"}"#), None);
+        // Uppercase hex is not the canonical form omp writes.
+        assert_eq!(
+            Omp.parse_capture(&format!(r#"{{"sessionId":"{}"}}"#, CAPTURED.to_uppercase())),
+            None
+        );
         assert_eq!(Omp.parse_capture(""), None);
     }
 

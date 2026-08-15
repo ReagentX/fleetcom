@@ -204,6 +204,9 @@ pub struct CapturePaths {
     pub claude_settings: PathBuf,
     /// Program installed through `codex`'s `notify` config override.
     pub codex_notify: PathBuf,
+    /// Extension module loaded by `omp -e`, which appends to the user's own
+    /// extensions rather than replacing them.
+    pub omp_capture: PathBuf,
 }
 
 /// Spawn-time additions for one instrumented launch.
@@ -371,13 +374,14 @@ pub(crate) mod fixtures {
     /// A second distinct ID for last-hint, requote, and ambiguity cases.
     pub(crate) const OTHER: &str = "11111111-2222-4333-8444-555555555555";
 
-    /// Capture-path fixture. The spaced `claude_settings` and `codex_notify`
-    /// paths keep the shell- and TOML-quoting assertions honest.
+    /// Capture-path fixture. The spaced asset paths keep the shell- and
+    /// TOML-quoting assertions honest.
     pub(super) fn paths() -> CapturePaths {
         CapturePaths {
             capture_file: PathBuf::from("/tmp/cap/session.json"),
             claude_settings: PathBuf::from("/tmp/Application Support/fleetcom.json"),
             codex_notify: PathBuf::from("/tmp/Application Support/notify.sh"),
+            omp_capture: PathBuf::from("/tmp/Application Support/omp-capture.js"),
         }
     }
 

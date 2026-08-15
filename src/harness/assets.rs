@@ -21,6 +21,11 @@
 //!   newline-joined argv with the payload appended, so the displaced notifier
 //!   receives the same final argument `codex` would have passed; otherwise
 //!   exit 0.
+//! - `omp`: `-e <omp-capture.js>` loads an extension module inside the agent's
+//!   own process, appending to the user's extensions rather than replacing
+//!   them. Its `session_start` and `session_switch` handlers write the session
+//!   id as JSON over `$FLEETCOM_CAPTURE_FILE`, skip the write when that
+//!   variable is unset or empty, and swallow every error.
 
 use std::{
     fs, io,
@@ -51,6 +56,38 @@ IFS='
 set -f
 set -- $FLEETCOM_NOTIFY_CHAIN "$1"
 exec "$@"
+"#;
+
+/// Extension module injected into `omp`. omp resolves the factory as
+/// `typeof module === "function" ? module : module.default`, so the default
+/// export is the subscription point. The module is imported, never executed,
+/// so it needs no executable bit. `session_switch` matters as much as
+/// `session_start`: the user can change session inside the TUI with `/resume`,
+/// and the capture must follow.
+const OMP_CAPTURE_MODULE: &str = r#"import * as fs from "node:fs";
+
+function write(ctx, reason) {
+  const path = process.env.FLEETCOM_CAPTURE_FILE;
+  if (!path) return;
+  try {
+    fs.writeFileSync(
+      path,
+      JSON.stringify({
+        reason,
+        sessionId: ctx.sessionManager.getSessionId(),
+        sessionFile: ctx.sessionManager.getSessionFile(),
+        cwd: ctx.cwd,
+      }),
+    );
+  } catch {
+    // Best effort: a capture failure must never take the session down.
+  }
+}
+
+export default function (pi) {
+  pi.on("session_start", (_e, ctx) => write(ctx, "session_start"));
+  pi.on("session_switch", (_e, ctx) => write(ctx, "session_switch"));
+}
 "#;
 
 /// Build the `claude` settings overlay containing the `SessionStart` hook.
@@ -130,13 +167,15 @@ pub struct CaptureAssets {
     dir: PathBuf,
     claude_settings: PathBuf,
     codex_notify: PathBuf,
+    omp_capture: PathBuf,
 }
 
 impl CaptureAssets {
     /// Create `root` and a private `<root>/<pid>-<nonce>` namespace. The
-    /// namespace uses mode `0700`; its Claude settings use `0600`, and its
-    /// executable Codex notifier uses `0700`. Dead-owner namespaces are reaped
-    /// before the new namespace is created; other root entries remain.
+    /// namespace uses mode `0700`; its Claude settings and omp module use
+    /// `0600`, and its executable Codex notifier uses `0700`. Dead-owner
+    /// namespaces are reaped before the new namespace is created; other root
+    /// entries remain.
     pub fn install(root: &Path, pid: u32) -> io::Result<Self> {
         fs::DirBuilder::new()
             .recursive(true)
@@ -168,10 +207,16 @@ impl CaptureAssets {
         fs::write(&codex_notify, CODEX_NOTIFY_SCRIPT)?;
         fs::set_permissions(&codex_notify, fs::Permissions::from_mode(0o700))?;
 
+        // omp imports this module; it never execs it, so it stays 0600.
+        let omp_capture = dir.join("omp-capture.js");
+        fs::write(&omp_capture, OMP_CAPTURE_MODULE)?;
+        fs::set_permissions(&omp_capture, fs::Permissions::from_mode(0o600))?;
+
         Ok(Self {
             dir,
             claude_settings,
             codex_notify,
+            omp_capture,
         })
     }
 
@@ -182,6 +227,7 @@ impl CaptureAssets {
             capture_file: self.dir.join(format!("task-{task_id}-{run}.json")),
             claude_settings: self.claude_settings.clone(),
             codex_notify: self.codex_notify.clone(),
+            omp_capture: self.omp_capture.clone(),
         }
     }
 }
@@ -252,8 +298,11 @@ mod tests {
         assert_eq!(mode(&ns), 0o700);
         assert_eq!(assets.claude_settings, ns.join("claude-settings.json"));
         assert_eq!(assets.codex_notify, ns.join("codex-notify.sh"));
+        assert_eq!(assets.omp_capture, ns.join("omp-capture.js"));
         assert_eq!(mode(&assets.claude_settings), 0o600);
         assert_eq!(mode(&assets.codex_notify), 0o700);
+        // omp imports the module rather than executing it.
+        assert_eq!(mode(&assets.omp_capture), 0o600);
     }
 
     /// Installation creates a distinct namespace, reapplies the root mode, and
@@ -597,5 +646,31 @@ mod tests {
         );
         assert_eq!(paths.claude_settings, ns.join("claude-settings.json"));
         assert_eq!(paths.codex_notify, ns.join("codex-notify.sh"));
+        assert_eq!(paths.omp_capture, ns.join("omp-capture.js"));
+    }
+
+    /// The installed module carries every piece omp's loader and the capture
+    /// contract depend on. The assertion is deliberately static: omp ships as
+    /// a self-contained binary, so neither `bun` nor `node` is guaranteed on
+    /// `PATH`, and a runtime-gated test would skip silently and read as a
+    /// pass. The module itself was run against omp 17.3.4 on 2026-08-15 and
+    /// wrote the capture file on both accepted command shapes.
+    #[test]
+    fn omp_module_carries_its_load_bearing_pieces() {
+        let root = temp("assets_omp_module");
+        let assets = CaptureAssets::install(&root, std::process::id()).unwrap();
+        let text = fs::read_to_string(&assets.omp_capture).unwrap();
+        for piece in [
+            // omp resolves the factory through `module.default`.
+            "export default",
+            // A launch subscribes once; `/resume` inside the TUI fires again.
+            "session_start",
+            "session_switch",
+            CAPTURE_ENV,
+            // The guard that keeps a capture failure off the user's session.
+            "catch",
+        ] {
+            assert!(text.contains(piece), "the module must carry {piece:?}");
+        }
     }
 }
