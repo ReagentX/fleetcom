@@ -56,6 +56,17 @@ pub trait Harness: Sync {
     /// The tool's directory name under the launched process's `$HOME`.
     fn home_dot_dir(&self) -> &'static str;
 
+    /// Resolve the tool's store root from the launch environment. `env` reads
+    /// one variable from that environment and returns `None` when it is unset;
+    /// an unset value and an empty one stay distinguishable, which omp's
+    /// resolution depends on. The default is the two-step rule every harness
+    /// but omp follows: the tool-specific override, else `$HOME` joined with
+    /// the dot directory. Neither step reaching a value returns `None` so the
+    /// harness can still apply its platform-home fallback in `home_root`.
+    fn resolve_home(&self, env: &dyn Fn(&str) -> Option<PathBuf>) -> Option<PathBuf> {
+        env(self.home_env_var()).or_else(|| Some(env("HOME")?.join(self.home_dot_dir())))
+    }
+
     /// Resolve the tool's home root. `home` follows the `instrument` contract:
     /// falling back to this process's home happens only when the launch
     /// environment supplied neither the tool-specific override nor `HOME`.
@@ -620,13 +631,15 @@ mod tests {
         assert_eq!(Claude.home_env_var(), "CLAUDE_CONFIG_DIR");
         assert_eq!(Codex.home_env_var(), "CODEX_HOME");
         assert_eq!(Grok.home_env_var(), "GROK_HOME");
-        assert_eq!(Omp.home_env_var(), "PI_CODING_AGENT_DIR");
+        // omp's "home" is its sessions root, and `PI_CODING_AGENT_SESSION_DIR`
+        // is the one variable that names it verbatim.
+        assert_eq!(Omp.home_env_var(), "PI_CODING_AGENT_SESSION_DIR");
         assert_eq!(Claude.home_dot_dir(), ".claude");
         assert_eq!(Codex.home_dot_dir(), ".codex");
         assert_eq!(Grok.home_dot_dir(), ".grok");
-        // omp's store sits one level below its config root; both components
-        // reach `home_root`'s join.
-        assert_eq!(Omp.home_dot_dir(), ".omp/agent");
+        // omp resolves to its sessions root, two levels below the config
+        // root; every component reaches `home_root`'s join.
+        assert_eq!(Omp.home_dot_dir(), ".omp/agent/sessions");
     }
 
     #[test]
