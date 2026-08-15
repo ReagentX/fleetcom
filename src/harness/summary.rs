@@ -13,8 +13,8 @@
 //! To avoid treating it as live status, every matcher:
 //!
 //! 1. locates the chrome region structurally (claude's separator-pair input
-//!    box, codex's status bar and composer, grok's bordered input box) and
-//!    limits status candidates relative to it;
+//!    box, codex's composer and configured status line, grok's bordered
+//!    input box) and limits status candidates relative to it;
 //! 2. returns `None` when the expected structure is absent or inconsistent;
 //! 3. matches row prefixes so status rows truncated with an ellipsis at narrow
 //!    widths remain recognizable. A wrapped row fails the structural check.
