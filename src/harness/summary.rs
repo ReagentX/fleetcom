@@ -676,31 +676,33 @@ fn grok_border_label(row: &str) -> Option<String> {
     (!label.is_empty()).then(|| label.to_string())
 }
 
-// -------------------------------------------------------------------- omp --
+// ------------------------------------------------------------------- omp --
 
-/// Accepted omp spinner frames: the default unicode/nerd braille cycle
-/// (`⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏`, taken as the whole braille block) and the ascii preset's
-/// `-\|/`. The set is themeable and the ascii frames are ordinary
-/// punctuation, so a frame alone never makes a row status; the bracketed
-/// interrupt hint on the same row does.
+/// Accepted omp spinner frames: the braille cycle `⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏`, taken as
+/// the whole braille block, which is what both anchoring presets paint. A
+/// frame alone never makes a row status; the bracketed interrupt hint on the
+/// same row does.
 ///
-/// The ascii frames reach this matcher only through a custom theme, which
-/// overrides `symbols.spinnerFrames` and each symbol key independently of the
-/// preset: the ascii preset's own box glyphs never anchor (see [`OmpSummary`]),
-/// so ascii frames can only arrive on a screen whose box glyphs stayed unicode.
+/// The ascii preset's `-\|/` are not accepted. They could only arrive on a
+/// screen whose box glyphs stayed unicode — a hand-mixed theme — because the
+/// ascii preset's own corners never anchor (see [`OmpSummary`]), and ordinary
+/// punctuation is too weak a signal to carry for that.
 fn omp_frame(c: char) -> bool {
-    ('\u{2800}'..='\u{28FF}').contains(&c) || matches!(c, '-' | '\\' | '|' | '/')
+    ('\u{2800}'..='\u{28FF}').contains(&c)
 }
 
 /// The interrupt hint closing omp's status row, one spelling per bracket
-/// theme: unicode, nerd, ascii. The inner word is always `esc`. `[esc]` is
-/// reachable on an anchoring screen only through the same per-key custom
-/// override that reaches the ascii frames.
-const OMP_HINTS: &[&str] = &["⟦esc⟧", "⟨esc⟩", "[esc]"];
+/// theme: unicode and nerd. The inner word is always `esc`. The ascii `[esc]`
+/// is omitted for the same reason as the ascii frames: it is unreachable
+/// without a hand-mixed theme.
+const OMP_HINTS: &[&str] = &["⟦esc⟧", "⟨esc⟩"];
 
 /// The marker on the selector's chosen row, one spelling per symbol preset:
 /// unicode, nerd (a private-use nerd-font codepoint), ascii. omp renders the
-/// row as `{nav.cursor} {label}`.
+/// row as `{nav.cursor} {label}`. Unlike the frames and the hint, `>` is
+/// reachable under the stock ascii preset — the selector is plain text and
+/// needs no box to anchor — and [`omp_approve_row`]'s exact match bounds what
+/// that costs.
 const OMP_CURSORS: &[&str] = &["❯", "\u{f054}", ">"];
 
 /// omp (inline UI, primary screen). The pin is its two-row input box: a
@@ -715,8 +717,9 @@ const OMP_CURSORS: &[&str] = &["❯", "\u{f054}", ">"];
 /// horizontal as `-`, which no test can tell from a table, rule, or diagram in
 /// the transcript, so the status row degrades to the floor tier there by
 /// design — a stale scrollback row reported as live status is the worse
-/// outcome. The selector still matches under ascii: its shape is plain text
-/// and needs no box.
+/// outcome. That is why the status matcher carries no ascii spellings at all.
+/// The selector is the exception: its shape is plain text and needs no box, so
+/// it still matches under ascii.
 pub struct OmpSummary;
 
 impl SummaryAdapter for OmpSummary {

@@ -153,7 +153,7 @@ The attached status bar shows both: `[attached] api tests · cargo watch -x test
 | `<sessions>/<name>.json` | `0600` | directories, commands, groups, display names |
 | `<sessions>/recovery/` | `0700` | [automatic snapshots](sessions.md#recovery) |
 | `<sessions>/recovery/<snapshot>.json` | `0600` | one automatic session recipe |
-| `<capture-root>/<pid>-<nonce>/` | `0700` | [agent hook and notifier assets plus per-run capture payloads](agent-resume.md#capture-state-and-isolation) |
+| `<capture-root>/<pid>-<nonce>/` | `0700` | [agent hook, notifier, and extension-module assets plus per-run capture payloads](agent-resume.md#capture-state-and-isolation) |
 
 Saves are atomic: `fleetcom` writes a mode-`0600` temporary file in the destination directory, syncs it, then renames it over the target. This does not expose a partial or world-readable recipe. New session and recovery directories use mode `0700`; each save also removes group and other permissions from the destination directory.
 

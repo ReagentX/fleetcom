@@ -329,6 +329,10 @@ mod tests {
             CODEX_NOTIFY_SCRIPT
         );
         assert_eq!(
+            fs::read_to_string(&second.omp_capture).unwrap(),
+            OMP_CAPTURE_MODULE
+        );
+        assert_eq!(
             fs::read_to_string(&first.claude_settings).unwrap(),
             "garbage",
             "install must never write into an earlier namespace"
@@ -336,6 +340,7 @@ mod tests {
         assert_eq!(mode(&root), 0o700);
         assert_eq!(mode(&second.claude_settings), 0o600);
         assert_eq!(mode(&second.codex_notify), 0o700);
+        assert_eq!(mode(&second.omp_capture), 0o600);
     }
 
     /// Installation retains live-owner namespaces and non-namespace entries.
@@ -380,6 +385,7 @@ mod tests {
         fs::write(stale.join("task-1-0.json"), "predecessor").unwrap();
         fs::write(stale.join("claude-settings.json"), "old settings").unwrap();
         fs::write(stale.join("codex-notify.sh"), "old script").unwrap();
+        fs::write(stale.join("omp-capture.js"), "old module").unwrap();
 
         let assets = CaptureAssets::install(&root, std::process::id()).unwrap();
         let ns = namespace(&assets, &root);
@@ -399,12 +405,20 @@ mod tests {
             "old script"
         );
         assert_eq!(
+            fs::read_to_string(stale.join("omp-capture.js")).unwrap(),
+            "old module"
+        );
+        assert_eq!(
             fs::read_to_string(&assets.claude_settings).unwrap(),
             claude_settings_json()
         );
         assert_eq!(
             fs::read_to_string(&assets.codex_notify).unwrap(),
             CODEX_NOTIFY_SCRIPT
+        );
+        assert_eq!(
+            fs::read_to_string(&assets.omp_capture).unwrap(),
+            OMP_CAPTURE_MODULE
         );
         assert_eq!(mode(&ns), 0o700);
     }
@@ -647,30 +661,5 @@ mod tests {
         assert_eq!(paths.claude_settings, ns.join("claude-settings.json"));
         assert_eq!(paths.codex_notify, ns.join("codex-notify.sh"));
         assert_eq!(paths.omp_capture, ns.join("omp-capture.js"));
-    }
-
-    /// The installed module carries every piece omp's loader and the capture
-    /// contract depend on. The assertion is deliberately static: omp ships as
-    /// a self-contained binary, so neither `bun` nor `node` is guaranteed on
-    /// `PATH`, and a runtime-gated test would skip silently and read as a
-    /// pass. The module itself was run against omp 17.3.4 on 2026-08-15 and
-    /// wrote the capture file on both accepted command shapes.
-    #[test]
-    fn omp_module_carries_its_load_bearing_pieces() {
-        let root = temp("assets_omp_module");
-        let assets = CaptureAssets::install(&root, std::process::id()).unwrap();
-        let text = fs::read_to_string(&assets.omp_capture).unwrap();
-        for piece in [
-            // omp resolves the factory through `module.default`.
-            "export default",
-            // A launch subscribes once; `/resume` inside the TUI fires again.
-            "session_start",
-            "session_switch",
-            CAPTURE_ENV,
-            // The guard that keeps a capture failure off the user's session.
-            "catch",
-        ] {
-            assert!(text.contains(piece), "the module must carry {piece:?}");
-        }
     }
 }

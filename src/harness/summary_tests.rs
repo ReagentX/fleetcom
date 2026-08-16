@@ -1513,29 +1513,27 @@ fn omp_selector_row(approve: &str, head: &str) -> Vec<String> {
     ])
 }
 
-/// The intent phrase survives verbatim across every bracket theme and both
-/// spinner presets, the CLI's own truncating ellipsis included.
+/// The intent phrase survives verbatim across both anchoring bracket themes,
+/// the CLI's own truncating ellipsis included.
 #[test]
 fn omp_status_row_extracts_the_intent_phrase() {
     let probe = |row: &str| OmpSummary.live_preview(&omp_screen(&[row, ""]));
-    for hint in ["⟦esc⟧", "⟨esc⟩", "[esc]"] {
+    for hint in ["⟦esc⟧", "⟨esc⟩"] {
         assert_eq!(
             probe(&format!(" ⠴ Listing directory contents {hint}")),
             Some(("Listing directory contents".to_string(), "omp:spinner")),
             "{hint:?}"
         );
     }
-    // The ascii frames and hint, on the only screen that can carry them: a
-    // custom theme overriding those keys over unicode box glyphs, since the
-    // ascii preset's own box never anchors. Plus omp's default phrase, used
-    // when the model streams no intent of its own.
-    for frame in ['-', '\\', '|', '/'] {
-        assert_eq!(
-            probe(&format!(" {frame} Working… [esc]")),
-            Some(("Working…".to_string(), "omp:spinner")),
-            "{frame:?}"
-        );
-    }
+    // omp's default phrase, used when the model streams no intent of its own.
+    assert_eq!(
+        probe(" ⠹ Working… ⟦esc⟧"),
+        Some(("Working…".to_string(), "omp:spinner"))
+    );
+    // The ascii spellings are refused outright: neither the frame nor the
+    // bracket can reach an anchoring screen without a hand-mixed theme.
+    assert_eq!(probe(" - Working… [esc]"), None);
+    assert_eq!(probe(" ⠹ Working… [esc]"), None);
     assert_eq!(
         probe(" ⠋ Reading the fixture corpus rea… ⟦esc⟧"),
         Some(("Reading the fixture corpus rea…".to_string(), "omp:spinner")),
@@ -1654,10 +1652,8 @@ fn omp_approval_accepts_every_cursor_preset() {
 /// The ascii preset cannot anchor and is not meant to: its box corners are `+`
 /// and its horizontal `-`, which no test tells apart from a table or a rule,
 /// so the status row degrades to the floor tier rather than risk reporting a
-/// scrollback row as live. The ascii frames and the `[esc]` hint the matcher
-/// carries stay reachable through a custom theme, which overrides
-/// `symbols.spinnerFrames` and each symbol key independently of the preset —
-/// the mixed screen the phrase test builds.
+/// scrollback row as live. Its status row carries no ascii spelling either, so
+/// this screen fails both checks at once — the box is what the test pins.
 #[test]
 fn omp_ascii_box_glyphs_do_not_anchor() {
     let ascii_box = rs(&[
