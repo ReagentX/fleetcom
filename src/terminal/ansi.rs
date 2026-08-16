@@ -217,7 +217,9 @@ pub fn formatted<T>(term: &Term<T>) -> (Vec<u8>, (u16, u16), bool) {
 /// the display offset. Paired wide-char spacers are skipped so wide glyphs
 /// appear once; zero-width marks ride their base character; `'\t'` cells,
 /// concealed (SGR 8) cells, and orphaned wide halves read as the blank the
-/// replayed screen shows; trailing spaces are trimmed per row.
+/// replayed screen shows; trailing spaces are trimmed per row. The blanking
+/// is display policy: the emulator's scan-side reader (`push_row_glyphs`)
+/// deliberately keeps those glyphs for harness matchers.
 pub fn contents<T>(term: &Term<T>) -> String {
     let grid = term.grid();
     let cols = grid.columns();
