@@ -53,7 +53,9 @@ pub trait Harness: Sync {
     /// resolves it from the launch context used for instrumentation or save.
     fn home_env_var(&self) -> &'static str;
 
-    /// The tool's directory name under the launched process's `$HOME`.
+    /// The tool's store path relative to the launched process's `$HOME`. Most
+    /// tools name one dot directory; omp reaches its store three components
+    /// down, and `home_root`'s join keeps every one of them.
     fn home_dot_dir(&self) -> &'static str;
 
     /// Resolve the tool's store root from the launch environment. `env` reads
