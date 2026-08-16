@@ -14,7 +14,7 @@ use std::{
 
 use super::{
     CAPTURE_ENV, CapturePaths, Harness, Invocation, NOTIFY_CHAIN_ENV, SpawnPlan, is_uuid,
-    last_hint, leading_uuid, shell_quote, within_window_ms,
+    last_hint, leading_uuid, shell_quote, v7_millis, within_window_ms,
 };
 
 pub struct Codex;
@@ -293,15 +293,6 @@ fn toml_escape(s: &str) -> String {
         }
     }
     out
-}
-
-/// Extract the millisecond timestamp from a validated v7 UUID. Other versions
-/// return `None`.
-fn v7_millis(id: &str) -> Option<u64> {
-    if id.as_bytes()[14] != b'7' {
-        return None;
-    }
-    u64::from_str_radix(&format!("{}{}", &id[..8], &id[9..13]), 16).ok()
 }
 
 /// Check the rollout's first record for a matching `cwd` and no explicit

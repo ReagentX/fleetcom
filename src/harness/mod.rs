@@ -352,6 +352,16 @@ fn within_window_ms(a: u128, b: u128) -> bool {
     a.abs_diff(b) <= CORRELATE_WINDOW.as_millis()
 }
 
+/// Milliseconds embedded in the first 48 bits of a UUIDv7: the session's
+/// creation instant. `None` when `id` is not v7. `id` must already satisfy
+/// [`is_uuid`], which fixes its length and alphabet.
+fn v7_millis(id: &str) -> Option<u64> {
+    if id.as_bytes()[14] != b'7' {
+        return None;
+    }
+    u64::from_str_radix(&format!("{}{}", &id[..8], &id[9..13]), 16).ok()
+}
+
 /// Single-quote `s` for `$SHELL -c`, encoding embedded `'` as `'\''`.
 fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
