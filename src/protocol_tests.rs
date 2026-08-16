@@ -2,7 +2,12 @@ use super::*;
 
 /// Every command survives encode→frame-payload→decode unchanged, including
 /// the `Watch{None}` null, raw `Input` bytes (0 and 255), and the no-field
-/// `Shutdown`.
+/// `Shutdown`. Also the exhaustiveness gate for `Command`: encode is a
+/// compiler-exhaustive match, but decode's string match falls through to
+/// `None`, so a variant missing its decode arm would ship encoding fine and
+/// silently drop on decode. `variant_index` makes a new variant a compile
+/// error here until it gains an arm, and the coverage assert fails until a
+/// case round-trips it — which is what catches the forgotten decode arm.
 #[test]
 fn command_round_trips() {
     let cases = [
@@ -142,9 +147,42 @@ fn command_round_trips() {
         Command::ListSessions,
         Command::Shutdown,
     ];
+    // No `_` arm: adding a `Command` variant breaks compilation right here.
+    fn variant_index(c: &Command) -> usize {
+        match c {
+            Command::Spawn { .. } => 0,
+            Command::Kill { .. } => 1,
+            Command::Remove { .. } => 2,
+            Command::Restart { .. } => 3,
+            Command::Tag { .. } => 4,
+            Command::SetGroup { .. } => 5,
+            Command::SetName { .. } => 6,
+            Command::Resize { .. } => 7,
+            Command::Watch { .. } => 8,
+            Command::Input { .. } => 9,
+            Command::Paste { .. } => 10,
+            Command::Mouse { .. } => 11,
+            Command::Key { .. } => 12,
+            Command::Scrollback { .. } => 13,
+            Command::SaveSession { .. } => 14,
+            Command::LoadSession { .. } => 15,
+            Command::LoadRecovery { .. } => 16,
+            Command::ListSessions => 17,
+            Command::Shutdown => 18,
+        }
+    }
+    let mut seen = [false; 19];
     for c in cases {
+        seen[variant_index(&c)] = true;
         let (k, p) = encode_command(&c);
         assert_eq!(decode_command(k, &p).as_ref(), Some(&c), "round-trip {c:?}");
+    }
+    for (i, covered) in seen.iter().enumerate() {
+        assert!(
+            covered,
+            "Command variant #{i} (see variant_index) never round-tripped: \
+             add a `cases` entry above and its decode arm in decode_command"
+        );
     }
 }
 
