@@ -540,11 +540,9 @@ impl Emulator {
             .map(|t| t.text.as_str())
     }
 
-    /// The last sanitized title announced on the primary screen, retained
-    /// across printable output and alternate-screen excursions. An empty
-    /// announce or a full reset clears it. [`Emulator::title`] serves the
-    /// staged/epoch view; this slot serves inline programs whose constant
-    /// repaints disclaim staging.
+    /// Last sanitized primary-screen title. Printable output and
+    /// alternate-screen transitions do not clear it; an empty title or RIS
+    /// does.
     pub fn primary_title(&self) -> Option<&str> {
         self.alt.primary_title.as_deref()
     }
@@ -610,10 +608,10 @@ fn live_row_text_of(term: &Term<ProbeSink>, row: i32) -> String {
     text
 }
 
-/// Alternate-screen and title state updated at parser-event boundaries. A
-/// primary-screen title with no following printable output is assigned to the
-/// next alternate-screen entry; the state cannot distinguish that announce
-/// from a title emitted between two full-screen applications.
+/// Alternate-screen and title state updated at parser-event boundaries. Each
+/// nonempty sanitized primary-screen title is retained and staged. An
+/// alternate-screen entry consumes the staged copy unless printable output
+/// disclaims it first.
 #[derive(Default)]
 struct AltScreen {
     /// Count of alt-screen entries. Compared against
@@ -635,11 +633,9 @@ struct AltScreen {
     /// alternate-screen entry. Printable output disclaims it; a reset clears
     /// it.
     staged_title: Option<String>,
-    /// Retained last sanitized primary-screen announce. Where `staged_title`
-    /// bridges an announce into the next alternate-screen entry and dies on
-    /// printable output, this slot persists through output and alt
-    /// excursions: inline TUIs repaint constantly, so a disclaimed slot
-    /// could never label them. An empty announce or a reset clears it.
+    /// Last sanitized primary-screen title. Unlike `staged_title`, printable
+    /// output and alternate-screen entry do not clear it. An empty title or
+    /// reset does.
     primary_title: Option<String>,
     /// Mirror of the backend's raw (unsanitized) current title, kept only
     /// so the title-stack shadow pushes what the backend pushes.
@@ -1701,9 +1697,7 @@ mod tests {
         assert_eq!(emu.title(), Some("done"));
     }
 
-    /// Printable output disclaims the staged slot and leaves the retained
-    /// slot alone: the asymmetry that lets an inline TUI's title outlive
-    /// its own repaints.
+    /// Printable output clears the staged title but not the retained title.
     #[test]
     fn primary_title_survives_the_printable_output_that_disclaims_staging() {
         let mut emu = Emulator::new(4, 20, 0);
@@ -1715,8 +1709,7 @@ mod tests {
         assert_eq!(emu.primary_title(), Some("omp"), "retained: survives it");
     }
 
-    /// omp's announce shape: a bare prompt title, printed output, then a
-    /// labeled re-announce. The newer announce overwrites the retained slot.
+    /// The latest nonempty primary-screen title replaces the retained title.
     #[test]
     fn primary_title_is_overwritten_by_a_newer_announce() {
         let mut emu = Emulator::new(4, 20, 0);
@@ -1726,8 +1719,7 @@ mod tests {
         assert_eq!(emu.primary_title(), Some("\u{3c0} > check"));
     }
 
-    /// codex's clear shape: an empty announce empties the retained slot; a
-    /// RIS resets it with the rest of the title state.
+    /// An empty title or RIS clears the retained primary-screen title.
     #[test]
     fn empty_announce_and_reset_clear_the_primary_title() {
         let mut emu = Emulator::new(4, 20, 0);
@@ -1742,9 +1734,8 @@ mod tests {
         assert_eq!(emu.primary_title(), None, "RIS clears");
     }
 
-    /// An alternate-screen excursion — the entry claiming the staged title,
-    /// an in-alt announce, the exit — leaves the retained slot at the
-    /// pre-alt announce: a primary title stays true across it.
+    /// Alternate-screen title changes do not replace the retained primary
+    /// title.
     #[test]
     fn primary_title_is_unaffected_by_an_alt_round_trip() {
         let mut emu = Emulator::new(4, 20, 0);

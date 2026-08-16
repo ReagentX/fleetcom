@@ -47,7 +47,7 @@ fn floor(text: &str) -> (String, PreviewSource, Option<&'static str>) {
     (text.to_string(), PreviewSource::Floor, None)
 }
 
-/// Expected title-preview tuple: an adapter-normalized retained title.
+/// Expected title-preview tuple.
 fn titled(text: &str) -> (String, PreviewSource, Option<&'static str>) {
     (text.to_string(), PreviewSource::Title, None)
 }
@@ -280,8 +280,8 @@ fn claude_waiting_family_matches_the_skeleton_and_never_probes() {
     );
 }
 
-/// Every spinner frame strips to the bare title text — the text is the
-/// information, the frame was decoration; non-frame titles pass through.
+/// Every recognized spinner frame strips to the same bare title text;
+/// unsupported and empty shapes return `None`.
 #[test]
 fn claude_title_frames_canonicalize_to_constant_text() {
     for frame in CLAUDE_SPINNER {
@@ -710,9 +710,8 @@ fn codex_title_animations_canonicalize_to_constant_text() {
         ClaudeSummary.normalize_title("⠹ fleetcom")
     );
 
-    // Idle drops the spinner, and foreign titles are not codex's to rewrite.
-    // Refusing the bare project name is deliberate: for codex the frame is
-    // the signal, and the text alone says nothing about state.
+    // Bare, foreign, frame-only, and empty titles do not match Codex's title
+    // grammar.
     assert_eq!(CodexSummary.normalize_title("fleetcom"), None);
     assert_eq!(CodexSummary.normalize_title("zellij: main"), None);
     assert_eq!(CodexSummary.normalize_title("⠹"), None, "frame alone");
@@ -1320,10 +1319,8 @@ fn omp_approval_accepts_every_cursor_preset() {
     }
 }
 
-/// The title separator carries the state: `>` idle keeps the label alone, a
-/// braille frame folds to `⠋`, `!` stays verbatim, and the feature-disabled
-/// `π:` form keeps the label. Label-less idle titles and non-`π` titles
-/// refuse: an extension override owns the title and is not omp's to decode.
+/// omp title normalization strips idle and disabled-state prefixes, folds
+/// working frames to `⠋`, preserves `!`, and rejects unsupported shapes.
 #[test]
 fn omp_title_separators_decode_state_and_label() {
     assert_eq!(
@@ -1345,22 +1342,20 @@ fn omp_title_separators_decode_state_and_label() {
         "a label-less frame is still the working state"
     );
 
-    // `!` is omp's own waiting-on-you marker, kept verbatim: no prose is
-    // synthesized outside the approval matchers.
+    // The waiting marker is preserved with or without a label.
     assert_eq!(
         OmpSummary.normalize_title("π ! Fix the flaky test"),
         Some("! Fix the flaky test".to_string())
     );
     assert_eq!(OmpSummary.normalize_title("π !"), Some("!".to_string()));
 
-    // State feature disabled: `π: {label}`.
+    // The disabled-state form yields its label.
     assert_eq!(
         OmpSummary.normalize_title("π: Fix the flaky test"),
         Some("Fix the flaky test".to_string())
     );
 
-    // Label-less idle shapes carry nothing; everything else is an extension
-    // override or a foreign program and is refused, never guessed at.
+    // Empty idle/disabled labels and unsupported shapes return `None`.
     for title in [
         "π",
         "π >",
@@ -1556,9 +1551,8 @@ fn corpus_idle_states_fall_through() {
     }
 }
 
-/// Negative control for the titled fixture: this rows-only capture retains
-/// no title announce, so the idle screen falls through to the floor tier —
-/// its input row — never the alternate-screen marker the other CLIs reach.
+/// Without a title announce, the omp idle screen falls through to its input
+/// row in the floor tier.
 #[test]
 fn corpus_omp_idle_falls_through_to_the_floor() {
     let got = corpus(
@@ -1569,9 +1563,8 @@ fn corpus_omp_idle_falls_through_to_the_floor() {
     assert_eq!(got, floor(&format!("╰─{}─╯", " ".repeat(116))));
 }
 
-/// The same idle screen behind a retained `π > <label>` announce renders the
-/// primary-screen title tier: the adapter strips the idle separator and the
-/// label alone becomes the Title preview.
+/// An omp idle screen with a retained `π > <label>` title renders the label in
+/// the title tier.
 #[test]
 fn corpus_omp_idle_titled_renders_the_title_tier() {
     let got = corpus(

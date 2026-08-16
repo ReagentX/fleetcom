@@ -269,14 +269,14 @@ pub enum Lifecycle {
 /// Floor`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum PreviewSource {
-    /// The last non-blank row of the live screen: unshadowable for
-    /// primary-screen programs, so a title never replaces live stream output.
+    /// The last non-blank row of the live screen: the cascade's fallback when
+    /// no higher-ranked preview qualifies.
     Floor,
     /// The alternate screen is active with no usable title.
     Marker,
-    /// The child's window title. On the alternate screen any captured title
-    /// qualifies; on the primary screen only a retained announce the
-    /// summary adapter affirmatively normalizes.
+    /// The child's window title. The alternate screen accepts its current
+    /// captured title; the primary screen requires a retained title that the
+    /// summary adapter normalizes.
     Title,
     /// The cascade's top tier: a normalized screen or registry status.
     Anchor,

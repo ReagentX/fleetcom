@@ -28,10 +28,9 @@ pub trait ScreenFacts {
     fn alt_epoch(&self) -> u64;
     fn alternate_screen(&self) -> bool;
     fn title(&self) -> Option<&str>;
-    /// The retained primary-screen title slot: the last sanitized announce
-    /// made on the primary screen, held across printable output and
-    /// alternate-screen excursions; an empty announce or a full reset
-    /// clears it.
+    /// Last sanitized primary-screen title. Printable output and
+    /// alternate-screen transitions do not clear it; an empty title or full
+    /// reset does.
     fn primary_title(&self) -> Option<&str>;
     fn live_floor(&self) -> String;
     /// Every live-viewport row, trailing padding trimmed: the summary
@@ -87,10 +86,9 @@ pub trait SummaryAdapter: Sync {
     /// prepends it to live status as `{label} · `.
     fn model_label(&self, rows: &[String]) -> Option<String>;
 
-    /// Optionally normalize a captured title for display. Emulator title
-    /// capture remains program-agnostic; `None` renders the title verbatim.
-    /// Adapters fold animation frames to a per-CLI glyph, so a normalized
-    /// title still names the agent that painted it.
+    /// Normalize a title recognized as this CLI's output. On the alternate
+    /// screen, `None` preserves the captured title verbatim. On the primary
+    /// screen, `None` rejects the retained title and the cascade continues.
     fn normalize_title(&self, _title: &str) -> Option<String> {
         None
     }
@@ -155,12 +153,8 @@ fn cascade(
             },
         };
     }
-    // Primary-title tier, asymmetric with the alt tier by design: no
-    // verbatim pass-through. An alt-screen title belongs to the full-screen
-    // program that owns the display; on the primary screen any inline
-    // program may have announced a title once and moved on, so only shapes
-    // an adapter recognizes as live state are safe to render. No adapter,
-    // or a refusal, falls through to the floor.
+    // A retained primary title may outlive the inline program that announced
+    // it. Require adapter recognition instead of rendering it verbatim.
     if let Some(a) = adapter
         && let Some(title) = screen.primary_title()
         && let Some(text) = a.normalize_title(title)
@@ -345,7 +339,7 @@ impl PreviewState {
     }
 
     /// Freeze the preview once output is complete: the final screen is
-    /// resolved without hold timers.
+    /// resolved without hold timers or retained primary titles.
     /// If an alternate-screen render is followed only by restoration of the
     /// snapshotted primary floor, the rendered preview is retained. A
     /// different final floor is resolved normally.
@@ -368,10 +362,8 @@ impl PreviewState {
         // Finalization excludes registry state because the process has exited.
         let mut fin = cascade(screen, adapter, None);
         if !screen.alternate_screen() && fin.source == PreviewSource::Title {
-            // The primary title is the registry's sibling: an out-of-band
-            // live channel, not frozen screen content, and a killed child
-            // cannot retract a working frame or attention mark. The floor
-            // is what the frozen screen actually shows.
+            // A retained title survives child exit and may still report a
+            // working or waiting state. Freeze the visible floor instead.
             fin = cascade(screen, None, None);
         }
         fin.frozen = true;
@@ -393,8 +385,7 @@ mod tests {
         alt_epoch: u64,
         alt: bool,
         title: Option<String>,
-        /// The retained primary-screen announce slot, mirroring
-        /// `Emulator::primary_title`.
+        /// Last primary-screen title, mirroring `Emulator::primary_title`.
         primary_title: Option<String>,
         floor: String,
         /// Floor at the last `leave_alt`, mirroring the emulator's
@@ -508,8 +499,8 @@ mod tests {
             self.label.map(str::to_string)
         }
 
-        /// Recognize every title: rank tests need the primary-title tier
-        /// eligible without a real normalizer's shape rules.
+        /// Accept every title so rank tests can exercise the primary-title
+        /// tier without a CLI-specific grammar.
         fn normalize_title(&self, title: &str) -> Option<String> {
             Some(title.to_string())
         }
@@ -696,8 +687,7 @@ mod tests {
         assert_eq!((p.text.as_str(), p.source), ("", PreviewSource::Floor));
     }
 
-    /// A retained primary-screen title renders through the adapter's
-    /// normalizer: omp's `π > {label}` decodes to the bare label.
+    /// A retained omp idle title renders its label through the title tier.
     #[test]
     fn a_recognized_primary_title_renders_normalized() {
         let now = Instant::now();
@@ -711,21 +701,18 @@ mod tests {
         );
     }
 
-    /// A title the adapter refuses falls to the floor: on the primary
-    /// screen there is no verbatim pass-through.
+    /// A retained primary title that the adapter rejects falls to the floor.
     #[test]
     fn a_refused_primary_title_falls_to_the_floor() {
         let now = Instant::now();
         let mut st = PreviewState::new();
         let mut s = FakeScreen::primary("shell");
-        // codex refuses a bare title: it could be anyone's announce.
         s.set_primary_title("fleetcom");
         let p = st.resolve(now, &s, Some(&CodexSummary), None).clone();
         assert_eq!((p.text.as_str(), p.source), ("shell", PreviewSource::Floor));
     }
 
-    /// Without an adapter a retained primary title never renders: any
-    /// inline program may have announced it.
+    /// Without an adapter, a retained primary title falls to the floor.
     #[test]
     fn a_primary_title_without_an_adapter_falls_to_the_floor() {
         let now = Instant::now();
@@ -1221,11 +1208,8 @@ mod tests {
         );
     }
 
-    /// A killed child cannot retract its title, so finalization demotes a
-    /// primary-screen Title to the floor: like the registry, the title is an
-    /// out-of-band live channel, and freezing "\u{280b} label" would report a
-    /// dead task as working. The alt-screen Title tier is untouched (the
-    /// test above pins it).
+    /// Finalization replaces a retained primary title with the visible floor;
+    /// the retained title does not clear when the child exits.
     #[test]
     fn finalize_demotes_a_primary_title_to_the_floor() {
         let t0 = Instant::now();
