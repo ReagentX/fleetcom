@@ -19,6 +19,9 @@
 //! Sessions live at `<sessions root>/<encoded cwd>/<iso ts>_<uuidv7>.jsonl`.
 //! The harness home *is* the sessions root: `PI_CODING_AGENT_SESSION_DIR`
 //! names a sessions directory outright, so no agent-dir value can express it.
+//! That override also flattens the store — it is passed straight through as the
+//! session file's parent and the bucket level is never computed — so
+//! correlation scans the root and one level below it.
 //!
 //! The bucket name is deliberately not reproduced. omp encodes a cwd through
 //! three scopes — under `$HOME`, under `os.tmpdir()`, otherwise absolute —
@@ -36,9 +39,18 @@ use std::{
 };
 
 use super::{
-    CAPTURE_ENV, CapturePaths, Harness, Invocation, SpawnPlan, is_uuid, last_hint, shell_quote,
+    CAPTURE_ENV, CapturePaths, Harness, Invocation, SpawnPlan, is_uuid, leading_uuid, shell_quote,
     within_window_ms,
 };
+
+/// The command substring both hint channels print. Detection stays on the
+/// command rather than the prose around it: omp is free to reword the exit
+/// line, and every rewording still has to print the command it recommends.
+const RESUME_HINT: &str = "omp --resume ";
+
+/// The label `formatFatalRecoveryHints` writes for the main session; every
+/// other label is an agent id.
+const MAIN_LABEL: &str = "Main";
 
 pub struct Omp;
 
@@ -81,20 +93,15 @@ impl Harness for Omp {
             Some(p) => p,
             None => env("PI_PROFILE").unwrap_or_default(),
         };
-        let profile = Some(profile).filter(|p| !p.as_os_str().is_empty());
-
-        // `PI_CONFIG_DIR` is a directory *name*, so the relative case is the
-        // only one omp documents, and there the two agree. An absolute value
-        // diverges: node's `path.join` concatenates it under `$HOME`, while
-        // `Path::join` lets it replace `$HOME` outright. Correlation then
-        // reads a store omp never wrote and finds nothing, which is the safe
-        // direction — resume falls back to the launch command rather than
-        // reopening some other conversation.
-        let config = env("HOME")?.join(set("PI_CONFIG_DIR").unwrap_or_else(|| ".omp".into()));
-        let root = match &profile {
-            Some(p) => config.join("profiles").join(p),
-            None => config,
-        };
+        // `normalizeProfileName` trims the value and maps the `default`
+        // sentinel back to no profile, so `OMP_PROFILE=default` writes to the
+        // unprofiled store. Every other value it rejects makes omp refuse to
+        // start, non-UTF-8 included: the name must match `[a-z0-9][a-z0-9._-]*`.
+        let profile = profile
+            .to_str()
+            .map(str::trim)
+            .filter(|p| !p.is_empty() && *p != "default")
+            .map(PathBuf::from);
 
         // A named profile ignores `PI_CODING_AGENT_DIR`, and an agent
         // directory named that way is never redirected by XDG.
@@ -113,6 +120,23 @@ impl Harness for Omp {
                 return Some(data.join("sessions"));
             }
         }
+
+        // Only this last branch builds on `$HOME`; the two above name absolute
+        // paths outright, and demanding a home directory for them would drop an
+        // override omp itself honours.
+        //
+        // `PI_CONFIG_DIR` is a directory *name*, so the relative case is the
+        // only one omp documents, and there the two agree. An absolute value
+        // diverges: node's `path.join` concatenates it under `$HOME`, while
+        // `Path::join` lets it replace `$HOME` outright. Correlation then
+        // reads a store omp never wrote and finds nothing, which is the safe
+        // direction — resume falls back to the launch command rather than
+        // reopening some other conversation.
+        let config = env("HOME")?.join(set("PI_CONFIG_DIR").unwrap_or_else(|| ".omp".into()));
+        let root = match &profile {
+            Some(p) => config.join("profiles").join(p),
+            None => config,
+        };
         Some(root.join("agent").join("sessions"))
     }
 
@@ -158,15 +182,48 @@ impl Harness for Omp {
         is_uuid(id).then(|| id.to_string())
     }
 
+    /// The last trusted hint names the session at exit. Two channels print the
+    /// same command, and each occurrence is judged on its own: a hint carrying
+    /// a `<label>: ` prefix is a crash-recovery entry and is trusted only when
+    /// that label is `Main`; a hint with no label is the ordinary exit line and
+    /// is trusted as it stands. Among the trusted ones the last wins.
+    ///
+    /// Call-site details: every `AgentSession` registers a recovery-hint
+    /// provider, subagents included, so a crash with subagents alive prints one
+    /// `  <label>: omp --resume <uuid>` entry per session — main first, then
+    /// each subagent under its agent id. Taking the last would name a subagent
+    /// transcript, and omp's resume lookup never scans below a session stem, so
+    /// the saved command would fail on load. A block with no `Main:` entry
+    /// therefore yields nothing at all: the main session's id is worth more
+    /// from the capture file, which the extension has usually already written,
+    /// than a subagent's id that cannot be resumed at any price.
     fn scrape_exit(&self, text: &str) -> Option<String> {
-        // The last valid hint names the session at exit. The exit line and the
-        // crash recovery block print the same command.
-        last_hint(text, &["omp --resume "])
+        let mut last: Option<String> = None;
+        for (i, _) in text.match_indices(RESUME_HINT) {
+            let Some(id) = leading_uuid(&text[i + RESUME_HINT.len()..]) else {
+                continue;
+            };
+            let head = &text[..i];
+            let head = &head[head.rfind(['\n', '\r']).map_or(0, |n| n + 1)..];
+            // `formatFatalRecoveryHints` writes `  <label>: <command>`, so the
+            // trailing `": "` is what marks an occurrence as a labelled entry.
+            // The exit line's own lead-in carries no colon, and a rewording
+            // that grew one would be refused rather than trusted — the safe
+            // direction, since a wrong id here outranks the capture file.
+            if let Some(label) = head.strip_suffix(": ")
+                && label.trim() != MAIN_LABEL
+            {
+                continue;
+            }
+            last = Some(id.to_string());
+        }
+        last
     }
 
-    /// Scan every cwd bucket for the one in-window session whose header names
-    /// `cwd`. The id is the filename text after the last `_`: omp parses it
-    /// that way, and neither the leading timestamp nor the id contains `_`.
+    /// Scan the sessions root and every cwd bucket under it for the one
+    /// in-window session whose header names `cwd`. The id is the filename text
+    /// after the last `_`: omp parses it that way, and neither the leading
+    /// timestamp nor the id contains `_`.
     ///
     /// A just-launched session may legitimately have no file at all — omp
     /// keeps a session in memory until it holds an assistant message, so
@@ -181,9 +238,24 @@ impl Harness for Omp {
         // The bucket is named from the canonical cwd while the header records
         // the resolved-but-uncanonicalised one, so both forms must match.
         let canon = cwd.canonicalize().ok();
+
+        // Two layouts, one scan: the default store buckets sessions by encoded
+        // cwd, while `PI_CODING_AGENT_SESSION_DIR` is passed through as the
+        // file's parent directory and leaves the store flat. Which one is in
+        // play is not inferred — a file still has to clear the id, window, and
+        // header-cwd checks wherever it was found.
+        let mut dirs = vec![sessions.clone()];
+        dirs.extend(
+            fs::read_dir(&sessions)
+                .ok()?
+                .flatten()
+                .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+                .map(|e| e.path()),
+        );
+
         let mut survivors: Vec<String> = Vec::new();
-        for bucket in fs::read_dir(sessions).ok()?.flatten() {
-            let Ok(entries) = fs::read_dir(bucket.path()) else {
+        for dir in dirs {
+            let Ok(entries) = fs::read_dir(dir) else {
                 continue;
             };
             for entry in entries.flatten() {
@@ -206,7 +278,13 @@ impl Harness for Omp {
                 if !header_cwd_matches(&entry.path(), cwd, canon.as_deref()) {
                     continue;
                 }
-                survivors.push(id.to_string());
+                // One session's file can sit in two buckets at once: the
+                // bucket-rename migration preserves the legacy entry on a
+                // filename collision instead of overwriting it. The same uuid
+                // twice is still one candidate.
+                if !survivors.iter().any(|s| s == id) {
+                    survivors.push(id.to_string());
+                }
             }
         }
         match survivors.as_slice() {
@@ -220,9 +298,13 @@ impl Harness for Omp {
 /// creation instant. `None` when `id` is not v7. `id` must already satisfy
 /// [`is_uuid`], which fixes its length and alphabet.
 ///
-/// `codex.rs` carries the same six lines. The duplication is deliberate — the
-/// two stores are unrelated and neither module should own the other's
-/// helper — and is marked here so a later reconciliation pass can find both.
+/// `codex.rs` carries the same six lines. `super` is where cross-harness
+/// primitives belong — `is_uuid`, `leading_uuid`, `last_hint`, and
+/// `within_window_ms` all live there — and this one belongs beside them. It
+/// stayed duplicated for a scheduling reason, not a design one: `codex.rs` and
+/// `mod.rs` were under concurrent edit on another branch and the move would
+/// have collided. Whoever reconciles those branches should hoist it into
+/// `super` and delete both copies.
 fn v7_millis(id: &str) -> Option<u64> {
     if id.as_bytes()[14] != b'7' {
         return None;
@@ -230,11 +312,19 @@ fn v7_millis(id: &str) -> Option<u64> {
     u64::from_str_radix(&format!("{}{}", &id[..8], &id[9..13]), 16).ok()
 }
 
-/// Whether the session header names `cwd`, in either the given or the
-/// canonical form. Line 1 is a fixed-width mutable title slot in current omp
-/// and the header itself in older files, so both lines are tried and nothing
-/// past them is read: transcripts grow to megabytes and only the header
-/// participates.
+/// Whether the session header names `cwd`, in the given form, the canonical
+/// form, or as a path that canonicalises to the same place. Line 1 is a
+/// fixed-width mutable title slot in current omp and the header itself in older
+/// files, so both lines are tried and nothing past them is read: transcripts
+/// grow to megabytes and only the header participates.
+///
+/// Call-site details: the third comparison exists because omp puts the header
+/// through `standardizeMacOSPath`, which rewrites a `/private/...` path to its
+/// stripped alias whenever both realpath the same. A task running in the
+/// physical `/private/tmp/x` therefore meets a header saying `/tmp/x`, which is
+/// neither of its own two forms. Canonicalising the header touches the
+/// filesystem on a directory that may already be gone; that failure leaves the
+/// first two comparisons standing rather than dropping the candidate.
 fn header_cwd_matches(path: &Path, cwd: &Path, canon: Option<&Path>) -> bool {
     let Ok(file) = fs::File::open(path) else {
         return false;
@@ -254,7 +344,9 @@ fn header_cwd_matches(path: &Path, cwd: &Path, canon: Option<&Path>) -> bool {
         }
         return record["cwd"].as_str().is_some_and(|c| {
             let header = Path::new(c);
-            header == cwd || Some(header) == canon
+            header == cwd
+                || Some(header) == canon
+                || canon.is_some_and(|canon| header.canonicalize().is_ok_and(|h| h == canon))
         });
     }
     false
@@ -408,6 +500,30 @@ mod tests {
         let crash = format!("[Recovery]\n  Main: omp --resume {ID}\n");
         assert_eq!(Omp.scrape_exit(&crash).as_deref(), Some(ID));
 
+        // With subagents alive the block lists all of them, main first and
+        // each subagent labelled with its agent id. The last line is a
+        // subagent transcript omp's own resume lookup never reaches, so the
+        // `Main:` label decides instead of position.
+        let sub_a = "22222222-3333-4444-8555-666666666666";
+        let sub_b = "33333333-4444-4555-8666-777777777777";
+        let subagents =
+            format!("  agent-1: omp --resume {sub_a}\n  agent-2: omp --resume {sub_b}\n");
+        let swarm = format!("[Recovery]\n  Main: omp --resume {ID}\n{subagents}");
+        assert_eq!(Omp.scrape_exit(&swarm).as_deref(), Some(ID));
+
+        // The main session's provider returns nothing until it holds a session
+        // file, so a block can list only subagents. Every id in it names a
+        // transcript `--resume` cannot open; refusing leaves the supervisor's
+        // precedence to fall through to the capture file, which by then holds
+        // the id the extension reported.
+        let orphans = format!("[Recovery]\n{subagents}");
+        assert_eq!(Omp.scrape_exit(&orphans), None);
+
+        // A refused block does not poison the scrollback around it: a later
+        // exit line is unlabelled and still names the session.
+        let recovered = format!("{orphans}...\nResume this session with omp --resume {ID}\n");
+        assert_eq!(Omp.scrape_exit(&recovered).as_deref(), Some(ID));
+
         assert_eq!(Omp.scrape_exit("no hint here"), None);
         // A hint whose ID fails validation returns nothing.
         assert_eq!(Omp.scrape_exit("omp --resume NOT-A-UUID"), None);
@@ -447,6 +563,76 @@ mod tests {
         assert_eq!(
             Omp.correlate_fs(Path::new(CWD), spawned(), Some(&sessions)),
             None
+        );
+    }
+
+    /// `PI_CODING_AGENT_SESSION_DIR` becomes the session file's parent
+    /// directly, so its store carries no bucket level. One scan covers both
+    /// layouts: a file in the root and a file one level down, in the same
+    /// root, each correlating for its own header cwd.
+    #[test]
+    fn correlate_fs_reads_a_flat_store_and_a_bucketed_one() {
+        let sessions = temp("omp_layouts");
+        // An empty bucket name writes into the root itself.
+        let flat = v7_at(SPAWN_MS + 3_000, 8);
+        write_session(&sessions, "", &flat, CWD, true);
+        let nested = v7_at(SPAWN_MS + 5_000, 9);
+        write_session(&sessions, "bucket", &nested, "/work/other", true);
+
+        assert_eq!(
+            Omp.correlate_fs(Path::new(CWD), spawned(), Some(&sessions))
+                .as_deref(),
+            Some(flat.as_str())
+        );
+        assert_eq!(
+            Omp.correlate_fs(Path::new("/work/other"), spawned(), Some(&sessions))
+                .as_deref(),
+            Some(nested.as_str())
+        );
+        // The header still decides the directory in either layout.
+        assert_eq!(
+            Omp.correlate_fs(Path::new("/elsewhere"), spawned(), Some(&sessions)),
+            None
+        );
+    }
+
+    /// One session's file can sit in two buckets: the bucket-rename migration
+    /// preserves the legacy entry on a filename collision instead of
+    /// overwriting it. Both name the same cwd, so both survive the checks and
+    /// the same id must not count twice.
+    #[test]
+    fn correlate_fs_collapses_one_session_seen_in_two_buckets() {
+        let sessions = temp("omp_dupe");
+        let id = v7_at(SPAWN_MS + 6_000, 10);
+        write_session(&sessions, "encoded", &id, CWD, true);
+        write_session(&sessions, "--legacy--", &id, CWD, true);
+        assert_eq!(
+            Omp.correlate_fs(Path::new(CWD), spawned(), Some(&sessions))
+                .as_deref(),
+            Some(id.as_str())
+        );
+    }
+
+    /// omp puts the header cwd through `standardizeMacOSPath`, which rewrites
+    /// `/private/tmp/x` to `/tmp/x` when both realpath the same. The task then
+    /// runs in the physical path while the header holds an alias of it —
+    /// neither the given nor the canonical form of cwd — and only comparing
+    /// canonical to canonical matches. The symlink here stands in for
+    /// `/tmp -> /private/tmp` so the test holds off darwin too.
+    #[test]
+    fn correlate_fs_matches_a_header_holding_an_alias_of_the_cwd() {
+        let tmp = temp("omp_alias");
+        let (real, alias) = (tmp.join("real"), tmp.join("alias"));
+        fs::create_dir_all(&real).unwrap();
+        std::os::unix::fs::symlink(&real, &alias).unwrap();
+        let physical = real.canonicalize().unwrap();
+        let sessions = tmp.join("sessions");
+        let id = v7_at(SPAWN_MS + 7_000, 11);
+        write_session(&sessions, "bucket", &id, alias.to_str().unwrap(), true);
+        assert_eq!(
+            Omp.correlate_fs(&physical, spawned(), Some(&sessions))
+                .as_deref(),
+            Some(id.as_str())
         );
     }
 
@@ -556,6 +742,31 @@ mod tests {
             ]),
             Some("/h/.omp/profiles/work/agent/sessions".into())
         );
+        // `normalizeProfileName` trims the value and maps the `default`
+        // sentinel back to no profile, so both write to the unprofiled store
+        // and both let `PI_CODING_AGENT_DIR` through.
+        assert_eq!(
+            home(&[("HOME", "/h"), ("OMP_PROFILE", "default")]),
+            Some("/h/.omp/agent/sessions".into())
+        );
+        assert_eq!(
+            home(&[
+                ("HOME", "/h"),
+                ("PI_PROFILE", " default "),
+                ("PI_CODING_AGENT_DIR", "/a"),
+            ]),
+            Some("/a/sessions".into())
+        );
+        assert_eq!(
+            home(&[("HOME", "/h"), ("OMP_PROFILE", "  work  ")]),
+            Some("/h/.omp/profiles/work/agent/sessions".into())
+        );
+        // Whitespace alone trims to nothing, which is no profile.
+        assert_eq!(
+            home(&[("HOME", "/h"), ("OMP_PROFILE", "   ")]),
+            Some("/h/.omp/agent/sessions".into())
+        );
+
         // `OMP_PROFILE` wins by presence: it selects when non-empty and
         // suppresses `PI_PROFILE` when empty.
         assert_eq!(
@@ -586,6 +797,13 @@ mod tests {
         assert_eq!(
             home(&[("HOME", "/h"), ("PI_CONFIG_DIR", "/abs")]),
             Some("/abs/agent/sessions".into())
+        );
+
+        // `PI_CODING_AGENT_DIR` names an absolute path, so it answers without
+        // `HOME`. Demanding one would discard an override omp itself honours.
+        assert_eq!(
+            home(&[("PI_CODING_AGENT_DIR", "/a")]),
+            Some("/a/sessions".into())
         );
 
         // Without `HOME` or an override there is nothing to build from, and
@@ -631,6 +849,12 @@ mod tests {
                 ("PI_CODING_AGENT_DIR", "/a"),
             ]),
             Some("/a/sessions".into())
+        );
+
+        // The redirect target is absolute, so it too answers without `HOME`.
+        assert_eq!(
+            home(&[("XDG_DATA_HOME", xdg)]),
+            Some(dir.join("omp/sessions"))
         );
     }
 
