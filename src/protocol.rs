@@ -274,7 +274,9 @@ pub enum PreviewSource {
     Floor,
     /// The alternate screen is active with no usable title.
     Marker,
-    /// The child's window title, honored only on the alternate screen.
+    /// The child's window title. On the alternate screen any captured title
+    /// qualifies; on the primary screen only a retained announce the
+    /// summary adapter affirmatively normalizes.
     Title,
     /// The cascade's top tier: a normalized screen or registry status.
     Anchor,

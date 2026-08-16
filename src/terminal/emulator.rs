@@ -545,9 +545,6 @@ impl Emulator {
     /// announce or a full reset clears it. [`Emulator::title`] serves the
     /// staged/epoch view; this slot serves inline programs whose constant
     /// repaints disclaim staging.
-    // Unused pub in a bin crate is dead code; the preview resolution layer
-    // consumes this once its phase lands.
-    #[allow(dead_code)]
     pub fn primary_title(&self) -> Option<&str> {
         self.alt.primary_title.as_deref()
     }
