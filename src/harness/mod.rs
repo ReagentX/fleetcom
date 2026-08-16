@@ -659,6 +659,9 @@ mod tests {
         let (h, inv) = detect("grok").unwrap();
         assert_eq!(h.home_dot_dir(), ".grok");
         assert_eq!(inv, Invocation::Bare);
+        let (h, inv) = detect("omp").unwrap();
+        assert_eq!(h.home_dot_dir(), ".omp/agent/sessions");
+        assert_eq!(inv, Invocation::Bare);
         assert!(detect("vim").is_none());
         assert!(detect("").is_none());
     }

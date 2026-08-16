@@ -107,6 +107,11 @@ fn select_routes_to_the_matching_adapter() {
         select("grok").unwrap().live_preview(&grok).unwrap().1,
         "grok:spinner"
     );
+    let omp = omp_screen(&[" ⠴ Listing directory contents ⟦esc⟧", ""]);
+    assert_eq!(
+        select("omp").unwrap().live_preview(&omp).unwrap().1,
+        "omp:spinner"
+    );
 }
 
 /// The spinner phrase survives, the elapsed/token parenthetical drops,
@@ -1137,345 +1142,6 @@ fn grok_still_running_shapes() {
     );
 }
 
-// ------------------------------------------------------- corpus replay --
-
-/// Positive per-state fixtures at capture geometry (40×120): exact
-/// normalized text, Anchor provenance, and the matcher id.
-#[test]
-fn corpus_positive_states_anchor_exactly() {
-    struct Case(
-        &'static str,
-        &'static [u8],
-        &'static dyn SummaryAdapter,
-        &'static str,
-        &'static str,
-    );
-    let cases = [
-        Case(
-            "preview_claude_working",
-            include_bytes!("../../tests/corpus/preview_claude_working.bin"),
-            &ClaudeSummary,
-            "Fable 5 (high) · Concocting…",
-            "claude:spinner",
-        ),
-        Case(
-            "preview_claude_working_tool",
-            include_bytes!("../../tests/corpus/preview_claude_working_tool.bin"),
-            &ClaudeSummary,
-            "Fable 5 (high) · Hashing…",
-            "claude:spinner",
-        ),
-        Case(
-            "preview_claude_action",
-            include_bytes!("../../tests/corpus/preview_claude_action.bin"),
-            &ClaudeSummary,
-            "Fable 5 (high) · Running 1 shell command…",
-            "claude:action-row",
-        ),
-        Case(
-            "preview_claude_approval",
-            include_bytes!("../../tests/corpus/preview_claude_approval.bin"),
-            &ClaudeSummary,
-            "Fable 5 (high) · awaiting approval",
-            "claude:approval-menu",
-        ),
-        Case(
-            "preview_claude_tasklist",
-            include_bytes!("../../tests/corpus/preview_claude_tasklist.bin"),
-            &ClaudeSummary,
-            // Without the welcome box, the preview has no model prefix.
-            "Running phase 1 (dashboard UI)…",
-            "claude:spinner",
-        ),
-        Case(
-            "preview_codex_working",
-            include_bytes!("../../tests/corpus/preview_codex_working.bin"),
-            &CodexSummary,
-            "gpt-5.6-sol high · Working · 1 background terminal running",
-            "codex:working",
-        ),
-        Case(
-            "preview_codex_ran",
-            include_bytes!("../../tests/corpus/preview_codex_ran.bin"),
-            &CodexSummary,
-            "gpt-5.6-sol high · Ran sleep 5 && echo ok",
-            "codex:ran",
-        ),
-        Case(
-            "preview_claude_waiting",
-            include_bytes!("../../tests/corpus/preview_claude_waiting.bin"),
-            &ClaudeSummary,
-            // The welcome box is absent, so there is no model prefix.
-            "Waiting for 1 background agent to finish",
-            "claude:waiting",
-        ),
-        Case(
-            "preview_claude_workflow_wait",
-            include_bytes!("../../tests/corpus/preview_claude_workflow_wait.bin"),
-            &ClaudeSummary,
-            // The roster below the input box is excluded from the status.
-            "Waiting for 1 dynamic workflow to finish",
-            "claude:waiting",
-        ),
-        Case(
-            "preview_codex_hint_row",
-            include_bytes!("../../tests/corpus/preview_codex_hint_row.bin"),
-            &CodexSummary,
-            // No status line means no model prefix.
-            "Working",
-            "codex:working",
-        ),
-        Case(
-            "preview_codex_approval",
-            include_bytes!("../../tests/corpus/preview_codex_approval.bin"),
-            &CodexSummary,
-            "awaiting approval",
-            "codex:approval-menu",
-        ),
-        Case(
-            "preview_grok_working",
-            include_bytes!("../../tests/corpus/preview_grok_working.bin"),
-            &GrokSummary,
-            "Grok 4.5 (xhigh) · Sleep 5 seconds then echo ok…",
-            "grok:spinner",
-        ),
-        Case(
-            "preview_grok_worked",
-            include_bytes!("../../tests/corpus/preview_grok_worked.bin"),
-            &GrokSummary,
-            "Grok 4.5 (xhigh) · Worked for 8.7s",
-            "grok:worked",
-        ),
-        Case(
-            "preview_grok_still_running",
-            include_bytes!("../../tests/corpus/preview_grok_still_running.bin"),
-            &GrokSummary,
-            "Grok 4.5 (xhigh) · 1 subagent still running",
-            "grok:still-running",
-        ),
-    ];
-    for Case(name, bytes, adapter, text, rule) in cases {
-        let got = corpus(bytes, adapter, 120);
-        assert_eq!(got, anchor(text, rule), "{name}");
-    }
-}
-
-/// Idle and post-turn screens have no anchor and resolve to the
-/// alternate-screen marker.
-#[test]
-fn corpus_idle_states_fall_through() {
-    let cases: [(&str, &[u8], &dyn SummaryAdapter); 4] = [
-        (
-            "preview_claude_idle",
-            include_bytes!("../../tests/corpus/preview_claude_idle.bin"),
-            &ClaudeSummary,
-        ),
-        (
-            "preview_claude_done",
-            include_bytes!("../../tests/corpus/preview_claude_done.bin"),
-            &ClaudeSummary,
-        ),
-        (
-            "preview_grok_idle",
-            include_bytes!("../../tests/corpus/preview_grok_idle.bin"),
-            &GrokSummary,
-        ),
-        (
-            "preview_grok_splash",
-            include_bytes!("../../tests/corpus/preview_grok_splash.bin"),
-            &GrokSummary,
-        ),
-    ];
-    for (name, bytes, adapter) in cases {
-        let got = corpus(bytes, adapter, 120);
-        assert_eq!(got, marker(), "{name}");
-    }
-}
-
-/// Status-shaped conversation text does not extract.
-/// The claude fixtures quote an approval menu in the conversation; the
-/// codex fixtures hold `• Ran` in scrollback behind a finished turn.
-#[test]
-fn corpus_body_shaped_text_never_extracts() {
-    // Menu in the body, spinner live: the pinned spinner wins.
-    let got = corpus(
-        include_bytes!("../../tests/corpus/preview_claude_body_menu.bin"),
-        &ClaudeSummary,
-        120,
-    );
-    assert_eq!(got, anchor("Fable 5 (high) · Hashing…", "claude:spinner"));
-
-    // Menu touching the chrome window on an idle screen: abort, marker.
-    let got = corpus(
-        include_bytes!("../../tests/corpus/preview_claude_body_menu_idle.bin"),
-        &ClaudeSummary,
-        120,
-    );
-    assert_eq!(got, marker());
-
-    // Body prose between spinner-shaped text and the task list yields the marker.
-    let got = corpus(
-        include_bytes!("../../tests/corpus/preview_claude_body_above_tasklist.bin"),
-        &ClaudeSummary,
-        120,
-    );
-    assert_eq!(got, marker());
-
-    // Prior-turn `• Ran` in scrollback with the turn finished: the scan
-    // stops at the reply bullet and the floor tier reports the screen.
-    let got = corpus(
-        include_bytes!("../../tests/corpus/preview_codex_scrollback.bin"),
-        &CodexSummary,
-        120,
-    );
-    assert_eq!(
-        got,
-        floor("gpt-5.6-sol high · 5.26K used · 28.2K in · 78 out")
-    );
-
-    // A modal-shaped menu quoted in the body with the live composer
-    // below it: the composer suppresses the approval match, the quote
-    // is foreign to the status scan, and the floor tier reports.
-    let got = corpus(
-        include_bytes!("../../tests/corpus/preview_codex_body_menu.bin"),
-        &CodexSummary,
-        120,
-    );
-    assert_eq!(got, floor("gpt-5.6-sol high · 0 in · 0 out"));
-
-    // `• Ran` visible mid-turn with `• Working` at the pin: live wins.
-    let got = corpus(
-        include_bytes!("../../tests/corpus/preview_codex_working_over_ran.bin"),
-        &CodexSummary,
-        120,
-    );
-    assert_eq!(got, anchor("gpt-5.6-sol high · Working", "codex:working"));
-
-    // Grok scrollback `Subagent running:` with no `◎` chrome: the probe
-    // is that body row and refuses, same marker fall-through as idle.
-    let got = corpus(
-        include_bytes!("../../tests/corpus/preview_grok_subagent_scrollback.bin"),
-        &GrokSummary,
-        120,
-    );
-    assert_eq!(got, marker());
-}
-
-/// 80-column truncation: the CLIs cut their status rows at a word
-/// boundary with their own ellipsis; head matching still extracts and
-/// the kept suffix keeps that ellipsis verbatim.
-#[test]
-fn corpus_truncated_rows_still_anchor() {
-    let got = corpus(
-        include_bytes!("../../tests/corpus/preview_trunc_claude.bin"),
-        &ClaudeSummary,
-        80,
-    );
-    // No welcome box on the narrow screen: the label drops with it.
-    assert_eq!(got, anchor("Hashing…", "claude:spinner"));
-
-    let got = corpus(
-        include_bytes!("../../tests/corpus/preview_trunc_codex.bin"),
-        &CodexSummary,
-        80,
-    );
-    assert_eq!(
-        got,
-        anchor(
-            "gpt-5.6-sol high · Working · 1 background terminal running",
-            "codex:working"
-        )
-    );
-
-    let got = corpus(
-        include_bytes!("../../tests/corpus/preview_trunc_grok.bin"),
-        &GrokSummary,
-        80,
-    );
-    assert_eq!(
-        got,
-        anchor(
-            "Grok 4.5 (xhigh) · Sleep 5 seconds then echo…",
-            "grok:spinner"
-        )
-    );
-}
-
-/// Codex status layouts replay at their fixture-native widths.
-#[test]
-fn corpus_codex_0_147_rows_anchor() {
-    // The status header remains verbatim. Transcript rows above it do not
-    // surface, and the absent status line contributes no model prefix.
-    let got = corpus(
-        include_bytes!("../../tests/corpus/preview_codex_reasoning.bin"),
-        &CodexSummary,
-        80,
-    );
-    assert_eq!(got, anchor("Investigating rendering code", "codex:working"));
-
-    // Sixteen queued messages separate the status row from the composer.
-    // The status line below starts with `model-with-reasoning`, so its first
-    // item supplies the label.
-    let got = corpus(
-        include_bytes!("../../tests/corpus/preview_codex_queued.bin"),
-        &CodexSummary,
-        36,
-    );
-    assert_eq!(
-        got,
-        anchor("gpt-5.6-sol default · Working", "codex:working")
-    );
-}
-
-/// At 30 columns, a wrapped status ellipsis fails the structure check and
-/// resolves to the alternate-screen marker.
-#[test]
-fn corpus_wrapped_ellipsis_falls_through() {
-    let got = corpus(
-        include_bytes!("../../tests/corpus/preview_wrap_grok.bin"),
-        &GrokSummary,
-        30,
-    );
-    assert_eq!(got, marker());
-}
-
-/// Non-agent TUIs on the alternate screen resolve through the
-/// title/marker tiers with an adapter installed exactly as without one:
-/// the anchor tier never fires on foreign screens.
-#[test]
-fn corpus_non_agent_tuis_keep_their_tiers() {
-    for (name, bytes) in [
-        (
-            "vim_session",
-            &include_bytes!("../../tests/corpus/vim_session.bin")[..],
-        ),
-        (
-            "less_altscreen",
-            &include_bytes!("../../tests/corpus/less_altscreen.bin")[..],
-        ),
-    ] {
-        // Cut before the final alt-screen exit so the TUI still owns the
-        // screen, as it does for the task's whole interactive life.
-        let cut = bytes
-            .windows(8)
-            .rposition(|w| w == b"\x1b[?1049l")
-            .expect("fixture exits the alt screen");
-        let mut emu = Emulator::new(40, 120, 2000);
-        emu.process(&bytes[..cut]);
-        assert!(emu.alternate_screen(), "{name}: alt screen active at cut");
-        let mut st = PreviewState::new();
-        let with = st
-            .resolve(Instant::now(), &emu, Some(&ClaudeSummary), None)
-            .clone();
-        let mut st = PreviewState::new();
-        let without = st.resolve(Instant::now(), &emu, None, None).clone();
-        assert_eq!(with, without, "{name}: the adapter must change nothing");
-        assert_eq!(with.source, PreviewSource::Marker, "{name}");
-    }
-}
-
-// -------------------------------------------------------------------- omp --
-
 /// Place the provided rows above an adjacent two-row omp input box.
 fn omp_screen<S: AsRef<str>>(above: &[S]) -> Vec<String> {
     let mut rows: Vec<String> = above.iter().map(|s| s.as_ref().to_string()).collect();
@@ -1656,41 +1322,375 @@ fn omp_ascii_box_glyphs_do_not_anchor() {
     assert_eq!(OmpSummary.live_preview(&ascii_box), None);
 }
 
-/// omp corpus replay at capture geometry (40×120): exact status text, Anchor
-/// provenance, and matcher ID.
+// ------------------------------------------------------- corpus replay --
+
+/// Positive per-state fixtures at capture geometry (40×120): exact
+/// normalized text, Anchor provenance, and the matcher id.
 #[test]
-fn corpus_omp_states_anchor_exactly() {
-    for (name, bytes, want) in [
-        (
+fn corpus_positive_states_anchor_exactly() {
+    struct Case(
+        &'static str,
+        &'static [u8],
+        &'static dyn SummaryAdapter,
+        &'static str,
+        &'static str,
+    );
+    let cases = [
+        Case(
+            "preview_claude_working",
+            include_bytes!("../../tests/corpus/preview_claude_working.bin"),
+            &ClaudeSummary,
+            "Fable 5 (high) · Concocting…",
+            "claude:spinner",
+        ),
+        Case(
+            "preview_claude_working_tool",
+            include_bytes!("../../tests/corpus/preview_claude_working_tool.bin"),
+            &ClaudeSummary,
+            "Fable 5 (high) · Hashing…",
+            "claude:spinner",
+        ),
+        Case(
+            "preview_claude_action",
+            include_bytes!("../../tests/corpus/preview_claude_action.bin"),
+            &ClaudeSummary,
+            "Fable 5 (high) · Running 1 shell command…",
+            "claude:action-row",
+        ),
+        Case(
+            "preview_claude_approval",
+            include_bytes!("../../tests/corpus/preview_claude_approval.bin"),
+            &ClaudeSummary,
+            "Fable 5 (high) · awaiting approval",
+            "claude:approval-menu",
+        ),
+        Case(
+            "preview_claude_tasklist",
+            include_bytes!("../../tests/corpus/preview_claude_tasklist.bin"),
+            &ClaudeSummary,
+            // Without the welcome box, the preview has no model prefix.
+            "Running phase 1 (dashboard UI)…",
+            "claude:spinner",
+        ),
+        Case(
+            "preview_codex_working",
+            include_bytes!("../../tests/corpus/preview_codex_working.bin"),
+            &CodexSummary,
+            "gpt-5.6-sol high · Working · 1 background terminal running",
+            "codex:working",
+        ),
+        Case(
+            "preview_codex_ran",
+            include_bytes!("../../tests/corpus/preview_codex_ran.bin"),
+            &CodexSummary,
+            "gpt-5.6-sol high · Ran sleep 5 && echo ok",
+            "codex:ran",
+        ),
+        Case(
+            "preview_claude_waiting",
+            include_bytes!("../../tests/corpus/preview_claude_waiting.bin"),
+            &ClaudeSummary,
+            // The welcome box is absent, so there is no model prefix.
+            "Waiting for 1 background agent to finish",
+            "claude:waiting",
+        ),
+        Case(
+            "preview_claude_workflow_wait",
+            include_bytes!("../../tests/corpus/preview_claude_workflow_wait.bin"),
+            &ClaudeSummary,
+            // The roster below the input box is excluded from the status.
+            "Waiting for 1 dynamic workflow to finish",
+            "claude:waiting",
+        ),
+        Case(
+            "preview_codex_hint_row",
+            include_bytes!("../../tests/corpus/preview_codex_hint_row.bin"),
+            &CodexSummary,
+            // No status line means no model prefix.
+            "Working",
+            "codex:working",
+        ),
+        Case(
+            "preview_codex_approval",
+            include_bytes!("../../tests/corpus/preview_codex_approval.bin"),
+            &CodexSummary,
+            "awaiting approval",
+            "codex:approval-menu",
+        ),
+        Case(
+            "preview_grok_working",
+            include_bytes!("../../tests/corpus/preview_grok_working.bin"),
+            &GrokSummary,
+            "Grok 4.5 (xhigh) · Sleep 5 seconds then echo ok…",
+            "grok:spinner",
+        ),
+        Case(
+            "preview_grok_worked",
+            include_bytes!("../../tests/corpus/preview_grok_worked.bin"),
+            &GrokSummary,
+            "Grok 4.5 (xhigh) · Worked for 8.7s",
+            "grok:worked",
+        ),
+        Case(
+            "preview_grok_still_running",
+            include_bytes!("../../tests/corpus/preview_grok_still_running.bin"),
+            &GrokSummary,
+            "Grok 4.5 (xhigh) · 1 subagent still running",
+            "grok:still-running",
+        ),
+        Case(
             "preview_omp_working",
-            &include_bytes!("../../tests/corpus/preview_omp_working.bin")[..],
-            anchor("Listing directory contents", "omp:spinner"),
+            include_bytes!("../../tests/corpus/preview_omp_working.bin"),
+            &OmpSummary,
+            "Listing directory contents",
+            "omp:spinner",
         ),
-        (
+        Case(
             "preview_omp_approval",
-            &include_bytes!("../../tests/corpus/preview_omp_approval.bin")[..],
-            anchor("awaiting approval", "omp:approval-menu"),
+            include_bytes!("../../tests/corpus/preview_omp_approval.bin"),
+            &OmpSummary,
+            "awaiting approval",
+            "omp:approval-menu",
         ),
-    ] {
-        assert_eq!(corpus(bytes, &OmpSummary, 120), want, "{name}");
+    ];
+    for Case(name, bytes, adapter, text, rule) in cases {
+        let got = corpus(bytes, adapter, 120);
+        assert_eq!(got, anchor(text, rule), "{name}");
     }
 }
 
-/// omp is an inline UI, so a screen with no anchor falls through to the
-/// floor tier — its input row — never the alternate-screen marker.
+/// Idle and post-turn screens have no anchor and resolve to the
+/// alternate-screen marker.
 #[test]
-fn corpus_omp_states_fall_through_to_the_floor() {
-    let input_row = floor(&format!("╰─{}─╯", " ".repeat(116)));
+fn corpus_idle_states_fall_through() {
+    let cases: [(&str, &[u8], &dyn SummaryAdapter); 4] = [
+        (
+            "preview_claude_idle",
+            include_bytes!("../../tests/corpus/preview_claude_idle.bin"),
+            &ClaudeSummary,
+        ),
+        (
+            "preview_claude_done",
+            include_bytes!("../../tests/corpus/preview_claude_done.bin"),
+            &ClaudeSummary,
+        ),
+        (
+            "preview_grok_idle",
+            include_bytes!("../../tests/corpus/preview_grok_idle.bin"),
+            &GrokSummary,
+        ),
+        (
+            "preview_grok_splash",
+            include_bytes!("../../tests/corpus/preview_grok_splash.bin"),
+            &GrokSummary,
+        ),
+    ];
+    for (name, bytes, adapter) in cases {
+        let got = corpus(bytes, adapter, 120);
+        assert_eq!(got, marker(), "{name}");
+    }
+}
+
+/// omp is an inline UI: an idle screen falls through to the floor tier —
+/// its input row — never the alternate-screen marker the other CLIs reach.
+#[test]
+fn corpus_omp_idle_falls_through_to_the_floor() {
+    let got = corpus(
+        include_bytes!("../../tests/corpus/preview_omp_idle.bin"),
+        &OmpSummary,
+        120,
+    );
+    assert_eq!(got, floor(&format!("╰─{}─╯", " ".repeat(116))));
+}
+
+/// Status-shaped conversation text does not extract.
+/// The claude fixtures quote an approval menu in the conversation; the
+/// codex fixtures hold `• Ran` in scrollback behind a finished turn.
+#[test]
+fn corpus_body_shaped_text_never_extracts() {
+    // Menu in the body, spinner live: the pinned spinner wins.
+    let got = corpus(
+        include_bytes!("../../tests/corpus/preview_claude_body_menu.bin"),
+        &ClaudeSummary,
+        120,
+    );
+    assert_eq!(got, anchor("Fable 5 (high) · Hashing…", "claude:spinner"));
+
+    // Menu touching the chrome window on an idle screen: abort, marker.
+    let got = corpus(
+        include_bytes!("../../tests/corpus/preview_claude_body_menu_idle.bin"),
+        &ClaudeSummary,
+        120,
+    );
+    assert_eq!(got, marker());
+
+    // Body prose between spinner-shaped text and the task list yields the marker.
+    let got = corpus(
+        include_bytes!("../../tests/corpus/preview_claude_body_above_tasklist.bin"),
+        &ClaudeSummary,
+        120,
+    );
+    assert_eq!(got, marker());
+
+    // Prior-turn `• Ran` in scrollback with the turn finished: the scan
+    // stops at the reply bullet and the floor tier reports the screen.
+    let got = corpus(
+        include_bytes!("../../tests/corpus/preview_codex_scrollback.bin"),
+        &CodexSummary,
+        120,
+    );
+    assert_eq!(
+        got,
+        floor("gpt-5.6-sol high · 5.26K used · 28.2K in · 78 out")
+    );
+
+    // A modal-shaped menu quoted in the body with the live composer
+    // below it: the composer suppresses the approval match, the quote
+    // is foreign to the status scan, and the floor tier reports.
+    let got = corpus(
+        include_bytes!("../../tests/corpus/preview_codex_body_menu.bin"),
+        &CodexSummary,
+        120,
+    );
+    assert_eq!(got, floor("gpt-5.6-sol high · 0 in · 0 out"));
+
+    // `• Ran` visible mid-turn with `• Working` at the pin: live wins.
+    let got = corpus(
+        include_bytes!("../../tests/corpus/preview_codex_working_over_ran.bin"),
+        &CodexSummary,
+        120,
+    );
+    assert_eq!(got, anchor("gpt-5.6-sol high · Working", "codex:working"));
+
+    // Grok scrollback `Subagent running:` with no `◎` chrome: the probe
+    // is that body row and refuses, same marker fall-through as idle.
+    let got = corpus(
+        include_bytes!("../../tests/corpus/preview_grok_subagent_scrollback.bin"),
+        &GrokSummary,
+        120,
+    );
+    assert_eq!(got, marker());
+
+    // omp: a status-shaped row quoted in the transcript with prose between
+    // it and the idle input box. The pin is the row directly above the box,
+    // not a substring search, so the quote never anchors and the floor wins.
+    let got = corpus(
+        include_bytes!("../../tests/corpus/preview_omp_body_hint.bin"),
+        &OmpSummary,
+        120,
+    );
+    assert_eq!(got, floor(&format!("╰─{}─╯", " ".repeat(116))));
+}
+
+/// 80-column truncation: the CLIs cut their status rows at a word
+/// boundary with their own ellipsis; head matching still extracts and
+/// the kept suffix keeps that ellipsis verbatim.
+#[test]
+fn corpus_truncated_rows_still_anchor() {
+    let got = corpus(
+        include_bytes!("../../tests/corpus/preview_trunc_claude.bin"),
+        &ClaudeSummary,
+        80,
+    );
+    // No welcome box on the narrow screen: the label drops with it.
+    assert_eq!(got, anchor("Hashing…", "claude:spinner"));
+
+    let got = corpus(
+        include_bytes!("../../tests/corpus/preview_trunc_codex.bin"),
+        &CodexSummary,
+        80,
+    );
+    assert_eq!(
+        got,
+        anchor(
+            "gpt-5.6-sol high · Working · 1 background terminal running",
+            "codex:working"
+        )
+    );
+
+    let got = corpus(
+        include_bytes!("../../tests/corpus/preview_trunc_grok.bin"),
+        &GrokSummary,
+        80,
+    );
+    assert_eq!(
+        got,
+        anchor(
+            "Grok 4.5 (xhigh) · Sleep 5 seconds then echo…",
+            "grok:spinner"
+        )
+    );
+}
+
+/// Codex status layouts replay at their fixture-native widths.
+#[test]
+fn corpus_codex_0_147_rows_anchor() {
+    // The status header remains verbatim. Transcript rows above it do not
+    // surface, and the absent status line contributes no model prefix.
+    let got = corpus(
+        include_bytes!("../../tests/corpus/preview_codex_reasoning.bin"),
+        &CodexSummary,
+        80,
+    );
+    assert_eq!(got, anchor("Investigating rendering code", "codex:working"));
+
+    // Sixteen queued messages separate the status row from the composer.
+    // The status line below starts with `model-with-reasoning`, so its first
+    // item supplies the label.
+    let got = corpus(
+        include_bytes!("../../tests/corpus/preview_codex_queued.bin"),
+        &CodexSummary,
+        36,
+    );
+    assert_eq!(
+        got,
+        anchor("gpt-5.6-sol default · Working", "codex:working")
+    );
+}
+
+/// At 30 columns, a wrapped status ellipsis fails the structure check and
+/// resolves to the alternate-screen marker.
+#[test]
+fn corpus_wrapped_ellipsis_falls_through() {
+    let got = corpus(
+        include_bytes!("../../tests/corpus/preview_wrap_grok.bin"),
+        &GrokSummary,
+        30,
+    );
+    assert_eq!(got, marker());
+}
+
+/// Non-agent TUIs on the alternate screen resolve through the
+/// title/marker tiers with an adapter installed exactly as without one:
+/// the anchor tier never fires on foreign screens.
+#[test]
+fn corpus_non_agent_tuis_keep_their_tiers() {
     for (name, bytes) in [
         (
-            "preview_omp_idle",
-            &include_bytes!("../../tests/corpus/preview_omp_idle.bin")[..],
+            "vim_session",
+            &include_bytes!("../../tests/corpus/vim_session.bin")[..],
         ),
         (
-            "preview_omp_body_hint",
-            &include_bytes!("../../tests/corpus/preview_omp_body_hint.bin")[..],
+            "less_altscreen",
+            &include_bytes!("../../tests/corpus/less_altscreen.bin")[..],
         ),
     ] {
-        assert_eq!(corpus(bytes, &OmpSummary, 120), input_row, "{name}");
+        // Cut before the final alt-screen exit so the TUI still owns the
+        // screen, as it does for the task's whole interactive life.
+        let cut = bytes
+            .windows(8)
+            .rposition(|w| w == b"\x1b[?1049l")
+            .expect("fixture exits the alt screen");
+        let mut emu = Emulator::new(40, 120, 2000);
+        emu.process(&bytes[..cut]);
+        assert!(emu.alternate_screen(), "{name}: alt screen active at cut");
+        let mut st = PreviewState::new();
+        let with = st
+            .resolve(Instant::now(), &emu, Some(&ClaudeSummary), None)
+            .clone();
+        let mut st = PreviewState::new();
+        let without = st.resolve(Instant::now(), &emu, None, None).clone();
+        assert_eq!(with, without, "{name}: the adapter must change nothing");
+        assert_eq!(with.source, PreviewSource::Marker, "{name}");
     }
 }
