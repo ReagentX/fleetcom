@@ -536,6 +536,48 @@ fn spawn_grok_pins_an_id_and_injects_nothing_else() {
     );
 }
 
+/// An `omp` spawn receives `-e <module>` and the capture environment. omp
+/// cannot pin an ID at launch, so the task carries none.
+#[test]
+fn spawn_omp_loads_the_capture_extension() {
+    let dir = scratch("cap_omp");
+    let (bin, runtime) = (dir.join("bin"), dir.join("run"));
+    install_stub(&bin, "omp", &dir);
+    let mut s = sup_ctx(agent_ctx(&bin, &runtime, dir.to_path_buf()));
+    spawn(&mut s, "omp", dir.to_path_buf());
+
+    let argv = wait_argv(&mut s, &dir.join("argv"));
+    let ei = argv
+        .iter()
+        .position(|a| a == "-e")
+        .expect("the stub must receive -e");
+    let module = PathBuf::from(&argv[ei + 1]);
+    assert!(module.is_file(), "the extension module must exist");
+    let text = std::fs::read_to_string(&module).unwrap();
+    assert!(
+        text.contains("FLEETCOM_CAPTURE_FILE"),
+        "the module must write to the capture env: {text:?}"
+    );
+    let t = &s.tasks[0];
+    let cap = t.capture_file.clone().expect("capture file set");
+    assert_eq!(
+        module.parent(),
+        cap.parent(),
+        "assets and captures must share the namespace"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.join("capenv")).unwrap(),
+        cap.display().to_string(),
+        "the child env must name this run's capture file"
+    );
+    assert_eq!(
+        t.command, "omp",
+        "instrumentation must never leak into the stored command"
+    );
+    assert!(t.harness.is_some());
+    assert!(t.resume_id.is_none(), "omp cannot pin an id at launch");
+}
+
 /// A `grok` exit hint becomes the session ID used by the saved recipe.
 /// The spawn pin stays; scrape must outrank it.
 #[test]
@@ -1442,48 +1484,6 @@ fn recovery_cadence_rewrites_on_capture_drift_and_skips_when_static() {
     );
     let names: Vec<_> = std::fs::read_dir(&rec).unwrap().flatten().collect();
     assert_eq!(names.len(), 1, "one incarnation owns one snapshot file");
-}
-
-/// An `omp` spawn receives `-e <module>` and the capture environment. omp
-/// cannot pin an ID at launch, so the task carries none.
-#[test]
-fn spawn_omp_loads_the_capture_extension() {
-    let dir = scratch("cap_omp");
-    let (bin, runtime) = (dir.join("bin"), dir.join("run"));
-    install_stub(&bin, "omp", &dir);
-    let mut s = sup_ctx(agent_ctx(&bin, &runtime, dir.to_path_buf()));
-    spawn(&mut s, "omp", dir.to_path_buf());
-
-    let argv = wait_argv(&mut s, &dir.join("argv"));
-    let ei = argv
-        .iter()
-        .position(|a| a == "-e")
-        .expect("the stub must receive -e");
-    let module = PathBuf::from(&argv[ei + 1]);
-    assert!(module.is_file(), "the extension module must exist");
-    let text = std::fs::read_to_string(&module).unwrap();
-    assert!(
-        text.contains("FLEETCOM_CAPTURE_FILE"),
-        "the module must write to the capture env: {text:?}"
-    );
-    let t = &s.tasks[0];
-    let cap = t.capture_file.clone().expect("capture file set");
-    assert_eq!(
-        module.parent(),
-        cap.parent(),
-        "assets and captures must share the namespace"
-    );
-    assert_eq!(
-        std::fs::read_to_string(dir.join("capenv")).unwrap(),
-        cap.display().to_string(),
-        "the child env must name this run's capture file"
-    );
-    assert_eq!(
-        t.command, "omp",
-        "instrumentation must never leak into the stored command"
-    );
-    assert!(t.harness.is_some());
-    assert!(t.resume_id.is_none(), "omp cannot pin an id at launch");
 }
 
 // --- live registry blocked status --------------------------------------
