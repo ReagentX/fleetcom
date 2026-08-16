@@ -56,6 +56,15 @@ fn is_rule_row(row: &str) -> bool {
     n >= 40
 }
 
+/// Whether `c` is a braille-block code point — the spinner alphabet the
+/// CLIs draw animation frames from. Matchers accept the whole block, not one
+/// observed cycle: a frame left out reanimates a normalized title or drops a
+/// live row when a theme shifts frames. ASCII punctuation spellings are too
+/// weak to anchor safely.
+fn braille_frame(c: char) -> bool {
+    ('\u{2800}'..='\u{28FF}').contains(&c)
+}
+
 /// The status phrase of a spinner row: a frame char accepted by `is_frame`,
 /// a space, then text through the first `…` inclusive. The phrase must open
 /// alphanumeric; past that it is task-derived and unconstrained. Trailing
@@ -126,7 +135,7 @@ impl SummaryAdapter for ClaudeSummary {
         let frame = chars.next()?;
         // Normalize the entire quadrant-circle block as one animation set.
         let framed = CLAUDE_SPINNER.contains(&frame)
-            || ('\u{2800}'..='\u{28FF}').contains(&frame)
+            || braille_frame(frame)
             || ('\u{25D0}'..='\u{25D3}').contains(&frame);
         (framed && chars.next()? == ' ').then(|| format!("✻ {}", chars.as_str()))
     }
@@ -362,8 +371,7 @@ impl SummaryAdapter for CodexSummary {
         }
         let mut chars = title.chars();
         let frame = chars.next()?;
-        (('\u{2800}'..='\u{28FF}').contains(&frame) && chars.next()? == ' ')
-            .then(|| format!("⠋ {}", chars.as_str()))
+        (braille_frame(frame) && chars.next()? == ' ').then(|| format!("⠋ {}", chars.as_str()))
     }
 }
 
@@ -587,7 +595,7 @@ impl SummaryAdapter for GrokSummary {
         let t = probe.trim_start();
         // Keep the label through its first ellipsis. Wrapped tail rows have no
         // spinner prefix, so they fail the frame check and fall through.
-        if let Some(text) = spinner_text(t, |c| ('\u{2800}'..='\u{28FF}').contains(&c)) {
+        if let Some(text) = spinner_text(t, braille_frame) {
             return Some((text, "grok:spinner"));
         }
         // Still-running is the same probe, never a scan: a closer spinner
@@ -678,12 +686,6 @@ fn grok_border_label(row: &str) -> Option<String> {
 
 // ------------------------------------------------------------------- omp --
 
-/// Accept any braille code point as a spinner frame. The row still requires an
-/// interrupt hint, and ASCII punctuation is too weak to anchor safely.
-fn omp_frame(c: char) -> bool {
-    ('\u{2800}'..='\u{28FF}').contains(&c)
-}
-
 /// Interrupt-hint suffixes accepted on an anchored status row.
 const OMP_HINTS: &[&str] = &["⟦esc⟧", "⟨esc⟩"];
 
@@ -736,7 +738,7 @@ fn omp_input_box(rows: &[String]) -> Option<usize> {
 fn omp_spinner_status(rows: &[String], top: usize) -> Option<(String, &'static str)> {
     let probe = rows[..top].iter().rev().find(|r| !r.is_empty())?;
     let mut chars = probe.trim_start().chars();
-    if !omp_frame(chars.next()?) || chars.next()? != ' ' {
+    if !braille_frame(chars.next()?) || chars.next()? != ' ' {
         return None;
     }
     let rest = chars.as_str();
