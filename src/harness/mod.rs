@@ -95,10 +95,15 @@ pub trait Harness: Sync {
 
     /// Read the ID the tool is running right now from the live registry it
     /// publishes on disk. `pid` is the task's session leader, which for every
-    /// accepted command shape is the tool's own process. `cwd` and `spawned`
-    /// identify that process, since a registry record can outlive its writer.
-    /// Defaults to `None`: a tool that publishes no registry has nothing to
-    /// read.
+    /// accepted command shape is the tool's own process: `sh`, `bash`, `zsh`,
+    /// and `dash` each exec a single simple `-c` command in place rather than
+    /// forking, so `$$` names the tool. That exec is a shell optimization, not
+    /// a guarantee — under a `$SHELL` that forks and waits instead, the leader
+    /// is the shell, no record is filed under its pid, and this returns
+    /// `None`. The registry then goes unused rather than wrong. `cwd` and
+    /// `spawned` identify that process, since a registry record can outlive its
+    /// writer. Defaults to `None`: a tool that publishes no registry has
+    /// nothing to read.
     fn live_session_id(
         &self,
         _pid: u32,
@@ -114,7 +119,7 @@ pub trait Harness: Sync {
     /// `(text, rule)` shape [`crate::preview::SummaryAdapter::live_preview`]
     /// returns, so the cascade treats a registry-derived anchor and a
     /// screen-derived one alike. Parameters identify the live process exactly
-    /// as [`Harness::live_session_id`] does.
+    /// as [`Harness::live_session_id`] does, its exec-in-place caveat included.
     ///
     /// Only a blocked state answers `Some`. A tool's working and idle states
     /// already resolve to a title carrying the CLI's own per-turn summary

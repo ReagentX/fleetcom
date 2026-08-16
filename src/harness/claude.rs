@@ -78,11 +78,11 @@ impl Harness for Claude {
         home: Option<&Path>,
     ) -> Option<(String, &'static str)> {
         let rec = record_for_pid(home, pid, cwd, spawned)?;
-        // `Waiting` alone: see the trait doc. The registry beats the screen to
-        // this one state by about a second and reports it at any terminal
-        // width and for every dialog shape, including the ones
+        // The waiting state alone: see the trait doc. The registry beats the
+        // screen to this one state by about a second and reports it at any
+        // terminal width and for every dialog shape, including the ones
         // `ClaudeSummary`'s `❯ 1. `/`2. ` selector match does not cover.
-        (rec.status == Some(SessionStatus::Waiting))
+        rec.waiting
             .then(|| waiting_preview(rec.waiting_for.as_deref()))
     }
 
@@ -113,33 +113,14 @@ struct SessionRecord {
     /// `startedAt`: the process's start in epoch milliseconds. `procStart`
     /// names the same instant in human-readable form.
     started_at: u128,
-    /// `status`, absent from records written by non-interactive entrypoints.
-    status: Option<SessionStatus>,
-    /// `waitingFor`: why a `Waiting` session waits. Present only while the CLI
+    /// `status` reading `waiting`: the CLI blocked on the user. That is the
+    /// only value any caller acts on, so the rest of the vocabulary, a value
+    /// this reader predates, and the absent field non-interactive entrypoints
+    /// write all collapse to `false` without invalidating the record.
+    waiting: bool,
+    /// `waitingFor`: why a waiting session waits. Present only while the CLI
     /// holds a dialog open.
     waiting_for: Option<String>,
-}
-
-/// The `status` vocabulary the CLI validates its own records against.
-#[derive(Debug, PartialEq, Eq)]
-enum SessionStatus {
-    Busy,
-    Shell,
-    Idle,
-    Waiting,
-}
-
-/// Map one `status` string. An unrecognized value yields `None` instead of
-/// rejecting the record: a later CLI version can extend the vocabulary, and the
-/// session ID stays valid either way.
-fn status_of(status: &str) -> Option<SessionStatus> {
-    Some(match status {
-        "busy" => SessionStatus::Busy,
-        "shell" => SessionStatus::Shell,
-        "idle" => SessionStatus::Idle,
-        "waiting" => SessionStatus::Waiting,
-        _ => return None,
-    })
 }
 
 /// Preview text and matcher ID for a `waiting` record's `waitingFor` reason.
@@ -158,11 +139,6 @@ fn waiting_preview(reason: Option<&str>) -> (String, &'static str) {
     }
 }
 
-/// The registry directory: one `<pid>.json` record per live session.
-fn sessions_dir(home: Option<&Path>) -> Option<PathBuf> {
-    Some(Claude.home_root(home)?.join("sessions"))
-}
-
 /// Parse one registry record. The CLI rewrites the file in place with a plain
 /// write rather than a temp-and-rename, so a reader can catch it truncated:
 /// unparseable text yields `None` and the caller simply has no evidence this
@@ -179,7 +155,7 @@ fn parse_record(text: &str) -> Option<SessionRecord> {
         pid: v["pid"].as_i32().filter(|p| *p > 0)?,
         cwd: PathBuf::from(v["cwd"].as_str()?),
         started_at: u128::from(v["startedAt"].as_u64()?),
-        status: v["status"].as_str().and_then(status_of),
+        waiting: v["status"].as_str() == Some("waiting"),
         waiting_for: v["waitingFor"].as_str().map(str::to_string),
     })
 }
@@ -187,14 +163,22 @@ fn parse_record(text: &str) -> Option<SessionRecord> {
 /// Read the record `pid` publishes, requiring it to name that pid, that `cwd`,
 /// and a process started within [`super::CORRELATE_WINDOW`] of `spawned`.
 ///
-/// The two extra guards close a stale-record hazard: a `claude` killed by a
-/// signal leaves its record behind, and only the next `claude` launch sweeps
-/// it, so a recycled pid can find a stranger's record filed under its own name.
-/// `cwd` separates two directories; `startedAt` separates two processes in one
-/// directory. That window does not decay with session age, because `startedAt`
-/// records the process start: `/clear` mints a fresh `sessionId` in place and
-/// leaves `startedAt` untouched, so a session running for hours still matches
-/// its original spawn instant.
+/// A live task's pid cannot be reissued to a foreign `claude`:
+/// [`crate::task::Task::poll_exit`] reaps with `WNOWAIT` and leaves the exited
+/// leader a zombie, which holds the pid for the task's whole life. So
+/// `sessions/<pid>.json` is this task's own record or nothing — that, not the
+/// field checks, is what keeps a stranger out.
+///
+/// The `cwd` and `startedAt` guards close what the reservation cannot: a record
+/// an *earlier* process at that pid left behind, before this task existed. The
+/// CLI removes its record on a clean exit, but a signal-killed `claude` leaves
+/// it and only the next `claude` launch sweeps it. `cwd` separates two
+/// directories; `startedAt` separates two processes in one directory. Both cost
+/// less than the read that produced the record and sit at a shell-command
+/// boundary, so they stay. That window does not decay with session age, because
+/// `startedAt` records the process start: `/clear` mints a fresh `sessionId` in
+/// place and leaves `startedAt` untouched, so a session running for hours still
+/// matches its original spawn instant.
 ///
 /// Call-site details: `/cd` inside claude moves the session's `cwd` and fails
 /// this check, which loses the record. Failing closed there is deliberate.
@@ -205,11 +189,17 @@ fn record_for_pid(
     spawned: SystemTime,
 ) -> Option<SessionRecord> {
     let pid = i32::try_from(pid).ok()?;
-    let text = fs::read_to_string(sessions_dir(home)?.join(format!("{pid}.json"))).ok()?;
+    let dir = Claude.home_root(home)?.join("sessions");
+    let text = fs::read_to_string(dir.join(format!("{pid}.json"))).ok()?;
     let rec = parse_record(&text)?;
     let spawned_ms = spawned.duration_since(UNIX_EPOCH).ok()?.as_millis();
-    (rec.pid == pid && rec.cwd == cwd && within_window_ms(rec.started_at, spawned_ms))
-        .then_some(rec)
+    // Same path through two aliases is one directory: claude records
+    // `process.cwd()`, which is `getcwd(3)` and so symlink-resolved, while a
+    // task carries the path it was spawned with. `canonicalize` is IO and fails
+    // on a vanished directory, which leaves the verbatim comparison standing —
+    // a cwd matching neither form is still refused.
+    let same_cwd = rec.cwd == cwd || cwd.canonicalize().is_ok_and(|c| rec.cwd == c);
+    (rec.pid == pid && same_cwd && within_window_ms(rec.started_at, spawned_ms)).then_some(rec)
 }
 
 /// Convert an absolute working directory to Claude's project slug by replacing
@@ -409,7 +399,7 @@ mod tests {
         let rec = record_for_pid(Some(&home), LIVE_PID, cwd, at_ms(LIVE_STARTED))
             .expect("the live record must parse");
         assert_eq!(rec.id, OTHER);
-        assert_eq!(rec.status, Some(SessionStatus::Idle));
+        assert!(!rec.waiting, "the record's status is `idle`");
         assert_eq!(rec.waiting_for, None);
         assert_eq!(
             Claude
@@ -448,6 +438,42 @@ mod tests {
             &record(4242, ID, "/elsewhere", LIVE_STARTED, "interactive", ""),
         );
         assert!(record_for_pid(Some(&home), 4242, cwd, spawned).is_none());
+    }
+
+    /// Claude records `process.cwd()`, which `getcwd(3)` already resolved
+    /// through every symlink; the task carries the path it was spawned with.
+    /// One directory reached two ways still matches.
+    #[test]
+    fn record_for_pid_accepts_a_symlinked_cwd_alias() {
+        let tmp = temp("claude_registry_alias");
+        let home = tmp.join("home");
+        let real = tmp.join("real");
+        let link = tmp.join("link");
+        let other = tmp.join("other");
+        for d in [&home, &real, &other] {
+            fs::create_dir_all(d).unwrap();
+        }
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let canonical = real.canonicalize().unwrap();
+        install_record(
+            &home,
+            7,
+            &record(
+                7,
+                ID,
+                canonical.to_str().unwrap(),
+                LIVE_STARTED,
+                "interactive",
+                "",
+            ),
+        );
+
+        let spawned = at_ms(LIVE_STARTED);
+        assert!(record_for_pid(Some(&home), 7, &link, spawned).is_some());
+        // A real directory that is not an alias of the record's is still
+        // refused, as is one that no longer exists to canonicalize.
+        assert!(record_for_pid(Some(&home), 7, &other, spawned).is_none());
+        assert!(record_for_pid(Some(&home), 7, &tmp.join("gone"), spawned).is_none());
     }
 
     /// A `claude` killed by a signal leaves its record behind until the next
@@ -527,51 +553,22 @@ mod tests {
         assert!(record_for_pid(Some(&bare), LIVE_PID, cwd, spawned).is_none());
     }
 
-    /// The status vocabulary the CLI validates its own records against, the
-    /// absent status a non-interactive entrypoint writes, and the reason a
-    /// waiting session carries.
+    /// Only `waiting` is read, so a status absent or from a vocabulary this
+    /// reader predates leaves the record valid and its ID usable.
     #[test]
-    fn record_for_pid_reads_the_status_vocabulary() {
+    fn record_for_pid_keeps_the_id_under_an_unread_status() {
         let home = temp("claude_registry_status");
         let cwd = Path::new("/w");
         let spawned = at_ms(LIVE_STARTED);
-        let read = || record_for_pid(Some(&home), 7, cwd, spawned).expect("the record must parse");
-        let install = |tail: &str| {
+        for tail in ["", r#","status":"hibernating""#, r#","status":"busy""#] {
             install_record(
                 &home,
                 7,
                 &record(7, ID, "/w", LIVE_STARTED, "interactive", tail),
             );
-        };
-
-        for (status, want) in [
-            ("busy", SessionStatus::Busy),
-            ("shell", SessionStatus::Shell),
-            ("idle", SessionStatus::Idle),
-            ("waiting", SessionStatus::Waiting),
-        ] {
-            install(&format!(r#","status":"{status}""#));
-            assert_eq!(read().status, Some(want), "{status}");
-        }
-        // A status absent, or from a vocabulary this reader predates, still
-        // yields the ID.
-        for tail in ["", r#","status":"hibernating""#] {
-            install(tail);
-            let rec = read();
-            assert_eq!(rec.status, None, "{tail:?}");
-            assert_eq!(rec.id, ID);
-        }
-        for reason in [
-            "permission prompt",
-            "input needed",
-            "dialog open",
-            "sandbox request",
-            "worker request",
-        ] {
-            install(&format!(r#","status":"waiting","waitingFor":"{reason}""#));
-            let rec = read();
-            assert_eq!(rec.status, Some(SessionStatus::Waiting));
-            assert_eq!(rec.waiting_for.as_deref(), Some(reason));
+            let rec = record_for_pid(Some(&home), 7, cwd, spawned).expect("the record must parse");
+            assert_eq!(rec.id, ID, "{tail:?}");
+            assert!(!rec.waiting, "{tail:?}");
         }
     }
 
