@@ -515,10 +515,8 @@ mod tests {
         assert_eq!(toml_escape("a\tb"), "a\\u0009b");
         // Execute the suffix through a shell and inspect the resulting words.
         let paths = CapturePaths {
-            capture_file: PathBuf::from("/c"),
-            claude_settings: PathBuf::from("/s"),
             codex_notify: PathBuf::from(r#"/Odd Path/it's "here"\now"#),
-            omp_capture: PathBuf::from("/e.js"),
+            ..paths()
         };
         let inv = Codex.detect("codex").unwrap();
         let plan = Codex.instrument(&inv, &paths, Some(&no_config_home()));
