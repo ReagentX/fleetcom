@@ -292,28 +292,32 @@ fn live_fleet(dirs: &Dirs) -> Vec<TaskView> {
         },
         TaskView {
             id: 12,
-            command: "codex".to_string(),
+            command: "omp".to_string(),
             cwd: dirs.turret.clone(),
             tagged: false,
             group: Some("turret".to_string()),
             name: Some("Missile Nerf".to_string()),
             lifecycle: Lifecycle::Active,
             parked: false,
-            preview: anchor(MISSILE_NERF, "codex:working"),
+            // omp's spinner phrase carries no model-label prefix: the
+            // adapter's model_label is None.
+            preview: anchor("Tuning missile damage falloff", "omp:spinner"),
             started_ago: mins(33),
             quiet_ago: Some(secs(7)),
             finished_ago: None,
         },
         TaskView {
             id: 13,
-            command: "codex".to_string(),
+            command: "omp".to_string(),
             cwd: dirs.turret.clone(),
             tagged: false,
             group: Some("turret".to_string()),
             name: Some("EMP Nerf".to_string()),
             lifecycle: Lifecycle::Active,
             parked: false,
-            preview: anchor(EMP_NERF, "codex:working"),
+            // At its prompt: the primary-screen title tier renders the
+            // conversation label omp announces as `π > <label>`.
+            preview: title("EMP arc balance pass"),
             started_ago: mins(35),
             quiet_ago: Some(secs(3)),
             finished_ago: None,
@@ -535,8 +539,6 @@ const CODEX_LANGUAGE: &str =
     "gpt-5.6-sol high · fleetcom · feat/cs/interface-fixes · 387K used · 9.53M in · 61.2K out";
 const CODEX_REVIEW: &str =
     "gpt-5.6-sol high · fleetcom · feat/cs/interface-fixes · 221K used · 4.41M in · 38.7K out";
-const MISSILE_NERF: &str = "gpt-5.6-sol high · turret · main · 129K used · 1.31M in · 10.1K out";
-const EMP_NERF: &str = "gpt-5.6-sol high · turret · main · 161K used · 1.64M in · 10.4K out";
 const FLEETCOM_TESTS: &str =
     "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s";
 const LOGRIA_TESTS: &str = "test result: ok. 223 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.38s";
