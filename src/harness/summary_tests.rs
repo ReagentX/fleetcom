@@ -1150,9 +1150,7 @@ fn omp_screen<S: AsRef<str>>(above: &[S]) -> Vec<String> {
     rows
 }
 
-/// omp's approval screen: the selector replaces the input box while the
-/// status row keeps animating above it. `head` is the row that names the
-/// tool.
+/// Build an omp approval screen with `head` naming the tool.
 fn omp_selector(head: &str) -> Vec<String> {
     omp_selector_row(" ❯ Approve", head)
 }
@@ -1252,9 +1250,8 @@ fn omp_pins_the_status_row_to_the_input_box() {
     assert_eq!(OmpSummary.live_preview(&preview_box), None);
 }
 
-/// The selector synthesizes its label from the `Allow tool:` head, the
-/// selection, and the `Deny` sibling below it. The status row keeps
-/// painting throughout and never wins.
+/// Approval requires an `Allow tool:` head, a selected `Approve` row, and the
+/// `Deny` sibling below it. A spinner above the selector does not win.
 #[test]
 fn omp_approval_requires_the_selector_shape() {
     assert_eq!(
@@ -1278,8 +1275,8 @@ fn omp_approval_requires_the_selector_shape() {
     buried.extend(std::iter::repeat_n(" tool output".to_string(), 6));
     assert_eq!(OmpSummary.live_preview(&buried), None);
 
-    // The same block quoted in the transcript keeps the live input box
-    // below it; the box routes to the status probe, which sees prose.
+    // A live input box below the quoted selector routes to spinner matching.
+    // The selector's trailing rule is the nearest painted row and fails.
     let mut quoted = omp_selector(" Allow tool: bash");
     quoted.push(String::new());
     assert_eq!(OmpSummary.live_preview(&omp_screen(&quoted)), None);
@@ -1298,8 +1295,8 @@ fn omp_approval_accepts_every_cursor_preset() {
             "{cursor:?}"
         );
     }
-    // The row after the cursor must be `Approve` exactly: `>` also opens a
-    // quoted line, and the selector is the one place a bare `>` is trusted.
+    // The selected row must contain `Approve` exactly after the cursor: `>`
+    // also opens a quoted line and is trusted only in this exact shape.
     for approve in [" > Approve now", " >Approve", " > approve", " * Approve"] {
         assert_eq!(
             OmpSummary.live_preview(&omp_selector_row(approve, " Allow tool: bash")),
@@ -1309,8 +1306,8 @@ fn omp_approval_accepts_every_cursor_preset() {
     }
 }
 
-/// ASCII box glyphs are indistinguishable from transcript tables and rules, so
-/// they do not anchor status and the preview falls through to the floor tier.
+/// ASCII box glyphs do not anchor status: transcript tables and rules use the
+/// same glyphs.
 #[test]
 fn omp_ascii_box_glyphs_do_not_anchor() {
     let ascii_box = rs(&[

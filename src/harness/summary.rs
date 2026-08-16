@@ -16,10 +16,8 @@
 //!    box, codex's composer, grok's bordered input box, omp's two-row input
 //!    box) and limits status candidates relative to it;
 //! 2. returns `None` when the expected structure is absent or inconsistent;
-//! 3. matches row prefixes so status rows truncated with an ellipsis at narrow
-//!    widths remain recognizable (omp instead requires its interrupt-hint
-//!    suffix intact: it truncates the phrase itself and keeps the hint
-//!    painted). A wrapped row fails the structural check.
+//! 3. preserves CLI-generated ellipsis truncation. omp also requires its
+//!    trailing interrupt hint; wrapped rows fail that structural check.
 //!
 //! Normalization removes spinner glyphs, elapsed counters, throughput data,
 //! and key hints while preserving the CLI's status text. The only synthesized
@@ -44,9 +42,8 @@ pub fn select(command: &str) -> Option<&'static dyn SummaryAdapter> {
         .map(|a| a.summary)
 }
 
-/// The one synthesized status. Approval surfaces paint a menu, not a status
-/// row, so the three approval matchers and claude's registry reader all
-/// report this literal; the dashboard renders the exact string as a state.
+/// Preview text shared by approval-menu matchers and Claude's registry
+/// permission prompt.
 pub(crate) const AWAITING_APPROVAL: &str = "awaiting approval";
 
 /// Whether `row` is a full-width horizontal rule: nothing but `─`, long
@@ -63,11 +60,8 @@ fn is_rule_row(row: &str) -> bool {
     n >= 40
 }
 
-/// Whether `c` is a braille-block code point — the spinner alphabet the
-/// CLIs draw animation frames from. Matchers accept the whole block, not one
-/// observed cycle: a frame left out reanimates a normalized title or drops a
-/// live row when a theme shifts frames. ASCII punctuation spellings are too
-/// weak to anchor safely.
+/// Whether `c` is a Unicode Braille Patterns code point used as a spinner
+/// frame by the supported CLIs.
 fn braille_frame(c: char) -> bool {
     ('\u{2800}'..='\u{28FF}').contains(&c)
 }

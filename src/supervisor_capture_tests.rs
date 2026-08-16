@@ -537,7 +537,7 @@ fn spawn_grok_pins_an_id_and_injects_nothing_else() {
 }
 
 /// An `omp` spawn receives `-e <module>` and the capture environment. omp
-/// cannot pin an ID at launch, so the task carries none.
+/// cannot pin an ID at launch, so the task carries no session ID.
 #[test]
 fn spawn_omp_loads_the_capture_extension() {
     let dir = scratch("cap_omp");
