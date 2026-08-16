@@ -80,6 +80,8 @@ pub trait SummaryAdapter: Sync {
 
     /// Optionally normalize a captured title for display. Emulator title
     /// capture remains program-agnostic; `None` renders the title verbatim.
+    /// Adapters fold animation frames to a per-CLI glyph, so a normalized
+    /// title still names the agent that painted it.
     fn normalize_title(&self, _title: &str) -> Option<String> {
         None
     }
@@ -131,11 +133,9 @@ fn cascade(screen: &impl ScreenFacts, adapter: Option<&dyn SummaryAdapter>) -> P
             },
         };
     }
-    // Leading indentation is layout, not meaning: codex's status bar (an
-    // inline UI's bottom-most row, the floor of an idle codex task) indents
-    // itself, and the spaces waste preview width. Trimmed here, not in
-    // `live_floor`: the emulator's row stays a faithful fact because it
-    // doubles as the teardown-snapshot comparator.
+    // An indented status line can remain as the idle floor. Trim only the
+    // display candidate: `live_floor` also feeds teardown-snapshot comparison
+    // and must preserve the emulator row verbatim.
     let floor = screen.live_floor();
     let trimmed = floor.trim_start();
     Preview::floor(if trimmed.len() == floor.len() {

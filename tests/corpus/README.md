@@ -37,6 +37,10 @@ CRLF. Claude and Grok use the alternate screen; Codex is inline. Identifying
 and user-configured text is replaced with alignment-preserving synthetic
 values. Geometry is 40×120 unless noted.
 
+`preview_codex_reasoning.bin` uses 40×80 geometry, and
+`preview_codex_queued.bin` uses 40×36. Both are bottom-anchored on a 40-row
+screen to reproduce the inline layout.
+
 The Codex hint-row and approval fixtures use approximate indentation, so their
 tests match trimmed heads and column-0 structure. The Claude waiting fixture
 omits the welcome box and includes agent-roster rows below the input box. The
@@ -61,8 +65,10 @@ roster below it.
 | `preview_codex_working_over_ran.bin` | codex working with a `• Ran` row higher in the same turn | `codex:working` wins at the pin; the stale row never surfaces |
 | `preview_codex_scrollback.bin` | codex finished turn, `• Ran` from the prior turn in scrollback | the scan stops at the reply bullet and resolves to the floor tier |
 | `preview_codex_ran.bin` | codex transient completion row | `codex:ran` extraction through the `└` attachment row |
-| `preview_codex_hint_row.bin` | codex working with `tab to queue message` below the composer, no token bar | `codex:working` through the composer pin; no model prefix without the bar |
-| `preview_codex_approval.bin` | codex approval modal: composer and token bar replaced by a numbered menu | `codex:approval-menu` synthesizes `awaiting approval` |
+| `preview_codex_hint_row.bin` | codex working with `tab to queue message` below the composer, no status line | `codex:working` through the composer pin; no model prefix without one |
+| `preview_codex_approval.bin` | codex approval modal: composer and status line replaced by a numbered menu | `codex:approval-menu` synthesizes `awaiting approval` |
+| `preview_codex_reasoning.bin` | codex status row with a reasoning phrase over an `• Explored` group and reply bullet; composer carrying text; no status line | `codex:working` keeps the header verbatim; the `•`-headed rows above it do not surface, and no status line means no model prefix |
+| `preview_codex_queued.bin` | codex `• Working` row separated from the composer by a `• Queued follow-up inputs` block; `model-with-reasoning · current-dir` status line below | `codex:working` survives the queued-message heads; the first status-line item supplies the model label |
 | `preview_codex_body_menu.bin` | modal-shaped menu quoted in the body, live composer below | negative: the composer's presence suppresses the modal match; floor tier reports |
 | `preview_claude_waiting.bin` | claude waiting on a backgrounded subagent, `⏺` prose and agent roster around the box | `claude:waiting` extracts the ellipsis-less row verbatim; no model label mid-session |
 | `preview_claude_workflow_wait.bin` | claude waiting on a dynamic workflow, with 19 blank rows before the input box and a workflow roster below it | `claude:waiting` matches across the blank rows; the roster is excluded |

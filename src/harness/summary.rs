@@ -13,8 +13,8 @@
 //! To avoid treating it as live status, every matcher:
 //!
 //! 1. locates the chrome region structurally (claude's separator-pair input
-//!    box, codex's status bar and composer, grok's bordered input box) and
-//!    limits status candidates relative to it;
+//!    box, codex's composer, grok's bordered input box) and limits status
+//!    candidates relative to it;
 //! 2. returns `None` when the expected structure is absent or inconsistent;
 //! 3. matches row prefixes so status rows truncated with an ellipsis at narrow
 //!    widths remain recognizable. A wrapped row fails the structural check.
@@ -297,11 +297,32 @@ fn claude_welcome_label(rows: &[String]) -> Option<String> {
 
 // ----------------------------------------------------------------- codex --
 
+/// Column-0 glyphs accepted as the Codex composer prompt.
+const CODEX_PROMPT: &[char] = &['›', '»', '!'];
+
+/// Column-0 queued-message heads allowed between the status row and composer.
+/// Prefix matching admits runtime affordances appended to a head.
+const CODEX_QUEUED_HEADS: &[&str] = &[
+    "• Messages to be submitted after next tool call",
+    "• Messages to be submitted at end of turn",
+    "• Queued follow-up inputs",
+];
+
+/// Reasoning-effort words accepted in a `model-with-reasoning` item.
+const CODEX_EFFORT: &[&str] = &[
+    "minimal", "low", "medium", "high", "xhigh", "max", "ultra", "default",
+];
+
+/// Maximum indented rows crossed between the composer and the status row.
+/// Queued-message blocks are exempt: their height is the user's queue
+/// depth, so counting them would push the status row out of reach.
+const CODEX_STATUS_WINDOW: usize = 10;
+
 /// codex (inline UI, primary screen). The pin is its composer: the
-/// bottom-most column-0 `›` row that is not a modal selector; status rows
-/// sit above it, and scrollback beyond the first foreign row is out of
-/// bounds. The approval modal removes the composer and is checked first.
-/// A token bar or indented hint rows may appear below the composer.
+/// bottom-most column-0 prompt-glyph row that is not a modal selector;
+/// status rows sit above it, and scrollback beyond the first foreign row is
+/// out of bounds. The approval modal removes the composer and is checked
+/// first. The status line or indented hint rows may appear below the composer.
 pub struct CodexSummary;
 
 impl SummaryAdapter for CodexSummary {
@@ -314,9 +335,19 @@ impl SummaryAdapter for CodexSummary {
     }
 
     fn model_label(&self, rows: &[String]) -> Option<String> {
-        let token = codex_token_line(rows)?;
-        // `codex_token_line` guarantees a non-empty first segment.
-        Some(rows[token].trim().split(" · ").next()?.to_string())
+        codex_model_label(rows)
+    }
+
+    /// Fold braille frames to `⠋` and `[ . ] ` to `[ ! ] `. Other titles pass
+    /// unchanged.
+    fn normalize_title(&self, title: &str) -> Option<String> {
+        if let Some(rest) = title.strip_prefix("[ . ] ") {
+            return Some(format!("[ ! ] {rest}"));
+        }
+        let mut chars = title.chars();
+        let frame = chars.next()?;
+        (('\u{2800}'..='\u{28FF}').contains(&frame) && chars.next()? == ' ')
+            .then(|| format!("⠋ {}", chars.as_str()))
     }
 }
 
@@ -335,11 +366,11 @@ fn codex_numbered_option(row: &str) -> bool {
     t.len() > digits && digits >= 1 && t[digits..].starts_with(". ")
 }
 
-/// codex's approval modal: a selector row with an indented numbered sibling
-/// below it, pinned to the last nine painted rows. The modal removes the
-/// composer and token bar; that absence is the disambiguator (a menu quoted
-/// in the conversation always has the live composer below it, so any
-/// non-selector `›` row under the selector suppresses the match).
+/// Codex's approval modal: a selector row with an indented numbered sibling
+/// below it, pinned to the last nine painted rows. A quoted menu retains the
+/// live composer below it, so any non-selector [`CODEX_PROMPT`] row after the
+/// selector suppresses the match. Suppression tests the glyph alone because
+/// modal detection must not reinterpret a live composer as quoted content.
 fn codex_approval(rows: &[String]) -> Option<(String, &'static str)> {
     let last = rows.iter().rposition(|r| !r.is_empty())?;
     let i = (last.saturating_sub(8)..=last).find(|&i| codex_menu_head(&rows[i]))?;
@@ -349,71 +380,177 @@ fn codex_approval(rows: &[String]) -> Option<(String, &'static str)> {
     }
     rows[i + 1..]
         .iter()
-        .all(|r| !r.starts_with('›') || codex_menu_head(r))
+        .all(|r| !r.starts_with(CODEX_PROMPT) || codex_menu_head(r))
         .then(|| ("awaiting approval".to_string(), "codex:approval-menu"))
 }
 
-/// The token/status bar, when painted: the bottom-most
-/// `{model} · {…} in · {…} out` row among the last six painted rows.
-/// Independent of the composer pin because the bar may be absent; without it,
-/// the anchor has no model prefix.
-fn codex_token_line(rows: &[String]) -> Option<usize> {
+/// Return the first ` · `-separated item from the bottom-most qualifying row
+/// among the last six painted rows. The status line is independent of the
+/// composer and may be absent or omit the model.
+///
+/// Two shapes qualify:
+///
+/// - a `{…} in · {…} out` tail, which pins the model to the first item;
+/// - a `model-with-reasoning` head, `{model} {effort}` with an optional third
+///   word, matched by [`codex_model_with_reasoning`].
+///
+/// Neither shape means no label. The row must also be indented: the composer
+/// and reply bullets begin at column 0 and can otherwise satisfy the same text
+/// shapes.
+fn codex_model_label(rows: &[String]) -> Option<String> {
     let last = rows.iter().rposition(|r| !r.is_empty())?;
-    (last.saturating_sub(5)..=last).rev().find(|&i| {
+    (last.saturating_sub(5)..=last).rev().find_map(|i| {
+        if !rows[i].starts_with(' ') {
+            return None;
+        }
         let segs: Vec<&str> = rows[i].trim().split(" · ").collect();
-        segs.len() >= 3
-            && !segs[0].is_empty()
+        if segs[0].is_empty() {
+            return None;
+        }
+        let in_out = segs.len() >= 3
             && segs[segs.len() - 2].ends_with(" in")
-            && segs[segs.len() - 1].ends_with(" out")
+            && segs[segs.len() - 1].ends_with(" out");
+        (in_out || codex_model_with_reasoning(segs[0])).then(|| segs[0].to_string())
     })
 }
 
-/// The composer: the bottom-most column-0 `›` row that is not a modal
-/// selector. Rows below it are tolerated, never required: blank rows,
-/// indented affordance hints (`tab to queue message`), or the token bar.
-/// The working layout can paint hints below the composer with no bar at
-/// all. Prompt echoes in scrollback share the `›` head but sit above the
-/// composer, so the bottom-most wins.
+/// Whether an item has the accepted `model-with-reasoning` shape: two or three
+/// words, with a recognized effort word second. The optional third word
+/// occupies the service-tier position. The fixed effort vocabulary limits
+/// prose-shaped false matches.
+fn codex_model_with_reasoning(item: &str) -> bool {
+    let words: Vec<&str> = item.split_whitespace().collect();
+    matches!(words.len(), 2 | 3) && CODEX_EFFORT.contains(&words[1])
+}
+
+/// The composer: the bottom-most column-0 [`CODEX_PROMPT`] row — the glyph
+/// alone or the glyph and a space — that is not a modal selector. Rows
+/// below it are tolerated, never required: blank rows, indented affordance
+/// hints (`tab to queue message`), or the status line. The working layout can
+/// paint hints below the composer with no status line at all. Prompt echoes in
+/// scrollback share the glyph but sit above the composer, so the
+/// bottom-most wins.
 fn codex_composer(rows: &[String]) -> Option<usize> {
-    rows.iter()
-        .rposition(|r| (r.as_str() == "›" || r.starts_with("› ")) && !codex_menu_head(r))
+    rows.iter().rposition(|r| {
+        let mut chars = r.chars();
+        chars.next().is_some_and(|c| CODEX_PROMPT.contains(&c))
+            && matches!(chars.next(), None | Some(' '))
+            && !codex_menu_head(r)
+    })
 }
 
 /// Walk up from the composer through the status region: blanks and indented
 /// rows (tool-output attachments like `└ ok`, wrapped continuations) are
-/// skipped, and the first column-0 row decides. Only two heads extract
-/// (`• Working (` and `• Ran `); any other column-0 row (a reply bullet,
-/// a `⚠` notice, a turn separator) stops the scan: scrollback holds `• Ran`
-/// rows from every prior turn, and skipping an unknown row to reach one
-/// would resurface stale work as live status.
+/// skipped, [`CODEX_QUEUED_HEADS`] are walked past, and the first other
+/// column-0 row decides. Only two shapes extract ([`codex_status_head`] and
+/// `• Ran `); any other column-0 row (a reply bullet, a `⚠` notice, a turn
+/// separator) stops the scan: scrollback holds `• Ran` rows from every
+/// prior turn, and skipping an unknown row to reach one would resurface
+/// stale work as live status. `• Ran ` is tested first because the status
+/// head matches on structure, not on a literal verb.
 fn codex_status(rows: &[String], composer: usize) -> Option<(String, &'static str)> {
-    for row in rows[composer.saturating_sub(10)..composer].iter().rev() {
-        if row.is_empty() || row.starts_with(' ') {
+    // Indented rows crossed since the last column-0 row. A queued head
+    // claims the ones below it, so a deep queue never exhausts the window.
+    let mut indented = 0usize;
+    for row in rows[..composer].iter().rev() {
+        if row.is_empty() {
             continue;
         }
-        if let Some(after_paren) = row.strip_prefix("• Working (") {
-            return Some((codex_working(after_paren), "codex:working"));
+        if row.starts_with(' ') {
+            indented += 1;
+            continue;
+        }
+        if CODEX_QUEUED_HEADS.iter().any(|h| row.starts_with(h)) {
+            indented = 0;
+            continue;
+        }
+        if indented > CODEX_STATUS_WINDOW {
+            return None;
         }
         if let Some(cmd) = row.strip_prefix("• Ran ")
             && !cmd.is_empty()
         {
             return Some((format!("Ran {cmd}"), "codex:ran"));
         }
+        if let Some((header, after_paren)) = codex_status_head(row) {
+            return Some((codex_working(header, after_paren), "codex:working"));
+        }
         return None;
     }
     None
 }
 
-/// `7s • esc to interrupt) · 1 background terminal running · /ps to view ·
-/// /stop to close` → `Working · 1 background terminal running`. The
-/// parenthetical is the elapsed counter plus interrupt affordance, dropped
-/// whole: an unclosed paren is CLI-side truncation mid-affordance and drops
-/// to the end. Of the ` · ` suffixes, `/`-headed segments are key hints;
-/// everything else is slow-moving state and is kept, with its own ellipsis
-/// when the CLI truncated it.
-fn codex_working(after_paren: &str) -> String {
+/// Split a live status row into its header and the text after the opening
+/// parenthesis. The optional activity prefix is `• ` or `◦ `; the header must
+/// begin alphanumeric. [`codex_interrupt_paren`] supplies the fixed structure
+/// and admits rows truncated at the terminal width.
+fn codex_status_head(row: &str) -> Option<(&str, &str)> {
+    let rest = row
+        .strip_prefix("• ")
+        .or_else(|| row.strip_prefix("◦ "))
+        .unwrap_or(row);
+    if !rest.starts_with(char::is_alphanumeric) {
+        return None;
+    }
+    // The header can carry its own parentheses (`Starting MCP servers
+    // (1/3): a, b, c`), so the first ` (` opening a counter wins.
+    rest.match_indices(" (").find_map(|(i, _)| {
+        let after = &rest[i + " (".len()..];
+        codex_interrupt_paren(after).then(|| (&rest[..i], after))
+    })
+}
+
+/// Whether `s` begins with an elapsed counter and interrupt affordance. An
+/// elapsed counter alone is ambiguous with conversation prose and does not
+/// qualify. An unclosed affordance qualifies only when the row ends in `…`,
+/// the terminal-truncation marker.
+fn codex_interrupt_paren(s: &str) -> bool {
+    let Some(hint) = codex_elapsed(s).and_then(|rest| rest.strip_prefix(" • ")) else {
+        return false;
+    };
+    match hint.find(')') {
+        Some(end) => hint[..end].ends_with(" to interrupt"),
+        None => hint.ends_with('…'),
+    }
+}
+
+/// The text after codex's compact elapsed counter, or `None` when `s` does
+/// not open with one: space-separated `{digits}{unit}` fields in strictly
+/// descending `h`, `m`, `s` order, ending at the seconds field — `0s`,
+/// `1m 00s`, `25h 02m 03s`. A field that is not digits plus a unit (`1/3`,
+/// `9.9s`) fails.
+fn codex_elapsed(s: &str) -> Option<&str> {
+    let mut rest = s;
+    let mut units = "hms";
+    loop {
+        let digits = rest.chars().take_while(char::is_ascii_digit).count();
+        if digits == 0 {
+            return None;
+        }
+        let tail = &rest[digits..];
+        let unit = tail.chars().next()?;
+        let at = units.find(unit)?;
+        units = &units[at + 1..];
+        let after = &tail[unit.len_utf8()..];
+        if unit == 's' {
+            return Some(after);
+        }
+        rest = after.strip_prefix(' ')?;
+    }
+}
+
+/// `Working`, `7s • esc to interrupt) · 1 background terminal running · /ps
+/// to view · /stop to close` → `Working · 1 background terminal running`.
+/// The parenthetical is the elapsed counter plus interrupt affordance,
+/// dropped whole. Without a closing parenthesis, no suffix is parsed. Of the
+/// ` · ` suffixes, `/`-headed segments are key hints; every other nonempty
+/// segment is preserved.
+fn codex_working(header: &str, after_paren: &str) -> String {
     let tail = after_paren.find(')').map_or("", |i| &after_paren[i + 1..]);
-    format!("Working{}", slow_segments(tail, |seg| seg.starts_with('/')))
+    format!(
+        "{header}{}",
+        slow_segments(tail, |seg| seg.starts_with('/'))
+    )
 }
 
 // ------------------------------------------------------------------ grok --
