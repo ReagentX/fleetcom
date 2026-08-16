@@ -14,7 +14,7 @@ paints.
 All four render the same 21 tasks. `attach.png` is captured from a live session,
 because it needs a live attach.
 
-The fixture is `write_readme_screenshot_fixtures` in `src/app_tests.rs`. Edit the
+The fixture is `write_readme_screenshot_fixtures` in `src/app_readme_tests.rs`. Edit the
 fleet there (task names, previews, ages, tags, selection), then regenerate:
 
 ```sh

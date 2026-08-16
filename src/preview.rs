@@ -28,6 +28,10 @@ pub trait ScreenFacts {
     fn alt_epoch(&self) -> u64;
     fn alternate_screen(&self) -> bool;
     fn title(&self) -> Option<&str>;
+    /// Last sanitized primary-screen title. Printable output and
+    /// alternate-screen transitions do not clear it; an empty title or full
+    /// reset does.
+    fn primary_title(&self) -> Option<&str>;
     fn live_floor(&self) -> String;
     /// Every live-viewport row, trailing padding trimmed: the summary
     /// adapters' structural scan input.
@@ -54,6 +58,10 @@ impl ScreenFacts for Emulator {
         Self::title(self)
     }
 
+    fn primary_title(&self) -> Option<&str> {
+        Self::primary_title(self)
+    }
+
     fn live_floor(&self) -> String {
         Self::live_floor(self)
     }
@@ -78,10 +86,9 @@ pub trait SummaryAdapter: Sync {
     /// prepends it to live status as `{label} · `.
     fn model_label(&self, rows: &[String]) -> Option<String>;
 
-    /// Optionally normalize a captured title for display. Emulator title
-    /// capture remains program-agnostic; `None` renders the title verbatim.
-    /// Adapters fold animation frames to a per-CLI glyph, so a normalized
-    /// title still names the agent that painted it.
+    /// Normalize a title recognized as this CLI's output. On the alternate
+    /// screen, `None` preserves the captured title verbatim. On the primary
+    /// screen, `None` rejects the retained title and the cascade continues.
     fn normalize_title(&self, _title: &str) -> Option<String> {
         None
     }
@@ -92,7 +99,9 @@ pub trait SummaryAdapter: Sync {
 /// 2. summary adapter: the normalized live status when the CLI's working
 ///    structure is present
 /// 3. alternate screen: the title while its epoch is current, else the marker
-/// 4. primary screen: the live floor
+/// 4. primary title: the retained primary-screen announce, only when the
+///    adapter affirmatively normalizes it
+/// 5. primary screen: the live floor
 ///
 /// Tiers 1 and 2 both produce an Anchor. The adapter's model label prefixes
 /// either status when available.
@@ -144,6 +153,19 @@ fn cascade(
             },
         };
     }
+    // A retained primary title may outlive the inline program that announced
+    // it. Require adapter recognition instead of rendering it verbatim.
+    if let Some(a) = adapter
+        && let Some(title) = screen.primary_title()
+        && let Some(text) = a.normalize_title(title)
+    {
+        return Preview {
+            text,
+            source: PreviewSource::Title,
+            rule: None,
+            frozen: false,
+        };
+    }
     // An indented status line can remain as the idle floor. Trim only the
     // display candidate: `live_floor` also feeds teardown-snapshot comparison
     // and must preserve the emulator row verbatim.
@@ -161,6 +183,7 @@ type ResolveKey = (
     u64,
     u64,
     bool,
+    Option<String>,
     Option<String>,
     Option<(String, &'static str)>,
 );
@@ -237,6 +260,7 @@ impl PreviewState {
             screen.alt_epoch(),
             screen.alternate_screen(),
             screen.title().map(str::to_owned),
+            screen.primary_title().map(str::to_owned),
             blocked.map(|(text, rule)| (text.to_string(), rule)),
         );
         if self.last_key.as_ref() != Some(&key) {
@@ -315,7 +339,7 @@ impl PreviewState {
     }
 
     /// Freeze the preview once output is complete: the final screen is
-    /// resolved without hold timers.
+    /// resolved without hold timers or retained primary titles.
     /// If an alternate-screen render is followed only by restoration of the
     /// snapshotted primary floor, the rendered preview is retained. A
     /// different final floor is resolved normally.
@@ -337,6 +361,11 @@ impl PreviewState {
         }
         // Finalization excludes registry state because the process has exited.
         let mut fin = cascade(screen, adapter, None);
+        if !screen.alternate_screen() && fin.source == PreviewSource::Title {
+            // A retained title survives child exit and may still report a
+            // working or waiting state. Freeze the visible floor instead.
+            fin = cascade(screen, None, None);
+        }
         fin.frozen = true;
         self.rendered = fin;
     }
@@ -347,6 +376,7 @@ mod tests {
     use std::cell::Cell;
 
     use super::*;
+    use crate::harness::summary::{CodexSummary, OmpSummary};
 
     /// Synthetic screen facts with a floor-read counter for the
     /// revision-gate test.
@@ -355,6 +385,8 @@ mod tests {
         alt_epoch: u64,
         alt: bool,
         title: Option<String>,
+        /// Last primary-screen title, mirroring `Emulator::primary_title`.
+        primary_title: Option<String>,
         floor: String,
         /// Floor at the last `leave_alt`, mirroring the emulator's
         /// alt-exit snapshot.
@@ -369,6 +401,7 @@ mod tests {
                 alt_epoch: 0,
                 alt: false,
                 title: None,
+                primary_title: None,
                 floor: floor.into(),
                 alt_leave_floor: None,
                 floor_calls: Cell::new(0),
@@ -407,6 +440,11 @@ mod tests {
             self.floor = f.into();
             self.advance();
         }
+
+        fn set_primary_title(&mut self, t: &str) {
+            self.primary_title = Some(t.into());
+            self.advance();
+        }
     }
 
     impl ScreenFacts for FakeScreen {
@@ -424,6 +462,10 @@ mod tests {
 
         fn title(&self) -> Option<&str> {
             self.title.as_deref()
+        }
+
+        fn primary_title(&self) -> Option<&str> {
+            self.primary_title.as_deref()
         }
 
         fn live_floor(&self) -> String {
@@ -455,6 +497,12 @@ mod tests {
 
         fn model_label(&self, _rows: &[String]) -> Option<String> {
             self.label.map(str::to_string)
+        }
+
+        /// Accept every title so rank tests can exercise the primary-title
+        /// tier without a CLI-specific grammar.
+        fn normalize_title(&self, title: &str) -> Option<String> {
+            Some(title.to_string())
         }
     }
 
@@ -637,6 +685,82 @@ mod tests {
         let s = FakeScreen::primary("");
         let p = st.resolve(now, &s, None, None).clone();
         assert_eq!((p.text.as_str(), p.source), ("", PreviewSource::Floor));
+    }
+
+    /// A retained omp idle title renders its label through the title tier.
+    #[test]
+    fn a_recognized_primary_title_renders_normalized() {
+        let now = Instant::now();
+        let mut st = PreviewState::new();
+        let mut s = FakeScreen::primary("shell");
+        s.set_primary_title("π > fix parser");
+        let p = st.resolve(now, &s, Some(&OmpSummary), None).clone();
+        assert_eq!(
+            (p.text.as_str(), p.source, p.rule, p.frozen),
+            ("fix parser", PreviewSource::Title, None, false)
+        );
+    }
+
+    /// A retained primary title that the adapter rejects falls to the floor.
+    #[test]
+    fn a_refused_primary_title_falls_to_the_floor() {
+        let now = Instant::now();
+        let mut st = PreviewState::new();
+        let mut s = FakeScreen::primary("shell");
+        s.set_primary_title("fleetcom");
+        let p = st.resolve(now, &s, Some(&CodexSummary), None).clone();
+        assert_eq!((p.text.as_str(), p.source), ("shell", PreviewSource::Floor));
+    }
+
+    /// Without an adapter, a retained primary title falls to the floor.
+    #[test]
+    fn a_primary_title_without_an_adapter_falls_to_the_floor() {
+        let now = Instant::now();
+        let mut st = PreviewState::new();
+        let mut s = FakeScreen::primary("shell");
+        s.set_primary_title("π > fix parser");
+        let p = st.resolve(now, &s, None, None).clone();
+        assert_eq!((p.text.as_str(), p.source), ("shell", PreviewSource::Floor));
+    }
+
+    /// The anchor tier outranks a recognized primary title.
+    #[test]
+    fn an_anchor_outranks_the_primary_title() {
+        let now = Instant::now();
+        let mut st = PreviewState::new();
+        let mut s = FakeScreen::primary("shell");
+        s.set_primary_title("π ⠋ fix parser");
+        let adapter = StubAdapter {
+            live: Some(("Working", "stub:working")),
+            label: None,
+        };
+        let p = st.resolve(now, &s, Some(&adapter), None).clone();
+        assert_eq!(
+            (p.text.as_str(), p.source, p.rule),
+            ("Working", PreviewSource::Anchor, Some("stub:working"))
+        );
+    }
+
+    /// A primary-title change alone invalidates the resolve key.
+    #[test]
+    fn a_primary_title_change_invalidates_the_key() {
+        let t0 = Instant::now();
+        let mut st = PreviewState::new();
+        let mut s = FakeScreen::primary("shell");
+        s.set_primary_title("π > one");
+        assert_eq!(st.resolve(t0, &s, Some(&OmpSummary), None).text, "one");
+
+        // The slot changes with no revision bump: only the key's
+        // primary-title entry can trigger the recompute.
+        s.primary_title = Some("π > two".into());
+        let p = st
+            .resolve(t0 + TITLE_MIN_HOLD, &s, Some(&OmpSummary), None)
+            .clone();
+        assert_eq!(
+            (p.text.as_str(), p.source),
+            ("two", PreviewSource::Title),
+            "the changed slot must recompute the candidate"
+        );
     }
 
     /// Rank increases render on the very resolution that observes them.
@@ -1081,6 +1205,33 @@ mod tests {
         assert_eq!(
             (p.text.as_str(), p.source, p.frozen),
             ("step 2: done", PreviewSource::Title, true)
+        );
+    }
+
+    /// Finalization replaces a retained primary title with the visible floor;
+    /// the retained title does not clear when the child exits.
+    #[test]
+    fn finalize_demotes_a_primary_title_to_the_floor() {
+        let t0 = Instant::now();
+        let mut st = PreviewState::new();
+        let mut s = FakeScreen::primary("\u{2570}\u{2500} idle box \u{2500}\u{256f}");
+        s.set_primary_title("\u{3c0} \u{2819} fix parser");
+        let p = st.resolve(t0, &s, Some(&OmpSummary), None).clone();
+        assert_eq!(
+            (p.text.as_str(), p.source),
+            ("\u{280b} fix parser", PreviewSource::Title),
+            "premise: the title tier renders while the task lives"
+        );
+
+        st.finalize(&s, Some(&OmpSummary));
+        let p = st.resolve(t0, &s, Some(&OmpSummary), None).clone();
+        assert_eq!(
+            (p.text.as_str(), p.source, p.frozen),
+            (
+                "\u{2570}\u{2500} idle box \u{2500}\u{256f}",
+                PreviewSource::Floor,
+                true
+            )
         );
     }
 
