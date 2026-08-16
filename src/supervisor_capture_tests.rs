@@ -73,10 +73,7 @@ fn install_script(bin: &Path, name: &str, body: &str) {
     write_executable(&bin.join(name), body);
 }
 
-/// File the registry record `pid` publishes, carrying the raw `status` JSON
-/// pair. Every field `record_for_pid` validates has to agree with the task:
-/// the file name and `pid`, the `cwd`, and a process start inside the
-/// correlation window of the spawn.
+/// Write a matching interactive registry record with raw status fields.
 fn install_status_record(home: &Path, pid: u32, cwd: &Path, status: &str) {
     let sessions = home.join("sessions");
     std::fs::create_dir_all(&sessions).unwrap();
@@ -937,10 +934,7 @@ fn resume_id_precedence_scrape_over_capture_over_spawn() {
     );
 }
 
-/// Claude's live session registry outranks the ID pinned at spawn: the pin
-/// records what fleetcom asked for, the registry what the CLI is running, and
-/// `/clear` moves the conversation on the same process. Fleetcom's own hook
-/// output still outranks the registry.
+/// Session ID precedence is capture file, live registry, then spawn-time pin.
 #[test]
 fn resume_id_precedence_registry_over_spawn_under_capture() {
     let dir = scratch("registry_precedence");
@@ -969,8 +963,7 @@ fn resume_id_precedence_registry_over_spawn_under_capture() {
         .clone()
         .expect("a fresh claude launch pins an id");
     assert_ne!(injected.as_str(), CAP_ID);
-    // `$SHELL -c` execs the accepted command in place, so the task's pid names
-    // the registry record.
+    // Key the registry fixture to the spawned task.
     let pid = s.tasks[0].pid().expect("a live task has a pid");
 
     install_status_record(&claude_home, pid, &dir, r#""status":"idle""#);
@@ -984,7 +977,7 @@ fn resume_id_precedence_registry_over_spawn_under_capture() {
         "the injected id must not survive the registry; got {text}"
     );
 
-    // The hook fired: fleetcom's own capture channel wins.
+    // A capture-file ID outranks the registry ID.
     let cap = s.tasks[0].capture_file.clone().expect("capture file set");
     std::fs::write(
         &cap,
@@ -1453,11 +1446,8 @@ fn recovery_cadence_rewrites_on_capture_drift_and_skips_when_static() {
 
 // --- live registry blocked status --------------------------------------
 
-/// Tick until the sole task's emitted preview satisfies `pred`, then return
-/// the last preview seen. Only a tick resolves a preview and only a
-/// resolution probes the registry, so the 250 ms probe throttle expires on
-/// ticks, not on sleeps. A negative assertion reads the return value: `pred`
-/// stops on the first violation, so the preview returned is the violating one.
+/// Tick until the sole task's preview satisfies `pred` or the budget expires,
+/// then return the last preview.
 fn tick_until_preview(
     s: &mut Supervisor,
     budget: Duration,
@@ -1478,12 +1468,8 @@ fn tick_until_preview(
     last.expect("a Tasks snapshot must carry the task's preview")
 }
 
-/// The only test that drives `Task::refresh_blocked`: the harness tests call
-/// `live_blocked_status` directly and the preview tests hand `resolve` a
-/// literal claim, so gutting the probe leaves both green. A `waiting` record
-/// the CLI publishes for the task's own pid reaches the dashboard as the
-/// anchor tier, a non-waiting record does not, and an exited leader stops
-/// claiming to be blocked even though its record outlives it.
+/// A matching `waiting` record reaches the dashboard; non-waiting and post-exit
+/// records do not.
 #[test]
 fn registry_waiting_status_reaches_the_dashboard_preview() {
     let dir = scratch("registry_blocked");
@@ -1504,11 +1490,10 @@ fn registry_waiting_status_reaches_the_dashboard_preview() {
         &[("CLAUDE_CONFIG_DIR", &claude_home)],
     ));
     spawn(&mut s, "claude", dir.to_path_buf());
-    // The record is keyed by the leader's pid, which only the spawn can name.
+    // Key the record to the task's leader PID.
     let pid = s.tasks[0].pid().expect("a live task has a pid");
 
-    // `idle` is a live session no user is blocking on: three probe intervals
-    // of ticks must never anchor the preview.
+    // A non-waiting status must not anchor the preview.
     install_status_record(&claude_home, pid, &dir, r#""status":"idle""#);
     let p = tick_until_preview(&mut s, Duration::from_millis(750), |p| {
         p.source == PreviewSource::Anchor
@@ -1519,7 +1504,7 @@ fn registry_waiting_status_reaches_the_dashboard_preview() {
         "a non-waiting record must not anchor the preview: {p:?}"
     );
 
-    // The CLI rewrites the record in place when it blocks on a dialog.
+    // A waiting status becomes an Anchor preview.
     install_status_record(
         &claude_home,
         pid,
@@ -1539,10 +1524,8 @@ fn registry_waiting_status_reaches_the_dashboard_preview() {
         "a waiting record must reach the dashboard as the anchor tier"
     );
 
-    // The leader exits and its record survives, as one the CLI never got to
-    // remove does. The reason is rewritten afterward, to text the live task
-    // never saw: adopting it could only come from probing a dead leader,
-    // which the demotion hold holding the old text cannot be mistaken for.
+    // After exit, a changed record must neither retain nor replace the cached
+    // blocked preview.
     std::fs::write(&done, b"").unwrap();
     assert!(
         reap_until(&mut s, Duration::from_secs(5), |s| s.tasks[0]

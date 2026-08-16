@@ -10,11 +10,9 @@
 //! # Security invariant
 //!
 //! Every ID returned by `parse_capture`, `scrape_exit`, `live_session_id`, or
-//! `correlate_fs` eventually enters a shell command. These methods must
-//! therefore return only strings accepted by [`is_uuid`]. Free-text names,
-//! paths, and malformed IDs yield `None`. Summary adapters are display-only and
-//! do not return session IDs, and so is `live_blocked_status`: its text reaches
-//! the dashboard, never a command.
+//! `correlate_fs` eventually enters a shell command. These methods return only
+//! strings accepted by [`is_uuid`]; free text, paths, and malformed IDs yield
+//! `None`. Summary adapters and `live_blocked_status` are display-only.
 
 pub mod assets;
 mod claude;
@@ -93,17 +91,9 @@ pub trait Harness: Sync {
     /// Extract a session ID from final terminal text, including scrollback.
     fn scrape_exit(&self, text: &str) -> Option<String>;
 
-    /// Read the ID the tool is running right now from the live registry it
-    /// publishes on disk. `pid` is the task's session leader, which for every
-    /// accepted command shape is the tool's own process: `sh`, `bash`, `zsh`,
-    /// and `dash` each exec a single simple `-c` command in place rather than
-    /// forking, so `$$` names the tool. That exec is a shell optimization, not
-    /// a guarantee — under a `$SHELL` that forks and waits instead, the leader
-    /// is the shell, no record is filed under its pid, and this returns
-    /// `None`. The registry then goes unused rather than wrong. `cwd` and
-    /// `spawned` identify that process, since a registry record can outlive its
-    /// writer. Defaults to `None`: a tool that publishes no registry has
-    /// nothing to read.
+    /// Read the current session ID from the tool's on-disk registry. `pid`,
+    /// `cwd`, and `spawned` identify the task; implementations must reject a
+    /// record that does not match all three. Defaults to `None`.
     fn live_session_id(
         &self,
         _pid: u32,
@@ -114,23 +104,9 @@ pub trait Harness: Sync {
         None
     }
 
-    /// Read the tool's own claim that it is blocked on the user, as preview
-    /// text and the matcher ID naming the claim: the same
-    /// `(text, rule)` shape [`crate::preview::SummaryAdapter::live_preview`]
-    /// returns, so the cascade treats a registry-derived anchor and a
-    /// screen-derived one alike. Parameters identify the live process exactly
-    /// as [`Harness::live_session_id`] does, its exec-in-place caveat included.
-    ///
-    /// Only a blocked state answers `Some`. A tool's working and idle states
-    /// already resolve to a title carrying the CLI's own per-turn summary
-    /// (claude's OSC title is model-generated text such as
-    /// `✻ Run sleep command for 25 seconds`), and replacing that with the bare
-    /// word `busy` or `idle` would remove information rather than add it.
-    /// Being blocked on the user is the one state the screen cascade cannot
-    /// see reliably.
-    ///
-    /// Defaults to `None`: a tool that publishes no live status has nothing to
-    /// read.
+    /// Read a matching registry record's blocked-on-user status as preview
+    /// text and a matcher ID. Return `None` for every non-blocked state and for
+    /// tools without a live status registry.
     fn live_blocked_status(
         &self,
         _pid: u32,
@@ -355,8 +331,7 @@ fn within_window(a: SystemTime, b: SystemTime) -> bool {
     }
 }
 
-/// Millisecond form of [`within_window`] for epoch-millisecond timestamps,
-/// whether a UUID embeds them or a session record states them outright.
+/// Epoch-millisecond form of [`within_window`].
 fn within_window_ms(a: u128, b: u128) -> bool {
     a.abs_diff(b) <= CORRELATE_WINDOW.as_millis()
 }

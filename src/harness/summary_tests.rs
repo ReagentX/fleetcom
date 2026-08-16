@@ -284,8 +284,7 @@ fn claude_title_frames_canonicalize_to_constant_text() {
     let b = ClaudeSummary.normalize_title("✽ Claude Code");
     assert_eq!(a, b, "two frames must normalize identically");
 
-    // Spinner and quadrant-circle frames animate the same title, so the whole
-    // vocabulary must land on one rendered string.
+    // Every spinner frame must normalize to the same title.
     let rendered: std::collections::BTreeSet<Option<String>> = CLAUDE_SPINNER
         .iter()
         .copied()
@@ -313,11 +312,8 @@ fn claude_title_frames_canonicalize_to_constant_text() {
     assert_eq!(ClaudeSummary.normalize_title("✻"), None, "frame alone");
 }
 
-/// Cascade-level: the harness's blocked-status probe outranks the adapter's
-/// screen scrape on the very screen the scrape would anchor on, keeps its own
-/// rule, and takes the welcome box's model label like any other anchor. The
-/// registry reports `waiting` about a second before the dialog finishes
-/// painting, so the two disagree exactly while that repaint is in flight.
+/// A registry status outranks a screen-derived status while retaining the
+/// model label and its own matcher ID.
 #[test]
 fn registry_anchor_outranks_the_claude_spinner() {
     let rule = "─".repeat(60);
@@ -388,8 +384,7 @@ fn title_tier_renders_the_normalized_title() {
         "no adapter: verbatim"
     );
 
-    // The quadrant frames animate a title that carries the task summary, so
-    // the tier renders the summary once rather than alternating with it.
+    // Quadrant frames use the same canonical title as other spinner frames.
     let mut quadrant = Emulator::new(24, 80, 100);
     quadrant.process(
         b"\x1b[?1049h\x1b]0;\xe2\x97\x90 Run sleep command for 25 seconds\x07conversation body",
@@ -544,11 +539,8 @@ fn claude_approval_requires_the_dialog_shape() {
     assert_eq!(ClaudeSummary.live_preview(&lone), None);
 }
 
-/// The model label comes from the welcome box and reads as
-/// `{model} ({effort})`. Both cell spellings are live: the box's left pane is
-/// fixed near 50 columns, so a short model name keeps its trailing `effort`
-/// and a long one loses it to the CLI's own ellipsis. A cut landing inside
-/// the effort word refuses instead of guessing. No box, no label.
+/// The welcome-box label accepts complete and ellipsis forms but rejects a
+/// partial effort value. No box means no label.
 #[test]
 fn claude_label_reads_the_welcome_box() {
     let boxed = |cell: &str| {
@@ -558,28 +550,22 @@ fn claude_label_reads_the_welcome_box() {
             "╰──────────────────────────────────────╯",
         ])
     };
-    // Verbatim from a live session, and byte-identical at 100 and 160
-    // columns: the left pane is fixed near 50 columns, so a model name that
-    // overruns it truncates at every terminal width.
     let fixed_pane = "│ Opus 5 (1M context) with high… · Claude Max ·      │ Added opt-in memory cgroup support for Bas… │";
     for (cell, want) in [
         (
             "│ Fable 5 with high effort · Claude Max ·  │ notes │",
             Some("Fable 5 (high)"),
         ),
-        // Parentheses in the model name double up under the
-        // `{model} ({effort})` contract. Deliberate: the contract is applied
-        // as written.
+        // Parentheses in the model name do not change the output shape.
         (
             "│ Opus 5 (1M context) with high effort · Claude Max ·  │ notes │",
             Some("Opus 5 (1M context) (high)"),
         ),
         (fixed_pane, Some("Opus 5 (1M context) (high)")),
-        // `hi` is a cut through the effort word, not a level; `(hi)` would
-        // name an effort the session is not running at.
+        // Partial and empty effort values are invalid.
         ("│ Opus 5 (1M context) with hi… │ notes │", None),
         ("│ Opus 5 (1M context) with … │ notes │", None),
-        // Neither spelling: no trailing `effort`, no ellipsis.
+        // Neither accepted suffix is present.
         ("│ Some Model with high │ notes │", None),
     ] {
         assert_eq!(

@@ -134,14 +134,9 @@ fn fnv1a_hex(bytes: &[u8]) -> String {
     format!("{h:016x}")
 }
 
-/// Resolve the best session ID in precedence order: exit scrape, capture file,
-/// live session registry, then spawn-time ID. Exit and capture data outrank the
-/// launch value because either can reflect a conversation selected later. The
-/// registry outranks the launch value for the same reason and by a stronger
-/// one: the pin records what fleetcom asked for, while the registry records
-/// what the tool is running, and `/clear` mints a fresh ID mid-session. It
-/// ranks under the capture file only because that file is fleetcom's own hook
-/// output, and the two agree whenever both exist.
+/// Resolve the session ID in precedence order: exit scrape, capture file, live
+/// registry, then spawn-time ID. The first three can reflect a session selected
+/// after launch and therefore outrank the spawn-time value.
 fn current_resume_id(task: &Task) -> Option<String> {
     if let Some(id) = &task.scraped_id {
         return Some(id.clone());

@@ -88,27 +88,23 @@ pub trait SummaryAdapter: Sync {
 }
 
 /// Resolve the instantaneous candidate in descending priority:
-/// 1. harness registry: `blocked`, the CLI's own claim that it is blocked on
-///    the user, as passed by the caller
+/// 1. harness registry: the caller-provided blocked status
 /// 2. summary adapter: the normalized live status when the CLI's working
 ///    structure is present
 /// 3. alternate screen: the title while its epoch is current, else the marker
 /// 4. primary screen: the live floor
 ///
-/// Tiers 1 and 2 both produce an Anchor and are both `{model label} · `-
-/// prefixed when the adapter reads a label from stable chrome.
+/// Tiers 1 and 2 both produce an Anchor. The adapter's model label prefixes
+/// either status when available.
 fn cascade(
     screen: &impl ScreenFacts,
     adapter: Option<&dyn SummaryAdapter>,
     blocked: Option<(&str, &'static str)>,
 ) -> Preview {
     if adapter.is_some() || blocked.is_some() {
-        // Both probes and the label read the same viewport snapshot.
+        // The screen status and model label share one viewport snapshot.
         let rows = screen.live_rows();
-        // The registry claim is consulted first: what the CLI says about
-        // itself outranks a structural guess at its screen. It also lands
-        // about a second before the dialog finishes painting and holds at any
-        // terminal width, for every dialog shape the CLI draws.
+        // A registry status outranks a screen-derived status.
         let hit = blocked
             .map(|(text, rule)| (text.to_string(), rule))
             .or_else(|| adapter?.live_preview(&rows));
@@ -160,12 +156,7 @@ fn cascade(
     })
 }
 
-/// State that invalidates the cached preview candidate: the screen facts the
-/// cascade reads, plus the harness blocked-status probe. The probe belongs
-/// here because it moves independently of the screen — a session enters and
-/// leaves `waiting` with no repaint, and a repaint changes no status — so a
-/// key built from screen facts alone would strand a probe result that appeared
-/// or cleared while the grid stood still.
+/// Screen and registry state that invalidates the cached preview candidate.
 type ResolveKey = (
     u64,
     u64,
@@ -229,9 +220,8 @@ impl PreviewState {
     /// parameter, never read internally, so tests drive the holds with
     /// synthetic instants. The candidate is recomputed only when the
     /// resolution key changed; hold expiries commit the carried value
-    /// without a rescan. `adapter` is the task's summary adapter, fixed for
-    /// the task's life, so it needs no slot in the resolution key; `blocked`
-    /// is the caller's latest harness blocked-status probe, which does.
+    /// without a rescan. `adapter` is fixed for the task's lifetime; `blocked`
+    /// changes independently and is part of the resolution key.
     pub fn resolve(
         &mut self,
         now: Instant,
@@ -345,9 +335,7 @@ impl PreviewState {
             self.rendered.frozen = true;
             return;
         }
-        // No blocked probe: finalization runs once output is complete, and a
-        // record the exited process left behind claims a state it can no
-        // longer be in.
+        // Finalization excludes registry state because the process has exited.
         let mut fin = cascade(screen, adapter, None);
         fin.frozen = true;
         self.rendered = fin;
@@ -503,8 +491,7 @@ mod tests {
         assert_eq!(p.text, "Working");
     }
 
-    /// The harness probe is the top tier: it outranks the adapter's screen
-    /// anchor and takes the model label exactly as a screen anchor does.
+    /// A registry status outranks a screen status and retains the model label.
     #[test]
     fn a_registry_anchor_outranks_the_adapters_anchor() {
         let now = Instant::now();
@@ -534,10 +521,7 @@ mod tests {
         );
     }
 
-    /// The probe belongs in the resolution key. A task can enter and leave the
-    /// blocked state with no repaint, so a key built from screen facts alone
-    /// carries the stale candidate and the probe never reaches the cascade:
-    /// both halves of this test fail without it.
+    /// Registry changes invalidate the candidate even when the screen is static.
     #[test]
     fn a_probe_that_changes_on_a_static_screen_reaches_the_cascade() {
         let t0 = Instant::now();
@@ -549,8 +533,7 @@ mod tests {
             "premise: no probe, no anchor"
         );
 
-        // Same screen, same revision: only the probe changed. A rank increase
-        // renders on the resolution that observes it.
+        // A rank increase renders on the resolution that observes it.
         let probe = Some(("awaiting approval", "claude:registry-approval"));
         let p = st.resolve(t0, &s, None, probe).clone();
         assert_eq!(
@@ -562,8 +545,7 @@ mod tests {
             )
         );
 
-        // Clearing it is a rank drop like any other, so the floor returns at
-        // the hold's expiry rather than instantly.
+        // Clearing the status demotes through the standard hold.
         assert_eq!(st.resolve(t0, &s, None, None).source, PreviewSource::Anchor);
         let p = st.resolve(t0 + DEMOTION_HOLD, &s, None, None).clone();
         assert_eq!(

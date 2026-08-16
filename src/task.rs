@@ -35,15 +35,9 @@ use crate::{
 /// input when a child stops reading.
 const MAX_PENDING_WRITE: usize = 16 * 1024 * 1024;
 
-/// Minimum interval between harness blocked-status probes for one task. The
-/// probe reads the CLI's registry off disk, and `resolve_preview` runs for
-/// every task on every snapshot tick, which range from the 8 ms frame minimum
-/// to the 200 ms idle backstop: unthrottled, that is a filesystem read per
-/// claude task per frame. Nothing downstream absorbs what the throttle costs.
-/// A blocked status appearing is a rank increase, which cancels any pending
-/// demotion and renders on the tick that observes it, so the interval plus one
-/// tick is the whole visible latency of a newly blocked session. 250 ms of it
-/// is a delay no human reading a status line can distinguish from immediate.
+/// Minimum interval between on-disk blocked-status probes for one task. Preview
+/// resolution runs every 8–200 ms; this caps each task at four registry probes
+/// per second.
 const BLOCKED_PROBE_INTERVAL: Duration = Duration::from_millis(250);
 
 /// A whole-message refusal from the bounded writer queue.
@@ -111,8 +105,8 @@ pub struct Task {
     pub summary_adapter: Option<&'static dyn crate::preview::SummaryAdapter>,
     /// Run number used to give each rerun a distinct capture path.
     pub run: u32,
-    /// Session ID injected or recognized at spawn. Later capture data or an
-    /// exit hint can supersede it.
+    /// Session ID injected or recognized at spawn. Capture data, a live
+    /// registry record, or an exit hint can supersede it.
     pub resume_id: Option<String>,
     /// Capture path allocated for this task run.
     pub capture_file: Option<PathBuf>,
@@ -124,13 +118,11 @@ pub struct Task {
     /// Dashboard-preview resolution state; resets with the task on rerun
     /// because a rerun replaces the whole `Task`.
     preview: PreviewState,
-    /// Latest harness blocked-on-user probe, held between refreshes so the
-    /// preview cascade sees it on every tick without a filesystem read.
+    /// Cached blocked-on-user status from the harness registry.
     blocked: Option<(String, &'static str)>,
-    /// When `blocked` was last read: the [`BLOCKED_PROBE_INTERVAL`] deadline
-    /// base. `None` until the first probe.
+    /// Last registry probe time; `None` before the first probe.
     blocked_probed: Option<Instant>,
-    /// Wall-clock spawn time used for filesystem correlation.
+    /// Wall-clock spawn time used for registry and transcript correlation.
     pub spawned_at: SystemTime,
     exit_code: Option<i32>,
     pub started: Instant,
@@ -375,10 +367,7 @@ impl Task {
         })
     }
 
-    /// The session leader's PID, which for an accepted agent command is the
-    /// agent process itself: the pid its live session registry is keyed by.
-    /// [`crate::harness::Harness::live_session_id`] carries the exec-in-place
-    /// mechanism that makes that true and the `$SHELL` shape that breaks it.
+    /// Return the task's session-leader PID.
     pub fn pid(&self) -> Option<u32> {
         self.pid
     }
@@ -542,13 +531,9 @@ impl Task {
             .clone()
     }
 
-    /// Re-read the harness's blocked-on-user claim, at most once per
-    /// [`BLOCKED_PROBE_INTERVAL`]. Three states never probe: no harness (the
-    /// command is opaque, or its tool publishes no status), no pid, and an
-    /// exited leader, whose record — if the CLI left one behind at all —
-    /// claims a state the process can no longer be in. The last of those also
-    /// drops the cached claim, so the ticks between exit and freeze do not
-    /// render a dead session as blocked.
+    /// Refresh the harness's blocked-on-user status at most once per
+    /// [`BLOCKED_PROBE_INTERVAL`]. Tasks without a harness or PID do not probe;
+    /// finished tasks clear the cached status.
     fn refresh_blocked(&mut self, now: Instant) {
         let (Some(h), Some(pid), None) = (self.harness, self.pid, self.finished) else {
             self.blocked = None;

@@ -11,7 +11,7 @@ Start a supported agent without flags:
 3. Press `w`, enter a session name, and press `Enter`. If the earlier sources produced no ID, the save also checks the agent's on-disk session store. A captured bare command becomes its canonical resume form, such as `claude --resume '<uuid>'`.
 4. Run `fleetcom <session>`, or press `o` in the dashboard, to start new processes from the saved commands. A stored resume command reopens its captured conversation.
 
-On a finished agent task, `r` uses the captured launch, hook, notifier, registry, or exit ID without performing save-time filesystem correlation. The registry earns its place at save (`w`) rather than rerun: it names the conversation a *live* session is running even when the `SessionStart` hook never fired, as with hooks disabled. A rerun reads it only after an unclean exit, since a clean exit removes the record. The replacement keeps the task's ID, tag, group, and name. After a successful rewrite, the row shows the resume command because it has become the task's launch recipe; a [saved session](sessions.md) records the same string.
+On a finished agent task, `r` uses the captured launch, hook, notifier, registry, or exit ID without performing save-time filesystem correlation. A registry record remains eligible after exit if it is still present. The replacement keeps the task's ID, tag, group, and name. After a successful rewrite, the row shows the resume command because it has become the task's launch recipe; a [saved session](sessions.md) records the same string.
 
 Capture is best-effort and narrow by design. A command carrying a prompt, extra flags, or shell syntax stays opaque and saves verbatim. An accepted command with no available ID also saves unchanged. In both cases, loading the recipe reruns the original command.
 
@@ -52,9 +52,9 @@ A bare Claude command can accept an ID at launch. `fleetcom` therefore generates
 
 A canonical resume command already supplies its conversation ID, so adding a second ID would be incorrect; it receives only `--settings`. The overlay installs a `SessionStart` hook that copies its JSON payload into `FLEETCOM_CAPTURE_FILE`, from which the harness reads `session_id`.
 
-Claude also publishes a live session registry: one `<claude-home>/sessions/<pid>.json` record per session, written and rewritten by the CLI itself with no instrumentation. `sh`, `bash`, `zsh`, and `dash` each exec a single simple `-c` command in place rather than forking, so a task's own PID names its record and the lookup is a direct path, not a search. That exec is a shell optimization, not a guarantee: under a `$SHELL` that forks and waits instead, the task's leader is the shell, no record is filed under its PID, and the registry simply goes unused rather than wrong.
+Claude also publishes one `<claude-home>/sessions/<pid>.json` record per session. `fleetcom` reads the direct path for the task leader's PID. When `$SHELL -c` leaves the shell as the task leader instead of replacing it with Claude, no matching record exists and the registry contributes no ID.
 
-A record counts only when its `kind` is `interactive` and its `pid`, `cwd`, and `startedAt` all match the task. A live task's PID cannot be reissued — `fleetcom` reaps with `WNOWAIT`, leaving the exited leader a zombie that holds the PID for the task's whole life — so the file is that task's own record or nothing. The `cwd` and `startedAt` guards close what the reservation cannot: the CLI removes its record on a clean exit but leaves it behind when the process dies on a signal, and only the next `claude` launch sweeps it, so a record from an *earlier* process at that PID can otherwise be read as this task's. `cwd` matches through symlink aliases, because claude records the `getcwd(3)` form while a task carries the path it was spawned with. `startedAt` names the process start, which `/clear` leaves untouched, so the 30-second match does not decay as a session ages. `/cd` inside claude moves the session's directory and loses the record. The CLI rewrites the file in place rather than renaming a temporary, so a torn read yields no evidence rather than bad evidence. The same record also carries the session's live status, from which the dashboard reads one state — `waiting`, the CLI blocked on the user — as the top tier of its [preview cascade](commands.md#peek).
+A record counts only when its `kind` is `interactive` and its `pid`, `cwd`, and `startedAt` match the task. The PID must match the filename, the working directories must be identical or resolve to the same path, and the process start must fall within 30 seconds of the task spawn. Missing, malformed, or mismatched records contribute no evidence. The dashboard also maps a matching record's `waiting` status to the top tier of its [preview cascade](commands.md#peek); other statuses do not affect the preview.
 
 After the process exits and the PTY reader reaches EOF, the harness scans the retained terminal text for the last `claude --resume <uuid>` hint. Save-time filesystem correlation checks `<claude-home>/projects/<cwd-slug>/<uuid>.jsonl`, where the slug replaces `/` and `.` in the absolute working directory with `-`.
 
@@ -84,11 +84,11 @@ Several channels can identify different conversations during one task. To make t
 
 1. The exit hint scraped after process exit and PTY-reader EOF.
 2. The current capture-file payload.
-3. The live session registry, currently `claude` only.
+3. The live session registry, implemented by `claude`.
 4. The ID pinned or targeted at spawn.
 5. Save-time filesystem correlation, when exactly one store entry matches the task and the 30-second spawn window.
 
-The registry outranks the spawn pin because the pin records what `fleetcom` asked for while the registry records what the CLI is running, and those diverge the moment a user runs `/clear`, which mints a fresh ID mid-session. It ranks below the capture file only because that file is `fleetcom`'s own hook output, and the two agree whenever both exist.
+The registry outranks the spawn pin because it can contain a session ID selected after launch, including one created by `/clear`. The capture file outranks the registry.
 
 Saving and rerunning rewrite accepted commands to one of these forms:
 

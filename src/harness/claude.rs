@@ -1,9 +1,8 @@
-//! Claude exposes four useful session signals: a launch-time `--session-id`, a
-//! `SessionStart` hook, a live session registry, and an exit-time resume hint.
-//! Bare launches pin a v4 UUID; every accepted launch receives the hook through
-//! `--settings`. The CLI itself publishes one `<claude-home>/sessions/<pid>.json`
-//! record per live session, with no instrumentation. The filesystem fallback
-//! correlates `<claude-home>/projects/<cwd-slug>/<uuid>.jsonl` transcripts.
+//! Claude session capture uses a launch-time `--session-id`, a `SessionStart`
+//! hook, the live session registry, and the exit-time resume hint. Bare launches
+//! pin a v4 UUID; accepted launches install the hook through `--settings`.
+//! Live lookup reads `<claude-home>/sessions/<pid>.json`; fallback correlation
+//! reads project transcripts.
 
 use std::{
     fs,
@@ -78,10 +77,7 @@ impl Harness for Claude {
         home: Option<&Path>,
     ) -> Option<(String, &'static str)> {
         let rec = record_for_pid(pid, cwd, spawned, home)?;
-        // The waiting state alone: see the trait doc. The registry beats the
-        // screen to this one state by about a second and reports it at any
-        // terminal width and for every dialog shape, including the ones
-        // `ClaudeSummary`'s `❯ 1. `/`2. ` selector match does not cover.
+        // Only `waiting` overrides the screen-derived preview.
         rec.waiting
             .then(|| waiting_preview(rec.waiting_for.as_deref()))
     }
@@ -99,38 +95,24 @@ impl Harness for Claude {
     }
 }
 
-/// One record from the live session registry. The CLI writes it on launch and
-/// rewrites it in place as the session changes; it removes it on a clean exit
-/// but leaves it behind when the process dies on a signal, so a record on disk
-/// is a claim about a pid, not proof of a live session.
+/// Validated fields used to correlate a registry record with a task and render
+/// its blocked status.
 struct SessionRecord {
-    /// `sessionId`, already through [`is_uuid`].
+    /// `sessionId`, validated by [`is_uuid`].
     id: String,
-    /// `pid`, which also names the record's file.
     pid: i32,
-    /// `cwd` the session runs in.
     cwd: PathBuf,
-    /// `startedAt`: the process's start in epoch milliseconds. `procStart`
-    /// names the same instant in human-readable form.
+    /// `startedAt`, in epoch milliseconds.
     started_at: u128,
-    /// `status` reading `waiting`: the CLI blocked on the user. That is the
-    /// only value any caller acts on, so the rest of the vocabulary, a value
-    /// this reader predates, and the absent field non-interactive entrypoints
-    /// write all collapse to `false` without invalidating the record.
+    /// Whether `status` is `waiting`.
     waiting: bool,
-    /// `waitingFor`: why a waiting session waits. Present only while the CLI
-    /// holds a dialog open.
+    /// Optional `waitingFor` text.
     waiting_for: Option<String>,
 }
 
-/// Preview text and matcher ID for a `waiting` record's `waitingFor` reason.
-/// The CLI's dialog-label map spells five reasons: `permission prompt` (its
-/// default for any dialog), `input needed`, `dialog open`, `sandbox request`,
-/// and `worker request`. Only the first is rewritten, to the string
-/// `ClaudeSummary::claude_approval` already synthesizes for the same
-/// condition; the rest are claude's own words and are kept verbatim, as is any
-/// reason a later version adds. A record that reports `waiting` without a
-/// reason still names a user-blocking state, so it renders as one.
+/// Map a `waitingFor` reason to preview text and its matcher ID. Permission
+/// prompts use the same text as the screen matcher; other non-empty reasons
+/// remain verbatim. A missing reason falls back to `awaiting input`.
 fn waiting_preview(reason: Option<&str>) -> (String, &'static str) {
     match reason.filter(|r| !r.is_empty()) {
         Some("permission prompt") => ("awaiting approval".to_string(), "claude:registry-approval"),
@@ -139,11 +121,9 @@ fn waiting_preview(reason: Option<&str>) -> (String, &'static str) {
     }
 }
 
-/// Parse one registry record. The CLI rewrites the file in place with a plain
-/// write rather than a temp-and-rename, so a reader can catch it truncated:
-/// unparseable text yields `None` and the caller simply has no evidence this
-/// time. `bg`, `daemon`, and `daemon-worker` records name conversations no user
-/// is driving, so only `interactive` survives.
+/// Parse one interactive registry record. Malformed records and other `kind`
+/// values return `None`; a missing or unrecognized status remains valid but
+/// does not set `waiting`.
 fn parse_record(text: &str) -> Option<SessionRecord> {
     let v = jzon::parse(text).ok()?;
     if v["kind"].as_str()? != "interactive" {
@@ -160,28 +140,10 @@ fn parse_record(text: &str) -> Option<SessionRecord> {
     })
 }
 
-/// Read the record `pid` publishes, requiring it to name that pid, that `cwd`,
-/// and a process started within [`super::CORRELATE_WINDOW`] of `spawned`.
-///
-/// A live task's pid cannot be reissued to a foreign `claude`:
-/// [`crate::task::Task::poll_exit`] reaps with `WNOWAIT` and leaves the exited
-/// leader a zombie, which holds the pid for the task's whole life. So
-/// `sessions/<pid>.json` is this task's own record or nothing — that, not the
-/// field checks, is what keeps a stranger out.
-///
-/// The `cwd` and `startedAt` guards close what the reservation cannot: a record
-/// an *earlier* process at that pid left behind, before this task existed. The
-/// CLI removes its record on a clean exit, but a signal-killed `claude` leaves
-/// it and only the next `claude` launch sweeps it. `cwd` separates two
-/// directories; `startedAt` separates two processes in one directory. Both cost
-/// less than the read that produced the record and sit at a shell-command
-/// boundary, so they stay. That window does not decay with session age, because
-/// `startedAt` records the process start: `/clear` mints a fresh `sessionId` in
-/// place and leaves `startedAt` untouched, so a session running for hours still
-/// matches its original spawn instant.
-///
-/// Call-site details: `/cd` inside claude moves the session's `cwd` and fails
-/// this check, which loses the record. Failing closed there is deliberate.
+/// Read `sessions/<pid>.json` and require its PID, working directory, and
+/// process start to match the task. The unreaped task leader reserves its PID;
+/// the directory and start-time checks reject stale records already present at
+/// that path. A mismatch returns `None` because the ID may enter a shell command.
 fn record_for_pid(
     pid: u32,
     cwd: &Path,
@@ -193,24 +155,15 @@ fn record_for_pid(
     let text = fs::read_to_string(dir.join(format!("{pid}.json"))).ok()?;
     let rec = parse_record(&text)?;
     let spawned_ms = spawned.duration_since(UNIX_EPOCH).ok()?.as_millis();
-    // Same path through two aliases is one directory: claude records
-    // `process.cwd()`, which is `getcwd(3)` and so symlink-resolved, while a
-    // task carries the path it was spawned with. `canonicalize` is IO and fails
-    // on a vanished directory, which leaves the verbatim comparison standing —
-    // a cwd matching neither form is still refused.
+    // Accept the task's literal path or its canonical form; reject a failed
+    // canonicalization unless the literal paths already match.
     let same_cwd = rec.cwd == cwd || cwd.canonicalize().is_ok_and(|c| rec.cwd == c);
     (rec.pid == pid && same_cwd && within_window_ms(rec.started_at, spawned_ms)).then_some(rec)
 }
 
-/// Return the sole `candidate` in `dir` created within [`super::CORRELATE_WINDOW`]
-/// of `spawned`. `candidate` names an entry or skips it; entries without
-/// creation times cannot be correlated by window and are skipped too. Several
-/// in-window candidates cannot be told apart, and a stray non-uuid candidate
-/// still counts against uniqueness: both return `None`.
-///
-/// Local to this harness because creation time is the only correlator claude's
-/// transcript store offers: every other harness reads an instant the tool
-/// recorded itself, out of a rollout header or a v7 UUID.
+/// Return the sole candidate created within [`super::CORRELATE_WINDOW`] of
+/// `spawned`. Missing creation times, multiple candidates, and a sole invalid
+/// UUID return `None`.
 fn unique_in_window(
     dir: PathBuf,
     spawned: SystemTime,
@@ -257,9 +210,7 @@ mod tests {
         testutil::temp,
     };
 
-    /// One record a live `claude` 2.1.233 published. Field order and spelling
-    /// are as written; its `sessionId` is [`OTHER`], and the middle of `cwd` is
-    /// elided, which the reader never inspects.
+    /// Complete registry fixture with [`OTHER`] as its session ID.
     const LIVE_RECORD: &str = concat!(
         r#"{"pid":83849,"sessionId":"11111111-2222-4333-8444-555555555555","#,
         r#""cwd":"/private/tmp/.../scratchpad/live-claude","startedAt":1786834960302,"#,
@@ -269,27 +220,26 @@ mod tests {
         r#""name":"live-claude-66","nameSource":"derived","nameSince":1786834960303,"#,
         r#""status":"idle","updatedAt":1786834960352,"statusUpdatedAt":1786834960352}"#,
     );
-    /// The pid, directory, and process start [`LIVE_RECORD`] names.
+    /// Identity fields in [`LIVE_RECORD`].
     const LIVE_PID: u32 = 83849;
     const LIVE_CWD: &str = "/private/tmp/.../scratchpad/live-claude";
     const LIVE_STARTED: u64 = 1_786_834_960_302;
 
-    /// A registry record carrying every field the reader validates. `tail`
-    /// appends raw JSON for the optional status pair.
+    /// Build a registry record with optional raw JSON fields in `tail`.
     fn record(pid: i32, id: &str, cwd: &str, started: u64, kind: &str, tail: &str) -> String {
         format!(
             r#"{{"pid":{pid},"sessionId":"{id}","cwd":"{cwd}","startedAt":{started},"version":"2.1.233","kind":"{kind}","entrypoint":"cli"{tail}}}"#
         )
     }
 
-    /// File `body` as the registry record for `pid`, creating the store.
+    /// Write `body` to the registry path for `pid`.
     fn install_record(home: &Path, pid: i32, body: &str) {
         let dir = home.join("sessions");
         fs::create_dir_all(&dir).unwrap();
         fs::write(dir.join(format!("{pid}.json")), body).unwrap();
     }
 
-    /// The instant `ms` epoch milliseconds names.
+    /// Convert epoch milliseconds to [`SystemTime`].
     fn at_ms(ms: u64) -> SystemTime {
         UNIX_EPOCH + std::time::Duration::from_millis(ms)
     }
@@ -422,8 +372,7 @@ mod tests {
         );
     }
 
-    /// The record a live session published parses whole, and the harness
-    /// surfaces its ID through the trait.
+    /// A complete matching record exposes its validated session ID.
     #[test]
     fn record_for_pid_reads_a_live_record() {
         let home = temp("claude_registry");
@@ -442,8 +391,7 @@ mod tests {
         );
     }
 
-    /// The record must claim the pid whose file it sits in and the directory
-    /// the task runs in.
+    /// The record must match its filename PID and the task directory.
     #[test]
     fn record_for_pid_requires_the_records_own_pid_and_cwd() {
         let home = temp("claude_registry_ident");
@@ -457,7 +405,7 @@ mod tests {
         );
         assert!(record_for_pid(4242, cwd, spawned, Some(&home)).is_some());
 
-        // A record filed under one pid while naming another is not this task's.
+        // The filename and embedded PID must agree.
         install_record(
             &home,
             4242,
@@ -473,9 +421,7 @@ mod tests {
         assert!(record_for_pid(4242, cwd, spawned, Some(&home)).is_none());
     }
 
-    /// Claude records `process.cwd()`, which `getcwd(3)` already resolved
-    /// through every symlink; the task carries the path it was spawned with.
-    /// One directory reached two ways still matches.
+    /// Literal and canonical paths to the same directory both match.
     #[test]
     fn record_for_pid_accepts_a_symlinked_cwd_alias() {
         let tmp = temp("claude_registry_alias");
@@ -503,15 +449,12 @@ mod tests {
 
         let spawned = at_ms(LIVE_STARTED);
         assert!(record_for_pid(7, &link, spawned, Some(&home)).is_some());
-        // A real directory that is not an alias of the record's is still
-        // refused, as is one that no longer exists to canonicalize.
+        // Different and nonexistent paths remain mismatches.
         assert!(record_for_pid(7, &other, spawned, Some(&home)).is_none());
         assert!(record_for_pid(7, &tmp.join("gone"), spawned, Some(&home)).is_none());
     }
 
-    /// A `claude` killed by a signal leaves its record behind until the next
-    /// launch sweeps it. A task later assigned that pid in the same directory
-    /// satisfies both identity guards, so the process start is what rejects it.
+    /// The process start rejects a stale record with a matching PID and CWD.
     #[test]
     fn record_for_pid_rejects_a_recycled_pids_stale_record() {
         let home = temp("claude_registry_recycled");
@@ -522,17 +465,15 @@ mod tests {
             &record(4242, ID, "/w", LIVE_STARTED, "interactive", ""),
         );
 
-        // The same process: its start is inside the correlation window.
+        // The correlation window includes both endpoints.
         assert!(record_for_pid(4242, cwd, at_ms(LIVE_STARTED + 30_000), Some(&home)).is_some());
         assert!(record_for_pid(4242, cwd, at_ms(LIVE_STARTED - 30_000), Some(&home)).is_some());
-        // A later process under the recycled pid: minutes apart, or one
-        // millisecond outside the window.
+        // One millisecond outside the window is stale.
         assert!(record_for_pid(4242, cwd, at_ms(LIVE_STARTED + 30_001), Some(&home)).is_none());
         assert!(record_for_pid(4242, cwd, at_ms(LIVE_STARTED + 600_000), Some(&home)).is_none());
     }
 
-    /// Only an `interactive` record names a conversation a user is driving,
-    /// and only a strict UUID may leave the reader.
+    /// Only interactive records with strict UUIDs are eligible.
     #[test]
     fn record_for_pid_requires_an_interactive_kind_and_a_strict_id() {
         let home = temp("claude_registry_kind");
@@ -556,7 +497,7 @@ mod tests {
                 "{id:?}"
             );
         }
-        // A record missing `kind` is unclassifiable.
+        // `kind` is required.
         install_record(
             &home,
             7,
@@ -565,9 +506,7 @@ mod tests {
         assert!(record_for_pid(7, cwd, spawned, Some(&home)).is_none());
     }
 
-    /// The CLI rewrites the record in place rather than renaming a temporary,
-    /// so a reader can catch it truncated. That, an absent record, and an
-    /// absent store all mean no evidence this time.
+    /// Malformed and absent records contribute no evidence.
     #[test]
     fn record_for_pid_tolerates_a_torn_file_and_a_missing_store() {
         let home = temp("claude_registry_torn");
@@ -580,14 +519,13 @@ mod tests {
                 "{body:?}"
             );
         }
-        // No record for this pid, and no store at all.
+        // Missing file and missing directory follow the same path.
         assert!(record_for_pid(1, cwd, spawned, Some(&home)).is_none());
         let bare = temp("claude_registry_bare");
         assert!(record_for_pid(LIVE_PID, cwd, spawned, Some(&bare)).is_none());
     }
 
-    /// Only `waiting` is read, so a status absent or from a vocabulary this
-    /// reader predates leaves the record valid and its ID usable.
+    /// Status values other than `waiting` do not invalidate the session ID.
     #[test]
     fn record_for_pid_keeps_the_id_under_an_unread_status() {
         let home = temp("claude_registry_status");
@@ -605,12 +543,8 @@ mod tests {
         }
     }
 
-    /// The blocked-status probe speaks the `waitingFor` vocabulary the CLI's
-    /// own dialog-label map defines. `permission prompt` is its default for
-    /// any dialog and is the one value rewritten, to the string the screen
-    /// scraper synthesizes for the same condition; every other reason is
-    /// claude's wording and survives verbatim, a reason this reader predates
-    /// included. A `waiting` record with no reason still blocks the user.
+    /// Permission prompts use the approval label, other reasons remain
+    /// verbatim, and an absent reason falls back to `awaiting input`.
     #[test]
     fn live_blocked_status_maps_every_waiting_reason() {
         let home = temp("claude_blocked_reasons");
@@ -634,8 +568,6 @@ mod tests {
             "dialog open",
             "sandbox request",
             "worker request",
-            // Not in today's map: a later CLI version's wording is still
-            // claude's own and reads better than a synthesized stand-in.
             "quantum entanglement request",
         ] {
             assert_eq!(
@@ -656,11 +588,7 @@ mod tests {
         }
     }
 
-    /// Only `waiting` answers. `busy` and `shell` resolve to a title carrying
-    /// claude's own per-turn summary, and `idle` to whatever the screen shows;
-    /// replacing either with the bare status word would lose information. An
-    /// absent status, an unreadable one, and a record that fails the identity
-    /// guards are all no evidence.
+    /// Only `waiting` produces a blocked-status preview.
     #[test]
     fn live_blocked_status_answers_for_waiting_alone() {
         let home = temp("claude_blocked_states");
@@ -681,12 +609,12 @@ mod tests {
             r#","status":"idle""#,
             r#","status":"hibernating""#,
             "",
-            // A reason without the status it belongs to is not a claim.
+            // A reason without `status: waiting` is not blocked.
             r#","waitingFor":"permission prompt""#,
         ] {
             assert_eq!(probe(tail), None, "{tail:?}");
         }
-        // No record for this pid at all.
+        // A missing record contributes no status.
         assert_eq!(
             Claude.live_blocked_status(9, cwd, spawned, Some(&home)),
             None

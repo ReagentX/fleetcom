@@ -124,11 +124,7 @@ impl SummaryAdapter for ClaudeSummary {
     fn normalize_title(&self, title: &str) -> Option<String> {
         let mut chars = title.chars();
         let frame = chars.next()?;
-        // An animation frame set is only neutralized when every member
-        // collapses to one rendered string; a frame left out reanimates the
-        // title. The quadrant circles are taken as the whole contiguous
-        // block for that reason: `◐` and `◑` are the observed pair, and the
-        // other two cost nothing to cover ahead of a four-phase cycle.
+        // Normalize the entire quadrant-circle block as one animation set.
         let framed = CLAUDE_SPINNER.contains(&frame)
             || ('\u{2800}'..='\u{28FF}').contains(&frame)
             || ('\u{25D0}'..='\u{25D3}').contains(&frame);
@@ -274,10 +270,7 @@ fn claude_approval(rows: &[String]) -> Option<(String, &'static str)> {
         .then(|| ("awaiting approval".to_string(), "claude:approval-menu"))
 }
 
-/// The levels claude documents for `--effort`. A truncated cell is only
-/// trusted when its effort token is a complete member: `with hi…` is a cut
-/// landing inside the word, and rendering `(hi)` would state an effort the
-/// session is not running at.
+/// Complete effort values accepted before a welcome-box ellipsis.
 const CLAUDE_EFFORT: &[&str] = &["low", "medium", "high", "xhigh", "max"];
 
 /// `Fable 5 with high effort` from the welcome box → `Fable 5 (high)`. The
@@ -304,17 +297,9 @@ fn claude_welcome_label(rows: &[String]) -> Option<String> {
     None
 }
 
-/// `Fable 5 with high effort` → `Fable 5 (high)`, and the same for the
-/// spelling the CLI truncates itself: `Opus 5 (1M context) with high…`. The
-/// welcome box's left pane is fixed near 50 columns whatever the terminal
-/// width, so a model name that overruns the pane loses its trailing ` effort`
-/// to the CLI's own ellipsis and no terminal is wide enough to bring it back.
-/// The full spelling needs no vocabulary check — the trailing word proves the
-/// token is whole — while the truncated one is refused unless the token is a
-/// complete [`CLAUDE_EFFORT`] level. A model name carrying its own
-/// parentheses reads as `Opus 5 (1M context) (high)`; the
-/// `{model} ({effort})` contract is applied as written rather than
-/// special-cased.
+/// Normalize `<model> with <effort> effort` and its ellipsis form to
+/// `<model> (<effort>)`. The ellipsis form requires a complete
+/// [`CLAUDE_EFFORT`] value; a partial token returns `None`.
 fn claude_model_effort(head: &str) -> Option<String> {
     let (model, effort) = match head.strip_suffix(" effort") {
         Some(full) => full.rsplit_once(" with ")?,
