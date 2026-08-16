@@ -67,7 +67,7 @@ impl Harness for Claude {
         spawned: SystemTime,
         home: Option<&Path>,
     ) -> Option<String> {
-        Some(record_for_pid(home, pid, cwd, spawned)?.id)
+        Some(record_for_pid(pid, cwd, spawned, home)?.id)
     }
 
     fn live_blocked_status(
@@ -77,7 +77,7 @@ impl Harness for Claude {
         spawned: SystemTime,
         home: Option<&Path>,
     ) -> Option<(String, &'static str)> {
-        let rec = record_for_pid(home, pid, cwd, spawned)?;
+        let rec = record_for_pid(pid, cwd, spawned, home)?;
         // The waiting state alone: see the trait doc. The registry beats the
         // screen to this one state by about a second and reports it at any
         // terminal width and for every dialog shape, including the ones
@@ -183,10 +183,10 @@ fn parse_record(text: &str) -> Option<SessionRecord> {
 /// Call-site details: `/cd` inside claude moves the session's `cwd` and fails
 /// this check, which loses the record. Failing closed there is deliberate.
 fn record_for_pid(
-    home: Option<&Path>,
     pid: u32,
     cwd: &Path,
     spawned: SystemTime,
+    home: Option<&Path>,
 ) -> Option<SessionRecord> {
     let pid = i32::try_from(pid).ok()?;
     let dir = Claude.home_root(home)?.join("sessions");
@@ -396,7 +396,7 @@ mod tests {
         let home = temp("claude_registry");
         install_record(&home, LIVE_PID as i32, LIVE_RECORD);
         let cwd = Path::new(LIVE_CWD);
-        let rec = record_for_pid(Some(&home), LIVE_PID, cwd, at_ms(LIVE_STARTED))
+        let rec = record_for_pid(LIVE_PID, cwd, at_ms(LIVE_STARTED), Some(&home))
             .expect("the live record must parse");
         assert_eq!(rec.id, OTHER);
         assert!(!rec.waiting, "the record's status is `idle`");
@@ -422,7 +422,7 @@ mod tests {
             4242,
             &record(4242, ID, "/w", LIVE_STARTED, "interactive", ""),
         );
-        assert!(record_for_pid(Some(&home), 4242, cwd, spawned).is_some());
+        assert!(record_for_pid(4242, cwd, spawned, Some(&home)).is_some());
 
         // A record filed under one pid while naming another is not this task's.
         install_record(
@@ -430,14 +430,14 @@ mod tests {
             4242,
             &record(99, ID, "/w", LIVE_STARTED, "interactive", ""),
         );
-        assert!(record_for_pid(Some(&home), 4242, cwd, spawned).is_none());
+        assert!(record_for_pid(4242, cwd, spawned, Some(&home)).is_none());
 
         install_record(
             &home,
             4242,
             &record(4242, ID, "/elsewhere", LIVE_STARTED, "interactive", ""),
         );
-        assert!(record_for_pid(Some(&home), 4242, cwd, spawned).is_none());
+        assert!(record_for_pid(4242, cwd, spawned, Some(&home)).is_none());
     }
 
     /// Claude records `process.cwd()`, which `getcwd(3)` already resolved
@@ -469,11 +469,11 @@ mod tests {
         );
 
         let spawned = at_ms(LIVE_STARTED);
-        assert!(record_for_pid(Some(&home), 7, &link, spawned).is_some());
+        assert!(record_for_pid(7, &link, spawned, Some(&home)).is_some());
         // A real directory that is not an alias of the record's is still
         // refused, as is one that no longer exists to canonicalize.
-        assert!(record_for_pid(Some(&home), 7, &other, spawned).is_none());
-        assert!(record_for_pid(Some(&home), 7, &tmp.join("gone"), spawned).is_none());
+        assert!(record_for_pid(7, &other, spawned, Some(&home)).is_none());
+        assert!(record_for_pid(7, &tmp.join("gone"), spawned, Some(&home)).is_none());
     }
 
     /// A `claude` killed by a signal leaves its record behind until the next
@@ -490,12 +490,12 @@ mod tests {
         );
 
         // The same process: its start is inside the correlation window.
-        assert!(record_for_pid(Some(&home), 4242, cwd, at_ms(LIVE_STARTED + 30_000)).is_some());
-        assert!(record_for_pid(Some(&home), 4242, cwd, at_ms(LIVE_STARTED - 30_000)).is_some());
+        assert!(record_for_pid(4242, cwd, at_ms(LIVE_STARTED + 30_000), Some(&home)).is_some());
+        assert!(record_for_pid(4242, cwd, at_ms(LIVE_STARTED - 30_000), Some(&home)).is_some());
         // A later process under the recycled pid: minutes apart, or one
         // millisecond outside the window.
-        assert!(record_for_pid(Some(&home), 4242, cwd, at_ms(LIVE_STARTED + 30_001)).is_none());
-        assert!(record_for_pid(Some(&home), 4242, cwd, at_ms(LIVE_STARTED + 600_000)).is_none());
+        assert!(record_for_pid(4242, cwd, at_ms(LIVE_STARTED + 30_001), Some(&home)).is_none());
+        assert!(record_for_pid(4242, cwd, at_ms(LIVE_STARTED + 600_000), Some(&home)).is_none());
     }
 
     /// Only an `interactive` record names a conversation a user is driving,
@@ -508,7 +508,7 @@ mod tests {
         for kind in ["bg", "daemon", "daemon-worker"] {
             install_record(&home, 7, &record(7, ID, "/w", LIVE_STARTED, kind, ""));
             assert!(
-                record_for_pid(Some(&home), 7, cwd, spawned).is_none(),
+                record_for_pid(7, cwd, spawned, Some(&home)).is_none(),
                 "{kind}"
             );
         }
@@ -519,7 +519,7 @@ mod tests {
                 &record(7, id, "/w", LIVE_STARTED, "interactive", ""),
             );
             assert!(
-                record_for_pid(Some(&home), 7, cwd, spawned).is_none(),
+                record_for_pid(7, cwd, spawned, Some(&home)).is_none(),
                 "{id:?}"
             );
         }
@@ -529,7 +529,7 @@ mod tests {
             7,
             &format!(r#"{{"pid":7,"sessionId":"{ID}","cwd":"/w","startedAt":{LIVE_STARTED}}}"#),
         );
-        assert!(record_for_pid(Some(&home), 7, cwd, spawned).is_none());
+        assert!(record_for_pid(7, cwd, spawned, Some(&home)).is_none());
     }
 
     /// The CLI rewrites the record in place rather than renaming a temporary,
@@ -543,14 +543,14 @@ mod tests {
         for body in [&LIVE_RECORD[..LIVE_RECORD.len() / 2], "", "\0"] {
             install_record(&home, LIVE_PID as i32, body);
             assert!(
-                record_for_pid(Some(&home), LIVE_PID, cwd, spawned).is_none(),
+                record_for_pid(LIVE_PID, cwd, spawned, Some(&home)).is_none(),
                 "{body:?}"
             );
         }
         // No record for this pid, and no store at all.
-        assert!(record_for_pid(Some(&home), 1, cwd, spawned).is_none());
+        assert!(record_for_pid(1, cwd, spawned, Some(&home)).is_none());
         let bare = temp("claude_registry_bare");
-        assert!(record_for_pid(Some(&bare), LIVE_PID, cwd, spawned).is_none());
+        assert!(record_for_pid(LIVE_PID, cwd, spawned, Some(&bare)).is_none());
     }
 
     /// Only `waiting` is read, so a status absent or from a vocabulary this
@@ -566,7 +566,7 @@ mod tests {
                 7,
                 &record(7, ID, "/w", LIVE_STARTED, "interactive", tail),
             );
-            let rec = record_for_pid(Some(&home), 7, cwd, spawned).expect("the record must parse");
+            let rec = record_for_pid(7, cwd, spawned, Some(&home)).expect("the record must parse");
             assert_eq!(rec.id, ID, "{tail:?}");
             assert!(!rec.waiting, "{tail:?}");
         }
@@ -633,6 +633,15 @@ mod tests {
         let home = temp("claude_blocked_states");
         let cwd = Path::new("/w");
         let spawned = at_ms(LIVE_STARTED);
+        let probe = |tail: &str| {
+            install_record(
+                &home,
+                7,
+                &record(7, ID, "/w", LIVE_STARTED, "interactive", tail),
+            );
+            Claude.live_blocked_status(7, cwd, spawned, Some(&home))
+        };
+
         for tail in [
             r#","status":"busy""#,
             r#","status":"shell""#,
@@ -642,16 +651,7 @@ mod tests {
             // A reason without the status it belongs to is not a claim.
             r#","waitingFor":"permission prompt""#,
         ] {
-            install_record(
-                &home,
-                7,
-                &record(7, ID, "/w", LIVE_STARTED, "interactive", tail),
-            );
-            assert_eq!(
-                Claude.live_blocked_status(7, cwd, spawned, Some(&home)),
-                None,
-                "{tail:?}"
-            );
+            assert_eq!(probe(tail), None, "{tail:?}");
         }
         // No record for this pid at all.
         assert_eq!(

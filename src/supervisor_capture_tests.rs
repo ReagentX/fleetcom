@@ -73,6 +73,24 @@ fn install_script(bin: &Path, name: &str, body: &str) {
     write_executable(&bin.join(name), body);
 }
 
+/// File the registry record `pid` publishes, carrying the raw `status` JSON
+/// pair. Every field `record_for_pid` validates has to agree with the task:
+/// the file name and `pid`, the `cwd`, and a process start inside the
+/// correlation window of the spawn.
+fn install_status_record(home: &Path, pid: u32, cwd: &Path, status: &str) {
+    let sessions = home.join("sessions");
+    std::fs::create_dir_all(&sessions).unwrap();
+    std::fs::write(
+        sessions.join(format!("{pid}.json")),
+        format!(
+            r#"{{"pid":{pid},"sessionId":"{CAP_ID}","cwd":"{cwd}","startedAt":{started},"kind":"interactive",{status}}}"#,
+            cwd = cwd.display(),
+            started = now_ms()
+        ),
+    )
+    .unwrap();
+}
+
 /// Save a recipe and return its persisted JSON.
 fn save_and_read(s: &mut Supervisor, config: &Path, name: &str) -> String {
     s.apply(Command::SaveSession { name: name.into() });
@@ -955,17 +973,7 @@ fn resume_id_precedence_registry_over_spawn_under_capture() {
     // the registry record.
     let pid = s.tasks[0].pid().expect("a live task has a pid");
 
-    let sessions = claude_home.join("sessions");
-    std::fs::create_dir_all(&sessions).unwrap();
-    std::fs::write(
-        sessions.join(format!("{pid}.json")),
-        format!(
-            r#"{{"pid":{pid},"sessionId":"{CAP_ID}","cwd":"{cwd}","startedAt":{started},"kind":"interactive","status":"idle"}}"#,
-            cwd = dir.display(),
-            started = now_ms()
-        ),
-    )
-    .unwrap();
+    install_status_record(&claude_home, pid, &dir, r#""status":"idle""#);
     let text = save_and_read(&mut s, &config, "registry");
     assert!(
         text.contains(&format!("claude --resume '{CAP_ID}'")),
@@ -1444,24 +1452,6 @@ fn recovery_cadence_rewrites_on_capture_drift_and_skips_when_static() {
 }
 
 // --- live registry blocked status --------------------------------------
-
-/// File the registry record `pid` publishes, carrying the raw `status` JSON
-/// pair. Every field `record_for_pid` validates has to agree with the task:
-/// the file name and `pid`, the `cwd`, and a process start inside the
-/// correlation window of the spawn.
-fn install_status_record(home: &Path, pid: u32, cwd: &Path, status: &str) {
-    let sessions = home.join("sessions");
-    std::fs::create_dir_all(&sessions).unwrap();
-    std::fs::write(
-        sessions.join(format!("{pid}.json")),
-        format!(
-            r#"{{"pid":{pid},"sessionId":"{CAP_ID}","cwd":"{cwd}","startedAt":{started},"kind":"interactive",{status}}}"#,
-            cwd = cwd.display(),
-            started = now_ms()
-        ),
-    )
-    .unwrap();
-}
 
 /// Tick until the sole task's emitted preview satisfies `pred`, then return
 /// the last preview seen. Only a tick resolves a preview and only a

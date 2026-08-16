@@ -375,13 +375,10 @@ impl Task {
         })
     }
 
-    /// The session leader's PID. `sh`, `bash`, `zsh`, and `dash` each exec a
-    /// single simple `-c` command in place rather than forking, so for an
-    /// accepted agent command this is the agent process itself: the pid its
-    /// live session registry is keyed by. That exec is a shell optimization,
-    /// not a guarantee — under a `$SHELL` that forks and waits, the leader is
-    /// the shell and the registry lookups find nothing rather than the wrong
-    /// thing.
+    /// The session leader's PID, which for an accepted agent command is the
+    /// agent process itself: the pid its live session registry is keyed by.
+    /// [`crate::harness::Harness::live_session_id`] carries the exec-in-place
+    /// mechanism that makes that true and the `$SHELL` shape that breaks it.
     pub fn pid(&self) -> Option<u32> {
         self.pid
     }
