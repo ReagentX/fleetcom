@@ -16,8 +16,8 @@
 //!    box, codex's composer, grok's bordered input box, omp's two-row input
 //!    box) and limits status candidates relative to it;
 //! 2. returns `None` when the expected structure is absent or inconsistent;
-//! 3. matches row prefixes so status rows truncated with an ellipsis at narrow
-//!    widths remain recognizable. A wrapped row fails the structural check.
+//! 3. preserves CLI-generated ellipsis truncation. omp also requires its
+//!    trailing interrupt hint; wrapped rows fail that structural check.
 //!
 //! Normalization removes spinner glyphs, elapsed counters, throughput data,
 //! and key hints while preserving the CLI's status text. The only synthesized
@@ -42,6 +42,10 @@ pub fn select(command: &str) -> Option<&'static dyn SummaryAdapter> {
         .map(|a| a.summary)
 }
 
+/// Preview text shared by approval-menu matchers and Claude's registry
+/// permission prompt.
+pub(crate) const AWAITING_APPROVAL: &str = "awaiting approval";
+
 /// Whether `row` is a full-width horizontal rule: nothing but `─`, long
 /// enough that box borders and inline list rules never qualify. claude's
 /// input box is fenced by two such rows.
@@ -54,6 +58,12 @@ fn is_rule_row(row: &str) -> bool {
         n += 1;
     }
     n >= 40
+}
+
+/// Whether `c` is a Unicode Braille Patterns code point used as a spinner
+/// frame by the supported CLIs.
+fn braille_frame(c: char) -> bool {
+    ('\u{2800}'..='\u{28FF}').contains(&c)
 }
 
 /// The status phrase of a spinner row: a frame char accepted by `is_frame`,
@@ -126,7 +136,7 @@ impl SummaryAdapter for ClaudeSummary {
         let frame = chars.next()?;
         // Normalize the entire quadrant-circle block as one animation set.
         let framed = CLAUDE_SPINNER.contains(&frame)
-            || ('\u{2800}'..='\u{28FF}').contains(&frame)
+            || braille_frame(frame)
             || ('\u{25D0}'..='\u{25D3}').contains(&frame);
         (framed && chars.next()? == ' ').then(|| format!("✻ {}", chars.as_str()))
     }
@@ -267,7 +277,7 @@ fn claude_approval(rows: &[String]) -> Option<(String, &'static str)> {
     let next = rows[i + 1..].iter().find(|r| !r.is_empty())?;
     next.trim_start()
         .starts_with("2. ")
-        .then(|| ("awaiting approval".to_string(), "claude:approval-menu"))
+        .then(|| (AWAITING_APPROVAL.to_string(), "claude:approval-menu"))
 }
 
 /// Complete effort values accepted before a welcome-box ellipsis.
@@ -362,8 +372,7 @@ impl SummaryAdapter for CodexSummary {
         }
         let mut chars = title.chars();
         let frame = chars.next()?;
-        (('\u{2800}'..='\u{28FF}').contains(&frame) && chars.next()? == ' ')
-            .then(|| format!("⠋ {}", chars.as_str()))
+        (braille_frame(frame) && chars.next()? == ' ').then(|| format!("⠋ {}", chars.as_str()))
     }
 }
 
@@ -397,7 +406,7 @@ fn codex_approval(rows: &[String]) -> Option<(String, &'static str)> {
     rows[i + 1..]
         .iter()
         .all(|r| !r.starts_with(CODEX_PROMPT) || codex_menu_head(r))
-        .then(|| ("awaiting approval".to_string(), "codex:approval-menu"))
+        .then(|| (AWAITING_APPROVAL.to_string(), "codex:approval-menu"))
 }
 
 /// Return the first ` · `-separated item from the bottom-most qualifying row
@@ -587,7 +596,7 @@ impl SummaryAdapter for GrokSummary {
         let t = probe.trim_start();
         // Keep the label through its first ellipsis. Wrapped tail rows have no
         // spinner prefix, so they fail the frame check and fall through.
-        if let Some(text) = spinner_text(t, |c| ('\u{2800}'..='\u{28FF}').contains(&c)) {
+        if let Some(text) = spinner_text(t, braille_frame) {
             return Some((text, "grok:spinner"));
         }
         // Still-running is the same probe, never a scan: a closer spinner
@@ -678,12 +687,6 @@ fn grok_border_label(row: &str) -> Option<String> {
 
 // ------------------------------------------------------------------- omp --
 
-/// Accept any braille code point as a spinner frame. The row still requires an
-/// interrupt hint, and ASCII punctuation is too weak to anchor safely.
-fn omp_frame(c: char) -> bool {
-    ('\u{2800}'..='\u{28FF}').contains(&c)
-}
-
 /// Interrupt-hint suffixes accepted on an anchored status row.
 const OMP_HINTS: &[&str] = &["⟦esc⟧", "⟨esc⟩"];
 
@@ -736,7 +739,7 @@ fn omp_input_box(rows: &[String]) -> Option<usize> {
 fn omp_spinner_status(rows: &[String], top: usize) -> Option<(String, &'static str)> {
     let probe = rows[..top].iter().rev().find(|r| !r.is_empty())?;
     let mut chars = probe.trim_start().chars();
-    if !omp_frame(chars.next()?) || chars.next()? != ' ' {
+    if !braille_frame(chars.next()?) || chars.next()? != ' ' {
         return None;
     }
     let rest = chars.as_str();
@@ -764,7 +767,7 @@ fn omp_approval(rows: &[String]) -> Option<(String, &'static str)> {
     rows[i.saturating_sub(6)..i]
         .iter()
         .any(|r| omp_allow_head(r))
-        .then(|| ("awaiting approval".to_string(), "omp:approval-menu"))
+        .then(|| (AWAITING_APPROVAL.to_string(), "omp:approval-menu"))
 }
 
 /// The selector's chosen row: a cursor spelling, a space, then `Approve` and

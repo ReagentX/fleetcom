@@ -32,7 +32,7 @@ use std::{
 
 use super::{
     CAPTURE_ENV, CapturePaths, Harness, Invocation, SpawnPlan, is_uuid, leading_uuid, shell_quote,
-    within_window_ms,
+    v7_millis, within_window_ms,
 };
 
 /// Command fragment shared by ordinary exit and recovery hints.
@@ -220,16 +220,6 @@ impl Harness for Omp {
             _ => None,
         }
     }
-}
-
-/// Milliseconds embedded in the first 48 bits of a UUIDv7: the session's
-/// creation instant. `None` when `id` is not v7. `id` must already satisfy
-/// [`is_uuid`], which fixes its length and alphabet.
-fn v7_millis(id: &str) -> Option<u64> {
-    if id.as_bytes()[14] != b'7' {
-        return None;
-    }
-    u64::from_str_radix(&format!("{}{}", &id[..8], &id[9..13]), 16).ok()
 }
 
 /// Whether either of the first two records is a session header naming `cwd`,
