@@ -129,7 +129,7 @@ fn live_fleet(dirs: &Dirs) -> Vec<TaskView> {
             lifecycle: Lifecycle::Active,
             parked: false,
             preview: anchor(
-                "✻ Scope small fixes for dashboard and CLI",
+                "Scope small fixes for dashboard and CLI",
                 "claude:action-row",
             ),
             started_ago: mins(2),
@@ -355,7 +355,7 @@ fn live_fleet(dirs: &Dirs) -> Vec<TaskView> {
             name: None,
             lifecycle: Lifecycle::Active,
             parked: false,
-            preview: anchor("✻ Review GitHub issue 780", "claude:action-row"),
+            preview: anchor("Review GitHub issue 780", "claude:action-row"),
             started_ago: mins(6),
             quiet_ago: Some(secs(2)),
             finished_ago: None,
@@ -548,7 +548,7 @@ const FLEETCOM_CLIPPY: &str =
 const LOGRIA_WATCH: &str = "[Running 'cargo test'] test result: ok. 223 passed; 0 failed";
 const LOGRIA_DOC: &str = "Finished `dev` profile [unoptimized + debuginfo] target(s) in 3.41s";
 /// Quiet-fixture summary preview.
-const SUMMARY_QUIET: &str = "✻ Review fleetcom preview design document";
+const SUMMARY_QUIET: &str = "Review fleetcom preview design document";
 
 /// Visible `cargo test` tail used by the peek fixture.
 fn cargo_test_screen(id: u64) -> ScreenView {

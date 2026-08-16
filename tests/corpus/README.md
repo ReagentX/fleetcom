@@ -51,7 +51,10 @@ omits the welcome box, and includes a long blank gap above the input box and a
 roster below it. The omp fixtures replace the local model path and the working
 directory in the status line with same-length synthetic values, and their
 status rows carry a streamed intent phrase rather than omp's default
-`Working…`.
+`Working…`. `preview_omp_idle_titled.bin` is composed: the
+`preview_omp_idle.bin` rows verbatim, behind one prepended
+`ESC]0;π > fix the parser BEL` announce built from omp 17.3.4's verified
+`π > <label>` idle-title format.
 
 | Fixture | Scenario | Coverage |
 | --- | --- | --- |
@@ -85,6 +88,7 @@ status rows carry a streamed intent phrase rather than omp's default
 | `preview_omp_working.bin` | omp status row carrying the model's streamed intent phrase above the input box | `omp:spinner`; padding, spinner frame, and interrupt hint stripped |
 | `preview_omp_approval.bin` | omp approval selector, input box replaced, tool-call preview box and a live status row still above it | `omp:approval-menu` synthesizes `awaiting approval` while the status row keeps animating |
 | `preview_omp_idle.bin` | omp idle with the welcome box and tip above the input box | fall-through to the floor tier; an inline UI reaches no marker |
+| `preview_omp_idle_titled.bin` | the `preview_omp_idle.bin` bytes behind a prepended `π > fix the parser` title announce | the primary-screen title tier: the adapter strips the idle `>` and the label renders as the Title preview |
 | `preview_omp_body_hint.bin` | status-shaped row quoted in the transcript, prose between it and an idle input box | negative: the pin is the row above the box, not a substring search |
 | `preview_trunc_claude.bin` | synthetic 40×80: spinner row truncated inside its parenthetical | head match still extracts `Hashing…` |
 | `preview_trunc_codex.bin` | synthetic 40×80: working row truncated inside the `/ps` hint | the head still matches and the key-hint suffix is omitted |

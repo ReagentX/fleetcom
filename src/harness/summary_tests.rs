@@ -47,6 +47,11 @@ fn floor(text: &str) -> (String, PreviewSource, Option<&'static str>) {
     (text.to_string(), PreviewSource::Floor, None)
 }
 
+/// Expected title-preview tuple: an adapter-normalized retained title.
+fn titled(text: &str) -> (String, PreviewSource, Option<&'static str>) {
+    (text.to_string(), PreviewSource::Title, None)
+}
+
 /// Selection is a basename match on the first word only: wider than
 /// harness detection (arguments are tolerated), but env prefixes and
 /// shell syntax glued to the word select nothing.
@@ -1551,7 +1556,8 @@ fn corpus_idle_states_fall_through() {
     }
 }
 
-/// omp is an inline UI: an idle screen falls through to the floor tier —
+/// Negative control for the titled fixture: this rows-only capture retains
+/// no title announce, so the idle screen falls through to the floor tier —
 /// its input row — never the alternate-screen marker the other CLIs reach.
 #[test]
 fn corpus_omp_idle_falls_through_to_the_floor() {
@@ -1561,6 +1567,19 @@ fn corpus_omp_idle_falls_through_to_the_floor() {
         120,
     );
     assert_eq!(got, floor(&format!("╰─{}─╯", " ".repeat(116))));
+}
+
+/// The same idle screen behind a retained `π > <label>` announce renders the
+/// primary-screen title tier: the adapter strips the idle separator and the
+/// label alone becomes the Title preview.
+#[test]
+fn corpus_omp_idle_titled_renders_the_title_tier() {
+    let got = corpus(
+        include_bytes!("../../tests/corpus/preview_omp_idle_titled.bin"),
+        &OmpSummary,
+        120,
+    );
+    assert_eq!(got, titled("fix the parser"));
 }
 
 /// Status-shaped conversation text does not extract.

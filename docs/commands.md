@@ -202,7 +202,7 @@ The box uses a two-column layout. When height is limited, group headers drop fir
 
 A centered box over the dashboard showing the selected task's live screen (the last screenful). `↑`/`↓` (or `k`/`j`) switch which task you're peeking at; `Enter` attaches to it; `r` reruns it if it has finished; `Space`, `Esc`, or `q` closes.
 
-The footer's `preview:` segment names the source of the row's dashboard preview: `floor` (the last non-blank row of the live screen), `marker` (a full-screen program with no usable title), `title` (the child's window title), or `anchor/<rule>` (a recognized agent status, tagged with the matcher that produced it). Most rules name a screen matcher, such as `claude:spinner` or `codex:approval-menu`. The `claude:registry-approval` and `claude:registry-waiting` rules instead come from Claude's on-disk session status.
+The footer's `preview:` segment names the source of the row's dashboard preview: `floor` (the last non-blank row of the live screen), `marker` (a full-screen program with no usable title), `title` (the child's window title; a full-screen program's title renders verbatim, while on the primary screen only a title the task's agent adapter recognizes renders — a refusal falls to `floor`), or `anchor/<rule>` (a recognized agent status, tagged with the matcher that produced it). Most rules name a screen matcher, such as `claude:spinner` or `codex:approval-menu`. The `claude:registry-approval` and `claude:registry-waiting` rules instead come from Claude's on-disk session status.
 
 ## Attached
 
