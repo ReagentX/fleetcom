@@ -158,7 +158,8 @@ impl Harness for Codex {
                 // there to the first `_` or to the end. Reading the trailing 36
                 // instead would return the rollout ID of a reverted thread's
                 // `rollout-<ts>-<thread_id>_<rollout_id>.jsonl` — a valid UUID
-                // naming the wrong conversation.
+                // naming the wrong conversation. 0.147.0 writes no such name;
+                // codex main's `thread/revert` does.
                 let Some(ids) = stem.get(20..) else {
                     continue;
                 };
@@ -204,8 +205,8 @@ enum NotifyRoute {
 /// `config.toml` is the only file read, and the injected `-c` override is why
 /// that suffices: it lands in codex's `SessionFlags` layer at precedence 30,
 /// outranking every layer a user config can occupy — user config 20,
-/// user-with-profile 21, project 25. Only managed and enterprise config, at 40
-/// and 50, beat it.
+/// user-with-profile 21, project 25 — and enterprise-managed config too, at
+/// 15. Only the two legacy managed layers, at 40 and 50, beat it.
 fn config_notify_route(home: Option<&Path>) -> NotifyRoute {
     let Some(root) = Codex.home_root(home) else {
         return NotifyRoute::Vacant;

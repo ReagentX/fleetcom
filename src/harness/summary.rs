@@ -321,17 +321,19 @@ impl SummaryAdapter for CodexSummary {
 
     /// Canonicalize codex's two title animations so the rendered text holds
     /// still: the ten-frame braille spinner folds to `⠋`, and the blocked-on-
-    /// user blink folds its `[ . ]` phase into `[ ! ]`. The spinner advances
-    /// every 100 ms and the blink runs at 1 Hz, both far inside the preview's
-    /// 500 ms minimum hold, so without this the dashboard re-renders on every
-    /// frame. `⠋` is the spinner's first frame; claude normalizes to `✻`
-    /// instead, and that difference is what keeps the two agents' titles
-    /// distinguishable on the dashboard. Other titles pass through unchanged.
+    /// user blink folds its `[ . ] ` phase into `[ ! ] `. The preview's 500 ms
+    /// title hold damps neither. The spinner advances every 100 ms, so the hold
+    /// only thins its repaints to one per window rather than stopping them; the
+    /// blink holds each phase a full second, longer than the hold, so every
+    /// phase change reaches the dashboard. `[ ! ]` is the phase that reads as
+    /// an alarm, so it is the one worth freezing — and a title already in that
+    /// phase needs no rewrite, which is why only one phase is folded. `⠋` is
+    /// the spinner's first frame; claude normalizes to `✻` instead, and that
+    /// difference is what keeps the two agents' titles distinguishable on the
+    /// dashboard. Other titles pass through unchanged.
     fn normalize_title(&self, title: &str) -> Option<String> {
-        for phase in CODEX_TITLE_BLINK {
-            if let Some(rest) = title.strip_prefix(phase) {
-                return Some(format!("{}{rest}", CODEX_TITLE_BLINK[0]));
-            }
+        if let Some(rest) = title.strip_prefix("[ . ] ") {
+            return Some(format!("[ ! ] {rest}"));
         }
         let mut chars = title.chars();
         let frame = chars.next()?;
@@ -341,13 +343,22 @@ impl SummaryAdapter for CodexSummary {
 }
 
 /// Composer prompt glyphs: `!` in bash mode, `»` at `ultra` reasoning
-/// effort, `›` otherwise. All three render at column 0 and are dim while
-/// input is disabled, which costs the row no text.
+/// effort, `›` otherwise. All three render at column 0. Disabling input swaps
+/// whichever glyph the mode would paint for a dim `›`: the swap stays inside
+/// this set, and dimness is style rather than text, so neither reaches the
+/// pin.
 const CODEX_PROMPT: &[char] = &['›', '»', '!'];
 
 /// Queued-message group heads codex paints between the status row and the
 /// composer, each over its own `  ↳ `-indented item rows. The heads sit at
-/// column 0 and are chrome, not status.
+/// column 0 and are chrome, not status. Matched as prefixes: codex appends
+/// ` (press {key} to interrupt and send immediately)` to the first head
+/// whenever an interrupt key is bound, which is the default, so the painted
+/// row is 93 columns and an exact match fails at every width that fits it.
+/// All three take the prefix rule rather than one taking an exception —
+/// over-matching a reply bullet that opens with a head's words costs one
+/// skipped row, while missing a head aborts the walk this constant exists to
+/// let through.
 const CODEX_QUEUED_HEADS: &[&str] = &[
     "• Messages to be submitted after next tool call",
     "• Messages to be submitted at end of turn",
@@ -356,15 +367,13 @@ const CODEX_QUEUED_HEADS: &[&str] = &[
 
 /// Reasoning-effort words the `model-with-reasoning` status-line item renders
 /// after the model slug. `default` is one of them: it is the word codex prints
-/// when the profile names no effort, not the absence of a word.
+/// when the profile names no effort, not the absence of a word. `none` is not:
+/// codex's label function folds `ReasoningEffort::None` into `default`, so the
+/// word never reaches the row and listing it would only widen the surface a
+/// two-word phrase has to be read as a model.
 const CODEX_EFFORT: &[&str] = &[
-    "none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra", "default",
+    "minimal", "low", "medium", "high", "xhigh", "max", "ultra", "default",
 ];
-
-/// The two phases codex blinks between, at 1 Hz, while it is blocked on the
-/// user. The first is the canonical one: `[ ! ]` is the phase that reads as an
-/// alarm, so it is the one worth freezing on the dashboard.
-const CODEX_TITLE_BLINK: &[&str] = &["[ ! ] ", "[ . ] "];
 
 /// Maximum indented rows crossed between the composer and the status row.
 /// Queued-message blocks are exempt: their height is the user's queue
@@ -423,9 +432,19 @@ fn codex_approval(rows: &[String]) -> Option<(String, &'static str)> {
 /// Neither present means the model is not on the row, and no label is read: a
 /// label lifted off `status_line = ["current-dir", "model"]` would name the
 /// directory as the model.
+///
+/// Both shapes additionally require the row to be indented. codex renders the
+/// status line through its footer, which prefixes every line with two spaces,
+/// while the composer and reply bullets start at column 0 — and the composer
+/// is inside this window, so a user who has typed `ultra mode` otherwise
+/// paints a row that reads as `model-with-reasoning` and prefixes every
+/// preview with `› ultra mode · `.
 fn codex_model_row(rows: &[String]) -> Option<usize> {
     let last = rows.iter().rposition(|r| !r.is_empty())?;
     (last.saturating_sub(5)..=last).rev().find(|&i| {
+        if !rows[i].starts_with(' ') {
+            return false;
+        }
         let segs: Vec<&str> = rows[i].trim().split(" · ").collect();
         if segs[0].is_empty() {
             return false;
@@ -440,9 +459,13 @@ fn codex_model_row(rows: &[String]) -> Option<usize> {
 /// Whether an item is `model-with-reasoning`: `{model} {effort}`, plus the
 /// service tier codex appends when the account has one (`gpt-5.4 xhigh fast`,
 /// where the effort word is no longer last). Exactly two or three words, with
-/// the effort word second — the render has no other shape, and holding the
+/// the effort word second — the item has no other word count, and holding the
 /// count that tight is what keeps prose ending in an effort word (`I'll use
-/// medium effort`) from being read as a model.
+/// medium effort`) from being read as a model. The effort vocabulary is not
+/// closed the way the count is: `ReasoningEffort::Custom(String)` carries a
+/// model-defined word [`CODEX_EFFORT`] cannot list, and a row rendering one
+/// yields no label at all — the safe direction, and the reason this stays a
+/// list rather than a shape test.
 fn codex_model_with_reasoning(item: &str) -> bool {
     let words: Vec<&str> = item.split_whitespace().collect();
     matches!(words.len(), 2 | 3) && CODEX_EFFORT.contains(&words[1])
@@ -485,7 +508,7 @@ fn codex_status(rows: &[String], composer: usize) -> Option<(String, &'static st
             indented += 1;
             continue;
         }
-        if CODEX_QUEUED_HEADS.contains(&row.as_str()) {
+        if CODEX_QUEUED_HEADS.iter().any(|h| row.starts_with(h)) {
             indented = 0;
             continue;
         }
@@ -512,9 +535,9 @@ fn codex_status(rows: &[String], composer: usize) -> Option<(String, &'static st
 /// disabled — absent along with its space, so it is optional. The header is
 /// a free-form `String` (`Working` is only the default; a reasoning phrase,
 /// `Booting MCP server: {name}`, and verbatim stream errors all land there),
-/// which leaves the parenthetical as the only fixed structure. Anchoring on
-/// [`codex_elapsed`] rather than the closing `)` keeps rows truncated at the
-/// terminal's width matchable.
+/// which leaves the parenthetical as the only fixed structure. Matching it
+/// through [`codex_interrupt_paren`] rather than on the closing `)` keeps rows
+/// truncated at the terminal's width matchable.
 fn codex_status_head(row: &str) -> Option<(&str, &str)> {
     let rest = row
         .strip_prefix("• ")
@@ -527,40 +550,59 @@ fn codex_status_head(row: &str) -> Option<(&str, &str)> {
     // (1/3): a, b, c`), so the first ` (` opening a counter wins.
     rest.match_indices(" (").find_map(|(i, _)| {
         let after = &rest[i + " (".len()..];
-        codex_elapsed(after).then(|| (&rest[..i], after))
+        codex_interrupt_paren(after).then(|| (&rest[..i], after))
     })
 }
 
-/// Whether `s` opens with codex's compact elapsed counter: space-separated
-/// `{digits}{unit}` fields in strictly descending `h`, `m`, `s` order,
-/// ending at the seconds field — `0s`, `1m 00s`, `25h 02m 03s`. The counter
-/// must close the row or be followed by a space or `)`; a field that is not
-/// digits plus a unit (`1/3`, `9.9s`) fails. This token carries the whole
-/// anchor, since the header left of it is free-form.
-fn codex_elapsed(s: &str) -> bool {
+/// Whether `s` opens with the status widget's parenthetical in full:
+/// [`codex_elapsed`]'s counter, then ` • {key} to interrupt)`. The counter
+/// alone is not enough of an anchor, because the row it anchors shares its
+/// slot with the turn's last reply bullet: `• Build finished (3m 20s)` is a
+/// sentence a coding agent writes, and reading it as live status reports a
+/// finished turn as busy. The interrupt hint is the part conversation text
+/// does not reproduce.
+///
+/// This costs the one render codex writes without a hint, `({elapsed})` —
+/// reachable only with the interrupt key unbound, or during Windows
+/// elevated-sandbox setup, a platform this crate's unconditional `nix`
+/// dependency rules out. That render is textually identical to the prose, so
+/// no rule separates them; refusing both is the direction this file takes when
+/// a shape is ambiguous.
+///
+/// A row the CLI cut at the terminal's width never closes its paren and ends
+/// in the CLI's own `…`, which is what admits it with the hint still partial.
+fn codex_interrupt_paren(s: &str) -> bool {
+    let Some(hint) = codex_elapsed(s).and_then(|rest| rest.strip_prefix(" • ")) else {
+        return false;
+    };
+    match hint.find(')') {
+        Some(end) => hint[..end].ends_with(" to interrupt"),
+        None => hint.ends_with('…'),
+    }
+}
+
+/// The text after codex's compact elapsed counter, or `None` when `s` does
+/// not open with one: space-separated `{digits}{unit}` fields in strictly
+/// descending `h`, `m`, `s` order, ending at the seconds field — `0s`,
+/// `1m 00s`, `25h 02m 03s`. A field that is not digits plus a unit (`1/3`,
+/// `9.9s`) fails.
+fn codex_elapsed(s: &str) -> Option<&str> {
     let mut rest = s;
     let mut units = "hms";
     loop {
         let digits = rest.chars().take_while(char::is_ascii_digit).count();
         if digits == 0 {
-            return false;
+            return None;
         }
         let tail = &rest[digits..];
-        let Some(unit) = tail.chars().next() else {
-            return false;
-        };
-        let Some(at) = units.find(unit) else {
-            return false;
-        };
+        let unit = tail.chars().next()?;
+        let at = units.find(unit)?;
         units = &units[at + 1..];
         let after = &tail[unit.len_utf8()..];
         if unit == 's' {
-            return after.is_empty() || after.starts_with([' ', ')']);
+            return Some(after);
         }
-        let Some(next) = after.strip_prefix(' ') else {
-            return false;
-        };
-        rest = next;
+        rest = after.strip_prefix(' ')?;
     }
 }
 

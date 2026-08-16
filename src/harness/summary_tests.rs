@@ -541,14 +541,6 @@ fn codex_label_reads_either_status_line_shape() {
         assert_eq!(label(row), Some(want.to_string()), "{row:?}");
     }
 
-    for effort in CODEX_EFFORT {
-        assert_eq!(
-            label(&format!("  gpt-5.6-sol {effort} · /tmp/project")),
-            Some(format!("gpt-5.6-sol {effort}")),
-            "{effort:?}"
-        );
-    }
-
     for row in [
         // `status_line = ["current-dir", "model"]`: naming the directory as
         // the model is worse than naming nothing.
@@ -561,9 +553,22 @@ fn codex_label_reads_either_status_line_shape() {
         "  I'll use medium effort · /tmp/project",
         // The effort word with no model before it.
         "  high · /tmp/project",
+        // `none` is folded into `default` before the row is rendered, so the
+        // word is not a model's effort.
+        "  gpt-5.6-sol none · /tmp/project",
     ] {
         assert_eq!(label(row), None, "{row:?}");
     }
+
+    // codex indents the status line by the footer's two columns; the composer
+    // and reply bullets do not. Without that discriminator a typed draft
+    // takes the `model-with-reasoning` shape and prefixes every preview.
+    assert_eq!(CodexSummary.model_label(&rs(&["› ultra mode"])), None);
+    assert_eq!(
+        CodexSummary.model_label(&rs(&["›", "", "gpt-5.6-sol high · 0 in · 0 out"])),
+        None,
+        "an unindented row is not the status line, whichever shape it takes"
+    );
 }
 
 /// The braille spinner and the blocked-on-user blink each canonicalize to a
@@ -578,11 +583,18 @@ fn codex_title_animations_canonicalize_to_constant_text() {
         );
     }
 
-    // The blink's two phases differ only in the bracketed glyph.
-    let on = CodexSummary.normalize_title("[ ! ] Action Required | fleetcom");
-    let off = CodexSummary.normalize_title("[ . ] Action Required | fleetcom");
-    assert_eq!(on, off, "both blink phases must normalize identically");
-    assert_eq!(on, Some("[ ! ] Action Required | fleetcom".to_string()));
+    // The blink's two phases differ only in the bracketed glyph, so rewriting
+    // one direction is the whole fold: `[ ! ]` passes through and renders
+    // verbatim, which is the same text the `[ . ]` phase folds to.
+    assert_eq!(
+        CodexSummary.normalize_title("[ . ] Action Required | fleetcom"),
+        Some("[ ! ] Action Required | fleetcom".to_string())
+    );
+    assert_eq!(
+        CodexSummary.normalize_title("[ ! ] Action Required | fleetcom"),
+        None,
+        "the frozen phase needs no rewrite"
+    );
 
     // codex and claude fold braille to different glyphs on purpose: the
     // dashboard's titles stay attributable to the CLI that painted them.
@@ -600,7 +612,7 @@ fn codex_title_animations_canonicalize_to_constant_text() {
 /// The status row anchors on its parenthetical, not on a literal verb:
 /// the activity glyph blinks, drops to `◦`, or vanishes with animations
 /// off; the header is whatever the CLI put there; the interrupt key is
-/// remappable and its hint can be switched off entirely.
+/// remappable.
 #[test]
 fn codex_status_anchors_on_the_interrupt_parenthetical() {
     let probe = |row: &str| CodexSummary.live_preview(&rs(&[row, "", "›"]));
@@ -612,8 +624,6 @@ fn codex_status_anchors_on_the_interrupt_parenthetical() {
         "Working (0s • esc to interrupt)",
         // The interrupt key is remappable.
         "• Working (0s • f12 to interrupt)",
-        // The hint is off: the parenthetical is the counter alone.
-        "• Working (0s)",
     ] {
         assert_eq!(
             probe(row),
@@ -659,7 +669,8 @@ fn codex_status_anchors_on_the_interrupt_parenthetical() {
         );
     }
 
-    // The suffix and truncation rules hold for a non-default header.
+    // A non-default header carries its suffix through the same rules
+    // `codex_working_normalization` pins row by row for `Working`.
     assert_eq!(
         probe(
             "• Reviewing 2 approval requests (7s • esc to interrupt) · 1 background terminal running · /ps to view"
@@ -669,15 +680,10 @@ fn codex_status_anchors_on_the_interrupt_parenthetical() {
             "codex:working"
         ))
     );
-    assert_eq!(
-        probe("• Investigating rendering code (7s • esc to…"),
-        Some(("Investigating rendering code".to_string(), "codex:working")),
-        "an unclosed parenthetical drops to the end of the row"
-    );
 }
 
-/// Status-shaped rows whose counter is malformed refuse: the elapsed token
-/// is the whole anchor, because the header above it is unconstrained.
+/// Status-shaped rows whose counter is malformed refuse: the parenthetical
+/// carries the whole anchor, because the header left of it is unconstrained.
 #[test]
 fn codex_status_rejects_malformed_counters() {
     let probe = |row: &str| CodexSummary.live_preview(&rs(&[row, "", "›"]));
@@ -698,6 +704,33 @@ fn codex_status_rejects_malformed_counters() {
     ] {
         assert_eq!(probe(row), None, "{row:?}");
     }
+}
+
+/// A finished turn's last reply bullet occupies the status row's slot, so
+/// conversation prose that ends in a duration must not read as live status.
+/// The whole interrupt parenthetical is the anchor; the counter alone is a
+/// shape agents write in sentences.
+#[test]
+fn codex_status_refuses_conversation_prose() {
+    let probe = |row: &str| CodexSummary.live_preview(&rs(&[row, "", "›"]));
+    for row in [
+        // A duration parenthetical, and nothing to say it is a counter.
+        "• Build finished (3m 20s)",
+        // A space after the seconds field is not the hint separator.
+        "• Benchmarks improved (12s → 8s)",
+        // ` • ` alone is reachable in prose; the hint text is not.
+        "• Fixed the timeout (5s • retry logic)",
+        // Truncation is the only reason a parenthetical goes unclosed, and
+        // the CLI's ellipsis is what proves it.
+        "• Timed the suite (12s • 4 shards",
+    ] {
+        assert_eq!(probe(row), None, "{row:?}");
+    }
+
+    // Refusing the bare counter costs the hint-off render, `({elapsed})`,
+    // which needs the interrupt key unbound: a static row over a wrong live
+    // one, per this file's anchor discipline.
+    assert_eq!(probe("• Working (12s)"), None);
 }
 
 /// Every composer glyph pins the adapter: `!` in bash mode, `»` at `ultra`
@@ -728,11 +761,7 @@ fn codex_composer_accepts_every_prompt_glyph() {
 /// earns that pass.
 #[test]
 fn codex_status_walks_past_queued_message_blocks() {
-    for head in [
-        "• Messages to be submitted after next tool call",
-        "• Messages to be submitted at end of turn",
-        "• Queued follow-up inputs",
-    ] {
+    let walks = |head: &str| {
         let mut rows = vec![
             "• Working (0s • esc to interrupt)".to_string(),
             String::new(),
@@ -740,12 +769,24 @@ fn codex_status_walks_past_queued_message_blocks() {
         ];
         rows.extend((0..24).map(|i| format!("  ↳ Hello, world! {i}")));
         rows.extend([String::new(), "› ".to_string()]);
-        assert_eq!(
-            CodexSummary.live_preview(&rows),
-            Some(("Working".to_string(), "codex:working")),
-            "{head:?}"
-        );
+        CodexSummary.live_preview(&rows)
+    };
+    let working = Some(("Working".to_string(), "codex:working"));
+    for head in CODEX_QUEUED_HEADS {
+        assert_eq!(walks(head), working, "{head:?}");
     }
+
+    // The pending-steers head carries an interrupt hint whenever a key is
+    // bound, which is the default, and codex wraps rather than truncates it.
+    // From 93 columns up the row is painted whole — the case a bare literal
+    // never matches.
+    assert_eq!(
+        walks(
+            "• Messages to be submitted after next tool call (press esc to interrupt and send immediately)"
+        ),
+        working,
+        "the suffixed head at a width that does not wrap"
+    );
 
     // A near-miss head is a foreign column-0 row and aborts the scan.
     let foreign = rs(&[
