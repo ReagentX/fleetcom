@@ -168,12 +168,9 @@ fn scrape_now(t: &mut Task) {
     t.scrape_exit_hint();
 }
 
-/// Resolve the harness home from the launch environment. The tool-specific
-/// override wins, followed by `$HOME/<tool dot directory>`; neither yields
-/// `None` so the harness can apply its platform-home fallback.
+/// Resolve the harness store root from the task's launch environment.
 fn harness_home(env: &[(OsString, OsString)], h: &dyn harness::Harness) -> Option<PathBuf> {
-    let val = |key: &str| env_get(env, key).map(PathBuf::from);
-    val(h.home_env_var()).or_else(|| Some(val("HOME")?.join(h.home_dot_dir())))
+    h.resolve_home(&|key| env_get(env, key).map(PathBuf::from))
 }
 
 /// State for automatic recovery snapshots. Write failures do not interrupt

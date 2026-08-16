@@ -18,6 +18,7 @@ feed the bytes to the emulator verbatim.
 | `claude_resume.bin` | `claude --session-id`: one prompt, reply, `/exit` | alternate-screen exit followed by the primary-screen resume hint (`claude --resume <uuid>`); the scrape target for harness exit capture |
 | `codex_resume.bin` | `codex resume` | top-anchored DECSTBM scroll regions (`CSI 1;N r`), reverse index, inline-TUI history insertion, and an SGR-split resume hint for harness exit capture |
 | `grok_resume.bin` | `grok --session-id`: one prompt, reply, `/exit` | primary-screen exit followed by the resume hint (`grok --resume <uuid>`); the scrape target for harness exit capture |
+| `omp_resume.bin` | `omp`: one launch, `/exit` | primary-screen exit followed by the resume hint (`omp --resume <uuid>`); the scrape target for harness exit capture |
 | `tmux_split.bin` | `tmux` session with two splits and one command per pane | scroll regions, pane borders, full redraws |
 | `vim_session.bin` | `vim -u NONE`: insert, navigate, `:set number`, `:q!` | alternate screen, cursor addressing, line editing |
 | `less_altscreen.bin` | `less` over `/usr/share/dict/words`: page, `G`, `g`, `q` | alternate-screen entry and exit, full-screen paging |
@@ -33,9 +34,9 @@ feed the bytes to the emulator verbatim.
 The `preview_*.bin` fixtures pin summary-adapter extraction, normalization,
 and fallback behavior. Each fixture is a constructed repaint stream: optional
 alternate-screen entry, clear, home, then sanitized screen rows joined with
-CRLF. Claude and Grok use the alternate screen; Codex is inline. Identifying
-and user-configured text is replaced with alignment-preserving synthetic
-values. Geometry is 40×120 unless noted.
+CRLF. Claude and Grok use the alternate screen; Codex and omp are inline.
+Identifying and user-configured text is replaced with alignment-preserving
+synthetic values. Geometry is 40×120 unless noted.
 
 `preview_codex_reasoning.bin` uses 40×80 geometry, and
 `preview_codex_queued.bin` uses 40×36. Both are bottom-anchored on a 40-row
@@ -47,7 +48,10 @@ omits the welcome box and includes agent-roster rows below the input box. The
 Claude task-list fixtures use generic phase names in a task-list layout; both
 omit the welcome box. The Claude workflow-wait fixture uses generic wording,
 omits the welcome box, and includes a long blank gap above the input box and a
-roster below it.
+roster below it. The omp fixtures replace the local model path and the working
+directory in the status line with same-length synthetic values, and their
+status rows carry a streamed intent phrase rather than omp's default
+`Working…`.
 
 | Fixture | Scenario | Coverage |
 | --- | --- | --- |
@@ -78,6 +82,10 @@ roster below it.
 | `preview_grok_subagent_scrollback.bin` | grok idle with `Subagent running:` in the body, no `◎` row | fall-through; body-shaped text is not status |
 | `preview_grok_idle.bin` | grok idle session | fall-through to the marker |
 | `preview_grok_splash.bin` | grok launch splash with resume hint above the box | fall-through; distinct views never anchor |
+| `preview_omp_working.bin` | omp status row carrying the model's streamed intent phrase above the input box | `omp:spinner`; padding, spinner frame, and interrupt hint stripped |
+| `preview_omp_approval.bin` | omp approval selector, input box replaced, tool-call preview box and a live status row still above it | `omp:approval-menu` synthesizes `awaiting approval` while the status row keeps animating |
+| `preview_omp_idle.bin` | omp idle with the welcome box and tip above the input box | fall-through to the floor tier; an inline UI reaches no marker |
+| `preview_omp_body_hint.bin` | status-shaped row quoted in the transcript, prose between it and an idle input box | negative: the pin is the row above the box, not a substring search |
 | `preview_trunc_claude.bin` | synthetic 40×80: spinner row truncated inside its parenthetical | head match still extracts `Hashing…` |
 | `preview_trunc_codex.bin` | synthetic 40×80: working row truncated inside the `/ps` hint | the head still matches and the key-hint suffix is omitted |
 | `preview_trunc_grok.bin` | synthetic 40×80: spinner label truncated with the CLI's ellipsis | extraction keeps the CLI's own `…` verbatim |
@@ -93,10 +101,10 @@ The fixtures provide evidence for three distinct boundaries:
 - `codex_resume`, `wide_emoji`, `dec_scrollregion`, and `topregion_scroll` pin
   parser semantics: scrollback retention, intensity stacking, charset
   translation, and VS16 width.
-- `claude_resume`, `codex_resume`, and `grok_resume` verify that retained
-  terminal text preserves the exit hints consumed by their harnesses.
+- `claude_resume`, `codex_resume`, `grok_resume`, and `omp_resume` verify that
+  retained terminal text preserves the exit hints consumed by their harnesses.
 
 `src/golden.rs` contains the absolute display and parser expectations.
-`src/harness/claude.rs`, `src/harness/codex.rs`, and `src/harness/grok.rs`
-contain the agent-resume scrape expectations. `src/harness/summary.rs`
-contains the preview-fixture expectations.
+`src/harness/claude.rs`, `src/harness/codex.rs`, `src/harness/grok.rs`, and
+`src/harness/omp.rs` contain the agent-resume scrape expectations.
+`src/harness/summary.rs` contains the preview-fixture expectations.

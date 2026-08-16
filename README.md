@@ -30,7 +30,7 @@ Organize related tasks into named groups, even when they run in different direct
 
 ### Resume agent sessions
 
-Start `claude`, `codex`, or `grok` normally. When you rerun the task or reload a saved session, `fleetcom` resumes the same conversation automatically.
+Start `claude`, `codex`, `grok`, or `omp` normally. When you rerun the task or reload a saved session, `fleetcom` resumes the same conversation automatically.
 
 ## Operational model
 
@@ -40,7 +40,7 @@ Running several long-lived commands is pesky once they span terminal panes or ne
 - Delegates tasks to a daemon, so a disconnecting client stops nothing.
 - Saves and reloads task recipes: directories, commands, group assignments, and display names.
 - Reruns a completed task in place, keeping its identity, group, and name.
-- Preserves `claude`, `codex`, and `grok` conversations, so saved or rerun tasks resume instead of starting fresh.
+- Preserves `claude`, `codex`, `grok`, and `omp` conversations, so saved or rerun tasks resume instead of starting fresh.
 - Automatically snapshots the current task set for recovery.
 
 ## Documentation
@@ -102,7 +102,7 @@ Every task runs in its own pseudo-terminal, emulated with `alacritty_terminal`. 
 - Several long-lived commands need one place for observation, tagging, and attachment.
 - Jobs must survive a terminal closing and remain available for reattachment.
 - The same command set is launched often enough to justify a saved session.
-- Agent sessions (`claude`, `codex`, `grok`) must resume their conversations on rerun rather than start new ones.
+- Agent sessions (`claude`, `codex`, `grok`, `omp`) must resume their conversations on rerun rather than start new ones.
 
 ### When to avoid `fleetcom`
 

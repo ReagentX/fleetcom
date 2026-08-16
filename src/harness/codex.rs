@@ -527,6 +527,7 @@ mod tests {
             capture_file: PathBuf::from("/c"),
             claude_settings: PathBuf::from("/s"),
             codex_notify: PathBuf::from(r#"/Odd Path/it's "here"\now"#),
+            omp_capture: PathBuf::from("/e.js"),
         };
         let inv = Codex.detect("codex").unwrap();
         let plan = Codex.instrument(&inv, &paths, Some(&no_config_home()));

@@ -13,17 +13,17 @@
 //! To avoid treating it as live status, every matcher:
 //!
 //! 1. locates the chrome region structurally (claude's separator-pair input
-//!    box, codex's composer, grok's bordered input box) and limits status
-//!    candidates relative to it;
+//!    box, codex's composer, grok's bordered input box, omp's two-row input
+//!    box) and limits status candidates relative to it;
 //! 2. returns `None` when the expected structure is absent or inconsistent;
 //! 3. matches row prefixes so status rows truncated with an ellipsis at narrow
 //!    widths remain recognizable. A wrapped row fails the structural check.
 //!
 //! Normalization removes spinner glyphs, elapsed counters, throughput data,
 //! and key hints while preserving the CLI's status text. The only synthesized
-//! status is `awaiting approval`, for approval menus: claude's dialog and
-//! codex's modal. Corpus fixtures in `tests/corpus` pin the supported screen
-//! structures.
+//! status is `awaiting approval`, for approval menus: claude's dialog,
+//! codex's modal, and omp's selector. Corpus fixtures in `tests/corpus` pin
+//! the supported screen structures.
 
 use std::path::Path;
 
@@ -674,6 +674,115 @@ fn grok_border_label(row: &str) -> Option<String> {
     let text = &t[t.rfind('─')? + '─'.len_utf8()..];
     let label = text.trim().split(" · ").next()?.trim();
     (!label.is_empty()).then(|| label.to_string())
+}
+
+// ------------------------------------------------------------------- omp --
+
+/// Accept any braille code point as a spinner frame. The row still requires an
+/// interrupt hint, and ASCII punctuation is too weak to anchor safely.
+fn omp_frame(c: char) -> bool {
+    ('\u{2800}'..='\u{28FF}').contains(&c)
+}
+
+/// Interrupt-hint suffixes accepted on an anchored status row.
+const OMP_HINTS: &[&str] = &["⟦esc⟧", "⟨esc⟩"];
+
+/// Selector cursors accepted by [`omp_approve_row`]. The exact remainder check
+/// prevents the ASCII `>` cursor from matching quoted prose.
+const OMP_CURSORS: &[&str] = &["❯", "\u{f054}", ">"];
+
+/// omp inline-UI adapter. A two-row `╭…╮`/`╰…╯` input box anchors the nearest
+/// painted status row above it. The approval selector replaces the box, so its
+/// absence selects approval matching.
+///
+/// Unicode box corners anchor status. ASCII `+` and `-` do not: transcript
+/// tables and rules use the same glyphs. The plain-text approval selector still
+/// matches under ASCII.
+pub struct OmpSummary;
+
+impl SummaryAdapter for OmpSummary {
+    fn live_preview(&self, rows: &[String]) -> Option<(String, &'static str)> {
+        match omp_input_box(rows) {
+            Some(top) => omp_spinner_status(rows, top),
+            // Consider the approval selector only with the input box gone.
+            None => omp_approval(rows),
+        }
+    }
+
+    /// Model text is user-configurable status-line content, not a stable label.
+    fn model_label(&self, _rows: &[String]) -> Option<String> {
+        None
+    }
+}
+
+/// Inspect the bottom-most `╰…╯` row and return its predecessor only when that
+/// row is a `╭…╮` border. Adjacency rejects preview boxes containing a command.
+fn omp_input_box(rows: &[String]) -> Option<usize> {
+    let bottom = rows.iter().rposition(|r| {
+        let t = r.trim();
+        t.starts_with('╰') && t.ends_with('╯')
+    })?;
+    let t = rows[..bottom].last()?.trim();
+    (t.starts_with('╭') && t.ends_with('╮')).then(|| bottom - 1)
+}
+
+/// The status row: the first painted row above the input box, shaped
+/// `{frame} {phrase} {hint}` one column in. Everything between the frame and
+/// the hint is the model's own streamed intent phrase (`Listing directory
+/// contents`; `Working…` when the model streams nothing) and is returned
+/// verbatim, the CLI's own truncating `…` included. A wrapped row left its
+/// hint on the next line and fails the suffix check rather than yielding half
+/// a phrase.
+fn omp_spinner_status(rows: &[String], top: usize) -> Option<(String, &'static str)> {
+    let probe = rows[..top].iter().rev().find(|r| !r.is_empty())?;
+    let mut chars = probe.trim_start().chars();
+    if !omp_frame(chars.next()?) || chars.next()? != ' ' {
+        return None;
+    }
+    let rest = chars.as_str();
+    let text = OMP_HINTS
+        .iter()
+        .find_map(|h| rest.strip_suffix(h))?
+        .strip_suffix(' ')?;
+    text.chars()
+        .next()?
+        .is_alphanumeric()
+        .then(|| (text.to_string(), "omp:spinner"))
+}
+
+/// omp's approval selector, reached only with the input box gone: an
+/// `Allow tool: {name}` head within six rows above the selected `Approve` row,
+/// and `Deny` as the next painted row below it. The selection must occupy one
+/// of the final nine rows. Prose quoted above a live input box never reaches
+/// this matcher.
+fn omp_approval(rows: &[String]) -> Option<(String, &'static str)> {
+    let last = rows.iter().rposition(|r| !r.is_empty())?;
+    let i = (last.saturating_sub(8)..=last).find(|&i| omp_approve_row(&rows[i]))?;
+    if rows[i + 1..].iter().find(|r| !r.is_empty())?.trim() != "Deny" {
+        return None;
+    }
+    rows[i.saturating_sub(6)..i]
+        .iter()
+        .any(|r| omp_allow_head(r))
+        .then(|| ("awaiting approval".to_string(), "omp:approval-menu"))
+}
+
+/// The selector's chosen row: a cursor spelling, a space, then `Approve` and
+/// nothing more. Equality after the cursor is the whole check — the ascii
+/// cursor `>` also opens a quoted line, so the row's remainder has to be
+/// exact.
+fn omp_approve_row(row: &str) -> bool {
+    let t = row.trim();
+    OMP_CURSORS
+        .iter()
+        .any(|c| t.strip_prefix(c) == Some(" Approve"))
+}
+
+/// The selector's head row: `Allow tool: {name}`. The prefix's trailing
+/// space carries the name requirement — a trimmed row cannot end in one — so
+/// a bare `Allow tool:` fails.
+fn omp_allow_head(row: &str) -> bool {
+    row.trim().starts_with("Allow tool: ")
 }
 
 #[cfg(test)]

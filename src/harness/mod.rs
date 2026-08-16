@@ -18,6 +18,7 @@ pub mod assets;
 mod claude;
 mod codex;
 mod grok;
+mod omp;
 pub mod summary;
 
 use std::{
@@ -33,6 +34,7 @@ pub use codex::Codex;
 pub use grok::Grok;
 #[cfg(test)]
 pub(crate) use grok::encode_cwd;
+pub use omp::Omp;
 
 /// Environment variable naming the capture file used by injected assets.
 pub const CAPTURE_ENV: &str = "FLEETCOM_CAPTURE_FILE";
@@ -51,8 +53,15 @@ pub trait Harness: Sync {
     /// resolves it from the launch context used for instrumentation or save.
     fn home_env_var(&self) -> &'static str;
 
-    /// The tool's directory name under the launched process's `$HOME`.
+    /// Default store path relative to the launched process's `$HOME`.
     fn home_dot_dir(&self) -> &'static str;
+
+    /// Resolve the store root from the launch environment. The default uses
+    /// the tool-specific override, then `$HOME` plus [`Self::home_dot_dir`].
+    /// Returning `None` delegates to [`Self::home_root`]'s platform fallback.
+    fn resolve_home(&self, env: &dyn Fn(&str) -> Option<PathBuf>) -> Option<PathBuf> {
+        env(self.home_env_var()).or_else(|| Some(env("HOME")?.join(self.home_dot_dir())))
+    }
 
     /// Resolve the tool's home root. `home` follows the `instrument` contract:
     /// falling back to this process's home happens only when the launch
@@ -149,6 +158,10 @@ static AGENTS: &[Agent] = &[
         harness: &Grok,
         summary: &summary::GrokSummary,
     },
+    Agent {
+        harness: &Omp,
+        summary: &summary::OmpSummary,
+    },
 ];
 
 /// Return the first harness that recognizes `cmd`.
@@ -181,12 +194,15 @@ impl Invocation {
 /// Capture paths allocated by [`assets::CaptureAssets::paths_for`].
 #[derive(Debug, Clone)]
 pub struct CapturePaths {
-    /// Per-run path available to an injected hook or notifier.
+    /// Per-run path available to an injected capture asset.
     pub capture_file: PathBuf,
     /// Additive settings file passed to `claude --settings`.
     pub claude_settings: PathBuf,
     /// Program installed through `codex`'s `notify` config override.
     pub codex_notify: PathBuf,
+    /// Extension module loaded by `omp -e`, which appends to the user's own
+    /// extensions rather than replacing them.
+    pub omp_capture: PathBuf,
 }
 
 /// Spawn-time additions for one instrumented launch.
@@ -354,13 +370,14 @@ pub(crate) mod fixtures {
     /// A second distinct ID for last-hint, requote, and ambiguity cases.
     pub(crate) const OTHER: &str = "11111111-2222-4333-8444-555555555555";
 
-    /// Capture-path fixture. The spaced `claude_settings` and `codex_notify`
-    /// paths keep the shell- and TOML-quoting assertions honest.
+    /// Capture-path fixture. The spaced asset paths keep the shell- and
+    /// TOML-quoting assertions honest.
     pub(super) fn paths() -> CapturePaths {
         CapturePaths {
             capture_file: PathBuf::from("/tmp/cap/session.json"),
             claude_settings: PathBuf::from("/tmp/Application Support/fleetcom.json"),
             codex_notify: PathBuf::from("/tmp/Application Support/notify.sh"),
+            omp_capture: PathBuf::from("/tmp/Application Support/omp-capture.js"),
         }
     }
 
@@ -614,9 +631,11 @@ mod tests {
         assert_eq!(Claude.home_env_var(), "CLAUDE_CONFIG_DIR");
         assert_eq!(Codex.home_env_var(), "CODEX_HOME");
         assert_eq!(Grok.home_env_var(), "GROK_HOME");
+        assert_eq!(Omp.home_env_var(), "PI_CODING_AGENT_SESSION_DIR");
         assert_eq!(Claude.home_dot_dir(), ".claude");
         assert_eq!(Codex.home_dot_dir(), ".codex");
         assert_eq!(Grok.home_dot_dir(), ".grok");
+        assert_eq!(Omp.home_dot_dir(), ".omp/agent/sessions");
     }
 
     #[test]

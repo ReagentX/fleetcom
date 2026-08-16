@@ -21,6 +21,11 @@
 //!   newline-joined argv with the payload appended, so the displaced notifier
 //!   receives the same final argument `codex` would have passed; otherwise
 //!   exit 0.
+//! - `omp`: `-e <omp-capture.js>` loads an extension module inside the agent's
+//!   own process, appending to the user's extensions rather than replacing
+//!   them. Its `session_start` and `session_switch` handlers write the session
+//!   id as JSON over `$FLEETCOM_CAPTURE_FILE`, skip the write when that
+//!   variable is unset or empty, and swallow every error.
 
 use std::{
     fs, io,
@@ -51,6 +56,35 @@ IFS='
 set -f
 set -- $FLEETCOM_NOTIFY_CHAIN "$1"
 exec "$@"
+"#;
+
+/// Extension module loaded by `omp -e`. Its default export registers handlers
+/// for initial sessions and in-TUI session changes. omp imports the module, so
+/// the asset needs no executable bit.
+const OMP_CAPTURE_MODULE: &str = r#"import * as fs from "node:fs";
+
+function write(ctx, reason) {
+  const path = process.env.FLEETCOM_CAPTURE_FILE;
+  if (!path) return;
+  try {
+    fs.writeFileSync(
+      path,
+      JSON.stringify({
+        reason,
+        sessionId: ctx.sessionManager.getSessionId(),
+        sessionFile: ctx.sessionManager.getSessionFile(),
+        cwd: ctx.cwd,
+      }),
+    );
+  } catch {
+    // Best effort: a capture failure must never take the session down.
+  }
+}
+
+export default function (pi) {
+  pi.on("session_start", (_e, ctx) => write(ctx, "session_start"));
+  pi.on("session_switch", (_e, ctx) => write(ctx, "session_switch"));
+}
 "#;
 
 /// Build the `claude` settings overlay containing the `SessionStart` hook.
@@ -130,13 +164,15 @@ pub struct CaptureAssets {
     dir: PathBuf,
     claude_settings: PathBuf,
     codex_notify: PathBuf,
+    omp_capture: PathBuf,
 }
 
 impl CaptureAssets {
     /// Create `root` and a private `<root>/<pid>-<nonce>` namespace. The
-    /// namespace uses mode `0700`; its Claude settings use `0600`, and its
-    /// executable Codex notifier uses `0700`. Dead-owner namespaces are reaped
-    /// before the new namespace is created; other root entries remain.
+    /// namespace uses mode `0700`; its Claude settings and omp module use
+    /// `0600`, and its executable Codex notifier uses `0700`. Dead-owner
+    /// namespaces are reaped before the new namespace is created; other root
+    /// entries remain.
     pub fn install(root: &Path, pid: u32) -> io::Result<Self> {
         fs::DirBuilder::new()
             .recursive(true)
@@ -168,10 +204,16 @@ impl CaptureAssets {
         fs::write(&codex_notify, CODEX_NOTIFY_SCRIPT)?;
         fs::set_permissions(&codex_notify, fs::Permissions::from_mode(0o700))?;
 
+        // The module is imported, not executed.
+        let omp_capture = dir.join("omp-capture.js");
+        fs::write(&omp_capture, OMP_CAPTURE_MODULE)?;
+        fs::set_permissions(&omp_capture, fs::Permissions::from_mode(0o600))?;
+
         Ok(Self {
             dir,
             claude_settings,
             codex_notify,
+            omp_capture,
         })
     }
 
@@ -182,6 +224,7 @@ impl CaptureAssets {
             capture_file: self.dir.join(format!("task-{task_id}-{run}.json")),
             claude_settings: self.claude_settings.clone(),
             codex_notify: self.codex_notify.clone(),
+            omp_capture: self.omp_capture.clone(),
         }
     }
 }
@@ -252,8 +295,11 @@ mod tests {
         assert_eq!(mode(&ns), 0o700);
         assert_eq!(assets.claude_settings, ns.join("claude-settings.json"));
         assert_eq!(assets.codex_notify, ns.join("codex-notify.sh"));
+        assert_eq!(assets.omp_capture, ns.join("omp-capture.js"));
         assert_eq!(mode(&assets.claude_settings), 0o600);
         assert_eq!(mode(&assets.codex_notify), 0o700);
+        // omp imports the module rather than executing it.
+        assert_eq!(mode(&assets.omp_capture), 0o600);
     }
 
     /// Installation creates a distinct namespace, reapplies the root mode, and
@@ -280,6 +326,10 @@ mod tests {
             CODEX_NOTIFY_SCRIPT
         );
         assert_eq!(
+            fs::read_to_string(&second.omp_capture).unwrap(),
+            OMP_CAPTURE_MODULE
+        );
+        assert_eq!(
             fs::read_to_string(&first.claude_settings).unwrap(),
             "garbage",
             "install must never write into an earlier namespace"
@@ -287,6 +337,7 @@ mod tests {
         assert_eq!(mode(&root), 0o700);
         assert_eq!(mode(&second.claude_settings), 0o600);
         assert_eq!(mode(&second.codex_notify), 0o700);
+        assert_eq!(mode(&second.omp_capture), 0o600);
     }
 
     /// Installation retains live-owner namespaces and non-namespace entries.
@@ -331,6 +382,7 @@ mod tests {
         fs::write(stale.join("task-1-0.json"), "predecessor").unwrap();
         fs::write(stale.join("claude-settings.json"), "old settings").unwrap();
         fs::write(stale.join("codex-notify.sh"), "old script").unwrap();
+        fs::write(stale.join("omp-capture.js"), "old module").unwrap();
 
         let assets = CaptureAssets::install(&root, std::process::id()).unwrap();
         let ns = namespace(&assets, &root);
@@ -350,12 +402,20 @@ mod tests {
             "old script"
         );
         assert_eq!(
+            fs::read_to_string(stale.join("omp-capture.js")).unwrap(),
+            "old module"
+        );
+        assert_eq!(
             fs::read_to_string(&assets.claude_settings).unwrap(),
             claude_settings_json()
         );
         assert_eq!(
             fs::read_to_string(&assets.codex_notify).unwrap(),
             CODEX_NOTIFY_SCRIPT
+        );
+        assert_eq!(
+            fs::read_to_string(&assets.omp_capture).unwrap(),
+            OMP_CAPTURE_MODULE
         );
         assert_eq!(mode(&ns), 0o700);
     }
@@ -597,5 +657,6 @@ mod tests {
         );
         assert_eq!(paths.claude_settings, ns.join("claude-settings.json"));
         assert_eq!(paths.codex_notify, ns.join("codex-notify.sh"));
+        assert_eq!(paths.omp_capture, ns.join("omp-capture.js"));
     }
 }

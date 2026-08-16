@@ -1,0 +1,40 @@
+[2J[H│                                                                                                  │
+│                                          Welcome back!                                           │
+│                                                                                                  │
+│                                           ▀██████████▀                                           │
+│                                            ╘██    ██                                             │
+│                                             ██    ██                                             │
+│                                             ██    ██                                             │
+│                                            ▄██▄  ▄██▄                                            │
+│                                                                                                  │
+│                  /Users/dev/Projects/fixtures/qwen3/Qwen3.8-27B-UD-Q8_K_XL.gguf                  │
+│                                            llama.cpp                                             │
+╰──────────────────────────────────────────────────────────────────────────────────────────────────╯
+ Tip: Log in to several accounts of the same provider — `/login` again — and omp load-balances
+      across them automatically
+
+ xdev: xd://: mounted mcp__fixture_js, mcp__fixture_js_add_module_dir, mcp__fixture_js_reset
+
+
+ Use the bash tool to run: ls -la
+
+
+ I'll use the bash tool to run the requested command.
+
+╭──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+│ $ ls -la                                                                                                             │
+╰──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+
+ ⠴ Listing directory contents ⟦esc⟧
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+ Allow tool: bash
+ Command: ls -la
+
+ ❯ Approve
+   Deny
+
+ up/down navigate  enter select  esc cancel
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
