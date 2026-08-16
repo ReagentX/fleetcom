@@ -172,7 +172,14 @@ impl Harness for Codex {
                 if !line1_admits(&entry.path(), cwd) {
                     continue;
                 }
-                survivors.push(id.to_string());
+                // A reverted thread keeps its ID and gains a second rollout,
+                // so both names carry one conversation and both land in the
+                // window the shared ID's v7 instant defines. The same uuid
+                // twice is still one candidate.
+                let id = id.to_string();
+                if !survivors.contains(&id) {
+                    survivors.push(id);
+                }
             }
         }
         match survivors.as_slice() {
@@ -354,7 +361,14 @@ fn line1_admits(path: &Path, cwd: &Path) -> bool {
     {
         return false;
     }
-    payload["cwd"].as_str().is_some_and(|c| Path::new(c) == cwd)
+    // codex records the cwd its own process reports, and `getcwd(3)` resolves
+    // symlinks: a task spawned in `/tmp/x` on macOS is recorded as
+    // `/private/tmp/x` and never matches verbatim. Resolving this side is
+    // enough — the recorded path is already physical.
+    payload["cwd"].as_str().is_some_and(|c| {
+        let recorded = Path::new(c);
+        recorded == cwd || cwd.canonicalize().is_ok_and(|p| p == recorded)
+    })
 }
 
 #[cfg(test)]
@@ -837,8 +851,11 @@ mod tests {
         let spawned = SystemTime::UNIX_EPOCH + std::time::Duration::from_millis(spawn_ms);
         let cwd = Path::new("/work/proj");
         let rollout_id = v7_at(spawn_ms + 1_000, 9);
+        // One home throughout: revert keeps the thread ID and adds a rollout
+        // rather than replacing one, so the two names coexist and the second
+        // pass proves the pair still resolves to a single conversation.
+        let home = temp("codex_revert_name");
         for suffix in [String::new(), format!("_{rollout_id}")] {
-            let home = temp("codex_revert_name");
             let thread = write_rollout_named(&home, spawn_ms + 1_000, 1, cwd, &suffix, "");
             assert_ne!(thread, rollout_id);
             assert_eq!(
@@ -847,6 +864,31 @@ mod tests {
                 "{suffix:?}"
             );
         }
+    }
+
+    /// codex records the cwd `getcwd(3)` reports, which has resolved every
+    /// symlink; fleetcom holds the path the task was spawned with. On macOS a
+    /// task under `/tmp` is recorded as `/private/tmp` and a verbatim compare
+    /// never matches.
+    #[test]
+    fn correlate_fs_matches_a_symlinked_spawn_path() {
+        let home = temp("codex_symlink_cwd");
+        let spawn_ms: u64 = 1_785_000_000_000;
+        let spawned = SystemTime::UNIX_EPOCH + std::time::Duration::from_millis(spawn_ms);
+
+        let real = home.join("real");
+        fs::create_dir_all(&real).unwrap();
+        let link = home.join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        // The rollout names the resolved path; the task carries the link.
+        let id = write_rollout(&home, spawn_ms + 1_000, 1, &real.canonicalize().unwrap());
+        assert_eq!(
+            Codex.correlate_fs(&link, spawned, Some(&home)).as_deref(),
+            Some(id.as_str())
+        );
+        // An unrelated directory still fails, resolved or not.
+        assert_eq!(Codex.correlate_fs(&home, spawned, Some(&home)), None);
     }
 
     /// The ±2-day probe includes a rollout in the adjacent day directory.

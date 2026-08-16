@@ -133,9 +133,10 @@ fn cascade(screen: &impl ScreenFacts, adapter: Option<&dyn SummaryAdapter>) -> P
             },
         };
     }
-    // Leading indentation is layout, not meaning: codex's status bar (an
-    // inline UI's bottom-most row, the floor of an idle codex task) indents
-    // itself, and the spaces waste preview width. Trimmed here, not in
+    // Leading indentation is layout, not meaning: codex's status line (its
+    // bottom-most row, and so the floor of an idle codex task whenever the
+    // user configures one) indents itself, and the spaces waste preview
+    // width. Trimmed here, not in
     // `live_floor`: the emulator's row stays a faithful fact because it
     // doubles as the teardown-snapshot comparator.
     let floor = screen.live_floor();
