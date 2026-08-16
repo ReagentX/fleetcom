@@ -540,6 +540,18 @@ impl Emulator {
             .map(|t| t.text.as_str())
     }
 
+    /// The last sanitized title announced on the primary screen, retained
+    /// across printable output and alternate-screen excursions. An empty
+    /// announce or a full reset clears it. [`Emulator::title`] serves the
+    /// staged/epoch view; this slot serves inline programs whose constant
+    /// repaints disclaim staging.
+    // Unused pub in a bin crate is dead code; the preview resolution layer
+    // consumes this once its phase lands.
+    #[allow(dead_code)]
+    pub fn primary_title(&self) -> Option<&str> {
+        self.alt.primary_title.as_deref()
+    }
+
     /// The last non-blank row of the live screen, trailing padding trimmed;
     /// empty when the screen is blank. Ignores the scrollback view offset:
     /// `contents` follows `display_offset`, which would make a scrolled-back
@@ -626,6 +638,12 @@ struct AltScreen {
     /// alternate-screen entry. Printable output disclaims it; a reset clears
     /// it.
     staged_title: Option<String>,
+    /// Retained last sanitized primary-screen announce. Where `staged_title`
+    /// bridges an announce into the next alternate-screen entry and dies on
+    /// printable output, this slot persists through output and alt
+    /// excursions: inline TUIs repaint constantly, so a disclaimed slot
+    /// could never label them. An empty announce or a reset clears it.
+    primary_title: Option<String>,
     /// Mirror of the backend's raw (unsanitized) current title, kept only
     /// so the title-stack shadow pushes what the backend pushes.
     raw_title: Option<String>,
@@ -683,10 +701,10 @@ impl ObservedTerm<'_> {
         self.alt.last_alt = alt;
     }
 
-    /// Assign a sanitized title to the current alternate-screen epoch or
-    /// stage it for the next entry when on the primary screen. An empty title
-    /// clears captured and staged titles. Printable output, but not control
-    /// traffic, disclaims a staged title.
+    /// Assign a sanitized title to the current alternate-screen epoch, or
+    /// stage and retain it when on the primary screen. An empty title clears
+    /// captured, staged, and retained titles. Printable output, but not
+    /// control traffic, disclaims a staged title.
     fn observe_title(&mut self, title: Option<String>) {
         self.alt.raw_title.clone_from(&title);
         let text = title
@@ -695,6 +713,7 @@ impl ObservedTerm<'_> {
         let Some(text) = text else {
             self.alt.title = None;
             self.alt.staged_title = None;
+            self.alt.primary_title = None;
             return;
         };
         if self.term.mode().contains(TermMode::ALT_SCREEN) {
@@ -703,7 +722,8 @@ impl ObservedTerm<'_> {
                 alt_epoch: self.alt.epoch,
             });
         } else {
-            self.alt.staged_title = Some(text);
+            self.alt.staged_title = Some(text.clone());
+            self.alt.primary_title = Some(text);
         }
     }
 }
@@ -785,6 +805,7 @@ impl Handler for ObservedTerm<'_> {
         self.alt.raw_title = None;
         self.alt.title_stack.clear();
         self.alt.staged_title = None;
+        self.alt.primary_title = None;
     }
     delegate! {
         reverse_index();
@@ -1681,6 +1702,67 @@ mod tests {
         emu.process(b"\x1b]0;done\x07\x1b[?1049l");
         assert!(!emu.alternate_screen());
         assert_eq!(emu.title(), Some("done"));
+    }
+
+    /// Printable output disclaims the staged slot and leaves the retained
+    /// slot alone: the asymmetry that lets an inline TUI's title outlive
+    /// its own repaints.
+    #[test]
+    fn primary_title_survives_the_printable_output_that_disclaims_staging() {
+        let mut emu = Emulator::new(4, 20, 0);
+        emu.process(b"\x1b]0;omp\x07");
+        assert_eq!(emu.title(), Some("omp"), "premise: the announce staged");
+        assert_eq!(emu.primary_title(), Some("omp"));
+        emu.process(b"$ ls\r\n");
+        assert_eq!(emu.title(), None, "staged: disclaimed by printed output");
+        assert_eq!(emu.primary_title(), Some("omp"), "retained: survives it");
+    }
+
+    /// omp's announce shape: a bare prompt title, printed output, then a
+    /// labeled re-announce. The newer announce overwrites the retained slot.
+    #[test]
+    fn primary_title_is_overwritten_by_a_newer_announce() {
+        let mut emu = Emulator::new(4, 20, 0);
+        emu.process("\x1b]0;\u{3c0} >\x07build output\r\n".as_bytes());
+        assert_eq!(emu.primary_title(), Some("\u{3c0} >"));
+        emu.process("\x1b]0;\u{3c0} > check\x07".as_bytes());
+        assert_eq!(emu.primary_title(), Some("\u{3c0} > check"));
+    }
+
+    /// codex's clear shape: an empty announce empties the retained slot; a
+    /// RIS resets it with the rest of the title state.
+    #[test]
+    fn empty_announce_and_reset_clear_the_primary_title() {
+        let mut emu = Emulator::new(4, 20, 0);
+        emu.process(b"\x1b]0;codex\x07");
+        assert_eq!(emu.primary_title(), Some("codex"));
+        emu.process(b"\x1b]0;\x07");
+        assert_eq!(emu.primary_title(), None, "an empty announce clears");
+
+        let mut emu = Emulator::new(4, 20, 0);
+        emu.process(b"\x1b]0;codex\x07");
+        emu.process(b"\x1bc");
+        assert_eq!(emu.primary_title(), None, "RIS clears");
+    }
+
+    /// An alternate-screen excursion — the entry claiming the staged title,
+    /// an in-alt announce, the exit — leaves the retained slot at the
+    /// pre-alt announce: a primary title stays true across it.
+    #[test]
+    fn primary_title_is_unaffected_by_an_alt_round_trip() {
+        let mut emu = Emulator::new(4, 20, 0);
+        emu.process(b"\x1b]0;shell\x07\x1b[?1049h");
+        assert_eq!(emu.alt_epoch(), 1);
+        assert_eq!(emu.title(), Some("shell"), "premise: entry claimed staging");
+        emu.process(b"\x1b]0;altapp\x07");
+        assert_eq!(emu.title(), Some("altapp"));
+        assert_eq!(
+            emu.primary_title(),
+            Some("shell"),
+            "an in-alt announce must not touch the slot"
+        );
+        emu.process(b"\x1b[?1049l");
+        assert_eq!(emu.primary_title(), Some("shell"));
     }
 
     /// The end-of-life landing runs the same bookkeeping as `process`: a
