@@ -1,17 +1,8 @@
 //! Codex does not let the caller select an ID at launch. This harness instead
 //! injects a `notify` override, chains compatible configured notifiers, and
-//! scans every exit line that carries an ID. When neither channel yields an ID,
-//! it correlates rollout files under
-//! `<codex-home>/sessions/YYYY/MM/DD/rollout-<local-ts>-<uuid>.jsonl`.
-//!
-//! Those files are created lazily: `RolloutRecorder::new` precomputes the path
-//! and defers creation until the first persisted item, so a session that never
-//! received a prompt leaves no rollout at all and [`Codex::correlate_fs`]
-//! returns `None`. That is the right answer — there is no conversation to
-//! resume. Creation opens the path `O_APPEND|O_CREAT` in place rather than
-//! writing a temp file and renaming it, so a zero-byte or half-written first
-//! line is briefly observable; the `jzon::parse` guard in [`line1_admits`]
-//! rejects one.
+//! scans supported exit lines for an ID. When neither channel yields one, it
+//! correlates rollout files under `<codex-home>/sessions/YYYY/MM/DD/`.
+//! Missing, empty, and malformed rollouts do not produce a candidate.
 
 use std::{
     fmt::Write as _,
@@ -88,12 +79,8 @@ impl Harness for Codex {
     fn scrape_exit(&self, text: &str) -> Option<String> {
         let mut last = None;
         for line in text.lines() {
-            // Fatal exit with no hint: codex `println!`s a bare
-            // `Session ID: <uuid>`, the last channel left once the notify
-            // hook has not fired and the rollout may be empty. The phrase
-            // carries no program word to narrow it, so only a whole row at
-            // offset 0 counts: rendered model output always carries a `• `
-            // head or a two-space continuation indent and never reaches it.
+            // `Session ID:` has no program marker and can appear in captured
+            // conversation text. Accept it only at the start of a row.
             if let Some(rest) = line.strip_prefix("Session ID: ")
                 && let Some(id) = leading_uuid(rest)
             {
@@ -149,13 +136,9 @@ impl Harness for Codex {
                 else {
                     continue;
                 };
-                // The stem opens with 19 timestamp characters
-                // (`YYYY-MM-DDTHH-MM-SS`) and one `-`; the thread ID runs from
-                // there to the first `_` or to the end. Reading the trailing 36
-                // instead would return the rollout ID of a reverted thread's
-                // `rollout-<ts>-<thread_id>_<rollout_id>.jsonl` — a valid UUID
-                // naming the wrong conversation. 0.147.0 writes no such name;
-                // codex main's `thread/revert` does.
+                // The 20-byte timestamp prefix precedes the thread ID. A
+                // suffix may carry a second UUID, so reading the final UUID
+                // can select a rollout ID instead of the conversation.
                 let Some(ids) = stem.get(20..) else {
                     continue;
                 };
@@ -172,10 +155,8 @@ impl Harness for Codex {
                 if !line1_admits(&entry.path(), cwd) {
                     continue;
                 }
-                // A reverted thread keeps its ID and gains a second rollout,
-                // so both names carry one conversation and both land in the
-                // window the shared ID's v7 instant defines. The same uuid
-                // twice is still one candidate.
+                // Multiple rollouts may name the same thread. Correlation
+                // counts that thread once.
                 let id = id.to_string();
                 if !survivors.contains(&id) {
                     survivors.push(id);
@@ -201,15 +182,9 @@ enum NotifyRoute {
     Opaque,
 }
 
-/// Classify the effective `notify` route from `config.toml`. Because this is
-/// deliberately line-based rather than TOML-aware, two `notify` lines in one
-/// file are ambiguous and produce [`NotifyRoute::Opaque`].
-///
-/// `config.toml` is the only file read, and the injected `-c` override is why
-/// that suffices: it lands in codex's `SessionFlags` layer at precedence 30,
-/// outranking every layer a user config can occupy — user config 20,
-/// user-with-profile 21, project 25 — and enterprise-managed config too, at
-/// 15. Only the two legacy managed layers, at 40 and 50, beat it.
+/// Classify the `notify` route declared in `config.toml`. The parser is
+/// deliberately line-based: duplicate assignments are ambiguous and produce
+/// [`NotifyRoute::Opaque`].
 fn config_notify_route(home: Option<&Path>) -> NotifyRoute {
     let Some(root) = Codex.home_root(home) else {
         return NotifyRoute::Vacant;
@@ -329,18 +304,11 @@ fn v7_millis(id: &str) -> Option<u64> {
     u64::from_str_radix(&format!("{}{}", &id[..8], &id[9..13]), 16).ok()
 }
 
-/// Check whether the rollout's first record names `cwd` and belongs to a thread
-/// the user started. Subagent and guardian-review threads inherit the parent's
-/// cwd and are minted within seconds of it, so cwd and the window alone leave
-/// several rollouts standing and correlation collapses to `None`;
-/// `thread_source: "subagent"` and a `parent_thread_id` are what separate them.
-///
-/// The test rejects rather than admits by name: codex's `ThreadSource`
-/// deserializer turns any unknown string into `Feature(String)`, so requiring
-/// `"user"` would silently drop legitimate future thread kinds. Absence is a
-/// pass for the same reason — both fields are omitted when empty and neither
-/// existed before 0.147.0, so pre-0.147 sessions stay resumable. Reads stop at
-/// 64 KiB because later records do not participate in correlation.
+/// Check the rollout's first record for a matching `cwd` and no explicit
+/// spawned-thread provenance. Missing and unrecognized `thread_source` values
+/// remain eligible; `"subagent"` or any `parent_thread_id` rejects the record.
+/// Reads stop at 64 KiB because later records do not participate in
+/// correlation.
 fn line1_admits(path: &Path, cwd: &Path) -> bool {
     let Ok(file) = fs::File::open(path) else {
         return false;
@@ -361,10 +329,8 @@ fn line1_admits(path: &Path, cwd: &Path) -> bool {
     {
         return false;
     }
-    // codex records the cwd its own process reports, and `getcwd(3)` resolves
-    // symlinks: a task spawned in `/tmp/x` on macOS is recorded as
-    // `/private/tmp/x` and never matches verbatim. Resolving this side is
-    // enough — the recorded path is already physical.
+    // Rollouts can contain the physical cwd while the task retains a symlinked
+    // path. Canonicalize the task path before rejecting the match.
     payload["cwd"].as_str().is_some_and(|c| {
         let recorded = Path::new(c);
         recorded == cwd || cwd.canonicalize().is_ok_and(|p| p == recorded)
@@ -680,9 +646,7 @@ mod tests {
         assert_eq!(Codex.scrape_exit(&both).as_deref(), Some(ID));
     }
 
-    /// A fatal exit prints no resume hint and names the ID outright. Nothing
-    /// else recovers it: the notify hook never fired and the rollout may be
-    /// empty.
+    /// A fatal exit can name the session without printing a resume hint.
     #[test]
     fn scrape_exit_reads_the_fatal_session_id_line() {
         assert_eq!(
@@ -695,9 +659,7 @@ mod tests {
         assert_eq!(Codex.scrape_exit("Session ID: my session"), None);
         assert_eq!(Codex.scrape_exit(&format!("Session ID: {ID}ff")), None);
 
-        // Off the start of the row the phrase is quoted text, not codex's own
-        // line. A task killed before any exit line would otherwise resume on
-        // it; refusing costs only the fall through to `correlate_fs`.
+        // An indented or embedded label can be conversation text.
         for quoted in [
             format!("the log said Session ID: {ID}"),
             format!("• Session ID: {ID}"),
@@ -706,18 +668,14 @@ mod tests {
             assert_eq!(Codex.scrape_exit(&quoted), None, "{quoted:?}");
         }
 
-        // Across lines, the last channel to speak wins, either way round.
+        // Across lines, the last valid ID wins.
         let hint_last = format!("Session ID: {OTHER}\nrun codex resume {ID}");
         assert_eq!(Codex.scrape_exit(&hint_last).as_deref(), Some(ID));
         let id_last = format!("run codex resume {OTHER}\nSession ID: {ID}");
         assert_eq!(Codex.scrape_exit(&id_last).as_deref(), Some(ID));
     }
 
-    /// A half-migrated home — a legacy `profile` key beside the file it once
-    /// selected — must not chain the profile's notifier: 0.147.0 refuses to
-    /// start on that key at all, and layers `<profile>.config.toml` only under
-    /// `-p`, a command this harness never instruments. Chaining it would run a
-    /// notifier codex itself would not.
+    /// Notification chaining reads `config.toml` and ignores sibling files.
     #[test]
     fn config_notify_route_reads_config_toml_alone() {
         let home = temp("codex_profile_notify");
@@ -773,10 +731,7 @@ mod tests {
         );
     }
 
-    /// Subagent and guardian-review threads mint their own ID, write their own
-    /// rollout, and inherit the parent's cwd, so cwd and the window alone leave
-    /// several rollouts standing. Line 1's provenance fields are what separate
-    /// them, and either one alone disqualifies a file.
+    /// Either spawned-thread provenance field disqualifies a rollout.
     #[test]
     fn correlate_fs_excludes_spawned_threads() {
         let home = temp("codex_subagent");
@@ -786,7 +741,7 @@ mod tests {
         let parent = write_rollout(&home, spawn_ms + 1_000, 1, cwd);
         let resolves = |home: &Path| Codex.correlate_fs(cwd, spawned, Some(home));
 
-        // `thread_source` alone, as 0.147.0 writes it for a spawned thread.
+        // `thread_source` alone disqualifies the rollout.
         write_rollout_named(
             &home,
             spawn_ms + 3_000,
@@ -808,17 +763,13 @@ mod tests {
         );
         assert_eq!(resolves(&home).as_deref(), Some(parent.as_str()));
 
-        // A second rollout carrying neither field is a real sibling, and
-        // uniqueness fails as it always has.
+        // A second eligible thread makes correlation ambiguous.
         write_rollout(&home, spawn_ms + 7_000, 4, cwd);
         assert_eq!(resolves(&home), None);
     }
 
-    /// Disqualify by field rather than requiring `thread_source: "user"`:
-    /// codex's deserializer turns any unknown string into `Feature(String)`, so
-    /// an allow-list would drop future thread kinds. Absence passes too, which
-    /// is what keeps pre-0.147 rollouts resumable — the case above already
-    /// leans on it.
+    /// Unknown thread sources remain eligible unless another field marks the
+    /// rollout as spawned.
     #[test]
     fn correlate_fs_admits_thread_sources_it_does_not_know() {
         let spawn_ms: u64 = 1_785_000_000_000;
@@ -842,18 +793,14 @@ mod tests {
         }
     }
 
-    /// A thread created by `thread/revert` carries a second ID in its filename.
-    /// The trailing 36 characters are then the rollout ID — a valid UUID naming
-    /// a different object — so the thread ID is read from a fixed offset.
+    /// A suffixed rollout filename carries the thread ID before the rollout ID.
     #[test]
     fn correlate_fs_reads_the_thread_id_not_the_rollout_id() {
         let spawn_ms: u64 = 1_785_000_000_000;
         let spawned = SystemTime::UNIX_EPOCH + std::time::Duration::from_millis(spawn_ms);
         let cwd = Path::new("/work/proj");
         let rollout_id = v7_at(spawn_ms + 1_000, 9);
-        // One home throughout: revert keeps the thread ID and adds a rollout
-        // rather than replacing one, so the two names coexist and the second
-        // pass proves the pair still resolves to a single conversation.
+        // Both names coexist and resolve to one deduplicated thread.
         let home = temp("codex_revert_name");
         for suffix in [String::new(), format!("_{rollout_id}")] {
             let thread = write_rollout_named(&home, spawn_ms + 1_000, 1, cwd, &suffix, "");
@@ -866,10 +813,7 @@ mod tests {
         }
     }
 
-    /// codex records the cwd `getcwd(3)` reports, which has resolved every
-    /// symlink; fleetcom holds the path the task was spawned with. On macOS a
-    /// task under `/tmp` is recorded as `/private/tmp` and a verbatim compare
-    /// never matches.
+    /// Correlation matches a physical rollout cwd to a symlinked task cwd.
     #[test]
     fn correlate_fs_matches_a_symlinked_spawn_path() {
         let home = temp("codex_symlink_cwd");
@@ -922,10 +866,8 @@ mod tests {
         );
     }
 
-    /// The anchor has to survive emulation, not just `str::lines`.
-    /// `text_with_history` joins soft-wrapped rows into one logical line, so a
-    /// preceding row that exactly fills the width is the case that could push
-    /// the fatal line off offset 0.
+    /// A preceding full-width row does not merge with the session-ID row after
+    /// terminal emulation.
     #[test]
     fn fatal_session_id_holds_offset_zero_after_a_full_width_row() {
         let bytes = format!("{}\r\nSession ID: {ID}\r\n", "x".repeat(CORPUS_COLS));

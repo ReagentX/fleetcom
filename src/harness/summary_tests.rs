@@ -507,15 +507,14 @@ fn codex_working_normalization() {
     }
 }
 
-/// The status line is a user-ordered item array, so the label reads either
-/// shape that puts the model first: the opt-in `{…} in · {…} out` tail, or
-/// the default `model-with-reasoning` head. A row carrying neither yields no
-/// label rather than a guess.
+/// The label reads either status-line shape that puts the model first: a
+/// `{…} in · {…} out` tail or a `model-with-reasoning` head. A row carrying
+/// neither yields no label.
 #[test]
 fn codex_label_reads_either_status_line_shape() {
     let label = |row: &str| CodexSummary.model_label(&rs(&["›", "", row]));
     for (row, want) in [
-        // Rows codex 0.147.0's own snapshots render.
+        // Model-with-reasoning rows.
         (
             "  gpt-5.6-sol default · /tmp/project",
             "gpt-5.6-sol default",
@@ -549,16 +548,14 @@ fn codex_label_reads_either_status_line_shape() {
         "  I'll use medium effort · /tmp/project",
         // The effort word with no model before it.
         "  high · /tmp/project",
-        // `none` is folded into `default` before the row is rendered, so the
-        // word is not a model's effort.
+        // `none` is outside the accepted effort vocabulary.
         "  gpt-5.6-sol none · /tmp/project",
     ] {
         assert_eq!(label(row), None, "{row:?}");
     }
 
-    // codex indents the status line by the footer's two columns; the composer
-    // and reply bullets do not. Without that discriminator a typed draft
-    // takes the `model-with-reasoning` shape and prefixes every preview.
+    // Indentation distinguishes status lines from composers and reply bullets
+    // with the same text shape.
     assert_eq!(CodexSummary.model_label(&rs(&["› ultra mode"])), None);
     assert_eq!(
         CodexSummary.model_label(&rs(&["›", "", "gpt-5.6-sol high · 0 in · 0 out"])),
@@ -579,9 +576,7 @@ fn codex_title_animations_canonicalize_to_constant_text() {
         );
     }
 
-    // The blink's two phases differ only in the bracketed glyph, so rewriting
-    // one direction is the whole fold: `[ ! ]` passes through and renders
-    // verbatim, which is the same text the `[ . ]` phase folds to.
+    // `[ . ]` folds to `[ ! ]`; `[ ! ]` already has the canonical text.
     assert_eq!(
         CodexSummary.normalize_title("[ . ] Action Required | fleetcom"),
         Some("[ ! ] Action Required | fleetcom".to_string())
@@ -592,8 +587,7 @@ fn codex_title_animations_canonicalize_to_constant_text() {
         "the frozen phase needs no rewrite"
     );
 
-    // codex and claude fold braille to different glyphs on purpose: the
-    // dashboard's titles stay attributable to the CLI that painted them.
+    // Each adapter uses a distinct canonical frame.
     assert_ne!(
         CodexSummary.normalize_title("⠹ fleetcom"),
         ClaudeSummary.normalize_title("⠹ fleetcom")
@@ -605,10 +599,9 @@ fn codex_title_animations_canonicalize_to_constant_text() {
     assert_eq!(CodexSummary.normalize_title("⠹"), None, "frame alone");
 }
 
-/// The status row anchors on its parenthetical, not on a literal verb:
-/// the activity glyph blinks, drops to `◦`, or vanishes with animations
-/// off; the header is whatever the CLI put there; the interrupt key is
-/// remappable.
+/// The status row anchors on its parenthetical, not on a literal verb. The
+/// activity glyph is optional and accepts both painted forms; the interrupt
+/// key is unconstrained.
 #[test]
 fn codex_status_anchors_on_the_interrupt_parenthetical() {
     let probe = |row: &str| CodexSummary.live_preview(&rs(&[row, "", "›"]));
@@ -628,7 +621,7 @@ fn codex_status_anchors_on_the_interrupt_parenthetical() {
         );
     }
 
-    // Every elapsed shape codex formats, from a fresh turn to a day-long one.
+    // Accepted compact-duration shapes, from seconds through hours.
     for elapsed in [
         "0s",
         "59s",
@@ -644,7 +637,7 @@ fn codex_status_anchors_on_the_interrupt_parenthetical() {
         );
     }
 
-    // The header is a free-form String; `Working` is only its default.
+    // Any alphanumeric header can precede the fixed parenthetical.
     for header in [
         "Investigating rendering code",
         "Reviewing approval request",
@@ -655,7 +648,6 @@ fn codex_status_anchors_on_the_interrupt_parenthetical() {
         // counter, so the anchor is the parenthetical after it.
         "Starting MCP servers (1/3): a, b, c",
         "Setting up sandbox...",
-        // Stream errors reach the header verbatim.
         "Reconnecting... 1/5",
     ] {
         assert_eq!(
@@ -685,7 +677,7 @@ fn codex_status_rejects_malformed_counters() {
     let probe = |row: &str| CodexSummary.live_preview(&rs(&[row, "", "›"]));
     for row in [
         "• Working (soon • esc to interrupt)",
-        // claude's fractional seconds, not codex's zero-padded fields.
+        // Fractional seconds are not accepted.
         "• Working (9.9s • esc to interrupt)",
         // The counter ends at the seconds field.
         "• Working (1m • esc to interrupt)",
@@ -716,22 +708,18 @@ fn codex_status_refuses_conversation_prose() {
         "• Benchmarks improved (12s → 8s)",
         // ` • ` alone is reachable in prose; the hint text is not.
         "• Fixed the timeout (5s • retry logic)",
-        // Truncation is the only reason a parenthetical goes unclosed, and
-        // the CLI's ellipsis is what proves it.
+        // An unclosed parenthetical requires a terminal ellipsis.
         "• Timed the suite (12s • 4 shards",
     ] {
         assert_eq!(probe(row), None, "{row:?}");
     }
 
-    // Refusing the bare counter costs the hint-off render, `({elapsed})`,
-    // which needs the interrupt key unbound: a static row over a wrong live
-    // one, per this file's anchor discipline.
+    // A bare counter is ambiguous with conversation prose.
     assert_eq!(probe("• Working (12s)"), None);
 }
 
-/// Every composer glyph pins the adapter: `!` in bash mode, `»` at `ultra`
-/// reasoning effort, `›` otherwise. The glyph stands alone or heads a
-/// space; glued to text it is body content and the pin fails.
+/// Every accepted composer glyph pins the adapter. The glyph stands alone or
+/// heads a space; glued text does not qualify.
 #[test]
 fn codex_composer_accepts_every_prompt_glyph() {
     let status = "• Working (3s • esc to interrupt)";
@@ -753,8 +741,7 @@ fn codex_composer_accepts_every_prompt_glyph() {
 
 /// Queued-message blocks sit between the status row and the composer.
 /// Their heads are walked past and their items never count against the
-/// window: the queue's depth is the user's, not the CLI's. Nothing else
-/// earns that pass.
+/// window. No other column-0 head receives that exemption.
 #[test]
 fn codex_status_walks_past_queued_message_blocks() {
     let walks = |head: &str| {
@@ -772,10 +759,7 @@ fn codex_status_walks_past_queued_message_blocks() {
         assert_eq!(walks(head), working, "{head:?}");
     }
 
-    // The pending-steers head carries an interrupt hint whenever a key is
-    // bound, which is the default, and codex wraps rather than truncates it.
-    // From 93 columns up the row is painted whole — the case a bare literal
-    // never matches.
+    // Prefix matching admits an affordance appended to the queued head.
     assert_eq!(
         walks(
             "• Messages to be submitted after next tool call (press esc to interrupt and send immediately)"
@@ -1136,7 +1120,7 @@ fn corpus_positive_states_anchor_exactly() {
             "preview_codex_hint_row",
             include_bytes!("../../tests/corpus/preview_codex_hint_row.bin"),
             &CodexSummary,
-            // No status line in this layout: no model prefix, correctly.
+            // No status line means no model prefix.
             "Working",
             "codex:working",
         ),
@@ -1316,13 +1300,11 @@ fn corpus_truncated_rows_still_anchor() {
     );
 }
 
-/// codex 0.147.0 rows, replayed from the CLI's own snapshot tests at the
-/// geometry those snapshots were taken at.
+/// Codex status layouts replay at their fixture-native widths.
 #[test]
 fn corpus_codex_0_147_rows_anchor() {
-    // The header is the model's first reasoning chunk, kept verbatim, and
-    // the `•`-headed transcript rows above it never surface. This frame
-    // paints no status line, so nothing prefixes the text.
+    // The status header remains verbatim. Transcript rows above it do not
+    // surface, and the absent status line contributes no model prefix.
     let got = corpus(
         include_bytes!("../../tests/corpus/preview_codex_reasoning.bin"),
         &CodexSummary,
@@ -1331,8 +1313,8 @@ fn corpus_codex_0_147_rows_anchor() {
     assert_eq!(got, anchor("Investigating rendering code", "codex:working"));
 
     // Sixteen queued messages separate the status row from the composer.
-    // The status line below is codex's default pair, `model-with-reasoning ·
-    // current-dir`, so the label reads off its first item.
+    // The status line below starts with `model-with-reasoning`, so its first
+    // item supplies the label.
     let got = corpus(
         include_bytes!("../../tests/corpus/preview_codex_queued.bin"),
         &CodexSummary,

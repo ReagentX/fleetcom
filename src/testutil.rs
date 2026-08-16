@@ -225,11 +225,9 @@ pub(crate) fn write_rollout(home: &Path, ms: u64, tail: u32, cwd: &Path) -> Stri
     write_rollout_named(home, ms, tail, cwd, "", "")
 }
 
-/// [`write_rollout`] with the two shapes correlation has to tell apart.
-/// `stem_suffix` follows the thread ID in the filename — codex main's
-/// `thread/revert` appends `_<rollout_id>` there. `meta_extra` is spliced into
-/// the `session_meta` payload verbatim, each member led by its own comma, so a
-/// test can write the provenance fields 0.147.0 emits for spawned threads.
+/// [`write_rollout`] with an optional filename suffix and additional
+/// `session_meta` payload members. `stem_suffix` follows the thread ID;
+/// `meta_extra` is inserted verbatim and must include each leading comma.
 pub(crate) fn write_rollout_named(
     home: &Path,
     ms: u64,

@@ -13,8 +13,8 @@
 //! To avoid treating it as live status, every matcher:
 //!
 //! 1. locates the chrome region structurally (claude's separator-pair input
-//!    box, codex's composer and configured status line, grok's bordered
-//!    input box) and limits status candidates relative to it;
+//!    box, codex's composer, grok's bordered input box) and limits status
+//!    candidates relative to it;
 //! 2. returns `None` when the expected structure is absent or inconsistent;
 //! 3. matches row prefixes so status rows truncated with an ellipsis at narrow
 //!    widths remain recognizable. A wrapped row fails the structural check.
@@ -297,35 +297,18 @@ fn claude_welcome_label(rows: &[String]) -> Option<String> {
 
 // ----------------------------------------------------------------- codex --
 
-/// Composer prompt glyphs: `!` in bash mode, `»` at `ultra` reasoning
-/// effort, `›` otherwise. All three render at column 0. Disabling input swaps
-/// whichever glyph the mode would paint for a dim `›`: the swap stays inside
-/// this set, and dimness is style rather than text, so neither reaches the
-/// pin.
+/// Column-0 glyphs accepted as the Codex composer prompt.
 const CODEX_PROMPT: &[char] = &['›', '»', '!'];
 
-/// Queued-message group heads codex paints between the status row and the
-/// composer, each over its own `  ↳ `-indented item rows. The heads sit at
-/// column 0 and are chrome, not status. Matched as prefixes: codex appends
-/// ` (press {key} to interrupt and send immediately)` to the first head
-/// whenever an interrupt key is bound, which is the default, so the painted
-/// row is 93 columns and an exact match fails at every width that fits it.
-/// All three take the prefix rule rather than one taking an exception —
-/// over-matching a reply bullet that opens with a head's words costs one
-/// skipped row, while missing a head aborts the walk this constant exists to
-/// let through.
+/// Column-0 queued-message heads allowed between the status row and composer.
+/// Prefix matching admits runtime affordances appended to a head.
 const CODEX_QUEUED_HEADS: &[&str] = &[
     "• Messages to be submitted after next tool call",
     "• Messages to be submitted at end of turn",
     "• Queued follow-up inputs",
 ];
 
-/// Reasoning-effort words the `model-with-reasoning` status-line item renders
-/// after the model slug. `default` is one of them: it is the word codex prints
-/// when the profile names no effort, not the absence of a word. `none` is not:
-/// codex's label function folds `ReasoningEffort::None` into `default`, so the
-/// word never reaches the row and listing it would only widen the surface a
-/// two-word phrase has to be read as a model.
+/// Reasoning-effort words accepted in a `model-with-reasoning` item.
 const CODEX_EFFORT: &[&str] = &[
     "minimal", "low", "medium", "high", "xhigh", "max", "ultra", "default",
 ];
@@ -355,12 +338,8 @@ impl SummaryAdapter for CodexSummary {
         codex_model_label(rows)
     }
 
-    /// Canonicalize codex's two title animations: the ten-frame braille
-    /// spinner folds to its first frame `⠋`, the blocked-on-user blink folds
-    /// its `[ . ] ` phase into `[ ! ] `. The preview's 500 ms title hold damps
-    /// neither — the spinner advances every 100 ms, the blink holds each phase
-    /// a full second. Only `[ . ] ` folds: `[ ! ]` reads as an alarm, and a
-    /// title already in that phase needs no rewrite. Others pass unchanged.
+    /// Fold braille frames to `⠋` and `[ . ] ` to `[ ! ] `. Other titles pass
+    /// unchanged.
     fn normalize_title(&self, title: &str) -> Option<String> {
         if let Some(rest) = title.strip_prefix("[ . ] ") {
             return Some(format!("[ ! ] {rest}"));
@@ -387,14 +366,11 @@ fn codex_numbered_option(row: &str) -> bool {
     t.len() > digits && digits >= 1 && t[digits..].starts_with(". ")
 }
 
-/// codex's approval modal: a selector row with an indented numbered sibling
-/// below it, pinned to the last nine painted rows. The modal removes the
-/// composer and status line; that absence is the disambiguator (a menu quoted
-/// in the conversation always has the live composer below it, so any
-/// non-selector [`CODEX_PROMPT`] row under the selector suppresses the
-/// match). Suppression tests the glyph alone, without the composer's
-/// trailing-space rule: over-suppressing costs one preview, while
-/// under-suppressing reports a modal the user is not looking at.
+/// Codex's approval modal: a selector row with an indented numbered sibling
+/// below it, pinned to the last nine painted rows. A quoted menu retains the
+/// live composer below it, so any non-selector [`CODEX_PROMPT`] row after the
+/// selector suppresses the match. Suppression tests the glyph alone because
+/// modal detection must not reinterpret a live composer as quoted content.
 fn codex_approval(rows: &[String]) -> Option<(String, &'static str)> {
     let last = rows.iter().rposition(|r| !r.is_empty())?;
     let i = (last.saturating_sub(8)..=last).find(|&i| codex_menu_head(&rows[i]))?;
@@ -408,29 +384,19 @@ fn codex_approval(rows: &[String]) -> Option<(String, &'static str)> {
         .then(|| ("awaiting approval".to_string(), "codex:approval-menu"))
 }
 
-/// The model label: the first ` · `-joined item of the bottom-most row among
-/// the last six painted ones whose items open with the model. The row is the
-/// status line, independent of the composer pin: it is user-configured and
-/// may be absent — or omit the model entirely, leaving no model prefix.
+/// Return the first ` · `-separated item from the bottom-most qualifying row
+/// among the last six painted rows. The status line is independent of the
+/// composer and may be absent or omit the model.
 ///
-/// Two shapes qualify, because the items are a `[tui] status_line` array the
-/// user orders and codex drops unavailable ones silently:
+/// Two shapes qualify:
 ///
-/// - the opt-in `total-input-tokens`/`total-output-tokens` pair closing the
-///   row as `{…} in · {…} out`, which pins the model to the first item;
-/// - the default `model-with-reasoning` head, `{model} {effort}` with an
-///   optional service tier appended, matched by [`codex_model_with_reasoning`].
+/// - a `{…} in · {…} out` tail, which pins the model to the first item;
+/// - a `model-with-reasoning` head, `{model} {effort}` with an optional third
+///   word, matched by [`codex_model_with_reasoning`].
 ///
-/// Neither present means the model is not on the row, and no label is read: a
-/// label lifted off `status_line = ["current-dir", "model"]` would name the
-/// directory as the model.
-///
-/// Both shapes additionally require the row to be indented. codex renders the
-/// status line through its footer, which prefixes every line with two spaces,
-/// while the composer and reply bullets start at column 0 — and the composer
-/// is inside this window, so a user who has typed `ultra mode` otherwise
-/// paints a row that reads as `model-with-reasoning` and prefixes every
-/// preview with `› ultra mode · `.
+/// Neither shape means no label. The row must also be indented: the composer
+/// and reply bullets begin at column 0 and can otherwise satisfy the same text
+/// shapes.
 fn codex_model_label(rows: &[String]) -> Option<String> {
     let last = rows.iter().rposition(|r| !r.is_empty())?;
     (last.saturating_sub(5)..=last).rev().find_map(|i| {
@@ -448,16 +414,10 @@ fn codex_model_label(rows: &[String]) -> Option<String> {
     })
 }
 
-/// Whether an item is `model-with-reasoning`: `{model} {effort}`, plus the
-/// service tier codex appends when the account has one (`gpt-5.4 xhigh fast`,
-/// where the effort word is no longer last). Exactly two or three words, with
-/// the effort word second — the item has no other word count, and holding the
-/// count that tight is what keeps prose ending in an effort word (`I'll use
-/// medium effort`) from being read as a model. The effort vocabulary is not
-/// closed the way the count is: `ReasoningEffort::Custom(String)` carries a
-/// model-defined word [`CODEX_EFFORT`] cannot list, and a row rendering one
-/// yields no label at all — the safe direction, and the reason this stays a
-/// list rather than a shape test.
+/// Whether an item has the accepted `model-with-reasoning` shape: two or three
+/// words, with a recognized effort word second. The optional third word
+/// occupies the service-tier position. The fixed effort vocabulary limits
+/// prose-shaped false matches.
 fn codex_model_with_reasoning(item: &str) -> bool {
     let words: Vec<&str> = item.split_whitespace().collect();
     matches!(words.len(), 2 | 3) && CODEX_EFFORT.contains(&words[1])
@@ -520,16 +480,10 @@ fn codex_status(rows: &[String], composer: usize) -> Option<(String, &'static st
     None
 }
 
-/// The live status row, `[{glyph} ]{header} ({elapsed} • {key} to
-/// interrupt)`, split into its header and the text after the opening paren.
-/// The glyph is codex's activity indicator: a shimmered `•` on truecolor
-/// stdout, `•`/`◦` alternating at 600 ms otherwise, and — with animations
-/// disabled — absent along with its space, so it is optional. The header is
-/// a free-form `String` (`Working` is only the default; a reasoning phrase,
-/// `Booting MCP server: {name}`, and verbatim stream errors all land there),
-/// which leaves the parenthetical as the only fixed structure. Matching it
-/// through [`codex_interrupt_paren`] rather than on the closing `)` keeps rows
-/// truncated at the terminal's width matchable.
+/// Split a live status row into its header and the text after the opening
+/// parenthesis. The optional activity prefix is `• ` or `◦ `; the header must
+/// begin alphanumeric. [`codex_interrupt_paren`] supplies the fixed structure
+/// and admits rows truncated at the terminal width.
 fn codex_status_head(row: &str) -> Option<(&str, &str)> {
     let rest = row
         .strip_prefix("• ")
@@ -546,23 +500,10 @@ fn codex_status_head(row: &str) -> Option<(&str, &str)> {
     })
 }
 
-/// Whether `s` opens with the status widget's parenthetical in full:
-/// [`codex_elapsed`]'s counter, then ` • {key} to interrupt)`. The counter
-/// alone is not enough of an anchor, because the row it anchors shares its
-/// slot with the turn's last reply bullet: `• Build finished (3m 20s)` is a
-/// sentence a coding agent writes, and reading it as live status reports a
-/// finished turn as busy. The interrupt hint is the part conversation text
-/// does not reproduce.
-///
-/// This costs the one render codex writes without a hint, `({elapsed})` —
-/// reachable only with the interrupt key unbound, or during Windows
-/// elevated-sandbox setup, a platform this crate's unconditional `nix`
-/// dependency rules out. That render is textually identical to the prose, so
-/// no rule separates them; refusing both is the direction this file takes when
-/// a shape is ambiguous.
-///
-/// A row the CLI cut at the terminal's width never closes its paren and ends
-/// in the CLI's own `…`, which is what admits it with the hint still partial.
+/// Whether `s` begins with an elapsed counter and interrupt affordance. An
+/// elapsed counter alone is ambiguous with conversation prose and does not
+/// qualify. An unclosed affordance qualifies only when the row ends in `…`,
+/// the terminal-truncation marker.
 fn codex_interrupt_paren(s: &str) -> bool {
     let Some(hint) = codex_elapsed(s).and_then(|rest| rest.strip_prefix(" • ")) else {
         return false;
@@ -601,10 +542,9 @@ fn codex_elapsed(s: &str) -> Option<&str> {
 /// `Working`, `7s • esc to interrupt) · 1 background terminal running · /ps
 /// to view · /stop to close` → `Working · 1 background terminal running`.
 /// The parenthetical is the elapsed counter plus interrupt affordance,
-/// dropped whole: an unclosed paren is CLI-side truncation mid-affordance
-/// and drops to the end. Of the ` · ` suffixes, `/`-headed segments are key
-/// hints; everything else is slow-moving state and is kept, with its own
-/// ellipsis when the CLI truncated it.
+/// dropped whole. Without a closing parenthesis, no suffix is parsed. Of the
+/// ` · ` suffixes, `/`-headed segments are key hints; every other nonempty
+/// segment is preserved.
 fn codex_working(header: &str, after_paren: &str) -> String {
     let tail = after_paren.find(')').map_or("", |i| &after_paren[i + 1..]);
     format!(

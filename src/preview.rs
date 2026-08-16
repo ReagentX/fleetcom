@@ -133,12 +133,9 @@ fn cascade(screen: &impl ScreenFacts, adapter: Option<&dyn SummaryAdapter>) -> P
             },
         };
     }
-    // Leading indentation is layout, not meaning: codex's status line (its
-    // bottom-most row, and so the floor of an idle codex task whenever the
-    // user configures one) indents itself, and the spaces waste preview
-    // width. Trimmed here, not in
-    // `live_floor`: the emulator's row stays a faithful fact because it
-    // doubles as the teardown-snapshot comparator.
+    // An indented status line can remain as the idle floor. Trim only the
+    // display candidate: `live_floor` also feeds teardown-snapshot comparison
+    // and must preserve the emulator row verbatim.
     let floor = screen.live_floor();
     let trimmed = floor.trim_start();
     Preview::floor(if trimmed.len() == floor.len() {
