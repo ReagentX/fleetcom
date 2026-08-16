@@ -638,18 +638,30 @@ mod tests {
 
     #[test]
     fn home_env_vars_name_each_tools_override() {
-        assert_eq!(Claude.home_env_var(), "CLAUDE_CONFIG_DIR");
-        assert_eq!(Codex.home_env_var(), "CODEX_HOME");
-        assert_eq!(Grok.home_env_var(), "GROK_HOME");
-        assert_eq!(Omp.home_env_var(), "PI_CODING_AGENT_SESSION_DIR");
-        assert_eq!(Claude.home_dot_dir(), ".claude");
-        assert_eq!(Codex.home_dot_dir(), ".codex");
-        assert_eq!(Grok.home_dot_dir(), ".grok");
-        assert_eq!(Omp.home_dot_dir(), ".omp/agent/sessions");
+        // (env var, dot dir) per harness, in AGENTS order.
+        const OVERRIDES: [(&str, &str); 4] = [
+            ("CLAUDE_CONFIG_DIR", ".claude"),
+            ("CODEX_HOME", ".codex"),
+            ("GROK_HOME", ".grok"),
+            ("PI_CODING_AGENT_SESSION_DIR", ".omp/agent/sessions"),
+        ];
+        assert_eq!(
+            AGENTS.len(),
+            OVERRIDES.len(),
+            "a new harness needs its (env var, dot dir) row added here"
+        );
+        for (a, (env_var, dot_dir)) in AGENTS.iter().zip(OVERRIDES) {
+            let program = a.harness.shape().0;
+            assert_eq!(a.harness.home_env_var(), env_var, "{program}");
+            assert_eq!(a.harness.home_dot_dir(), dot_dir, "{program}");
+        }
     }
 
     #[test]
     fn registry_detect_routes_to_the_matching_harness() {
+        // The test enumerates each harness by hand: this canary turns a
+        // silently-passing fifth harness into a failure naming this test.
+        assert_eq!(AGENTS.len(), 4, "route the new harness's command here");
         let (h, inv) = detect("claude").unwrap();
         assert_eq!(h.home_dot_dir(), ".claude");
         assert_eq!(inv, Invocation::Bare);
