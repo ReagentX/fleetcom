@@ -1,5 +1,8 @@
 use super::*;
-use crate::harness::fixtures::{ID as CAP_ID, OTHER as CAP_OTHER};
+use crate::{
+    harness::fixtures::{ID as CAP_ID, OTHER as CAP_OTHER},
+    protocol::{Preview, PreviewSource},
+};
 
 // --- session-capture wiring -------------------------------------------
 
@@ -1438,4 +1441,143 @@ fn recovery_cadence_rewrites_on_capture_drift_and_skips_when_static() {
     );
     let names: Vec<_> = std::fs::read_dir(&rec).unwrap().flatten().collect();
     assert_eq!(names.len(), 1, "one incarnation owns one snapshot file");
+}
+
+// --- live registry blocked status --------------------------------------
+
+/// File the registry record `pid` publishes, carrying the raw `status` JSON
+/// pair. Every field `record_for_pid` validates has to agree with the task:
+/// the file name and `pid`, the `cwd`, and a process start inside the
+/// correlation window of the spawn.
+fn install_status_record(home: &Path, pid: u32, cwd: &Path, status: &str) {
+    let sessions = home.join("sessions");
+    std::fs::create_dir_all(&sessions).unwrap();
+    std::fs::write(
+        sessions.join(format!("{pid}.json")),
+        format!(
+            r#"{{"pid":{pid},"sessionId":"{CAP_ID}","cwd":"{cwd}","startedAt":{started},"kind":"interactive",{status}}}"#,
+            cwd = cwd.display(),
+            started = now_ms()
+        ),
+    )
+    .unwrap();
+}
+
+/// Tick until the sole task's emitted preview satisfies `pred`, then return
+/// the last preview seen. Only a tick resolves a preview and only a
+/// resolution probes the registry, so the 250 ms probe throttle expires on
+/// ticks, not on sleeps. A negative assertion reads the return value: `pred`
+/// stops on the first violation, so the preview returned is the violating one.
+fn tick_until_preview(
+    s: &mut Supervisor,
+    budget: Duration,
+    mut pred: impl FnMut(&Preview) -> bool,
+) -> Preview {
+    let mut last = None;
+    wait_until(budget, || {
+        s.tick();
+        for e in s.drain() {
+            if let Event::Tasks(v) = e
+                && let Some(t) = v.into_iter().next()
+            {
+                last = Some(t.preview);
+            }
+        }
+        last.as_ref().is_some_and(&mut pred)
+    });
+    last.expect("a Tasks snapshot must carry the task's preview")
+}
+
+/// The only test that drives `Task::refresh_blocked`: the harness tests call
+/// `live_blocked_status` directly and the preview tests hand `resolve` a
+/// literal claim, so gutting the probe leaves both green. A `waiting` record
+/// the CLI publishes for the task's own pid reaches the dashboard as the
+/// anchor tier, a non-waiting record does not, and an exited leader stops
+/// claiming to be blocked even though its record outlives it.
+#[test]
+fn registry_waiting_status_reaches_the_dashboard_preview() {
+    let dir = scratch("registry_blocked");
+    let (bin, runtime) = (dir.join("bin"), dir.join("run"));
+    let (claude_home, done) = (dir.join("claude_home"), dir.join("done"));
+    install_script(
+        &bin,
+        "claude",
+        &format!(
+            "until [ -e '{d}' ]; do sleep 0.05; done",
+            d = done.display()
+        ),
+    );
+    let mut s = sup_ctx(agent_ctx_plus(
+        &bin,
+        &runtime,
+        dir.to_path_buf(),
+        &[("CLAUDE_CONFIG_DIR", &claude_home)],
+    ));
+    spawn(&mut s, "claude", dir.to_path_buf());
+    // The record is keyed by the leader's pid, which only the spawn can name.
+    let pid = s.tasks[0].pid().expect("a live task has a pid");
+
+    // `idle` is a live session no user is blocking on: three probe intervals
+    // of ticks must never anchor the preview.
+    install_status_record(&claude_home, pid, &dir, r#""status":"idle""#);
+    let p = tick_until_preview(&mut s, Duration::from_millis(750), |p| {
+        p.source == PreviewSource::Anchor
+    });
+    assert_ne!(
+        p.source,
+        PreviewSource::Anchor,
+        "a non-waiting record must not anchor the preview: {p:?}"
+    );
+
+    // The CLI rewrites the record in place when it blocks on a dialog.
+    install_status_record(
+        &claude_home,
+        pid,
+        &dir,
+        r#""status":"waiting","waitingFor":"permission prompt""#,
+    );
+    let p = tick_until_preview(&mut s, Duration::from_secs(5), |p| {
+        p.source == PreviewSource::Anchor
+    });
+    assert_eq!(
+        (p.text.as_str(), p.source, p.rule),
+        (
+            "awaiting approval",
+            PreviewSource::Anchor,
+            Some("claude:registry-approval")
+        ),
+        "a waiting record must reach the dashboard as the anchor tier"
+    );
+
+    // The leader exits and its record survives, as one the CLI never got to
+    // remove does. The reason is rewritten afterward, to text the live task
+    // never saw: adopting it could only come from probing a dead leader,
+    // which the demotion hold holding the old text cannot be mistaken for.
+    std::fs::write(&done, b"").unwrap();
+    assert!(
+        reap_until(&mut s, Duration::from_secs(5), |s| s.tasks[0]
+            .finished
+            .is_some()),
+        "the leader never exited"
+    );
+    install_status_record(
+        &claude_home,
+        pid,
+        &dir,
+        r#""status":"waiting","waitingFor":"dialog open""#,
+    );
+    let p = tick_until_preview(&mut s, Duration::from_secs(5), |p| {
+        p.text != "awaiting approval"
+    });
+    assert!(
+        p.text != "awaiting approval" && p.text != "dialog open",
+        "an exited leader must not render as blocked: {p:?}"
+    );
+    assert!(
+        claude_home
+            .join("sessions")
+            .join(format!("{pid}.json"))
+            .is_file(),
+        "the surviving record is the whole point of the case"
+    );
 }

@@ -38,10 +38,12 @@ const MAX_PENDING_WRITE: usize = 16 * 1024 * 1024;
 /// Minimum interval between harness blocked-status probes for one task. The
 /// probe reads the CLI's registry off disk, and `resolve_preview` runs for
 /// every task on every snapshot tick, which range from the 8 ms frame minimum
-/// to the 200 ms idle backstop: unthrottled, that is a syscall per task per
-/// frame. 250 ms buys nothing back in exchange, because the state is
-/// human-facing and already sits far below the 500 ms title hold and the
-/// 600 ms demotion hold the preview passes through afterward.
+/// to the 200 ms idle backstop: unthrottled, that is a filesystem read per
+/// claude task per frame. Nothing downstream absorbs what the throttle costs.
+/// A blocked status appearing is a rank increase, which cancels any pending
+/// demotion and renders on the tick that observes it, so the interval plus one
+/// tick is the whole visible latency of a newly blocked session. 250 ms of it
+/// is a delay no human reading a status line can distinguish from immediate.
 const BLOCKED_PROBE_INTERVAL: Duration = Duration::from_millis(250);
 
 /// A whole-message refusal from the bounded writer queue.
@@ -373,9 +375,13 @@ impl Task {
         })
     }
 
-    /// The session leader's PID. `$SHELL -c` execs an accepted agent command in
-    /// place, so for those tasks this is the agent process itself: the pid its
-    /// live session registry is keyed by.
+    /// The session leader's PID. `sh`, `bash`, `zsh`, and `dash` each exec a
+    /// single simple `-c` command in place rather than forking, so for an
+    /// accepted agent command this is the agent process itself: the pid its
+    /// live session registry is keyed by. That exec is a shell optimization,
+    /// not a guarantee — under a `$SHELL` that forks and waits, the leader is
+    /// the shell and the registry lookups find nothing rather than the wrong
+    /// thing.
     pub fn pid(&self) -> Option<u32> {
         self.pid
     }
