@@ -845,10 +845,10 @@ fn codex_ran_stops_at_foreign_rows() {
     assert_eq!(CodexSummary.live_preview(&behind_reply), None);
 }
 
-/// A hint row may follow the composer without a token bar. The anchor
+/// A hint row may follow the composer without a status line. The anchor
 /// still fires, without a model prefix.
 #[test]
-fn codex_hint_row_layout_anchors_without_a_token_bar() {
+fn codex_hint_row_layout_anchors_without_a_status_line() {
     let hinted = rs(&[
         "• Running cargo test --test daemon_env",
         "",
@@ -866,7 +866,7 @@ fn codex_hint_row_layout_anchors_without_a_token_bar() {
     assert_eq!(CodexSummary.model_label(&hinted), None);
 }
 
-/// The approval modal replaces composer and token bar with a numbered
+/// The approval modal replaces composer and status line with a numbered
 /// menu; the selector row plus a numbered sibling synthesizes the
 /// label, wherever the selection sits.
 #[test]
@@ -1136,7 +1136,7 @@ fn corpus_positive_states_anchor_exactly() {
             "preview_codex_hint_row",
             include_bytes!("../../tests/corpus/preview_codex_hint_row.bin"),
             &CodexSummary,
-            // No token bar in this layout: no model prefix, correctly.
+            // No status line in this layout: no model prefix, correctly.
             "Working",
             "codex:working",
         ),

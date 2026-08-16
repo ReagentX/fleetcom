@@ -69,8 +69,8 @@ roster below it.
 | `preview_codex_working_over_ran.bin` | codex working with a `• Ran` row higher in the same turn | `codex:working` wins at the pin; the stale row never surfaces |
 | `preview_codex_scrollback.bin` | codex finished turn, `• Ran` from the prior turn in scrollback | the scan stops at the reply bullet and resolves to the floor tier |
 | `preview_codex_ran.bin` | codex transient completion row | `codex:ran` extraction through the `└` attachment row |
-| `preview_codex_hint_row.bin` | codex working with `tab to queue message` below the composer, no token bar | `codex:working` through the composer pin; no model prefix without the bar |
-| `preview_codex_approval.bin` | codex approval modal: composer and token bar replaced by a numbered menu | `codex:approval-menu` synthesizes `awaiting approval` |
+| `preview_codex_hint_row.bin` | codex working with `tab to queue message` below the composer, no status line | `codex:working` through the composer pin; no model prefix without one |
+| `preview_codex_approval.bin` | codex approval modal: composer and status line replaced by a numbered menu | `codex:approval-menu` synthesizes `awaiting approval` |
 | `preview_codex_reasoning.bin` | codex 0.147.0 status row headed by the model's own reasoning phrase, over an `• Explored` group and a reply bullet, composer carrying text, no status line | `codex:working` keeps the CLI's header verbatim; the `•`-headed rows above it never surface, and no status line means no model prefix |
 | `preview_codex_queued.bin` | codex 0.147.0 `• Working` row separated from the composer by a `• Queued follow-up inputs` block, default `status_line` below | `codex:working` survives the queued-message heads; the model label reads the default `model-with-reasoning · current-dir` shape |
 | `preview_codex_body_menu.bin` | modal-shaped menu quoted in the body, live composer below | negative: the composer's presence suppresses the modal match; floor tier reports |
