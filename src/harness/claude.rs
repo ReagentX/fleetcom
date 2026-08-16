@@ -10,6 +10,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
+use super::summary::AWAITING_APPROVAL;
 use super::{
     CAPTURE_ENV, CapturePaths, Harness, Invocation, SpawnPlan, is_uuid, last_hint, pin_plan,
     shell_quote, within_window, within_window_ms,
@@ -115,7 +116,7 @@ struct SessionRecord {
 /// remain verbatim. A missing reason falls back to `awaiting input`.
 fn waiting_preview(reason: Option<&str>) -> (String, &'static str) {
     match reason.filter(|r| !r.is_empty()) {
-        Some("permission prompt") => ("awaiting approval".to_string(), "claude:registry-approval"),
+        Some("permission prompt") => (AWAITING_APPROVAL.to_string(), "claude:registry-approval"),
         Some(other) => (other.to_string(), "claude:registry-waiting"),
         None => ("awaiting input".to_string(), "claude:registry-waiting"),
     }

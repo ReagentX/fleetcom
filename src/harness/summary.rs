@@ -42,6 +42,11 @@ pub fn select(command: &str) -> Option<&'static dyn SummaryAdapter> {
         .map(|a| a.summary)
 }
 
+/// The one synthesized status. Approval surfaces paint a menu, not a status
+/// row, so the three approval matchers and claude's registry reader all
+/// report this literal; the dashboard renders the exact string as a state.
+pub(crate) const AWAITING_APPROVAL: &str = "awaiting approval";
+
 /// Whether `row` is a full-width horizontal rule: nothing but `─`, long
 /// enough that box borders and inline list rules never qualify. claude's
 /// input box is fenced by two such rows.
@@ -276,7 +281,7 @@ fn claude_approval(rows: &[String]) -> Option<(String, &'static str)> {
     let next = rows[i + 1..].iter().find(|r| !r.is_empty())?;
     next.trim_start()
         .starts_with("2. ")
-        .then(|| ("awaiting approval".to_string(), "claude:approval-menu"))
+        .then(|| (AWAITING_APPROVAL.to_string(), "claude:approval-menu"))
 }
 
 /// Complete effort values accepted before a welcome-box ellipsis.
@@ -405,7 +410,7 @@ fn codex_approval(rows: &[String]) -> Option<(String, &'static str)> {
     rows[i + 1..]
         .iter()
         .all(|r| !r.starts_with(CODEX_PROMPT) || codex_menu_head(r))
-        .then(|| ("awaiting approval".to_string(), "codex:approval-menu"))
+        .then(|| (AWAITING_APPROVAL.to_string(), "codex:approval-menu"))
 }
 
 /// Return the first ` · `-separated item from the bottom-most qualifying row
@@ -766,7 +771,7 @@ fn omp_approval(rows: &[String]) -> Option<(String, &'static str)> {
     rows[i.saturating_sub(6)..i]
         .iter()
         .any(|r| omp_allow_head(r))
-        .then(|| ("awaiting approval".to_string(), "omp:approval-menu"))
+        .then(|| (AWAITING_APPROVAL.to_string(), "omp:approval-menu"))
 }
 
 /// The selector's chosen row: a cursor spelling, a space, then `Approve` and
