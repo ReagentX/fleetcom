@@ -128,17 +128,21 @@ impl SummaryAdapter for ClaudeSummary {
         claude_welcome_label(rows)
     }
 
-    /// Canonicalize a leading claude spinner, braille, or quadrant-circle
-    /// frame to `✻` so title animation does not change the rendered text.
-    /// Other titles pass through unchanged.
+    /// Strip a leading claude spinner, braille, or quadrant-circle frame:
+    /// the title text carries the information, the frame is animation, so a
+    /// framed title normalizes to its bare text and animation never changes
+    /// the rendered result. Other titles pass through unchanged.
     fn normalize_title(&self, title: &str) -> Option<String> {
         let mut chars = title.chars();
         let frame = chars.next()?;
-        // Normalize the entire quadrant-circle block as one animation set.
+        // The quadrant-circle block is one animation set with the spinner.
         let framed = CLAUDE_SPINNER.contains(&frame)
             || braille_frame(frame)
             || ('\u{25D0}'..='\u{25D3}').contains(&frame);
-        (framed && chars.next()? == ' ').then(|| format!("✻ {}", chars.as_str()))
+        // A frame with no text refuses: `None` renders the title verbatim,
+        // where `Some("")` would render a blank preview line.
+        (framed && chars.next()? == ' ' && !chars.as_str().is_empty())
+            .then(|| chars.as_str().to_string())
     }
 }
 
@@ -715,6 +719,35 @@ impl SummaryAdapter for OmpSummary {
     /// Model text is user-configurable status-line content, not a stable label.
     fn model_label(&self, _rows: &[String]) -> Option<String> {
         None
+    }
+
+    /// Decode omp's `π {sep} {label}` title. The separator carries the
+    /// state: `>` is idle, a braille frame is working (folded to `⠋` so
+    /// animation never changes the rendered text), `!` is waiting on the
+    /// user; `π: {label}` is the state feature disabled. The label is the
+    /// information — an idle or feature-disabled title without one carries
+    /// nothing and refuses. So does any non-`π` title: an extension override
+    /// owns the title verbatim, and a wrong preview is worse than none.
+    fn normalize_title(&self, title: &str) -> Option<String> {
+        if let Some(label) = title.strip_prefix("π: ") {
+            return (!label.is_empty()).then(|| label.to_string());
+        }
+        let mut chars = title.strip_prefix("π ")?.chars();
+        let sep = chars.next()?;
+        let label = match chars.next() {
+            None => "",
+            Some(' ') => chars.as_str(),
+            Some(_) => return None,
+        };
+        match sep {
+            '>' => (!label.is_empty()).then(|| label.to_string()),
+            // `!` and the frame stay: without a label they are the state.
+            '!' if label.is_empty() => Some("!".to_string()),
+            '!' => Some(format!("! {label}")),
+            f if braille_frame(f) && label.is_empty() => Some("⠋".to_string()),
+            f if braille_frame(f) => Some(format!("⠋ {label}")),
+            _ => None,
+        }
     }
 }
 

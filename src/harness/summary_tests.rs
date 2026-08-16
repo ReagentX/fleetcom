@@ -275,13 +275,14 @@ fn claude_waiting_family_matches_the_skeleton_and_never_probes() {
     );
 }
 
-/// Every spinner frame canonicalizes to `✻`; non-frame titles pass through.
+/// Every spinner frame strips to the bare title text — the text is the
+/// information, the frame was decoration; non-frame titles pass through.
 #[test]
 fn claude_title_frames_canonicalize_to_constant_text() {
     for frame in CLAUDE_SPINNER {
         assert_eq!(
             ClaudeSummary.normalize_title(&format!("{frame} Claude Code")),
-            Some("✻ Claude Code".to_string()),
+            Some("Claude Code".to_string()),
             "{frame:?}"
         );
     }
@@ -298,23 +299,28 @@ fn claude_title_frames_canonicalize_to_constant_text() {
         .collect();
     assert_eq!(
         rendered,
-        std::collections::BTreeSet::from([Some("✻ Run sleep command".to_string())]),
+        std::collections::BTreeSet::from([Some("Run sleep command".to_string())]),
         "spinner and quadrant frames must render one string"
     );
 
     // A braille frame plus the session summary.
     assert_eq!(
         ClaudeSummary.normalize_title("⠐ Review fleetcom preview design document"),
-        Some("✻ Review fleetcom preview design document".to_string())
+        Some("Review fleetcom preview design document".to_string())
     );
     assert_eq!(
         ClaudeSummary.normalize_title("⠴ Review fleetcom preview design document"),
-        Some("✻ Review fleetcom preview design document".to_string()),
+        Some("Review fleetcom preview design document".to_string()),
         "mid-block braille frame"
     );
 
     assert_eq!(ClaudeSummary.normalize_title("zellij: main"), None);
     assert_eq!(ClaudeSummary.normalize_title("✻"), None, "frame alone");
+    assert_eq!(
+        ClaudeSummary.normalize_title("\u{273b} "),
+        None,
+        "a frame with no text refuses rather than rendering a blank"
+    );
 }
 
 /// A registry status outranks a screen-derived status while retaining the
@@ -366,8 +372,8 @@ fn registry_anchor_outranks_the_claude_spinner() {
 }
 
 /// Cascade-level: with the claude adapter installed and no anchor on
-/// the screen, a frame-led title renders canonicalized under the Title
-/// tier; without an adapter it renders verbatim.
+/// the screen, a frame-led title renders stripped to its text under the
+/// Title tier; without an adapter it renders verbatim.
 #[test]
 fn title_tier_renders_the_normalized_title() {
     let mut emu = Emulator::new(24, 80, 100);
@@ -378,7 +384,7 @@ fn title_tier_renders_the_normalized_title() {
         .clone();
     assert_eq!(
         (p.text.as_str(), p.source, p.rule),
-        ("✻ Claude Code", PreviewSource::Title, None)
+        ("Claude Code", PreviewSource::Title, None)
     );
 
     let mut st = PreviewState::new();
@@ -389,7 +395,7 @@ fn title_tier_renders_the_normalized_title() {
         "no adapter: verbatim"
     );
 
-    // Quadrant frames use the same canonical title as other spinner frames.
+    // Quadrant frames strip to the same bare text as other spinner frames.
     let mut quadrant = Emulator::new(24, 80, 100);
     quadrant.process(
         b"\x1b[?1049h\x1b]0;\xe2\x97\x90 Run sleep command for 25 seconds\x07conversation body",
@@ -401,7 +407,7 @@ fn title_tier_renders_the_normalized_title() {
     assert_eq!(
         (p.text.as_str(), p.source, p.rule),
         (
-            "✻ Run sleep command for 25 seconds",
+            "Run sleep command for 25 seconds",
             PreviewSource::Title,
             None
         )
@@ -700,9 +706,12 @@ fn codex_title_animations_canonicalize_to_constant_text() {
     );
 
     // Idle drops the spinner, and foreign titles are not codex's to rewrite.
+    // Refusing the bare project name is deliberate: for codex the frame is
+    // the signal, and the text alone says nothing about state.
     assert_eq!(CodexSummary.normalize_title("fleetcom"), None);
     assert_eq!(CodexSummary.normalize_title("zellij: main"), None);
     assert_eq!(CodexSummary.normalize_title("⠹"), None, "frame alone");
+    assert_eq!(CodexSummary.normalize_title(""), None, "empty title");
 }
 
 /// The status row anchors on its parenthetical, not on a literal verb. The
@@ -1303,6 +1312,60 @@ fn omp_approval_accepts_every_cursor_preset() {
             None,
             "{approve:?}"
         );
+    }
+}
+
+/// The title separator carries the state: `>` idle keeps the label alone, a
+/// braille frame folds to `⠋`, `!` stays verbatim, and the feature-disabled
+/// `π:` form keeps the label. Label-less idle titles and non-`π` titles
+/// refuse: an extension override owns the title and is not omp's to decode.
+#[test]
+fn omp_title_separators_decode_state_and_label() {
+    assert_eq!(
+        OmpSummary.normalize_title("π > Fix the flaky test"),
+        Some("Fix the flaky test".to_string())
+    );
+
+    // Every working frame must normalize to the same title.
+    for frame in ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'] {
+        assert_eq!(
+            OmpSummary.normalize_title(&format!("π {frame} Fix the flaky test")),
+            Some("⠋ Fix the flaky test".to_string()),
+            "{frame:?}"
+        );
+    }
+    assert_eq!(
+        OmpSummary.normalize_title("π ⠴"),
+        Some("⠋".to_string()),
+        "a label-less frame is still the working state"
+    );
+
+    // `!` is omp's own waiting-on-you marker, kept verbatim: no prose is
+    // synthesized outside the approval matchers.
+    assert_eq!(
+        OmpSummary.normalize_title("π ! Fix the flaky test"),
+        Some("! Fix the flaky test".to_string())
+    );
+    assert_eq!(OmpSummary.normalize_title("π !"), Some("!".to_string()));
+
+    // State feature disabled: `π: {label}`.
+    assert_eq!(
+        OmpSummary.normalize_title("π: Fix the flaky test"),
+        Some("Fix the flaky test".to_string())
+    );
+
+    // Label-less idle shapes carry nothing; everything else is an extension
+    // override or a foreign program and is refused, never guessed at.
+    for title in [
+        "π",
+        "π >",
+        "π: ",
+        "π >> quoted",
+        "custom extension title",
+        "zellij: main",
+        "",
+    ] {
+        assert_eq!(OmpSummary.normalize_title(title), None, "{title:?}");
     }
 }
 
