@@ -683,13 +683,25 @@ fn grok_border_label(row: &str) -> Option<String> {
 /// `-\|/`. The set is themeable and the ascii frames are ordinary
 /// punctuation, so a frame alone never makes a row status; the bracketed
 /// interrupt hint on the same row does.
+///
+/// The ascii frames reach this matcher only through a custom theme, which
+/// overrides `symbols.spinnerFrames` and each symbol key independently of the
+/// preset: the ascii preset's own box glyphs never anchor (see [`OmpSummary`]),
+/// so ascii frames can only arrive on a screen whose box glyphs stayed unicode.
 fn omp_frame(c: char) -> bool {
     ('\u{2800}'..='\u{28FF}').contains(&c) || matches!(c, '-' | '\\' | '|' | '/')
 }
 
 /// The interrupt hint closing omp's status row, one spelling per bracket
-/// theme: unicode, nerd, ascii. The inner word is always `esc`.
+/// theme: unicode, nerd, ascii. The inner word is always `esc`. `[esc]` is
+/// reachable on an anchoring screen only through the same per-key custom
+/// override that reaches the ascii frames.
 const OMP_HINTS: &[&str] = &["⟦esc⟧", "⟨esc⟩", "[esc]"];
+
+/// The marker on the selector's chosen row, one spelling per symbol preset:
+/// unicode, nerd (a private-use nerd-font codepoint), ascii. omp renders the
+/// row as `{nav.cursor} {label}`.
+const OMP_CURSORS: &[&str] = &["❯", "\u{f054}", ">"];
 
 /// omp (inline UI, primary screen). The pin is its two-row input box: a
 /// `╭…╮` status border directly above the `╰…╯` row the user types on. The
@@ -697,6 +709,14 @@ const OMP_HINTS: &[&str] = &["⟦esc⟧", "⟨esc⟩", "[esc]"];
 /// The approval selector replaces the box outright, so the box's absence —
 /// not matcher order — is what separates a blocked task from a busy one:
 /// omp keeps animating the status row underneath the selector.
+///
+/// Preset coverage: those corners are the unicode and nerd spellings, and
+/// nothing else anchors. The ascii preset draws every corner as `+` and the
+/// horizontal as `-`, which no test can tell from a table, rule, or diagram in
+/// the transcript, so the status row degrades to the floor tier there by
+/// design — a stale scrollback row reported as live status is the worse
+/// outcome. The selector still matches under ascii: its shape is plain text
+/// and needs no box.
 pub struct OmpSummary;
 
 impl SummaryAdapter for OmpSummary {
@@ -756,13 +776,13 @@ fn omp_spinner_status(rows: &[String], top: usize) -> Option<(String, &'static s
 }
 
 /// omp's approval selector, reached only with the input box gone: an
-/// `Allow tool: {name}` head within six rows above a `❯ Approve` row, and
-/// `Deny` as the next painted row below it, the selection pinned to the last
-/// nine painted rows. Prose quoting those words keeps the live input box
-/// below it and never reaches here.
+/// `Allow tool: {name}` head within six rows above the selected `Approve`
+/// row, and `Deny` as the next painted row below it, the selection pinned to
+/// the last nine painted rows. Prose quoting those words keeps the live input
+/// box below it and never reaches here.
 fn omp_approval(rows: &[String]) -> Option<(String, &'static str)> {
     let last = rows.iter().rposition(|r| !r.is_empty())?;
-    let i = (last.saturating_sub(8)..=last).find(|&i| rows[i].trim() == "❯ Approve")?;
+    let i = (last.saturating_sub(8)..=last).find(|&i| omp_approve_row(&rows[i]))?;
     if rows[i + 1..].iter().find(|r| !r.is_empty())?.trim() != "Deny" {
         return None;
     }
@@ -770,6 +790,17 @@ fn omp_approval(rows: &[String]) -> Option<(String, &'static str)> {
         .iter()
         .any(|r| omp_allow_head(r))
         .then(|| ("awaiting approval".to_string(), "omp:approval-menu"))
+}
+
+/// The selector's chosen row: a cursor spelling, a space, then `Approve` and
+/// nothing more. Equality after the cursor is the whole check — the ascii
+/// cursor `>` also opens a quoted line, so the row's remainder has to be
+/// exact.
+fn omp_approve_row(row: &str) -> bool {
+    let t = row.trim();
+    OMP_CURSORS
+        .iter()
+        .any(|c| t.strip_prefix(c) == Some(" Approve"))
 }
 
 /// The selector's head row: `Allow tool: {name}`. The prefix's trailing

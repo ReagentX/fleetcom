@@ -1489,6 +1489,12 @@ fn omp_screen<S: AsRef<str>>(above: &[S]) -> Vec<String> {
 /// status row keeps animating above it. `head` is the row that names the
 /// tool.
 fn omp_selector(head: &str) -> Vec<String> {
+    omp_selector_row(" ❯ Approve", head)
+}
+
+/// The same screen with the selected row written out, for the themed
+/// `nav.cursor` spellings and the near misses around them.
+fn omp_selector_row(approve: &str, head: &str) -> Vec<String> {
     let rule = "─".repeat(120);
     rs(&[
         " ⠴ Listing directory contents ⟦esc⟧",
@@ -1498,7 +1504,7 @@ fn omp_selector(head: &str) -> Vec<String> {
         head,
         " Command: ls -la",
         "",
-        " ❯ Approve",
+        approve,
         "   Deny",
         "",
         " up/down navigate  enter select  esc cancel",
@@ -1519,8 +1525,10 @@ fn omp_status_row_extracts_the_intent_phrase() {
             "{hint:?}"
         );
     }
-    // The ascii spinner preset, and omp's default phrase when the model
-    // streams no intent of its own.
+    // The ascii frames and hint, on the only screen that can carry them: a
+    // custom theme overriding those keys over unicode box glyphs, since the
+    // ascii preset's own box never anchors. Plus omp's default phrase, used
+    // when the model streams no intent of its own.
     for frame in ['-', '\\', '|', '/'] {
         assert_eq!(
             probe(&format!(" {frame} Working… [esc]")),
@@ -1614,6 +1622,51 @@ fn omp_approval_requires_the_selector_shape() {
     let mut quoted = omp_selector(" Allow tool: bash");
     quoted.push(String::new());
     assert_eq!(OmpSummary.live_preview(&omp_screen(&quoted)), None);
+}
+
+/// The marker on the selected row is omp's themed `nav.cursor`: `❯` under
+/// unicode, a private-use glyph under nerd, `>` under ascii. Every spelling
+/// has to read as blocked — a missed one leaves the task advertising a working
+/// status while it sits waiting on the user.
+#[test]
+fn omp_approval_accepts_every_cursor_preset() {
+    for cursor in ['❯', '\u{f054}', '>'] {
+        assert_eq!(
+            OmpSummary.live_preview(&omp_selector_row(
+                &format!(" {cursor} Approve"),
+                " Allow tool: bash"
+            )),
+            Some(("awaiting approval".to_string(), "omp:approval-menu")),
+            "{cursor:?}"
+        );
+    }
+    // The row after the cursor must be `Approve` exactly: `>` also opens a
+    // quoted line, and the selector is the one place a bare `>` is trusted.
+    for approve in [" > Approve now", " >Approve", " > approve", " * Approve"] {
+        assert_eq!(
+            OmpSummary.live_preview(&omp_selector_row(approve, " Allow tool: bash")),
+            None,
+            "{approve:?}"
+        );
+    }
+}
+
+/// The ascii preset cannot anchor and is not meant to: its box corners are `+`
+/// and its horizontal `-`, which no test tells apart from a table or a rule,
+/// so the status row degrades to the floor tier rather than risk reporting a
+/// scrollback row as live. The ascii frames and the `[esc]` hint the matcher
+/// carries stay reachable through a custom theme, which overrides
+/// `symbols.spinnerFrames` and each symbol key independently of the preset —
+/// the mixed screen the phrase test builds.
+#[test]
+fn omp_ascii_box_glyphs_do_not_anchor() {
+    let ascii_box = rs(&[
+        " - Listing directory contents [esc]",
+        "",
+        "+-- pi > model . high > 12.2%/131K --+",
+        "+-                                  -+",
+    ]);
+    assert_eq!(OmpSummary.live_preview(&ascii_box), None);
 }
 
 /// omp corpus replay at capture geometry (40×120): exact status text,
