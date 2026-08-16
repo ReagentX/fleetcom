@@ -29,7 +29,7 @@ fn corpus(
     let mut emu = Emulator::new(40, cols, 2000);
     emu.process(bytes);
     let mut st = PreviewState::new();
-    let p = st.resolve(Instant::now(), &emu, Some(adapter));
+    let p = st.resolve(Instant::now(), &emu, Some(adapter), None);
     (p.text.clone(), p.source, p.rule)
 }
 
@@ -284,6 +284,19 @@ fn claude_title_frames_canonicalize_to_constant_text() {
     let b = ClaudeSummary.normalize_title("✽ Claude Code");
     assert_eq!(a, b, "two frames must normalize identically");
 
+    // Every spinner frame must normalize to the same title.
+    let rendered: std::collections::BTreeSet<Option<String>> = CLAUDE_SPINNER
+        .iter()
+        .copied()
+        .chain('\u{25D0}'..='\u{25D3}')
+        .map(|frame| ClaudeSummary.normalize_title(&format!("{frame} Run sleep command")))
+        .collect();
+    assert_eq!(
+        rendered,
+        std::collections::BTreeSet::from([Some("✻ Run sleep command".to_string())]),
+        "spinner and quadrant frames must render one string"
+    );
+
     // A braille frame plus the session summary.
     assert_eq!(
         ClaudeSummary.normalize_title("⠐ Review fleetcom preview design document"),
@@ -299,6 +312,54 @@ fn claude_title_frames_canonicalize_to_constant_text() {
     assert_eq!(ClaudeSummary.normalize_title("✻"), None, "frame alone");
 }
 
+/// A registry status outranks a screen-derived status while retaining the
+/// model label and its own matcher ID.
+#[test]
+fn registry_anchor_outranks_the_claude_spinner() {
+    let rule = "─".repeat(60);
+    let screen = [
+        "╭─── Claude Code v2.1.233 ────────────╮",
+        "│ Fable 5 with high effort · Claude Max ·  │ notes │",
+        "╰──────────────────────────────────────╯",
+        "",
+        "✻ Hashing… (6s · ↓ 87 tokens)",
+        &rule,
+        "❯",
+        &rule,
+    ]
+    .join("\r\n");
+    let mut emu = Emulator::new(24, 80, 100);
+    emu.process(screen.as_bytes());
+
+    let mut st = PreviewState::new();
+    let p = st
+        .resolve(Instant::now(), &emu, Some(&ClaudeSummary), None)
+        .clone();
+    assert_eq!(
+        (p.text.as_str(), p.rule),
+        ("Fable 5 (high) · Hashing…", Some("claude:spinner")),
+        "premise: this screen anchors on the spinner"
+    );
+
+    let mut st = PreviewState::new();
+    let p = st
+        .resolve(
+            Instant::now(),
+            &emu,
+            Some(&ClaudeSummary),
+            Some(("awaiting approval", "claude:registry-approval")),
+        )
+        .clone();
+    assert_eq!(
+        (p.text.as_str(), p.source, p.rule),
+        (
+            "Fable 5 (high) · awaiting approval",
+            PreviewSource::Anchor,
+            Some("claude:registry-approval")
+        )
+    );
+}
+
 /// Cascade-level: with the claude adapter installed and no anchor on
 /// the screen, a frame-led title renders canonicalized under the Title
 /// tier; without an adapter it renders verbatim.
@@ -308,7 +369,7 @@ fn title_tier_renders_the_normalized_title() {
     emu.process(b"\x1b[?1049h\x1b]0;\xe2\x9c\xa2 Claude Code\x07conversation body");
     let mut st = PreviewState::new();
     let p = st
-        .resolve(Instant::now(), &emu, Some(&ClaudeSummary))
+        .resolve(Instant::now(), &emu, Some(&ClaudeSummary), None)
         .clone();
     assert_eq!(
         (p.text.as_str(), p.source, p.rule),
@@ -316,11 +377,29 @@ fn title_tier_renders_the_normalized_title() {
     );
 
     let mut st = PreviewState::new();
-    let p = st.resolve(Instant::now(), &emu, None).clone();
+    let p = st.resolve(Instant::now(), &emu, None, None).clone();
     assert_eq!(
         (p.text.as_str(), p.source),
         ("✢ Claude Code", PreviewSource::Title),
         "no adapter: verbatim"
+    );
+
+    // Quadrant frames use the same canonical title as other spinner frames.
+    let mut quadrant = Emulator::new(24, 80, 100);
+    quadrant.process(
+        b"\x1b[?1049h\x1b]0;\xe2\x97\x90 Run sleep command for 25 seconds\x07conversation body",
+    );
+    let mut st = PreviewState::new();
+    let p = st
+        .resolve(Instant::now(), &quadrant, Some(&ClaudeSummary), None)
+        .clone();
+    assert_eq!(
+        (p.text.as_str(), p.source, p.rule),
+        (
+            "✻ Run sleep command for 25 seconds",
+            PreviewSource::Title,
+            None
+        )
     );
 }
 
@@ -460,19 +539,41 @@ fn claude_approval_requires_the_dialog_shape() {
     assert_eq!(ClaudeSummary.live_preview(&lone), None);
 }
 
-/// The model label comes from the welcome box and reads as
-/// `{model} ({effort})`; no box, no label.
+/// The welcome-box label accepts complete and ellipsis forms but rejects a
+/// partial effort value. No box means no label.
 #[test]
 fn claude_label_reads_the_welcome_box() {
-    let boxed = rs(&[
-        "╭─── Claude Code v2.1.215 ────────────╮",
-        "│ Fable 5 with high effort · Claude Max ·  │ notes │",
-        "╰──────────────────────────────────────╯",
-    ]);
-    assert_eq!(
-        ClaudeSummary.model_label(&boxed),
-        Some("Fable 5 (high)".to_string())
-    );
+    let boxed = |cell: &str| {
+        rs(&[
+            "╭─── Claude Code v2.1.233 ────────────╮",
+            cell,
+            "╰──────────────────────────────────────╯",
+        ])
+    };
+    let fixed_pane = "│ Opus 5 (1M context) with high… · Claude Max ·      │ Added opt-in memory cgroup support for Bas… │";
+    for (cell, want) in [
+        (
+            "│ Fable 5 with high effort · Claude Max ·  │ notes │",
+            Some("Fable 5 (high)"),
+        ),
+        // Parentheses in the model name do not change the output shape.
+        (
+            "│ Opus 5 (1M context) with high effort · Claude Max ·  │ notes │",
+            Some("Opus 5 (1M context) (high)"),
+        ),
+        (fixed_pane, Some("Opus 5 (1M context) (high)")),
+        // Partial and empty effort values are invalid.
+        ("│ Opus 5 (1M context) with hi… │ notes │", None),
+        ("│ Opus 5 (1M context) with … │ notes │", None),
+        // Neither accepted suffix is present.
+        ("│ Some Model with high │ notes │", None),
+    ] {
+        assert_eq!(
+            ClaudeSummary.model_label(&boxed(cell)),
+            want.map(str::to_string),
+            "{cell:?}"
+        );
+    }
     assert_eq!(ClaudeSummary.model_label(&rs(&["no box here"])), None);
 }
 
@@ -1364,10 +1465,10 @@ fn corpus_non_agent_tuis_keep_their_tiers() {
         assert!(emu.alternate_screen(), "{name}: alt screen active at cut");
         let mut st = PreviewState::new();
         let with = st
-            .resolve(Instant::now(), &emu, Some(&ClaudeSummary))
+            .resolve(Instant::now(), &emu, Some(&ClaudeSummary), None)
             .clone();
         let mut st = PreviewState::new();
-        let without = st.resolve(Instant::now(), &emu, None).clone();
+        let without = st.resolve(Instant::now(), &emu, None, None).clone();
         assert_eq!(with, without, "{name}: the adapter must change nothing");
         assert_eq!(with.source, PreviewSource::Marker, "{name}");
     }

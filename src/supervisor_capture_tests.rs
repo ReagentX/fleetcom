@@ -1,5 +1,8 @@
 use super::*;
-use crate::harness::fixtures::{ID as CAP_ID, OTHER as CAP_OTHER};
+use crate::{
+    harness::fixtures::{ID as CAP_ID, OTHER as CAP_OTHER},
+    protocol::{Preview, PreviewSource},
+};
 
 // --- session-capture wiring -------------------------------------------
 
@@ -68,6 +71,21 @@ fn agent_ctx_plus(
 fn install_script(bin: &Path, name: &str, body: &str) {
     std::fs::create_dir_all(bin).unwrap();
     write_executable(&bin.join(name), body);
+}
+
+/// Write a matching interactive registry record with raw status fields.
+fn install_status_record(home: &Path, pid: u32, cwd: &Path, status: &str) {
+    let sessions = home.join("sessions");
+    std::fs::create_dir_all(&sessions).unwrap();
+    std::fs::write(
+        sessions.join(format!("{pid}.json")),
+        format!(
+            r#"{{"pid":{pid},"sessionId":"{CAP_ID}","cwd":"{cwd}","startedAt":{started},"kind":"interactive",{status}}}"#,
+            cwd = cwd.display(),
+            started = now_ms()
+        ),
+    )
+    .unwrap();
 }
 
 /// Save a recipe and return its persisted JSON.
@@ -916,6 +934,66 @@ fn resume_id_precedence_scrape_over_capture_over_spawn() {
     );
 }
 
+/// Session ID precedence is capture file, live registry, then spawn-time pin.
+#[test]
+fn resume_id_precedence_registry_over_spawn_under_capture() {
+    let dir = scratch("registry_precedence");
+    let (bin, runtime, config) = (dir.join("bin"), dir.join("run"), dir.join("config"));
+    let (claude_home, done) = (dir.join("claude_home"), dir.join("done"));
+    install_script(
+        &bin,
+        "claude",
+        &format!(
+            "until [ -e '{d}' ]; do sleep 0.05; done",
+            d = done.display()
+        ),
+    );
+    let mut s = sup_ctx(agent_ctx_plus(
+        &bin,
+        &runtime,
+        dir.to_path_buf(),
+        &[
+            ("FLEETCOM_CONFIG_DIR", &config),
+            ("CLAUDE_CONFIG_DIR", &claude_home),
+        ],
+    ));
+    spawn(&mut s, "claude", dir.to_path_buf());
+    let injected = s.tasks[0]
+        .resume_id
+        .clone()
+        .expect("a fresh claude launch pins an id");
+    assert_ne!(injected.as_str(), CAP_ID);
+    // Key the registry fixture to the spawned task.
+    let pid = s.tasks[0].pid().expect("a live task has a pid");
+
+    install_status_record(&claude_home, pid, &dir, r#""status":"idle""#);
+    let text = save_and_read(&mut s, &config, "registry");
+    assert!(
+        text.contains(&format!("claude --resume '{CAP_ID}'")),
+        "the registry must beat the injected id; got {text}"
+    );
+    assert!(
+        !text.contains(&injected),
+        "the injected id must not survive the registry; got {text}"
+    );
+
+    // A capture-file ID outranks the registry ID.
+    let cap = s.tasks[0].capture_file.clone().expect("capture file set");
+    std::fs::write(
+        &cap,
+        format!(
+            r#"{{"session_id":"{CAP_OTHER}","hook_event_name":"SessionStart","source":"clear"}}"#
+        ),
+    )
+    .unwrap();
+    let text = save_and_read(&mut s, &config, "capture");
+    assert!(
+        text.contains(&format!("claude --resume '{CAP_OTHER}'")),
+        "the capture file must beat the registry; got {text}"
+    );
+    std::fs::write(&done, b"").unwrap();
+}
+
 /// A silent Codex task falls back to one matching rollout under
 /// `CODEX_HOME` when live channels produce no ID.
 #[test]
@@ -1364,4 +1442,115 @@ fn recovery_cadence_rewrites_on_capture_drift_and_skips_when_static() {
     );
     let names: Vec<_> = std::fs::read_dir(&rec).unwrap().flatten().collect();
     assert_eq!(names.len(), 1, "one incarnation owns one snapshot file");
+}
+
+// --- live registry blocked status --------------------------------------
+
+/// Tick until the sole task's preview satisfies `pred` or the budget expires,
+/// then return the last preview.
+fn tick_until_preview(
+    s: &mut Supervisor,
+    budget: Duration,
+    mut pred: impl FnMut(&Preview) -> bool,
+) -> Preview {
+    let mut last = None;
+    wait_until(budget, || {
+        s.tick();
+        for e in s.drain() {
+            if let Event::Tasks(v) = e
+                && let Some(t) = v.into_iter().next()
+            {
+                last = Some(t.preview);
+            }
+        }
+        last.as_ref().is_some_and(&mut pred)
+    });
+    last.expect("a Tasks snapshot must carry the task's preview")
+}
+
+/// A matching `waiting` record reaches the dashboard; non-waiting and post-exit
+/// records do not.
+#[test]
+fn registry_waiting_status_reaches_the_dashboard_preview() {
+    let dir = scratch("registry_blocked");
+    let (bin, runtime) = (dir.join("bin"), dir.join("run"));
+    let (claude_home, done) = (dir.join("claude_home"), dir.join("done"));
+    install_script(
+        &bin,
+        "claude",
+        &format!(
+            "until [ -e '{d}' ]; do sleep 0.05; done",
+            d = done.display()
+        ),
+    );
+    let mut s = sup_ctx(agent_ctx_plus(
+        &bin,
+        &runtime,
+        dir.to_path_buf(),
+        &[("CLAUDE_CONFIG_DIR", &claude_home)],
+    ));
+    spawn(&mut s, "claude", dir.to_path_buf());
+    // Key the record to the task's leader PID.
+    let pid = s.tasks[0].pid().expect("a live task has a pid");
+
+    // A non-waiting status must not anchor the preview.
+    install_status_record(&claude_home, pid, &dir, r#""status":"idle""#);
+    let p = tick_until_preview(&mut s, Duration::from_millis(750), |p| {
+        p.source == PreviewSource::Anchor
+    });
+    assert_ne!(
+        p.source,
+        PreviewSource::Anchor,
+        "a non-waiting record must not anchor the preview: {p:?}"
+    );
+
+    // A waiting status becomes an Anchor preview.
+    install_status_record(
+        &claude_home,
+        pid,
+        &dir,
+        r#""status":"waiting","waitingFor":"permission prompt""#,
+    );
+    let p = tick_until_preview(&mut s, Duration::from_secs(5), |p| {
+        p.source == PreviewSource::Anchor
+    });
+    assert_eq!(
+        (p.text.as_str(), p.source, p.rule),
+        (
+            "awaiting approval",
+            PreviewSource::Anchor,
+            Some("claude:registry-approval")
+        ),
+        "a waiting record must reach the dashboard as the anchor tier"
+    );
+
+    // After exit, a changed record must neither retain nor replace the cached
+    // blocked preview.
+    std::fs::write(&done, b"").unwrap();
+    assert!(
+        reap_until(&mut s, Duration::from_secs(5), |s| s.tasks[0]
+            .finished
+            .is_some()),
+        "the leader never exited"
+    );
+    install_status_record(
+        &claude_home,
+        pid,
+        &dir,
+        r#""status":"waiting","waitingFor":"dialog open""#,
+    );
+    let p = tick_until_preview(&mut s, Duration::from_secs(5), |p| {
+        p.text != "awaiting approval"
+    });
+    assert!(
+        p.text != "awaiting approval" && p.text != "dialog open",
+        "an exited leader must not render as blocked: {p:?}"
+    );
+    assert!(
+        claude_home
+            .join("sessions")
+            .join(format!("{pid}.json"))
+            .is_file(),
+        "the surviving record is the whole point of the case"
+    );
 }

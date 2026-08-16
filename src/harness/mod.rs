@@ -9,11 +9,10 @@
 //!
 //! # Security invariant
 //!
-//! Every ID returned by `parse_capture`, `scrape_exit`, or `correlate_fs`
-//! eventually enters a shell command. These methods must therefore return only
-//! strings accepted by [`is_uuid`]. Free-text names, paths, and malformed IDs
-//! yield `None`. Summary adapters are display-only and do not return session
-//! IDs.
+//! Every ID returned by `parse_capture`, `scrape_exit`, `live_session_id`, or
+//! `correlate_fs` eventually enters a shell command. These methods return only
+//! strings accepted by [`is_uuid`]; free text, paths, and malformed IDs yield
+//! `None`. Summary adapters and `live_blocked_status` are display-only.
 
 pub mod assets;
 mod claude;
@@ -23,7 +22,7 @@ pub mod summary;
 
 use std::{
     ffi::OsString,
-    fs::{self, File},
+    fs::File,
     io::Read,
     path::{Path, PathBuf},
     time::{Duration, SystemTime},
@@ -91,6 +90,32 @@ pub trait Harness: Sync {
 
     /// Extract a session ID from final terminal text, including scrollback.
     fn scrape_exit(&self, text: &str) -> Option<String>;
+
+    /// Read the current session ID from the tool's on-disk registry. `pid`,
+    /// `cwd`, and `spawned` identify the task; implementations must reject a
+    /// record that does not match all three. Defaults to `None`.
+    fn live_session_id(
+        &self,
+        _pid: u32,
+        _cwd: &Path,
+        _spawned: SystemTime,
+        _home: Option<&Path>,
+    ) -> Option<String> {
+        None
+    }
+
+    /// Read a matching registry record's blocked-on-user status as preview
+    /// text and a matcher ID. Return `None` for every non-blocked state and for
+    /// tools without a live status registry.
+    fn live_blocked_status(
+        &self,
+        _pid: u32,
+        _cwd: &Path,
+        _spawned: SystemTime,
+        _home: Option<&Path>,
+    ) -> Option<(String, &'static str)> {
+        None
+    }
 
     /// Find one session ID in the tool's on-disk store. Missing or ambiguous
     /// matches return `None`. `home` follows the `instrument` contract.
@@ -306,38 +331,9 @@ fn within_window(a: SystemTime, b: SystemTime) -> bool {
     }
 }
 
-/// Millisecond form of [`within_window`] for UUID-embedded timestamps.
+/// Epoch-millisecond form of [`within_window`].
 fn within_window_ms(a: u128, b: u128) -> bool {
     a.abs_diff(b) <= CORRELATE_WINDOW.as_millis()
-}
-
-/// Return the sole `candidate` in `dir` created within [`CORRELATE_WINDOW`]
-/// of `spawned`. `candidate` names an entry or skips it; entries without
-/// creation times cannot be correlated by window and are skipped too. Several
-/// in-window candidates cannot be told apart, and a stray non-uuid candidate
-/// still counts against uniqueness: both return `None`.
-fn unique_in_window(
-    dir: PathBuf,
-    spawned: SystemTime,
-    candidate: impl Fn(&fs::DirEntry) -> Option<String>,
-) -> Option<String> {
-    let mut candidates: Vec<String> = Vec::new();
-    for entry in fs::read_dir(dir).ok()?.flatten() {
-        let Some(name) = candidate(&entry) else {
-            continue;
-        };
-        let Ok(created) = entry.metadata().and_then(|m| m.created()) else {
-            continue;
-        };
-        if !within_window(created, spawned) {
-            continue;
-        }
-        candidates.push(name);
-    }
-    match candidates.as_slice() {
-        [only] if is_uuid(only) => Some(only.clone()),
-        _ => None,
-    }
 }
 
 /// Single-quote `s` for `$SHELL -c`, encoding embedded `'` as `'\''`.

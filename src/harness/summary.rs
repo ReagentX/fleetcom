@@ -118,13 +118,16 @@ impl SummaryAdapter for ClaudeSummary {
         claude_welcome_label(rows)
     }
 
-    /// Canonicalize a leading claude spinner or braille frame to `✻` so title
-    /// animation does not change the rendered text. Other titles pass through
-    /// unchanged.
+    /// Canonicalize a leading claude spinner, braille, or quadrant-circle
+    /// frame to `✻` so title animation does not change the rendered text.
+    /// Other titles pass through unchanged.
     fn normalize_title(&self, title: &str) -> Option<String> {
         let mut chars = title.chars();
         let frame = chars.next()?;
-        let framed = CLAUDE_SPINNER.contains(&frame) || ('\u{2800}'..='\u{28FF}').contains(&frame);
+        // Normalize the entire quadrant-circle block as one animation set.
+        let framed = CLAUDE_SPINNER.contains(&frame)
+            || ('\u{2800}'..='\u{28FF}').contains(&frame)
+            || ('\u{25D0}'..='\u{25D3}').contains(&frame);
         (framed && chars.next()? == ' ').then(|| format!("✻ {}", chars.as_str()))
     }
 }
@@ -267,6 +270,9 @@ fn claude_approval(rows: &[String]) -> Option<(String, &'static str)> {
         .then(|| ("awaiting approval".to_string(), "claude:approval-menu"))
 }
 
+/// Complete effort values accepted before a welcome-box ellipsis.
+const CLAUDE_EFFORT: &[&str] = &["low", "medium", "high", "xhigh", "max"];
+
 /// `Fable 5 with high effort` from the welcome box → `Fable 5 (high)`. The
 /// welcome box is the stable source; user-configurable statusline rows are not
 /// parsed. When the box scrolls away, the label is unavailable.
@@ -284,15 +290,25 @@ fn claude_welcome_label(rows: &[String]) -> Option<String> {
             continue;
         };
         let head = cell.trim().split(" · ").next().unwrap_or("");
-        if let Some(model_effort) = head.strip_suffix(" effort")
-            && let Some((model, effort)) = model_effort.rsplit_once(" with ")
-            && !model.is_empty()
-            && !effort.is_empty()
-        {
-            return Some(format!("{model} ({effort})"));
+        if let Some(label) = claude_model_effort(head) {
+            return Some(label);
         }
     }
     None
+}
+
+/// Normalize `<model> with <effort> effort` and its ellipsis form to
+/// `<model> (<effort>)`. The ellipsis form requires a complete
+/// [`CLAUDE_EFFORT`] value; a partial token returns `None`.
+fn claude_model_effort(head: &str) -> Option<String> {
+    let (model, effort) = match head.strip_suffix(" effort") {
+        Some(full) => full.rsplit_once(" with ")?,
+        None => {
+            let (model, effort) = head.strip_suffix('…')?.rsplit_once(" with ")?;
+            CLAUDE_EFFORT.contains(&effort).then_some((model, effort))?
+        }
+    };
+    (!model.is_empty() && !effort.is_empty()).then(|| format!("{model} ({effort})"))
 }
 
 // ----------------------------------------------------------------- codex --

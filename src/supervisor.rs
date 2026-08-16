@@ -134,9 +134,9 @@ fn fnv1a_hex(bytes: &[u8]) -> String {
     format!("{h:016x}")
 }
 
-/// Resolve the best session ID in precedence order: exit scrape, capture file,
-/// then spawn-time ID. Exit and capture data outrank the launch value because
-/// either can reflect a conversation selected later.
+/// Resolve the session ID in precedence order: exit scrape, capture file, live
+/// registry, then spawn-time ID. The first three can reflect a session selected
+/// after launch and therefore outrank the spawn-time value.
 fn current_resume_id(task: &Task) -> Option<String> {
     if let Some(id) = &task.scraped_id {
         return Some(id.clone());
@@ -144,6 +144,16 @@ fn current_resume_id(task: &Task) -> Option<String> {
     if let (Some(h), Some(path)) = (task.harness, &task.capture_file)
         && let Ok(payload) = std::fs::read_to_string(path)
         && let Some(id) = h.parse_capture(&payload)
+    {
+        return Some(id);
+    }
+    if let (Some(h), Some(pid)) = (task.harness, task.pid())
+        && let Some(id) = h.live_session_id(
+            pid,
+            &task.cwd,
+            task.spawned_at,
+            task.harness_home.as_deref(),
+        )
     {
         return Some(id);
     }

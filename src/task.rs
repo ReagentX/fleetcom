@@ -35,6 +35,11 @@ use crate::{
 /// input when a child stops reading.
 const MAX_PENDING_WRITE: usize = 16 * 1024 * 1024;
 
+/// Minimum interval between on-disk blocked-status probes for one task. Preview
+/// resolution runs every 8–200 ms; this caps each task at four registry probes
+/// per second.
+const BLOCKED_PROBE_INTERVAL: Duration = Duration::from_millis(250);
+
 /// A whole-message refusal from the bounded writer queue.
 #[derive(Debug)]
 pub struct WriteRefused {
@@ -100,8 +105,8 @@ pub struct Task {
     pub summary_adapter: Option<&'static dyn crate::preview::SummaryAdapter>,
     /// Run number used to give each rerun a distinct capture path.
     pub run: u32,
-    /// Session ID injected or recognized at spawn. Later capture data or an
-    /// exit hint can supersede it.
+    /// Session ID injected or recognized at spawn. Capture data, a live
+    /// registry record, or an exit hint can supersede it.
     pub resume_id: Option<String>,
     /// Capture path allocated for this task run.
     pub capture_file: Option<PathBuf>,
@@ -113,7 +118,11 @@ pub struct Task {
     /// Dashboard-preview resolution state; resets with the task on rerun
     /// because a rerun replaces the whole `Task`.
     preview: PreviewState,
-    /// Wall-clock spawn time used for filesystem correlation.
+    /// Cached blocked-on-user status from the harness registry.
+    blocked: Option<(String, &'static str)>,
+    /// Last registry probe time; `None` before the first probe.
+    blocked_probed: Option<Instant>,
+    /// Wall-clock spawn time used for registry and transcript correlation.
     pub spawned_at: SystemTime,
     exit_code: Option<i32>,
     pub started: Instant,
@@ -346,6 +355,8 @@ impl Task {
             scraped_id: None,
             scraped: false,
             preview: PreviewState::new(),
+            blocked: None,
+            blocked_probed: None,
             spawned_at: SystemTime::now(),
             exit_code: None,
             started: Instant::now(),
@@ -354,6 +365,11 @@ impl Task {
             kill_sent: false,
             reaped: false,
         })
+    }
+
+    /// Return the task's session-leader PID.
+    pub fn pid(&self) -> Option<u32> {
+        self.pid
     }
 
     /// Latch the exit code and finish time if the leader has exited, without
@@ -507,10 +523,35 @@ impl Task {
     /// the grid lock (see [`crate::preview`]). `now` is the caller's tick
     /// instant so every task in one snapshot resolves against the same clock.
     pub fn resolve_preview(&mut self, now: Instant) -> Preview {
+        self.refresh_blocked(now);
         let emu = grid(&self.parser);
+        let blocked = self.blocked.as_ref().map(|(text, rule)| (&**text, *rule));
         self.preview
-            .resolve(now, &*emu, self.summary_adapter)
+            .resolve(now, &*emu, self.summary_adapter, blocked)
             .clone()
+    }
+
+    /// Refresh the harness's blocked-on-user status at most once per
+    /// [`BLOCKED_PROBE_INTERVAL`]. Tasks without a harness or PID do not probe;
+    /// finished tasks clear the cached status.
+    fn refresh_blocked(&mut self, now: Instant) {
+        let (Some(h), Some(pid), None) = (self.harness, self.pid, self.finished) else {
+            self.blocked = None;
+            return;
+        };
+        if self
+            .blocked_probed
+            .is_some_and(|t| now.duration_since(t) < BLOCKED_PROBE_INTERVAL)
+        {
+            return;
+        }
+        self.blocked_probed = Some(now);
+        self.blocked = h.live_blocked_status(
+            pid,
+            &self.cwd,
+            self.spawned_at,
+            self.harness_home.as_deref(),
+        );
     }
 
     /// Freeze the preview once output is complete. Any open `?2026` frame is

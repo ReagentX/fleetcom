@@ -276,7 +276,7 @@ pub enum PreviewSource {
     Marker,
     /// The child's window title, honored only on the alternate screen.
     Title,
-    /// Normalized adapter output: the cascade's top tier.
+    /// The cascade's top tier: a normalized screen or registry status.
     Anchor,
 }
 
@@ -297,8 +297,8 @@ impl PreviewSource {
 pub struct Preview {
     pub text: String,
     pub source: PreviewSource,
-    /// Summary-adapter matcher ID for an Anchor preview; `None` for other
-    /// sources. Never encoded, so a wire-decoded view always carries `None`.
+    /// Matcher ID for an Anchor preview; `None` for other sources. This field
+    /// is not encoded, so a wire-decoded view always carries `None`.
     pub rule: Option<&'static str>,
     /// Whether the preview froze at output-complete and can no longer change.
     pub frozen: bool,

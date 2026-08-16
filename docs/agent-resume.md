@@ -11,7 +11,7 @@ Start a supported agent without flags:
 3. Press `w`, enter a session name, and press `Enter`. If the earlier sources produced no ID, the save also checks the agent's on-disk session store. A captured bare command becomes its canonical resume form, such as `claude --resume '<uuid>'`.
 4. Run `fleetcom <session>`, or press `o` in the dashboard, to start new processes from the saved commands. A stored resume command reopens its captured conversation.
 
-On a finished agent task, `r` uses the captured launch, hook, notifier, or exit ID without performing save-time filesystem correlation. The replacement keeps the task's ID, tag, group, and name. After a successful rewrite, the row shows the resume command because it has become the task's launch recipe; a [saved session](sessions.md) records the same string.
+On a finished agent task, `r` uses the captured launch, hook, notifier, registry, or exit ID without performing save-time filesystem correlation. A registry record remains eligible after exit if it is still present. The replacement keeps the task's ID, tag, group, and name. After a successful rewrite, the row shows the resume command because it has become the task's launch recipe; a [saved session](sessions.md) records the same string.
 
 Capture is best-effort and narrow by design. A command carrying a prompt, extra flags, or shell syntax stays opaque and saves verbatim. An accepted command with no available ID also saves unchanged. In both cases, loading the recipe reruns the original command.
 
@@ -52,6 +52,10 @@ A bare Claude command can accept an ID at launch. `fleetcom` therefore generates
 
 A canonical resume command already supplies its conversation ID, so adding a second ID would be incorrect; it receives only `--settings`. The overlay installs a `SessionStart` hook that copies its JSON payload into `FLEETCOM_CAPTURE_FILE`, from which the harness reads `session_id`.
 
+Claude also publishes one `<claude-home>/sessions/<pid>.json` record per session. `fleetcom` reads the direct path for the task leader's PID. When `$SHELL -c` leaves the shell as the task leader instead of replacing it with Claude, no matching record exists and the registry contributes no ID.
+
+A record counts only when its `kind` is `interactive` and its `pid`, `cwd`, and `startedAt` match the task. The PID must match the filename, the working directories must be identical or resolve to the same path, and the process start must fall within 30 seconds of the task spawn. Missing, malformed, or mismatched records contribute no evidence. The dashboard also maps a matching record's `waiting` status to the top tier of its [preview cascade](commands.md#peek); other statuses do not affect the preview.
+
 After the process exits and the PTY reader reaches EOF, the harness scans the retained terminal text for the last `claude --resume <uuid>` hint. Save-time filesystem correlation checks `<claude-home>/projects/<cwd-slug>/<uuid>.jsonl`, where the slug replaces `/` and `.` in the absolute working directory with `-`.
 
 ### `codex`
@@ -80,8 +84,11 @@ Several channels can identify different conversations during one task. To make t
 
 1. The exit hint scraped after process exit and PTY-reader EOF.
 2. The current capture-file payload.
-3. The ID pinned or targeted at spawn.
-4. Save-time filesystem correlation, when exactly one store entry matches the task and the 30-second spawn window.
+3. The live session registry, implemented by `claude`.
+4. The ID pinned or targeted at spawn.
+5. Save-time filesystem correlation, when exactly one store entry matches the task and the 30-second spawn window.
+
+The registry outranks the spawn pin because it can contain a session ID selected after launch, including one created by `/clear`. The capture file outranks the registry.
 
 Saving and rerunning rewrite accepted commands to one of these forms:
 
@@ -95,7 +102,7 @@ The program word is preserved as typed. If no valid ID is available, the origina
 
 ## Validation boundary
 
-Every captured value eventually enters a shell command, which makes validation the security boundary. Accepted IDs contain exactly lowercase hexadecimal characters in the `8-4-4-4-12` UUID shape. Capture payloads, terminal hints, store names, and the final command builder all apply the same check. Malformed values are ignored rather than interpolated.
+Every captured value eventually enters a shell command, which makes validation the security boundary. Accepted IDs contain exactly lowercase hexadecimal characters in the `8-4-4-4-12` UUID shape. Capture payloads, terminal hints, registry records, store names, and the final command builder all apply the same check. Malformed values are ignored rather than interpolated.
 
 ## Extending capture
 
@@ -105,6 +112,8 @@ Each tool implements the `Harness` trait in [`src/harness/mod.rs`](../src/harnes
 - `instrument` returns spawn-time arguments, environment entries, and an optional pinned ID.
 - `parse_capture` reads an ID from hook or notify JSON.
 - `scrape_exit` reads an ID from retained terminal text.
+- `live_session_id` reads the ID a live session publishes on disk. It defaults to `None` for tools that publish no registry.
+- `live_blocked_status` reads that same registry for one display fact: whether the tool says it is blocked on the user. It returns preview text, never an ID, and defaults to `None`.
 - `correlate_fs` finds one matching on-disk session.
 
 The supervisor resolves each harness home from the task's launch environment: the tool-specific variable first, then `$HOME` plus the tool's dot directory. That resolved path remains attached to the task for later filesystem correlation.
@@ -116,6 +125,6 @@ The supervisor resolves each harness home from the task's launch environment: th
 | `FLEETCOM_RUNTIME_DIR` | Explicit capture-asset root as well as the daemon runtime override. |
 | `FLEETCOM_CAPTURE_FILE` | Per-run capture file used by the injected hook or notifier. |
 | `FLEETCOM_NOTIFY_CHAIN` | Newline-joined argv for the configured Codex notifier; empty when none is active. |
-| `CLAUDE_CONFIG_DIR` | Claude home used for transcript correlation; defaults to `$HOME/.claude`. |
+| `CLAUDE_CONFIG_DIR` | Claude home holding the `sessions/<pid>.json` registry and the transcripts used for correlation; defaults to `$HOME/.claude`. |
 | `CODEX_HOME` | Codex home used for notify routing and rollout correlation; defaults to `$HOME/.codex`. |
 | `GROK_HOME` | Grok home used for session-directory correlation; defaults to `$HOME/.grok`. |
