@@ -17,7 +17,9 @@
 //!    box) and limits status candidates relative to it;
 //! 2. returns `None` when the expected structure is absent or inconsistent;
 //! 3. matches row prefixes so status rows truncated with an ellipsis at narrow
-//!    widths remain recognizable. A wrapped row fails the structural check.
+//!    widths remain recognizable (omp instead requires its interrupt-hint
+//!    suffix intact: it truncates the phrase itself and keeps the hint
+//!    painted). A wrapped row fails the structural check.
 //!
 //! Normalization removes spinner glyphs, elapsed counters, throughput data,
 //! and key hints while preserving the CLI's status text. The only synthesized

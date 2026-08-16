@@ -157,7 +157,9 @@ fn record_for_pid(
     let rec = parse_record(&text)?;
     let spawned_ms = spawned.duration_since(UNIX_EPOCH).ok()?.as_millis();
     // Accept the task's literal path or its canonical form; reject a failed
-    // canonicalization unless the literal paths already match.
+    // canonicalization unless the literal paths already match. The record
+    // side is `process.cwd()`, already resolved, so canonicalizing it (omp's
+    // third comparison, forced by its rewritten header path) buys nothing.
     let same_cwd = rec.cwd == cwd || cwd.canonicalize().is_ok_and(|c| rec.cwd == c);
     (rec.pid == pid && same_cwd && within_window_ms(rec.started_at, spawned_ms)).then_some(rec)
 }
