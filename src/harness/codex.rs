@@ -89,15 +89,11 @@ impl Harness for Codex {
         let mut last = None;
         for line in text.lines() {
             // Fatal exit with no hint: codex `println!`s a bare
-            // `Session ID: <uuid>`, the last channel left once the notify hook
-            // has not fired and the rollout may be empty. Only a whole row
-            // counts. The phrase carries no program word to narrow it, so an
-            // unanchored match would let any scrollback line quoting it decide
-            // the resume ID of a task killed before codex printed an exit line
-            // at all — a wrong ID where the fall through to `correlate_fs`
-            // would have been provenance-checked. Rendered model output always
-            // carries a `• ` head or a two-space continuation indent, so it
-            // cannot reach offset 0.
+            // `Session ID: <uuid>`, the last channel left once the notify
+            // hook has not fired and the rollout may be empty. The phrase
+            // carries no program word to narrow it, so only a whole row at
+            // offset 0 counts: rendered model output always carries a `• `
+            // head or a two-space continuation indent and never reaches it.
             if let Some(rest) = line.strip_prefix("Session ID: ")
                 && let Some(id) = leading_uuid(rest)
             {

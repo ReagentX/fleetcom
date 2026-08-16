@@ -80,6 +80,8 @@ pub trait SummaryAdapter: Sync {
 
     /// Optionally normalize a captured title for display. Emulator title
     /// capture remains program-agnostic; `None` renders the title verbatim.
+    /// Adapters fold animation frames to a per-CLI glyph, so a normalized
+    /// title still names the agent that painted it.
     fn normalize_title(&self, _title: &str) -> Option<String> {
         None
     }

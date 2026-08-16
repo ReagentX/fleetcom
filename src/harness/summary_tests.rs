@@ -505,10 +505,6 @@ fn codex_working_normalization() {
             "{row:?}"
         );
     }
-    assert_eq!(
-        CodexSummary.model_label(&rs(&tail[1..])),
-        Some("gpt-5.6-sol high".to_string())
-    );
 }
 
 /// The status line is a user-ordered item array, so the label reads either
@@ -739,7 +735,7 @@ fn codex_status_refuses_conversation_prose() {
 #[test]
 fn codex_composer_accepts_every_prompt_glyph() {
     let status = "• Working (3s • esc to interrupt)";
-    for glyph in ['›', '»', '!'] {
+    for glyph in CODEX_PROMPT {
         for composer in [glyph.to_string(), format!("{glyph} Write tests")] {
             assert_eq!(
                 CodexSummary.live_preview(&rs(&[status, "", &composer])),
@@ -913,18 +909,18 @@ fn codex_quoted_menu_with_a_live_composer_is_not_a_modal() {
     // Every prompt glyph suppresses: the modal selector is always `›`
     // whatever the composer renders, so a `»` or `!` composer below a
     // quoted menu is still a live composer and still disqualifies it.
-    for composer in ["›", "»", "!"] {
+    for glyph in CODEX_PROMPT {
         let quoted = rs(&[
             "• I found these options in the doc:",
             "",
             "› 1. Yes, proceed (y)",
             "  2. No, cancel (esc)",
             "",
-            composer,
+            &glyph.to_string(),
             "",
             "  gpt-5.6-sol high · 0 in · 0 out",
         ]);
-        assert_eq!(CodexSummary.live_preview(&quoted), None, "{composer}");
+        assert_eq!(CodexSummary.live_preview(&quoted), None, "{glyph}");
     }
 }
 

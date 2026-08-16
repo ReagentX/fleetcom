@@ -297,51 +297,6 @@ fn claude_welcome_label(rows: &[String]) -> Option<String> {
 
 // ----------------------------------------------------------------- codex --
 
-/// codex (inline UI, primary screen). The pin is its composer: the
-/// bottom-most column-0 prompt-glyph row that is not a modal selector;
-/// status rows sit above it, and scrollback beyond the first foreign row is
-/// out of bounds. The approval modal removes the composer and is checked
-/// first. A token bar or indented hint rows may appear below the composer.
-pub struct CodexSummary;
-
-impl SummaryAdapter for CodexSummary {
-    fn live_preview(&self, rows: &[String]) -> Option<(String, &'static str)> {
-        if let Some(hit) = codex_approval(rows) {
-            return Some(hit);
-        }
-        let composer = codex_composer(rows)?;
-        codex_status(rows, composer)
-    }
-
-    fn model_label(&self, rows: &[String]) -> Option<String> {
-        let row = codex_model_row(rows)?;
-        // `codex_model_row` guarantees a non-empty first segment.
-        Some(rows[row].trim().split(" · ").next()?.to_string())
-    }
-
-    /// Canonicalize codex's two title animations so the rendered text holds
-    /// still: the ten-frame braille spinner folds to `⠋`, and the blocked-on-
-    /// user blink folds its `[ . ] ` phase into `[ ! ] `. The preview's 500 ms
-    /// title hold damps neither. The spinner advances every 100 ms, so the hold
-    /// only thins its repaints to one per window rather than stopping them; the
-    /// blink holds each phase a full second, longer than the hold, so every
-    /// phase change reaches the dashboard. `[ ! ]` is the phase that reads as
-    /// an alarm, so it is the one worth freezing — and a title already in that
-    /// phase needs no rewrite, which is why only one phase is folded. `⠋` is
-    /// the spinner's first frame; claude normalizes to `✻` instead, and that
-    /// difference is what keeps the two agents' titles distinguishable on the
-    /// dashboard. Other titles pass through unchanged.
-    fn normalize_title(&self, title: &str) -> Option<String> {
-        if let Some(rest) = title.strip_prefix("[ . ] ") {
-            return Some(format!("[ ! ] {rest}"));
-        }
-        let mut chars = title.chars();
-        let frame = chars.next()?;
-        (('\u{2800}'..='\u{28FF}').contains(&frame) && chars.next()? == ' ')
-            .then(|| format!("⠋ {}", chars.as_str()))
-    }
-}
-
 /// Composer prompt glyphs: `!` in bash mode, `»` at `ultra` reasoning
 /// effort, `›` otherwise. All three render at column 0. Disabling input swaps
 /// whichever glyph the mode would paint for a dim `›`: the swap stays inside
@@ -380,6 +335,43 @@ const CODEX_EFFORT: &[&str] = &[
 /// depth, so counting them would push the status row out of reach.
 const CODEX_STATUS_WINDOW: usize = 10;
 
+/// codex (inline UI, primary screen). The pin is its composer: the
+/// bottom-most column-0 prompt-glyph row that is not a modal selector;
+/// status rows sit above it, and scrollback beyond the first foreign row is
+/// out of bounds. The approval modal removes the composer and is checked
+/// first. The status line or indented hint rows may appear below the composer.
+pub struct CodexSummary;
+
+impl SummaryAdapter for CodexSummary {
+    fn live_preview(&self, rows: &[String]) -> Option<(String, &'static str)> {
+        if let Some(hit) = codex_approval(rows) {
+            return Some(hit);
+        }
+        let composer = codex_composer(rows)?;
+        codex_status(rows, composer)
+    }
+
+    fn model_label(&self, rows: &[String]) -> Option<String> {
+        codex_model_label(rows)
+    }
+
+    /// Canonicalize codex's two title animations: the ten-frame braille
+    /// spinner folds to its first frame `⠋`, the blocked-on-user blink folds
+    /// its `[ . ] ` phase into `[ ! ] `. The preview's 500 ms title hold damps
+    /// neither — the spinner advances every 100 ms, the blink holds each phase
+    /// a full second. Only `[ . ] ` folds: `[ ! ]` reads as an alarm, and a
+    /// title already in that phase needs no rewrite. Others pass unchanged.
+    fn normalize_title(&self, title: &str) -> Option<String> {
+        if let Some(rest) = title.strip_prefix("[ . ] ") {
+            return Some(format!("[ ! ] {rest}"));
+        }
+        let mut chars = title.chars();
+        let frame = chars.next()?;
+        (('\u{2800}'..='\u{28FF}').contains(&frame) && chars.next()? == ' ')
+            .then(|| format!("⠋ {}", chars.as_str()))
+    }
+}
+
 /// `› 1. Yes, proceed (y)`: the modal's selected option row (column-0 `›`,
 /// one digit, `. `).
 fn codex_menu_head(row: &str) -> bool {
@@ -397,7 +389,7 @@ fn codex_numbered_option(row: &str) -> bool {
 
 /// codex's approval modal: a selector row with an indented numbered sibling
 /// below it, pinned to the last nine painted rows. The modal removes the
-/// composer and token bar; that absence is the disambiguator (a menu quoted
+/// composer and status line; that absence is the disambiguator (a menu quoted
 /// in the conversation always has the live composer below it, so any
 /// non-selector [`CODEX_PROMPT`] row under the selector suppresses the
 /// match). Suppression tests the glyph alone, without the composer's
@@ -416,10 +408,10 @@ fn codex_approval(rows: &[String]) -> Option<(String, &'static str)> {
         .then(|| ("awaiting approval".to_string(), "codex:approval-menu"))
 }
 
-/// The status line, when painted: the bottom-most row among the last six
-/// painted ones whose ` · `-joined items open with the model. Independent of
-/// the composer pin because the line is user-configured and may be absent —
-/// or may omit the model entirely, in which case there is no model prefix.
+/// The model label: the first ` · `-joined item of the bottom-most row among
+/// the last six painted ones whose items open with the model. The row is the
+/// status line, independent of the composer pin: it is user-configured and
+/// may be absent — or omit the model entirely, leaving no model prefix.
 ///
 /// Two shapes qualify, because the items are a `[tui] status_line` array the
 /// user orders and codex drops unavailable ones silently:
@@ -439,20 +431,20 @@ fn codex_approval(rows: &[String]) -> Option<(String, &'static str)> {
 /// is inside this window, so a user who has typed `ultra mode` otherwise
 /// paints a row that reads as `model-with-reasoning` and prefixes every
 /// preview with `› ultra mode · `.
-fn codex_model_row(rows: &[String]) -> Option<usize> {
+fn codex_model_label(rows: &[String]) -> Option<String> {
     let last = rows.iter().rposition(|r| !r.is_empty())?;
-    (last.saturating_sub(5)..=last).rev().find(|&i| {
+    (last.saturating_sub(5)..=last).rev().find_map(|i| {
         if !rows[i].starts_with(' ') {
-            return false;
+            return None;
         }
         let segs: Vec<&str> = rows[i].trim().split(" · ").collect();
         if segs[0].is_empty() {
-            return false;
+            return None;
         }
         let in_out = segs.len() >= 3
             && segs[segs.len() - 2].ends_with(" in")
             && segs[segs.len() - 1].ends_with(" out");
-        in_out || codex_model_with_reasoning(segs[0])
+        (in_out || codex_model_with_reasoning(segs[0])).then(|| segs[0].to_string())
     })
 }
 
@@ -474,8 +466,8 @@ fn codex_model_with_reasoning(item: &str) -> bool {
 /// The composer: the bottom-most column-0 [`CODEX_PROMPT`] row — the glyph
 /// alone or the glyph and a space — that is not a modal selector. Rows
 /// below it are tolerated, never required: blank rows, indented affordance
-/// hints (`tab to queue message`), or the token bar. The working layout can
-/// paint hints below the composer with no bar at all. Prompt echoes in
+/// hints (`tab to queue message`), or the status line. The working layout can
+/// paint hints below the composer with no status line at all. Prompt echoes in
 /// scrollback share the glyph but sit above the composer, so the
 /// bottom-most wins.
 fn codex_composer(rows: &[String]) -> Option<usize> {
