@@ -13,7 +13,7 @@ use std::{
 
 use super::{
     CAPTURE_ENV, CapturePaths, Harness, Invocation, SpawnPlan, is_uuid, last_hint, pin_plan,
-    shell_quote, unique_in_window, within_window_ms,
+    shell_quote, within_window, within_window_ms,
 };
 
 pub struct Claude;
@@ -200,6 +200,39 @@ fn record_for_pid(
     // a cwd matching neither form is still refused.
     let same_cwd = rec.cwd == cwd || cwd.canonicalize().is_ok_and(|c| rec.cwd == c);
     (rec.pid == pid && same_cwd && within_window_ms(rec.started_at, spawned_ms)).then_some(rec)
+}
+
+/// Return the sole `candidate` in `dir` created within [`super::CORRELATE_WINDOW`]
+/// of `spawned`. `candidate` names an entry or skips it; entries without
+/// creation times cannot be correlated by window and are skipped too. Several
+/// in-window candidates cannot be told apart, and a stray non-uuid candidate
+/// still counts against uniqueness: both return `None`.
+///
+/// Local to this harness because creation time is the only correlator claude's
+/// transcript store offers: every other harness reads an instant the tool
+/// recorded itself, out of a rollout header or a v7 UUID.
+fn unique_in_window(
+    dir: PathBuf,
+    spawned: SystemTime,
+    candidate: impl Fn(&fs::DirEntry) -> Option<String>,
+) -> Option<String> {
+    let mut candidates: Vec<String> = Vec::new();
+    for entry in fs::read_dir(dir).ok()?.flatten() {
+        let Some(name) = candidate(&entry) else {
+            continue;
+        };
+        let Ok(created) = entry.metadata().and_then(|m| m.created()) else {
+            continue;
+        };
+        if !within_window(created, spawned) {
+            continue;
+        }
+        candidates.push(name);
+    }
+    match candidates.as_slice() {
+        [only] if is_uuid(only) => Some(only.clone()),
+        _ => None,
+    }
 }
 
 /// Convert an absolute working directory to Claude's project slug by replacing

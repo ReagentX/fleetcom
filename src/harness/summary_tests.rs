@@ -319,7 +319,7 @@ fn claude_title_frames_canonicalize_to_constant_text() {
 /// registry reports `waiting` about a second before the dialog finishes
 /// painting, so the two disagree exactly while that repaint is in flight.
 #[test]
-fn a_registry_anchor_outranks_the_claude_spinner() {
+fn registry_anchor_outranks_the_claude_spinner() {
     let rule = "─".repeat(60);
     let screen = [
         "╭─── Claude Code v2.1.233 ────────────╮",

@@ -24,7 +24,7 @@ pub mod summary;
 
 use std::{
     ffi::OsString,
-    fs::{self, File},
+    fs::File,
     io::Read,
     path::{Path, PathBuf},
     time::{Duration, SystemTime},
@@ -355,38 +355,10 @@ fn within_window(a: SystemTime, b: SystemTime) -> bool {
     }
 }
 
-/// Millisecond form of [`within_window`] for UUID-embedded timestamps.
+/// Millisecond form of [`within_window`] for epoch-millisecond timestamps,
+/// whether a UUID embeds them or a session record states them outright.
 fn within_window_ms(a: u128, b: u128) -> bool {
     a.abs_diff(b) <= CORRELATE_WINDOW.as_millis()
-}
-
-/// Return the sole `candidate` in `dir` created within [`CORRELATE_WINDOW`]
-/// of `spawned`. `candidate` names an entry or skips it; entries without
-/// creation times cannot be correlated by window and are skipped too. Several
-/// in-window candidates cannot be told apart, and a stray non-uuid candidate
-/// still counts against uniqueness: both return `None`.
-fn unique_in_window(
-    dir: PathBuf,
-    spawned: SystemTime,
-    candidate: impl Fn(&fs::DirEntry) -> Option<String>,
-) -> Option<String> {
-    let mut candidates: Vec<String> = Vec::new();
-    for entry in fs::read_dir(dir).ok()?.flatten() {
-        let Some(name) = candidate(&entry) else {
-            continue;
-        };
-        let Ok(created) = entry.metadata().and_then(|m| m.created()) else {
-            continue;
-        };
-        if !within_window(created, spawned) {
-            continue;
-        }
-        candidates.push(name);
-    }
-    match candidates.as_slice() {
-        [only] if is_uuid(only) => Some(only.clone()),
-        _ => None,
-    }
 }
 
 /// Single-quote `s` for `$SHELL -c`, encoding embedded `'` as `'\''`.
