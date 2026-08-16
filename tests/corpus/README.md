@@ -18,7 +18,7 @@ feed the bytes to the emulator verbatim.
 | `claude_resume.bin` | `claude --session-id`: one prompt, reply, `/exit` | alternate-screen exit followed by the primary-screen resume hint (`claude --resume <uuid>`); the scrape target for harness exit capture |
 | `codex_resume.bin` | `codex resume` | top-anchored DECSTBM scroll regions (`CSI 1;N r`), reverse index, inline-TUI history insertion, and an SGR-split resume hint for harness exit capture |
 | `grok_resume.bin` | `grok --session-id`: one prompt, reply, `/exit` | primary-screen exit followed by the resume hint (`grok --resume <uuid>`); the scrape target for harness exit capture |
-| `omp_resume.bin` | `omp`: one launch, `/exit` | primary-screen exit followed by the resume hint (`omp --resume <uuid>`); the scrape target for harness exit capture. At 143 KB it dwarfs its neighbours: omp's welcome box paints a per-character truecolor gradient logo |
+| `omp_resume.bin` | `omp`: one launch, `/exit` | primary-screen exit followed by the resume hint (`omp --resume <uuid>`); the scrape target for harness exit capture |
 | `tmux_split.bin` | `tmux` session with two splits and one command per pane | scroll regions, pane borders, full redraws |
 | `vim_session.bin` | `vim -u NONE`: insert, navigate, `:set number`, `:q!` | alternate screen, cursor addressing, line editing |
 | `less_altscreen.bin` | `less` over `/usr/share/dict/words`: page, `G`, `g`, `q` | alternate-screen entry and exit, full-screen paging |

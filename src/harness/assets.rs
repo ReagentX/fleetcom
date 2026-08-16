@@ -58,12 +58,9 @@ set -- $FLEETCOM_NOTIFY_CHAIN "$1"
 exec "$@"
 "#;
 
-/// Extension module injected into `omp`. omp resolves the factory as
-/// `typeof module === "function" ? module : module.default`, so the default
-/// export is the subscription point. The module is imported, never executed,
-/// so it needs no executable bit. `session_switch` matters as much as
-/// `session_start`: the user can change session inside the TUI with `/resume`,
-/// and the capture must follow.
+/// Extension module loaded by `omp -e`. Its default export registers handlers
+/// for initial sessions and in-TUI session changes. omp imports the module, so
+/// the asset needs no executable bit.
 const OMP_CAPTURE_MODULE: &str = r#"import * as fs from "node:fs";
 
 function write(ctx, reason) {
@@ -207,7 +204,7 @@ impl CaptureAssets {
         fs::write(&codex_notify, CODEX_NOTIFY_SCRIPT)?;
         fs::set_permissions(&codex_notify, fs::Permissions::from_mode(0o700))?;
 
-        // omp imports this module; it never execs it, so it stays 0600.
+        // The module is imported, not executed.
         let omp_capture = dir.join("omp-capture.js");
         fs::write(&omp_capture, OMP_CAPTURE_MODULE)?;
         fs::set_permissions(&omp_capture, fs::Permissions::from_mode(0o600))?;

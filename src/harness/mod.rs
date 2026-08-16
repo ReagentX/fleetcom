@@ -53,18 +53,12 @@ pub trait Harness: Sync {
     /// resolves it from the launch context used for instrumentation or save.
     fn home_env_var(&self) -> &'static str;
 
-    /// The tool's store path relative to the launched process's `$HOME`. Most
-    /// tools name one dot directory; omp reaches its store three components
-    /// down, and `home_root`'s join keeps every one of them.
+    /// Default store path relative to the launched process's `$HOME`.
     fn home_dot_dir(&self) -> &'static str;
 
-    /// Resolve the tool's store root from the launch environment. `env` reads
-    /// one variable from that environment and returns `None` when it is unset;
-    /// an unset value and an empty one stay distinguishable, which omp's
-    /// resolution depends on. The default is the two-step rule every harness
-    /// but omp follows: the tool-specific override, else `$HOME` joined with
-    /// the dot directory. Neither step reaching a value returns `None` so the
-    /// harness can still apply its platform-home fallback in `home_root`.
+    /// Resolve the store root from the launch environment. The default uses
+    /// the tool-specific override, then `$HOME` plus [`Self::home_dot_dir`].
+    /// Returning `None` delegates to [`Self::home_root`]'s platform fallback.
     fn resolve_home(&self, env: &dyn Fn(&str) -> Option<PathBuf>) -> Option<PathBuf> {
         env(self.home_env_var()).or_else(|| Some(env("HOME")?.join(self.home_dot_dir())))
     }
@@ -200,7 +194,7 @@ impl Invocation {
 /// Capture paths allocated by [`assets::CaptureAssets::paths_for`].
 #[derive(Debug, Clone)]
 pub struct CapturePaths {
-    /// Per-run path available to an injected hook or notifier.
+    /// Per-run path available to an injected capture asset.
     pub capture_file: PathBuf,
     /// Additive settings file passed to `claude --settings`.
     pub claude_settings: PathBuf,
@@ -637,14 +631,10 @@ mod tests {
         assert_eq!(Claude.home_env_var(), "CLAUDE_CONFIG_DIR");
         assert_eq!(Codex.home_env_var(), "CODEX_HOME");
         assert_eq!(Grok.home_env_var(), "GROK_HOME");
-        // omp's "home" is its sessions root, and `PI_CODING_AGENT_SESSION_DIR`
-        // is the one variable that names it verbatim.
         assert_eq!(Omp.home_env_var(), "PI_CODING_AGENT_SESSION_DIR");
         assert_eq!(Claude.home_dot_dir(), ".claude");
         assert_eq!(Codex.home_dot_dir(), ".codex");
         assert_eq!(Grok.home_dot_dir(), ".grok");
-        // omp resolves to its sessions root, two levels below the config
-        // root; every component reaches `home_root`'s join.
         assert_eq!(Omp.home_dot_dir(), ".omp/agent/sessions");
     }
 

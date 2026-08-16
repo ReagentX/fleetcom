@@ -678,48 +678,26 @@ fn grok_border_label(row: &str) -> Option<String> {
 
 // ------------------------------------------------------------------- omp --
 
-/// Accepted omp spinner frames: the braille cycle `⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏`, taken as
-/// the whole braille block, which is what both anchoring presets paint. A
-/// frame alone never makes a row status; the bracketed interrupt hint on the
-/// same row does.
-///
-/// The ascii preset's `-\|/` are not accepted. They could only arrive on a
-/// screen whose box glyphs stayed unicode — a hand-mixed theme — because the
-/// ascii preset's own corners never anchor (see [`OmpSummary`]), and ordinary
-/// punctuation is too weak a signal to carry for that.
+/// Accept any braille code point as a spinner frame. The row still requires an
+/// interrupt hint, and ASCII punctuation is too weak to anchor safely.
 fn omp_frame(c: char) -> bool {
     ('\u{2800}'..='\u{28FF}').contains(&c)
 }
 
-/// The interrupt hint closing omp's status row, one spelling per bracket
-/// theme: unicode and nerd. The inner word is always `esc`. The ascii `[esc]`
-/// is omitted for the same reason as the ascii frames: it is unreachable
-/// without a hand-mixed theme.
+/// Interrupt-hint suffixes accepted on an anchored status row.
 const OMP_HINTS: &[&str] = &["⟦esc⟧", "⟨esc⟩"];
 
-/// The marker on the selector's chosen row, one spelling per symbol preset:
-/// unicode, nerd (a private-use nerd-font codepoint), ascii. omp renders the
-/// row as `{nav.cursor} {label}`. Unlike the frames and the hint, `>` is
-/// reachable under the stock ascii preset — the selector is plain text and
-/// needs no box to anchor — and [`omp_approve_row`]'s exact match bounds what
-/// that costs.
+/// Selector cursors accepted by [`omp_approve_row`]. The exact remainder check
+/// prevents the ASCII `>` cursor from matching quoted prose.
 const OMP_CURSORS: &[&str] = &["❯", "\u{f054}", ">"];
 
-/// omp (inline UI, primary screen). The pin is its two-row input box: a
-/// `╭…╮` status border directly above the `╰…╯` row the user types on. The
-/// status row is the first painted row above that pair.
-/// The approval selector replaces the box outright, so the box's absence —
-/// not matcher order — is what separates a blocked task from a busy one:
-/// omp keeps animating the status row underneath the selector.
+/// omp inline-UI adapter. A two-row `╭…╮`/`╰…╯` input box anchors the nearest
+/// painted status row above it. The approval selector replaces the box, so its
+/// absence selects approval matching.
 ///
-/// Preset coverage: those corners are the unicode and nerd spellings, and
-/// nothing else anchors. The ascii preset draws every corner as `+` and the
-/// horizontal as `-`, which no test can tell from a table, rule, or diagram in
-/// the transcript, so the status row degrades to the floor tier there by
-/// design — a stale scrollback row reported as live status is the worse
-/// outcome. That is why the status matcher carries no ascii spellings at all.
-/// The selector is the exception: its shape is plain text and needs no box, so
-/// it still matches under ascii.
+/// Unicode box corners anchor status. ASCII `+` and `-` do not: transcript
+/// tables and rules use the same glyphs. The plain-text approval selector still
+/// matches under ASCII.
 pub struct OmpSummary;
 
 impl SummaryAdapter for OmpSummary {
@@ -731,20 +709,14 @@ impl SummaryAdapter for OmpSummary {
         }
     }
 
-    /// No label. omp's model text lives in its status line, a
-    /// user-configurable segment list — the same reason [`ClaudeSummary`]
-    /// reads the welcome box instead of the statusline. Observed values are
-    /// absolute paths to local model files, long enough to swamp the
-    /// preview on their own.
+    /// Model text is user-configurable status-line content, not a stable label.
     fn model_label(&self, _rows: &[String]) -> Option<String> {
         None
     }
 }
 
-/// omp's input box: the bottom-most `╰…╯` row whose immediately preceding
-/// row is a `╭…╮` border. Returns that border's index. Adjacency is the
-/// whole check, and it is what rejects the tool-call preview box: that box
-/// draws the same corners but fences a `│`-headed command row between them.
+/// Inspect the bottom-most `╰…╯` row and return its predecessor only when that
+/// row is a `╭…╮` border. Adjacency rejects preview boxes containing a command.
 fn omp_input_box(rows: &[String]) -> Option<usize> {
     let bottom = rows.iter().rposition(|r| {
         let t = r.trim();
@@ -779,10 +751,10 @@ fn omp_spinner_status(rows: &[String], top: usize) -> Option<(String, &'static s
 }
 
 /// omp's approval selector, reached only with the input box gone: an
-/// `Allow tool: {name}` head within six rows above the selected `Approve`
-/// row, and `Deny` as the next painted row below it, the selection pinned to
-/// the last nine painted rows. Prose quoting those words keeps the live input
-/// box below it and never reaches here.
+/// `Allow tool: {name}` head within six rows above the selected `Approve` row,
+/// and `Deny` as the next painted row below it. The selection must occupy one
+/// of the final nine rows. Prose quoted above a live input box never reaches
+/// this matcher.
 fn omp_approval(rows: &[String]) -> Option<(String, &'static str)> {
     let last = rows.iter().rposition(|r| !r.is_empty())?;
     let i = (last.saturating_sub(8)..=last).find(|&i| omp_approve_row(&rows[i]))?;

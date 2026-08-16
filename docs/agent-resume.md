@@ -82,23 +82,21 @@ After exit, the harness scans retained terminal text for the last `grok -r <uuid
 
 ### `omp`
 
-omp can pin no ID at launch: it ships no `--session-id`, and `--resume` rejects an ID that does not already exist, so a generated UUID would name a session the resume command could never reach. Both accepted forms therefore take the same injection, and neither carries a pinned ID:
+omp cannot pin an ID at launch: it has no `--session-id`, and `--resume` requires an existing session. Both accepted forms therefore receive the same injection and no pinned ID:
 
 ```text
 -e '<namespace>/omp-capture.js'
 ```
 
-That asset is a JavaScript module, and `-e` loads it into the agent's own process at startup, appending to the user's own extensions rather than replacing them. Its `session_start` and `session_switch` handlers write the session ID as JSON to `FLEETCOM_CAPTURE_FILE`; the harness reads `sessionId`. `session_switch` is what covers omp's in-TUI `/resume`, which changes the session ID of a process `fleetcom` has already launched.
+`-e` loads the JavaScript module into the agent process and appends it to the user's extensions. Its `session_start` and `session_switch` handlers write `sessionId` as JSON to `FLEETCOM_CAPTURE_FILE`. The second handler follows in-TUI `/resume` changes. Capture writes are best-effort: the module returns when the capture path is empty and ignores write errors.
 
-No other harness runs code inside the agent: Claude's asset is a settings file and Codex's is a shell script the agent execs after a turn. Two things bound that. The module no-ops when `FLEETCOM_CAPTURE_FILE` is unset or empty, and it swallows every error it raises; omp's own extension runner then calls each handler under a timeout inside a `catch`, reporting a throw to its extension error channel instead of propagating it. `--trusted-extension` fills the same slot and is never used: it is mutually exclusive with `-e` and replaces the user's entire extension discovery, omp's own bridges included.
-
-After exit, the harness scans retained terminal text for the last `omp --resume <uuid>` hint. omp prints it as `Resume this session with omp --resume <uuid>`, and a crash prints the same command inside a `[Recovery]` block, so one matcher reads both. That block carries one entry per live session, though — main first, then every subagent under its own agent ID — so a labelled entry counts only when its label is `Main`. A block naming no main session yields nothing: a subagent transcript lives below what omp's own resume lookup scans, so its ID cannot be resumed at all, and the capture file's ID is worth more. omp also resumes through `-r`, `--session`, and `-c`; those spellings stay opaque, because a command `fleetcom` cannot rewrite exactly is left verbatim.
+After exit, the harness scans retained terminal text for the last trusted `omp --resume <uuid>` hint. It accepts ordinary exit hints and `Main:` entries in `[Recovery]` blocks. Other labels identify subagent sessions that `omp --resume` cannot open, so they contribute no exit evidence. The aliases `-r`, `--session`, and `-c` remain opaque because `fleetcom` rewrites only the canonical form it detects exactly.
 
 Save-time filesystem correlation reads `<sessions root>/<encoded-cwd>/<iso-ts>_<uuid>.jsonl`, where the sessions root comes from omp's own variable chain rather than one home override; the [environment-variable table](#environment-variables) lists it. `PI_CODING_AGENT_SESSION_DIR` is the exception: omp passes that path straight through as the session file's parent and never computes a bucket, so the store is flat under it. The scan covers the root and one level below without inferring which layout is in play.
 
-Correlation does not reproduce the bucket name. omp encodes a working directory through three scopes — under `$HOME`, under the temporary directory, otherwise absolute — after realpath-canonicalizing the working directory, `$HOME`, and `$TMPDIR`, and it changed that scheme three times inside the 17.2.x line, each change shipping an on-disk migration. The scan enumerates the buckets instead and confirms the directory from the session header's own `cwd` field. That field is not simply the resolved path: on macOS omp strips a `/private` prefix when both forms resolve alike, which is the opposite of what canonicalizing produces, so the header is compared against the task's directory as given, as canonicalized, and canonicalized itself. A candidate must be the sole file whose UUIDv7 creation instant falls within the 30-second spawn window; an ID that is not v7 is skipped rather than dated from metadata omp did not write. Duplicate IDs collapse first, because omp's bucket-rename migration preserves the legacy entry on a filename collision and one session can therefore appear under two bucket names.
+Correlation enumerates buckets instead of deriving their names, then verifies each session header's `cwd` against the task path and its canonical target. A candidate must be the sole UUIDv7 session created within 30 seconds of task spawn. UUIDs found in multiple buckets count once.
 
-A session with no assistant message leaves no file at all, because omp holds it in memory until the model replies. Correlation therefore cannot find a just-launched session, and an empty bucket is ordinary rather than an error: a session with no reply has nothing worth resuming.
+An empty sessions root or bucket contributes no candidate.
 
 ## ID precedence
 
@@ -154,7 +152,7 @@ The supervisor supplies the launch environment and delegates the decision to `re
 | `GROK_HOME` | Grok home used for session-directory correlation; defaults to `$HOME/.grok`. |
 | `PI_CODING_AGENT_SESSION_DIR` | omp sessions root, used verbatim for correlation. The rest of omp's chain builds that path instead of naming it. |
 | `PI_CODING_AGENT_DIR` | omp agent directory, whose `sessions` subdirectory is the store. A selected profile ignores it. |
-| `PI_CONFIG_DIR` | omp config directory name under `$HOME`; defaults to `.omp`. An absolute value diverges from omp's own joining and correlation then finds nothing rather than the wrong session. |
+| `PI_CONFIG_DIR` | omp config directory under `$HOME`; defaults to `.omp`. Under `fleetcom`, an absolute value replaces `$HOME`. |
 | `OMP_PROFILE` | omp profile, read by presence: it selects a profile when non-empty and suppresses `PI_PROFILE` when empty. |
 | `PI_PROFILE` | omp profile used only when `OMP_PROFILE` is absent. A profile inserts `profiles/<name>` under the config directory. |
-| `XDG_DATA_HOME` | Redirects the still-default omp agent directory to `<value>/omp`, flattening the `agent/` level, and only when that directory already exists. |
+| `XDG_DATA_HOME` | Redirects the still-default omp agent directory to `<value>/omp`, flattening the `agent/` level, when that target already exists. |

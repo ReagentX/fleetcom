@@ -168,9 +168,7 @@ fn scrape_now(t: &mut Task) {
     t.scrape_exit_hint();
 }
 
-/// Resolve the harness home from the launch environment. The harness owns the
-/// rule and reads whichever variables it needs; the default is the
-/// tool-specific override followed by `$HOME/<tool dot directory>`.
+/// Resolve the harness store root from the task's launch environment.
 fn harness_home(env: &[(OsString, OsString)], h: &dyn harness::Harness) -> Option<PathBuf> {
     h.resolve_home(&|key| env_get(env, key).map(PathBuf::from))
 }

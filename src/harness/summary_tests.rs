@@ -1476,8 +1476,7 @@ fn corpus_non_agent_tuis_keep_their_tiers() {
 
 // -------------------------------------------------------------------- omp --
 
-/// Place transcript rows above an omp input box: the status border directly
-/// over the row the user types on, with no row between them.
+/// Place the provided rows above an adjacent two-row omp input box.
 fn omp_screen<S: AsRef<str>>(above: &[S]) -> Vec<String> {
     let mut rows: Vec<String> = above.iter().map(|s| s.as_ref().to_string()).collect();
     rows.push("╭── π  > ⬢ model · ◒ high > ◫ 12.2%/131K ▶──╮".to_string());
@@ -1492,8 +1491,7 @@ fn omp_selector(head: &str) -> Vec<String> {
     omp_selector_row(" ❯ Approve", head)
 }
 
-/// The same screen with the selected row written out, for the themed
-/// `nav.cursor` spellings and the near misses around them.
+/// Build an approval selector with a configurable selected row.
 fn omp_selector_row(approve: &str, head: &str) -> Vec<String> {
     let rule = "─".repeat(120);
     rs(&[
@@ -1530,8 +1528,7 @@ fn omp_status_row_extracts_the_intent_phrase() {
         probe(" ⠹ Working… ⟦esc⟧"),
         Some(("Working…".to_string(), "omp:spinner"))
     );
-    // The ascii spellings are refused outright: neither the frame nor the
-    // bracket can reach an anchoring screen without a hand-mixed theme.
+    // ASCII frames and hints do not satisfy the anchored status grammar.
     assert_eq!(probe(" - Working… [esc]"), None);
     assert_eq!(probe(" ⠹ Working… [esc]"), None);
     assert_eq!(
@@ -1610,7 +1607,7 @@ fn omp_approval_requires_the_selector_shape() {
     let lone = rs(&[" Allow tool: bash", "", " ❯ Approve", "", " esc cancel"]);
     assert_eq!(OmpSummary.live_preview(&lone), None);
 
-    // The selection must sit in the bottom of the painted rows.
+    // The selection must occupy one of the final nine rows.
     let mut buried = omp_selector(" Allow tool: bash");
     buried.extend(std::iter::repeat_n(" tool output".to_string(), 6));
     assert_eq!(OmpSummary.live_preview(&buried), None);
@@ -1622,10 +1619,7 @@ fn omp_approval_requires_the_selector_shape() {
     assert_eq!(OmpSummary.live_preview(&omp_screen(&quoted)), None);
 }
 
-/// The marker on the selected row is omp's themed `nav.cursor`: `❯` under
-/// unicode, a private-use glyph under nerd, `>` under ascii. Every spelling
-/// has to read as blocked — a missed one leaves the task advertising a working
-/// status while it sits waiting on the user.
+/// Every supported selector cursor reports a blocked task.
 #[test]
 fn omp_approval_accepts_every_cursor_preset() {
     for cursor in ['❯', '\u{f054}', '>'] {
@@ -1649,11 +1643,8 @@ fn omp_approval_accepts_every_cursor_preset() {
     }
 }
 
-/// The ascii preset cannot anchor and is not meant to: its box corners are `+`
-/// and its horizontal `-`, which no test tells apart from a table or a rule,
-/// so the status row degrades to the floor tier rather than risk reporting a
-/// scrollback row as live. Its status row carries no ascii spelling either, so
-/// this screen fails both checks at once — the box is what the test pins.
+/// ASCII box glyphs are indistinguishable from transcript tables and rules, so
+/// they do not anchor status and the preview falls through to the floor tier.
 #[test]
 fn omp_ascii_box_glyphs_do_not_anchor() {
     let ascii_box = rs(&[
@@ -1665,9 +1656,8 @@ fn omp_ascii_box_glyphs_do_not_anchor() {
     assert_eq!(OmpSummary.live_preview(&ascii_box), None);
 }
 
-/// omp corpus replay at capture geometry (40×120): exact status text,
-/// Anchor provenance, and the matcher id. Kept in its own table so the omp
-/// and codex fixture sets can land independently.
+/// omp corpus replay at capture geometry (40×120): exact status text, Anchor
+/// provenance, and matcher ID.
 #[test]
 fn corpus_omp_states_anchor_exactly() {
     for (name, bytes, want) in [
