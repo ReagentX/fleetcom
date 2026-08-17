@@ -638,7 +638,8 @@ mod tests {
 
     #[test]
     fn home_env_vars_name_each_tools_override() {
-        // (env var, dot dir) per harness, in AGENTS order.
+        // Expected environment override and default directory for each
+        // `AGENTS` entry, in the same order.
         const OVERRIDES: [(&str, &str); 4] = [
             ("CLAUDE_CONFIG_DIR", ".claude"),
             ("CODEX_HOME", ".codex"),
@@ -659,8 +660,8 @@ mod tests {
 
     #[test]
     fn registry_detect_routes_to_the_matching_harness() {
-        // The test enumerates each harness by hand: this canary turns a
-        // silently-passing fifth harness into a failure naming this test.
+        // The literal count keeps this hand-written routing coverage aligned
+        // with `AGENTS`.
         assert_eq!(AGENTS.len(), 4, "route the new harness's command here");
         let (h, inv) = detect("claude").unwrap();
         assert_eq!(h.home_dot_dir(), ".claude");

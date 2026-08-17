@@ -155,13 +155,13 @@ fn record_for_pid(
     (rec.pid == pid && same_cwd && within_window_ms(rec.started_at, spawned_ms)).then_some(rec)
 }
 
-/// Return the stem of the sole `.jsonl` transcript in `dir` created within
-/// [`super::CORRELATE_WINDOW`] of `spawned`. Missing creation times, multiple
-/// candidates, and a sole invalid UUID return `None`.
+/// Return the UUID stem of the sole `.jsonl` transcript created within
+/// [`super::CORRELATE_WINDOW`] of `spawned`. Unreadable entries and creation
+/// times are ignored; directory errors, zero or multiple candidates, and an
+/// invalid sole stem return `None`.
 fn unique_in_window(dir: PathBuf, spawned: SystemTime) -> Option<String> {
     let mut candidates: Vec<String> = Vec::new();
     for entry in fs::read_dir(dir).ok()?.flatten() {
-        // A transcript's stem is its session ID.
         let path = entry.path();
         if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
             continue;

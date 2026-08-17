@@ -20,8 +20,7 @@ fn claude_screen<S: AsRef<str>>(above: &[S]) -> Vec<String> {
     rows
 }
 
-/// Place the provided rows above grok's three-row bordered input box; the
-/// footer carries the `Grok 4.5 (xhigh)` model label.
+/// Append Grok's three-row input box, including its model label, to `above`.
 fn grok_screen<S: AsRef<str>>(above: &[S]) -> Vec<String> {
     let mut rows: Vec<String> = above.iter().map(|s| s.as_ref().to_string()).collect();
     rows.push("  ╭──────────────────────╮".to_string());
@@ -94,8 +93,8 @@ fn select_covers_every_registered_shape() {
 /// adapter fires that CLI's rule on that CLI's screen shape.
 #[test]
 fn select_routes_to_the_matching_adapter() {
-    // The test enumerates each CLI's screen by hand: this canary turns a
-    // silently-passing fifth adapter into a failure naming this test.
+    // The literal count keeps this hand-written routing coverage aligned with
+    // the registered adapters.
     assert_eq!(
         crate::harness::AGENTS.len(),
         4,
@@ -1506,8 +1505,8 @@ fn corpus_positive_states_anchor_exactly() {
             "omp:approval-menu",
         ),
     ];
-    // Fixture names embed the program word, so this canary forces every
-    // registered harness to pin at least one positive screen here.
+    // Fixture names start with the program word: require a positive case for
+    // every registered harness.
     for a in crate::harness::AGENTS {
         let program = a.harness.shape().0;
         let prefix = format!("preview_{program}_");

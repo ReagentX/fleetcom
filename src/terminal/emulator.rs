@@ -580,10 +580,9 @@ fn live_floor_of(term: &Term<ProbeSink>) -> String {
 /// Append a grid row's glyphs, omitting wide-character spacers, mapping tabs
 /// to spaces, and preserving combining marks. Callers handle trailing spaces.
 ///
-/// Deliberately diverges from [`crate::ansi::contents`]: concealed (SGR 8)
-/// cells and orphaned wide halves keep their glyphs here because every caller
-/// feeds scan input to harness matchers, while `contents` blanks them for
-/// display parity with the replayed screen.
+/// Unlike [`crate::ansi::contents`], this scan view preserves glyphs in
+/// concealed (SGR 8) cells and orphaned wide halves. Harness matchers inspect
+/// stored grid text, not replay-equivalent display text.
 fn push_row_glyphs(out: &mut String, row: &Row<Cell>) {
     for cell in row {
         if cell

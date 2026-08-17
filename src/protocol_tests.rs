@@ -2,12 +2,11 @@ use super::*;
 
 /// Every command survives encode→frame-payload→decode unchanged, including
 /// the `Watch{None}` null, raw `Input` bytes (0 and 255), and the no-field
-/// `Shutdown`. Also the exhaustiveness gate for `Command`: encode is a
-/// compiler-exhaustive match, but decode's string match falls through to
-/// `None`, so a variant missing its decode arm would ship encoding fine and
-/// silently drop on decode. `variant_index` makes a new variant a compile
-/// error here until it gains an arm, and the coverage assert fails until a
-/// case round-trips it — which is what catches the forgotten decode arm.
+/// `Shutdown`.
+///
+/// `variant_index` exhaustively matches `Command`, and `seen` verifies that
+/// `cases` covers every arm. This guards `decode_command`, whose unknown-tag
+/// fallback prevents the compiler from detecting an omitted decode arm.
 #[test]
 fn command_round_trips() {
     let cases = [
@@ -147,7 +146,8 @@ fn command_round_trips() {
         Command::ListSessions,
         Command::Shutdown,
     ];
-    // No `_` arm: adding a `Command` variant breaks compilation right here.
+    // Keep this match exhaustive: `seen` then proves that `cases` covers every
+    // arm.
     fn variant_index(c: &Command) -> usize {
         match c {
             Command::Spawn { .. } => 0,

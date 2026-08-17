@@ -577,10 +577,8 @@ fn semantic_dec_scrollregion_charset_translation() {
     assert_eq!(al.grid().cursor.point, Point::new(Line(39), Column(0)));
 }
 
-/// Compare the [`emulator::Emulator`] wrapper and the raw backend on one
-/// fixture: screen, cursor, and alternate-screen mode must match.
-///
-/// [`emulator::Emulator`]: crate::emulator::Emulator
+/// Assert identical screen text, cursor state, and alternate-screen mode for
+/// one fixture replayed through [`crate::emulator::Emulator`] and a raw `Term`.
 fn assert_wrapper_matches(file: &str, bytes: &[u8]) {
     let al = alacritty(bytes);
     let mut emu = crate::testutil::corpus_emulator();

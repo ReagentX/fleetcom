@@ -173,10 +173,9 @@ fn harness_home(env: &[(OsString, OsString)], h: &dyn harness::Harness) -> Optio
     h.resolve_home(&|key| env_get(env, key).map(PathBuf::from))
 }
 
-/// Whether applying `cmd` can change the session recipe: `session_config`
-/// serializes each task's command, group, name, and cwd, nothing else. The
-/// match is exhaustive so a new recipe-affecting variant fails compilation
-/// here instead of silently skipping recovery arming.
+/// Whether `cmd` may change the task set or fields serialized by
+/// `session_config`. Exhaustive matching requires every command variant to
+/// declare its recovery effect.
 fn affects_recipe(cmd: &Command) -> bool {
     match cmd {
         Command::Spawn { .. }
@@ -186,8 +185,9 @@ fn affects_recipe(cmd: &Command) -> bool {
         | Command::SetName { .. }
         | Command::LoadSession { .. }
         | Command::LoadRecovery { .. } => true,
-        // Kill changes lifecycle and Tag flips the in-use flag — neither is
-        // serialized; the rest never touch a task's recipe fields.
+        // `Kill` changes lifecycle and `Tag` changes dashboard state; neither
+        // changes the task set or serialized fields. The remaining variants
+        // also leave the recipe unchanged.
         Command::Kill { .. }
         | Command::Tag { .. }
         | Command::Resize { .. }
@@ -918,8 +918,8 @@ impl Supervisor {
     /// Build `{dir: [entries]}` in spawn order. Groups and names remain intact;
     /// agent entries use the command returned by `recipe_command`.
     fn session_config(&self) -> SessionConfig {
-        // Ascending by construction: `admit` pushes under a monotonic
-        // `next_id`, and `rerun` replaces in place under the same id.
+        // `admit` appends monotonic IDs; `rerun` preserves both index and ID;
+        // removal preserves relative order.
         debug_assert!(
             self.tasks.is_sorted_by_key(|t| t.id),
             "task set left id order"
