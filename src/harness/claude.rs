@@ -85,14 +85,7 @@ impl Harness for Claude {
 
     fn correlate_fs(&self, cwd: &Path, spawned: SystemTime, home: Option<&Path>) -> Option<String> {
         let dir = self.home_root(home)?.join("projects").join(slug(cwd)?);
-        unique_in_window(dir, spawned, |entry| {
-            // A transcript's stem is its session ID.
-            let path = entry.path();
-            if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
-                return None;
-            }
-            Some(path.file_stem()?.to_str()?.to_string())
-        })
+        unique_in_window(dir, spawned)
     }
 }
 
@@ -162,17 +155,18 @@ fn record_for_pid(
     (rec.pid == pid && same_cwd && within_window_ms(rec.started_at, spawned_ms)).then_some(rec)
 }
 
-/// Return the sole candidate created within [`super::CORRELATE_WINDOW`] of
-/// `spawned`. Missing creation times, multiple candidates, and a sole invalid
-/// UUID return `None`.
-fn unique_in_window(
-    dir: PathBuf,
-    spawned: SystemTime,
-    candidate: impl Fn(&fs::DirEntry) -> Option<String>,
-) -> Option<String> {
+/// Return the UUID stem of the sole `.jsonl` transcript created within
+/// [`super::CORRELATE_WINDOW`] of `spawned`. Unreadable entries and creation
+/// times are ignored; directory errors, zero or multiple candidates, and an
+/// invalid sole stem return `None`.
+fn unique_in_window(dir: PathBuf, spawned: SystemTime) -> Option<String> {
     let mut candidates: Vec<String> = Vec::new();
     for entry in fs::read_dir(dir).ok()?.flatten() {
-        let Some(name) = candidate(&entry) else {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+            continue;
+        }
+        let Some(name) = path.file_stem().and_then(|s| s.to_str()) else {
             continue;
         };
         let Ok(created) = entry.metadata().and_then(|m| m.created()) else {
@@ -181,7 +175,7 @@ fn unique_in_window(
         if !within_window(created, spawned) {
             continue;
         }
-        candidates.push(name);
+        candidates.push(name.to_string());
     }
     match candidates.as_slice() {
         [only] if is_uuid(only) => Some(only.clone()),

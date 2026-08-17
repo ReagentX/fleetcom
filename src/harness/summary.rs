@@ -7,6 +7,14 @@
 //! command. It is therefore outside the session-ID validation boundary in
 //! [`is_uuid`](super::is_uuid).
 //!
+//! # Title tiers
+//!
+//! Adapters also normalize terminal titles for the preview cascade's Title
+//! tiers. An alternate-screen title falls back to the sanitized captured title
+//! when normalization rejects it. A retained primary-screen title renders only
+//! when the adapter recognizes its shape because any inline program can replace
+//! the terminal title.
+//!
 //! # Anchor discipline
 //!
 //! Status-shaped text can also appear in scrollback or conversation content.

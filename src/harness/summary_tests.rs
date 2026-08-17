@@ -20,6 +20,15 @@ fn claude_screen<S: AsRef<str>>(above: &[S]) -> Vec<String> {
     rows
 }
 
+/// Append Grok's three-row input box, including its model label, to `above`.
+fn grok_screen<S: AsRef<str>>(above: &[S]) -> Vec<String> {
+    let mut rows: Vec<String> = above.iter().map(|s| s.as_ref().to_string()).collect();
+    rows.push("  ╭──────────────────────╮".to_string());
+    rows.push("  │ ❯                    │".to_string());
+    rows.push("  ╰── Grok 4.5 (xhigh) · always-approve ─╯".to_string());
+    rows
+}
+
 /// Resolve a corpus fixture at 40 rows and return its text, source, and rule.
 fn corpus(
     bytes: &[u8],
@@ -84,6 +93,13 @@ fn select_covers_every_registered_shape() {
 /// adapter fires that CLI's rule on that CLI's screen shape.
 #[test]
 fn select_routes_to_the_matching_adapter() {
+    // The literal count keeps this hand-written routing coverage aligned with
+    // the registered adapters.
+    assert_eq!(
+        crate::harness::AGENTS.len(),
+        4,
+        "route the new adapter's screen here"
+    );
     let sep = "─".repeat(80);
     let claude = rs(&["✻ Hashing… (6s · ↓ 87 tokens)", &sep, "❯", &sep]);
     assert_eq!(
@@ -101,12 +117,9 @@ fn select_routes_to_the_matching_adapter() {
         select("codex").unwrap().live_preview(&codex).unwrap().1,
         "codex:working"
     );
-    let grok = rs(&[
+    let grok = grok_screen(&[
         "    ⠼ Sleep 5 seconds then echo ok… 1.5s   2.8s ⇣14.2k [↓][stop]",
         "",
-        "  ╭──────────────────────╮",
-        "  │ ❯                    │",
-        "  ╰── Grok 4.5 (xhigh) · always-approve ─╯",
     ]);
     assert_eq!(
         select("grok").unwrap().live_preview(&grok).unwrap().1,
@@ -1045,16 +1058,7 @@ fn codex_requires_the_composer_pin() {
 /// longer durations included; free text above the box refuses.
 #[test]
 fn grok_status_shapes() {
-    let boxed = [
-        "  ╭──────────────────────╮",
-        "  │ ❯                    │",
-        "  ╰── Grok 4.5 (xhigh) · always-approve ─╯",
-    ];
-    let probe = |status: &str| {
-        let mut rows = vec![status, ""];
-        rows.extend(boxed);
-        GrokSummary.live_preview(&rs(&rows))
-    };
+    let probe = |status: &str| GrokSummary.live_preview(&grok_screen(&[status, ""]));
     assert_eq!(
         probe("    ⠼ Sleep 5 seconds then echo ok… 1.5s   2.8s ⇣14.2k [↓][stop]"),
         Some(("Sleep 5 seconds then echo ok…".to_string(), "grok:spinner"))
@@ -1077,10 +1081,8 @@ fn grok_status_shapes() {
         None
     );
 
-    let mut rows = vec!["    ⠋ Thinking… 0.2s", ""];
-    rows.extend(boxed);
     assert_eq!(
-        GrokSummary.model_label(&rs(&rows)),
+        GrokSummary.model_label(&grok_screen(&["    ⠋ Thinking… 0.2s", ""])),
         Some("Grok 4.5 (xhigh)".to_string())
     );
     // A plain border carries no label.
@@ -1093,16 +1095,7 @@ fn grok_status_shapes() {
 /// do not match. A closer Worked-for row wins: no upward scan.
 #[test]
 fn grok_still_running_shapes() {
-    let boxed = [
-        "  ╭──────────────────────╮",
-        "  │ ❯                    │",
-        "  ╰── Grok 4.5 (xhigh) · always-approve ─╯",
-    ];
-    let probe = |status: &str| {
-        let mut rows = vec![status, ""];
-        rows.extend(boxed);
-        GrokSummary.live_preview(&rs(&rows))
-    };
+    let probe = |status: &str| GrokSummary.live_preview(&grok_screen(&[status, ""]));
     assert_eq!(
         probe("    ◎ 1 subagent still running"),
         Some(("1 subagent still running".to_string(), "grok:still-running"))
@@ -1142,15 +1135,14 @@ fn grok_still_running_shapes() {
     }
 
     // The probe is a single row: Worked-for closer to the box wins.
-    let mut rows = vec![
+    let rows = grok_screen(&[
         "    ◎ 1 subagent still running",
         "",
         "     Worked for 8.7s",
         "",
-    ];
-    rows.extend(boxed);
+    ]);
     assert_eq!(
-        GrokSummary.live_preview(&rs(&rows)),
+        GrokSummary.live_preview(&rows),
         Some(("Worked for 8.7s".to_string(), "grok:worked"))
     );
 }
@@ -1513,6 +1505,16 @@ fn corpus_positive_states_anchor_exactly() {
             "omp:approval-menu",
         ),
     ];
+    // Fixture names start with the program word: require a positive case for
+    // every registered harness.
+    for a in crate::harness::AGENTS {
+        let program = a.harness.shape().0;
+        let prefix = format!("preview_{program}_");
+        assert!(
+            cases.iter().any(|Case(name, ..)| name.starts_with(&prefix)),
+            "a new adapter needs a positive corpus fixture named {prefix}*"
+        );
+    }
     for Case(name, bytes, adapter, text, rule) in cases {
         let got = corpus(bytes, adapter, 120);
         assert_eq!(got, anchor(text, rule), "{name}");

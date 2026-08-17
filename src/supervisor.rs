@@ -173,6 +173,36 @@ fn harness_home(env: &[(OsString, OsString)], h: &dyn harness::Harness) -> Optio
     h.resolve_home(&|key| env_get(env, key).map(PathBuf::from))
 }
 
+/// Whether `cmd` may change the task set or fields serialized by
+/// `session_config`. Exhaustive matching requires every command variant to
+/// declare its recovery effect.
+fn affects_recipe(cmd: &Command) -> bool {
+    match cmd {
+        Command::Spawn { .. }
+        | Command::Remove { .. }
+        | Command::Restart { .. }
+        | Command::SetGroup { .. }
+        | Command::SetName { .. }
+        | Command::LoadSession { .. }
+        | Command::LoadRecovery { .. } => true,
+        // `Kill` changes lifecycle and `Tag` changes dashboard state; neither
+        // changes the task set or serialized fields. The remaining variants
+        // also leave the recipe unchanged.
+        Command::Kill { .. }
+        | Command::Tag { .. }
+        | Command::Resize { .. }
+        | Command::Watch { .. }
+        | Command::Input { .. }
+        | Command::Paste { .. }
+        | Command::Mouse { .. }
+        | Command::Key { .. }
+        | Command::Scrollback { .. }
+        | Command::SaveSession { .. }
+        | Command::ListSessions
+        | Command::Shutdown => false,
+    }
+}
+
 /// State for automatic recovery snapshots. Write failures do not interrupt
 /// task supervision, and teardown does not write or delete snapshots.
 struct Recovery {
@@ -334,16 +364,7 @@ impl Supervisor {
     pub fn apply(&mut self, cmd: Command) {
         // Recipe-affecting command variants arm recovery before validation;
         // fingerprinting filters rejected commands and other no-ops.
-        if matches!(
-            &cmd,
-            Command::Spawn { .. }
-                | Command::Remove { .. }
-                | Command::Restart { .. }
-                | Command::SetGroup { .. }
-                | Command::SetName { .. }
-                | Command::LoadSession { .. }
-                | Command::LoadRecovery { .. }
-        ) {
+        if affects_recipe(&cmd) {
             self.recovery.dirty = true;
             self.recovery.last_mutation = Some(Instant::now());
         }
@@ -897,11 +918,14 @@ impl Supervisor {
     /// Build `{dir: [entries]}` in spawn order. Groups and names remain intact;
     /// agent entries use the command returned by `recipe_command`.
     fn session_config(&self) -> SessionConfig {
-        let mut order: Vec<usize> = (0..self.tasks.len()).collect();
-        order.sort_by_key(|&i| self.tasks[i].id);
+        // `admit` appends monotonic IDs; `rerun` preserves both index and ID;
+        // removal preserves relative order.
+        debug_assert!(
+            self.tasks.is_sorted_by_key(|t| t.id),
+            "task set left id order"
+        );
         let mut cfg = SessionConfig::new();
-        for &i in &order {
-            let t = &self.tasks[i];
+        for t in &self.tasks {
             cfg.entry(path::abbreviate(&t.cwd))
                 .or_default()
                 .push(SessionEntry {

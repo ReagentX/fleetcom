@@ -577,76 +577,45 @@ fn semantic_dec_scrollregion_charset_translation() {
     assert_eq!(al.grid().cursor.point, Point::new(Line(39), Column(0)));
 }
 
-/// Compare `ObservedTerm` and the raw backend across the corpus: screen,
-/// cursor, and alternate-screen mode must match.
-#[test]
-fn emulator_wrapper_matches_the_raw_backend_on_every_fixture() {
-    let fixtures: [(&str, &[u8]); 12] = [
-        (
-            "tmux_split",
-            include_bytes!("../../tests/corpus/tmux_split.bin"),
-        ),
-        (
-            "vim_session",
-            include_bytes!("../../tests/corpus/vim_session.bin"),
-        ),
-        (
-            "less_altscreen",
-            include_bytes!("../../tests/corpus/less_altscreen.bin"),
-        ),
-        (
-            "top_live",
-            include_bytes!("../../tests/corpus/top_live.bin"),
-        ),
-        (
-            "shell_colors",
-            include_bytes!("../../tests/corpus/shell_colors.bin"),
-        ),
-        (
-            "build_log",
-            include_bytes!("../../tests/corpus/build_log.bin"),
-        ),
-        (
-            "claude_resume",
-            include_bytes!("../../tests/corpus/claude_resume.bin"),
-        ),
-        (
-            "codex_resume",
-            include_bytes!("../../tests/corpus/codex_resume.bin"),
-        ),
-        (
-            "grok_resume",
-            include_bytes!("../../tests/corpus/grok_resume.bin"),
-        ),
-        (
-            "wide_emoji",
-            include_bytes!("../../tests/corpus/wide_emoji.bin"),
-        ),
-        (
-            "dec_scrollregion",
-            include_bytes!("../../tests/corpus/dec_scrollregion.bin"),
-        ),
-        (
-            "topregion_scroll",
-            include_bytes!("../../tests/corpus/topregion_scroll.bin"),
-        ),
-    ];
-    for (name, bytes) in fixtures {
-        let al = alacritty(bytes);
-        let mut emu = crate::testutil::corpus_emulator();
-        emu.process(bytes);
-        let (_, al_cursor, al_hidden) = ansi::formatted(&al);
-        let (_, emu_cursor, emu_hidden) = emu.formatted();
-        assert_eq!(emu.contents(), ansi::contents(&al), "{name}: screen");
-        assert_eq!(
-            (emu_cursor, emu_hidden),
-            (al_cursor, al_hidden),
-            "{name}: cursor"
-        );
-        assert_eq!(
-            emu.alternate_screen(),
-            al.mode().contains(TermMode::ALT_SCREEN),
-            "{name}: alt bit"
-        );
-    }
+/// Assert identical screen text, cursor state, and alternate-screen mode for
+/// one fixture replayed through [`crate::emulator::Emulator`] and a raw `Term`.
+fn assert_wrapper_matches(file: &str, bytes: &[u8]) {
+    let al = alacritty(bytes);
+    let mut emu = crate::testutil::corpus_emulator();
+    emu.process(bytes);
+    let (_, al_cursor, al_hidden) = ansi::formatted(&al);
+    let (_, emu_cursor, emu_hidden) = emu.formatted();
+    assert_eq!(emu.contents(), ansi::contents(&al), "{file}: screen");
+    assert_eq!(
+        (emu_cursor, emu_hidden),
+        (al_cursor, al_hidden),
+        "{file}: cursor"
+    );
+    assert_eq!(
+        emu.alternate_screen(),
+        al.mode().contains(TermMode::ALT_SCREEN),
+        "{file}: alt bit"
+    );
 }
+
+macro_rules! wrapper_oracle {
+    ($name:ident, $file:literal) => {
+        #[test]
+        fn $name() {
+            assert_wrapper_matches($file, include_bytes!(concat!("../../tests/corpus/", $file)));
+        }
+    };
+}
+
+wrapper_oracle!(wrapper_tmux_split, "tmux_split.bin");
+wrapper_oracle!(wrapper_vim_session, "vim_session.bin");
+wrapper_oracle!(wrapper_less_altscreen, "less_altscreen.bin");
+wrapper_oracle!(wrapper_top_live, "top_live.bin");
+wrapper_oracle!(wrapper_shell_colors, "shell_colors.bin");
+wrapper_oracle!(wrapper_build_log, "build_log.bin");
+wrapper_oracle!(wrapper_claude_resume, "claude_resume.bin");
+wrapper_oracle!(wrapper_codex_resume, "codex_resume.bin");
+wrapper_oracle!(wrapper_grok_resume, "grok_resume.bin");
+wrapper_oracle!(wrapper_wide_emoji, "wide_emoji.bin");
+wrapper_oracle!(wrapper_dec_scrollregion, "dec_scrollregion.bin");
+wrapper_oracle!(wrapper_topregion_scroll, "topregion_scroll.bin");
