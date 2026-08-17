@@ -104,21 +104,42 @@ fn shift(code: KeyCode) -> KeyEvent {
     KeyEvent::new(code, KeyModifiers::SHIFT)
 }
 
+/// Minimal live task for injecting into `app.views` directly: carries the
+/// fields `sections`/`display_order` sort on (id, cwd, tagged, group) with
+/// everything else inert. Ordering tests use these instead of real children
+/// because a spawned child that exits mid-test re-buckets its row into
+/// Completed and breaks a fixed expected order under load.
+fn view(id: u64, cwd: PathBuf, tagged: bool, group: Option<&str>) -> TaskView {
+    TaskView {
+        id,
+        command: "true".to_string(),
+        cwd,
+        tagged,
+        group: group.map(str::to_string),
+        name: None,
+        lifecycle: Lifecycle::Active,
+        parked: false,
+        preview: Preview::floor(String::new()),
+        started_ago: Duration::ZERO,
+        quiet_ago: Some(Duration::ZERO),
+        finished_ago: None,
+    }
+}
+
 /// Selection is bound to a task id, so a reorder (here: tagging a task into
 /// the "In use" bucket) must not move the highlight to a different task.
 #[test]
 fn selection_follows_task_across_reorder() {
     let mut app = App::new_local(30, 100);
     let dir = app.invocation_dir.clone();
-    app.spawn_in("sleep 5", dir.clone()); // id 1
-    app.spawn_in("sleep 5", dir); // id 2
-    app.pump();
+    app.views = vec![view(1, dir.clone(), false, None), view(2, dir, false, None)];
     app.resolve_selection();
     assert_eq!(app.selected_id, Some(1));
 
-    // Tag id 2 -> it sorts into the "In use" bucket, ahead of id 1.
-    app.transport.send(Command::Tag { id: 2, on: true });
-    app.pump();
+    // Tag id 2 -> it sorts into the "In use" bucket, ahead of id 1. Mutated
+    // in place: the Tag round-trip is other tests' subject, and a pump would
+    // overwrite the injected views with the core's empty snapshot.
+    app.views[1].tagged = true;
 
     let order = app.display_order();
     assert_eq!(app.views[order[0]].id, 2, "tagged task should sort first");
@@ -134,9 +155,10 @@ fn selection_follows_task_across_reorder() {
 fn dir_mode_groups_by_cwd() {
     let mut app = App::new_local(30, 100);
     let inv = app.invocation_dir.clone();
-    app.spawn_in("sleep 5", inv); // id 1, invocation dir
-    app.spawn_in("sleep 5", PathBuf::from("/tmp")); // id 2, /tmp
-    app.pump();
+    app.views = vec![
+        view(1, inv, false, None),                   // invocation dir
+        view(2, PathBuf::from("/tmp"), false, None), // /tmp
+    ];
 
     app.group_mode = GroupMode::State;
     let s = app.sections();
@@ -2169,11 +2191,11 @@ fn find_palette_opens_on_slash_only_with_tasks() {
 fn find_candidates_follow_display_order() {
     let mut app = App::new_local(30, 100);
     let inv = app.invocation_dir.clone();
-    app.spawn_in("sleep 5", inv.clone()); // id 1
-    app.spawn_in("sleep 5", inv.clone()); // id 2
-    app.spawn_in("sleep 5", inv); // id 3
-    app.transport.send(Command::Tag { id: 3, on: true });
-    app.pump();
+    app.views = vec![
+        view(1, inv.clone(), false, None),
+        view(2, inv.clone(), false, None),
+        view(3, inv, true, None),
+    ];
     let order: Vec<u64> = app
         .display_order()
         .into_iter()
@@ -2191,9 +2213,10 @@ fn find_candidates_follow_display_order() {
 fn find_empty_input_lists_every_task() {
     let mut app = App::new_local(30, 100);
     let inv = app.invocation_dir.clone();
-    app.spawn_in("sleep 5", inv.clone()); // id 1
-    app.spawn_grouped("sleep 5", inv, "alpha"); // id 2
-    app.pump();
+    app.views = vec![
+        view(1, inv.clone(), false, None),
+        view(2, inv, false, Some("alpha")),
+    ];
     app.on_key_dashboard(key(KeyCode::Char('/')));
     assert_eq!(find_ids(&app), vec![1, 2]);
 
