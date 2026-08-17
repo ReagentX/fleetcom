@@ -17,7 +17,7 @@
 
 use std::{
     fs,
-    io::{self, ErrorKind, Read, Write},
+    io::{self, ErrorKind, Read, Seek, Write},
     net::Shutdown,
     os::unix::{
         fs::{DirBuilderExt, MetadataExt, PermissionsExt},
@@ -33,7 +33,7 @@ use std::{
         mpsc::channel,
     },
     thread,
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use nix::{
@@ -48,7 +48,7 @@ use crate::{
     path::FLEETCOM_RUNTIME_DIR,
     protocol::{
         Command, Event, LaunchContext, PROTOCOL_VERSION, decode_command, decode_event,
-        decode_hello, encode_command, encode_event, encode_hello, hello_version,
+        decode_hello, encode_event, encode_hello, hello_version,
     },
     supervisor::{self, Supervisor},
 };
@@ -367,12 +367,18 @@ fn no_daemon() -> io::Result<()> {
 /// `--kill` must work while someone else is attached. The pid comes from the
 /// lock file (trustworthy while the flock is held: the holder wrote it), and
 /// daemon exit releases the flock, so acquiring it is the completion signal.
-/// A no-op (with a message) if no daemon is running.
+/// A no-op (with a message) if no daemon is running. A held flock with no
+/// readable pid is a daemon mid-startup: that is an error, never the no-op,
+/// because someone provably holds the lock.
 pub fn run_kill() -> io::Result<()> {
-    let dir = runtime_dir();
+    run_kill_in(&runtime_dir())
+}
+
+/// `run_kill` against an explicit runtime directory.
+fn run_kill_in(dir: &Path) -> io::Result<()> {
     // The lock PID is a signal target, and the socket receives the client's
     // environment, so validate the directory before reading either file.
-    ensure_runtime_dir(&dir)?;
+    ensure_runtime_dir(dir)?;
     let lock_path = dir.join("daemon.lock");
     let Ok(file) = fs::OpenOptions::new()
         .read(true)
@@ -387,13 +393,27 @@ pub fn run_kill() -> io::Result<()> {
         Err((file, _)) => file,
     };
 
-    let mut pid_str = String::new();
-    file.read_to_string(&mut pid_str)?;
-    let Some(pid) = crate::task::positive_pid(pid_str.trim()) else {
-        // Without a usable pid, fall back to a Shutdown frame over the socket.
-        // Bound the fallback because an attached client can keep the daemon
-        // from accepting this connection.
-        return kill_via_socket_at(&socket_path(), KILL_SOCKET_TIMEOUT);
+    // The flock is held, but the pid can be momentarily unreadable:
+    // `run_daemon` acquires the lock, then truncates and writes the pid, so
+    // the only held-lock window without one is those two syscalls. Poll the
+    // file briefly rather than guess.
+    let mut pid = None;
+    for _ in 0..20 {
+        let mut pid_str = String::new();
+        file.seek(io::SeekFrom::Start(0))?;
+        file.read_to_string(&mut pid_str)?;
+        pid = crate::task::positive_pid(pid_str.trim());
+        if pid.is_some() {
+            break;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    let Some(pid) = pid else {
+        return Err(io::Error::new(
+            ErrorKind::TimedOut,
+            "the daemon holds the lock but has not written its pid (it may \
+             still be starting); retry",
+        ));
     };
 
     // ESRCH means the daemon exited between the lock probe and here; the flock
@@ -417,93 +437,6 @@ pub fn run_kill() -> io::Result<()> {
         ErrorKind::TimedOut,
         "daemon did not exit after SIGTERM",
     ))
-}
-
-/// Timeout applied to blocking socket-fallback kill operations.
-const KILL_SOCKET_TIMEOUT: Duration = Duration::from_secs(10);
-
-/// Timeout reported when the socket-fallback kill exchange does not finish.
-fn kill_handshake_timeout() -> io::Error {
-    io::Error::new(
-        ErrorKind::TimedOut,
-        "the daemon is running but did not complete the kill handshake in \
-         time (another client may be attached); retry after it detaches, or \
-         send SIGTERM to the daemon process directly",
-    )
-}
-
-/// Set the read timeout to the remaining deadline budget.
-fn arm_read_deadline(s: &UnixStream, deadline: Instant) -> io::Result<()> {
-    let left = deadline.saturating_duration_since(Instant::now());
-    if left.is_zero() {
-        return Err(kill_handshake_timeout());
-    }
-    s.set_read_timeout(Some(left))
-}
-
-/// Convert either platform representation of a socket timeout into the
-/// kill-handshake timeout.
-fn deadline_mapped(e: io::Error) -> io::Error {
-    if is_timeout(&e) {
-        kill_handshake_timeout()
-    } else {
-        e
-    }
-}
-
-/// When the lock lacks a valid PID, send `Shutdown` over the socket and bound
-/// handshake and completion I/O by `budget`.
-fn kill_via_socket_at(path: &Path, budget: Duration) -> io::Result<()> {
-    match UnixStream::connect(path) {
-        Ok(mut s) => {
-            let (kind, payload) = encode_hello(&LaunchContext::here());
-            kill_exchange(&mut s, budget, kind, &payload)
-        }
-        Err(_) => no_daemon(),
-    }
-}
-
-/// Drive the bounded Shutdown exchange with a pre-encoded hello frame.
-fn kill_exchange(
-    s: &mut UnixStream,
-    budget: Duration,
-    hello_kind: u8,
-    hello_payload: &[u8],
-) -> io::Result<()> {
-    let deadline = Instant::now() + budget;
-    s.set_write_timeout(Some(budget))?;
-
-    write_frame(s, hello_kind, hello_payload).map_err(deadline_mapped)?;
-    arm_read_deadline(s, deadline)?;
-    let (kind, payload) = read_frame(s).map_err(deadline_mapped)?;
-    check_hello_ack(kind, &payload)?;
-
-    let (kind, payload) = encode_command(&Command::Shutdown);
-    write_frame(s, kind, &payload).map_err(deadline_mapped)?;
-    // Socket closure signals completion. Re-arm each read with the remaining
-    // budget so the loop cannot outlive the deadline.
-    let mut buf = [0u8; 256];
-    loop {
-        arm_read_deadline(s, deadline)?;
-        match s.read(&mut buf) {
-            Ok(0) => return Ok(()),
-            Ok(_) => {}
-            Err(e) if is_timeout(&e) => return Err(kill_handshake_timeout()),
-            // Retry interrupted reads; the deadline still bounds the loop.
-            Err(e) if e.kind() == ErrorKind::Interrupted => {}
-            // The daemon closing mid-drain is completion, same as `Ok(0)`.
-            Err(e)
-                if matches!(
-                    e.kind(),
-                    ErrorKind::ConnectionReset | ErrorKind::BrokenPipe | ErrorKind::UnexpectedEof
-                ) =>
-            {
-                return Ok(());
-            }
-            // Propagate other errors because they do not confirm daemon exit.
-            Err(e) => return Err(e),
-        }
-    }
 }
 
 /// The daemon entry point (`fleetcom --daemon`). Binds the socket and serves clients
@@ -923,66 +856,26 @@ mod tests {
         assert!(notice.contains("--kill"), "{notice}");
     }
 
-    /// A missing hello response times out the kill exchange.
+    /// A held flock with no pid is a daemon between lock acquisition and pid
+    /// write: `--kill` must report an error, not the Ok "no daemon running"
+    /// no-op, because the holder proves a daemon is starting.
     #[test]
-    fn kill_via_socket_bounds_the_handshake_wait() {
-        let base = temp("kill_socket_mute");
-        fs::create_dir_all(&*base).unwrap();
-        let sock = base.join("mute.sock");
-        // Leave the connection queued in the listener backlog.
-        let _listener = UnixListener::bind(&sock).unwrap();
-        let start = Instant::now();
-        let err = kill_via_socket_at(&sock, Duration::from_millis(200)).unwrap_err();
+    fn kill_with_a_held_lock_and_no_pid_is_an_error() {
+        let base = temp("kill_lock_no_pid");
+        let dir = base.join("runtime");
+        ensure_runtime_dir(&dir).unwrap();
+        let holder = fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(dir.join("daemon.lock"))
+            .unwrap();
+        // flock is per open-file-description, so this handle contends with
+        // the one `run_kill_in` opens, even within one process.
+        let _held = Flock::lock(holder, FlockArg::LockExclusiveNonblock).unwrap();
+        let err = run_kill_in(&dir).unwrap_err();
         assert_eq!(err.kind(), ErrorKind::TimedOut);
-        assert!(err.to_string().contains("kill handshake"), "{err}");
-        assert!(
-            start.elapsed() < Duration::from_secs(5),
-            "the deadline must fire, not the test's timeout"
-        );
-    }
-
-    /// A blocked hello write reports the kill-handshake timeout.
-    #[test]
-    fn kill_exchange_maps_a_write_timeout() {
-        let base = temp("kill_socket_bigenv");
-        fs::create_dir_all(&*base).unwrap();
-        let sock = base.join("mute.sock");
-        let _listener = UnixListener::bind(&sock).unwrap();
-        let mut s = UnixStream::connect(&sock).unwrap();
-        // The listener never accepts, so this payload fills the send buffer.
-        let oversized = vec![0u8; 8 * 1024 * 1024];
-        let err = kill_exchange(&mut s, Duration::from_millis(200), 0, &oversized).unwrap_err();
-        assert_eq!(err.kind(), ErrorKind::TimedOut);
-        assert!(err.to_string().contains("kill handshake"), "{err}");
-    }
-
-    /// A daemon that keeps the socket open after Shutdown times out the drain.
-    #[test]
-    fn kill_via_socket_bounds_the_drain_wait() {
-        let base = temp("kill_socket_drain");
-        fs::create_dir_all(&*base).unwrap();
-        let sock = base.join("stuck.sock");
-        let listener = UnixListener::bind(&sock).unwrap();
-        let server = thread::spawn(move || {
-            let (mut s, _) = listener.accept().unwrap();
-            let _ = read_frame(&mut s); // hello
-            let (kind, payload) = encode_event(&Event::HelloOk);
-            let _ = write_frame(&mut s, kind, &payload);
-            let _ = read_frame(&mut s); // Shutdown, swallowed
-            // Hold the socket open until the client drops its end.
-            let _ = s.read(&mut [0u8; 16]);
-        });
-        let err = kill_via_socket_at(&sock, Duration::from_millis(300)).unwrap_err();
-        assert_eq!(err.kind(), ErrorKind::TimedOut);
-        server.join().unwrap();
-    }
-
-    /// A missing socket makes the fallback a no-op.
-    #[test]
-    fn kill_via_socket_without_a_socket_is_a_noop() {
-        let base = temp("kill_socket_absent");
-        fs::create_dir_all(&*base).unwrap();
-        assert!(kill_via_socket_at(&base.join("absent.sock"), Duration::from_millis(100)).is_ok());
+        assert!(err.to_string().contains("pid"), "{err}");
     }
 
     /// Remove group and other read/execute permissions from a valid directory.
