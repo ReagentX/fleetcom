@@ -5,9 +5,10 @@ use std::{
     os::unix::net::UnixStream,
     sync::{
         atomic::AtomicBool,
-        mpsc::{Receiver, Sender, TryRecvError, channel},
+        mpsc::{Receiver, RecvTimeoutError, Sender, TryRecvError, channel},
     },
     thread::{self, JoinHandle},
+    time::{Duration, Instant},
 };
 
 use crate::{
@@ -41,7 +42,9 @@ pub trait Transport {
     fn connected(&self) -> bool;
     /// Tear down per `intent`, blocking until it's done, so the client restores
     /// the terminal only after the core has acted (tasks killed on `Quit`, the
-    /// connection closed on `Disconnect`).
+    /// connection closed on `Disconnect`). The wait is not unconditional: an
+    /// implementation may bound it and hang up on a wedged core — the terminal
+    /// restore is owed to the user either way.
     fn shutdown(&mut self, intent: ExitIntent);
 }
 
@@ -195,6 +198,37 @@ impl SocketTransport {
             dead: false,
         }
     }
+
+    /// `Quit` teardown: send `Shutdown`, then wait at most `bound` for the
+    /// daemon to close the socket — the reader ending is the proof the tasks
+    /// died. The reader owns `evt_tx`, so `evt_rx` disconnecting is exactly the
+    /// reader ending; events arriving meanwhile are discarded (the client is
+    /// past polling). On expiry, force our socket shut: the halves are clones
+    /// of one descriptor, so this errors the reader's blocking `read_frame` out
+    /// immediately (dropping the write half alone would not interrupt it),
+    /// which makes the final join bounded. Production passes `SEND_TIMEOUT`;
+    /// tests pass a small budget.
+    fn quit_within(&mut self, bound: Duration) {
+        self.send(Command::Shutdown);
+        let deadline = Instant::now() + bound;
+        loop {
+            let now = Instant::now();
+            if now >= deadline {
+                // The daemon never closed the socket: it lost its right to be
+                // waited on. Hang up so the reader errors out.
+                let _ = self.write.shutdown(Shutdown::Both);
+                break;
+            }
+            match self.evt_rx.recv_timeout(deadline - now) {
+                Ok(_) => {}                                   // discard
+                Err(RecvTimeoutError::Timeout) => {}          // deadline re-checked above
+                Err(RecvTimeoutError::Disconnected) => break, // reader ended
+            }
+        }
+        if let Some(h) = self.reader.take() {
+            let _ = h.join();
+        }
+    }
 }
 
 impl Transport for SocketTransport {
@@ -223,19 +257,21 @@ impl Transport for SocketTransport {
 
     fn shutdown(&mut self, intent: ExitIntent) {
         match intent {
-            // Group-kill every task and stop the daemon; the socket then closes
-            // (daemon gone = tasks killed).
-            ExitIntent::Quit => self.send(Command::Shutdown),
+            // Group-kill every task and stop the daemon, then wait for our
+            // reader to see the daemon close the socket (daemon gone = tasks
+            // killed) — but only up to `SEND_TIMEOUT`. A wedged daemon that
+            // never closes does not get a veto on restoring the terminal.
+            ExitIntent::Quit => self.quit_within(SEND_TIMEOUT),
             // Close the connection without a Shutdown: the daemon sees EOF and
-            // keeps the tasks running for the next client to reattach.
+            // keeps the tasks running for the next client to reattach. The
+            // close we just forced errors the reader out of its blocking read,
+            // so this join is bounded.
             ExitIntent::Disconnect => {
                 let _ = self.write.shutdown(Shutdown::Both);
+                if let Some(h) = self.reader.take() {
+                    let _ = h.join();
+                }
             }
-        }
-        // Either way, wait for our reader to see the socket close before the
-        // client restores the terminal. On Quit that means the tasks are dead.
-        if let Some(h) = self.reader.take() {
-            let _ = h.join();
         }
     }
 }
@@ -294,5 +330,32 @@ mod tests {
         // The stream was shut down with it, so the reader thread saw EOF and
         // exited: joining it cannot hang.
         t.reader.take().unwrap().join().unwrap();
+    }
+
+    /// `Quit` teardown is bounded: a daemon that accepts the `Shutdown` frame
+    /// but never closes the socket cannot block the terminal restore.
+    #[test]
+    fn quit_shutdown_is_bounded_when_the_daemon_never_closes() {
+        let (ours, theirs) = UnixStream::pair().unwrap();
+        let write = ours.try_clone().unwrap();
+        let (wait_tx, _wait_rx) = channel();
+        let mut t = SocketTransport::from_halves(write, ours, wait_tx);
+
+        // Hold `theirs` open, never writing and never closing: the `Shutdown`
+        // frame lands in the socket buffer, but no close ever arrives, so the
+        // reader stays blocked in `read_frame` until the transport hangs up.
+        let (done_tx, done_rx) = channel();
+        let worker = thread::spawn(move || {
+            t.quit_within(Duration::from_millis(150));
+            let _ = done_tx.send(());
+        });
+        // Test-side deadline well above the bound: on unfixed code the worker
+        // blocks in the reader join forever, and this fails the test instead of
+        // hanging the suite (unwinding drops `theirs`, which unblocks it).
+        done_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("Quit shutdown must return within its bound");
+        worker.join().unwrap();
+        drop(theirs);
     }
 }
