@@ -5,7 +5,9 @@ use std::{
     os::unix::net::UnixStream,
     sync::{
         atomic::AtomicBool,
-        mpsc::{Receiver, RecvTimeoutError, Sender, TryRecvError, channel},
+        mpsc::{
+            Receiver, RecvTimeoutError, Sender, SyncSender, TryRecvError, channel, sync_channel,
+        },
     },
     thread::{self, JoinHandle},
     time::{Duration, Instant},
@@ -152,28 +154,69 @@ impl Drop for ThreadTransport {
     }
 }
 
+/// Frames a `send` may queue ahead of the writer thread. 64 bounds the run
+/// loop's exposure to 64 frames of delivery latency — not 64 × `SEND_TIMEOUT`
+/// of blocking, because `send` never waits on the queue: a full queue means
+/// the peer let 64 frames pile up against a 5 s-per-write budget, and the
+/// transport declares it dead instead (see `SocketTransport::send`).
+const SEND_QUEUE: usize = 64;
+
 /// The core as a separate process (`fleetcom --daemon`), reached over a Unix
-/// socket. Commands are written as frames on the connection; a reader thread
-/// turns inbound event frames back into `Event`s on a channel, so `poll` drains
-/// the channel exactly like `ThreadTransport`.
+/// socket. Commands are encoded on the caller's thread and queued to a writer
+/// thread that frames them onto the connection, so a daemon that stops reading
+/// can never block the client's run loop; a reader thread turns inbound event
+/// frames back into `Event`s on a channel, so `poll` drains the channel
+/// exactly like `ThreadTransport`.
 pub struct SocketTransport {
-    write: UnixStream,
+    /// Control handle for forced shutdowns only — frame writes happen on the
+    /// writer thread. All handles are `try_clone`s of one socket (dup'd FDs
+    /// share the open socket description), so a shutdown here errors the
+    /// reader and writer out of their blocking calls.
+    ctrl: UnixStream,
+    /// Encoded frames to the writer thread. `None` once teardown takes it:
+    /// dropping the sender is what ends an idle writer's `recv` loop.
+    frame_tx: Option<SyncSender<(u8, Vec<u8>)>>,
     evt_rx: Receiver<Event>,
     reader: Option<JoinHandle<()>>,
+    writer: Option<JoinHandle<()>>,
     /// Set when the reader thread ends on socket EOF (the daemon is gone), or
-    /// when a `send` fails (the connection is unrecoverable; see `send`).
+    /// when `send` cannot queue a frame (the connection is unrecoverable; see
+    /// `send`). A write failure on the writer thread lands here indirectly:
+    /// the writer shuts the socket down, the reader exits on it, and `poll`
+    /// observes the disconnect.
     dead: bool,
 }
 
 impl SocketTransport {
-    /// Build over pre-split stream halves (`write`, `read`). The `try_clone` that
-    /// can fail is the caller's job: done outside the transport so the App's
-    /// transport factory stays infallible. `wait_tx` wakes the client's run loop
-    /// on each inbound event.
-    pub fn from_halves(write: UnixStream, read: UnixStream, wait_tx: Sender<()>) -> Self {
+    /// Build over pre-split clones of one stream: `write` feeds the writer
+    /// thread, `read` the reader thread, `ctrl` stays behind for forced
+    /// shutdowns. The `try_clone`s that can fail are the caller's job: done
+    /// outside the transport so the App's transport factory stays infallible.
+    /// `wait_tx` wakes the client's run loop on each inbound event.
+    pub fn from_halves(
+        write: UnixStream,
+        read: UnixStream,
+        ctrl: UnixStream,
+        wait_tx: Sender<()>,
+    ) -> Self {
         // Keep construction infallible; if this best-effort setup fails, the
         // stream retains its existing write-timeout setting.
         let _ = write.set_write_timeout(Some(SEND_TIMEOUT));
+        let (frame_tx, frame_rx) = sync_channel::<(u8, Vec<u8>)>(SEND_QUEUE);
+        let writer = thread::spawn(move || {
+            let mut write = write;
+            // Ends when the queue sender drops (teardown, or the transport
+            // itself dropped) or a frame write fails. `SEND_TIMEOUT` on the
+            // stream bounds each write; on failure, shut the socket down so
+            // the reader's blocking `read_frame` errors out too and the `dead`
+            // flag reaches the client through the existing `poll` path.
+            while let Ok((kind, payload)) = frame_rx.recv() {
+                if write_frame(&mut write, kind, &payload).is_err() {
+                    let _ = write.shutdown(Shutdown::Both);
+                    break;
+                }
+            }
+        });
         let (evt_tx, evt_rx) = channel();
         let reader = thread::spawn(move || {
             let mut read = read;
@@ -192,21 +235,25 @@ impl SocketTransport {
             let _ = wait_tx.send(());
         });
         Self {
-            write,
+            ctrl,
+            frame_tx: Some(frame_tx),
             evt_rx,
             reader: Some(reader),
+            writer: Some(writer),
             dead: false,
         }
     }
 
-    /// `Quit` teardown: send `Shutdown`, then wait at most `bound` for the
+    /// `Quit` teardown: queue `Shutdown`, then wait at most `bound` for the
     /// daemon to close the socket — the reader ending is the proof the tasks
-    /// died. The reader owns `evt_tx`, so `evt_rx` disconnecting is exactly the
-    /// reader ending; events arriving meanwhile are discarded (the client is
-    /// past polling). On expiry, force our socket shut: the halves are clones
-    /// of one descriptor, so this errors the reader's blocking `read_frame` out
+    /// died. `Shutdown` rides the writer queue like any frame; whether it
+    /// flushes or not, the bounded `evt_rx` wait is the backstop. The reader
+    /// owns `evt_tx`, so `evt_rx` disconnecting is exactly the reader ending;
+    /// events arriving meanwhile are discarded (the client is past polling).
+    /// On expiry, force our socket shut: the handles are clones of one
+    /// descriptor, so this errors the reader's blocking `read_frame` out
     /// immediately (dropping the write half alone would not interrupt it),
-    /// which makes the final join bounded. Production passes `SEND_TIMEOUT`;
+    /// which makes the final joins bounded. Production passes `SEND_TIMEOUT`;
     /// tests pass a small budget.
     fn quit_within(&mut self, bound: Duration) {
         self.send(Command::Shutdown);
@@ -216,7 +263,7 @@ impl SocketTransport {
             if now >= deadline {
                 // The daemon never closed the socket: it lost its right to be
                 // waited on. Hang up so the reader errors out.
-                let _ = self.write.shutdown(Shutdown::Both);
+                let _ = self.ctrl.shutdown(Shutdown::Both);
                 break;
             }
             match self.evt_rx.recv_timeout(deadline - now) {
@@ -226,6 +273,20 @@ impl SocketTransport {
             }
         }
         if let Some(h) = self.reader.take() {
+            let _ = h.join();
+        }
+        self.join_writer();
+    }
+
+    /// End the writer thread with a bounded join. Every caller has a socket
+    /// closure already in force (the daemon closed it, or we forced `ctrl`
+    /// shut), so a writer blocked mid-write errors out immediately; dropping
+    /// the queue sender is what ends an idle writer's `recv`. Without a prior
+    /// closure this join could wait a full `SEND_TIMEOUT` — never call it on a
+    /// live socket.
+    fn join_writer(&mut self) {
+        self.frame_tx.take();
+        if let Some(h) = self.writer.take() {
             let _ = h.join();
         }
     }
@@ -238,12 +299,21 @@ impl Transport for SocketTransport {
             return;
         }
         let (kind, payload) = encode_command(&cmd);
-        if write_frame(&mut self.write, kind, &payload).is_err() {
-            // A failed frame write may leave a partial frame on the stream.
-            // Mark the connection dead and close both halves so the reader
-            // exits and the client can reconnect.
+        // Queue, never block: this runs on the client's run-loop thread, where
+        // any wait on the peer freezes painting, input, and exit.
+        let queued = self
+            .frame_tx
+            .as_ref()
+            .is_some_and(|tx| tx.try_send((kind, payload)).is_ok());
+        if !queued {
+            // Full or disconnected. A full queue means the peer let
+            // `SEND_QUEUE` frames pile up against a `SEND_TIMEOUT`-per-write
+            // budget: for our purposes that is a dead peer, the same verdict
+            // as a failed synchronous write. Mark the connection dead and
+            // close the socket so the reader and writer exit and the client
+            // can reconnect.
             self.dead = true;
-            let _ = self.write.shutdown(Shutdown::Both);
+            let _ = self.ctrl.shutdown(Shutdown::Both);
         }
     }
 
@@ -264,13 +334,14 @@ impl Transport for SocketTransport {
             ExitIntent::Quit => self.quit_within(SEND_TIMEOUT),
             // Close the connection without a Shutdown: the daemon sees EOF and
             // keeps the tasks running for the next client to reattach. The
-            // close we just forced errors the reader out of its blocking read,
-            // so this join is bounded.
+            // close we just forced errors the reader out of its blocking read
+            // and any in-flight frame write, so both joins are bounded.
             ExitIntent::Disconnect => {
-                let _ = self.write.shutdown(Shutdown::Both);
+                let _ = self.ctrl.shutdown(Shutdown::Both);
                 if let Some(h) = self.reader.take() {
                     let _ = h.join();
                 }
+                self.join_writer();
             }
         }
     }
@@ -312,13 +383,33 @@ impl Transport for LocalTransport {
 mod tests {
     use super::*;
 
-    /// A failed send marks the transport disconnected and stops its reader.
+    /// Build a transport over one end of a socketpair, doing the `try_clone`
+    /// splitting the production call sites do.
+    fn transport_over(ours: UnixStream) -> SocketTransport {
+        let write = ours.try_clone().unwrap();
+        let ctrl = ours.try_clone().unwrap();
+        let (wait_tx, _wait_rx) = channel();
+        SocketTransport::from_halves(write, ours, ctrl, wait_tx)
+    }
+
+    /// Poll until the transport reports dead or `bound` expires. Dead now
+    /// propagates asynchronously (writer error → socket shutdown → reader
+    /// exit → `poll` sees the disconnect), so tests must wait, bounded.
+    fn wait_dead(t: &mut SocketTransport, bound: Duration) {
+        let deadline = Instant::now() + bound;
+        while t.connected() && Instant::now() < deadline {
+            let _ = t.poll();
+            thread::yield_now();
+        }
+    }
+
+    /// A send the writer thread cannot deliver marks the transport
+    /// disconnected: the failed write shuts the socket down, the reader exits
+    /// on it, and `poll` surfaces the drop.
     #[test]
     fn failed_send_marks_the_transport_dead() {
         let (ours, theirs) = UnixStream::pair().unwrap();
-        let write = ours.try_clone().unwrap();
-        let (wait_tx, _wait_rx) = channel();
-        let mut t = SocketTransport::from_halves(write, ours, wait_tx);
+        let mut t = transport_over(ours);
         assert!(t.connected());
 
         drop(theirs); // the daemon is gone
@@ -326,10 +417,53 @@ mod tests {
             id: None,
             attached: false,
         });
+        wait_dead(&mut t, Duration::from_secs(2));
         assert!(!t.connected(), "a failed send must mark the transport dead");
-        // The stream was shut down with it, so the reader thread saw EOF and
-        // exited: joining it cannot hang.
+        // The stream was shut down along the way, so the reader thread saw
+        // EOF and exited: joining it cannot hang.
         t.reader.take().unwrap().join().unwrap();
+        // The writer ended too — its write failed against the closed peer, or
+        // its sender is about to drop; either way this join is bounded.
+        t.join_writer();
+    }
+
+    /// The regression this design exists for: a peer that stops reading must
+    /// not block `send` — the run loop's thread is the UI. Fill the socket
+    /// send buffer and the whole frame queue; every `send` must return
+    /// promptly and the transport must declare itself dead, leaving recovery
+    /// to the reconnect path.
+    #[test]
+    fn send_burst_against_a_stalled_peer_never_blocks_the_caller() {
+        let (ours, theirs) = UnixStream::pair().unwrap();
+        let mut t = transport_over(ours);
+
+        // 64 KiB per frame: one or two fill the socket send buffer (single-
+        // digit KiB by default on macOS), the rest fill the `SEND_QUEUE`
+        // slots, and the overflow must be refused, not waited on.
+        let bytes = vec![b'p'; 64 * 1024];
+        let start = Instant::now();
+        for _ in 0..(SEND_QUEUE + 8) {
+            t.send(Command::Paste {
+                id: 1,
+                bytes: bytes.clone(),
+            });
+        }
+        let elapsed = start.elapsed();
+        // Unfixed, the first buffer-filling write alone blocks `SEND_TIMEOUT`
+        // (5 s); the whole burst must stay far under that.
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "send burst blocked the run loop for {elapsed:?}"
+        );
+        assert!(
+            !t.connected(),
+            "a full frame queue must mark the transport dead"
+        );
+
+        // Force the socket shut so the writer blocked mid-frame errors out:
+        // no thread outlives the test unbounded.
+        t.shutdown(ExitIntent::Disconnect);
+        drop(theirs);
     }
 
     /// `Quit` teardown is bounded: a daemon that accepts the `Shutdown` frame
@@ -337,9 +471,7 @@ mod tests {
     #[test]
     fn quit_shutdown_is_bounded_when_the_daemon_never_closes() {
         let (ours, theirs) = UnixStream::pair().unwrap();
-        let write = ours.try_clone().unwrap();
-        let (wait_tx, _wait_rx) = channel();
-        let mut t = SocketTransport::from_halves(write, ours, wait_tx);
+        let mut t = transport_over(ours);
 
         // Hold `theirs` open, never writing and never closing: the `Shutdown`
         // frame lands in the socket buffer, but no close ever arrives, so the
