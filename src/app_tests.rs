@@ -104,11 +104,9 @@ fn shift(code: KeyCode) -> KeyEvent {
     KeyEvent::new(code, KeyModifiers::SHIFT)
 }
 
-/// Minimal live task for injecting into `app.views` directly: carries the
-/// fields `sections`/`display_order` sort on (id, cwd, tagged, group) with
-/// everything else inert. Ordering tests use these instead of real children
-/// because a spawned child that exits mid-test re-buckets its row into
-/// Completed and breaks a fixed expected order under load.
+/// Construct a stable live task without spawning a child. `Active` and
+/// unparked keep an untagged view in Running; a child can exit during the test
+/// and move its row to Completed.
 fn view(id: u64, cwd: PathBuf, tagged: bool, group: Option<&str>) -> TaskView {
     TaskView {
         id,
@@ -136,9 +134,8 @@ fn selection_follows_task_across_reorder() {
     app.resolve_selection();
     assert_eq!(app.selected_id, Some(1));
 
-    // Tag id 2 -> it sorts into the "In use" bucket, ahead of id 1. Mutated
-    // in place: the Tag round-trip is other tests' subject, and a pump would
-    // overwrite the injected views with the core's empty snapshot.
+    // Tagging id 2 moves it into "In use," ahead of id 1. Mutate the injected
+    // snapshot directly: a pump would replace it with the empty core snapshot.
     app.views[1].tagged = true;
 
     let order = app.display_order();

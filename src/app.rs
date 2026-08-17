@@ -341,8 +341,8 @@ impl App {
     /// the socket.
     pub fn connect(rows: u16, cols: u16) -> io::Result<Self> {
         let (stream, origin) = crate::daemon::connect_ready()?;
-        // Split the stream here (the fallible part) so the transport factory in
-        // `assemble` (which owns the wake sender) stays infallible.
+        // Create the reader and control handles before `assemble`: its
+        // transport factory cannot return an `io::Result`.
         let read = stream.try_clone()?;
         let ctrl = stream.try_clone()?;
         let mut app = Self::assemble(rows, cols, move |_, _, wait_tx| {

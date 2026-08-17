@@ -367,14 +367,14 @@ fn no_daemon() -> io::Result<()> {
 /// `--kill` must work while someone else is attached. The pid comes from the
 /// lock file (trustworthy while the flock is held: the holder wrote it), and
 /// daemon exit releases the flock, so acquiring it is the completion signal.
-/// A no-op (with a message) if no daemon is running. A held flock with no
-/// readable pid is a daemon mid-startup: that is an error, never the no-op,
-/// because someone provably holds the lock.
+/// A no-op (with a message) if no daemon is running. A held flock without a
+/// usable pid is an error: it may be the interval between lock acquisition and
+/// pid publication, so it cannot be treated as the no-daemon case.
 pub fn run_kill() -> io::Result<()> {
     run_kill_in(&runtime_dir())
 }
 
-/// `run_kill` against an explicit runtime directory.
+/// Run the `--kill` operation against an explicit runtime directory.
 fn run_kill_in(dir: &Path) -> io::Result<()> {
     // The lock PID is a signal target, and the socket receives the client's
     // environment, so validate the directory before reading either file.
@@ -393,10 +393,8 @@ fn run_kill_in(dir: &Path) -> io::Result<()> {
         Err((file, _)) => file,
     };
 
-    // The flock is held, but the pid can be momentarily unreadable:
-    // `run_daemon` acquires the lock, then truncates and writes the pid, so
-    // the only held-lock window without one is those two syscalls. Poll the
-    // file briefly rather than guess.
+    // `run_daemon` acquires the flock before replacing the pid. Retry briefly
+    // to cover that publication interval.
     let mut pid = None;
     for _ in 0..20 {
         let mut pid_str = String::new();
@@ -856,9 +854,8 @@ mod tests {
         assert!(notice.contains("--kill"), "{notice}");
     }
 
-    /// A held flock with no pid is a daemon between lock acquisition and pid
-    /// write: `--kill` must report an error, not the Ok "no daemon running"
-    /// no-op, because the holder proves a daemon is starting.
+    /// A held flock without a usable pid is an error: an existing lock file
+    /// reaches the no-daemon path only when its flock is acquirable.
     #[test]
     fn kill_with_a_held_lock_and_no_pid_is_an_error() {
         let base = temp("kill_lock_no_pid");
@@ -870,8 +867,8 @@ mod tests {
             .truncate(false)
             .open(dir.join("daemon.lock"))
             .unwrap();
-        // flock is per open-file-description, so this handle contends with
-        // the one `run_kill_in` opens, even within one process.
+        // The second open creates a distinct open-file description, so it
+        // contends with this lock even within one process.
         let _held = Flock::lock(holder, FlockArg::LockExclusiveNonblock).unwrap();
         let err = run_kill_in(&dir).unwrap_err();
         assert_eq!(err.kind(), ErrorKind::TimedOut);
