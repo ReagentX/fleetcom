@@ -456,8 +456,8 @@ fn codex_model_with_reasoning(item: &str) -> bool {
     matches!(words.len(), 2 | 3) && CODEX_EFFORT.contains(&words[1])
 }
 
-/// The composer: the bottom-most column-0 [`CODEX_PROMPT`] row — the glyph
-/// alone or the glyph and a space — that is not a modal selector. Rows
+/// The composer: the bottom-most column-0 [`CODEX_PROMPT`] row that is not a
+/// modal selector. The row is the glyph alone or the glyph and a space. Rows
 /// below it are tolerated, never required: blank rows, indented affordance
 /// hints (`tab to queue message`), or the status line. The working layout can
 /// paint hints below the composer with no status line at all. Prompt echoes in
@@ -549,8 +549,8 @@ fn codex_interrupt_paren(s: &str) -> bool {
 
 /// The text after codex's compact elapsed counter, or `None` when `s` does
 /// not open with one: space-separated `{digits}{unit}` fields in strictly
-/// descending `h`, `m`, `s` order, ending at the seconds field — `0s`,
-/// `1m 00s`, `25h 02m 03s`. A field that is not digits plus a unit (`1/3`,
+/// descending `h`, `m`, `s` order, ending at the seconds field (`0s`,
+/// `1m 00s`, `25h 02m 03s`). A field that is not digits plus a unit (`1/3`,
 /// `9.9s`) fails.
 fn codex_elapsed(s: &str) -> Option<&str> {
     let mut rest = s;
@@ -805,7 +805,7 @@ fn omp_approval(rows: &[String]) -> Option<(String, &'static str)> {
 }
 
 /// The selector's chosen row: a cursor spelling, a space, then `Approve` and
-/// nothing more. Equality after the cursor is the whole check — the ascii
+/// nothing more. Equality after the cursor is the whole check: the ascii
 /// cursor `>` also opens a quoted line, so the row's remainder has to be
 /// exact.
 fn omp_approve_row(row: &str) -> bool {
@@ -816,7 +816,7 @@ fn omp_approve_row(row: &str) -> bool {
 }
 
 /// The selector's head row: `Allow tool: {name}`. The prefix's trailing
-/// space carries the name requirement — a trimmed row cannot end in one — so
+/// space carries the name requirement: a trimmed row cannot end in one, so
 /// a bare `Allow tool:` fails.
 fn omp_allow_head(row: &str) -> bool {
     row.trim().starts_with("Allow tool: ")

@@ -341,11 +341,12 @@ impl App {
     /// the socket.
     pub fn connect(rows: u16, cols: u16) -> io::Result<Self> {
         let (stream, origin) = crate::daemon::connect_ready()?;
-        // Split the stream here (the fallible part) so the transport factory in
-        // `assemble` (which owns the wake sender) stays infallible.
+        // Create the reader and control handles before `assemble`: its
+        // transport factory cannot return an `io::Result`.
         let read = stream.try_clone()?;
+        let ctrl = stream.try_clone()?;
         let mut app = Self::assemble(rows, cols, move |_, _, wait_tx| {
-            Box::new(SocketTransport::from_halves(stream, read, wait_tx))
+            Box::new(SocketTransport::from_halves(stream, read, ctrl, wait_tx))
         });
         app.daemon_backed = true;
         // Report when a running daemon could not apply this invocation's
@@ -361,7 +362,8 @@ impl App {
             // Reconnection must not block the active UI indefinitely.
             let stream = crate::daemon::connect_ready_bounded()?;
             let read = stream.try_clone()?;
-            Ok(SocketTransport::from_halves(stream, read, wait_tx))
+            let ctrl = stream.try_clone()?;
+            Ok(SocketTransport::from_halves(stream, read, ctrl, wait_tx))
         };
         match build() {
             Ok(t) => {

@@ -15,8 +15,8 @@
 //! Sessions live at `<sessions root>/<encoded cwd>/<iso ts>_<uuidv7>.jsonl`.
 //! The harness home *is* the sessions root: `PI_CODING_AGENT_SESSION_DIR`
 //! names a sessions directory outright, so no agent-dir value can express it.
-//! That override also flattens the store — it is passed straight through as the
-//! session file's parent and the bucket level is never computed — so
+//! That override also flattens the store: it is passed straight through as the
+//! session file's parent and the bucket level is never computed, so
 //! correlation scans the root and one level below it.
 //!
 //! Correlation does not derive bucket names. It enumerates the root and its
