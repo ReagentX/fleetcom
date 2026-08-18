@@ -242,8 +242,8 @@ fn run() -> io::Result<()> {
     // Keyboard enhancement distinguishes modified Enter; bracketed paste
     // delivers the clipboard as one event. Keyboard flags are screen-specific,
     // so enable them after entering the alternate screen. Mouse capture is
-    // managed by `App::sync_input_modes`. Save and enable alternate scroll;
-    // restoration occurs in `restore_terminal`.
+    // managed by `App::sync_input_modes`. Save and enable alternate scroll
+    // and focus reporting; restoration occurs in `restore_terminal`.
     if kitty {
         execute!(
             out,
@@ -253,7 +253,11 @@ fn run() -> io::Result<()> {
         // setup actually did, not what it attempted.
         KITTY_PUSHED.store(true, Ordering::Relaxed);
     }
-    execute!(out, EnableBracketedPaste, Print("\x1b[?1007s\x1b[?1007h"))?;
+    execute!(
+        out,
+        EnableBracketedPaste,
+        Print("\x1b[?1007s\x1b[?1007h\x1b[?1004s\x1b[?1004h")
+    )?;
     // `fleetcom [--foreground] <session>` loads that session at startup; the
     // result shows in the status line.
     if let Some(name) = &session {
@@ -303,7 +307,7 @@ fn emit_restore_sequences(out: &mut impl io::Write, kitty_pushed: bool) -> io::R
         out,
         DisableMouseCapture,
         DisableBracketedPaste,
-        Print("\x1b[?1007r"),
+        Print("\x1b[?1007r\x1b[?1004r"),
         Show,
         LeaveAlternateScreen
     )
@@ -484,8 +488,10 @@ mod tests {
         for out in [&pushed, &unpushed] {
             assert!(contains(out, &leave));
             assert!(contains(out, &show));
-            // Alternate-scroll restore is a raw Print, not a crossterm command.
+            // Alternate-scroll and focus-reporting restores are raw Prints,
+            // not crossterm commands.
             assert!(contains(out, b"\x1b[?1007r"));
+            assert!(contains(out, b"\x1b[?1004r"));
         }
     }
 }
