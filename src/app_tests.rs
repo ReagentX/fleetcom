@@ -2436,6 +2436,42 @@ fn painted(app: &mut App) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
+/// Highlight rows swap reverse video for a bright-black background while the
+/// host terminal is unfocused
+#[test]
+fn unfocused_terminal_mutes_the_highlight_rows() {
+    use crossterm::style::{Attribute, Color, SetAttribute, SetBackgroundColor};
+
+    fn sgr(cmd: impl crossterm::Command) -> String {
+        let mut s = String::new();
+        cmd.write_ansi(&mut s).unwrap();
+        s
+    }
+    let reverse = sgr(SetAttribute(Attribute::Reverse));
+    let muted = sgr(SetBackgroundColor(Color::DarkGrey));
+
+    let mut app = App::new_local(30, 100);
+    let inv = app.invocation_dir.clone();
+    app.spawn_in("sleep 5", inv);
+    app.pump();
+    app.selected_id = Some(1);
+
+    // The dashboard's only reverse-video line is the selected row, so its
+    // presence tracks `rev` exactly.
+    let focused = painted(&mut app);
+    assert!(focused.contains(&reverse), "{focused:?}");
+    assert!(!focused.contains(&muted), "{focused:?}");
+
+    app.terminal_focused = false;
+    let away = painted(&mut app);
+    assert!(away.contains(&muted), "{away:?}");
+    assert!(!away.contains(&reverse), "{away:?}");
+
+    // Regaining focus restores the live highlight.
+    app.terminal_focused = true;
+    assert!(painted(&mut app).contains(&reverse));
+}
+
 /// `?` opens the overlay; `?`, `Esc`, and `q` each close it.
 #[test]
 fn controls_overlay_opens_on_question_and_closes_on_peeks_key_set() {

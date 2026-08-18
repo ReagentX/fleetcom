@@ -10,7 +10,7 @@ use std::{
 use crossterm::{
     cursor::{Hide, MoveTo, Show},
     queue,
-    style::{Attribute, Print, SetAttribute},
+    style::{Attribute, Color, Print, SetAttribute, SetBackgroundColor},
     terminal::{BeginSynchronizedUpdate, EndSynchronizedUpdate},
 };
 
@@ -87,15 +87,16 @@ fn dim(out: &mut impl Write, y: u16, s: &str, cols: usize) -> io::Result<()> {
     )
 }
 
-/// Paint a full-width reverse-video line: selection and focused-field styling.
-fn rev(out: &mut impl Write, y: u16, s: &str, cols: usize) -> io::Result<()> {
-    queue!(
-        out,
-        MoveTo(0, y),
-        SetAttribute(Attribute::Reverse),
-        Print(pad(s, cols)),
-        SetAttribute(Attribute::Reset)
-    )
+/// Paint a full-width highlight line: selection and focused-field styling.
+fn rev(out: &mut impl Write, y: u16, s: &str, cols: usize, focused: bool) -> io::Result<()> {
+    queue!(out, MoveTo(0, y))?;
+    // When the host terminal is unfocused, the highlight is muted to a dark-grey
+    if focused {
+        queue!(out, SetAttribute(Attribute::Reverse))?;
+    } else {
+        queue!(out, SetBackgroundColor(Color::DarkGrey))?;
+    }
+    queue!(out, Print(pad(s, cols)), SetAttribute(Attribute::Reset))
 }
 
 fn render_dashboard(out: &mut impl Write, app: &App) -> io::Result<()> {
@@ -183,7 +184,7 @@ fn render_dashboard(out: &mut impl Write, app: &App) -> io::Result<()> {
             Row::Task(ti) => {
                 let v = &app.views[*ti];
                 if app.selected_id == Some(v.id) {
-                    rev(out, y, &task_row(v, cols), cols)?;
+                    rev(out, y, &task_row(v, cols), cols, app.terminal_focused)?;
                 } else if v.preview.source == PreviewSource::Marker {
                     // The marker is a placeholder, not output: dim the
                     // preview cell so it reads as metadata.
@@ -666,7 +667,7 @@ fn render_panel(out: &mut impl Write, app: &App, p: &Panel) -> io::Result<()> {
     let panel_h = (body + 2) as u16;
     let top = rows.saturating_sub(panel_h).max(2);
 
-    rev(out, top, &p.header, cols)?;
+    rev(out, top, &p.header, cols, app.terminal_focused)?;
 
     if total == 0 {
         if let Some(msg) = p.empty {
@@ -679,7 +680,7 @@ fn render_panel(out: &mut impl Write, app: &App, p: &Panel) -> io::Result<()> {
             let marker = if idx == p.sel { "▸ " } else { "  " };
             let line = format!("    {marker}{}", p.labels[idx]);
             if idx == p.sel {
-                rev(out, y, &line, cols)?;
+                rev(out, y, &line, cols, app.terminal_focused)?;
             } else {
                 put(out, y, &line, cols)?;
             }
@@ -929,7 +930,13 @@ fn render_attached(out: &mut impl Write, app: &App) -> io::Result<()> {
     let cols = app.cols as usize;
     let title = attached_title(v);
     let bar = attached_bar(&title, screen.map_or(0, |s| s.scrollback), app.notice());
-    rev(out, app.rows.saturating_sub(1), &bar, cols)?;
+    rev(
+        out,
+        app.rows.saturating_sub(1),
+        &bar,
+        cols,
+        app.terminal_focused,
+    )?;
 
     // Place the real cursor where the child's is, so typing feels native.
     match screen {

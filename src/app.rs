@@ -202,6 +202,9 @@ pub struct App {
     /// Id of the attached task, if any: by id (not index) so it survives the
     /// task list changing underneath it.
     pub focused_id: Option<u64>,
+    /// Whether the host terminal window has focus
+    /// While unfocused, highlight rows mute to a bright-black background
+    pub terminal_focused: bool,
     pub rows: u16,
     pub cols: u16,
     /// Bytes of the last painted frame; the renderer skips the write when the
@@ -424,6 +427,7 @@ impl App {
             spawn_cwd: invocation_dir.clone(),
             spawn_group: None,
             focused_id: None,
+            terminal_focused: true,
             rows,
             cols,
             last_frame: Vec::new(),
@@ -881,6 +885,8 @@ impl App {
                     CtEvent::Resize(cols, rows) => self.on_resize(rows, cols),
                     CtEvent::Paste(s) => self.on_paste(&s),
                     CtEvent::Mouse(m) => self.on_mouse(m),
+                    CtEvent::FocusGained => self.terminal_focused = true,
+                    CtEvent::FocusLost => self.terminal_focused = false,
                     _ => {}
                 }
             }
