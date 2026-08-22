@@ -12,7 +12,8 @@ use std::{
 };
 
 use super::{
-    CapturePaths, Harness, Invocation, SpawnPlan, is_uuid, last_hint, pin_plan, within_window,
+    CapturePaths, Harness, Invocation, SpawnPlan, last_hint, pin_plan, push_unique, sole_id,
+    within_window,
 };
 
 pub struct Grok;
@@ -38,11 +39,6 @@ impl Harness for Grok {
         _home: Option<&Path>,
     ) -> SpawnPlan {
         pin_plan(inv)
-    }
-
-    /// Grok has no injected live capture channel.
-    fn parse_capture(&self, _payload: &str) -> Option<String> {
-        None
     }
 
     fn scrape_exit(&self, text: &str) -> Option<String> {
@@ -121,12 +117,6 @@ fn cwd_record(text: &str) -> &str {
         .unwrap_or(text)
 }
 
-fn push_unique(found: &mut Vec<PathBuf>, p: PathBuf) {
-    if !found.contains(&p) {
-        found.push(p);
-    }
-}
-
 fn encoded_dir(sessions: &Path, cwd: &Path) -> Option<PathBuf> {
     let p = sessions.join(encode_cwd(cwd)?);
     p.is_dir().then_some(p)
@@ -171,15 +161,10 @@ fn unique_session(groups: &[PathBuf], spawned: SystemTime) -> Option<String> {
             let Some(name) = name.to_str() else {
                 continue;
             };
-            if !candidates.iter().any(|c| c == name) {
-                candidates.push(name.to_string());
-            }
+            push_unique(&mut candidates, name.to_string());
         }
     }
-    match candidates.as_slice() {
-        [only] if is_uuid(only) => Some(only.clone()),
-        _ => None,
-    }
+    sole_id(candidates)
 }
 
 /// `YYYY-MM-DDTHH:MM:SS[.frac]Z` as grok writes `created_at`. Any other shape

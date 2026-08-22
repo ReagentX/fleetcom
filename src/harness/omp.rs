@@ -25,14 +25,14 @@
 
 use std::{
     fs,
-    io::{BufRead, BufReader, Read},
     path::{Path, PathBuf},
     time::SystemTime,
 };
 
 use super::{
-    CAPTURE_ENV, CapturePaths, Harness, Invocation, SpawnPlan, is_uuid, leading_uuid, shell_quote,
-    v7_millis, within_window_ms,
+    CAPTURE_ENV, CapturePaths, Harness, Invocation, SpawnPlan, capture_id, is_uuid, jsonl_head,
+    leading_uuid, push_unique, same_cwd, shell_quote, sole_id, unix_millis, v7_millis,
+    within_window_ms,
 };
 
 /// Command fragment shared by ordinary exit and recovery hints.
@@ -134,9 +134,7 @@ impl Harness for Omp {
 
     /// Return `sessionId` from a valid extension payload.
     fn parse_capture(&self, payload: &str) -> Option<String> {
-        let v = jzon::parse(payload).ok()?;
-        let id = v["sessionId"].as_str()?;
-        is_uuid(id).then(|| id.to_string())
+        capture_id(&jzon::parse(payload).ok()?, "sessionId")
     }
 
     /// Return the last trusted exit hint. Unlabelled hints are ordinary exit
@@ -167,10 +165,7 @@ impl Harness for Omp {
     /// stores. The ID follows the last `_` in the filename.
     fn correlate_fs(&self, cwd: &Path, spawned: SystemTime, home: Option<&Path>) -> Option<String> {
         let sessions = self.home_root(home)?;
-        let spawn_ms = spawned
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .ok()?
-            .as_millis();
+        let spawn_ms = unix_millis(spawned)?;
         // Session headers may record either the supplied or canonical path.
         let canon = cwd.canonicalize().ok();
 
@@ -210,15 +205,10 @@ impl Harness for Omp {
                 }
                 // The same session may appear in multiple buckets; count its
                 // UUID once.
-                if !survivors.iter().any(|s| s == id) {
-                    survivors.push(id.to_string());
-                }
+                push_unique(&mut survivors, id.to_string());
             }
         }
-        match survivors.as_slice() {
-            [only] => Some(only.clone()),
-            _ => None,
-        }
+        sole_id(survivors)
     }
 }
 
@@ -227,26 +217,16 @@ impl Harness for Omp {
 /// first record is a fixed-width title slot. Nothing later can affect
 /// correlation, so transcripts are not read beyond the header.
 fn header_cwd_matches(path: &Path, cwd: &Path, canon: Option<&Path>) -> bool {
-    let Ok(file) = fs::File::open(path) else {
+    let Some(records) = jsonl_head(path, 2) else {
         return false;
     };
-    let mut reader = BufReader::new(file.take(64 * 1024));
-    let mut line = String::new();
-    for _ in 0..2 {
-        line.clear();
-        if !matches!(reader.read_line(&mut line), Ok(n) if n > 0) {
-            return false;
-        }
-        let Ok(record) = jzon::parse(&line) else {
-            continue;
-        };
+    for record in records.into_iter().flatten() {
         if record["type"].as_str() != Some("session") {
             continue;
         }
         return record["cwd"].as_str().is_some_and(|c| {
             let header = Path::new(c);
-            header == cwd
-                || Some(header) == canon
+            same_cwd(header, cwd, canon)
                 || canon.is_some_and(|canon| header.canonicalize().is_ok_and(|h| h == canon))
         });
     }

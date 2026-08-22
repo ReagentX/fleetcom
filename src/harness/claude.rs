@@ -7,13 +7,13 @@
 use std::{
     fs,
     path::{Path, PathBuf},
-    time::{SystemTime, UNIX_EPOCH},
+    time::SystemTime,
 };
 
 use super::summary::AWAITING_APPROVAL;
 use super::{
-    CAPTURE_ENV, CapturePaths, Harness, Invocation, SpawnPlan, is_uuid, last_hint, pin_plan,
-    shell_quote, within_window, within_window_ms,
+    CAPTURE_ENV, CapturePaths, Harness, Invocation, SpawnPlan, capture_id, is_uuid, last_hint,
+    pin_plan, same_cwd, shell_quote, sole_id, unix_millis, within_window, within_window_ms,
 };
 
 pub struct Claude;
@@ -50,9 +50,7 @@ impl Harness for Claude {
     }
 
     fn parse_capture(&self, payload: &str) -> Option<String> {
-        let v = jzon::parse(payload).ok()?;
-        let id = v["session_id"].as_str()?;
-        is_uuid(id).then(|| id.to_string())
+        capture_id(&jzon::parse(payload).ok()?, "session_id")
     }
 
     fn scrape_exit(&self, text: &str) -> Option<String> {
@@ -148,11 +146,10 @@ fn record_for_pid(
     let dir = Claude.home_root(home)?.join("sessions");
     let text = fs::read_to_string(dir.join(format!("{pid}.json"))).ok()?;
     let rec = parse_record(&text)?;
-    let spawned_ms = spawned.duration_since(UNIX_EPOCH).ok()?.as_millis();
-    // Test literal equality before canonicalizing the task path: identical
-    // nonexistent paths remain eligible.
-    let same_cwd = rec.cwd == cwd || cwd.canonicalize().is_ok_and(|c| rec.cwd == c);
-    (rec.pid == pid && same_cwd && within_window_ms(rec.started_at, spawned_ms)).then_some(rec)
+    (rec.pid == pid
+        && same_cwd(&rec.cwd, cwd, cwd.canonicalize().ok().as_deref())
+        && within_window_ms(rec.started_at, unix_millis(spawned)?))
+    .then_some(rec)
 }
 
 /// Return the UUID stem of the sole `.jsonl` transcript created within
@@ -177,10 +174,7 @@ fn unique_in_window(dir: PathBuf, spawned: SystemTime) -> Option<String> {
         }
         candidates.push(name.to_string());
     }
-    match candidates.as_slice() {
-        [only] if is_uuid(only) => Some(only.clone()),
-        _ => None,
-    }
+    sole_id(candidates)
 }
 
 /// Convert an absolute working directory to Claude's project slug by replacing
@@ -236,7 +230,7 @@ mod tests {
 
     /// Convert epoch milliseconds to [`SystemTime`].
     fn at_ms(ms: u64) -> SystemTime {
-        UNIX_EPOCH + std::time::Duration::from_millis(ms)
+        std::time::UNIX_EPOCH + std::time::Duration::from_millis(ms)
     }
 
     /// Claude-specific opaque shapes: flags, `--continue`/`-c`, subcommands,

@@ -24,7 +24,7 @@ pub mod summary;
 use std::{
     ffi::OsString,
     fs::File,
-    io::Read,
+    io::{BufRead, BufReader, Read},
     path::{Path, PathBuf},
     time::{Duration, SystemTime},
 };
@@ -94,8 +94,11 @@ pub trait Harness: Sync {
         home: Option<&Path>,
     ) -> SpawnPlan;
 
-    /// Extract a session ID from hook or notify JSON.
-    fn parse_capture(&self, payload: &str) -> Option<String>;
+    /// Extract a session ID from hook or notify JSON. Defaults to `None` for
+    /// tools without an injected capture channel.
+    fn parse_capture(&self, _payload: &str) -> Option<String> {
+        None
+    }
 
     /// Extract a session ID from final terminal text, including scrollback.
     fn scrape_exit(&self, text: &str) -> Option<String>;
@@ -277,6 +280,13 @@ pub fn is_uuid(s: &str) -> bool {
         })
 }
 
+/// Validated session ID at `key` in hook or notify JSON; [`is_uuid`] is the
+/// shell-insertion boundary.
+fn capture_id(v: &jzon::JsonValue, key: &str) -> Option<String> {
+    let id = v[key].as_str()?;
+    is_uuid(id).then(|| id.to_string())
+}
+
 /// Return the strict UUID at the start of `s`. The next byte must end the token;
 /// an alphanumeric character, `-`, or `_` extends the token and rejects it.
 fn leading_uuid(s: &str) -> Option<&str> {
@@ -360,6 +370,55 @@ fn v7_millis(id: &str) -> Option<u64> {
         return None;
     }
     u64::from_str_radix(&format!("{}{}", &id[..8], &id[9..13]), 16).ok()
+}
+
+/// Epoch milliseconds of `t`; `None` before the epoch.
+fn unix_millis(t: SystemTime) -> Option<u128> {
+    Some(t.duration_since(SystemTime::UNIX_EPOCH).ok()?.as_millis())
+}
+
+/// Whether a store-recorded path names the task's working directory: literal
+/// equality first, so identical nonexistent paths stay eligible, then the
+/// canonical task path `canon` for symlinked invocations.
+fn same_cwd(recorded: &Path, cwd: &Path, canon: Option<&Path>) -> bool {
+    recorded == cwd || canon.is_some_and(|c| recorded == c)
+}
+
+/// The one candidate when exactly one strict UUID survives; any other count
+/// or shape yields `None`.
+fn sole_id(candidates: Vec<String>) -> Option<String> {
+    match candidates.as_slice() {
+        [only] if is_uuid(only) => Some(only.clone()),
+        _ => None,
+    }
+}
+
+/// Append `x` unless an equal entry is present.
+fn push_unique<T: PartialEq>(v: &mut Vec<T>, x: T) {
+    if !v.contains(&x) {
+        v.push(x);
+    }
+}
+
+/// Parse the first `n` JSONL records of `path`, reading at most 64 KiB so
+/// later transcript content cannot affect correlation. Each entry is `None`
+/// when its line does not parse, so callers decide whether a malformed record
+/// rejects or is skipped. `None` when the file cannot be opened, a read
+/// fails, or the file ends before `n` records.
+fn jsonl_head(path: &Path, n: usize) -> Option<Vec<Option<jzon::JsonValue>>> {
+    let file = File::open(path).ok()?;
+    let mut reader = BufReader::new(file.take(64 * 1024));
+    let mut records = Vec::with_capacity(n);
+    let mut line = String::new();
+    for _ in 0..n {
+        line.clear();
+        match reader.read_line(&mut line) {
+            Ok(len) if len > 0 => {}
+            _ => return None,
+        }
+        records.push(jzon::parse(&line).ok());
+    }
+    Some(records)
 }
 
 /// Single-quote `s` for `$SHELL -c`, encoding embedded `'` as `'\''`.
