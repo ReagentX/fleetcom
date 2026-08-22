@@ -4,17 +4,12 @@
 //! correlates rollout files under `<codex-home>/sessions/YYYY/MM/DD/`.
 //! Missing, empty, and malformed rollouts do not produce a candidate.
 
-use std::{
-    fmt::Write as _,
-    fs,
-    io::{BufRead, BufReader, Read},
-    path::Path,
-    time::SystemTime,
-};
+use std::{fmt::Write as _, fs, path::Path, time::SystemTime};
 
 use super::{
-    CAPTURE_ENV, CapturePaths, Harness, Invocation, NOTIFY_CHAIN_ENV, SpawnPlan, is_uuid,
-    last_hint, leading_uuid, shell_quote, v7_millis, within_window_ms,
+    CAPTURE_ENV, CapturePaths, Harness, Invocation, NOTIFY_CHAIN_ENV, SpawnPlan, capture_id,
+    is_uuid, jsonl_head, last_hint, leading_uuid, push_unique, same_cwd, shell_quote, sole_id,
+    unix_millis, v7_millis, within_window_ms,
 };
 
 pub struct Codex;
@@ -72,8 +67,7 @@ impl Harness for Codex {
         if v["type"].as_str() != Some("agent-turn-complete") {
             return None;
         }
-        let id = v["thread-id"].as_str()?;
-        is_uuid(id).then(|| id.to_string())
+        capture_id(&v, "thread-id")
     }
 
     fn scrape_exit(&self, text: &str) -> Option<String> {
@@ -108,10 +102,7 @@ impl Harness for Codex {
 
     fn correlate_fs(&self, cwd: &Path, spawned: SystemTime, home: Option<&Path>) -> Option<String> {
         let root = self.home_root(home)?;
-        let spawn_ms = spawned
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .ok()?
-            .as_millis();
+        let spawn_ms = unix_millis(spawned)?;
         // Day directories are named by LOCAL date, which std cannot compute
         // without a timezone database. The UTC date differs from it by at
         // most one day, so probing the UTC date ±2 covers local ±1.
@@ -157,16 +148,10 @@ impl Harness for Codex {
                 }
                 // Multiple rollouts may name the same thread. Correlation
                 // counts that thread once.
-                let id = id.to_string();
-                if !survivors.contains(&id) {
-                    survivors.push(id);
-                }
+                push_unique(&mut survivors, id.to_string());
             }
         }
-        match survivors.as_slice() {
-            [only] => Some(only.clone()),
-            _ => None,
-        }
+        sole_id(survivors)
     }
 }
 
@@ -298,20 +283,11 @@ fn toml_escape(s: &str) -> String {
 /// Check the rollout's first record for a matching `cwd` and no explicit
 /// spawned-thread provenance. Missing and unrecognized `thread_source` values
 /// remain eligible; `"subagent"` or any `parent_thread_id` rejects the record.
-/// Reads stop at 64 KiB because later records do not participate in
-/// correlation.
 fn line1_admits(path: &Path, cwd: &Path) -> bool {
-    let Ok(file) = fs::File::open(path) else {
+    let Some(records) = jsonl_head(path, 1) else {
         return false;
     };
-    let mut line = String::new();
-    if BufReader::new(file.take(64 * 1024))
-        .read_line(&mut line)
-        .is_err()
-    {
-        return false;
-    }
-    let Ok(meta) = jzon::parse(&line) else {
+    let Some(meta) = records[0].as_ref() else {
         return false;
     };
     let payload = &meta["payload"];
@@ -322,10 +298,9 @@ fn line1_admits(path: &Path, cwd: &Path) -> bool {
     }
     // Rollouts can contain the physical cwd while the task retains a symlinked
     // path. Canonicalize the task path before rejecting the match.
-    payload["cwd"].as_str().is_some_and(|c| {
-        let recorded = Path::new(c);
-        recorded == cwd || cwd.canonicalize().is_ok_and(|p| p == recorded)
-    })
+    payload["cwd"]
+        .as_str()
+        .is_some_and(|c| same_cwd(Path::new(c), cwd, cwd.canonicalize().ok().as_deref()))
 }
 
 #[cfg(test)]
