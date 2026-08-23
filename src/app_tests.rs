@@ -3917,6 +3917,23 @@ fn unchanged_frame_emits_nothing() {
     assert!(second.is_empty(), "an identical frame is a no-op");
 }
 
+#[test]
+fn peek_shows_short_output_instead_of_the_blank_grid_tail() {
+    let mut app = App::attached_with_lines(&["alpha", "beta", "gamma"]);
+    assert_eq!(
+        app.selected_id, app.focused_id,
+        "the peek reads the selected task's screen"
+    );
+    app.mode = Mode::Peek;
+    app.last_frame.clear();
+    let mut out = Vec::new();
+    crate::ui::render(&mut out, &mut app).unwrap();
+    let frame = String::from_utf8_lossy(&out);
+    for word in ["alpha", "beta", "gamma"] {
+        assert!(frame.contains(word), "peek frame must show {word:?}");
+    }
+}
+
 // Repaint timing.
 
 /// Core-driven repaints wait for the remainder of `PAINT_MIN`.
