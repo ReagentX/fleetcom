@@ -404,6 +404,17 @@ fn tasks_and_status_round_trip() {
     assert_eq!(decode_event(k, &p), Some(status));
 }
 
+/// A spawn acknowledgement round-trips with an id above `u32::MAX`.
+#[test]
+fn spawned_round_trips() {
+    let ev = Event::Spawned {
+        id: u64::from(u32::MAX) + 7,
+    };
+    let (k, p) = encode_event(&ev);
+    assert_eq!(k, KIND_CONTROL);
+    assert_eq!(decode_event(k, &p), Some(ev));
+}
+
 /// `SetGroup` emits `"g"` only for an assignment. A missing or null `"g"`
 /// decodes as a clear.
 #[test]
