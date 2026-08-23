@@ -448,10 +448,10 @@ fn render_peek(out: &mut impl Write, app: &App) -> io::Result<()> {
     let bh = rows.saturating_sub(6).clamp(5, 16);
 
     // Use an empty body until the selected task's screen arrives.
-    let lines: &[String] = app.screen_for(v.id).map_or(&[], |s| &s.lines);
-    // Show the newest lines that fit inside the overlay.
-    let start = lines.len().saturating_sub(bh.saturating_sub(2));
-    let tail = &lines[start..];
+    let (lines, alt_screen): (&[String], bool) = app
+        .screen_for(v.id)
+        .map_or((&[], false), |s| (&s.lines, s.alt_screen));
+    let tail = peek_window(lines, bh.saturating_sub(2), alt_screen);
 
     // The peek footer identifies the preview source and in-process matcher.
     let footer = format!(
@@ -470,6 +470,22 @@ fn render_peek(out: &mut impl Write, app: &App) -> io::Result<()> {
             footer: &footer,
         },
     )
+}
+
+/// The peek body is the last `height` lines of the selected task's screen, or all lines
+/// when the task is in alternate-screen mode. When the screen is shorter than `height`,
+/// all lines are returned.
+fn peek_window(lines: &[String], height: usize, alt_screen: bool) -> &[String] {
+    // `contents()` trims trailing padding, so a blank row is exactly empty.
+    let end = if alt_screen {
+        lines.len()
+    } else {
+        lines
+            .iter()
+            .rposition(|l| !l.is_empty())
+            .map_or(0, |i| i + 1)
+    };
+    &lines[end.saturating_sub(height)..end]
 }
 
 /// The peek footer's provenance label: source, then the matcher rule when
@@ -1007,6 +1023,70 @@ mod tests {
         );
         assert!(selection_overlay(None, &lines).is_empty());
         assert!(selection_overlay(Some(&sel), &[]).is_empty());
+    }
+
+    fn rows(spec: &[&str]) -> Vec<String> {
+        spec.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// A pane-sized grid whose first rows carry `content`, the rest blank.
+    fn grid(content: &[&str], height: usize) -> Vec<String> {
+        let mut g = rows(content);
+        g.resize(height, String::new());
+        g
+    }
+
+    #[test]
+    fn peek_window_shows_short_output_from_its_first_row() {
+        // Three rows in a 39-row grid: the window is those rows, not the
+        // grid's blank tail.
+        let g = grid(&["alpha", "beta", "gamma"], 39);
+        assert_eq!(peek_window(&g, 14, false), &g[..3]);
+    }
+
+    #[test]
+    fn peek_window_ends_at_the_last_non_blank_row() {
+        // Twenty content rows, height 14: rows 6..20, trailing blanks skipped.
+        let content: Vec<String> = (0..20).map(|i| format!("row{i}")).collect();
+        let mut g = content.clone();
+        g.resize(39, String::new());
+        assert_eq!(peek_window(&g, 14, false), &content[6..20]);
+    }
+
+    #[test]
+    fn peek_window_on_a_full_grid_is_the_bottom_slice() {
+        // A non-blank last row makes the content window the grid bottom:
+        // the scrolled-output case keeps its old crop exactly.
+        let g: Vec<String> = (0..39).map(|i| format!("row{i}")).collect();
+        assert_eq!(peek_window(&g, 14, false), &g[25..]);
+    }
+
+    #[test]
+    fn peek_window_keeps_interior_blank_rows() {
+        let g = grid(&["para one", "", "para two"], 39);
+        assert_eq!(peek_window(&g, 14, false), &g[..3]);
+        // A window shorter than the content still ends at the last row.
+        assert_eq!(peek_window(&g, 2, false), &g[1..3]);
+    }
+
+    #[test]
+    fn peek_window_of_a_blank_grid_is_empty() {
+        let g = grid(&[], 39);
+        assert!(peek_window(&g, 14, false).is_empty());
+        assert!(peek_window(&[], 14, false).is_empty());
+        assert!(peek_window(&[], 14, true).is_empty());
+    }
+
+    #[test]
+    fn peek_window_pins_the_alternate_screen_to_the_grid_bottom() {
+        // A canvas with a blank tail keeps the bottom crop: a partial repaint
+        // must not shift the window.
+        let g = grid(&["dialog"], 39);
+        assert_eq!(peek_window(&g, 14, true), &g[25..]);
+        assert!(peek_window(&g, 14, true).iter().all(String::is_empty));
+        // Height beyond the grid saturates to the whole grid.
+        assert_eq!(peek_window(&g, 50, true), &g[..]);
+        assert_eq!(peek_window(&g, 50, false), &g[..1]);
     }
 
     #[test]
