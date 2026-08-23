@@ -98,6 +98,8 @@ fn tick_emits_snapshot_and_watched_screen() {
     let mut s = sup(24, 80);
     spawn(&mut s, "sleep 30", here());
 
+    // Discard `Spawned`; this test isolates events queued by `tick`.
+    let _ = s.drain();
     s.tick();
     let evs = s.drain();
     assert_eq!(evs.len(), 1, "only a Tasks snapshot while unwatched");
@@ -521,13 +523,16 @@ fn spawn_ready(s: &mut Supervisor, command: String, cwd: PathBuf, ready: &Path) 
     first_id(s)
 }
 
-/// Tick once and return the first snapshotted task's id.
+/// Tick once and return the first task id from `Tasks`, ignoring other events.
 fn first_id(s: &mut Supervisor) -> u64 {
     s.tick();
-    match s.drain().first() {
-        Some(Event::Tasks(v)) => v[0].id,
-        _ => panic!("expected a Tasks snapshot"),
-    }
+    s.drain()
+        .iter()
+        .find_map(|e| match e {
+            Event::Tasks(v) => Some(v[0].id),
+            _ => None,
+        })
+        .expect("expected a Tasks snapshot")
 }
 
 /// Tick once and return task `id` from the emitted snapshot.
@@ -1017,7 +1022,7 @@ fn spawn_carries_a_normalized_group_from_birth() {
     let mut s = sup(24, 80);
     spawn_grouped(&mut s, "sleep 30", here(), "  ui\x1b[2J  ");
     s.tick();
-    match s.drain().first() {
+    match s.drain().iter().find(|e| matches!(e, Event::Tasks(_))) {
         Some(Event::Tasks(v)) => assert_eq!(v[0].group.as_deref(), Some("ui[2J")),
         _ => panic!("expected a Tasks snapshot"),
     }
@@ -1713,6 +1718,74 @@ fn load_reports_admit_failures_not_clean_success() {
     );
 }
 
+/// A direct spawn queues `Spawned` before `tick` queues the matching `Tasks`
+/// snapshot.
+#[test]
+fn spawn_acks_with_spawned_before_the_snapshot() {
+    let mut s = sup(24, 80);
+    spawn(&mut s, "sleep 30", here());
+    s.tick();
+    let evs = s.drain();
+    let ack = evs
+        .iter()
+        .position(|e| matches!(e, Event::Spawned { .. }))
+        .expect("spawn must ack with Spawned");
+    let snap = evs
+        .iter()
+        .position(|e| matches!(e, Event::Tasks(_)))
+        .expect("tick must emit a Tasks snapshot");
+    assert!(ack < snap, "Spawned must precede the snapshot; got {evs:?}");
+    let (Some(Event::Spawned { id }), Some(Event::Tasks(v))) = (evs.get(ack), evs.get(snap)) else {
+        unreachable!();
+    };
+    assert_eq!(v.len(), 1);
+    assert_eq!(*id, v[0].id, "the ack must name the admitted task");
+}
+
+/// A command-length refusal emits no `Spawned` event.
+#[test]
+fn refused_spawn_emits_no_spawned() {
+    let mut s = sup(24, 80);
+    s.apply(Command::Spawn {
+        command: "x".repeat(MAX_COMMAND_LEN + 1),
+        cwd: here(),
+        group: None,
+    });
+    let evs = s.drain();
+    assert!(
+        !evs.iter().any(|e| matches!(e, Event::Spawned { .. })),
+        "a refused spawn must not ack; got {evs:?}"
+    );
+}
+
+/// Session loads admit tasks without emitting `Spawned` events.
+#[test]
+fn session_load_emits_no_spawned() {
+    let dir = scratch("sess_no_ack");
+    let config = dir.join("config");
+    std::fs::create_dir_all(config.join("sessions")).unwrap();
+    std::fs::write(
+        config.join("sessions").join("fleet.json"),
+        format!(r#"{{"{}": ["true", "true"]}}"#, dir.display()),
+    )
+    .unwrap();
+    let mut s = sup_ctx(config_ctx(&config, dir.to_path_buf(), &[]));
+    s.apply(Command::LoadSession {
+        name: "fleet".into(),
+    });
+    s.tick();
+    let evs = s.drain();
+    assert!(
+        evs.iter()
+            .any(|e| matches!(e, Event::Tasks(v) if v.len() == 2)),
+        "both entries must be admitted; got {evs:?}"
+    );
+    assert!(
+        !evs.iter().any(|e| matches!(e, Event::Spawned { .. })),
+        "a session load must not ack; got {evs:?}"
+    );
+}
+
 /// Direct spawns reject commands above `MAX_COMMAND_LEN` without creating a task.
 #[test]
 fn spawn_refuses_over_length_command() {
@@ -2228,6 +2301,8 @@ fn recovery_maintenance_writes_detached_and_queues_nothing() {
         Duration::from_secs(600),
     );
     spawn(&mut s, "sleep 30", dir.to_path_buf());
+    // Discard `Spawned`; this test isolates events queued by maintenance.
+    let _ = s.drain();
     // Match the daemon's detached reap-and-maintain loop.
     assert!(
         wait_until(Duration::from_secs(5), || {

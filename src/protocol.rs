@@ -12,7 +12,7 @@ use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
 use crate::frame::{KIND_CONTROL, KIND_HELLO, KIND_SCREEN};
 
 /// Wire-protocol version; the handshake rejects mismatched peers.
-pub const PROTOCOL_VERSION: u32 = 10;
+pub const PROTOCOL_VERSION: u32 = 11;
 
 /// Reserved dashboard label for tasks without a custom group.
 pub const UNASSIGNED: &str = "Unassigned";
@@ -194,6 +194,9 @@ pub enum Event {
     Screen(ScreenView),
     /// A one-line notice for the status line (save/load result, spawn error).
     Status(String),
+    /// The id assigned to a direct `Spawn`. This event precedes the next task
+    /// snapshot containing that id. Session and recovery loads do not emit it.
+    Spawned { id: u64 },
     /// The reply to `ListSessions`: saved session-recipe names (sorted) and
     /// recovery snapshots (newest first).
     Sessions {
@@ -871,6 +874,10 @@ pub fn encode_event(ev: &Event) -> (u8, Vec<u8>) {
             let o = jzon::object! { "t": "status", "msg": msg.as_str() };
             (KIND_CONTROL, o.dump().into_bytes())
         }
+        Event::Spawned { id } => {
+            let o = jzon::object! { "t": "spawned", "id": *id };
+            (KIND_CONTROL, o.dump().into_bytes())
+        }
         Event::Sessions { names, recovery } => {
             let mut rec = jzon::JsonValue::new_array();
             for r in recovery {
@@ -974,6 +981,9 @@ pub fn decode_event(kind: u8, payload: &[u8]) -> Option<Event> {
                     Some(Event::Tasks(views))
                 }
                 "status" => Some(Event::Status(v["msg"].as_str()?.to_string())),
+                "spawned" => Some(Event::Spawned {
+                    id: v["id"].as_u64()?,
+                }),
                 "sessions" => Some(Event::Sessions {
                     names: str_vec(&v["names"])?,
                     recovery: recovery_vec(&v["recovery"]),

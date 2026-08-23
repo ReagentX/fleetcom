@@ -190,6 +190,10 @@ pub struct App {
     /// task itself, so it can't jump to a neighbor when the list reorders
     /// (a task exits, or gets tagged into another bucket).
     pub selected_id: Option<u64>,
+    /// Task id awaiting its first snapshot row. A later `Spawned` event replaces
+    /// it; a snapshot clears it only after the row appears. This preserves
+    /// direct-spawn selection across event batching.
+    pending_select: Option<u64>,
     pub mode: Mode,
     pub group_mode: GroupMode,
     pub input: EditBuffer,
@@ -375,15 +379,23 @@ impl App {
                     rows: self.pane_rows(),
                     cols: self.cols,
                 });
-                self.views.clear();
-                self.focused_screen = None;
-                self.watched = None;
-                self.selected_id = None;
-                self.mode = Mode::Dashboard;
+                self.reset_for_reconnect();
                 self.status = Some("reconnected".to_string());
             }
             Err(e) => self.status = Some(format!("reconnect failed: {e}")),
         }
+    }
+
+    /// Clear task and selection state owned by the disconnected transport.
+    /// Task ids are daemon-local and may be reused after a daemon restart, so
+    /// retaining `pending_select` could select an unrelated task.
+    fn reset_for_reconnect(&mut self) {
+        self.views.clear();
+        self.focused_screen = None;
+        self.watched = None;
+        self.selected_id = None;
+        self.pending_select = None;
+        self.mode = Mode::Dashboard;
     }
 
     /// `--foreground`: run the core in-process on a thread (no daemon). A
@@ -421,6 +433,7 @@ impl App {
             watched: None,
             daemon_backed: false,
             selected_id: None,
+            pending_select: None,
             mode: Mode::Dashboard,
             group_mode: GroupMode::State,
             input: EditBuffer::default(),
@@ -722,7 +735,19 @@ impl App {
             match ev {
                 // The handshake is handled before the transport is created.
                 Event::HelloOk => {}
-                Event::Tasks(v) => self.views = v,
+                Event::Tasks(v) => {
+                    self.views = v;
+                    // The acknowledgement precedes its row. Select only after
+                    // the matching snapshot arrives, then rendering keeps that
+                    // row visible.
+                    if let Some(id) = self.pending_select
+                        && self.task_index(id).is_some()
+                    {
+                        self.selected_id = Some(id);
+                        self.pending_select = None;
+                    }
+                }
+                Event::Spawned { id } => self.pending_select = Some(id),
                 Event::Screen(s) => self.on_screen(s),
                 Event::Status(s) => {
                     // Mirror attached-mode status messages into the visible notice bar.

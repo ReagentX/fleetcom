@@ -146,6 +146,122 @@ fn selection_follows_task_across_reorder() {
     assert_eq!(app.views[app.selected_task().unwrap()].id, 1);
 }
 
+/// Each admitted direct spawn moves selection to its task.
+#[test]
+fn spawn_moves_selection_to_the_new_task() {
+    let mut app = App::new_local(30, 100);
+    let dir = app.invocation_dir.clone();
+    app.spawn_in("sleep 30", dir.clone());
+    app.resolve_selection();
+    let first = app.selected_id.expect("first spawn selected");
+
+    app.spawn_in("sleep 31", dir);
+    let second = app.selected_id.expect("second spawn selected");
+    assert_ne!(first, second, "selection must move off the prior task");
+    assert_eq!(
+        app.views[app.selected_task().unwrap()].command,
+        "sleep 31",
+        "selection must land on the newest spawn"
+    );
+    assert_eq!(app.pending_select, None, "the ack must be consumed");
+}
+
+/// When two spawn acknowledgements share a snapshot, the later id replaces the
+/// earlier pending id and wins selection.
+#[test]
+fn two_spawns_in_one_sync_select_the_last() {
+    let mut app = App::new_local(30, 100);
+    let dir = app.invocation_dir.clone();
+    app.transport.send(Command::Spawn {
+        command: "sleep 30".into(),
+        cwd: dir.clone(),
+        group: None,
+    });
+    app.transport.send(Command::Spawn {
+        command: "sleep 31".into(),
+        cwd: dir,
+        group: None,
+    });
+    app.pump();
+    assert_eq!(
+        app.views.len(),
+        2,
+        "both spawns must land: {:?}",
+        app.status
+    );
+    assert_eq!(
+        app.views[app.selected_task().unwrap()].command,
+        "sleep 31",
+        "the later spawn wins the selection"
+    );
+}
+
+/// A refused direct spawn emits no acknowledgement and leaves selection intact.
+#[test]
+fn refused_spawn_leaves_selection_alone() {
+    let mut app = App::new_local(30, 100);
+    let dir = app.invocation_dir.clone();
+    app.spawn_in("sleep 30", dir.clone());
+    let kept = app.selected_id;
+    assert!(kept.is_some());
+
+    // Exceed the direct-spawn command limit by one byte.
+    app.transport.send(Command::Spawn {
+        command: "x".repeat(64 * 1024 + 1),
+        cwd: dir,
+        group: None,
+    });
+    app.pump();
+    assert_eq!(
+        app.views.len(),
+        1,
+        "the refused spawn must not admit a task"
+    );
+    assert_eq!(app.selected_id, kept, "selection must not move");
+    assert_eq!(app.pending_select, None, "a refusal must not leave an ack");
+}
+
+/// A snapshot without the pending task neither changes selection nor clears the
+/// pending id.
+#[test]
+fn pending_select_ignores_snapshots_without_the_id() {
+    let mut app = App::new_local(30, 100);
+    let dir = app.invocation_dir.clone();
+    app.spawn_in("sleep 30", dir);
+    let kept = app.selected_id;
+
+    app.pending_select = Some(9999);
+    // A state change makes the next pump deliver a fresh snapshot.
+    let id = kept.unwrap();
+    app.transport.send(Command::SetGroup {
+        id,
+        group: Some("g".into()),
+    });
+    app.pump();
+    assert_eq!(
+        app.selected_id, kept,
+        "an absent id must not move selection"
+    );
+    assert_eq!(app.pending_select, Some(9999), "the pending id stays armed");
+}
+
+/// Reconnect drops a pending spawn id because a replacement daemon may reuse it.
+#[test]
+fn reconnect_reset_drops_the_pending_spawn_ack() {
+    let mut app = App::new_local(30, 100);
+    let dir = app.invocation_dir.clone();
+    app.views = vec![view(1, dir, false, None)];
+    app.selected_id = Some(1);
+    app.pending_select = Some(2);
+    app.mode = Mode::Disconnected;
+
+    app.reset_for_reconnect();
+    assert_eq!(app.pending_select, None, "the stale ack must not survive");
+    assert_eq!(app.selected_id, None);
+    assert!(app.views.is_empty());
+    assert!(app.mode == Mode::Dashboard);
+}
+
 /// Dir mode makes one section per distinct cwd (invocation dir first); state
 /// mode collapses them back into the state buckets.
 #[test]
@@ -300,8 +416,8 @@ fn custom_mode_selection_survives_group_move() {
     app.spawn_grouped("sleep 5", inv, "beta"); // id 2
     app.pump();
     app.group_mode = GroupMode::Custom;
-    app.resolve_selection();
-    assert_eq!(app.selected_id, Some(1));
+    // Exercise moving id 1 rather than the selected second spawn.
+    app.selected_id = Some(1);
 
     // Move id 1 from the first section to the last.
     app.transport.send(Command::SetGroup {
@@ -452,8 +568,7 @@ fn selection_follows_task_across_parked_rebucket() {
     app.spawn_in("sleep 5", dir.clone()); // id 1
     app.spawn_in("sleep 5", dir); // id 2
     app.pump();
-    app.resolve_selection();
-    assert_eq!(app.selected_id, Some(1));
+    app.selected_id = Some(1);
 
     // Park id 1 -> it sinks into "Idle", below id 2's "Running".
     let i = app.views.iter().position(|v| v.id == 1).unwrap();
@@ -1339,14 +1454,13 @@ fn selection_wraps_at_list_edges() {
     // below crosses a section boundary.
     app.transport.send(Command::Tag { id: 2, on: true });
     app.pump();
-    app.resolve_selection();
     assert_eq!(app.section_ids().len(), 2, "tag splits the list in two");
 
     let order = app.display_order();
     let first = app.views[order[0]].id;
     let last = app.views[*order.last().unwrap()].id;
     assert_eq!(first, 2, "tagged task sorts first");
-    assert_eq!(app.selected_id, Some(first));
+    app.selected_id = Some(first);
 
     app.select_up();
     assert_eq!(
@@ -1540,8 +1654,7 @@ fn app_with_tags_split_across_groups() -> App {
 #[test]
 fn cycle_tagged_advances_and_wraps() {
     let mut app = app_with_tagged_pair();
-    app.resolve_selection();
-    assert_eq!(app.selected_id, Some(2), "first row is the first tag");
+    app.selected_id = Some(2); // Start on the first tagged row.
 
     app.on_key_dashboard(key(KeyCode::Char('M')));
     assert_eq!(app.selected_id, Some(4), "forward to the second tag");
@@ -1577,8 +1690,7 @@ fn cycle_tagged_is_noop_without_tags() {
     app.spawn_in("sleep 5", inv.clone()); // id 1
     app.spawn_in("sleep 5", inv); // id 2
     app.pump();
-    app.resolve_selection();
-    assert_eq!(app.selected_id, Some(1));
+    app.selected_id = Some(1);
 
     app.on_key_dashboard(key(KeyCode::Char('M')));
     assert_eq!(app.selected_id, Some(1), "no tags: the selection stands");
@@ -1612,8 +1724,7 @@ fn cycle_tagged_with_one_tag_holds_the_selection() {
     app.pump();
     app.transport.send(Command::Tag { id: 2, on: true });
     app.pump();
-    app.resolve_selection();
-    assert_eq!(app.selected_id, Some(2), "the only tag heads the list");
+    app.selected_id = Some(2); // Start on the only tagged row.
 
     app.on_key_dashboard(key(KeyCode::Char('M')));
     app.on_key_dashboard(key(KeyCode::Char('M')));
@@ -1637,7 +1748,7 @@ fn cycle_tagged_without_selection_takes_the_first_tag() {
 #[test]
 fn cycle_tagged_mutates_no_task_state() {
     let mut app = app_with_tags_split_across_groups();
-    app.resolve_selection();
+    app.selected_id = Some(1);
     let before: Vec<_> = app
         .views
         .iter()
@@ -1943,8 +2054,7 @@ fn wheel_moves_dashboard_selection() {
     app.spawn_in("sleep 5", dir.clone()); // id 1
     app.spawn_in("sleep 5", dir); // id 2
     app.pump();
-    app.resolve_selection();
-    assert_eq!(app.selected_id, Some(1));
+    app.selected_id = Some(1);
 
     let wheel = |kind| MouseEvent {
         kind,
@@ -2053,7 +2163,8 @@ fn group_filter_narrows_and_preselects_the_first_match() {
     app.spawn_grouped("sleep 5", inv.clone(), "alpha"); // id 1
     app.spawn_grouped("sleep 5", inv, "beta"); // id 2
     app.pump();
-    app.resolve_selection();
+    // Keep alpha selected so filtered beta carries no "(current)" mark.
+    app.selected_id = Some(1);
     app.on_key_dashboard(key(KeyCode::Char('g')));
     assert_eq!(app.group_candidates.len(), 3);
 
@@ -2177,7 +2288,8 @@ fn find_palette_opens_on_slash_only_with_tasks() {
     let inv = app.invocation_dir.clone();
     app.spawn_in("sleep 5", inv);
     app.pump();
-    assert_eq!(app.selected_id, None, "nothing selected yet");
+    // Exercise opening find without a current selection.
+    app.selected_id = None;
     app.on_key_dashboard(key(KeyCode::Char('/')));
     assert!(app.mode == Mode::Find);
     assert_eq!(find_ids(&app), vec![1]);
@@ -2322,8 +2434,7 @@ fn find_enter_jumps_the_selection() {
     app.spawn_in("sleep 5", inv.clone()); // id 2
     app.spawn_in("sleep 5", inv); // id 3
     app.pump();
-    app.resolve_selection();
-    assert_eq!(app.selected_id, Some(1));
+    app.selected_id = Some(1);
 
     app.on_key_dashboard(key(KeyCode::Char('/')));
     app.on_key_find(key(KeyCode::Down));
@@ -2347,8 +2458,7 @@ fn find_esc_leaves_the_selection_alone() {
     app.spawn_in("sleep 5", inv.clone()); // id 1
     app.spawn_in("true", inv); // id 2
     app.pump();
-    app.resolve_selection();
-    assert_eq!(app.selected_id, Some(1));
+    app.selected_id = Some(1);
 
     app.on_key_dashboard(key(KeyCode::Char('/')));
     find_type(&mut app, "true");

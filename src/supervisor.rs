@@ -818,9 +818,9 @@ impl Supervisor {
         Ok(task)
     }
 
-    /// Spawn under the next id and admit the task to the set, normalizing its
-    /// labels. The caller owns the `MAX_TASKS` gate and failure reporting,
-    /// which differ between direct spawns and session loads.
+    /// Spawn a task under the next id, normalize its labels, and return the id.
+    /// The caller enforces `MAX_TASKS` and reports failures because direct
+    /// spawns and session loads handle them differently.
     fn admit(
         &mut self,
         command: &str,
@@ -828,13 +828,14 @@ impl Supervisor {
         env: &[(OsString, OsString)],
         group: Option<String>,
         name: Option<String>,
-    ) -> io::Result<()> {
-        let mut task = self.spawn_task(self.next_id, 0, command, cwd, env)?;
+    ) -> io::Result<u64> {
+        let id = self.next_id;
+        let mut task = self.spawn_task(id, 0, command, cwd, env)?;
         task.group = normalize_group(group);
         task.name = normalize_label(name);
         self.next_id += 1;
         self.tasks.push(task);
-        Ok(())
+        Ok(id)
     }
 
     fn spawn(&mut self, command: &str, cwd: PathBuf, group: Option<String>) {
@@ -853,8 +854,11 @@ impl Supervisor {
         let Some(launch) = self.launch_or_refuse() else {
             return;
         };
-        if let Err(e) = self.admit(command, &cwd, &launch.env, group, None) {
-            self.status(format!("spawn failed: {e}"));
+        match self.admit(command, &cwd, &launch.env, group, None) {
+            // Preserve event order: the acknowledgement precedes the next
+            // `Tasks` snapshot containing this id.
+            Ok(id) => self.events.push(Event::Spawned { id }),
+            Err(e) => self.status(format!("spawn failed: {e}")),
         }
     }
 
@@ -1021,7 +1025,7 @@ impl Supervisor {
                     entry.group.clone(),
                     entry.name.clone(),
                 ) {
-                    Ok(()) => spawned += 1,
+                    Ok(_) => spawned += 1,
                     // Track spawn failures separately from skipped entries.
                     Err(_) => failed += 1,
                 }
