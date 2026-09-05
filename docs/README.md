@@ -169,7 +169,7 @@ Recipes persist full command lines, which can embed secrets. A token passed as a
 
 ### Captured IDs cross a shell boundary
 
-Agent resume writes a captured conversation ID into a command run through `$SHELL -c`, so validation is a security boundary. Accepted IDs contain only lowercase hexadecimal in the `8-4-4-4-12` UUID shape. Hook payloads, terminal scrapes, live session records, filesystem correlation, and the command builder all apply that check. Instrumentation applies only to a bare program word or its canonical resume form, never arbitrary shell text. [Agent session resume](agent-resume.md#validation-boundary) documents both boundaries.
+Agent resume writes a captured conversation ID into a command run through `$SHELL -c`, so validation is a security boundary. Accepted IDs contain only lowercase hexadecimal in the `8-4-4-4-12` UUID shape. Capture payloads, live session records, and the command builder all apply that check. Terminal output supplies no session IDs. Instrumentation applies only to a bare program word or its canonical resume form, never arbitrary shell text. [Agent session resume](agent-resume.md#validation-boundary) documents both boundaries.
 
 ### Copied text leaves through the terminal
 

@@ -332,15 +332,12 @@ fn input_hints_track_child_modes() {
     t.terminate();
 }
 
-/// The scrape waits on two criteria: the child must have exited and the PTY
-/// reader must have stopped; a live reader may still hold bytes that
-/// have not reached the grid.
+/// A live reader may still hold bytes that have not reached the grid, so
+/// finalization waits for reader EOF even after the child exits.
 #[test]
-fn scrape_exit_hint_waits_for_reader_eof() {
-    const ID: &str = "c8c4a5cc-0b32-4ba0-a6b4-6ed08c218e0d";
-    let cmd = format!("printf 'Resume this session with:\\nclaude --resume {ID}\\n'");
-    let mut t = Task::spawn(20, &cmd, &cmd, &here(), 24, 80, 2000, &sh_env(), no_waker()).unwrap();
-    t.harness = Some(&crate::harness::Claude);
+fn finalize_preview_waits_for_reader_eof() {
+    let cmd = "printf 'test result: ok\\n'";
+    let mut t = Task::spawn(20, cmd, cmd, &here(), 24, 80, 2000, &sh_env(), no_waker()).unwrap();
     assert!(
         wait_until(Duration::from_secs(60), || {
             t.poll_exit().unwrap();
@@ -355,8 +352,12 @@ fn scrape_exit_hint_waits_for_reader_eof() {
     t.handle = Some(thread::spawn(move || {
         let _ = parked.recv();
     }));
-    t.scrape_exit_hint();
-    assert_eq!(t.scraped_id, None, "the scrape must wait for reader EOF");
+    t.finalize_preview();
+    assert!(
+        !t.resolve_preview(Instant::now()).frozen,
+        "finalization must wait for reader EOF"
+    );
+    grid(&t.parser).process(b"late output\r\n");
 
     // Dropping the sender ends the stand-in: the reader reached EOF.
     drop(release);
@@ -364,19 +365,17 @@ fn scrape_exit_hint_waits_for_reader_eof() {
         wait_until(Duration::from_secs(60), || t.reader_done()),
         "the stand-in reader never stopped"
     );
-    t.scrape_exit_hint();
-    assert_eq!(t.scraped_id.as_deref(), Some(ID));
+    t.finalize_preview();
+    let p = t.resolve_preview(Instant::now());
+    assert_eq!((p.text.as_str(), p.frozen), ("late output", true));
 }
 
-/// A child that dies with a `?2026` frame still open leaves its hint
-/// buffered in the parser, and no ESU can ever arrive to release it: the
-/// scrape must land the frame instead of reading pre-frame text.
+/// A child that dies with a `?2026` frame still open leaves output buffered:
+/// no ESU can arrive, so finalization must land the frame before resolving.
 #[test]
-fn scrape_exit_hint_lands_an_open_sync_frame() {
-    const ID: &str = "7f3b9c1e-5a2d-4e8f-9b6a-0c4d2e8f1a3b";
-    let cmd = format!("printf '\\033[?2026hResume this session with:\\nclaude --resume {ID}\\n'");
-    let mut t = Task::spawn(21, &cmd, &cmd, &here(), 24, 80, 2000, &sh_env(), no_waker()).unwrap();
-    t.harness = Some(&crate::harness::Claude);
+fn finalize_preview_lands_an_open_sync_frame() {
+    let cmd = "printf '\\033[?2026htest result: ok\\n'";
+    let mut t = Task::spawn(21, cmd, cmd, &here(), 24, 80, 2000, &sh_env(), no_waker()).unwrap();
     assert!(
         wait_until(Duration::from_secs(60), || {
             t.poll_exit().unwrap();
@@ -385,11 +384,13 @@ fn scrape_exit_hint_lands_an_open_sync_frame() {
         "child never exited"
     );
     assert!(
-        !grid(&t.parser).text_with_history().contains(ID),
-        "premise: the unclosed frame still buffers the hint at scrape time"
+        !grid(&t.parser).contents().contains("test result: ok"),
+        "premise: the unclosed frame still buffers the final output"
     );
-    t.scrape_exit_hint();
-    assert_eq!(t.scraped_id.as_deref(), Some(ID));
+    t.finalize_preview();
+    assert!(grid(&t.parser).contents().contains("test result: ok"));
+    let p = t.resolve_preview(Instant::now());
+    assert_eq!((p.text.as_str(), p.frozen), ("test result: ok", true));
 }
 
 /// Primary-screen finalization re-resolves: a final line that lands

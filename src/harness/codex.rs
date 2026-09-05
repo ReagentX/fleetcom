@@ -1,6 +1,5 @@
 //! Codex does not let the caller select an ID at launch. This harness instead
-//! injects a `notify` override, chains compatible configured notifiers, and
-//! scans supported exit lines for an ID.
+//! injects a `notify` override and chains compatible configured notifiers.
 
 use std::{
     fmt::Write as _,
@@ -10,7 +9,7 @@ use std::{
 
 use super::{
     CAPTURE_ENV, CapturePaths, Harness, Invocation, NOTIFY_CHAIN_ENV, SpawnPlan, capture_id,
-    home_root, last_hint, leading_uuid, resolve_home, shell_quote,
+    home_root, resolve_home, shell_quote,
 };
 
 pub struct Codex;
@@ -65,36 +64,6 @@ impl Harness for Codex {
             return None;
         }
         capture_id(&v, "thread-id")
-    }
-
-    fn scrape_exit(&self, text: &str) -> Option<String> {
-        let mut last = None;
-        for line in text.lines() {
-            // `Session ID:` has no program marker and can appear in captured
-            // conversation text. Accept it only at the start of a row.
-            if let Some(rest) = line.strip_prefix("Session ID: ")
-                && let Some(id) = leading_uuid(rest)
-            {
-                last = Some(id.to_string());
-            }
-            // Plain hint: `... run codex resume <uuid>`.
-            if let Some(id) = last_hint(line, &["codex resume "]) {
-                last = Some(id);
-            }
-            // Named-thread hint: `codex resume, then select <name> (<uuid>)`.
-            // Only the parenthesized ID is trusted, never the name.
-            if line.contains("codex resume") && line.contains("then select") {
-                for (i, _) in line.match_indices('(') {
-                    let inner = &line[i + 1..];
-                    if let Some(id) = leading_uuid(inner)
-                        && inner.as_bytes().get(36) == Some(&b')')
-                    {
-                        last = Some(id.to_string());
-                    }
-                }
-            }
-        }
-        last
     }
 }
 
@@ -229,8 +198,8 @@ mod tests {
 
     use super::*;
     use crate::{
-        harness::fixtures::{OTHER, assert_all_opaque, assert_corpus_scrape, paths},
-        testutil::{CORPUS_COLS, Scratch, temp},
+        harness::fixtures::{assert_all_opaque, paths},
+        testutil::{Scratch, temp},
     };
 
     /// Codex's own launch and resume commands carry v7 IDs; the shared v4
@@ -511,55 +480,6 @@ mod tests {
         assert_eq!(Codex.parse_capture("not json"), None);
     }
 
-    #[test]
-    fn scrape_exit_reads_both_hint_shapes_and_never_names() {
-        let plain = format!("To continue this session, run codex resume {ID}");
-        assert_eq!(Codex.scrape_exit(&plain).as_deref(), Some(ID));
-
-        let named = format!("To continue this session, run codex resume, then select docs ({ID})");
-        assert_eq!(Codex.scrape_exit(&named).as_deref(), Some(ID));
-
-        // A named form without an ID yields nothing.
-        assert_eq!(
-            Codex.scrape_exit("run codex resume, then select my-thread"),
-            None
-        );
-        assert_eq!(Codex.scrape_exit("codex resume my-thread"), None);
-
-        // The last hint wins.
-        let both = format!("run codex resume {OTHER}\n...\nrun codex resume, then select x ({ID})");
-        assert_eq!(Codex.scrape_exit(&both).as_deref(), Some(ID));
-    }
-
-    /// A fatal exit can name the session without printing a resume hint.
-    #[test]
-    fn scrape_exit_reads_the_fatal_session_id_line() {
-        assert_eq!(
-            Codex.scrape_exit(&format!("Session ID: {ID}")).as_deref(),
-            Some(ID)
-        );
-
-        // The label alone, a name, and a token-extending ID yield nothing.
-        assert_eq!(Codex.scrape_exit("Session ID:"), None);
-        assert_eq!(Codex.scrape_exit("Session ID: my session"), None);
-        assert_eq!(Codex.scrape_exit(&format!("Session ID: {ID}ff")), None);
-
-        // An indented or embedded label can be conversation text.
-        for quoted in [
-            format!("the log said Session ID: {ID}"),
-            format!("• Session ID: {ID}"),
-            format!("  Session ID: {ID}"),
-        ] {
-            assert_eq!(Codex.scrape_exit(&quoted), None, "{quoted:?}");
-        }
-
-        // Across lines, the last valid ID wins.
-        let hint_last = format!("Session ID: {OTHER}\nrun codex resume {ID}");
-        assert_eq!(Codex.scrape_exit(&hint_last).as_deref(), Some(ID));
-        let id_last = format!("run codex resume {OTHER}\nSession ID: {ID}");
-        assert_eq!(Codex.scrape_exit(&id_last).as_deref(), Some(ID));
-    }
-
     /// Notification chaining reads `config.toml` and ignores sibling files.
     #[test]
     fn config_notify_route_reads_config_toml_alone() {
@@ -580,24 +500,5 @@ mod tests {
         // Two assignment lines remain ambiguous.
         fs::write(&cfg, "notify = [\"/a\"]\nnotify = [\"/b\"]\n").unwrap();
         assert_eq!(config_notify_route(Some(&home)), NotifyRoute::Opaque);
-    }
-
-    /// A preceding full-width row does not merge with the session-ID row after
-    /// terminal emulation.
-    #[test]
-    fn fatal_session_id_holds_offset_zero_after_a_full_width_row() {
-        let bytes = format!("{}\r\nSession ID: {ID}\r\n", "x".repeat(CORPUS_COLS));
-        assert_corpus_scrape(&Codex, bytes.as_bytes(), ID);
-    }
-
-    /// The scraper recovers an SGR-split exit hint from the corpus bytes after
-    /// terminal emulation removes the styling.
-    #[test]
-    fn corpus_scrape_recovers_the_exit_hint_id() {
-        assert_corpus_scrape(
-            &Codex,
-            include_bytes!("../../tests/corpus/codex_resume.bin"),
-            "019f5453-de22-7240-b2e5-0d32692aa6d9",
-        );
     }
 }

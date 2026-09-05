@@ -10,7 +10,7 @@ use alacritty_terminal::{
     Term,
     event::{Event, EventListener},
     grid::{Dimensions, Row, Scroll},
-    index::{Column, Line},
+    index::Line,
     term::{
         Config, TermMode,
         cell::{Cell, Flags},
@@ -370,33 +370,6 @@ impl Emulator {
     /// Plain-text contents of the visible screen, one line per row.
     pub fn contents(&self) -> String {
         crate::ansi::contents(&self.term)
-    }
-
-    /// Reconstruct retained terminal text from the oldest history row through
-    /// the live viewport. Soft wraps join into logical lines, hard lines lose
-    /// trailing padding, and the current scroll offset does not affect output.
-    pub fn text_with_history(&self) -> String {
-        let grid = self.term.grid();
-        let top = -(grid.history_size() as i32);
-        let bottom = grid.screen_lines() as i32 - 1;
-        let last_col = grid.columns() - 1;
-        let mut out = String::new();
-        for row in top..=bottom {
-            let row_start = out.len();
-            let line = &grid[Line(row)];
-            push_row_glyphs(&mut out, line);
-            // A soft wrap continues on the next grid row.
-            if line[Column(last_col)].flags.contains(Flags::WRAPLINE) {
-                continue;
-            }
-            while out.len() > row_start && out.ends_with(' ') {
-                out.pop();
-            }
-            if row < bottom {
-                out.push('\n');
-            }
-        }
-        out
     }
 
     /// Which mouse events the child asked for; the most recent DECSET wins
@@ -1136,7 +1109,7 @@ mod tests {
         assert!(emu.contents().contains("and on"));
     }
 
-    /// The end-of-life landing `finish_output` exists for: BSU, a hint, no
+    /// The end-of-life landing `finish_output` exists for: BSU, output, no
     /// ESU ever. The frame must land without waiting out the sync timeout,
     /// and a clean emulator must pass through untouched.
     #[test]
@@ -1149,12 +1122,12 @@ mod tests {
 
         emu.process(b"before\x1b[?2026hafter");
         assert!(
-            !emu.text_with_history().contains("after"),
+            !emu.contents().contains("after"),
             "premise: the unclosed frame buffers the text"
         );
         emu.finish_output();
         assert!(
-            emu.text_with_history().contains("after"),
+            emu.contents().contains("after"),
             "finish_output must land the frame with the timeout still pending"
         );
 
@@ -1240,77 +1213,6 @@ mod tests {
         assert_eq!(emu.scrollback(), 9, "over-scroll clamps at history");
         emu.set_scrollback(0);
         assert_eq!(emu.scrollback(), 0);
-    }
-
-    /// Retained text includes scrollback in chronological order and does not
-    /// change when the viewport scroll offset changes.
-    #[test]
-    fn text_with_history_includes_scrolled_off_rows() {
-        let mut emu = Emulator::new(4, 10, 100);
-        for i in 0..12 {
-            emu.process(format!("l{i}\r\n").as_bytes());
-        }
-        // 12 newlines on a 4-row screen: the first rows are history now.
-        assert!(!emu.contents().contains("l0"));
-        let full = emu.text_with_history();
-        assert!(full.starts_with("l0"), "oldest history row leads");
-        assert!(full.contains("l11"), "the live screen is included");
-        // 9 history rows plus the 4-row viewport, one line per row.
-        assert_eq!(full.split('\n').count(), 13);
-        // The view offset must not change what is reported.
-        emu.set_scrollback(usize::MAX);
-        assert_eq!(emu.text_with_history(), full);
-    }
-
-    /// Soft wraps reconstruct one logical line without erasing explicit line
-    /// breaks.
-    #[test]
-    fn text_with_history_joins_soft_wrapped_rows() {
-        let mut emu = Emulator::new(6, 20, 100);
-        let hint = "claude --resume 123e4567-e89b-42d3-a456-426614174000";
-        emu.process(format!("before\r\n{hint}\r\nafter").as_bytes());
-        let full = emu.text_with_history();
-        assert!(
-            full.contains(hint),
-            "52 chars over 3 rows at 20 columns must come back unbroken: {full:?}"
-        );
-        // Explicit newlines still bound logical lines on both sides.
-        assert!(full.contains(&format!("before\n{hint}\nafter")));
-    }
-
-    /// A wrapped codex named-thread hint remains one logical line.
-    #[test]
-    fn text_with_history_joins_codex_hint_across_rows() {
-        let mut emu = Emulator::new(8, 40, 100);
-        let hint = "To continue this session, run codex resume, then select \
-                    mythic-otter (123e4567-e89b-42d3-a456-426614174000)";
-        emu.process(hint.as_bytes());
-        assert!(
-            emu.text_with_history().contains(hint),
-            "the hint spans 3 rows at 40 columns and must join unbroken"
-        );
-    }
-
-    /// Wrap markers travel with rows into scrollback: a wrapped line pushed
-    /// off the live screen still joins, including across the history to
-    /// viewport boundary.
-    #[test]
-    fn text_with_history_joins_wrapped_rows_in_scrollback() {
-        let mut emu = Emulator::new(4, 20, 100);
-        let hint = "claude --resume 123e4567-e89b-42d3-a456-426614174000";
-        emu.process(format!("{hint}\r\n").as_bytes());
-        for i in 0..6 {
-            emu.process(format!("pad {i}\r\n").as_bytes());
-        }
-        let full = emu.text_with_history();
-        assert!(
-            !emu.contents().contains("claude"),
-            "premise: the hint scrolled fully into history"
-        );
-        assert!(
-            full.contains(hint),
-            "history rows keep their wrap markers: {full:?}"
-        );
     }
 
     /// Top-anchored region scrollback remains reachable after shrinking and

@@ -3,7 +3,7 @@
 Synthetic escape sequences isolate parser rules, but they do not reproduce the
 state transitions emitted by real terminal programs. This corpus keeps their
 raw PTY output so the emulator tests can replay those transitions byte for
-byte. The fixtures provide the evidence for display, parser, and resume-hint
+byte. The fixtures provide the evidence for display and parser
 assertions that would otherwise depend on synthetic approximations.
 
 ## Capture method
@@ -15,10 +15,9 @@ feed the bytes to the emulator verbatim.
 
 | Fixture | Scenario | Coverage |
 | --- | --- | --- |
-| `claude_resume.bin` | `claude --session-id`: one prompt, reply, `/exit` | alternate-screen exit followed by the primary-screen resume hint (`claude --resume <uuid>`); the scrape target for harness exit capture |
-| `codex_resume.bin` | `codex resume` | top-anchored DECSTBM scroll regions (`CSI 1;N r`), reverse index, inline-TUI history insertion, and an SGR-split resume hint for harness exit capture |
-| `grok_resume.bin` | `grok --session-id`: one prompt, reply, `/exit` | primary-screen exit followed by the resume hint (`grok --resume <uuid>`); the scrape target for harness exit capture |
-| `omp_resume.bin` | `omp`: one launch, `/exit` | primary-screen exit followed by the resume hint (`omp --resume <uuid>`); the scrape target for harness exit capture |
+| `claude_resume.bin` | `claude --session-id`: one prompt, reply, `/exit` | alternate-screen teardown and final primary-screen display |
+| `codex_resume.bin` | `codex resume` | top-anchored DECSTBM scroll regions (`CSI 1;N r`), reverse index, inline-TUI history insertion, and SGR-styled exit output |
+| `grok_resume.bin` | `grok --session-id`: one prompt, reply, `/exit` | final primary-screen display |
 | `tmux_split.bin` | `tmux` session with two splits and one command per pane | scroll regions, pane borders, full redraws |
 | `vim_session.bin` | `vim -u NONE`: insert, navigate, `:set number`, `:q!` | alternate screen, cursor addressing, line editing |
 | `less_altscreen.bin` | `less` over `/usr/share/dict/words`: page, `G`, `g`, `q` | alternate-screen entry and exit, full-screen paging |
@@ -96,7 +95,7 @@ status rows carry a streamed intent phrase rather than omp's default
 
 ## What the fixtures prove
 
-The fixtures provide evidence for three distinct boundaries:
+The fixtures provide evidence for display and parser behavior:
 
 - `tmux_split`, `vim_session`, `less_altscreen`, `top_live`, `shell_colors`,
   and `build_log` pin displayed state: every plain-text row, the cursor, and
@@ -104,10 +103,9 @@ The fixtures provide evidence for three distinct boundaries:
 - `codex_resume`, `wide_emoji`, `dec_scrollregion`, and `topregion_scroll` pin
   parser semantics: scrollback retention, intensity stacking, charset
   translation, and VS16 width.
-- `claude_resume`, `codex_resume`, `grok_resume`, and `omp_resume` verify that
-  retained terminal text preserves the exit hints consumed by their harnesses.
+- `claude_resume`, `codex_resume`, and `grok_resume` compare the emulator's
+  final display, cursor, and alternate-screen state with the terminal backend.
 
-`src/golden.rs` contains the absolute display and parser expectations.
-`src/harness/claude.rs`, `src/harness/codex.rs`, `src/harness/grok.rs`, and
-`src/harness/omp.rs` contain the agent-resume scrape expectations.
-`src/harness/summary.rs` contains the preview-fixture expectations.
+`src/terminal/golden.rs` contains the absolute display and parser expectations
+and the terminal-backend comparisons. `src/harness/summary_tests.rs` contains
+the preview-fixture expectations.

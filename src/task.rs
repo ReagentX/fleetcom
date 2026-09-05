@@ -105,16 +105,11 @@ pub struct Task {
     pub summary_adapter: Option<&'static dyn crate::preview::SummaryAdapter>,
     /// Run number used to give each rerun a distinct capture path.
     pub run: u32,
-    /// Session ID injected or recognized at spawn. Capture data, a live
-    /// registry record, or an exit hint can supersede it.
+    /// Session ID injected or recognized at spawn. Capture data or a live
+    /// registry record can supersede it.
     pub resume_id: Option<String>,
     /// Capture path allocated for this task run.
     pub capture_file: Option<PathBuf>,
-    /// Session ID scraped once from final terminal text after exit and reader
-    /// EOF.
-    pub scraped_id: Option<String>,
-    /// Whether the one-shot full-history exit scrape has run.
-    scraped: bool,
     /// Dashboard-preview resolution state; resets with the task on rerun
     /// because a rerun replaces the whole `Task`.
     preview: PreviewState,
@@ -348,8 +343,6 @@ impl Task {
             run: 0,
             resume_id: None,
             capture_file: None,
-            scraped_id: None,
-            scraped: false,
             preview: PreviewState::new(),
             blocked: None,
             blocked_probed: None,
@@ -398,29 +391,7 @@ impl Task {
         self.finished.is_some() && self.handle.as_ref().is_none_or(JoinHandle::is_finished)
     }
 
-    /// Scrape at most one exit hint after the process exits and the PTY reader
-    /// reaches EOF (see [`Task::output_complete`]).
-    pub fn scrape_exit_hint(&mut self) {
-        let Some(h) = self.harness else { return };
-        if self.scraped || !self.output_complete() {
-            return;
-        }
-        self.scraped = true;
-        let text = {
-            let mut emu = grid(&self.parser);
-            // Land any open synchronized frame before scraping. The reader is
-            // stopped, so no closing ESU can arrive; all slave fds are closed,
-            // so generated probe replies have no recipient.
-            let _ = emu.finish_output();
-            emu.text_with_history()
-        };
-        if let Some(id) = h.scrape_exit(&text) {
-            self.scraped_id = Some(id);
-        }
-    }
-
-    /// Report whether the reader reached EOF. Tests use this second scrape gate
-    /// without driving the reap loop.
+    /// Report whether the reader reached EOF without driving the reap loop.
     #[cfg(test)]
     pub(crate) fn reader_done(&self) -> bool {
         self.handle.as_ref().is_none_or(|h| h.is_finished())

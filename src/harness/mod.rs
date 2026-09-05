@@ -9,7 +9,7 @@
 //!
 //! # Security invariant
 //!
-//! Every ID returned by `parse_capture`, `scrape_exit`, or `live_session_id`
+//! Every ID returned by `parse_capture` or `live_session_id`
 //! eventually enters a shell command. These methods return only
 //! strings accepted by [`is_uuid`]; free text, paths, and malformed IDs yield
 //! `None`. Summary adapters and `live_blocked_status` are display-only.
@@ -76,9 +76,6 @@ pub trait Harness: Sync {
     fn parse_capture(&self, _payload: &str) -> Option<String> {
         None
     }
-
-    /// Extract a session ID from final terminal text, including scrollback.
-    fn scrape_exit(&self, text: &str) -> Option<String>;
 
     /// Read the current session ID from the tool's on-disk registry. `pid`,
     /// `cwd`, and `spawned` identify the task; implementations must reject a
@@ -277,33 +274,6 @@ fn capture_id(v: &jzon::JsonValue, key: &str) -> Option<String> {
     is_uuid(id).then(|| id.to_string())
 }
 
-/// Return the strict UUID at the start of `s`. The next byte must end the token;
-/// an alphanumeric character, `-`, or `_` extends the token and rejects it.
-fn leading_uuid(s: &str) -> Option<&str> {
-    let head = s.get(..36).filter(|h| is_uuid(h))?;
-    match s.as_bytes().get(36) {
-        Some(&c) if c.is_ascii_alphanumeric() || c == b'-' || c == b'_' => None,
-        _ => Some(head),
-    }
-}
-
-/// Extract the ID after the last valid resume hint in `text`. Every
-/// occurrence of every `hints` prefix competes when a strict UUID follows it,
-/// and the largest byte offset wins across prefixes.
-fn last_hint(text: &str, hints: &[&str]) -> Option<String> {
-    let mut last: Option<(usize, String)> = None;
-    for hint in hints {
-        for (i, _) in text.match_indices(hint) {
-            if let Some(id) = leading_uuid(&text[i + hint.len()..])
-                && last.as_ref().is_none_or(|(j, _)| i > *j)
-            {
-                last = Some((i, id.to_string()));
-            }
-        }
-    }
-    last.map(|(_, id)| id)
-}
-
 /// Generate a v4 UUID from `/dev/urandom`. A read failure returns `None`, which
 /// lets the caller launch without pinning an ID.
 fn uuid_v4() -> Option<String> {
@@ -344,17 +314,16 @@ fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
-/// Fixtures and assertions for harness detection and exit scraping.
+/// Fixtures and assertions for harness detection and capture.
 #[cfg(test)]
 pub(crate) mod fixtures {
     use std::path::PathBuf;
 
     use super::{CapturePaths, Harness};
-    use crate::testutil::corpus_emulator;
 
     /// Strict v4 UUID used wherever a valid session ID is needed.
     pub(crate) const ID: &str = "c8c4a5cc-0b32-4ba0-a6b4-6ed08c218e0d";
-    /// A second distinct ID for last-hint, requote, and ambiguity cases.
+    /// A second distinct ID for requote and precedence cases.
     pub(crate) const OTHER: &str = "11111111-2222-4333-8444-555555555555";
 
     /// Capture-path fixture. The spaced asset paths keep the shell- and
@@ -376,14 +345,6 @@ pub(crate) mod fixtures {
             let resumed = h.resume_command(cmd, id);
             assert_eq!(resumed, *cmd, "an opaque command must never be rewritten");
         }
-    }
-
-    /// Replay `bytes` at corpus geometry and assert the scraped exit ID.
-    pub(super) fn assert_corpus_scrape(h: &dyn Harness, bytes: &[u8], expected: &str) {
-        let mut emu = corpus_emulator();
-        emu.process(bytes);
-        let text = emu.text_with_history();
-        assert_eq!(h.scrape_exit(&text).as_deref(), Some(expected));
     }
 }
 
@@ -502,19 +463,6 @@ mod tests {
         assert!(!is_uuid("my session name"));
         assert!(!is_uuid("/tmp/evil; rm -rf ~"));
         assert!(!is_uuid(""));
-    }
-
-    #[test]
-    fn leading_uuid_requires_a_token_boundary() {
-        assert_eq!(leading_uuid(ID), Some(ID));
-        assert_eq!(leading_uuid(&format!("{ID} tail")), Some(ID));
-        assert_eq!(leading_uuid(&format!("{ID})")), Some(ID));
-
-        // A continuing token is not an id.
-        assert_eq!(leading_uuid(&format!("{ID}f")), None);
-        assert_eq!(leading_uuid(&format!("{ID}-x")), None);
-        assert_eq!(leading_uuid(&format!("{ID}_x")), None);
-        assert_eq!(leading_uuid("short"), None);
     }
 
     #[test]

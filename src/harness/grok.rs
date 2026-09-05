@@ -1,10 +1,9 @@
 //! Grok has no injectable live-capture channel. Bare launches instead pin a v4
-//! UUID, and completed tasks expose either `grok -r <uuid>` or
-//! `grok --resume <uuid>` in terminal output.
+//! UUID; canonical resume commands retain their explicit ID.
 
 use std::path::Path;
 
-use super::{CapturePaths, Harness, Invocation, SpawnPlan, last_hint, pin_plan};
+use super::{CapturePaths, Harness, Invocation, SpawnPlan, pin_plan};
 
 pub struct Grok;
 
@@ -22,18 +21,13 @@ impl Harness for Grok {
     ) -> SpawnPlan {
         pin_plan(inv)
     }
-
-    fn scrape_exit(&self, text: &str) -> Option<String> {
-        // The last valid short or long resume hint names the conversation.
-        last_hint(text, &["grok -r ", "grok --resume "])
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::harness::{
-        fixtures::{ID, OTHER, assert_all_opaque, assert_corpus_scrape, paths},
+        fixtures::{ID, assert_all_opaque, paths},
         is_uuid,
     };
 
@@ -86,35 +80,5 @@ mod tests {
         let payload = format!(r#"{{"session_id":"{ID}"}}"#);
         assert_eq!(Grok.parse_capture(&payload), None);
         assert_eq!(Grok.parse_capture(""), None);
-    }
-
-    #[test]
-    fn scrape_exit_reads_both_spellings_and_takes_the_last() {
-        let short = format!("Resume with: grok -r {ID}");
-        assert_eq!(Grok.scrape_exit(&short).as_deref(), Some(ID));
-        let long = format!("Resume with: grok --resume {ID}");
-        assert_eq!(Grok.scrape_exit(&long).as_deref(), Some(ID));
-
-        // The last hint by position wins across spellings, either order.
-        let both = format!("grok -r {OTHER}\n...\ngrok --resume {ID}\n");
-        assert_eq!(Grok.scrape_exit(&both).as_deref(), Some(ID));
-        let both = format!("grok --resume {OTHER}\n...\ngrok -r {ID}\n");
-        assert_eq!(Grok.scrape_exit(&both).as_deref(), Some(ID));
-
-        assert_eq!(Grok.scrape_exit("no hint here"), None);
-        // A hint whose ID fails validation returns nothing.
-        assert_eq!(Grok.scrape_exit("grok -r NOT-A-UUID"), None);
-        // A longer hexadecimal run is not an ID.
-        assert_eq!(Grok.scrape_exit(&format!("grok -r {ID}ff")), None);
-    }
-
-    /// The scraper recovers the exit-hint ID from the corpus terminal bytes.
-    #[test]
-    fn corpus_scrape_recovers_the_exit_hint_id() {
-        assert_corpus_scrape(
-            &Grok,
-            include_bytes!("../../tests/corpus/grok_resume.bin"),
-            "17ac97af-8cfc-46a7-9599-8cea45a687a6",
-        );
     }
 }

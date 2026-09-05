@@ -133,13 +133,10 @@ fn fnv1a_hex(bytes: &[u8]) -> String {
     format!("{h:016x}")
 }
 
-/// Resolve the session ID in precedence order: exit scrape, capture file, live
-/// registry, then spawn-time ID. The first three can reflect a session selected
+/// Resolve the session ID in precedence order: capture file, live registry,
+/// then spawn-time ID. The first two can reflect a session selected
 /// after launch and therefore outrank the spawn-time value.
 fn current_resume_id(task: &Task) -> Option<String> {
-    if let Some(id) = &task.scraped_id {
-        return Some(id.clone());
-    }
     if let (Some(h), Some(path)) = (task.harness, &task.capture_file)
         && let Ok(payload) = std::fs::read_to_string(path)
         && let Some(id) = h.parse_capture(&payload)
@@ -157,14 +154,6 @@ fn current_resume_id(task: &Task) -> Option<String> {
         return Some(id);
     }
     task.resume_id.clone()
-}
-
-/// Poll for exit before save or rerun reads the session ID. Scraping remains
-/// deferred until the PTY reader reaches EOF and the terminal contains every
-/// child byte.
-fn scrape_now(t: &mut Task) {
-    let _ = t.poll_exit();
-    t.scrape_exit_hint();
 }
 
 /// Resolve harness configuration from the task's launch environment.
@@ -446,16 +435,13 @@ impl Supervisor {
             // latched this pass and is retried next. waitid failing is rare and
             // must not take down the loop.
             let _ = t.poll_exit();
-            // Scrape after process exit and reader EOF, when every child byte
-            // is present in the grid (see `Task::scrape_exit_hint`).
-            t.scrape_exit_hint();
             // Freeze the preview from the complete output and final screen.
             t.finalize_preview();
             if t.overdue(now, self.kill_grace) {
                 t.force_kill();
             }
         }
-        // Removed tasks need exit handling and escalation, not hint scraping.
+        // Removed tasks still need exit handling and escalation.
         for t in &mut self.graveyard {
             let _ = t.poll_exit();
             if t.overdue(now, self.kill_grace) {
@@ -605,8 +591,7 @@ impl Supervisor {
             self.recovery.dirty = false;
             return;
         };
-        // Refresh finished tasks' resume IDs before serialization.
-        let cfg = self.refreshed_config();
+        let cfg = self.session_config();
         // Exclude the timestamped label from content comparison.
         let hash = fnv1a_hex(session::fingerprint_json(&cfg).as_bytes());
         // Deduplication is scoped to the current root and requires the snapshot
@@ -850,9 +835,8 @@ impl Supervisor {
             self.status(format!("rerun failed: no task {id}"));
             return;
         };
-        // Latch a recent exit and scrape its drained terminal before choosing
-        // the rerun command.
-        scrape_now(&mut self.tasks[i]);
+        // A task can exit between the last reap tick and this request.
+        let _ = self.tasks[i].poll_exit();
         if self.tasks[i].finished.is_none() {
             self.status("rerun failed: task is still running");
             return;
@@ -886,14 +870,6 @@ impl Supervisor {
             }
             Err(e) => self.status(format!("spawn failed: {e}")),
         }
-    }
-
-    /// Refresh finished tasks' resume IDs before building the session recipe.
-    fn refreshed_config(&mut self) -> SessionConfig {
-        for t in &mut self.tasks {
-            scrape_now(t);
-        }
-        self.session_config()
     }
 
     /// Build `{dir: [entries]}` in spawn order. Groups and names remain intact;
@@ -940,7 +916,7 @@ impl Supervisor {
     }
 
     fn save_session(&mut self, name: &str) {
-        let cfg = self.refreshed_config();
+        let cfg = self.session_config();
         let count: usize = cfg.values().map(Vec::len).sum();
         let status = match self
             .sessions_root()

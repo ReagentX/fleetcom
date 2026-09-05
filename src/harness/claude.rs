@@ -1,6 +1,6 @@
 //! Claude session capture uses a launch-time `--session-id`, a `SessionStart`
-//! hook, the live session registry, and the exit-time resume hint. Bare launches
-//! pin a v4 UUID; accepted launches install the hook through `--settings`.
+//! hook, and the live session registry. Bare launches pin a v4 UUID; accepted
+//! launches install the hook through `--settings`.
 //! Live lookup reads `<claude-home>/sessions/<pid>.json`.
 
 use std::{
@@ -12,7 +12,7 @@ use std::{
 use super::summary::AWAITING_APPROVAL;
 use super::{
     CAPTURE_ENV, CapturePaths, Harness, Invocation, SpawnPlan, capture_id, home_root, is_uuid,
-    last_hint, pin_plan, resolve_home, shell_quote,
+    pin_plan, resolve_home, shell_quote,
 };
 
 pub struct Claude;
@@ -46,11 +46,6 @@ impl Harness for Claude {
 
     fn parse_capture(&self, payload: &str) -> Option<String> {
         capture_id(&jzon::parse(payload).ok()?, "session_id")
-    }
-
-    fn scrape_exit(&self, text: &str) -> Option<String> {
-        // The last valid hint names the conversation at exit.
-        last_hint(text, &["claude --resume "])
     }
 
     fn live_session_id(
@@ -153,7 +148,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        harness::fixtures::{ID, OTHER, assert_all_opaque, assert_corpus_scrape, paths},
+        harness::fixtures::{ID, OTHER, assert_all_opaque, paths},
         testutil::temp,
     };
 
@@ -261,21 +256,6 @@ mod tests {
         );
         assert_eq!(Claude.parse_capture("not json"), None);
         assert_eq!(Claude.parse_capture("{}"), None);
-    }
-
-    #[test]
-    fn scrape_exit_takes_the_last_hint() {
-        let text = format!(
-            "Resume this session with:\nclaude --resume {OTHER}\n...\n\
-             Resume this session with:\nclaude --resume {ID}\n"
-        );
-        assert_eq!(Claude.scrape_exit(&text).as_deref(), Some(ID));
-
-        assert_eq!(Claude.scrape_exit("no hint here"), None);
-        // A hint whose ID fails validation returns nothing.
-        assert_eq!(Claude.scrape_exit("claude --resume NOT-A-UUID"), None);
-        // A longer hexadecimal run is not an ID.
-        assert_eq!(Claude.scrape_exit(&format!("claude --resume {ID}ff")), None);
     }
 
     /// A complete matching record exposes its validated session ID.
@@ -524,16 +504,6 @@ mod tests {
         assert_eq!(
             Claude.live_blocked_status(9, cwd, spawned, Some(&home)),
             None
-        );
-    }
-
-    /// The scraper recovers the exit-hint ID from the corpus terminal bytes.
-    #[test]
-    fn corpus_scrape_recovers_the_exit_hint_id() {
-        assert_corpus_scrape(
-            &Claude,
-            include_bytes!("../../tests/corpus/claude_resume.bin"),
-            "c8c4a5cc-0b32-4ba0-a6b4-6ed08c218e0d",
         );
     }
 }

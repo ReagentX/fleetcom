@@ -283,12 +283,7 @@ fn rerun_resumes_the_captured_conversation() {
 fn rerun_cannot_read_the_old_runs_stale_capture() {
     let dir = scratch("cap_stale_run");
     let (bin, runtime, config) = (dir.join("bin"), dir.join("run"), dir.join("config"));
-    // The session drifts to CAP_ID mid-run and the exit hint reports it.
-    install_script(
-        &bin,
-        "claude",
-        &format!("printf 'Resume this session with:\\nclaude --resume {CAP_ID}\\n'"),
-    );
+    install_stub(&bin, "claude", &dir);
     let mut s = sup_ctx(agent_ctx_plus(
         &bin,
         &runtime,
@@ -297,16 +292,15 @@ fn rerun_cannot_read_the_old_runs_stale_capture() {
     ));
     spawn(&mut s, "claude", dir.to_path_buf());
     let id = s.tasks[0].id;
-    // The capture file still holds the pre-drift session.
+    // The old run's final capture becomes the new run's launch ID.
     let stale = format!(
         r#"{{"session_id":"{CAP_OTHER}","hook_event_name":"SessionStart","source":"startup"}}"#
     );
     let old_cap = s.tasks[0].capture_file.clone().expect("capture file set");
-    std::fs::write(&old_cap, &stale).unwrap();
+    std::fs::write(&old_cap, format!(r#"{{"session_id":"{CAP_ID}"}}"#)).unwrap();
     assert!(reap_until(&mut s, Duration::from_secs(5), |s| s.tasks[0]
-        .scraped_id
+        .finished
         .is_some()));
-    assert_eq!(s.tasks[0].scraped_id.as_deref(), Some(CAP_ID));
 
     s.apply(Command::Restart { id });
     let new_cap = s.tasks[0].capture_file.clone().expect("capture file set");
@@ -574,262 +568,170 @@ fn spawn_omp_loads_the_capture_extension() {
     assert!(t.resume_id.is_none(), "omp cannot pin an id at launch");
 }
 
-/// A `grok` exit hint becomes the session ID used by the saved recipe.
-/// The spawn pin stays; scrape must outrank it.
+/// Printed hints are display content even after exit and reader EOF. Named
+/// saves, recovery snapshots, and reruns retain the capture or launch ID; an
+/// uncaptured task retains its exact authored command.
 #[test]
-fn grok_exit_hint_is_scraped_and_saved_as_a_resume() {
-    let dir = scratch("grok_scrape_exit");
-    let (bin, runtime, config) = (dir.join("bin"), dir.join("run"), dir.join("config"));
-    install_script(
-        &bin,
-        "grok",
-        &format!("printf 'Resume this session with:\\ngrok --resume {CAP_ID}\\n'"),
-    );
-    let mut s = sup_ctx(agent_ctx_plus(
-        &bin,
-        &runtime,
-        dir.to_path_buf(),
-        &[("FLEETCOM_CONFIG_DIR", &config)],
-    ));
-    spawn(&mut s, "grok", dir.to_path_buf());
-    assert!(reap_until(&mut s, Duration::from_secs(5), |s| s.tasks[0]
-        .scraped_id
-        .is_some()));
-    assert_eq!(s.tasks[0].scraped_id.as_deref(), Some(CAP_ID));
-    assert!(
-        s.tasks[0].resume_id.is_some(),
-        "the spawn pin stays; scrape must outrank it"
-    );
-    assert_ne!(s.tasks[0].resume_id.as_deref(), Some(CAP_ID));
-
-    let text = save_and_read(&mut s, &config, "hint");
-    assert!(
-        text.contains(&format!("grok --resume '{CAP_ID}'")),
-        "the recipe must resume the scraped session; got {text}"
-    );
+fn printed_resume_hints_do_not_change_saved_recovery_or_rerun_commands() {
+    for (tool, hints) in [
+        (
+            "claude",
+            format!("Resume this session with:\nclaude --resume {CAP_ID}\n"),
+        ),
+        (
+            "codex",
+            format!(
+                "To continue this session, run codex resume {CAP_ID}\n\
+                 To continue this session, run codex resume, then select docs ({CAP_ID})\n\
+                 Session ID: {CAP_ID}\n"
+            ),
+        ),
+        (
+            "grok",
+            format!("grok -r {CAP_ID}\ngrok --resume {CAP_ID}\n"),
+        ),
+        (
+            "omp",
+            format!(
+                "Resume this session with omp --resume {CAP_ID}\n\
+                 [Recovery]\n  Main: omp --resume {CAP_ID}\n"
+            ),
+        ),
+    ] {
+        let dir = scratch(tool);
+        let (bin, runtime, config) = (dir.join("bin"), dir.join("run"), dir.join("config"));
+        install_script(&bin, tool, &format!("printf '%s' '{hints}'"));
+        let mut s = sup_ctx(agent_ctx_plus(
+            &bin,
+            &runtime,
+            dir.to_path_buf(),
+            &[
+                ("FLEETCOM_CONFIG_DIR", &config),
+                ("CLAUDE_CONFIG_DIR", &dir.join("claude-home")),
+                ("CODEX_HOME", &dir.join("codex-home")),
+            ],
+        ));
+        s.set_recovery_timing(Duration::from_millis(20), Duration::from_millis(100));
+        let authored = format!("  {}/{}\t", bin.display(), tool);
+        spawn(&mut s, &authored, dir.to_path_buf());
+        s.tasks[0].group = Some("agents".into());
+        s.tasks[0].name = Some(tool.into());
+        let expected_id = match tool {
+            "claude" => {
+                std::fs::write(
+                    s.tasks[0].capture_file.as_ref().unwrap(),
+                    format!(r#"{{"session_id":"{CAP_OTHER}"}}"#),
+                )
+                .unwrap();
+                Some(CAP_OTHER.to_string())
+            }
+            "grok" => s.tasks[0].resume_id.clone(),
+            _ => None,
+        };
+        assert_ne!(expected_id.as_deref(), Some(CAP_ID));
+        let command = match expected_id.as_deref() {
+            Some(id) => format!("{}/{} --resume '{id}'", bin.display(), tool),
+            None => authored,
+        };
+        assert!(
+            reap_until(&mut s, Duration::from_secs(5), |s| {
+                s.tasks[0].finished.is_some() && s.tasks[0].reader_done()
+            }),
+            "{tool}: output never completed"
+        );
+        // EOF can become visible after this pass's per-task work.
+        s.reap();
+        assert!(
+            s.tasks[0]
+                .screen_lines()
+                .iter()
+                .any(|line| line.contains(CAP_ID)),
+            "{tool}: the printed UUID must reach the terminal"
+        );
+        let expected = SessionConfig::from([(
+            path::abbreviate(&dir),
+            vec![SessionEntry {
+                cmd: command.clone(),
+                group: Some("agents".into()),
+                name: Some(tool.into()),
+            }],
+        )]);
+        save_and_read(&mut s, &config, "hints");
+        assert_eq!(
+            session::load_in(&config.join("sessions"), "hints").unwrap(),
+            expected,
+            "{tool}: named save"
+        );
+        assert!(
+            wait_until(Duration::from_secs(5), || {
+                s.tick();
+                !recovery_files(&config).is_empty()
+            }),
+            "{tool}: recovery snapshot never landed"
+        );
+        let files = recovery_files(&config);
+        assert_eq!(files.len(), 1);
+        let stem = files[0].strip_suffix(".json").unwrap();
+        assert_eq!(
+            session::load_recovery_in(&config.join("sessions/recovery"), stem).unwrap(),
+            expected,
+            "{tool}: recovery"
+        );
+        let id = s.tasks[0].id;
+        s.apply(Command::Restart { id });
+        assert_eq!(s.tasks[0].run, 1, "{tool}: rerun must replace the task");
+        assert_eq!(s.tasks[0].command, command, "{tool}: rerun command");
+        assert_eq!(s.tasks[0].resume_id, expected_id, "{tool}: rerun ID");
+    }
 }
 
-/// Saving between process exit and the next reap tick still captures the
-/// grok exit hint because `save_session` performs its own ready scrape.
+/// Rerun latches a recent exit before checking eligibility and retains the
+/// explicit launch ID when terminal output names another conversation.
 #[test]
-fn save_scrapes_a_finished_grok_task_without_reap() {
-    let dir = scratch("grok_save_sync_scrape");
-    let (bin, runtime, config) = (dir.join("bin"), dir.join("run"), dir.join("config"));
-    install_script(
-        &bin,
-        "grok",
-        &format!("printf 'Resume this session with:\\ngrok --resume {CAP_ID}\\n'"),
-    );
-    let mut s = sup_ctx(agent_ctx_plus(
-        &bin,
-        &runtime,
-        dir.to_path_buf(),
-        &[("FLEETCOM_CONFIG_DIR", &config)],
-    ));
-    spawn(&mut s, "grok", dir.to_path_buf());
-
-    assert!(
-        wait_until(Duration::from_secs(5), || s.tasks[0].reader_done()),
-        "the stub never reached EOF"
-    );
-    assert!(s.tasks[0].finished.is_none(), "no reap may have run yet");
-
-    let text = save_and_read(&mut s, &config, "syncsave");
-    assert!(
-        text.contains(&format!("grok --resume '{CAP_ID}'")),
-        "save must scrape the finished task itself; got {text}"
-    );
-    assert_eq!(s.tasks[0].scraped_id.as_deref(), Some(CAP_ID));
-}
-
-/// Rerunning between process exit and the next reap tick latches the exit,
-/// scrapes the grok hint, and resumes that session.
-#[test]
-fn rerun_scrapes_a_finished_grok_task_without_reap() {
-    let dir = scratch("grok_rerun_sync_scrape");
-    let (bin, runtime, config) = (dir.join("bin"), dir.join("run"), dir.join("config"));
-    install_script(
-        &bin,
-        "grok",
-        &format!("printf 'Resume this session with:\\ngrok --resume {CAP_ID}\\n'"),
-    );
-    let mut s = sup_ctx(agent_ctx_plus(
-        &bin,
-        &runtime,
-        dir.to_path_buf(),
-        &[("FLEETCOM_CONFIG_DIR", &config)],
-    ));
-    spawn(&mut s, "grok", dir.to_path_buf());
-    let id = s.tasks[0].id;
-
-    assert!(
-        wait_until(Duration::from_secs(5), || s.tasks[0].reader_done()),
-        "the stub never reached EOF"
-    );
-    assert!(s.tasks[0].finished.is_none(), "no reap may have run yet");
-
-    s.apply(Command::Restart { id });
-    assert_eq!(
-        s.tasks[0].command,
-        format!("grok --resume '{CAP_ID}'"),
-        "rerun must compute its resume command from the exit scrape"
-    );
-}
-
-/// A `claude` exit hint becomes the session ID used by the saved recipe.
-#[test]
-fn exit_hint_is_scraped_and_saved_as_a_resume() {
-    let dir = scratch("scrape_exit");
-    let (bin, runtime, config) = (dir.join("bin"), dir.join("run"), dir.join("config"));
-    install_script(
-        &bin,
-        "claude",
-        &format!("printf 'Resume this session with:\\nclaude --resume {CAP_ID}\\n'"),
-    );
-    let mut s = sup_ctx(agent_ctx_plus(
-        &bin,
-        &runtime,
-        dir.to_path_buf(),
-        &[("FLEETCOM_CONFIG_DIR", &config)],
-    ));
-    spawn(&mut s, "claude", dir.to_path_buf());
-    // No pre-exit synchronization: the scrape's reader-EOF gate means
-    // reap can run against the exiting stub at any point and the hint
-    // still lands.
-    assert!(reap_until(&mut s, Duration::from_secs(5), |s| s.tasks[0]
-        .scraped_id
-        .is_some()));
-    assert_eq!(s.tasks[0].scraped_id.as_deref(), Some(CAP_ID));
-
-    let text = save_and_read(&mut s, &config, "hint");
-    assert!(
-        text.contains(&format!("claude --resume '{CAP_ID}'")),
-        "the recipe must resume the scraped session; got {text}"
-    );
-}
-
-/// Saving between process exit and the next reap tick still captures the
-/// exit hint because `save_session` performs its own ready scrape.
-#[test]
-fn save_scrapes_a_finished_task_without_reap() {
-    let dir = scratch("save_sync_scrape");
-    let (bin, runtime, config) = (dir.join("bin"), dir.join("run"), dir.join("config"));
-    install_script(
-        &bin,
-        "claude",
-        &format!("printf 'Resume this session with:\\nclaude --resume {CAP_ID}\\n'"),
-    );
-    let mut s = sup_ctx(agent_ctx_plus(
-        &bin,
-        &runtime,
-        dir.to_path_buf(),
-        &[("FLEETCOM_CONFIG_DIR", &config)],
-    ));
-    spawn(&mut s, "claude", dir.to_path_buf());
-
-    // Wait out only the residual reader-drain race: after EOF the sole
-    // remaining gate is the exit latch, which save's own pass must flip.
-    assert!(
-        wait_until(Duration::from_secs(5), || s.tasks[0].reader_done()),
-        "the stub never reached EOF"
-    );
-    assert!(s.tasks[0].finished.is_none(), "no reap may have run yet");
-
-    let text = save_and_read(&mut s, &config, "syncsave");
-    assert!(
-        text.contains(&format!("claude --resume '{CAP_ID}'")),
-        "save must scrape the finished task itself; got {text}"
-    );
-    assert_eq!(s.tasks[0].scraped_id.as_deref(), Some(CAP_ID));
-}
-
-/// Rerunning between process exit and the next reap tick latches the exit,
-/// scrapes the hint, and resumes that session.
-#[test]
-fn rerun_scrapes_a_finished_task_without_reap() {
-    let dir = scratch("rerun_sync_scrape");
+fn rerun_latches_exit_without_reap_and_preserves_the_launch_id() {
+    use rustix::process::{Pid, WaitId, WaitIdOptions, waitid};
+    let dir = scratch("rerun_without_reap");
     let (bin, runtime) = (dir.join("bin"), dir.join("run"));
     install_script(
         &bin,
-        "claude",
-        &format!("printf 'Resume this session with:\\nclaude --resume {CAP_ID}\\n'"),
+        "grok",
+        &format!(
+            "printf '%s\\n' \"$@\" > '{}/argv'\n\
+             printf 'grok --resume {CAP_ID}\\n'",
+            dir.display()
+        ),
     );
     let mut s = sup_ctx(agent_ctx(&bin, &runtime, dir.to_path_buf()));
-    spawn(&mut s, "claude", dir.to_path_buf());
-    let id = s.tasks[0].id;
-
-    assert!(
-        wait_until(Duration::from_secs(5), || s.tasks[0].reader_done()),
-        "the stub never reached EOF"
-    );
-    assert!(s.tasks[0].finished.is_none(), "no reap may have run yet");
-
-    s.apply(Command::Restart { id });
-    assert_eq!(
-        s.tasks[0].command,
-        format!("claude --resume '{CAP_ID}'"),
-        "rerun must compute its resume command from the exit scrape"
-    );
-}
-
-/// Session-ID precedence is exit scrape, capture file, then spawn-time ID.
-#[test]
-fn resume_id_precedence_scrape_over_capture_over_spawn() {
-    let dir = scratch("precedence");
-    let (bin, runtime, config) = (dir.join("bin"), dir.join("run"), dir.join("config"));
-    let (hinted, done) = (dir.join("hinted"), dir.join("done"));
-    install_script(
-        &bin,
-        "claude",
-        &format!(
-            "until [ -e '{h}' ]; do sleep 0.05; done\n\
-                 printf 'Resume this session with:\\nclaude --resume {CAP_ID}\\n'\n\
-                 until [ -e '{d}' ]; do sleep 0.05; done",
-            h = hinted.display(),
-            d = done.display()
-        ),
-    );
-    let mut s = sup_ctx(agent_ctx_plus(
-        &bin,
-        &runtime,
+    spawn(
+        &mut s,
+        format!("grok --resume {CAP_OTHER}"),
         dir.to_path_buf(),
-        &[("FLEETCOM_CONFIG_DIR", &config)],
-    ));
-    spawn(&mut s, "claude", dir.to_path_buf());
-    let injected = s.tasks[0]
-        .resume_id
-        .clone()
-        .expect("a fresh claude launch pins an id");
-    assert_ne!(injected.as_str(), CAP_OTHER);
-
-    // The hook moved the session mid-run: pre-exit, the capture file
-    // must beat the injected id.
-    let cap = s.tasks[0].capture_file.clone().expect("capture file set");
-    std::fs::write(
-        &cap,
-        format!(
-            r#"{{"session_id":"{CAP_OTHER}","hook_event_name":"SessionStart","source":"clear"}}"#
-        ),
-    )
-    .unwrap();
-    let text = save_and_read(&mut s, &config, "mid");
-    assert!(
-        text.contains(&format!("claude --resume '{CAP_OTHER}'")),
-        "pre-exit the capture file must beat the injected id; got {text}"
     );
-
-    // Print the hint and let the task exit: post-exit, the scrape must
-    // beat the capture file.
-    std::fs::write(&hinted, b"").unwrap();
-    std::fs::write(&done, b"").unwrap();
-    assert!(reap_until(&mut s, Duration::from_secs(5), |s| s.tasks[0]
-        .scraped_id
-        .is_some()));
-    assert_eq!(s.tasks[0].scraped_id.as_deref(), Some(CAP_ID));
-    let text = save_and_read(&mut s, &config, "post");
+    let id = s.tasks[0].id;
+    let pid = Pid::from_raw(s.tasks[0].pid().unwrap() as i32).unwrap();
     assert!(
-        text.contains(&format!("claude --resume '{CAP_ID}'")),
-        "post-exit the scraped hint must beat the capture file; got {text}"
+        wait_until(Duration::from_secs(5), || {
+            let exited = waitid(
+                WaitId::Pid(pid),
+                WaitIdOptions::EXITED | WaitIdOptions::NOWAIT | WaitIdOptions::NOHANG,
+            )
+            .unwrap()
+            .is_some();
+            exited && s.tasks[0].reader_done()
+        }),
+        "the stub never exited and drained its output"
+    );
+    assert!(
+        s.tasks[0].finished.is_none(),
+        "no exit latch may have run yet"
+    );
+    std::fs::remove_file(dir.join("argv")).unwrap();
+    s.apply(Command::Restart { id });
+    assert_eq!(s.tasks[0].run, 1);
+    assert_eq!(s.tasks[0].command, format!("grok --resume '{CAP_OTHER}'"));
+    assert_eq!(
+        wait_argv(&mut s, &dir.join("argv")),
+        ["--resume", CAP_OTHER]
     );
 }
 
