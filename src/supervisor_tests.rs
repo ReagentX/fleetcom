@@ -622,17 +622,17 @@ fn term_ignoring_task_escalates_to_kill() {
     wait_for_lifecycle(&mut s, id, |l| l == Lifecycle::Failed);
 }
 
-/// `Shutdown` exits as soon as TERM-respecting tasks die: well inside the
-/// grace, not after it.
+/// Leader exit does not shorten shutdown's grace, even for ordinary tasks.
 #[test]
-fn shutdown_returns_early_when_tasks_respect_term() {
+fn shutdown_waits_the_grace_when_tasks_respect_term() {
     let mut s = sup(24, 80);
+    s.set_kill_grace(Duration::from_millis(200));
     spawn(&mut s, "sleep 300", here());
     let t0 = Instant::now();
     s.apply(Command::Shutdown);
     assert!(
-        t0.elapsed() < Duration::from_secs(1),
-        "shutdown waited the full grace for a TERM-respecting task"
+        t0.elapsed() >= Duration::from_millis(200),
+        "shutdown skipped the grace for a TERM-respecting task"
     );
     s.tick();
     assert!(
@@ -705,29 +705,27 @@ fn overfull_writer_queue_refuses_message_with_notice() {
     );
 }
 
-/// `Shutdown` with a TERM-ignoring task is bounded by the grace, then
-/// SIGKILLs it: quit can be slowed, never wedged.
+/// TERM-ignoring tasks share one grace; shutdown never waits per task.
 #[test]
 fn shutdown_is_bounded_by_grace() {
     let dir = scratch("shutdown_bound");
-    let ready = dir.join("ready");
     let mut s = sup(24, 80);
     s.set_kill_grace(Duration::from_millis(200));
-    spawn_ready(
-        &mut s,
-        format!(
-            "trap '' TERM; echo r > {r}; while :; do sleep 0.1; done",
-            r = ready.display()
-        ),
-        dir.to_path_buf(),
-        &ready,
-    );
+    for i in 0..8 {
+        let ready = dir.join(format!("ready_{i}"));
+        spawn_ready(
+            &mut s,
+            format!("trap '' TERM; echo r > {}; exec sleep 300", ready.display()),
+            dir.to_path_buf(),
+            &ready,
+        );
+    }
     let t0 = Instant::now();
     s.apply(Command::Shutdown);
     let elapsed = t0.elapsed();
     assert!(
-        elapsed < Duration::from_secs(2),
-        "shutdown took {elapsed:?}: not bounded by the 200 ms grace"
+        elapsed >= Duration::from_millis(200) && elapsed < Duration::from_secs(1),
+        "shutdown took {elapsed:?}: eight tasks must share the 200 ms grace"
     );
     s.tick();
     assert!(
@@ -1406,7 +1404,7 @@ fn kill_escalation_reaches_term_ignoring_straggler_after_leader_exit() {
 /// Shutdown after removal preserves the removed task's TERM grace.
 #[test]
 fn shutdown_waits_for_graveyard_grace() {
-    use nix::sys::signal::kill;
+    use nix::sys::signal::{Signal, kill};
     let dir = scratch("shutdown_graveyard");
     let (spid, ready) = (dir.join("spid"), dir.join("ready"));
     let mut s = sup(24, 80);
@@ -1416,7 +1414,7 @@ fn shutdown_waits_for_graveyard_grace() {
     let id = spawn_ready(
         &mut s,
         format!(
-            "trap '' HUP; (trap '' TERM; exec sleep 300) & echo $! > {sp}; echo r > {r}",
+            "trap '' HUP TERM; sleep 300 & echo $! > {sp}; echo r > {r}",
             sp = spid.display(),
             r = ready.display()
         ),
@@ -1435,23 +1433,21 @@ fn shutdown_waits_for_graveyard_grace() {
         kill(straggler, None).is_ok()
     });
     s.apply(Command::Shutdown);
+    let alive_mid_grace = alive_mid_grace.join();
+    let dead = wait_until(Duration::from_secs(5), || kill(straggler, None).is_err());
+    // A failed escalation must not leak the fixture after shutdown clears ownership.
+    if !dead {
+        let _ = kill(straggler, Signal::SIGKILL);
+    }
     assert!(
-        alive_mid_grace.join().unwrap(),
+        alive_mid_grace.unwrap(),
         "straggler was KILLed before its grace elapsed"
     );
-    assert!(
-        reap_until(&mut s, Duration::from_secs(5), |_| kill(straggler, None)
-            .is_err()),
-        "straggler survived shutdown"
-    );
+    assert!(dead, "straggler survived shutdown");
 }
 
-/// The defect the group probe fixes: every leader exits at birth after
-/// backgrounding a TERM-refusing child, so the old leader-only predicate
-/// saw nothing to wait for and Drop KILLed the child instantly. Shutdown
-/// must instead hold the full grace while the group probes non-empty;
-/// the child, unreachable by KILL once the probe reaped its leader,
-/// survives to reparent.
+/// Leader exit must neither skip the descendant's grace nor release the
+/// process-group ID before escalation.
 #[test]
 fn shutdown_holds_the_grace_for_members_of_an_exited_leader() {
     use nix::sys::signal::{Signal, kill};
@@ -1463,7 +1459,7 @@ fn shutdown_holds_the_grace_for_members_of_an_exited_leader() {
     let id = spawn_ready(
         &mut s,
         format!(
-            "trap '' HUP; (trap '' TERM; exec sleep 300) & echo $! > {sp}; echo r > {r}",
+            "trap '' HUP TERM; sleep 300 & echo $! > {sp}; echo r > {r}",
             sp = spid.display(),
             r = ready.display()
         ),
@@ -1476,12 +1472,19 @@ fn shutdown_holds_the_grace_for_members_of_an_exited_leader() {
     }));
     assert!(kill(straggler, None).is_ok(), "straggler should be alive");
 
+    let alive_mid_grace = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(200));
+        kill(straggler, None).is_ok()
+    });
     let t0 = Instant::now();
     s.apply(Command::Shutdown);
     let elapsed = t0.elapsed();
-    let survived = kill(straggler, None).is_ok();
-    // Clean up the reparented survivor before asserting.
-    let _ = kill(straggler, Signal::SIGKILL);
+    let alive_mid_grace = alive_mid_grace.join();
+    let dead = wait_until(Duration::from_secs(5), || kill(straggler, None).is_err());
+    // A failed escalation must not leak the fixture after shutdown clears ownership.
+    if !dead {
+        let _ = kill(straggler, Signal::SIGKILL);
+    }
     assert!(
         elapsed >= Duration::from_millis(400),
         "shutdown returned in {elapsed:?} with a non-empty group: the grace was skipped"
@@ -1491,16 +1494,17 @@ fn shutdown_holds_the_grace_for_members_of_an_exited_leader() {
         "shutdown took {elapsed:?}: not bounded by the 400 ms grace"
     );
     assert!(
-        survived,
-        "the straggler was KILLed instead of receiving the TERM grace"
+        alive_mid_grace.unwrap(),
+        "straggler was KILLed before its grace elapsed"
     );
+    assert!(dead, "straggler survived shutdown after its leader exited");
 }
 
-/// Prompt exit, pinned: leaders exited long ago and left empty groups,
-/// so shutdown returns in a few probe passes, nowhere near the grace.
+/// Completed rows retain group ownership and receive the same shutdown grace.
 #[test]
-fn shutdown_is_prompt_when_every_group_is_already_empty() {
+fn shutdown_waits_the_grace_when_every_task_has_finished() {
     let mut s = sup(24, 80);
+    s.set_kill_grace(Duration::from_millis(200));
     for _ in 0..2 {
         spawn(&mut s, "true", here());
     }
@@ -1510,10 +1514,18 @@ fn shutdown_is_prompt_when_every_group_is_already_empty() {
     let t0 = Instant::now();
     s.apply(Command::Shutdown);
     assert!(
-        t0.elapsed() < Duration::from_millis(500),
-        "shutdown of already-empty groups took {:?}: the early exit is gone",
+        t0.elapsed() >= Duration::from_millis(200),
+        "shutdown of completed tasks skipped the grace: {:?}",
         t0.elapsed()
     );
+}
+
+#[test]
+fn shutdown_is_prompt_when_the_fleet_is_empty() {
+    let mut s = sup(24, 80);
+    let t0 = Instant::now();
+    s.apply(Command::Shutdown);
+    assert!(t0.elapsed() < Duration::from_millis(500));
 }
 
 /// Session paths follow the connection's launch context: a hello env

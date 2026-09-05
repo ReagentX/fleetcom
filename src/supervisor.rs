@@ -90,8 +90,7 @@ fn effective_scrollback(flag: Option<usize>, env: Option<&str>) -> usize {
         .map_or(DEFAULT_SCROLLBACK, |lines| lines.min(MAX_SCROLLBACK))
 }
 
-/// Grace period between SIGTERM and SIGKILL, bounding shutdown delay for tasks
-/// that do not exit after SIGTERM.
+/// Grace period between SIGTERM and SIGKILL, shared by all tasks at shutdown.
 const KILL_GRACE: Duration = Duration::from_secs(2);
 
 /// Quiet period used to coalesce recipe changes into one recovery write.
@@ -249,11 +248,8 @@ pub struct Supervisor {
     /// leader's zombie is collected. Invisible to `tick` snapshots, so the row
     /// disappears instantly while the sweep runs behind it.
     ///
-    /// Entries remain through `kill_grace` because observing group emptiness
-    /// would cost the escalation: the probe (`Task::group_gone`) must reap
-    /// the leader to see past its zombie, and a reaped group can no longer
-    /// be KILLed. Entries therefore keep their zombie until `kill_sent`, and
-    /// `shutdown_all` counts the graveyard instead of probing it.
+    /// Entries keep their leader's zombie until SIGKILL has been sent:
+    /// collecting it earlier would release the process-group ID.
     graveyard: Vec<Task>,
     next_id: u64,
     /// PTY content size (rows already minus the client's status bar). Every task
@@ -469,38 +465,22 @@ impl Supervisor {
         self.graveyard.retain_mut(|t| !t.try_collect());
     }
 
-    /// Kill every task for the quit path: TERM all groups at once, wait out
-    /// one shared grace, then SIGKILL the stragglers. The wait exits early
-    /// once `swept` proves there is nothing left to wait for; a task's
-    /// `finished` alone cannot gate it, because leader exit says nothing
-    /// about the rest of the group (`cmd & exit 0` leaves members behind),
-    /// and a leader-only predicate KILLed those members the instant the last
-    /// leader happened to be done, skipping the TERM grace entirely.
-    /// Blocking is bounded by the grace. Anything the final KILLs don't
-    /// collect (a leader in uninterruptible sleep) reparents to init when
-    /// the daemon exits moments later, as do TERM-refusing members of a
-    /// group whose leader the emptiness probe reaped (see
-    /// `Task::group_gone`); blocking on either could wedge shutdown forever.
+    /// TERM every owned group, wait one shared grace, then SIGKILL before
+    /// collecting leaders. Exited leaders retain their process-group IDs:
+    /// their descendants may still need escalation. Existing TERM timers
+    /// continue through `reap`; a nonempty fleet waits even if leaders exit.
+    /// Collection and PTY teardown never block on live processes or workers.
     fn shutdown_all(&mut self) {
         for t in &mut self.tasks {
             t.terminate();
         }
         let deadline = Instant::now() + self.kill_grace;
-        while !self.swept() && Instant::now() < deadline {
+        while (!self.tasks.is_empty() || !self.graveyard.is_empty()) && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(25));
             self.reap();
         }
         self.tasks.clear(); // Drop force-kills whatever is left
         self.graveyard.clear();
-    }
-
-    /// Shutdown's exit test: every live task's process group probes gone and
-    /// the graveyard has drained. Graveyard entries are counted, not probed:
-    /// probing reaps the leader, and a reaped group forfeits the KILL its
-    /// pending escalation still owes (`Task::try_collect`'s `kill_sent` gate
-    /// exists for the same reason); they leave through `reap` as always.
-    fn swept(&mut self) -> bool {
-        self.graveyard.is_empty() && self.tasks.iter_mut().all(Task::group_gone)
     }
 
     /// One step of the core's own loop: reap exits, then emit a fresh task

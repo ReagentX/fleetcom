@@ -112,9 +112,7 @@ Rerunning preserves the task's ID, `◆` tag, group, name, and spawn order; its 
 
 Input meaning depends on the active surface. From the dashboard, `q` or `Ctrl-C` disconnects the client. A daemon and its tasks continue running, so the next `fleetcom` invocation reconnects. Under `--foreground`, the in-process core exits with the client and its tasks die. While attached, `Ctrl-C` belongs to the child. In prompts and pickers, `Esc` cancels without disconnecting.
 
-Uppercase `Q` stops the daemon and terminates each task's process group. Shutdown sends `TERM` first, then `KILL` after a two-second grace period. Processes that have moved into another group are outside this sweep.
-
-A `TERM`-ignoring member can also survive when its leader exits during shutdown. The group-emptiness check then releases the process-group ID reservation before escalation; [Shutdown is graceful-first](README.md#shutdown-is-graceful-first) explains the tradeoff.
+Uppercase `Q` stops the daemon and terminates each task's process group. Shutdown sends `TERM` first, then `KILL` after one shared two-second grace period. Exited leaders remain unreaped until escalation so `TERM`-ignoring descendants in their groups still receive `KILL`. A nonempty fleet waits the grace even when its listed tasks have finished or respect `TERM`; with no tasks left to clean up, shutdown returns immediately. Tasks already terminating keep their original escalation timers. Processes that have moved into another group or session are outside this sweep.
 
 ### Task organization
 

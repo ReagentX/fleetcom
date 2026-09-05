@@ -179,63 +179,25 @@ fn killed_leader_latches_137_via_collect() {
     assert_eq!(t.exit_code, Some(137));
 }
 
-/// The shutdown probe reaps the exited leader, then probes the group in
-/// the same pass: a zombie-only group turns gone in that one call. The
-/// pre-reap assertions pin why the reap must come first: the zombie
-/// alone keeps the group id resolvable for kill-style probes.
+/// Collection must retain the group reservation until escalation, including
+/// when a repeated TERM request arrives after the leader has exited.
 #[test]
-fn group_gone_reaps_then_probes_past_the_zombie() {
-    use nix::errno::Errno;
+fn exited_leader_is_collectible_only_after_kill() {
     let mut t = spawn(30, "exit 0");
     wait_finished(&mut t);
-    let pgid = Pid::from_raw(t.pid.expect("spawn always yields a pid") as i32);
-    // Zombie in place: the probe answer is Ok on Linux, EPERM on macOS,
-    // never ESRCH, so emptiness is invisible before the reap.
-    assert_ne!(
-        killpg(pgid, None::<Signal>),
-        Err(Errno::ESRCH),
-        "an unreaped zombie must keep the group id resolvable"
-    );
-    assert!(
-        t.group_gone(),
-        "a zombie-only group must probe gone in one reap+probe pass"
-    );
-    // The probe spent the zombie: the group id no longer resolves.
-    assert_eq!(killpg(pgid, None::<Signal>), Err(Errno::ESRCH));
-}
-
-/// A member that survives the leader holds the probe after the reap,
-/// and the probe turns gone once that member dies.
-#[test]
-fn group_gone_holds_while_a_member_survives() {
-    use nix::sys::signal::kill;
-    let dir = temp("task_gone");
-    let spid = dir.join("spid");
-    // `trap '' HUP` first so the background child survives its session
-    // leader's exit and remains available for the group probe.
-    let cmd = format!("trap '' HUP; sleep 300 & echo $! > {}", spid.display());
-    let mut t = Task::spawn(31, &cmd, &cmd, &here(), 24, 80, 2000, &sh_env(), no_waker()).unwrap();
-    wait_finished(&mut t);
-    let straggler = read_pid(&spid);
-
-    assert!(!t.group_gone(), "a surviving member must hold the probe");
-    assert!(t.reaped, "the probe reaps the exited leader to see past it");
-
-    let _ = kill(straggler, Signal::SIGKILL);
-    assert!(
-        wait_until(Duration::from_secs(5), || t.group_gone()),
-        "the group must probe gone once its last member dies"
-    );
-}
-
-/// `finished` gates the zombie-spending reap: a leader that has not
-/// exited is never reaped (or waited on) by the probe.
-#[test]
-fn group_gone_never_reaps_a_live_leader() {
-    let mut t = spawn(32, "sleep 300");
-    assert!(!t.group_gone(), "a live leader is a live group");
-    assert!(!t.reaped, "the probe must not reap a running leader");
+    assert!(!t.try_collect());
     t.terminate();
+    let term_sent = t.term_sent.unwrap();
+    t.terminate();
+    assert_eq!(
+        t.term_sent,
+        Some(term_sent),
+        "repeated TERM reset the grace"
+    );
+    assert!(!t.try_collect());
+    assert!(kill(Pid::from_raw(t.pid.unwrap() as i32), None).is_ok());
+    t.force_kill();
+    assert!(t.try_collect());
 }
 
 /// Scrollback clamps at both ends and input returns to live output.

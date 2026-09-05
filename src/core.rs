@@ -89,9 +89,9 @@ fn ready_to_tick(dirty: bool, since_last_tick: Duration) -> bool {
 /// signal that ends the loop with `ClientGone`.
 ///
 /// `stop` is an external stop request (the daemon's signal flag): checked once
-/// per wake/timeout, so a raised flag ends the loop within one `FALLBACK` even
-/// when nothing else is happening. It shuts down exactly like a `Shutdown`
-/// command: tasks killed, `LoopExit::Shutdown` returned.
+/// per wake/timeout, so a raised flag begins shutdown within one `FALLBACK`
+/// even when nothing else is happening. It shuts down exactly like a
+/// `Shutdown` command: TERM grace, tasks killed, `LoopExit::Shutdown` returned.
 pub fn run_loop(
     sup: &mut Supervisor,
     wake_rx: &Receiver<Wake>,
@@ -268,6 +268,7 @@ mod tests {
     fn stop_flag_ends_loop_with_shutdown() {
         let cwd = std::env::current_dir().unwrap();
         let mut sup = Supervisor::new(24, 80, 2000);
+        sup.set_kill_grace(Duration::ZERO);
         sup.set_launch_context(crate::protocol::LaunchContext::here());
         let (wake_tx, wake_rx) = std::sync::mpsc::channel::<Wake>();
         sup.set_waker(wake_tx);
@@ -284,8 +285,8 @@ mod tests {
         let started = Instant::now();
         let exit = run_loop(&mut sup, &wake_rx, &stop, |_| true);
         assert!(matches!(exit, LoopExit::Shutdown));
-        // The flag is checked before blocking, so the return is immediate: well
-        // under the FALLBACK a wake-starved loop would otherwise sleep.
+        // With no TERM grace, only stop observation contributes to the bound:
+        // the flag must be checked before a wake-starved loop sleeps.
         assert!(started.elapsed() < FALLBACK);
         // Shutdown cleared the task set: a tick emits an empty snapshot.
         sup.tick();
