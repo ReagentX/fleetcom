@@ -1,26 +1,23 @@
 //! Codex does not let the caller select an ID at launch. This harness instead
 //! injects a `notify` override, chains compatible configured notifiers, and
-//! scans supported exit lines for an ID. When neither channel yields one, it
-//! correlates rollout files under `<codex-home>/sessions/YYYY/MM/DD/`.
-//! Missing, empty, and malformed rollouts do not produce a candidate.
+//! scans supported exit lines for an ID.
 
-use std::{fmt::Write as _, fs, path::Path, time::SystemTime};
+use std::{
+    fmt::Write as _,
+    fs,
+    path::{Path, PathBuf},
+};
 
 use super::{
     CAPTURE_ENV, CapturePaths, Harness, Invocation, NOTIFY_CHAIN_ENV, SpawnPlan, capture_id,
-    is_uuid, jsonl_head, last_hint, leading_uuid, push_unique, same_cwd, shell_quote, sole_id,
-    unix_millis, v7_millis, within_window_ms,
+    home_root, last_hint, leading_uuid, resolve_home, shell_quote,
 };
 
 pub struct Codex;
 
 impl Harness for Codex {
-    fn home_env_var(&self) -> &'static str {
-        "CODEX_HOME"
-    }
-
-    fn home_dot_dir(&self) -> &'static str {
-        ".codex"
+    fn resolve_home(&self, env: &dyn Fn(&str) -> Option<PathBuf>) -> Option<PathBuf> {
+        resolve_home(env, "CODEX_HOME", ".codex")
     }
 
     fn shape(&self) -> (&'static str, &'static str) {
@@ -99,60 +96,6 @@ impl Harness for Codex {
         }
         last
     }
-
-    fn correlate_fs(&self, cwd: &Path, spawned: SystemTime, home: Option<&Path>) -> Option<String> {
-        let root = self.home_root(home)?;
-        let spawn_ms = unix_millis(spawned)?;
-        // Day directories are named by LOCAL date, which std cannot compute
-        // without a timezone database. The UTC date differs from it by at
-        // most one day, so probing the UTC date ±2 covers local ±1.
-        let spawn_days = (spawn_ms / 86_400_000) as i64;
-        let mut survivors: Vec<String> = Vec::new();
-        for day in (spawn_days - 2)..=(spawn_days + 2) {
-            let (y, m, d) = crate::format::civil_from_days(day);
-            let dir = root
-                .join("sessions")
-                .join(format!("{y:04}"))
-                .join(format!("{m:02}"))
-                .join(format!("{d:02}"));
-            let Ok(entries) = fs::read_dir(&dir) else {
-                continue;
-            };
-            for entry in entries.flatten() {
-                let name = entry.file_name();
-                let Some(stem) = name
-                    .to_str()
-                    .and_then(|n| n.strip_prefix("rollout-"))
-                    .and_then(|n| n.strip_suffix(".jsonl"))
-                else {
-                    continue;
-                };
-                // The 20-byte timestamp prefix precedes the thread ID. A
-                // suffix may carry a second UUID, so reading the final UUID
-                // can select a rollout ID instead of the conversation.
-                let Some(ids) = stem.get(20..) else {
-                    continue;
-                };
-                let id = ids.split_once('_').map_or(ids, |(thread, _)| thread);
-                if !is_uuid(id) {
-                    continue;
-                }
-                // Correlate with the v7 ID's embedded UTC instant; the
-                // filename timestamp is local wall-clock time.
-                let Some(ms) = v7_millis(id) else { continue };
-                if !within_window_ms(u128::from(ms), spawn_ms) {
-                    continue;
-                }
-                if !line1_admits(&entry.path(), cwd) {
-                    continue;
-                }
-                // Multiple rollouts may name the same thread. Correlation
-                // counts that thread once.
-                push_unique(&mut survivors, id.to_string());
-            }
-        }
-        sole_id(survivors)
-    }
 }
 
 /// Whether Codex notification capture can preserve the configured route.
@@ -171,7 +114,7 @@ enum NotifyRoute {
 /// deliberately line-based: duplicate assignments are ambiguous and produce
 /// [`NotifyRoute::Opaque`].
 fn config_notify_route(home: Option<&Path>) -> NotifyRoute {
-    let Some(root) = Codex.home_root(home) else {
+    let Some(root) = home_root(home, ".codex") else {
         return NotifyRoute::Vacant;
     };
     let text = fs::read_to_string(root.join("config.toml")).unwrap_or_default();
@@ -280,29 +223,6 @@ fn toml_escape(s: &str) -> String {
     out
 }
 
-/// Check the rollout's first record for a matching `cwd` and no explicit
-/// spawned-thread provenance. Missing and unrecognized `thread_source` values
-/// remain eligible; `"subagent"` or any `parent_thread_id` rejects the record.
-fn line1_admits(path: &Path, cwd: &Path) -> bool {
-    let Some(records) = jsonl_head(path, 1) else {
-        return false;
-    };
-    let Some(meta) = records[0].as_ref() else {
-        return false;
-    };
-    let payload = &meta["payload"];
-    if payload["thread_source"].as_str() == Some("subagent")
-        || !payload["parent_thread_id"].is_null()
-    {
-        return false;
-    }
-    // Rollouts can contain the physical cwd while the task retains a symlinked
-    // path. Canonicalize the task path before rejecting the match.
-    payload["cwd"]
-        .as_str()
-        .is_some_and(|c| same_cwd(Path::new(c), cwd, cwd.canonicalize().ok().as_deref()))
-}
-
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
@@ -310,7 +230,7 @@ mod tests {
     use super::*;
     use crate::{
         harness::fixtures::{OTHER, assert_all_opaque, assert_corpus_scrape, paths},
-        testutil::{CORPUS_COLS, Scratch, temp, v7_at, write_rollout, write_rollout_named},
+        testutil::{CORPUS_COLS, Scratch, temp},
     };
 
     /// Codex's own launch and resume commands carry v7 IDs; the shared v4
@@ -660,175 +580,6 @@ mod tests {
         // Two assignment lines remain ambiguous.
         fs::write(&cfg, "notify = [\"/a\"]\nnotify = [\"/b\"]\n").unwrap();
         assert_eq!(config_notify_route(Some(&home)), NotifyRoute::Opaque);
-    }
-
-    #[test]
-    fn correlate_fs_requires_a_unique_cwd_matched_rollout() {
-        let home = temp("codex_correlate");
-        let spawn_ms: u64 = 1_785_000_000_000; // 2026-07-25T02:40Z
-        let spawned = SystemTime::UNIX_EPOCH + std::time::Duration::from_millis(spawn_ms);
-
-        let id = write_rollout(&home, spawn_ms + 4_000, 1, Path::new("/work/proj"));
-        assert_eq!(
-            Codex
-                .correlate_fs(Path::new("/work/proj"), spawned, Some(&home))
-                .as_deref(),
-            Some(id.as_str())
-        );
-        // A different task directory does not match this rollout.
-        assert_eq!(
-            Codex.correlate_fs(Path::new("/elsewhere"), spawned, Some(&home)),
-            None
-        );
-
-        // Outside the ±30 s window: excluded.
-        write_rollout(&home, spawn_ms + 90_000, 2, Path::new("/late/proj"));
-        assert_eq!(
-            Codex.correlate_fs(Path::new("/late/proj"), spawned, Some(&home)),
-            None
-        );
-
-        // Two in-window rollouts from the same directory are ambiguous.
-        write_rollout(&home, spawn_ms + 8_000, 3, Path::new("/work/proj"));
-        assert_eq!(
-            Codex.correlate_fs(Path::new("/work/proj"), spawned, Some(&home)),
-            None
-        );
-    }
-
-    /// Either spawned-thread provenance field disqualifies a rollout.
-    #[test]
-    fn correlate_fs_excludes_spawned_threads() {
-        let home = temp("codex_subagent");
-        let spawn_ms: u64 = 1_785_000_000_000;
-        let spawned = SystemTime::UNIX_EPOCH + std::time::Duration::from_millis(spawn_ms);
-        let cwd = Path::new("/work/proj");
-        let parent = write_rollout(&home, spawn_ms + 1_000, 1, cwd);
-        let resolves = |home: &Path| Codex.correlate_fs(cwd, spawned, Some(home));
-
-        // `thread_source` alone disqualifies the rollout.
-        write_rollout_named(
-            &home,
-            spawn_ms + 3_000,
-            2,
-            cwd,
-            "",
-            r#","source":{"subagent":{"other":"guardian"}},"thread_source":"subagent""#,
-        );
-        assert_eq!(resolves(&home).as_deref(), Some(parent.as_str()));
-
-        // `parent_thread_id` alone: any value at all names a spawning thread.
-        write_rollout_named(
-            &home,
-            spawn_ms + 5_000,
-            3,
-            cwd,
-            "",
-            &format!(r#","parent_thread_id":"{parent}""#),
-        );
-        assert_eq!(resolves(&home).as_deref(), Some(parent.as_str()));
-
-        // A second eligible thread makes correlation ambiguous.
-        write_rollout(&home, spawn_ms + 7_000, 4, cwd);
-        assert_eq!(resolves(&home), None);
-    }
-
-    /// Unknown thread sources remain eligible unless another field marks the
-    /// rollout as spawned.
-    #[test]
-    fn correlate_fs_admits_thread_sources_it_does_not_know() {
-        let spawn_ms: u64 = 1_785_000_000_000;
-        let spawned = SystemTime::UNIX_EPOCH + std::time::Duration::from_millis(spawn_ms);
-        let cwd = Path::new("/work/proj");
-        for source in ["user", "some_future_kind"] {
-            let home = temp("codex_thread_source");
-            let id = write_rollout_named(
-                &home,
-                spawn_ms + 1_000,
-                1,
-                cwd,
-                "",
-                &format!(r#","thread_source":"{source}""#),
-            );
-            assert_eq!(
-                Codex.correlate_fs(cwd, spawned, Some(&home)).as_deref(),
-                Some(id.as_str()),
-                "{source:?}"
-            );
-        }
-    }
-
-    /// A suffixed rollout filename carries the thread ID before the rollout ID.
-    #[test]
-    fn correlate_fs_reads_the_thread_id_not_the_rollout_id() {
-        let spawn_ms: u64 = 1_785_000_000_000;
-        let spawned = SystemTime::UNIX_EPOCH + std::time::Duration::from_millis(spawn_ms);
-        let cwd = Path::new("/work/proj");
-        let rollout_id = v7_at(spawn_ms + 1_000, 9);
-        // Both names coexist and resolve to one deduplicated thread.
-        let home = temp("codex_revert_name");
-        for suffix in [String::new(), format!("_{rollout_id}")] {
-            let thread = write_rollout_named(&home, spawn_ms + 1_000, 1, cwd, &suffix, "");
-            assert_ne!(thread, rollout_id);
-            assert_eq!(
-                Codex.correlate_fs(cwd, spawned, Some(&home)).as_deref(),
-                Some(thread.as_str()),
-                "{suffix:?}"
-            );
-        }
-    }
-
-    /// Correlation matches a physical rollout cwd to a symlinked task cwd.
-    #[test]
-    fn correlate_fs_matches_a_symlinked_spawn_path() {
-        let home = temp("codex_symlink_cwd");
-        let spawn_ms: u64 = 1_785_000_000_000;
-        let spawned = SystemTime::UNIX_EPOCH + std::time::Duration::from_millis(spawn_ms);
-
-        let real = home.join("real");
-        fs::create_dir_all(&real).unwrap();
-        let link = home.join("link");
-        std::os::unix::fs::symlink(&real, &link).unwrap();
-
-        // The rollout names the resolved path; the task carries the link.
-        let id = write_rollout(&home, spawn_ms + 1_000, 1, &real.canonicalize().unwrap());
-        assert_eq!(
-            Codex.correlate_fs(&link, spawned, Some(&home)).as_deref(),
-            Some(id.as_str())
-        );
-        // An unrelated directory still fails, resolved or not.
-        assert_eq!(Codex.correlate_fs(&home, spawned, Some(&home)), None);
-    }
-
-    /// The ±2-day probe includes a rollout in the adjacent day directory.
-    #[test]
-    fn correlate_fs_spans_adjacent_day_directories() {
-        let home = temp("codex_dayspan");
-        let spawn_ms: u64 = 1_785_000_000_000;
-        let spawned = SystemTime::UNIX_EPOCH + std::time::Duration::from_millis(spawn_ms);
-
-        let id = v7_at(spawn_ms + 2_000, 7);
-        let (y, m, d) = crate::format::civil_from_days((spawn_ms / 86_400_000) as i64 - 1);
-        let dir = home
-            .join("sessions")
-            .join(format!("{y:04}"))
-            .join(format!("{m:02}"))
-            .join(format!("{d:02}"));
-        fs::create_dir_all(&dir).unwrap();
-        fs::write(
-            dir.join(format!("rollout-2026-07-24T19-40-02-{id}.jsonl")),
-            format!(
-                r#"{{"timestamp":"x","type":"session_meta","payload":{{"id":"{id}","cwd":"/w"}}}}"#
-            ),
-        )
-        .unwrap();
-
-        assert_eq!(
-            Codex
-                .correlate_fs(Path::new("/w"), spawned, Some(&home))
-                .as_deref(),
-            Some(id.as_str())
-        );
     }
 
     /// A preceding full-width row does not merge with the session-ID row after

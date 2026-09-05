@@ -122,7 +122,7 @@ pub struct Task {
     blocked: Option<(String, &'static str)>,
     /// Last registry probe time; `None` before the first probe.
     blocked_probed: Option<Instant>,
-    /// Wall-clock spawn time used for registry and transcript correlation.
+    /// Wall-clock spawn time used to validate the Claude PID registry record.
     pub spawned_at: SystemTime,
     exit_code: Option<i32>,
     pub started: Instant,

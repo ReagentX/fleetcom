@@ -492,15 +492,11 @@ fn spawn_grok_pins_an_id_and_injects_nothing_else() {
     let dir = scratch("cap_grok");
     let (bin, runtime, config) = (dir.join("bin"), dir.join("run"), dir.join("config"));
     install_stub(&bin, "grok", &dir);
-    // Keep save-time correlation inside the scratch tree.
     let mut s = sup_ctx(agent_ctx_plus(
         &bin,
         &runtime,
         dir.to_path_buf(),
-        &[
-            ("FLEETCOM_CONFIG_DIR", &config),
-            ("GROK_HOME", &dir.join("grok_home")),
-        ],
+        &[("FLEETCOM_CONFIG_DIR", &config)],
     ));
     spawn(&mut s, "grok", dir.to_path_buf());
 
@@ -593,10 +589,7 @@ fn grok_exit_hint_is_scraped_and_saved_as_a_resume() {
         &bin,
         &runtime,
         dir.to_path_buf(),
-        &[
-            ("FLEETCOM_CONFIG_DIR", &config),
-            ("GROK_HOME", &dir.join("grok_home")),
-        ],
+        &[("FLEETCOM_CONFIG_DIR", &config)],
     ));
     spawn(&mut s, "grok", dir.to_path_buf());
     assert!(reap_until(&mut s, Duration::from_secs(5), |s| s.tasks[0]
@@ -631,10 +624,7 @@ fn save_scrapes_a_finished_grok_task_without_reap() {
         &bin,
         &runtime,
         dir.to_path_buf(),
-        &[
-            ("FLEETCOM_CONFIG_DIR", &config),
-            ("GROK_HOME", &dir.join("grok_home")),
-        ],
+        &[("FLEETCOM_CONFIG_DIR", &config)],
     ));
     spawn(&mut s, "grok", dir.to_path_buf());
 
@@ -667,10 +657,7 @@ fn rerun_scrapes_a_finished_grok_task_without_reap() {
         &bin,
         &runtime,
         dir.to_path_buf(),
-        &[
-            ("FLEETCOM_CONFIG_DIR", &config),
-            ("GROK_HOME", &dir.join("grok_home")),
-        ],
+        &[("FLEETCOM_CONFIG_DIR", &config)],
     ));
     spawn(&mut s, "grok", dir.to_path_buf());
     let id = s.tasks[0].id;
@@ -686,136 +673,6 @@ fn rerun_scrapes_a_finished_grok_task_without_reap() {
         s.tasks[0].command,
         format!("grok --resume '{CAP_ID}'"),
         "rerun must compute its resume command from the exit scrape"
-    );
-}
-
-/// A silent grok task falls back to one in-window top-level session dir
-/// under `GROK_HOME` when live channels produce no ID.
-#[test]
-fn save_falls_back_to_fs_correlation_for_a_silent_grok() {
-    let dir = scratch("grok_correlate_save");
-    let (bin, runtime, config, grok_home) = (
-        dir.join("bin"),
-        dir.join("run"),
-        dir.join("config"),
-        dir.join("grok_home"),
-    );
-    install_stub(&bin, "grok", &dir);
-    let mut s = sup_ctx(agent_ctx_plus(
-        &bin,
-        &runtime,
-        dir.to_path_buf(),
-        &[("FLEETCOM_CONFIG_DIR", &config), ("GROK_HOME", &grok_home)],
-    ));
-    spawn(&mut s, "grok", dir.to_path_buf());
-    assert!(reap_until(&mut s, Duration::from_secs(5), |s| s.tasks[0]
-        .finished
-        .is_some()));
-    assert!(s.tasks[0].scraped_id.is_none(), "a silent exit has no hint");
-    // Bare grok always pins; recipe_command would take that ID and never
-    // reach correlate_fs unless the pin is absent.
-    s.tasks[0].resume_id = None;
-    assert!(
-        current_resume_id(&s.tasks[0]).is_none(),
-        "clearing the pin is what exposes filesystem correlation"
-    );
-
-    let group = grok_home
-        .join("sessions")
-        .join(crate::harness::encode_cwd(&s.tasks[0].cwd).expect("task cwd is UTF-8"));
-    std::fs::create_dir_all(group.join(CAP_ID)).unwrap();
-
-    let text = save_and_read(&mut s, &config, "corr");
-    assert!(
-        text.contains(&format!("grok --resume '{CAP_ID}'")),
-        "save must fall back to filesystem correlation; got {text}"
-    );
-}
-
-/// An in-window `session_kind: subagent` sibling does not steal uniqueness
-/// from the top-level session directory.
-#[test]
-fn save_ignores_an_in_window_grok_subagent_sibling() {
-    let dir = scratch("grok_correlate_subagent");
-    let (bin, runtime, config, grok_home) = (
-        dir.join("bin"),
-        dir.join("run"),
-        dir.join("config"),
-        dir.join("grok_home"),
-    );
-    install_stub(&bin, "grok", &dir);
-    let mut s = sup_ctx(agent_ctx_plus(
-        &bin,
-        &runtime,
-        dir.to_path_buf(),
-        &[("FLEETCOM_CONFIG_DIR", &config), ("GROK_HOME", &grok_home)],
-    ));
-    spawn(&mut s, "grok", dir.to_path_buf());
-    assert!(reap_until(&mut s, Duration::from_secs(5), |s| s.tasks[0]
-        .finished
-        .is_some()));
-    assert!(s.tasks[0].scraped_id.is_none(), "a silent exit has no hint");
-    s.tasks[0].resume_id = None;
-
-    let group = grok_home
-        .join("sessions")
-        .join(crate::harness::encode_cwd(&s.tasks[0].cwd).expect("task cwd is UTF-8"));
-    std::fs::create_dir_all(group.join(CAP_ID)).unwrap();
-    // No created_at: birthtime is in-window, so the skip is session_kind.
-    let other = group.join(CAP_OTHER);
-    std::fs::create_dir_all(&other).unwrap();
-    std::fs::write(other.join("summary.json"), r#"{"session_kind":"subagent"}"#).unwrap();
-
-    let text = save_and_read(&mut s, &config, "subagent");
-    assert!(
-        text.contains(&format!("grok --resume '{CAP_ID}'")),
-        "the recipe must resume the top-level session; got {text}"
-    );
-    assert!(
-        !text.contains(CAP_OTHER),
-        "an in-window subagent sibling must not correlate; got {text}"
-    );
-}
-
-/// A spawn through a symlink cwd correlates against the canonical group's
-/// encoded name.
-#[test]
-fn save_follows_a_symlink_cwd_to_the_canonical_grok_group() {
-    let dir = scratch("grok_correlate_symlink");
-    let (bin, runtime, config, grok_home, real, link) = (
-        dir.join("bin"),
-        dir.join("run"),
-        dir.join("config"),
-        dir.join("grok_home"),
-        dir.join("real"),
-        dir.join("link"),
-    );
-    std::fs::create_dir_all(&real).unwrap();
-    std::os::unix::fs::symlink(&real, &link).unwrap();
-    install_stub(&bin, "grok", &dir);
-    let mut s = sup_ctx(agent_ctx_plus(
-        &bin,
-        &runtime,
-        dir.to_path_buf(),
-        &[("FLEETCOM_CONFIG_DIR", &config), ("GROK_HOME", &grok_home)],
-    ));
-    spawn(&mut s, "grok", link);
-    assert!(reap_until(&mut s, Duration::from_secs(5), |s| s.tasks[0]
-        .finished
-        .is_some()));
-    assert!(s.tasks[0].scraped_id.is_none(), "a silent exit has no hint");
-    s.tasks[0].resume_id = None;
-
-    let canonical = real.canonicalize().unwrap();
-    let group = grok_home
-        .join("sessions")
-        .join(crate::harness::encode_cwd(&canonical).expect("canonical path is UTF-8"));
-    std::fs::create_dir_all(group.join(CAP_ID)).unwrap();
-
-    let text = save_and_read(&mut s, &config, "symlink");
-    assert!(
-        text.contains(&format!("grok --resume '{CAP_ID}'")),
-        "save must correlate through the canonical group; got {text}"
     );
 }
 
@@ -1036,17 +893,34 @@ fn resume_id_precedence_registry_over_spawn_under_capture() {
     std::fs::write(&done, b"").unwrap();
 }
 
-/// A silent Codex task falls back to one matching rollout under
-/// `CODEX_HOME` when live channels produce no ID.
+/// Two tasks sharing a directory do not own a nearby rollout. Named saves
+/// and recovery must preserve both authored commands when capture is silent.
 #[test]
-fn save_falls_back_to_fs_correlation_for_a_silent_codex() {
-    let dir = scratch("correlate_save");
+fn silent_codex_tasks_keep_authored_commands_in_saves_and_recovery() {
+    let dir = scratch("uncaptured_codex");
     let (bin, runtime, config) = (dir.join("bin"), dir.join("run"), dir.join("config"));
     let codex_home = dir.join("codex_home");
-    install_stub(&bin, "codex", &dir);
-    // Create a rollout with a current v7 instant and the task's cwd.
-    let now_ms = now_ms();
-    let id = write_rollout(&codex_home, now_ms, 1, &dir);
+    install_script(&bin, "codex", "exit 0");
+
+    // This sole rollout matches the directory and the former 30-second
+    // window for both tasks, but predates both launches.
+    let ms = now_ms();
+    let id = format!(
+        "{:08x}-{:04x}-7000-8000-000000000001",
+        ms >> 16,
+        ms & 0xffff
+    );
+    let (y, m, d) = crate::format::civil_from_days((ms / 86_400_000) as i64);
+    let rollouts = codex_home.join(format!("sessions/{y:04}/{m:02}/{d:02}"));
+    std::fs::create_dir_all(&rollouts).unwrap();
+    std::fs::write(
+        rollouts.join(format!("rollout-2026-07-13T09-00-00-{id}.jsonl")),
+        format!(
+            r#"{{"type":"session_meta","payload":{{"id":"{id}","cwd":"{}"}}}}"#,
+            dir.display()
+        ),
+    )
+    .unwrap();
 
     let mut s = sup_ctx(agent_ctx_plus(
         &bin,
@@ -1057,62 +931,62 @@ fn save_falls_back_to_fs_correlation_for_a_silent_codex() {
             ("CODEX_HOME", &codex_home),
         ],
     ));
-    spawn(&mut s, "codex", dir.to_path_buf());
-    assert!(reap_until(&mut s, Duration::from_secs(5), |s| s.tasks[0]
-        .finished
-        .is_some()));
-    assert!(s.tasks[0].scraped_id.is_none(), "a silent exit has no hint");
-    assert!(
-        current_resume_id(&s.tasks[0]).is_none(),
-        "no capture channel fired"
+    s.set_recovery_timing(Duration::from_millis(20), Duration::from_millis(100));
+    let commands = ["codex".to_string(), format!("  {}/codex\t", bin.display())];
+    for command in &commands {
+        spawn(&mut s, command, dir.to_path_buf());
+    }
+    assert_eq!(s.tasks.len(), 2);
+    assert!(reap_until(&mut s, Duration::from_secs(5), |s| s
+        .tasks
+        .iter()
+        .all(|t| t.finished.is_some())));
+    for task in &s.tasks {
+        assert!(
+            current_resume_id(task).is_none(),
+            "no capture channel fired"
+        );
+        let spawn_ms = task
+            .spawned_at
+            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_millis();
+        assert!(
+            spawn_ms.abs_diff(u128::from(ms)) <= 30_000,
+            "the decoy must remain plausible"
+        );
+    }
+    let expected = SessionConfig::from([(
+        path::abbreviate(&dir),
+        commands
+            .iter()
+            .map(|cmd| SessionEntry {
+                cmd: cmd.clone(),
+                group: None,
+                name: None,
+            })
+            .collect(),
+    )]);
+    save_and_read(&mut s, &config, "silent");
+    assert_eq!(
+        session::load_in(&config.join("sessions"), "silent").unwrap(),
+        expected
     );
 
-    let text = save_and_read(&mut s, &config, "corr");
     assert!(
-        text.contains(&format!("codex resume '{id}'")),
-        "save must fall back to filesystem correlation; got {text}"
+        wait_until(Duration::from_secs(5), || {
+            s.tick();
+            !recovery_files(&config).is_empty()
+        }),
+        "the recovery snapshot never landed"
     );
-}
-
-/// Save-time correlation uses the task's spawn-time `CODEX_HOME`, even
-/// after a reconnect supplies another home containing a matching rollout.
-#[test]
-fn save_correlates_against_the_spawn_time_home() {
-    let dir = scratch("correlate_home");
-    let (bin, runtime, config) = (dir.join("bin"), dir.join("run"), dir.join("config"));
-    let (home_a, home_b) = (dir.join("codex_a"), dir.join("codex_b"));
-    install_stub(&bin, "codex", &dir);
-    let now_ms = now_ms();
-    // One unique in-window rollout per store, both naming the task cwd.
-    let id_a = write_rollout(&home_a, now_ms, 1, &dir);
-    let id_b = write_rollout(&home_b, now_ms, 2, &dir);
-
-    let mut s = sup_ctx(agent_ctx_plus(
-        &bin,
-        &runtime,
-        dir.to_path_buf(),
-        &[("FLEETCOM_CONFIG_DIR", &config), ("CODEX_HOME", &home_a)],
-    ));
-    spawn(&mut s, "codex", dir.to_path_buf());
-    assert!(reap_until(&mut s, Duration::from_secs(5), |s| s.tasks[0]
-        .finished
-        .is_some()));
-
-    // Reconnect under home B, then save.
-    s.set_launch_context(agent_ctx_plus(
-        &bin,
-        &runtime,
-        dir.to_path_buf(),
-        &[("FLEETCOM_CONFIG_DIR", &config), ("CODEX_HOME", &home_b)],
-    ));
-    let text = save_and_read(&mut s, &config, "homepin");
-    assert!(
-        text.contains(&format!("codex resume '{id_a}'")),
-        "the recipe must resolve from the launch-time store; got {text}"
-    );
-    assert!(
-        !text.contains(&id_b),
-        "the reconnect store's decoy must not correlate; got {text}"
+    let files = recovery_files(&config);
+    assert_eq!(files.len(), 1);
+    let stem = files[0].strip_suffix(".json").unwrap();
+    let recovery = config.join("sessions").join("recovery");
+    assert_eq!(
+        session::load_recovery_in(&recovery, stem).unwrap(),
+        expected
     );
 }
 
@@ -1120,7 +994,7 @@ fn save_correlates_against_the_spawn_time_home() {
 /// joined with the tool's dot directory, then nothing.
 #[test]
 fn harness_home_prefers_the_tool_var_then_home() {
-    use crate::harness::{Claude, Codex, Grok};
+    use crate::harness::{Claude, Codex, Grok, Omp};
     let env: Vec<(OsString, OsString)> = vec![
         ("HOME".into(), "/h".into()),
         ("CODEX_HOME".into(), "/x".into()),
@@ -1135,15 +1009,13 @@ fn harness_home_prefers_the_tool_var_then_home() {
         harness_home(&env, &Claude).as_deref(),
         Some(Path::new("/h/.claude"))
     );
-    assert_eq!(
-        harness_home(&env, &Grok).as_deref(),
-        Some(Path::new("/h/.grok"))
-    );
+    assert_eq!(harness_home(&env, &Grok), None);
+    assert_eq!(harness_home(&env, &Omp), None);
     assert_eq!(harness_home(&[], &Codex), None);
 }
 
-/// With only `HOME` in the launch environment, both notify routing and
-/// save-time correlation resolve through `<home>/.codex`.
+/// With only `HOME` in the launch environment, notify routing reads
+/// `<home>/.codex/config.toml`.
 #[test]
 fn home_only_launch_env_targets_the_clients_dot_codex() {
     let dir = scratch("home_resolve");
@@ -1163,11 +1035,6 @@ fn home_only_launch_env_targets_the_clients_dot_codex() {
     )
     .unwrap();
     install_stub(&bin, "codex", &dir);
-    // A unique in-window rollout in the same tree for save-time
-    // correlation: with injection suppressed, no capture channel fires.
-    let now_ms = now_ms();
-    let id = write_rollout(&codex_home, now_ms, 1, &dir);
-
     let mut s = sup_ctx(agent_ctx_plus(
         &bin,
         &runtime,
@@ -1189,10 +1056,15 @@ fn home_only_launch_env_targets_the_clients_dot_codex() {
         .finished
         .is_some()));
 
-    let text = save_and_read(&mut s, &config, "homeonly");
-    assert!(
-        text.contains(&format!("codex resume '{id}'")),
-        "correlation must read <home>/.codex; got {text}"
+    save_and_read(&mut s, &config, "homeonly");
+    let cfg = session::load_in(&config.join("sessions"), "homeonly").unwrap();
+    assert_eq!(
+        cfg[&path::abbreviate(&dir)],
+        vec![SessionEntry {
+            cmd: "codex".into(),
+            group: None,
+            name: None,
+        }]
     );
 }
 
@@ -1245,14 +1117,12 @@ fn stale_inherited_notify_chain_is_never_executed() {
     );
 }
 
-/// Without a live or filesystem ID, an agent recipe retains the original
-/// command.
+/// Without a known ID, an agent recipe retains the original command.
 #[test]
 fn agent_save_without_any_id_keeps_the_plain_command() {
     let dir = scratch("no_id");
     let (bin, runtime, config) = (dir.join("bin"), dir.join("run"), dir.join("config"));
-    // CODEX_HOME names a store that never exists: correlation has
-    // nothing to find, and the notify routing nothing to read.
+    // No config.toml exists, so notifier routing has nothing to read.
     let codex_home = dir.join("codex_home");
     install_stub(&bin, "codex", &dir);
     let mut s = sup_ctx(agent_ctx_plus(

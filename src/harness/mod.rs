@@ -9,8 +9,8 @@
 //!
 //! # Security invariant
 //!
-//! Every ID returned by `parse_capture`, `scrape_exit`, `live_session_id`, or
-//! `correlate_fs` eventually enters a shell command. These methods return only
+//! Every ID returned by `parse_capture`, `scrape_exit`, or `live_session_id`
+//! eventually enters a shell command. These methods return only
 //! strings accepted by [`is_uuid`]; free text, paths, and malformed IDs yield
 //! `None`. Summary adapters and `live_blocked_status` are display-only.
 
@@ -24,16 +24,14 @@ pub mod summary;
 use std::{
     ffi::OsString,
     fs::File,
-    io::{BufRead, BufReader, Read},
+    io::Read,
     path::{Path, PathBuf},
-    time::{Duration, SystemTime},
+    time::SystemTime,
 };
 
 pub use claude::Claude;
 pub use codex::Codex;
 pub use grok::Grok;
-#[cfg(test)]
-pub(crate) use grok::encode_cwd;
 pub use omp::Omp;
 
 /// Environment variable naming the capture file used by injected assets.
@@ -44,33 +42,12 @@ pub const CAPTURE_ENV: &str = "FLEETCOM_CAPTURE_FILE";
 /// configured so inherited values cannot reach the capture script.
 pub const NOTIFY_CHAIN_ENV: &str = "FLEETCOM_NOTIFY_CHAIN";
 
-/// Maximum difference between a task spawn and a correlated session timestamp.
-const CORRELATE_WINDOW: Duration = Duration::from_secs(30);
-
-/// Detection, capture, correlation, and resume behavior for one agent CLI.
+/// Detection, capture, and resume behavior for one agent CLI.
 pub trait Harness: Sync {
-    /// Environment variable overriding the tool's home root. The supervisor
-    /// resolves it from the launch context used for instrumentation or save.
-    fn home_env_var(&self) -> &'static str;
-
-    /// Default store path relative to the launched process's `$HOME`.
-    fn home_dot_dir(&self) -> &'static str;
-
-    /// Resolve the store root from the launch environment. The default uses
-    /// the tool-specific override, then `$HOME` plus [`Self::home_dot_dir`].
-    /// Returning `None` delegates to [`Self::home_root`]'s platform fallback.
-    fn resolve_home(&self, env: &dyn Fn(&str) -> Option<PathBuf>) -> Option<PathBuf> {
-        env(self.home_env_var()).or_else(|| Some(env("HOME")?.join(self.home_dot_dir())))
-    }
-
-    /// Resolve the tool's home root. `home` follows the `instrument` contract:
-    /// falling back to this process's home happens only when the launch
-    /// environment supplied neither the tool-specific override nor `HOME`.
-    fn home_root(&self, home: Option<&Path>) -> Option<PathBuf> {
-        match home {
-            Some(p) => Some(p.to_path_buf()),
-            None => Some(dirs::home_dir()?.join(self.home_dot_dir())),
-        }
+    /// Resolve configuration needed by instrumentation or the live registry
+    /// from the launch environment. Tools that need neither return `None`.
+    fn resolve_home(&self, _env: &dyn Fn(&str) -> Option<PathBuf>) -> Option<PathBuf> {
+        None
     }
 
     /// Program word and canonical resume selector. The default detection and
@@ -129,16 +106,29 @@ pub trait Harness: Sync {
         None
     }
 
-    /// Find one session ID in the tool's on-disk store. Missing or ambiguous
-    /// matches return `None`. `home` follows the `instrument` contract.
-    fn correlate_fs(&self, cwd: &Path, spawned: SystemTime, home: Option<&Path>) -> Option<String>;
-
     /// Rewrite an accepted `cmd` into the canonical command that resumes
     /// `id`.
     fn resume_command(&self, cmd: &str, id: &str) -> String {
         let (program, selector) = self.shape();
         resume_shape(cmd, program, selector, id)
     }
+}
+
+/// Resolve a tool-specific override before the launch environment's home.
+/// Without either, the consumer applies [`home_root`]'s platform fallback.
+fn resolve_home(
+    env: &dyn Fn(&str) -> Option<PathBuf>,
+    override_var: &str,
+    dot_dir: &str,
+) -> Option<PathBuf> {
+    env(override_var).or_else(|| Some(env("HOME")?.join(dot_dir)))
+}
+
+/// Use the launch-time configuration root, falling back to this process's
+/// platform home only when the launch supplied no root.
+fn home_root(home: Option<&Path>, dot_dir: &str) -> Option<PathBuf> {
+    home.map(Path::to_path_buf)
+        .or_else(|| Some(dirs::home_dir()?.join(dot_dir)))
 }
 
 /// One registered agent CLI: capture harness and display adapter.
@@ -347,78 +337,6 @@ fn pin_plan(inv: &Invocation) -> SpawnPlan {
         plan.injected_id = Some(id);
     }
     plan
-}
-
-/// Whether `a` and `b` differ by at most [`CORRELATE_WINDOW`].
-fn within_window(a: SystemTime, b: SystemTime) -> bool {
-    match a.duration_since(b) {
-        Ok(d) => d <= CORRELATE_WINDOW,
-        Err(e) => e.duration() <= CORRELATE_WINDOW,
-    }
-}
-
-/// Epoch-millisecond form of [`within_window`].
-fn within_window_ms(a: u128, b: u128) -> bool {
-    a.abs_diff(b) <= CORRELATE_WINDOW.as_millis()
-}
-
-/// Milliseconds embedded in the first 48 bits of a UUIDv7: the session's
-/// creation instant. `None` when `id` is not v7. `id` must already satisfy
-/// [`is_uuid`], which fixes its length and alphabet.
-fn v7_millis(id: &str) -> Option<u64> {
-    if id.as_bytes()[14] != b'7' {
-        return None;
-    }
-    u64::from_str_radix(&format!("{}{}", &id[..8], &id[9..13]), 16).ok()
-}
-
-/// Epoch milliseconds of `t`; `None` before the epoch.
-fn unix_millis(t: SystemTime) -> Option<u128> {
-    Some(t.duration_since(SystemTime::UNIX_EPOCH).ok()?.as_millis())
-}
-
-/// Whether a store-recorded path names the task's working directory: literal
-/// equality first, so identical nonexistent paths stay eligible, then the
-/// canonical task path `canon` for symlinked invocations.
-fn same_cwd(recorded: &Path, cwd: &Path, canon: Option<&Path>) -> bool {
-    recorded == cwd || canon.is_some_and(|c| recorded == c)
-}
-
-/// The one candidate when exactly one strict UUID survives; any other count
-/// or shape yields `None`.
-fn sole_id(candidates: Vec<String>) -> Option<String> {
-    match candidates.as_slice() {
-        [only] if is_uuid(only) => Some(only.clone()),
-        _ => None,
-    }
-}
-
-/// Append `x` unless an equal entry is present.
-fn push_unique<T: PartialEq>(v: &mut Vec<T>, x: T) {
-    if !v.contains(&x) {
-        v.push(x);
-    }
-}
-
-/// Parse the first `n` JSONL records of `path`, reading at most 64 KiB so
-/// later transcript content cannot affect correlation. Each entry is `None`
-/// when its line does not parse, so callers decide whether a malformed record
-/// rejects or is skipped. `None` when the file cannot be opened, a read
-/// fails, or the file ends before `n` records.
-fn jsonl_head(path: &Path, n: usize) -> Option<Vec<Option<jzon::JsonValue>>> {
-    let file = File::open(path).ok()?;
-    let mut reader = BufReader::new(file.take(64 * 1024));
-    let mut records = Vec::with_capacity(n);
-    let mut line = String::new();
-    for _ in 0..n {
-        line.clear();
-        match reader.read_line(&mut line) {
-            Ok(len) if len > 0 => {}
-            _ => return None,
-        }
-        records.push(jzon::parse(&line).ok());
-    }
-    Some(records)
 }
 
 /// Single-quote `s` for `$SHELL -c`, encoding embedded `'` as `'\''`.
@@ -686,53 +604,21 @@ mod tests {
     }
 
     #[test]
-    fn within_window_is_symmetric_and_bounded() {
-        let t = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
-        assert!(within_window(t, t + Duration::from_secs(30)));
-        assert!(within_window(t + Duration::from_secs(30), t));
-        assert!(!within_window(t, t + Duration::from_secs(31)));
-        assert!(within_window_ms(5_000, 35_000));
-        assert!(!within_window_ms(5_000, 35_001));
-    }
-
-    #[test]
-    fn home_env_vars_name_each_tools_override() {
-        // Expected environment override and default directory for each
-        // `AGENTS` entry, in the same order.
-        const OVERRIDES: [(&str, &str); 4] = [
-            ("CLAUDE_CONFIG_DIR", ".claude"),
-            ("CODEX_HOME", ".codex"),
-            ("GROK_HOME", ".grok"),
-            ("PI_CODING_AGENT_SESSION_DIR", ".omp/agent/sessions"),
-        ];
-        assert_eq!(
-            AGENTS.len(),
-            OVERRIDES.len(),
-            "a new harness needs its (env var, dot dir) row added here"
-        );
-        for (a, (env_var, dot_dir)) in AGENTS.iter().zip(OVERRIDES) {
-            let program = a.harness.shape().0;
-            assert_eq!(a.harness.home_env_var(), env_var, "{program}");
-            assert_eq!(a.harness.home_dot_dir(), dot_dir, "{program}");
-        }
-    }
-
-    #[test]
     fn registry_detect_routes_to_the_matching_harness() {
         // The literal count keeps this hand-written routing coverage aligned
         // with `AGENTS`.
         assert_eq!(AGENTS.len(), 4, "route the new harness's command here");
         let (h, inv) = detect("claude").unwrap();
-        assert_eq!(h.home_dot_dir(), ".claude");
+        assert_eq!(h.shape().0, "claude");
         assert_eq!(inv, Invocation::Bare);
         let (h, inv) = detect(&format!("codex resume {ID}")).unwrap();
-        assert_eq!(h.home_dot_dir(), ".codex");
+        assert_eq!(h.shape().0, "codex");
         assert_eq!(inv, Invocation::Resume(ID.into()));
         let (h, inv) = detect("grok").unwrap();
-        assert_eq!(h.home_dot_dir(), ".grok");
+        assert_eq!(h.shape().0, "grok");
         assert_eq!(inv, Invocation::Bare);
         let (h, inv) = detect("omp").unwrap();
-        assert_eq!(h.home_dot_dir(), ".omp/agent/sessions");
+        assert_eq!(h.shape().0, "omp");
         assert_eq!(inv, Invocation::Bare);
         assert!(detect("vim").is_none());
         assert!(detect("").is_none());

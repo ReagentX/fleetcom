@@ -167,7 +167,7 @@ fn scrape_now(t: &mut Task) {
     t.scrape_exit_hint();
 }
 
-/// Resolve the harness store root from the task's launch environment.
+/// Resolve harness configuration from the task's launch environment.
 fn harness_home(env: &[(OsString, OsString)], h: &dyn harness::Harness) -> Option<PathBuf> {
     h.resolve_home(&|key| env_get(env, key).map(PathBuf::from))
 }
@@ -789,7 +789,7 @@ impl Supervisor {
         )?;
         if let Some((h, home, capture_file, resume_id)) = meta {
             task.harness = Some(h);
-            // Preserve the launch-time store for later correlation.
+            // Registry reads must keep using the launch-time configuration.
             task.harness_home = home;
             task.capture_file = Some(capture_file);
             task.resume_id = resume_id;
@@ -864,10 +864,7 @@ impl Supervisor {
         // targeted conversation.
         let (command, cwd) = {
             let old = &self.tasks[i];
-            let command = match (old.harness, current_resume_id(old)) {
-                (Some(h), Some(rid)) => h.resume_command(&old.command, &rid),
-                _ => old.command.clone(),
-            };
+            let command = Self::recipe_command(old);
             (command, old.cwd.clone())
         };
         // Preserve the finished task if its replacement cannot start. The run
@@ -913,7 +910,7 @@ impl Supervisor {
             cfg.entry(path::abbreviate(&t.cwd))
                 .or_default()
                 .push(SessionEntry {
-                    cmd: self.recipe_command(t),
+                    cmd: Self::recipe_command(t),
                     group: t.group.clone(),
                     name: t.name.clone(),
                 });
@@ -921,19 +918,12 @@ impl Supervisor {
         cfg
     }
 
-    /// Build the command stored for one task. Agent commands use the best live
-    /// ID, then filesystem correlation; without either, the requested command
-    /// remains unchanged.
-    fn recipe_command(&self, t: &Task) -> String {
-        let Some(h) = t.harness else {
-            return t.command.clone();
-        };
-        // Correlate against the store selected when this task launched.
-        let id = current_resume_id(t)
-            .or_else(|| h.correlate_fs(&t.cwd, t.spawned_at, t.harness_home.as_deref()));
-        match id {
-            Some(id) => h.resume_command(&t.command, &id),
-            None => t.command.clone(),
+    /// Build the saved or rerun command from the task's best-known ID.
+    /// Without an ID, preserve the requested command exactly.
+    fn recipe_command(t: &Task) -> String {
+        match (t.harness, current_resume_id(t)) {
+            (Some(h), Some(id)) => h.resume_command(&t.command, &id),
+            _ => t.command.clone(),
         }
     }
 

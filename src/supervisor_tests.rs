@@ -5,7 +5,7 @@ use crate::{
     protocol::{ClipboardKind, Key, Mods},
     testutil::{
         Scratch, here, install_fake_notifier, now_ms, read_pid, sh_env, wait_until,
-        write_executable, write_rollout,
+        write_executable,
     },
 };
 

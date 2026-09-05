@@ -1,5 +1,5 @@
 //! Test scaffolds shared by the in-src test modules: scratch directories,
-//! deadline polling, and the corpus/rollout fixtures. Test-only (`#[cfg(test)]`
+//! deadline polling, and corpus fixtures. Test-only (`#[cfg(test)]`
 //! at the declaration in `main.rs`), so nothing here ships.
 
 use std::{
@@ -17,7 +17,6 @@ use std::{
 
 use crate::{
     emulator::Emulator,
-    format::civil_from_days,
     task::{pid_is_dead, positive_pid},
 };
 
@@ -206,54 +205,4 @@ pub(crate) const CORPUS_COLS: usize = 120;
 /// scrollback (2000 rows) to retain every fixture's history.
 pub(crate) fn corpus_emulator() -> Emulator {
     Emulator::new(CORPUS_LINES as u16, CORPUS_COLS as u16, 2000)
-}
-
-/// A v7-shaped ID whose embedded instant is `ms`, with a fixed tail.
-pub(crate) fn v7_at(ms: u64, tail: u32) -> String {
-    format!(
-        "{:08x}-{:04x}-7000-8000-0000000{:05x}",
-        ms >> 16,
-        ms & 0xffff,
-        tail
-    )
-}
-
-/// Write a rollout under the UTC day dir for `ms` with `cwd` in its
-/// `session_meta` line; returns the ID. The filename timestamp is inert:
-/// correlation reads the v7 ID's embedded instant, never the name.
-pub(crate) fn write_rollout(home: &Path, ms: u64, tail: u32, cwd: &Path) -> String {
-    write_rollout_named(home, ms, tail, cwd, "", "")
-}
-
-/// [`write_rollout`] with an optional filename suffix and additional
-/// `session_meta` payload members. `stem_suffix` follows the thread ID;
-/// `meta_extra` is inserted verbatim and must include each leading comma.
-pub(crate) fn write_rollout_named(
-    home: &Path,
-    ms: u64,
-    tail: u32,
-    cwd: &Path,
-    stem_suffix: &str,
-    meta_extra: &str,
-) -> String {
-    let id = v7_at(ms, tail);
-    let (y, m, d) = civil_from_days((ms / 86_400_000) as i64);
-    let dir = home
-        .join("sessions")
-        .join(format!("{y:04}"))
-        .join(format!("{m:02}"))
-        .join(format!("{d:02}"));
-    fs::create_dir_all(&dir).unwrap();
-    let meta = format!(
-        r#"{{"timestamp":"x","type":"session_meta","payload":{{"id":"{id}","cwd":"{}"{meta_extra}}}}}"#,
-        cwd.display()
-    );
-    fs::write(
-        dir.join(format!(
-            "rollout-2026-07-13T09-00-00-{id}{stem_suffix}.jsonl"
-        )),
-        format!("{meta}\n{{}}\n"),
-    )
-    .unwrap();
-    id
 }

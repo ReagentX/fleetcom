@@ -1,8 +1,7 @@
 //! Claude session capture uses a launch-time `--session-id`, a `SessionStart`
 //! hook, the live session registry, and the exit-time resume hint. Bare launches
 //! pin a v4 UUID; accepted launches install the hook through `--settings`.
-//! Live lookup reads `<claude-home>/sessions/<pid>.json`; fallback correlation
-//! reads project transcripts.
+//! Live lookup reads `<claude-home>/sessions/<pid>.json`.
 
 use std::{
     fs,
@@ -12,19 +11,15 @@ use std::{
 
 use super::summary::AWAITING_APPROVAL;
 use super::{
-    CAPTURE_ENV, CapturePaths, Harness, Invocation, SpawnPlan, capture_id, is_uuid, last_hint,
-    pin_plan, same_cwd, shell_quote, sole_id, unix_millis, within_window, within_window_ms,
+    CAPTURE_ENV, CapturePaths, Harness, Invocation, SpawnPlan, capture_id, home_root, is_uuid,
+    last_hint, pin_plan, resolve_home, shell_quote,
 };
 
 pub struct Claude;
 
 impl Harness for Claude {
-    fn home_env_var(&self) -> &'static str {
-        "CLAUDE_CONFIG_DIR"
-    }
-
-    fn home_dot_dir(&self) -> &'static str {
-        ".claude"
+    fn resolve_home(&self, env: &dyn Fn(&str) -> Option<PathBuf>) -> Option<PathBuf> {
+        resolve_home(env, "CLAUDE_CONFIG_DIR", ".claude")
     }
 
     fn shape(&self) -> (&'static str, &'static str) {
@@ -80,11 +75,6 @@ impl Harness for Claude {
         rec.waiting
             .then(|| waiting_preview(rec.waiting_for.as_deref()))
     }
-
-    fn correlate_fs(&self, cwd: &Path, spawned: SystemTime, home: Option<&Path>) -> Option<String> {
-        let dir = self.home_root(home)?.join("projects").join(slug(cwd)?);
-        unique_in_window(dir, spawned)
-    }
 }
 
 /// Validated fields used to correlate a registry record with a task and render
@@ -135,7 +125,8 @@ fn parse_record(text: &str) -> Option<SessionRecord> {
 /// Read `sessions/<pid>.json` and require its PID, working directory, and
 /// process start to match the task. The unreaped task leader reserves its PID;
 /// the directory and start-time checks reject stale records already present at
-/// that path. A mismatch returns `None` because the ID may enter a shell command.
+/// that path. The start time may differ by at most 30 seconds. A mismatch
+/// returns `None` because the ID may enter a shell command.
 fn record_for_pid(
     pid: u32,
     cwd: &Path,
@@ -143,50 +134,17 @@ fn record_for_pid(
     home: Option<&Path>,
 ) -> Option<SessionRecord> {
     let pid = i32::try_from(pid).ok()?;
-    let dir = Claude.home_root(home)?.join("sessions");
+    let dir = home_root(home, ".claude")?.join("sessions");
     let text = fs::read_to_string(dir.join(format!("{pid}.json"))).ok()?;
     let rec = parse_record(&text)?;
+    let spawn_ms = spawned
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .ok()?
+        .as_millis();
     (rec.pid == pid
-        && same_cwd(&rec.cwd, cwd, cwd.canonicalize().ok().as_deref())
-        && within_window_ms(rec.started_at, unix_millis(spawned)?))
-    .then_some(rec)
-}
-
-/// Return the UUID stem of the sole `.jsonl` transcript created within
-/// [`super::CORRELATE_WINDOW`] of `spawned`. Unreadable entries and creation
-/// times are ignored; directory errors, zero or multiple candidates, and an
-/// invalid sole stem return `None`.
-fn unique_in_window(dir: PathBuf, spawned: SystemTime) -> Option<String> {
-    let mut candidates: Vec<String> = Vec::new();
-    for entry in fs::read_dir(dir).ok()?.flatten() {
-        let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
-            continue;
-        }
-        let Some(name) = path.file_stem().and_then(|s| s.to_str()) else {
-            continue;
-        };
-        let Ok(created) = entry.metadata().and_then(|m| m.created()) else {
-            continue;
-        };
-        if !within_window(created, spawned) {
-            continue;
-        }
-        candidates.push(name.to_string());
-    }
-    sole_id(candidates)
-}
-
-/// Convert an absolute working directory to Claude's project slug by replacing
-/// `/` and `.` with `-` (`/a/b.c` becomes `-a-b-c`). Non-UTF-8 paths have no
-/// representable slug.
-fn slug(cwd: &Path) -> Option<String> {
-    Some(
-        cwd.to_str()?
-            .chars()
-            .map(|c| if c == '/' || c == '.' { '-' } else { c })
-            .collect(),
-    )
+        && (rec.cwd == cwd || cwd.canonicalize().is_ok_and(|canon| rec.cwd == canon))
+        && rec.started_at.abs_diff(spawn_ms) <= 30_000)
+        .then_some(rec)
 }
 
 #[cfg(test)]
@@ -320,47 +278,6 @@ mod tests {
         assert_eq!(Claude.scrape_exit(&format!("claude --resume {ID}ff")), None);
     }
 
-    #[test]
-    fn correlate_fs_requires_a_unique_in_window_transcript() {
-        let home = temp("claude_correlate");
-        // Slug: `/` and `.` both become `-`.
-        let cwd = Path::new("/a/b.c");
-        let dir = home.join("projects").join("-a-b-c");
-        fs::create_dir_all(&dir).unwrap();
-        fs::write(dir.join(format!("{ID}.jsonl")), "{}").unwrap();
-        let now = SystemTime::now();
-
-        assert_eq!(
-            Claude.correlate_fs(cwd, now, Some(&home)).as_deref(),
-            Some(ID)
-        );
-        // Outside the window: the transcript predates the spawn by minutes.
-        let late = now + std::time::Duration::from_secs(120);
-        assert_eq!(Claude.correlate_fs(cwd, late, Some(&home)), None);
-        // Wrong project directory.
-        assert_eq!(
-            Claude.correlate_fs(Path::new("/other"), now, Some(&home)),
-            None
-        );
-
-        // A second in-window transcript makes the match ambiguous.
-        fs::write(dir.join(format!("{OTHER}.jsonl")), "{}").unwrap();
-        assert_eq!(Claude.correlate_fs(cwd, now, Some(&home)), None);
-    }
-
-    #[test]
-    fn correlate_fs_rejects_a_unique_non_uuid_stem() {
-        let home = temp("claude_nonuuid");
-        let cwd = Path::new("/w");
-        let dir = home.join("projects").join("-w");
-        fs::create_dir_all(&dir).unwrap();
-        fs::write(dir.join("agent-notes.jsonl"), "{}").unwrap();
-        assert_eq!(
-            Claude.correlate_fs(cwd, SystemTime::now(), Some(&home)),
-            None
-        );
-    }
-
     /// A complete matching record exposes its validated session ID.
     #[test]
     fn record_for_pid_reads_a_live_record() {
@@ -454,7 +371,7 @@ mod tests {
             &record(4242, ID, "/w", LIVE_STARTED, "interactive", ""),
         );
 
-        // The correlation window includes both endpoints.
+        // The start-time tolerance includes both endpoints.
         assert!(record_for_pid(4242, cwd, at_ms(LIVE_STARTED + 30_000), Some(&home)).is_some());
         assert!(record_for_pid(4242, cwd, at_ms(LIVE_STARTED - 30_000), Some(&home)).is_some());
         // One millisecond outside the window is stale.
