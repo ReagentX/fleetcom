@@ -314,23 +314,22 @@ fn step_down(sel: usize, len: usize) -> usize {
 }
 
 /// State-section order: In use, Running, Idle, then Completed.
-/// Tags take precedence, completion follows `lifecycle`, and live tasks use
-/// `parked` to distinguish Running from Idle.
+/// Tags take precedence over lifecycle.
 fn section_rank(v: &TaskView) -> u8 {
     if v.tagged {
         0
-    } else if matches!(v.lifecycle, Lifecycle::Ok | Lifecycle::Failed) {
-        3
-    } else if v.parked {
-        2
     } else {
-        1
+        match v.lifecycle {
+            Lifecycle::Active => 1,
+            Lifecycle::Idle => 2,
+            Lifecycle::Ok | Lifecycle::Failed => 3,
+        }
     }
 }
 
 /// Within-section row order: tagged, live, then finished.
-/// `parked` does not affect row order, so transitions between active and idle
-/// preserve a task's position outside state grouping.
+/// Transitions between active and idle preserve a task's position outside
+/// state grouping.
 fn row_rank(v: &TaskView) -> u8 {
     if v.tagged {
         0

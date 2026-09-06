@@ -105,16 +105,11 @@ pub struct Task {
     pub summary_adapter: Option<&'static dyn crate::preview::SummaryAdapter>,
     /// Run number used to give each rerun a distinct capture path.
     pub run: u32,
-    /// Session ID injected or recognized at spawn. Capture data, a live
-    /// registry record, or an exit hint can supersede it.
+    /// Session ID injected or recognized at spawn. Capture data or a live
+    /// registry record can supersede it.
     pub resume_id: Option<String>,
     /// Capture path allocated for this task run.
     pub capture_file: Option<PathBuf>,
-    /// Session ID scraped once from final terminal text after exit and reader
-    /// EOF.
-    pub scraped_id: Option<String>,
-    /// Whether the one-shot full-history exit scrape has run.
-    scraped: bool,
     /// Dashboard-preview resolution state; resets with the task on rerun
     /// because a rerun replaces the whole `Task`.
     preview: PreviewState,
@@ -122,7 +117,7 @@ pub struct Task {
     blocked: Option<(String, &'static str)>,
     /// Last registry probe time; `None` before the first probe.
     blocked_probed: Option<Instant>,
-    /// Wall-clock spawn time used for registry and transcript correlation.
+    /// Wall-clock spawn time used to validate the Claude PID registry record.
     pub spawned_at: SystemTime,
     exit_code: Option<i32>,
     pub started: Instant,
@@ -134,11 +129,7 @@ pub struct Task {
     kill_sent: bool,
     /// Whether the leader has been reaped; its process group must not be
     /// signalled afterward because the ID may have been reused (`terminate`
-    /// and `force_kill` gate on this). The signal-0 existence probe
-    /// (`group_gone`) is the one carve-out: it delivers nothing, so a
-    /// recycled ID cannot be harmed, and its errors are one-sided; ESRCH is
-    /// conclusive while a stale "exists" only extends a wait that stays
-    /// bounded by the shutdown grace.
+    /// and `force_kill` gate on this).
     reaped: bool,
 }
 
@@ -352,8 +343,6 @@ impl Task {
             run: 0,
             resume_id: None,
             capture_file: None,
-            scraped_id: None,
-            scraped: false,
             preview: PreviewState::new(),
             blocked: None,
             blocked_probed: None,
@@ -376,8 +365,7 @@ impl Task {
     /// reaping it. `WNOWAIT` leaves the zombie in place, which is what keeps
     /// the pid (and therefore the pgid) reserved so the group stays signalable
     /// for the task's whole life; see the `reaped` field. The zombie is
-    /// collected exactly once: at teardown (`collect`), or by the shutdown
-    /// emptiness probe (`group_gone`).
+    /// collected at teardown, after SIGKILL.
     pub fn poll_exit(&mut self) -> io::Result<()> {
         if self.finished.is_some() || self.reaped {
             return Ok(());
@@ -403,29 +391,7 @@ impl Task {
         self.finished.is_some() && self.handle.as_ref().is_none_or(JoinHandle::is_finished)
     }
 
-    /// Scrape at most one exit hint after the process exits and the PTY reader
-    /// reaches EOF (see [`Task::output_complete`]).
-    pub fn scrape_exit_hint(&mut self) {
-        let Some(h) = self.harness else { return };
-        if self.scraped || !self.output_complete() {
-            return;
-        }
-        self.scraped = true;
-        let text = {
-            let mut emu = grid(&self.parser);
-            // Land any open synchronized frame before scraping. The reader is
-            // stopped, so no closing ESU can arrive; all slave fds are closed,
-            // so generated probe replies have no recipient.
-            let _ = emu.finish_output();
-            emu.text_with_history()
-        };
-        if let Some(id) = h.scrape_exit(&text) {
-            self.scraped_id = Some(id);
-        }
-    }
-
-    /// Report whether the reader reached EOF. Tests use this second scrape gate
-    /// without driving the reap loop.
+    /// Report whether the reader reached EOF without driving the reap loop.
     #[cfg(test)]
     pub(crate) fn reader_done(&self) -> bool {
         self.handle.as_ref().is_none_or(|h| h.is_finished())
@@ -493,11 +459,6 @@ impl Task {
             .lock()
             .map(|t| now.duration_since(*t))
             .unwrap_or(Duration::ZERO)
-    }
-
-    /// Whether a live task has been quiet beyond the placement window.
-    pub fn parked(&self, now: Instant, window: Duration) -> bool {
-        self.finished.is_none() && self.quiet_for(now) > window
     }
 
     /// Flush an expired `?2026` synchronized update so a stalled child's
@@ -719,55 +680,6 @@ impl Task {
         // unblocks the worker and EOFs the reader; the reader's own sender
         // clone drops when it exits, closing the queue.
         self.input_tx.take();
-    }
-
-    /// Whether this task's process group is observably gone: leader reaped
-    /// and a signal-0 group probe answering ESRCH. The shutdown wait's exit
-    /// test; nothing else may call it, because it spends the zombie.
-    ///
-    /// The order inside one call is load-bearing. An unreaped zombie leader
-    /// keeps the group answering kill-style probes regardless of member
-    /// count (Linux reports it Ok, macOS EPERM, never ESRCH), so emptiness
-    /// is unobservable until the leader is reaped: reap first, probe second,
-    /// in the same pass, before the freed pid could plausibly recycle. Later
-    /// calls re-probe a long-reaped ID, which is safe only because the
-    /// probe's errors are one-sided: surviving members keep the pgid
-    /// reserved (a pid still serving as a live group's ID is not reissued),
-    /// so "exists" stays truthful while anyone remains; a recycled ID
-    /// misreads only as "exists", a bounded wait, never a stray signal; and
-    /// ESRCH cannot be wrong, since an ID with no group behind it cannot be
-    /// this group with members. Real signals get no such carve-out (see
-    /// `reaped`).
-    ///
-    /// The reap spends the pgid reservation `force_kill` relies on: a group
-    /// that still has members afterward can no longer be KILL-escalated, so
-    /// TERM-refusing members outlive shutdown and reparent to init. That is
-    /// the price of observing emptiness at all; the graveyard declines to
-    /// pay it and keeps its zombies until `kill_sent` (see
-    /// `Supervisor::reap`).
-    pub fn group_gone(&mut self) -> bool {
-        let Some(pid) = self.pid else {
-            // No pid was ever known: nothing waitable or signalable exists.
-            return true;
-        };
-        if self.finished.is_none() {
-            // A live leader is a live group; the zombie-spending reap below
-            // must never run before the leader has exited.
-            return false;
-        }
-        if !self.reaped {
-            self.collect();
-            if !self.reaped {
-                // Transient waitid failure: hold shutdown and retry next pass.
-                return false;
-            }
-        }
-        // Only ESRCH reads as gone. Ok is a live signalable member; EPERM is
-        // a member that exists but is beyond our signals. Both hold the wait.
-        matches!(
-            killpg(Pid::from_raw(pid as i32), None::<Signal>),
-            Err(Errno::ESRCH)
-        )
     }
 }
 

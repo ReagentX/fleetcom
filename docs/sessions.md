@@ -51,7 +51,7 @@ The file is plain JSON and practical to edit by hand. Editing the `name` field c
 
 Commands with neither a group nor a name use the string form. String and object entries can appear in the same directory array.
 
-A bare agent command does not identify its conversation, so saving it verbatim would start another one on load. When `fleetcom` captures an ID for `claude`, `codex`, `grok`, or `omp`, it stores the resume form instead. The result remains an ordinary command string that can run directly in a shell:
+A bare agent command does not identify its conversation, so saving it verbatim would start another one on load. When `fleetcom` captures an ID for `claude`, `codex`, `grok`, or `omp`, it stores the resume form instead. Without a known ID, named saves and recovery snapshots preserve the authored command. The result remains an ordinary command string that can run directly in a shell:
 
 ```json
 {

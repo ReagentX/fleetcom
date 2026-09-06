@@ -169,7 +169,7 @@ Recipes persist full command lines, which can embed secrets. A token passed as a
 
 ### Captured IDs cross a shell boundary
 
-Agent resume writes a captured conversation ID into a command run through `$SHELL -c`, so validation is a security boundary. Accepted IDs contain only lowercase hexadecimal in the `8-4-4-4-12` UUID shape. Hook payloads, terminal scrapes, live session records, filesystem correlation, and the command builder all apply that check. Instrumentation applies only to a bare program word or its canonical resume form, never arbitrary shell text. [Agent session resume](agent-resume.md#validation-boundary) documents both boundaries.
+Agent resume writes a captured conversation ID into a command run through `$SHELL -c`, so validation is a security boundary. Accepted IDs contain only lowercase hexadecimal in the `8-4-4-4-12` UUID shape. Capture payloads, live session records, and the command builder all apply that check. Terminal output supplies no session IDs. Instrumentation applies only to a bare program word or its canonical resume form, never arbitrary shell text. [Agent session resume](agent-resume.md#validation-boundary) documents both boundaries.
 
 ### Copied text leaves through the terminal
 
@@ -211,7 +211,7 @@ A second `fleetcom` prints a waiting notice, then attaches when the active clien
 
 ### Shutdown is graceful-first
 
-`X`, `Q`, `--kill`, and daemon shutdown signals send `SIGTERM` to each task's *process group*, then escalate to `SIGKILL` after two seconds. Removing one task (`X`) keeps an exited leader unreaped through escalation, reserving the process-group ID so background children remain signalable. During full shutdown (`Q`/`--kill`), checking whether a group is empty reaps its exited leader. A `TERM`-ignoring member that outlives the leader can then become unsafe to signal by group ID and survive daemon shutdown. A child created by `cmd &` in a non-interactive shell normally remains in its parent's group. A process that calls `setsid` or otherwise leaves the group is outside the sweep and must be terminated separately.
+`X`, `Q`, `--kill`, and daemon shutdown signals send `SIGTERM` to each task's *process group*, then escalate to `SIGKILL` after two seconds. Exited leaders remain unreaped through escalation, reserving the process-group IDs so background children remain signalable. Full shutdown (`Q`/`--kill`) waits one shared grace period even when all listed tasks have finished or exit on `TERM`; with no tasks left to clean up, shutdown returns immediately. Tasks already terminating keep their original escalation timers. A child created by `cmd &` in a non-interactive shell normally remains in its parent's group. A process that calls `setsid` or otherwise leaves the group is outside the sweep and must be terminated separately.
 
 ### `--foreground` is ephemeral
 

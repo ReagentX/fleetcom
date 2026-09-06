@@ -90,8 +90,7 @@ fn effective_scrollback(flag: Option<usize>, env: Option<&str>) -> usize {
         .map_or(DEFAULT_SCROLLBACK, |lines| lines.min(MAX_SCROLLBACK))
 }
 
-/// Grace period between SIGTERM and SIGKILL, bounding shutdown delay for tasks
-/// that do not exit after SIGTERM.
+/// Grace period between SIGTERM and SIGKILL, shared by all tasks at shutdown.
 const KILL_GRACE: Duration = Duration::from_secs(2);
 
 /// Quiet period used to coalesce recipe changes into one recovery write.
@@ -134,13 +133,10 @@ fn fnv1a_hex(bytes: &[u8]) -> String {
     format!("{h:016x}")
 }
 
-/// Resolve the session ID in precedence order: exit scrape, capture file, live
-/// registry, then spawn-time ID. The first three can reflect a session selected
+/// Resolve the session ID in precedence order: capture file, live registry,
+/// then spawn-time ID. The first two can reflect a session selected
 /// after launch and therefore outrank the spawn-time value.
 fn current_resume_id(task: &Task) -> Option<String> {
-    if let Some(id) = &task.scraped_id {
-        return Some(id.clone());
-    }
     if let (Some(h), Some(path)) = (task.harness, &task.capture_file)
         && let Ok(payload) = std::fs::read_to_string(path)
         && let Some(id) = h.parse_capture(&payload)
@@ -160,15 +156,7 @@ fn current_resume_id(task: &Task) -> Option<String> {
     task.resume_id.clone()
 }
 
-/// Poll for exit before save or rerun reads the session ID. Scraping remains
-/// deferred until the PTY reader reaches EOF and the terminal contains every
-/// child byte.
-fn scrape_now(t: &mut Task) {
-    let _ = t.poll_exit();
-    t.scrape_exit_hint();
-}
-
-/// Resolve the harness store root from the task's launch environment.
+/// Resolve harness configuration from the task's launch environment.
 fn harness_home(env: &[(OsString, OsString)], h: &dyn harness::Harness) -> Option<PathBuf> {
     h.resolve_home(&|key| env_get(env, key).map(PathBuf::from))
 }
@@ -192,7 +180,6 @@ fn affects_recipe(cmd: &Command) -> bool {
         | Command::Tag { .. }
         | Command::Resize { .. }
         | Command::Watch { .. }
-        | Command::Input { .. }
         | Command::Paste { .. }
         | Command::Mouse { .. }
         | Command::Key { .. }
@@ -249,11 +236,8 @@ pub struct Supervisor {
     /// leader's zombie is collected. Invisible to `tick` snapshots, so the row
     /// disappears instantly while the sweep runs behind it.
     ///
-    /// Entries remain through `kill_grace` because observing group emptiness
-    /// would cost the escalation: the probe (`Task::group_gone`) must reap
-    /// the leader to see past its zombie, and a reaped group can no longer
-    /// be KILLed. Entries therefore keep their zombie until `kill_sent`, and
-    /// `shutdown_all` counts the graveyard instead of probing it.
+    /// Entries keep their leader's zombie until SIGKILL has been sent:
+    /// collecting it earlier would release the process-group ID.
     graveyard: Vec<Task>,
     next_id: u64,
     /// PTY content size (rows already minus the client's status bar). Every task
@@ -421,10 +405,8 @@ impl Supervisor {
                 self.watched = id;
                 self.watch_attached = attached;
             }
-            Command::Input { id, bytes } => self.deliver(id, "input", |t| t.send_input(&bytes)),
-            // Paste and scroll land here (not as pre-encoded `Input`) because
-            // their encoding depends on the child's terminal state, which
-            // only this side of the socket can see.
+            // Paste and mouse encoding depend on the child's terminal modes,
+            // which only the core's emulator can see.
             Command::Paste { id, bytes } => self.deliver(id, "paste", |t| t.send_paste(&bytes)),
             Command::Mouse { id, kind, col, row } => {
                 self.deliver(id, "mouse input", |t| t.send_mouse(kind, col, row))
@@ -450,16 +432,13 @@ impl Supervisor {
             // latched this pass and is retried next. waitid failing is rare and
             // must not take down the loop.
             let _ = t.poll_exit();
-            // Scrape after process exit and reader EOF, when every child byte
-            // is present in the grid (see `Task::scrape_exit_hint`).
-            t.scrape_exit_hint();
             // Freeze the preview from the complete output and final screen.
             t.finalize_preview();
             if t.overdue(now, self.kill_grace) {
                 t.force_kill();
             }
         }
-        // Removed tasks need exit handling and escalation, not hint scraping.
+        // Removed tasks still need exit handling and escalation.
         for t in &mut self.graveyard {
             let _ = t.poll_exit();
             if t.overdue(now, self.kill_grace) {
@@ -469,38 +448,22 @@ impl Supervisor {
         self.graveyard.retain_mut(|t| !t.try_collect());
     }
 
-    /// Kill every task for the quit path: TERM all groups at once, wait out
-    /// one shared grace, then SIGKILL the stragglers. The wait exits early
-    /// once `swept` proves there is nothing left to wait for; a task's
-    /// `finished` alone cannot gate it, because leader exit says nothing
-    /// about the rest of the group (`cmd & exit 0` leaves members behind),
-    /// and a leader-only predicate KILLed those members the instant the last
-    /// leader happened to be done, skipping the TERM grace entirely.
-    /// Blocking is bounded by the grace. Anything the final KILLs don't
-    /// collect (a leader in uninterruptible sleep) reparents to init when
-    /// the daemon exits moments later, as do TERM-refusing members of a
-    /// group whose leader the emptiness probe reaped (see
-    /// `Task::group_gone`); blocking on either could wedge shutdown forever.
+    /// TERM every owned group, wait one shared grace, then SIGKILL before
+    /// collecting leaders. Exited leaders retain their process-group IDs:
+    /// their descendants may still need escalation. Existing TERM timers
+    /// continue through `reap`; a nonempty fleet waits even if leaders exit.
+    /// Collection and PTY teardown never block on live processes or workers.
     fn shutdown_all(&mut self) {
         for t in &mut self.tasks {
             t.terminate();
         }
         let deadline = Instant::now() + self.kill_grace;
-        while !self.swept() && Instant::now() < deadline {
+        while (!self.tasks.is_empty() || !self.graveyard.is_empty()) && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(25));
             self.reap();
         }
         self.tasks.clear(); // Drop force-kills whatever is left
         self.graveyard.clear();
-    }
-
-    /// Shutdown's exit test: every live task's process group probes gone and
-    /// the graveyard has drained. Graveyard entries are counted, not probed:
-    /// probing reaps the leader, and a reaped group forfeits the KILL its
-    /// pending escalation still owes (`Task::try_collect`'s `kill_sent` gate
-    /// exists for the same reason); they leave through `reap` as always.
-    fn swept(&mut self) -> bool {
-        self.graveyard.is_empty() && self.tasks.iter_mut().all(Task::group_gone)
     }
 
     /// One step of the core's own loop: reap exits, then emit a fresh task
@@ -542,7 +505,6 @@ impl Supervisor {
                     group: t.group.clone(),
                     name: t.name.clone(),
                     lifecycle: t.lifecycle(now, IDLE_AFTER),
-                    parked: t.parked(now, IDLE_AFTER),
                     preview: t.resolve_preview(now),
                     started_ago: now.duration_since(t.started),
                     quiet_ago: t.finished.is_none().then(|| t.quiet_for(now)),
@@ -625,8 +587,7 @@ impl Supervisor {
             self.recovery.dirty = false;
             return;
         };
-        // Refresh finished tasks' resume IDs before serialization.
-        let cfg = self.refreshed_config();
+        let cfg = self.session_config();
         // Exclude the timestamped label from content comparison.
         let hash = fnv1a_hex(session::fingerprint_json(&cfg).as_bytes());
         // Deduplication is scoped to the current root and requires the snapshot
@@ -809,7 +770,7 @@ impl Supervisor {
         )?;
         if let Some((h, home, capture_file, resume_id)) = meta {
             task.harness = Some(h);
-            // Preserve the launch-time store for later correlation.
+            // Registry reads must keep using the launch-time configuration.
             task.harness_home = home;
             task.capture_file = Some(capture_file);
             task.resume_id = resume_id;
@@ -870,9 +831,8 @@ impl Supervisor {
             self.status(format!("rerun failed: no task {id}"));
             return;
         };
-        // Latch a recent exit and scrape its drained terminal before choosing
-        // the rerun command.
-        scrape_now(&mut self.tasks[i]);
+        // A task can exit between the last reap tick and this request.
+        let _ = self.tasks[i].poll_exit();
         if self.tasks[i].finished.is_none() {
             self.status("rerun failed: task is still running");
             return;
@@ -884,10 +844,7 @@ impl Supervisor {
         // targeted conversation.
         let (command, cwd) = {
             let old = &self.tasks[i];
-            let command = match (old.harness, current_resume_id(old)) {
-                (Some(h), Some(rid)) => h.resume_command(&old.command, &rid),
-                _ => old.command.clone(),
-            };
+            let command = Self::recipe_command(old);
             (command, old.cwd.clone())
         };
         // Preserve the finished task if its replacement cannot start. The run
@@ -911,14 +868,6 @@ impl Supervisor {
         }
     }
 
-    /// Refresh finished tasks' resume IDs before building the session recipe.
-    fn refreshed_config(&mut self) -> SessionConfig {
-        for t in &mut self.tasks {
-            scrape_now(t);
-        }
-        self.session_config()
-    }
-
     /// Build `{dir: [entries]}` in spawn order. Groups and names remain intact;
     /// agent entries use the command returned by `recipe_command`.
     fn session_config(&self) -> SessionConfig {
@@ -933,7 +882,7 @@ impl Supervisor {
             cfg.entry(path::abbreviate(&t.cwd))
                 .or_default()
                 .push(SessionEntry {
-                    cmd: self.recipe_command(t),
+                    cmd: Self::recipe_command(t),
                     group: t.group.clone(),
                     name: t.name.clone(),
                 });
@@ -941,19 +890,12 @@ impl Supervisor {
         cfg
     }
 
-    /// Build the command stored for one task. Agent commands use the best live
-    /// ID, then filesystem correlation; without either, the requested command
-    /// remains unchanged.
-    fn recipe_command(&self, t: &Task) -> String {
-        let Some(h) = t.harness else {
-            return t.command.clone();
-        };
-        // Correlate against the store selected when this task launched.
-        let id = current_resume_id(t)
-            .or_else(|| h.correlate_fs(&t.cwd, t.spawned_at, t.harness_home.as_deref()));
-        match id {
-            Some(id) => h.resume_command(&t.command, &id),
-            None => t.command.clone(),
+    /// Build the saved or rerun command from the task's best-known ID.
+    /// Without an ID, preserve the requested command exactly.
+    fn recipe_command(t: &Task) -> String {
+        match (t.harness, current_resume_id(t)) {
+            (Some(h), Some(id)) => h.resume_command(&t.command, &id),
+            _ => t.command.clone(),
         }
     }
 
@@ -970,7 +912,7 @@ impl Supervisor {
     }
 
     fn save_session(&mut self, name: &str) {
-        let cfg = self.refreshed_config();
+        let cfg = self.session_config();
         let count: usize = cfg.values().map(Vec::len).sum();
         let status = match self
             .sessions_root()

@@ -1,7 +1,7 @@
 use super::*;
 
 /// Every command survives encode→frame-payload→decode unchanged, including
-/// the `Watch{None}` null, raw `Input` bytes (0 and 255), and the no-field
+/// the `Watch{None}` null, `Paste` bytes (0 and 255), and the no-field
 /// `Shutdown`.
 ///
 /// `variant_index` exhaustively matches `Command`, and `seen` verifies that
@@ -56,15 +56,11 @@ fn command_round_trips() {
             id: None,
             attached: false,
         },
-        Command::Input {
-            id: 1,
-            bytes: vec![0, 27, 91, 255],
-        },
         Command::Paste {
-            // Non-UTF-8 and marker-shaped bytes must survive: the core, not
+            // NUL, non-UTF-8, and marker-shaped bytes must survive: the core, not
             // the client, decides what the child receives.
             id: 6,
-            bytes: b"line1\nline2\x1b[201~\xff".to_vec(),
+            bytes: b"line1\nline2\x1b[201~\0\xff".to_vec(),
         },
         Command::Mouse {
             id: 8,
@@ -159,19 +155,18 @@ fn command_round_trips() {
             Command::SetName { .. } => 6,
             Command::Resize { .. } => 7,
             Command::Watch { .. } => 8,
-            Command::Input { .. } => 9,
-            Command::Paste { .. } => 10,
-            Command::Mouse { .. } => 11,
-            Command::Key { .. } => 12,
-            Command::Scrollback { .. } => 13,
-            Command::SaveSession { .. } => 14,
-            Command::LoadSession { .. } => 15,
-            Command::LoadRecovery { .. } => 16,
-            Command::ListSessions => 17,
-            Command::Shutdown => 18,
+            Command::Paste { .. } => 9,
+            Command::Mouse { .. } => 10,
+            Command::Key { .. } => 11,
+            Command::Scrollback { .. } => 12,
+            Command::SaveSession { .. } => 13,
+            Command::LoadSession { .. } => 14,
+            Command::LoadRecovery { .. } => 15,
+            Command::ListSessions => 16,
+            Command::Shutdown => 17,
         }
     }
-    let mut seen = [false; 19];
+    let mut seen = [false; 18];
     for c in cases {
         seen[variant_index(&c)] = true;
         let (k, p) = encode_command(&c);
@@ -277,12 +272,14 @@ fn out_of_range_numerics_are_rejected() {
     }
 }
 
-/// Invalid base64 and non-string byte or path fields reject the command.
+/// Invalid base64, non-string byte or path fields, and the removed raw-input
+/// command are rejected.
 #[test]
-fn invalid_base64_is_rejected() {
+fn invalid_byte_commands_are_rejected() {
     for json in [
-        r#"{"t":"input","id":1,"bytes":"!!!"}"#,
-        r#"{"t":"input","id":1,"bytes":[0,27]}"#, // bytes must be a base64 string
+        r#"{"t":"input","id":1,"bytes":"ABtb/w=="}"#, // removed command, valid bytes
+        r#"{"t":"paste","id":1,"bytes":"!!!"}"#,
+        r#"{"t":"paste","id":1,"bytes":[0,27]}"#, // bytes must be a base64 string
         r#"{"t":"paste","id":1,"bytes":"AAAA="}"#, // bad padding length
         r#"{"t":"spawn","command":"ls","cwd":"/tmp/x"}"#, // plain path
     ] {
@@ -312,7 +309,6 @@ fn tv(id: u64) -> TaskView {
         group: None,
         name: None,
         lifecycle: Lifecycle::Ok,
-        parked: false,
         preview: Preview::floor(String::new()),
         started_ago: Duration::from_millis(0),
         quiet_ago: None,
@@ -339,11 +335,11 @@ fn mistyped_event_members_are_rejected() {
     for json in [
         r#"{"t":"tasks","tasks":[{"id":"nope"}]}"#,
         // The cwd must be a base64 string.
-        r#"{"t":"tasks","tasks":[{"id":1,"command":"x","cwd":"/x","tagged":true,"life":"ok","preview":"","started_ms":0}]}"#,
+        r#"{"t":"tasks","tasks":[{"id":1,"command":"x","cwd":"/x","tagged":true,"life":"ok","preview":"","src":"floor","frozen":false,"started_ms":0}]}"#,
         // A present group must be a string; only missing/null means unassigned.
-        r#"{"t":"tasks","tasks":[{"id":1,"command":"x","cwd":"Lw==","tagged":true,"life":"ok","preview":"","started_ms":0,"group":5}]}"#,
+        r#"{"t":"tasks","tasks":[{"id":1,"command":"x","cwd":"Lw==","tagged":true,"life":"ok","preview":"","src":"floor","frozen":false,"started_ms":0,"group":5}]}"#,
         // A present name must be a string.
-        r#"{"t":"tasks","tasks":[{"id":1,"command":"x","cwd":"Lw==","tagged":true,"life":"ok","preview":"","started_ms":0,"name":5}]}"#,
+        r#"{"t":"tasks","tasks":[{"id":1,"command":"x","cwd":"Lw==","tagged":true,"life":"ok","preview":"","src":"floor","frozen":false,"started_ms":0,"name":5}]}"#,
         r#"{"t":"tasks","tasks":["flat"]}"#,
         // Numeric member in `names`.
         r#"{"t":"sessions","names":["ok",5]}"#,
@@ -375,7 +371,6 @@ fn tasks_and_status_round_trip() {
             group: Some("x".into()),
             name: Some("editor".into()),
             lifecycle: Lifecycle::Idle,
-            parked: false,
             preview: Preview {
                 text: "~ line".into(),
                 source: PreviewSource::Title,
@@ -474,7 +469,7 @@ fn set_name_wire_form() {
 #[test]
 fn tasks_frame_group_key_is_optional() {
     // "Lw==" is the base64 encoding of "/".
-    let ungrouped = r#"{"t":"tasks","tasks":[{"id":1,"command":"x","cwd":"Lw==","tagged":false,"life":"ok","preview":"","src":"floor","frozen":false,"started_ms":0,"parked":false}]}"#;
+    let ungrouped = r#"{"t":"tasks","tasks":[{"id":1,"command":"x","cwd":"Lw==","tagged":false,"life":"ok","preview":"","src":"floor","frozen":false,"started_ms":0}]}"#;
     match decode_event(KIND_CONTROL, ungrouped.as_bytes()) {
         Some(Event::Tasks(v)) => assert_eq!(v[0].group, None),
         other => panic!("expected tasks event, got {other:?}"),
@@ -483,7 +478,7 @@ fn tasks_frame_group_key_is_optional() {
     let (_, p) = encode_event(&Event::Tasks(vec![tv(1)]));
     assert_eq!(std::str::from_utf8(&p).unwrap(), ungrouped);
 
-    let grouped = r#"{"t":"tasks","tasks":[{"id":1,"command":"x","cwd":"Lw==","tagged":false,"group":"infra","life":"ok","preview":"","started_ms":0}]}"#;
+    let grouped = r#"{"t":"tasks","tasks":[{"id":1,"command":"x","cwd":"Lw==","tagged":false,"group":"infra","life":"ok","preview":"","src":"floor","frozen":false,"started_ms":0}]}"#;
     match decode_event(KIND_CONTROL, grouped.as_bytes()) {
         Some(Event::Tasks(v)) => assert_eq!(v[0].group.as_deref(), Some("infra")),
         other => panic!("expected tasks event, got {other:?}"),
@@ -495,7 +490,7 @@ fn tasks_frame_group_key_is_optional() {
 #[test]
 fn tasks_frame_name_key_is_optional() {
     // "Lw==" is the base64 encoding of "/".
-    let unnamed = r#"{"t":"tasks","tasks":[{"id":1,"command":"x","cwd":"Lw==","tagged":false,"life":"ok","preview":"","src":"floor","frozen":false,"started_ms":0,"parked":false}]}"#;
+    let unnamed = r#"{"t":"tasks","tasks":[{"id":1,"command":"x","cwd":"Lw==","tagged":false,"life":"ok","preview":"","src":"floor","frozen":false,"started_ms":0}]}"#;
     match decode_event(KIND_CONTROL, unnamed.as_bytes()) {
         Some(Event::Tasks(v)) => assert_eq!(v[0].name, None),
         other => panic!("expected tasks event, got {other:?}"),
@@ -504,52 +499,59 @@ fn tasks_frame_name_key_is_optional() {
     let (_, p) = encode_event(&Event::Tasks(vec![tv(1)]));
     assert_eq!(std::str::from_utf8(&p).unwrap(), unnamed);
 
-    let named = r#"{"t":"tasks","tasks":[{"id":1,"command":"x","cwd":"Lw==","tagged":false,"name":"build","life":"ok","preview":"","started_ms":0}]}"#;
+    let named = r#"{"t":"tasks","tasks":[{"id":1,"command":"x","cwd":"Lw==","tagged":false,"name":"build","life":"ok","preview":"","src":"floor","frozen":false,"started_ms":0}]}"#;
     match decode_event(KIND_CONTROL, named.as_bytes()) {
         Some(Event::Tasks(v)) => assert_eq!(v[0].name.as_deref(), Some("build")),
         other => panic!("expected tasks event, got {other:?}"),
     }
 }
 
-/// Live parked and finished views encode only their applicable age field.
+/// Each lifecycle preserves its optional age and omits the inapplicable age.
 #[test]
-fn parked_and_age_fields_round_trip() {
-    let tasks = Event::Tasks(vec![
-        TaskView {
-            command: "top".into(),
-            lifecycle: Lifecycle::Idle,
-            parked: true,
-            started_ago: Duration::from_millis(60_000),
-            quiet_ago: Some(Duration::from_millis(12_000)),
-            ..tv(1)
-        },
-        TaskView {
-            command: "make".into(),
-            started_ago: Duration::from_millis(60_000),
-            finished_ago: Some(Duration::from_millis(3_000)),
-            ..tv(2)
-        },
-    ]);
-    let (k, p) = encode_event(&tasks);
-    let s = std::str::from_utf8(&p).unwrap();
-    assert_eq!(s.matches("\"quiet_ms\"").count(), 1, "frame was {s}");
-    assert_eq!(s.matches("\"finished_ms\"").count(), 1, "frame was {s}");
-    assert_eq!(decode_event(k, &p), Some(tasks));
+fn lifecycle_and_age_fields_round_trip() {
+    for lifecycle in [
+        Lifecycle::Active,
+        Lifecycle::Idle,
+        Lifecycle::Ok,
+        Lifecycle::Failed,
+    ] {
+        for age in [None, Some(Duration::from_millis(12_000))] {
+            let live = matches!(lifecycle, Lifecycle::Active | Lifecycle::Idle);
+            let tasks = Event::Tasks(vec![TaskView {
+                lifecycle,
+                started_ago: Duration::from_millis(60_000),
+                quiet_ago: if live { age } else { None },
+                finished_ago: if live { None } else { age },
+                ..tv(1)
+            }]);
+            let (k, p) = encode_event(&tasks);
+            let s = std::str::from_utf8(&p).unwrap();
+            assert!(!s.contains("\"parked\""), "frame was {s}");
+            assert_eq!(
+                s.contains("\"quiet_ms\""),
+                live && age.is_some(),
+                "frame was {s}"
+            );
+            assert_eq!(
+                s.contains("\"finished_ms\""),
+                !live && age.is_some(),
+                "frame was {s}"
+            );
+            assert_eq!(decode_event(k, &p), Some(tasks));
+        }
+    }
 }
 
-/// Missing parked and age fields use lifecycle-derived and unknown defaults.
+/// Null ages remain unknown, just like omitted ages.
 #[test]
-fn tasks_frame_without_parked_keys_decodes_with_defaults() {
-    let old = r#"{"t":"tasks","tasks":[{"id":1,"command":"x","cwd":"Lw==","tagged":false,"life":"idle","preview":"","started_ms":0},{"id":2,"command":"y","cwd":"Lw==","tagged":false,"life":"active","preview":"","started_ms":0}]}"#;
-    match decode_event(KIND_CONTROL, old.as_bytes()) {
-        Some(Event::Tasks(v)) => {
-            assert!(v[0].parked, "idle derives parked");
-            assert!(!v[1].parked, "active derives not-parked");
-            assert_eq!((v[0].quiet_ago, v[0].finished_ago), (None, None));
-            assert_eq!((v[1].quiet_ago, v[1].finished_ago), (None, None));
-        }
-        other => panic!("expected tasks event, got {other:?}"),
-    }
+fn tasks_frame_null_ages_decode_as_unknown() {
+    let tasks = Event::Tasks(vec![tv(1)]);
+    let (k, p) = encode_event(&tasks);
+    let s = String::from_utf8(p).unwrap().replace(
+        "\"started_ms\":0",
+        "\"started_ms\":0,\"quiet_ms\":null,\"finished_ms\":null",
+    );
+    assert_eq!(decode_event(k, s.as_bytes()), Some(tasks));
 }
 
 /// Every preview source round-trips with its frozen flag, and `rule`
@@ -617,21 +619,33 @@ fn preview_source_and_frozen_round_trip() {
     }
 }
 
-/// Missing preview metadata decodes to an unfrozen Floor source.
+/// Same-version task frames require a known source and a boolean frozen flag.
 #[test]
-fn tasks_frame_without_preview_keys_decodes_with_floor_defaults() {
-    let old = r#"{"t":"tasks","tasks":[{"id":1,"command":"x","cwd":"Lw==","tagged":false,"life":"active","preview":"p","started_ms":0,"parked":false}]}"#;
-    match decode_event(KIND_CONTROL, old.as_bytes()) {
-        Some(Event::Tasks(v)) => {
-            assert_eq!(v[0].preview.source, PreviewSource::Floor);
-            assert!(!v[0].preview.frozen);
-            assert_eq!(v[0].preview.rule, None);
+fn tasks_frame_requires_valid_preview_metadata() {
+    let tasks = Event::Tasks(vec![tv(1)]);
+    let (k, p) = encode_event(&tasks);
+    assert_eq!(decode_event(k, &p), Some(tasks));
+    let valid = String::from_utf8(p).unwrap();
+    for (field, value, invalid) in [
+        (
+            "src",
+            "\"floor\"",
+            &["null", "false", "0", "[]", "{}", "\"vibes\""][..],
+        ),
+        (
+            "frozen",
+            "false",
+            &["null", "0", "\"false\"", "[]", "{}"][..],
+        ),
+    ] {
+        let member = format!("\"{field}\":{value}");
+        let missing = valid.replace(&format!("{member},"), "");
+        assert_eq!(decode_event(k, missing.as_bytes()), None, "missing {field}");
+        for value in invalid {
+            let bad = valid.replace(&member, &format!("\"{field}\":{value}"));
+            assert_eq!(decode_event(k, bad.as_bytes()), None, "frame was {bad}");
         }
-        other => panic!("expected tasks event, got {other:?}"),
     }
-    // A present source must be a known label.
-    let bad = r#"{"t":"tasks","tasks":[{"id":1,"command":"x","cwd":"Lw==","tagged":false,"life":"active","preview":"p","src":"vibes","frozen":false,"started_ms":0,"parked":false}]}"#;
-    assert_eq!(decode_event(KIND_CONTROL, bad.as_bytes()), None);
 }
 
 /// `Sessions` carries the picker's names verbatim: several names, an empty

@@ -59,9 +59,9 @@ fn nonzero_exit_is_recorded() {
     t.terminate();
 }
 
-/// Lifecycle and placement cross the shared quiet threshold together.
+/// A live task becomes idle only after the quiet threshold; output resets it.
 #[test]
-fn lifecycle_and_parked_agree_across_the_window_edge() {
+fn lifecycle_crosses_idle_threshold_and_resets_on_activity() {
     let mut t = spawn(5, "sleep 5");
     // `sleep` writes nothing, so `last_activity` keeps its spawn value
     // and the injected `now`s measure against a fixed instant.
@@ -70,11 +70,13 @@ fn lifecycle_and_parked_agree_across_the_window_edge() {
 
     let inside = quiet_since + Duration::from_secs(9);
     assert_eq!(t.lifecycle(inside, window), Lifecycle::Active);
-    assert!(!t.parked(inside, window));
+
+    assert_eq!(t.lifecycle(quiet_since + window, window), Lifecycle::Active);
 
     let past = quiet_since + Duration::from_secs(11);
     assert_eq!(t.lifecycle(past, window), Lifecycle::Idle);
-    assert!(t.parked(past, window));
+    *t.last_activity.lock().unwrap() = past;
+    assert_eq!(t.lifecycle(past, window), Lifecycle::Active);
     t.terminate();
 }
 
@@ -87,21 +89,22 @@ fn sub_window_quiet_gaps_never_read_as_idle() {
     for gaps in 1..=4u32 {
         let probe = start + Duration::from_secs(9) * gaps;
         assert_eq!(t.lifecycle(probe, window), Lifecycle::Active);
-        assert!(!t.parked(probe, window));
         // Simulate output at the end of each quiet gap.
         *t.last_activity.lock().unwrap() = probe;
     }
     t.terminate();
 }
 
-/// A finished task is never parked, no matter how long it has been quiet.
+/// Exit status takes precedence over elapsed quiet time.
 #[test]
-fn finished_tasks_are_never_parked() {
-    let mut t = spawn(6, "exit 0");
-    wait_finished(&mut t);
-    let now = *t.last_activity.lock().unwrap() + Duration::from_secs(11);
-    assert!(!t.parked(now, Duration::from_secs(10)));
-    t.terminate();
+fn finished_lifecycle_ignores_quiet_time() {
+    for (command, expected) in [("exit 0", Lifecycle::Ok), ("exit 3", Lifecycle::Failed)] {
+        let mut t = spawn(6, command);
+        wait_finished(&mut t);
+        let now = *t.last_activity.lock().unwrap() + Duration::from_secs(11);
+        assert_eq!(t.lifecycle(now, Duration::from_secs(10)), expected);
+        t.terminate();
+    }
 }
 
 #[test]
@@ -179,63 +182,25 @@ fn killed_leader_latches_137_via_collect() {
     assert_eq!(t.exit_code, Some(137));
 }
 
-/// The shutdown probe reaps the exited leader, then probes the group in
-/// the same pass: a zombie-only group turns gone in that one call. The
-/// pre-reap assertions pin why the reap must come first: the zombie
-/// alone keeps the group id resolvable for kill-style probes.
+/// Collection must retain the group reservation until escalation, including
+/// when a repeated TERM request arrives after the leader has exited.
 #[test]
-fn group_gone_reaps_then_probes_past_the_zombie() {
-    use nix::errno::Errno;
+fn exited_leader_is_collectible_only_after_kill() {
     let mut t = spawn(30, "exit 0");
     wait_finished(&mut t);
-    let pgid = Pid::from_raw(t.pid.expect("spawn always yields a pid") as i32);
-    // Zombie in place: the probe answer is Ok on Linux, EPERM on macOS,
-    // never ESRCH, so emptiness is invisible before the reap.
-    assert_ne!(
-        killpg(pgid, None::<Signal>),
-        Err(Errno::ESRCH),
-        "an unreaped zombie must keep the group id resolvable"
-    );
-    assert!(
-        t.group_gone(),
-        "a zombie-only group must probe gone in one reap+probe pass"
-    );
-    // The probe spent the zombie: the group id no longer resolves.
-    assert_eq!(killpg(pgid, None::<Signal>), Err(Errno::ESRCH));
-}
-
-/// A member that survives the leader holds the probe after the reap,
-/// and the probe turns gone once that member dies.
-#[test]
-fn group_gone_holds_while_a_member_survives() {
-    use nix::sys::signal::kill;
-    let dir = temp("task_gone");
-    let spid = dir.join("spid");
-    // `trap '' HUP` first so the background child survives its session
-    // leader's exit and remains available for the group probe.
-    let cmd = format!("trap '' HUP; sleep 300 & echo $! > {}", spid.display());
-    let mut t = Task::spawn(31, &cmd, &cmd, &here(), 24, 80, 2000, &sh_env(), no_waker()).unwrap();
-    wait_finished(&mut t);
-    let straggler = read_pid(&spid);
-
-    assert!(!t.group_gone(), "a surviving member must hold the probe");
-    assert!(t.reaped, "the probe reaps the exited leader to see past it");
-
-    let _ = kill(straggler, Signal::SIGKILL);
-    assert!(
-        wait_until(Duration::from_secs(5), || t.group_gone()),
-        "the group must probe gone once its last member dies"
-    );
-}
-
-/// `finished` gates the zombie-spending reap: a leader that has not
-/// exited is never reaped (or waited on) by the probe.
-#[test]
-fn group_gone_never_reaps_a_live_leader() {
-    let mut t = spawn(32, "sleep 300");
-    assert!(!t.group_gone(), "a live leader is a live group");
-    assert!(!t.reaped, "the probe must not reap a running leader");
+    assert!(!t.try_collect());
     t.terminate();
+    let term_sent = t.term_sent.unwrap();
+    t.terminate();
+    assert_eq!(
+        t.term_sent,
+        Some(term_sent),
+        "repeated TERM reset the grace"
+    );
+    assert!(!t.try_collect());
+    assert!(kill(Pid::from_raw(t.pid.unwrap() as i32), None).is_ok());
+    t.force_kill();
+    assert!(t.try_collect());
 }
 
 /// Scrollback clamps at both ends and input returns to live output.
@@ -370,15 +335,12 @@ fn input_hints_track_child_modes() {
     t.terminate();
 }
 
-/// The scrape waits on two criteria: the child must have exited and the PTY
-/// reader must have stopped; a live reader may still hold bytes that
-/// have not reached the grid.
+/// A live reader may still hold bytes that have not reached the grid, so
+/// finalization waits for reader EOF even after the child exits.
 #[test]
-fn scrape_exit_hint_waits_for_reader_eof() {
-    const ID: &str = "c8c4a5cc-0b32-4ba0-a6b4-6ed08c218e0d";
-    let cmd = format!("printf 'Resume this session with:\\nclaude --resume {ID}\\n'");
-    let mut t = Task::spawn(20, &cmd, &cmd, &here(), 24, 80, 2000, &sh_env(), no_waker()).unwrap();
-    t.harness = Some(&crate::harness::Claude);
+fn finalize_preview_waits_for_reader_eof() {
+    let cmd = "printf 'test result: ok\\n'";
+    let mut t = Task::spawn(20, cmd, cmd, &here(), 24, 80, 2000, &sh_env(), no_waker()).unwrap();
     assert!(
         wait_until(Duration::from_secs(60), || {
             t.poll_exit().unwrap();
@@ -393,8 +355,12 @@ fn scrape_exit_hint_waits_for_reader_eof() {
     t.handle = Some(thread::spawn(move || {
         let _ = parked.recv();
     }));
-    t.scrape_exit_hint();
-    assert_eq!(t.scraped_id, None, "the scrape must wait for reader EOF");
+    t.finalize_preview();
+    assert!(
+        !t.resolve_preview(Instant::now()).frozen,
+        "finalization must wait for reader EOF"
+    );
+    grid(&t.parser).process(b"late output\r\n");
 
     // Dropping the sender ends the stand-in: the reader reached EOF.
     drop(release);
@@ -402,19 +368,17 @@ fn scrape_exit_hint_waits_for_reader_eof() {
         wait_until(Duration::from_secs(60), || t.reader_done()),
         "the stand-in reader never stopped"
     );
-    t.scrape_exit_hint();
-    assert_eq!(t.scraped_id.as_deref(), Some(ID));
+    t.finalize_preview();
+    let p = t.resolve_preview(Instant::now());
+    assert_eq!((p.text.as_str(), p.frozen), ("late output", true));
 }
 
-/// A child that dies with a `?2026` frame still open leaves its hint
-/// buffered in the parser, and no ESU can ever arrive to release it: the
-/// scrape must land the frame instead of reading pre-frame text.
+/// A child that dies with a `?2026` frame still open leaves output buffered:
+/// no ESU can arrive, so finalization must land the frame before resolving.
 #[test]
-fn scrape_exit_hint_lands_an_open_sync_frame() {
-    const ID: &str = "7f3b9c1e-5a2d-4e8f-9b6a-0c4d2e8f1a3b";
-    let cmd = format!("printf '\\033[?2026hResume this session with:\\nclaude --resume {ID}\\n'");
-    let mut t = Task::spawn(21, &cmd, &cmd, &here(), 24, 80, 2000, &sh_env(), no_waker()).unwrap();
-    t.harness = Some(&crate::harness::Claude);
+fn finalize_preview_lands_an_open_sync_frame() {
+    let cmd = "printf '\\033[?2026htest result: ok\\n'";
+    let mut t = Task::spawn(21, cmd, cmd, &here(), 24, 80, 2000, &sh_env(), no_waker()).unwrap();
     assert!(
         wait_until(Duration::from_secs(60), || {
             t.poll_exit().unwrap();
@@ -423,11 +387,13 @@ fn scrape_exit_hint_lands_an_open_sync_frame() {
         "child never exited"
     );
     assert!(
-        !grid(&t.parser).text_with_history().contains(ID),
-        "premise: the unclosed frame still buffers the hint at scrape time"
+        !grid(&t.parser).contents().contains("test result: ok"),
+        "premise: the unclosed frame still buffers the final output"
     );
-    t.scrape_exit_hint();
-    assert_eq!(t.scraped_id.as_deref(), Some(ID));
+    t.finalize_preview();
+    assert!(grid(&t.parser).contents().contains("test result: ok"));
+    let p = t.resolve_preview(Instant::now());
+    assert_eq!((p.text.as_str(), p.frozen), ("test result: ok", true));
 }
 
 /// Primary-screen finalization re-resolves: a final line that lands

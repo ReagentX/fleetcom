@@ -283,12 +283,7 @@ fn rerun_resumes_the_captured_conversation() {
 fn rerun_cannot_read_the_old_runs_stale_capture() {
     let dir = scratch("cap_stale_run");
     let (bin, runtime, config) = (dir.join("bin"), dir.join("run"), dir.join("config"));
-    // The session drifts to CAP_ID mid-run and the exit hint reports it.
-    install_script(
-        &bin,
-        "claude",
-        &format!("printf 'Resume this session with:\\nclaude --resume {CAP_ID}\\n'"),
-    );
+    install_stub(&bin, "claude", &dir);
     let mut s = sup_ctx(agent_ctx_plus(
         &bin,
         &runtime,
@@ -297,16 +292,15 @@ fn rerun_cannot_read_the_old_runs_stale_capture() {
     ));
     spawn(&mut s, "claude", dir.to_path_buf());
     let id = s.tasks[0].id;
-    // The capture file still holds the pre-drift session.
+    // The old run's final capture becomes the new run's launch ID.
     let stale = format!(
         r#"{{"session_id":"{CAP_OTHER}","hook_event_name":"SessionStart","source":"startup"}}"#
     );
     let old_cap = s.tasks[0].capture_file.clone().expect("capture file set");
-    std::fs::write(&old_cap, &stale).unwrap();
+    std::fs::write(&old_cap, format!(r#"{{"session_id":"{CAP_ID}"}}"#)).unwrap();
     assert!(reap_until(&mut s, Duration::from_secs(5), |s| s.tasks[0]
-        .scraped_id
+        .finished
         .is_some()));
-    assert_eq!(s.tasks[0].scraped_id.as_deref(), Some(CAP_ID));
 
     s.apply(Command::Restart { id });
     let new_cap = s.tasks[0].capture_file.clone().expect("capture file set");
@@ -492,15 +486,11 @@ fn spawn_grok_pins_an_id_and_injects_nothing_else() {
     let dir = scratch("cap_grok");
     let (bin, runtime, config) = (dir.join("bin"), dir.join("run"), dir.join("config"));
     install_stub(&bin, "grok", &dir);
-    // Keep save-time correlation inside the scratch tree.
     let mut s = sup_ctx(agent_ctx_plus(
         &bin,
         &runtime,
         dir.to_path_buf(),
-        &[
-            ("FLEETCOM_CONFIG_DIR", &config),
-            ("GROK_HOME", &dir.join("grok_home")),
-        ],
+        &[("FLEETCOM_CONFIG_DIR", &config)],
     ));
     spawn(&mut s, "grok", dir.to_path_buf());
 
@@ -578,401 +568,170 @@ fn spawn_omp_loads_the_capture_extension() {
     assert!(t.resume_id.is_none(), "omp cannot pin an id at launch");
 }
 
-/// A `grok` exit hint becomes the session ID used by the saved recipe.
-/// The spawn pin stays; scrape must outrank it.
+/// Printed hints are display content even after exit and reader EOF. Named
+/// saves, recovery snapshots, and reruns retain the capture or launch ID; an
+/// uncaptured task retains its exact authored command.
 #[test]
-fn grok_exit_hint_is_scraped_and_saved_as_a_resume() {
-    let dir = scratch("grok_scrape_exit");
-    let (bin, runtime, config) = (dir.join("bin"), dir.join("run"), dir.join("config"));
-    install_script(
-        &bin,
-        "grok",
-        &format!("printf 'Resume this session with:\\ngrok --resume {CAP_ID}\\n'"),
-    );
-    let mut s = sup_ctx(agent_ctx_plus(
-        &bin,
-        &runtime,
-        dir.to_path_buf(),
-        &[
-            ("FLEETCOM_CONFIG_DIR", &config),
-            ("GROK_HOME", &dir.join("grok_home")),
-        ],
-    ));
-    spawn(&mut s, "grok", dir.to_path_buf());
-    assert!(reap_until(&mut s, Duration::from_secs(5), |s| s.tasks[0]
-        .scraped_id
-        .is_some()));
-    assert_eq!(s.tasks[0].scraped_id.as_deref(), Some(CAP_ID));
-    assert!(
-        s.tasks[0].resume_id.is_some(),
-        "the spawn pin stays; scrape must outrank it"
-    );
-    assert_ne!(s.tasks[0].resume_id.as_deref(), Some(CAP_ID));
-
-    let text = save_and_read(&mut s, &config, "hint");
-    assert!(
-        text.contains(&format!("grok --resume '{CAP_ID}'")),
-        "the recipe must resume the scraped session; got {text}"
-    );
+fn printed_resume_hints_do_not_change_saved_recovery_or_rerun_commands() {
+    for (tool, hints) in [
+        (
+            "claude",
+            format!("Resume this session with:\nclaude --resume {CAP_ID}\n"),
+        ),
+        (
+            "codex",
+            format!(
+                "To continue this session, run codex resume {CAP_ID}\n\
+                 To continue this session, run codex resume, then select docs ({CAP_ID})\n\
+                 Session ID: {CAP_ID}\n"
+            ),
+        ),
+        (
+            "grok",
+            format!("grok -r {CAP_ID}\ngrok --resume {CAP_ID}\n"),
+        ),
+        (
+            "omp",
+            format!(
+                "Resume this session with omp --resume {CAP_ID}\n\
+                 [Recovery]\n  Main: omp --resume {CAP_ID}\n"
+            ),
+        ),
+    ] {
+        let dir = scratch(tool);
+        let (bin, runtime, config) = (dir.join("bin"), dir.join("run"), dir.join("config"));
+        install_script(&bin, tool, &format!("printf '%s' '{hints}'"));
+        let mut s = sup_ctx(agent_ctx_plus(
+            &bin,
+            &runtime,
+            dir.to_path_buf(),
+            &[
+                ("FLEETCOM_CONFIG_DIR", &config),
+                ("CLAUDE_CONFIG_DIR", &dir.join("claude-home")),
+                ("CODEX_HOME", &dir.join("codex-home")),
+            ],
+        ));
+        s.set_recovery_timing(Duration::from_millis(20), Duration::from_millis(100));
+        let authored = format!("  {}/{}\t", bin.display(), tool);
+        spawn(&mut s, &authored, dir.to_path_buf());
+        s.tasks[0].group = Some("agents".into());
+        s.tasks[0].name = Some(tool.into());
+        let expected_id = match tool {
+            "claude" => {
+                std::fs::write(
+                    s.tasks[0].capture_file.as_ref().unwrap(),
+                    format!(r#"{{"session_id":"{CAP_OTHER}"}}"#),
+                )
+                .unwrap();
+                Some(CAP_OTHER.to_string())
+            }
+            "grok" => s.tasks[0].resume_id.clone(),
+            _ => None,
+        };
+        assert_ne!(expected_id.as_deref(), Some(CAP_ID));
+        let command = match expected_id.as_deref() {
+            Some(id) => format!("{}/{} --resume '{id}'", bin.display(), tool),
+            None => authored,
+        };
+        assert!(
+            reap_until(&mut s, Duration::from_secs(5), |s| {
+                s.tasks[0].finished.is_some() && s.tasks[0].reader_done()
+            }),
+            "{tool}: output never completed"
+        );
+        // EOF can become visible after this pass's per-task work.
+        s.reap();
+        assert!(
+            s.tasks[0]
+                .screen_lines()
+                .iter()
+                .any(|line| line.contains(CAP_ID)),
+            "{tool}: the printed UUID must reach the terminal"
+        );
+        let expected = SessionConfig::from([(
+            path::abbreviate(&dir),
+            vec![SessionEntry {
+                cmd: command.clone(),
+                group: Some("agents".into()),
+                name: Some(tool.into()),
+            }],
+        )]);
+        save_and_read(&mut s, &config, "hints");
+        assert_eq!(
+            session::load_in(&config.join("sessions"), "hints").unwrap(),
+            expected,
+            "{tool}: named save"
+        );
+        assert!(
+            wait_until(Duration::from_secs(5), || {
+                s.tick();
+                !recovery_files(&config).is_empty()
+            }),
+            "{tool}: recovery snapshot never landed"
+        );
+        let files = recovery_files(&config);
+        assert_eq!(files.len(), 1);
+        let stem = files[0].strip_suffix(".json").unwrap();
+        assert_eq!(
+            session::load_recovery_in(&config.join("sessions/recovery"), stem).unwrap(),
+            expected,
+            "{tool}: recovery"
+        );
+        let id = s.tasks[0].id;
+        s.apply(Command::Restart { id });
+        assert_eq!(s.tasks[0].run, 1, "{tool}: rerun must replace the task");
+        assert_eq!(s.tasks[0].command, command, "{tool}: rerun command");
+        assert_eq!(s.tasks[0].resume_id, expected_id, "{tool}: rerun ID");
+    }
 }
 
-/// Saving between process exit and the next reap tick still captures the
-/// grok exit hint because `save_session` performs its own ready scrape.
+/// Rerun latches a recent exit before checking eligibility and retains the
+/// explicit launch ID when terminal output names another conversation.
 #[test]
-fn save_scrapes_a_finished_grok_task_without_reap() {
-    let dir = scratch("grok_save_sync_scrape");
-    let (bin, runtime, config) = (dir.join("bin"), dir.join("run"), dir.join("config"));
-    install_script(
-        &bin,
-        "grok",
-        &format!("printf 'Resume this session with:\\ngrok --resume {CAP_ID}\\n'"),
-    );
-    let mut s = sup_ctx(agent_ctx_plus(
-        &bin,
-        &runtime,
-        dir.to_path_buf(),
-        &[
-            ("FLEETCOM_CONFIG_DIR", &config),
-            ("GROK_HOME", &dir.join("grok_home")),
-        ],
-    ));
-    spawn(&mut s, "grok", dir.to_path_buf());
-
-    assert!(
-        wait_until(Duration::from_secs(5), || s.tasks[0].reader_done()),
-        "the stub never reached EOF"
-    );
-    assert!(s.tasks[0].finished.is_none(), "no reap may have run yet");
-
-    let text = save_and_read(&mut s, &config, "syncsave");
-    assert!(
-        text.contains(&format!("grok --resume '{CAP_ID}'")),
-        "save must scrape the finished task itself; got {text}"
-    );
-    assert_eq!(s.tasks[0].scraped_id.as_deref(), Some(CAP_ID));
-}
-
-/// Rerunning between process exit and the next reap tick latches the exit,
-/// scrapes the grok hint, and resumes that session.
-#[test]
-fn rerun_scrapes_a_finished_grok_task_without_reap() {
-    let dir = scratch("grok_rerun_sync_scrape");
-    let (bin, runtime, config) = (dir.join("bin"), dir.join("run"), dir.join("config"));
-    install_script(
-        &bin,
-        "grok",
-        &format!("printf 'Resume this session with:\\ngrok --resume {CAP_ID}\\n'"),
-    );
-    let mut s = sup_ctx(agent_ctx_plus(
-        &bin,
-        &runtime,
-        dir.to_path_buf(),
-        &[
-            ("FLEETCOM_CONFIG_DIR", &config),
-            ("GROK_HOME", &dir.join("grok_home")),
-        ],
-    ));
-    spawn(&mut s, "grok", dir.to_path_buf());
-    let id = s.tasks[0].id;
-
-    assert!(
-        wait_until(Duration::from_secs(5), || s.tasks[0].reader_done()),
-        "the stub never reached EOF"
-    );
-    assert!(s.tasks[0].finished.is_none(), "no reap may have run yet");
-
-    s.apply(Command::Restart { id });
-    assert_eq!(
-        s.tasks[0].command,
-        format!("grok --resume '{CAP_ID}'"),
-        "rerun must compute its resume command from the exit scrape"
-    );
-}
-
-/// A silent grok task falls back to one in-window top-level session dir
-/// under `GROK_HOME` when live channels produce no ID.
-#[test]
-fn save_falls_back_to_fs_correlation_for_a_silent_grok() {
-    let dir = scratch("grok_correlate_save");
-    let (bin, runtime, config, grok_home) = (
-        dir.join("bin"),
-        dir.join("run"),
-        dir.join("config"),
-        dir.join("grok_home"),
-    );
-    install_stub(&bin, "grok", &dir);
-    let mut s = sup_ctx(agent_ctx_plus(
-        &bin,
-        &runtime,
-        dir.to_path_buf(),
-        &[("FLEETCOM_CONFIG_DIR", &config), ("GROK_HOME", &grok_home)],
-    ));
-    spawn(&mut s, "grok", dir.to_path_buf());
-    assert!(reap_until(&mut s, Duration::from_secs(5), |s| s.tasks[0]
-        .finished
-        .is_some()));
-    assert!(s.tasks[0].scraped_id.is_none(), "a silent exit has no hint");
-    // Bare grok always pins; recipe_command would take that ID and never
-    // reach correlate_fs unless the pin is absent.
-    s.tasks[0].resume_id = None;
-    assert!(
-        current_resume_id(&s.tasks[0]).is_none(),
-        "clearing the pin is what exposes filesystem correlation"
-    );
-
-    let group = grok_home
-        .join("sessions")
-        .join(crate::harness::encode_cwd(&s.tasks[0].cwd).expect("task cwd is UTF-8"));
-    std::fs::create_dir_all(group.join(CAP_ID)).unwrap();
-
-    let text = save_and_read(&mut s, &config, "corr");
-    assert!(
-        text.contains(&format!("grok --resume '{CAP_ID}'")),
-        "save must fall back to filesystem correlation; got {text}"
-    );
-}
-
-/// An in-window `session_kind: subagent` sibling does not steal uniqueness
-/// from the top-level session directory.
-#[test]
-fn save_ignores_an_in_window_grok_subagent_sibling() {
-    let dir = scratch("grok_correlate_subagent");
-    let (bin, runtime, config, grok_home) = (
-        dir.join("bin"),
-        dir.join("run"),
-        dir.join("config"),
-        dir.join("grok_home"),
-    );
-    install_stub(&bin, "grok", &dir);
-    let mut s = sup_ctx(agent_ctx_plus(
-        &bin,
-        &runtime,
-        dir.to_path_buf(),
-        &[("FLEETCOM_CONFIG_DIR", &config), ("GROK_HOME", &grok_home)],
-    ));
-    spawn(&mut s, "grok", dir.to_path_buf());
-    assert!(reap_until(&mut s, Duration::from_secs(5), |s| s.tasks[0]
-        .finished
-        .is_some()));
-    assert!(s.tasks[0].scraped_id.is_none(), "a silent exit has no hint");
-    s.tasks[0].resume_id = None;
-
-    let group = grok_home
-        .join("sessions")
-        .join(crate::harness::encode_cwd(&s.tasks[0].cwd).expect("task cwd is UTF-8"));
-    std::fs::create_dir_all(group.join(CAP_ID)).unwrap();
-    // No created_at: birthtime is in-window, so the skip is session_kind.
-    let other = group.join(CAP_OTHER);
-    std::fs::create_dir_all(&other).unwrap();
-    std::fs::write(other.join("summary.json"), r#"{"session_kind":"subagent"}"#).unwrap();
-
-    let text = save_and_read(&mut s, &config, "subagent");
-    assert!(
-        text.contains(&format!("grok --resume '{CAP_ID}'")),
-        "the recipe must resume the top-level session; got {text}"
-    );
-    assert!(
-        !text.contains(CAP_OTHER),
-        "an in-window subagent sibling must not correlate; got {text}"
-    );
-}
-
-/// A spawn through a symlink cwd correlates against the canonical group's
-/// encoded name.
-#[test]
-fn save_follows_a_symlink_cwd_to_the_canonical_grok_group() {
-    let dir = scratch("grok_correlate_symlink");
-    let (bin, runtime, config, grok_home, real, link) = (
-        dir.join("bin"),
-        dir.join("run"),
-        dir.join("config"),
-        dir.join("grok_home"),
-        dir.join("real"),
-        dir.join("link"),
-    );
-    std::fs::create_dir_all(&real).unwrap();
-    std::os::unix::fs::symlink(&real, &link).unwrap();
-    install_stub(&bin, "grok", &dir);
-    let mut s = sup_ctx(agent_ctx_plus(
-        &bin,
-        &runtime,
-        dir.to_path_buf(),
-        &[("FLEETCOM_CONFIG_DIR", &config), ("GROK_HOME", &grok_home)],
-    ));
-    spawn(&mut s, "grok", link);
-    assert!(reap_until(&mut s, Duration::from_secs(5), |s| s.tasks[0]
-        .finished
-        .is_some()));
-    assert!(s.tasks[0].scraped_id.is_none(), "a silent exit has no hint");
-    s.tasks[0].resume_id = None;
-
-    let canonical = real.canonicalize().unwrap();
-    let group = grok_home
-        .join("sessions")
-        .join(crate::harness::encode_cwd(&canonical).expect("canonical path is UTF-8"));
-    std::fs::create_dir_all(group.join(CAP_ID)).unwrap();
-
-    let text = save_and_read(&mut s, &config, "symlink");
-    assert!(
-        text.contains(&format!("grok --resume '{CAP_ID}'")),
-        "save must correlate through the canonical group; got {text}"
-    );
-}
-
-/// A `claude` exit hint becomes the session ID used by the saved recipe.
-#[test]
-fn exit_hint_is_scraped_and_saved_as_a_resume() {
-    let dir = scratch("scrape_exit");
-    let (bin, runtime, config) = (dir.join("bin"), dir.join("run"), dir.join("config"));
-    install_script(
-        &bin,
-        "claude",
-        &format!("printf 'Resume this session with:\\nclaude --resume {CAP_ID}\\n'"),
-    );
-    let mut s = sup_ctx(agent_ctx_plus(
-        &bin,
-        &runtime,
-        dir.to_path_buf(),
-        &[("FLEETCOM_CONFIG_DIR", &config)],
-    ));
-    spawn(&mut s, "claude", dir.to_path_buf());
-    // No pre-exit synchronization: the scrape's reader-EOF gate means
-    // reap can run against the exiting stub at any point and the hint
-    // still lands.
-    assert!(reap_until(&mut s, Duration::from_secs(5), |s| s.tasks[0]
-        .scraped_id
-        .is_some()));
-    assert_eq!(s.tasks[0].scraped_id.as_deref(), Some(CAP_ID));
-
-    let text = save_and_read(&mut s, &config, "hint");
-    assert!(
-        text.contains(&format!("claude --resume '{CAP_ID}'")),
-        "the recipe must resume the scraped session; got {text}"
-    );
-}
-
-/// Saving between process exit and the next reap tick still captures the
-/// exit hint because `save_session` performs its own ready scrape.
-#[test]
-fn save_scrapes_a_finished_task_without_reap() {
-    let dir = scratch("save_sync_scrape");
-    let (bin, runtime, config) = (dir.join("bin"), dir.join("run"), dir.join("config"));
-    install_script(
-        &bin,
-        "claude",
-        &format!("printf 'Resume this session with:\\nclaude --resume {CAP_ID}\\n'"),
-    );
-    let mut s = sup_ctx(agent_ctx_plus(
-        &bin,
-        &runtime,
-        dir.to_path_buf(),
-        &[("FLEETCOM_CONFIG_DIR", &config)],
-    ));
-    spawn(&mut s, "claude", dir.to_path_buf());
-
-    // Wait out only the residual reader-drain race: after EOF the sole
-    // remaining gate is the exit latch, which save's own pass must flip.
-    assert!(
-        wait_until(Duration::from_secs(5), || s.tasks[0].reader_done()),
-        "the stub never reached EOF"
-    );
-    assert!(s.tasks[0].finished.is_none(), "no reap may have run yet");
-
-    let text = save_and_read(&mut s, &config, "syncsave");
-    assert!(
-        text.contains(&format!("claude --resume '{CAP_ID}'")),
-        "save must scrape the finished task itself; got {text}"
-    );
-    assert_eq!(s.tasks[0].scraped_id.as_deref(), Some(CAP_ID));
-}
-
-/// Rerunning between process exit and the next reap tick latches the exit,
-/// scrapes the hint, and resumes that session.
-#[test]
-fn rerun_scrapes_a_finished_task_without_reap() {
-    let dir = scratch("rerun_sync_scrape");
+fn rerun_latches_exit_without_reap_and_preserves_the_launch_id() {
+    use rustix::process::{Pid, WaitId, WaitIdOptions, waitid};
+    let dir = scratch("rerun_without_reap");
     let (bin, runtime) = (dir.join("bin"), dir.join("run"));
     install_script(
         &bin,
-        "claude",
-        &format!("printf 'Resume this session with:\\nclaude --resume {CAP_ID}\\n'"),
+        "grok",
+        &format!(
+            "printf '%s\\n' \"$@\" > '{}/argv'\n\
+             printf 'grok --resume {CAP_ID}\\n'",
+            dir.display()
+        ),
     );
     let mut s = sup_ctx(agent_ctx(&bin, &runtime, dir.to_path_buf()));
-    spawn(&mut s, "claude", dir.to_path_buf());
-    let id = s.tasks[0].id;
-
-    assert!(
-        wait_until(Duration::from_secs(5), || s.tasks[0].reader_done()),
-        "the stub never reached EOF"
-    );
-    assert!(s.tasks[0].finished.is_none(), "no reap may have run yet");
-
-    s.apply(Command::Restart { id });
-    assert_eq!(
-        s.tasks[0].command,
-        format!("claude --resume '{CAP_ID}'"),
-        "rerun must compute its resume command from the exit scrape"
-    );
-}
-
-/// Session-ID precedence is exit scrape, capture file, then spawn-time ID.
-#[test]
-fn resume_id_precedence_scrape_over_capture_over_spawn() {
-    let dir = scratch("precedence");
-    let (bin, runtime, config) = (dir.join("bin"), dir.join("run"), dir.join("config"));
-    let (hinted, done) = (dir.join("hinted"), dir.join("done"));
-    install_script(
-        &bin,
-        "claude",
-        &format!(
-            "until [ -e '{h}' ]; do sleep 0.05; done\n\
-                 printf 'Resume this session with:\\nclaude --resume {CAP_ID}\\n'\n\
-                 until [ -e '{d}' ]; do sleep 0.05; done",
-            h = hinted.display(),
-            d = done.display()
-        ),
-    );
-    let mut s = sup_ctx(agent_ctx_plus(
-        &bin,
-        &runtime,
+    spawn(
+        &mut s,
+        format!("grok --resume {CAP_OTHER}"),
         dir.to_path_buf(),
-        &[("FLEETCOM_CONFIG_DIR", &config)],
-    ));
-    spawn(&mut s, "claude", dir.to_path_buf());
-    let injected = s.tasks[0]
-        .resume_id
-        .clone()
-        .expect("a fresh claude launch pins an id");
-    assert_ne!(injected.as_str(), CAP_OTHER);
-
-    // The hook moved the session mid-run: pre-exit, the capture file
-    // must beat the injected id.
-    let cap = s.tasks[0].capture_file.clone().expect("capture file set");
-    std::fs::write(
-        &cap,
-        format!(
-            r#"{{"session_id":"{CAP_OTHER}","hook_event_name":"SessionStart","source":"clear"}}"#
-        ),
-    )
-    .unwrap();
-    let text = save_and_read(&mut s, &config, "mid");
-    assert!(
-        text.contains(&format!("claude --resume '{CAP_OTHER}'")),
-        "pre-exit the capture file must beat the injected id; got {text}"
     );
-
-    // Print the hint and let the task exit: post-exit, the scrape must
-    // beat the capture file.
-    std::fs::write(&hinted, b"").unwrap();
-    std::fs::write(&done, b"").unwrap();
-    assert!(reap_until(&mut s, Duration::from_secs(5), |s| s.tasks[0]
-        .scraped_id
-        .is_some()));
-    assert_eq!(s.tasks[0].scraped_id.as_deref(), Some(CAP_ID));
-    let text = save_and_read(&mut s, &config, "post");
+    let id = s.tasks[0].id;
+    let pid = Pid::from_raw(s.tasks[0].pid().unwrap() as i32).unwrap();
     assert!(
-        text.contains(&format!("claude --resume '{CAP_ID}'")),
-        "post-exit the scraped hint must beat the capture file; got {text}"
+        wait_until(Duration::from_secs(5), || {
+            let exited = waitid(
+                WaitId::Pid(pid),
+                WaitIdOptions::EXITED | WaitIdOptions::NOWAIT | WaitIdOptions::NOHANG,
+            )
+            .unwrap()
+            .is_some();
+            exited && s.tasks[0].reader_done()
+        }),
+        "the stub never exited and drained its output"
+    );
+    assert!(
+        s.tasks[0].finished.is_none(),
+        "no exit latch may have run yet"
+    );
+    std::fs::remove_file(dir.join("argv")).unwrap();
+    s.apply(Command::Restart { id });
+    assert_eq!(s.tasks[0].run, 1);
+    assert_eq!(s.tasks[0].command, format!("grok --resume '{CAP_OTHER}'"));
+    assert_eq!(
+        wait_argv(&mut s, &dir.join("argv")),
+        ["--resume", CAP_OTHER]
     );
 }
 
@@ -1036,17 +795,34 @@ fn resume_id_precedence_registry_over_spawn_under_capture() {
     std::fs::write(&done, b"").unwrap();
 }
 
-/// A silent Codex task falls back to one matching rollout under
-/// `CODEX_HOME` when live channels produce no ID.
+/// Two tasks sharing a directory do not own a nearby rollout. Named saves
+/// and recovery must preserve both authored commands when capture is silent.
 #[test]
-fn save_falls_back_to_fs_correlation_for_a_silent_codex() {
-    let dir = scratch("correlate_save");
+fn silent_codex_tasks_keep_authored_commands_in_saves_and_recovery() {
+    let dir = scratch("uncaptured_codex");
     let (bin, runtime, config) = (dir.join("bin"), dir.join("run"), dir.join("config"));
     let codex_home = dir.join("codex_home");
-    install_stub(&bin, "codex", &dir);
-    // Create a rollout with a current v7 instant and the task's cwd.
-    let now_ms = now_ms();
-    let id = write_rollout(&codex_home, now_ms, 1, &dir);
+    install_script(&bin, "codex", "exit 0");
+
+    // This sole rollout matches the directory and the former 30-second
+    // window for both tasks, but predates both launches.
+    let ms = now_ms();
+    let id = format!(
+        "{:08x}-{:04x}-7000-8000-000000000001",
+        ms >> 16,
+        ms & 0xffff
+    );
+    let (y, m, d) = crate::format::civil_from_days((ms / 86_400_000) as i64);
+    let rollouts = codex_home.join(format!("sessions/{y:04}/{m:02}/{d:02}"));
+    std::fs::create_dir_all(&rollouts).unwrap();
+    std::fs::write(
+        rollouts.join(format!("rollout-2026-07-13T09-00-00-{id}.jsonl")),
+        format!(
+            r#"{{"type":"session_meta","payload":{{"id":"{id}","cwd":"{}"}}}}"#,
+            dir.display()
+        ),
+    )
+    .unwrap();
 
     let mut s = sup_ctx(agent_ctx_plus(
         &bin,
@@ -1057,62 +833,62 @@ fn save_falls_back_to_fs_correlation_for_a_silent_codex() {
             ("CODEX_HOME", &codex_home),
         ],
     ));
-    spawn(&mut s, "codex", dir.to_path_buf());
-    assert!(reap_until(&mut s, Duration::from_secs(5), |s| s.tasks[0]
-        .finished
-        .is_some()));
-    assert!(s.tasks[0].scraped_id.is_none(), "a silent exit has no hint");
-    assert!(
-        current_resume_id(&s.tasks[0]).is_none(),
-        "no capture channel fired"
+    s.set_recovery_timing(Duration::from_millis(20), Duration::from_millis(100));
+    let commands = ["codex".to_string(), format!("  {}/codex\t", bin.display())];
+    for command in &commands {
+        spawn(&mut s, command, dir.to_path_buf());
+    }
+    assert_eq!(s.tasks.len(), 2);
+    assert!(reap_until(&mut s, Duration::from_secs(5), |s| s
+        .tasks
+        .iter()
+        .all(|t| t.finished.is_some())));
+    for task in &s.tasks {
+        assert!(
+            current_resume_id(task).is_none(),
+            "no capture channel fired"
+        );
+        let spawn_ms = task
+            .spawned_at
+            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_millis();
+        assert!(
+            spawn_ms.abs_diff(u128::from(ms)) <= 30_000,
+            "the decoy must remain plausible"
+        );
+    }
+    let expected = SessionConfig::from([(
+        path::abbreviate(&dir),
+        commands
+            .iter()
+            .map(|cmd| SessionEntry {
+                cmd: cmd.clone(),
+                group: None,
+                name: None,
+            })
+            .collect(),
+    )]);
+    save_and_read(&mut s, &config, "silent");
+    assert_eq!(
+        session::load_in(&config.join("sessions"), "silent").unwrap(),
+        expected
     );
 
-    let text = save_and_read(&mut s, &config, "corr");
     assert!(
-        text.contains(&format!("codex resume '{id}'")),
-        "save must fall back to filesystem correlation; got {text}"
+        wait_until(Duration::from_secs(5), || {
+            s.tick();
+            !recovery_files(&config).is_empty()
+        }),
+        "the recovery snapshot never landed"
     );
-}
-
-/// Save-time correlation uses the task's spawn-time `CODEX_HOME`, even
-/// after a reconnect supplies another home containing a matching rollout.
-#[test]
-fn save_correlates_against_the_spawn_time_home() {
-    let dir = scratch("correlate_home");
-    let (bin, runtime, config) = (dir.join("bin"), dir.join("run"), dir.join("config"));
-    let (home_a, home_b) = (dir.join("codex_a"), dir.join("codex_b"));
-    install_stub(&bin, "codex", &dir);
-    let now_ms = now_ms();
-    // One unique in-window rollout per store, both naming the task cwd.
-    let id_a = write_rollout(&home_a, now_ms, 1, &dir);
-    let id_b = write_rollout(&home_b, now_ms, 2, &dir);
-
-    let mut s = sup_ctx(agent_ctx_plus(
-        &bin,
-        &runtime,
-        dir.to_path_buf(),
-        &[("FLEETCOM_CONFIG_DIR", &config), ("CODEX_HOME", &home_a)],
-    ));
-    spawn(&mut s, "codex", dir.to_path_buf());
-    assert!(reap_until(&mut s, Duration::from_secs(5), |s| s.tasks[0]
-        .finished
-        .is_some()));
-
-    // Reconnect under home B, then save.
-    s.set_launch_context(agent_ctx_plus(
-        &bin,
-        &runtime,
-        dir.to_path_buf(),
-        &[("FLEETCOM_CONFIG_DIR", &config), ("CODEX_HOME", &home_b)],
-    ));
-    let text = save_and_read(&mut s, &config, "homepin");
-    assert!(
-        text.contains(&format!("codex resume '{id_a}'")),
-        "the recipe must resolve from the launch-time store; got {text}"
-    );
-    assert!(
-        !text.contains(&id_b),
-        "the reconnect store's decoy must not correlate; got {text}"
+    let files = recovery_files(&config);
+    assert_eq!(files.len(), 1);
+    let stem = files[0].strip_suffix(".json").unwrap();
+    let recovery = config.join("sessions").join("recovery");
+    assert_eq!(
+        session::load_recovery_in(&recovery, stem).unwrap(),
+        expected
     );
 }
 
@@ -1120,7 +896,7 @@ fn save_correlates_against_the_spawn_time_home() {
 /// joined with the tool's dot directory, then nothing.
 #[test]
 fn harness_home_prefers_the_tool_var_then_home() {
-    use crate::harness::{Claude, Codex, Grok};
+    use crate::harness::{Claude, Codex, Grok, Omp};
     let env: Vec<(OsString, OsString)> = vec![
         ("HOME".into(), "/h".into()),
         ("CODEX_HOME".into(), "/x".into()),
@@ -1135,15 +911,13 @@ fn harness_home_prefers_the_tool_var_then_home() {
         harness_home(&env, &Claude).as_deref(),
         Some(Path::new("/h/.claude"))
     );
-    assert_eq!(
-        harness_home(&env, &Grok).as_deref(),
-        Some(Path::new("/h/.grok"))
-    );
+    assert_eq!(harness_home(&env, &Grok), None);
+    assert_eq!(harness_home(&env, &Omp), None);
     assert_eq!(harness_home(&[], &Codex), None);
 }
 
-/// With only `HOME` in the launch environment, both notify routing and
-/// save-time correlation resolve through `<home>/.codex`.
+/// With only `HOME` in the launch environment, notify routing reads
+/// `<home>/.codex/config.toml`.
 #[test]
 fn home_only_launch_env_targets_the_clients_dot_codex() {
     let dir = scratch("home_resolve");
@@ -1163,11 +937,6 @@ fn home_only_launch_env_targets_the_clients_dot_codex() {
     )
     .unwrap();
     install_stub(&bin, "codex", &dir);
-    // A unique in-window rollout in the same tree for save-time
-    // correlation: with injection suppressed, no capture channel fires.
-    let now_ms = now_ms();
-    let id = write_rollout(&codex_home, now_ms, 1, &dir);
-
     let mut s = sup_ctx(agent_ctx_plus(
         &bin,
         &runtime,
@@ -1189,10 +958,15 @@ fn home_only_launch_env_targets_the_clients_dot_codex() {
         .finished
         .is_some()));
 
-    let text = save_and_read(&mut s, &config, "homeonly");
-    assert!(
-        text.contains(&format!("codex resume '{id}'")),
-        "correlation must read <home>/.codex; got {text}"
+    save_and_read(&mut s, &config, "homeonly");
+    let cfg = session::load_in(&config.join("sessions"), "homeonly").unwrap();
+    assert_eq!(
+        cfg[&path::abbreviate(&dir)],
+        vec![SessionEntry {
+            cmd: "codex".into(),
+            group: None,
+            name: None,
+        }]
     );
 }
 
@@ -1245,14 +1019,12 @@ fn stale_inherited_notify_chain_is_never_executed() {
     );
 }
 
-/// Without a live or filesystem ID, an agent recipe retains the original
-/// command.
+/// Without a known ID, an agent recipe retains the original command.
 #[test]
 fn agent_save_without_any_id_keeps_the_plain_command() {
     let dir = scratch("no_id");
     let (bin, runtime, config) = (dir.join("bin"), dir.join("run"), dir.join("config"));
-    // CODEX_HOME names a store that never exists: correlation has
-    // nothing to find, and the notify routing nothing to read.
+    // No config.toml exists, so notifier routing has nothing to read.
     let codex_home = dir.join("codex_home");
     install_stub(&bin, "codex", &dir);
     let mut s = sup_ctx(agent_ctx_plus(

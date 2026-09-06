@@ -9,8 +9,8 @@ use common::{
 };
 
 /// Read the refusal `Status`, assert `needle` appears, then require EOF: the
-/// daemon must close, not serve.
-fn expect_refusal(stream: &mut std::os::unix::net::UnixStream, needle: &str) {
+/// daemon must close, not serve. Return the refusal text for further assertions.
+fn expect_refusal(stream: &mut std::os::unix::net::UnixStream, needle: &str) -> String {
     let (kind, payload) = read_frame(stream).expect("no refusal frame");
     let text = String::from_utf8_lossy(&payload).into_owned();
     assert_eq!(kind, 1, "refusal must be a control frame");
@@ -22,14 +22,20 @@ fn expect_refusal(stream: &mut std::os::unix::net::UnixStream, needle: &str) {
         read_frame(stream).is_err(),
         "daemon kept serving after refusing the handshake"
     );
+    text
 }
 
 #[test]
 fn version_mismatch_is_refused_with_both_versions_named() {
     let (dir, daemon, mut stream) = start_daemon_raw("mismatch", |_| {});
     let cwd = dir.display().to_string();
-    stream.write_all(&hello_frame(999, &[], &cwd)).unwrap();
-    expect_refusal(&mut stream, "v999");
+    let previous = common::PROTOCOL_VERSION - 1;
+    stream.write_all(&hello_frame(previous, &[], &cwd)).unwrap();
+    let refusal = expect_refusal(&mut stream, &format!("client speaks v{previous}"));
+    assert!(
+        refusal.contains(&format!("speaks v{}, client", common::PROTOCOL_VERSION)),
+        "refusal must name the daemon version: {refusal}"
+    );
 
     // The daemon survives the refusal and accepts the next (correct) client.
     let sock = dir.join("default.sock");
