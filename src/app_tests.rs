@@ -104,8 +104,8 @@ fn shift(code: KeyCode) -> KeyEvent {
     KeyEvent::new(code, KeyModifiers::SHIFT)
 }
 
-/// Construct a stable live task without spawning a child. `Active` and
-/// unparked keep an untagged view in Running; a child can exit during the test
+/// Construct a stable live task without spawning a child. `Active` keeps an
+/// untagged view in Running; a child can exit during the test
 /// and move its row to Completed.
 fn view(id: u64, cwd: PathBuf, tagged: bool, group: Option<&str>) -> TaskView {
     TaskView {
@@ -116,7 +116,6 @@ fn view(id: u64, cwd: PathBuf, tagged: bool, group: Option<&str>) -> TaskView {
         group: group.map(str::to_string),
         name: None,
         lifecycle: Lifecycle::Active,
-        parked: false,
         preview: Preview::floor(String::new()),
         started_ago: Duration::ZERO,
         quiet_ago: Some(Duration::ZERO),
@@ -483,16 +482,16 @@ fn tagging_a_finished_task_moves_it_to_in_use() {
     assert_eq!(app.sections()[0].0, "In use");
 }
 
-/// A parked live task gets its own "Idle" section between "Running" and
+/// An idle task gets its own "Idle" section between "Running" and
 /// "Completed". The test updates the local snapshot after the last pump so a
 /// fresh core snapshot cannot overwrite it; this avoids waiting for the 10 s
 /// quiet window.
 #[test]
-fn parked_task_lands_in_idle_between_running_and_completed() {
+fn idle_task_lands_in_idle_between_running_and_completed() {
     let mut app = App::new_local(30, 100);
     let inv = app.invocation_dir.clone();
     app.spawn_in("sleep 5", inv.clone()); // id 1: running
-    app.spawn_in("sleep 5", inv.clone()); // id 2: parked below
+    app.spawn_in("sleep 5", inv.clone()); // id 2: idle below
     app.spawn_in("sleep 5", inv.clone()); // id 3: tagged below
     app.spawn_in("true", inv); // id 4: exits ~immediately
     wait_until(Duration::from_secs(5), || {
@@ -505,7 +504,7 @@ fn parked_task_lands_in_idle_between_running_and_completed() {
     app.pump();
 
     let i = app.views.iter().position(|v| v.id == 2).unwrap();
-    app.views[i].parked = true;
+    app.views[i].lifecycle = Lifecycle::Idle;
 
     assert_eq!(
         app.section_ids(),
@@ -518,51 +517,40 @@ fn parked_task_lands_in_idle_between_running_and_completed() {
     );
 }
 
-/// Tagged beats parked: a tagged task stays in "In use" even while parked.
+/// A tagged task stays in "In use" through idle and completed lifecycles.
 #[test]
-fn tagged_parked_task_stays_in_use() {
+fn tagged_task_stays_in_use_across_lifecycles() {
     let mut app = App::new_local(30, 100);
     let inv = app.invocation_dir.clone();
-    app.spawn_in("sleep 5", inv.clone()); // id 1: tagged + parked
+    app.spawn_in("sleep 5", inv.clone()); // id 1: tagged + idle
     app.spawn_in("sleep 5", inv); // id 2: running
     app.pump();
     app.transport.send(Command::Tag { id: 1, on: true });
     app.pump();
 
     let i = app.views.iter().position(|v| v.id == 1).unwrap();
-    app.views[i].parked = true;
-
-    assert_eq!(
-        app.section_ids(),
-        vec![
-            ("In use".to_string(), vec![1]),
-            ("Running".to_string(), vec![2]),
-        ]
-    );
+    for lifecycle in [
+        Lifecycle::Active,
+        Lifecycle::Idle,
+        Lifecycle::Ok,
+        Lifecycle::Failed,
+    ] {
+        app.views[i].lifecycle = lifecycle;
+        assert_eq!(
+            app.section_ids(),
+            vec![
+                ("In use".to_string(), vec![1]),
+                ("Running".to_string(), vec![2]),
+            ]
+        );
+    }
 }
 
-/// One window drives both signals, so a live core ships `Lifecycle::Idle`
-/// and `parked` together: an idle-glyph task lands in the "Idle" section
-/// under state grouping. Glyph and placement agree.
-#[test]
-fn idle_glyph_task_lands_in_idle_section() {
-    let mut app = App::new_local(30, 100);
-    let inv = app.invocation_dir.clone();
-    app.spawn_in("sleep 5", inv); // id 1
-    app.pump();
-
-    let i = app.views.iter().position(|v| v.id == 1).unwrap();
-    app.views[i].lifecycle = Lifecycle::Idle;
-    app.views[i].parked = true;
-
-    assert_eq!(app.section_ids(), vec![("Idle".to_string(), vec![1])]);
-}
-
-/// Selection is bound to a task id, so a `parked` flip (re-bucketing the
+/// Selection is bound to a task id, so an idle transition (re-bucketing the
 /// row from "Running" into "Idle") must not move the highlight to a
 /// different task.
 #[test]
-fn selection_follows_task_across_parked_rebucket() {
+fn selection_follows_task_across_idle_rebucket() {
     let mut app = App::new_local(30, 100);
     let dir = app.invocation_dir.clone();
     app.spawn_in("sleep 5", dir.clone()); // id 1
@@ -570,9 +558,9 @@ fn selection_follows_task_across_parked_rebucket() {
     app.pump();
     app.selected_id = Some(1);
 
-    // Park id 1 -> it sinks into "Idle", below id 2's "Running".
+    // Idle id 1 -> it sinks into "Idle", below id 2's "Running".
     let i = app.views.iter().position(|v| v.id == 1).unwrap();
-    app.views[i].parked = true;
+    app.views[i].lifecycle = Lifecycle::Idle;
 
     let order = app.display_order();
     assert_eq!(app.views[order[0]].id, 2, "running task should sort first");
@@ -580,11 +568,27 @@ fn selection_follows_task_across_parked_rebucket() {
     // Still on id 1, even though it is now the second row.
     assert_eq!(app.selected_id, Some(1));
     assert_eq!(app.views[app.selected_task().unwrap()].id, 1);
+
+    app.views[i].lifecycle = Lifecycle::Active;
+    assert_eq!(app.section_ids(), vec![("Running".to_string(), vec![1, 2])]);
+    assert_eq!(app.selected_id, Some(1));
+    assert_eq!(app.views[app.selected_task().unwrap()].id, 1);
+
+    app.views[i].lifecycle = Lifecycle::Ok;
+    assert_eq!(
+        app.section_ids(),
+        vec![
+            ("Running".to_string(), vec![2]),
+            ("Completed".to_string(), vec![1]),
+        ]
+    );
+    assert_eq!(app.selected_id, Some(1));
+    assert_eq!(app.views[app.selected_task().unwrap()].id, 1);
 }
 
 /// Idle state does not affect row order within a custom group.
 #[test]
-fn custom_mode_parked_task_holds_its_row() {
+fn custom_mode_idle_task_holds_its_row() {
     let mut app = App::new_local(30, 100);
     let inv = app.invocation_dir.clone();
     app.spawn_grouped("sleep 5", inv.clone(), "alpha"); // id 1
@@ -594,17 +598,17 @@ fn custom_mode_parked_task_holds_its_row() {
     assert_eq!(app.section_ids(), vec![("alpha".to_string(), vec![1, 2])]);
 
     let i = app.views.iter().position(|v| v.id == 1).unwrap();
-    app.views[i].parked = true;
+    app.views[i].lifecycle = Lifecycle::Idle;
     assert_eq!(
         app.section_ids(),
         vec![("alpha".to_string(), vec![1, 2])],
-        "parked id 1 keeps its row above id 2 within alpha"
+        "idle id 1 keeps its row above id 2 within alpha"
     );
 }
 
 /// Idle state does not affect row order within a directory section.
 #[test]
-fn dir_mode_parked_task_holds_its_row() {
+fn dir_mode_idle_task_holds_its_row() {
     let mut app = App::new_local(30, 100);
     let inv = app.invocation_dir.clone();
     app.spawn_in("sleep 5", inv.clone()); // id 1
@@ -615,17 +619,17 @@ fn dir_mode_parked_task_holds_its_row() {
     assert_eq!(app.section_ids(), vec![(label.clone(), vec![1, 2])]);
 
     let i = app.views.iter().position(|v| v.id == 1).unwrap();
-    app.views[i].parked = true;
+    app.views[i].lifecycle = Lifecycle::Idle;
     assert_eq!(
         app.section_ids(),
         vec![(label, vec![1, 2])],
-        "parked id 1 keeps its row above id 2 within its directory"
+        "idle id 1 keeps its row above id 2 within its directory"
     );
 }
 
 /// Entering and leaving idle state preserves row order.
 #[test]
-fn parked_round_trip_leaves_row_order_identical() {
+fn idle_round_trip_leaves_row_order_identical() {
     let mut app = App::new_local(30, 100);
     let inv = app.invocation_dir.clone();
     app.spawn_grouped("sleep 5", inv.clone(), "alpha"); // id 1
@@ -637,10 +641,10 @@ fn parked_round_trip_leaves_row_order_identical() {
     assert_eq!(app.section_ids(), want);
 
     let i = app.views.iter().position(|v| v.id == 2).unwrap();
-    app.views[i].parked = true;
+    app.views[i].lifecycle = Lifecycle::Idle;
     assert_eq!(app.section_ids(), want, "quiet does not move id 2");
 
-    app.views[i].parked = false;
+    app.views[i].lifecycle = Lifecycle::Active;
     assert_eq!(app.section_ids(), want, "waking does not move id 2 back");
 }
 
@@ -688,7 +692,7 @@ fn dir_mode_finished_sinks_within_section() {
 
 /// Tagged tasks sort first within a custom group, including while idle.
 #[test]
-fn custom_mode_tagged_task_floats_and_holds_while_parked() {
+fn custom_mode_tagged_task_floats_and_holds_while_idle() {
     let mut app = App::new_local(30, 100);
     let inv = app.invocation_dir.clone();
     app.spawn_grouped("sleep 5", inv.clone(), "alpha"); // id 1
@@ -700,11 +704,11 @@ fn custom_mode_tagged_task_floats_and_holds_while_parked() {
     assert_eq!(app.section_ids(), vec![("alpha".to_string(), vec![2, 1])]);
 
     let i = app.views.iter().position(|v| v.id == 2).unwrap();
-    app.views[i].parked = true;
+    app.views[i].lifecycle = Lifecycle::Idle;
     assert_eq!(
         app.section_ids(),
         vec![("alpha".to_string(), vec![2, 1])],
-        "tagged id 2 stays at the top of alpha while parked"
+        "tagged id 2 stays at the top of alpha while idle"
     );
 }
 
@@ -721,10 +725,10 @@ fn state_mode_ordering_survives_the_row_key_split() {
 
     app.spawn_in("sleep 30", dir_b.clone()); // id 1: running, dir b
     app.spawn_in("sleep 30", dir_a.clone()); // id 2: running, dir a
-    app.spawn_in("sleep 30", dir_b.clone()); // id 3: parked -> Idle, dir b
-    app.spawn_in("sleep 30", dir_a.clone()); // id 4: parked -> Idle, dir a
+    app.spawn_in("sleep 30", dir_b.clone()); // id 3: idle, dir b
+    app.spawn_in("sleep 30", dir_a.clone()); // id 4: idle, dir a
     app.spawn_in("sleep 30", dir_b.clone()); // id 5: tagged, dir b
-    app.spawn_in("sleep 30", dir_a.clone()); // id 6: tagged + parked, dir a
+    app.spawn_in("sleep 30", dir_a.clone()); // id 6: tagged + idle, dir a
     app.spawn_in("true", dir_b.clone()); // id 7: finished, dir b
     app.spawn_in("true", dir_a.clone()); // id 8: finished, dir a
     wait_until(Duration::from_secs(5), || {
@@ -741,16 +745,16 @@ fn state_mode_ordering_survives_the_row_key_split() {
     app.pump();
 
     // Override the time-dependent idle state after the final snapshot.
-    for (id, parked) in [
-        (1u64, false),
-        (2, false),
-        (3, true),
-        (4, true),
-        (5, false),
-        (6, true),
+    for (id, lifecycle) in [
+        (1u64, Lifecycle::Active),
+        (2, Lifecycle::Active),
+        (3, Lifecycle::Idle),
+        (4, Lifecycle::Idle),
+        (5, Lifecycle::Active),
+        (6, Lifecycle::Idle),
     ] {
         let i = app.views.iter().position(|v| v.id == id).unwrap();
-        app.views[i].parked = parked;
+        app.views[i].lifecycle = lifecycle;
     }
 
     let (a, b) = (path::abbreviate(&dir_a), path::abbreviate(&dir_b));

@@ -313,12 +313,12 @@ fn attached_title(v: &TaskView) -> String {
 }
 
 /// Age shown for a task: time since exit when finished, last output when
-/// parked, or launch otherwise. Missing edge timestamps fall back to launch.
+/// idle, or launch otherwise. Missing edge timestamps fall back to launch.
 fn row_age(v: &TaskView) -> Duration {
-    let edge = match (v.lifecycle, v.parked) {
-        (Lifecycle::Ok | Lifecycle::Failed, _) => v.finished_ago,
-        (_, true) => v.quiet_ago,
-        (_, false) => None,
+    let edge = match v.lifecycle {
+        Lifecycle::Ok | Lifecycle::Failed => v.finished_ago,
+        Lifecycle::Idle => v.quiet_ago,
+        Lifecycle::Active => None,
     };
     edge.unwrap_or(v.started_ago)
 }
@@ -1179,7 +1179,6 @@ mod tests {
             group: None,
             name: name.map(str::to_string),
             lifecycle: Lifecycle::Active,
-            parked: false,
             preview: Preview::floor(String::new()),
             started_ago: std::time::Duration::from_secs(5),
             quiet_ago: None,
@@ -1191,13 +1190,11 @@ mod tests {
     /// launch-age fallback ("2h") cannot collide with an edge age.
     fn timed_view(
         lifecycle: Lifecycle,
-        parked: bool,
         quiet_ago: Option<Duration>,
         finished_ago: Option<Duration>,
     ) -> TaskView {
         TaskView {
             lifecycle,
-            parked,
             quiet_ago,
             finished_ago,
             started_ago: Duration::from_secs(2 * 60 * 60),
@@ -1207,23 +1204,36 @@ mod tests {
 
     /// The time column uses exit, quiet, or launch age according to task state.
     #[test]
-    fn task_row_time_column_follows_the_debounced_state() {
+    fn task_row_time_column_follows_lifecycle() {
         let quiet = Some(Duration::from_secs(4 * 60)); // renders "4m"
         let exited = Some(Duration::from_secs(3)); // renders "3s"
         let cases = [
-            (Lifecycle::Ok, false, None, exited, "3s"),
-            (Lifecycle::Failed, false, None, exited, "3s"),
-            (Lifecycle::Idle, true, quiet, None, "4m"),
-            (Lifecycle::Idle, true, None, None, "2h"), // missing quiet timestamp
-            (Lifecycle::Active, false, None, None, "2h"),
-            (Lifecycle::Ok, false, None, None, "2h"), // missing exit timestamp
+            (Lifecycle::Ok, None, exited, "3s"),
+            (Lifecycle::Failed, None, exited, "3s"),
+            (Lifecycle::Idle, quiet, None, "4m"),
+            (Lifecycle::Idle, None, None, "2h"), // missing quiet timestamp
+            (Lifecycle::Active, quiet, None, "2h"),
+            (Lifecycle::Active, None, None, "2h"),
+            (Lifecycle::Ok, None, None, "2h"), // missing exit timestamp
+            (Lifecycle::Failed, None, None, "2h"),
         ];
-        for (lifecycle, parked, quiet_ago, finished_ago, want) in cases {
-            let row = task_row(&timed_view(lifecycle, parked, quiet_ago, finished_ago), 80);
-            assert!(
-                row.ends_with(want),
-                "{lifecycle:?} parked={parked} wanted {want:?}: {row:?}"
-            );
+        for (lifecycle, quiet_ago, finished_ago, want) in cases {
+            for tagged in [false, true] {
+                let mut v = timed_view(lifecycle, quiet_ago, finished_ago);
+                v.tagged = tagged;
+                let row = task_row(&v, 80);
+                assert!(
+                    row.ends_with(want),
+                    "{lifecycle:?} wanted {want:?}: {row:?}"
+                );
+                let glyph = match lifecycle {
+                    Lifecycle::Active => "✻",
+                    Lifecycle::Idle => "∙",
+                    Lifecycle::Ok => "✓",
+                    Lifecycle::Failed => "✗",
+                };
+                assert!(row.starts_with(&format!("  {glyph} ")), "{row:?}");
+            }
         }
     }
 
@@ -1258,7 +1268,7 @@ mod tests {
         for cols in [40usize, 80] {
             for title in titles {
                 for preview in previews {
-                    let mut v = timed_view(Lifecycle::Active, false, None, None);
+                    let mut v = timed_view(Lifecycle::Active, None, None);
                     v.name = Some(title.to_string());
                     v.preview = Preview::floor(preview.to_string());
                     let row = task_row(&v, cols);
@@ -1277,8 +1287,8 @@ mod tests {
     #[test]
     fn task_row_cells_hold_their_column_budgets() {
         let cols = 72;
-        let ascii = timed_view(Lifecycle::Active, false, None, None);
-        let mut wide = timed_view(Lifecycle::Active, false, None, None);
+        let ascii = timed_view(Lifecycle::Active, None, None);
+        let mut wide = timed_view(Lifecycle::Active, None, None);
         wide.name = Some("日本語のテスト".into());
         wide.preview = Preview::floor("進捗 50% 😀".into());
         let (al, ap, at) = task_row_parts(&ascii, cols);

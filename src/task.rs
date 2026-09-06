@@ -461,11 +461,6 @@ impl Task {
             .unwrap_or(Duration::ZERO)
     }
 
-    /// Whether a live task has been quiet beyond the placement window.
-    pub fn parked(&self, now: Instant, window: Duration) -> bool {
-        self.finished.is_none() && self.quiet_for(now) > window
-    }
-
     /// Flush an expired `?2026` synchronized update so a stalled child's
     /// buffered frame becomes visible (see [`Emulator::flush_expired_sync`]);
     /// probe replies the flushed bytes generated are forwarded like live

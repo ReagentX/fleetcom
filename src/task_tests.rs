@@ -59,9 +59,9 @@ fn nonzero_exit_is_recorded() {
     t.terminate();
 }
 
-/// Lifecycle and placement cross the shared quiet threshold together.
+/// A live task becomes idle only after the quiet threshold; output resets it.
 #[test]
-fn lifecycle_and_parked_agree_across_the_window_edge() {
+fn lifecycle_crosses_idle_threshold_and_resets_on_activity() {
     let mut t = spawn(5, "sleep 5");
     // `sleep` writes nothing, so `last_activity` keeps its spawn value
     // and the injected `now`s measure against a fixed instant.
@@ -70,11 +70,13 @@ fn lifecycle_and_parked_agree_across_the_window_edge() {
 
     let inside = quiet_since + Duration::from_secs(9);
     assert_eq!(t.lifecycle(inside, window), Lifecycle::Active);
-    assert!(!t.parked(inside, window));
+
+    assert_eq!(t.lifecycle(quiet_since + window, window), Lifecycle::Active);
 
     let past = quiet_since + Duration::from_secs(11);
     assert_eq!(t.lifecycle(past, window), Lifecycle::Idle);
-    assert!(t.parked(past, window));
+    *t.last_activity.lock().unwrap() = past;
+    assert_eq!(t.lifecycle(past, window), Lifecycle::Active);
     t.terminate();
 }
 
@@ -87,21 +89,22 @@ fn sub_window_quiet_gaps_never_read_as_idle() {
     for gaps in 1..=4u32 {
         let probe = start + Duration::from_secs(9) * gaps;
         assert_eq!(t.lifecycle(probe, window), Lifecycle::Active);
-        assert!(!t.parked(probe, window));
         // Simulate output at the end of each quiet gap.
         *t.last_activity.lock().unwrap() = probe;
     }
     t.terminate();
 }
 
-/// A finished task is never parked, no matter how long it has been quiet.
+/// Exit status takes precedence over elapsed quiet time.
 #[test]
-fn finished_tasks_are_never_parked() {
-    let mut t = spawn(6, "exit 0");
-    wait_finished(&mut t);
-    let now = *t.last_activity.lock().unwrap() + Duration::from_secs(11);
-    assert!(!t.parked(now, Duration::from_secs(10)));
-    t.terminate();
+fn finished_lifecycle_ignores_quiet_time() {
+    for (command, expected) in [("exit 0", Lifecycle::Ok), ("exit 3", Lifecycle::Failed)] {
+        let mut t = spawn(6, command);
+        wait_finished(&mut t);
+        let now = *t.last_activity.lock().unwrap() + Duration::from_secs(11);
+        assert_eq!(t.lifecycle(now, Duration::from_secs(10)), expected);
+        t.terminate();
+    }
 }
 
 #[test]

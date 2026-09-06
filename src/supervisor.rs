@@ -508,7 +508,6 @@ impl Supervisor {
                     group: t.group.clone(),
                     name: t.name.clone(),
                     lifecycle: t.lifecycle(now, IDLE_AFTER),
-                    parked: t.parked(now, IDLE_AFTER),
                     preview: t.resolve_preview(now),
                     started_ago: now.duration_since(t.started),
                     quiet_ago: t.finished.is_none().then(|| t.quiet_for(now)),

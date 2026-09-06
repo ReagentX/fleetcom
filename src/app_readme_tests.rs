@@ -127,7 +127,6 @@ fn live_fleet(dirs: &Dirs) -> Vec<TaskView> {
             group: Some("dashboard".to_string()),
             name: Some("Dashboard Refine".to_string()),
             lifecycle: Lifecycle::Active,
-            parked: false,
             preview: anchor(
                 "Scope small fixes for dashboard and CLI",
                 "claude:action-row",
@@ -144,7 +143,6 @@ fn live_fleet(dirs: &Dirs) -> Vec<TaskView> {
             group: Some("dashboard".to_string()),
             name: Some("Summary Refine".to_string()),
             lifecycle: Lifecycle::Active,
-            parked: false,
             preview: anchor("Inferring… · thinking with high effort", "claude:spinner"),
             started_ago: mins(5),
             quiet_ago: Some(secs(8)),
@@ -158,7 +156,6 @@ fn live_fleet(dirs: &Dirs) -> Vec<TaskView> {
             group: Some("dashboard".to_string()),
             name: Some("Grok Language".to_string()),
             lifecycle: Lifecycle::Active,
-            parked: false,
             preview: anchor("Grok 4.5 (xhigh) · Responding…", "grok:spinner"),
             started_ago: mins(12),
             quiet_ago: Some(secs(4)),
@@ -172,7 +169,6 @@ fn live_fleet(dirs: &Dirs) -> Vec<TaskView> {
             group: Some("dashboard".to_string()),
             name: Some("Codex Language".to_string()),
             lifecycle: Lifecycle::Active,
-            parked: false,
             preview: anchor(CODEX_LANGUAGE, "codex:working"),
             started_ago: mins(18),
             quiet_ago: Some(secs(2)),
@@ -186,7 +182,6 @@ fn live_fleet(dirs: &Dirs) -> Vec<TaskView> {
             group: Some("dashboard".to_string()),
             name: Some("Codex Review".to_string()),
             lifecycle: Lifecycle::Active,
-            parked: false,
             preview: anchor(CODEX_REVIEW, "codex:working"),
             started_ago: mins(24),
             quiet_ago: Some(secs(6)),
@@ -200,7 +195,6 @@ fn live_fleet(dirs: &Dirs) -> Vec<TaskView> {
             group: Some("tests".to_string()),
             name: None,
             lifecycle: Lifecycle::Ok,
-            parked: false,
             preview: frozen(FLEETCOM_TESTS),
             started_ago: mins(2),
             quiet_ago: None,
@@ -214,7 +208,6 @@ fn live_fleet(dirs: &Dirs) -> Vec<TaskView> {
             group: Some("tests".to_string()),
             name: None,
             lifecycle: Lifecycle::Failed,
-            parked: false,
             preview: frozen(FLEETCOM_CLIPPY),
             started_ago: mins(5),
             quiet_ago: None,
@@ -228,7 +221,6 @@ fn live_fleet(dirs: &Dirs) -> Vec<TaskView> {
             group: Some("desktop".to_string()),
             name: Some("claude agents".to_string()),
             lifecycle: Lifecycle::Active,
-            parked: false,
             preview: title("2 awaiting input · claude agents"),
             started_ago: mins(63),
             quiet_ago: Some(secs(9)),
@@ -242,7 +234,6 @@ fn live_fleet(dirs: &Dirs) -> Vec<TaskView> {
             group: Some("desktop".to_string()),
             name: Some("Zellij".to_string()),
             lifecycle: Lifecycle::Active,
-            parked: false,
             preview: title("Desktop ¦ Utility"),
             started_ago: mins(126),
             quiet_ago: Some(secs(4)),
@@ -256,7 +247,6 @@ fn live_fleet(dirs: &Dirs) -> Vec<TaskView> {
             group: None,
             name: None,
             lifecycle: Lifecycle::Idle,
-            parked: true,
             preview: floor(">>>"),
             started_ago: mins(48),
             quiet_ago: Some(mins(41)),
@@ -270,7 +260,6 @@ fn live_fleet(dirs: &Dirs) -> Vec<TaskView> {
             group: Some("desktop".to_string()),
             name: None,
             lifecycle: Lifecycle::Ok,
-            parked: false,
             preview: frozen("Already up-to-date."),
             started_ago: mins(14),
             quiet_ago: None,
@@ -284,7 +273,6 @@ fn live_fleet(dirs: &Dirs) -> Vec<TaskView> {
             group: Some("turret".to_string()),
             name: Some("Game Infra Review".to_string()),
             lifecycle: Lifecycle::Active,
-            parked: false,
             preview: title("Turret Game Codebase Organization and Ex… - grok"),
             started_ago: mins(8),
             quiet_ago: Some(secs(5)),
@@ -298,7 +286,6 @@ fn live_fleet(dirs: &Dirs) -> Vec<TaskView> {
             group: Some("turret".to_string()),
             name: Some("Missile Nerf".to_string()),
             lifecycle: Lifecycle::Active,
-            parked: false,
             // omp's spinner phrase carries no model-label prefix: the
             // adapter's model_label is None.
             preview: anchor("Tuning missile damage falloff", "omp:spinner"),
@@ -314,7 +301,6 @@ fn live_fleet(dirs: &Dirs) -> Vec<TaskView> {
             group: Some("turret".to_string()),
             name: Some("EMP Nerf".to_string()),
             lifecycle: Lifecycle::Active,
-            parked: false,
             // At its prompt: the primary-screen title tier renders the
             // conversation label omp announces as `π > <label>`.
             preview: title("EMP arc balance pass"),
@@ -330,7 +316,6 @@ fn live_fleet(dirs: &Dirs) -> Vec<TaskView> {
             group: Some("tests".to_string()),
             name: None,
             lifecycle: Lifecycle::Ok,
-            parked: false,
             preview: frozen(CRABAPPLE_TESTS),
             started_ago: mins(18),
             quiet_ago: None,
@@ -344,7 +329,6 @@ fn live_fleet(dirs: &Dirs) -> Vec<TaskView> {
             group: Some("tests".to_string()),
             name: None,
             lifecycle: Lifecycle::Ok,
-            parked: false,
             preview: frozen(CRABSTEP_TESTS),
             started_ago: mins(22),
             quiet_ago: None,
@@ -358,7 +342,6 @@ fn live_fleet(dirs: &Dirs) -> Vec<TaskView> {
             group: None,
             name: None,
             lifecycle: Lifecycle::Active,
-            parked: false,
             preview: anchor("Review GitHub issue 780", "claude:action-row"),
             started_ago: mins(6),
             quiet_ago: Some(secs(2)),
@@ -372,7 +355,6 @@ fn live_fleet(dirs: &Dirs) -> Vec<TaskView> {
             group: Some("tests".to_string()),
             name: None,
             lifecycle: Lifecycle::Ok,
-            parked: false,
             preview: frozen(IMESSAGE_TESTS),
             started_ago: mins(20),
             quiet_ago: None,
@@ -386,7 +368,6 @@ fn live_fleet(dirs: &Dirs) -> Vec<TaskView> {
             group: Some("tests".to_string()),
             name: None,
             lifecycle: Lifecycle::Ok,
-            parked: false,
             preview: frozen(LOGRIA_TESTS),
             started_ago: mins(32),
             quiet_ago: None,
@@ -400,7 +381,6 @@ fn live_fleet(dirs: &Dirs) -> Vec<TaskView> {
             group: Some("tests".to_string()),
             name: None,
             lifecycle: Lifecycle::Active,
-            parked: false,
             preview: floor(LOGRIA_WATCH),
             started_ago: secs(45),
             quiet_ago: Some(secs(2)),
@@ -414,7 +394,6 @@ fn live_fleet(dirs: &Dirs) -> Vec<TaskView> {
             group: Some("tests".to_string()),
             name: None,
             lifecycle: Lifecycle::Idle,
-            parked: true,
             preview: floor(LOGRIA_DOC),
             started_ago: mins(28),
             quiet_ago: Some(mins(26)),
@@ -427,7 +406,6 @@ fn live_fleet(dirs: &Dirs) -> Vec<TaskView> {
 struct Quiet {
     id: u64,
     lifecycle: Lifecycle,
-    parked: bool,
     started_ago: Duration,
     quiet_ago: Option<Duration>,
     finished_ago: Option<Duration>,
@@ -441,7 +419,6 @@ impl Quiet {
         Self {
             id,
             lifecycle: Lifecycle::Idle,
-            parked: true,
             started_ago: started,
             quiet_ago: Some(quiet),
             finished_ago: None,
@@ -453,7 +430,6 @@ impl Quiet {
     const fn active(id: u64, started: Duration, quiet: Duration) -> Self {
         Self {
             lifecycle: Lifecycle::Active,
-            parked: false,
             ..Self::idle(id, started, quiet)
         }
     }
@@ -462,7 +438,6 @@ impl Quiet {
     const fn done(id: u64, started: Duration, finished: Duration) -> Self {
         Self {
             lifecycle: Lifecycle::Ok,
-            parked: false,
             quiet_ago: None,
             finished_ago: Some(finished),
             ..Self::idle(id, started, finished)
@@ -523,7 +498,6 @@ fn quiet_fleet(dirs: &Dirs) -> Vec<TaskView> {
             panic!("no peek-frame override for task {}", v.id);
         };
         v.lifecycle = q.lifecycle;
-        v.parked = q.parked;
         v.started_ago = q.started_ago;
         v.quiet_ago = q.quiet_ago;
         v.finished_ago = q.finished_ago;

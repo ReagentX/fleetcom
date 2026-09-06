@@ -12,7 +12,7 @@ use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
 use crate::frame::{KIND_CONTROL, KIND_HELLO, KIND_SCREEN};
 
 /// Wire-protocol version; the handshake rejects mismatched peers.
-pub const PROTOCOL_VERSION: u32 = 11;
+pub const PROTOCOL_VERSION: u32 = 12;
 
 /// Reserved dashboard label for tasks without a custom group.
 pub const UNASSIGNED: &str = "Unassigned";
@@ -323,9 +323,9 @@ impl Preview {
 
 /// A read-only snapshot of one task: everything a dashboard row needs, with no
 /// handle into the live process. Time is pre-reduced to the `*_ago` durations
-/// and `lifecycle`/`parked` are pre-computed by the core (it owns the clock
-/// and the one idle window both fields share), so nothing here depends on a
-/// process-local `Instant` that a socket peer could not interpret.
+/// and `lifecycle` is computed by the core from its idle window, so nothing
+/// here depends on a process-local `Instant` that a socket peer could not
+/// interpret.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TaskView {
     pub id: u64,
@@ -337,10 +337,6 @@ pub struct TaskView {
     /// Custom display name; `None` means unnamed.
     pub name: Option<String>,
     pub lifecycle: Lifecycle,
-    /// Quiet past the core's idle window while live; `false` once finished.
-    /// Same threshold as `Lifecycle::Idle`: the glyph reads `lifecycle`,
-    /// state-section placement reads this field.
-    pub parked: bool,
     /// The dashboard preview, resolved by the core at snapshot time.
     pub preview: Preview,
     pub started_ago: Duration,
@@ -860,7 +856,6 @@ pub fn encode_event(ev: &Event) -> (u8, Vec<u8>) {
                 let _ = o.insert("src", tv.preview.source.label());
                 let _ = o.insert("frozen", tv.preview.frozen);
                 let _ = o.insert("started_ms", tv.started_ago.as_millis() as u64);
-                let _ = o.insert("parked", tv.parked);
                 // Each age exists in exactly one phase: `quiet_ms` while
                 // live, `finished_ms` once finished.
                 insert_opt_ms(&mut o, "quiet_ms", tv.quiet_ago);
@@ -939,23 +934,6 @@ pub fn decode_event(kind: u8, payload: &[u8]) -> Option<Event> {
                     let mut views = Vec::new();
                     for tv in v["tasks"].members() {
                         let lifecycle = lifecycle_from(tv["life"].as_str()?)?;
-                        // A frame from a daemon predating `parked` derives it
-                        // from the idle lifecycle: skew degrades to the
-                        // pre-`parked` signal, never to a dropped frame.
-                        // Current cores compute `parked` from that same window,
-                        // so the fallback matches a modern frame.
-                        let parked = if tv["parked"].is_null() {
-                            lifecycle == Lifecycle::Idle
-                        } else {
-                            tv["parked"].as_bool()?
-                        };
-                        // Missing preview metadata uses conservative defaults
-                        // so the task frame remains usable.
-                        let source = if tv["src"].is_null() {
-                            PreviewSource::Floor
-                        } else {
-                            source_from(tv["src"].as_str()?)?
-                        };
                         views.push(TaskView {
                             id: tv["id"].as_u64()?,
                             command: tv["command"].as_str()?.to_string(),
@@ -965,15 +943,13 @@ pub fn decode_event(kind: u8, payload: &[u8]) -> Option<Event> {
                             group: opt_str(&tv["group"])?,
                             name: opt_str(&tv["name"])?,
                             lifecycle,
-                            parked,
                             preview: Preview {
                                 text: tv["preview"].as_str()?.to_string(),
-                                source,
+                                source: source_from(tv["src"].as_str()?)?,
                                 rule: None,
-                                frozen: bool_flag(&tv["frozen"])?,
+                                frozen: tv["frozen"].as_bool()?,
                             },
                             started_ago: Duration::from_millis(tv["started_ms"].as_u64()?),
-                            // Absent from pre-`parked` daemons: unknown, not zero.
                             quiet_ago: opt_ms(&tv["quiet_ms"])?,
                             finished_ago: opt_ms(&tv["finished_ms"])?,
                         });
