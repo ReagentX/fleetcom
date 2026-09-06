@@ -1,7 +1,7 @@
 use super::*;
 
 /// Every command survives encode→frame-payload→decode unchanged, including
-/// the `Watch{None}` null, raw `Input` bytes (0 and 255), and the no-field
+/// the `Watch{None}` null, `Paste` bytes (0 and 255), and the no-field
 /// `Shutdown`.
 ///
 /// `variant_index` exhaustively matches `Command`, and `seen` verifies that
@@ -56,15 +56,11 @@ fn command_round_trips() {
             id: None,
             attached: false,
         },
-        Command::Input {
-            id: 1,
-            bytes: vec![0, 27, 91, 255],
-        },
         Command::Paste {
-            // Non-UTF-8 and marker-shaped bytes must survive: the core, not
+            // NUL, non-UTF-8, and marker-shaped bytes must survive: the core, not
             // the client, decides what the child receives.
             id: 6,
-            bytes: b"line1\nline2\x1b[201~\xff".to_vec(),
+            bytes: b"line1\nline2\x1b[201~\0\xff".to_vec(),
         },
         Command::Mouse {
             id: 8,
@@ -159,19 +155,18 @@ fn command_round_trips() {
             Command::SetName { .. } => 6,
             Command::Resize { .. } => 7,
             Command::Watch { .. } => 8,
-            Command::Input { .. } => 9,
-            Command::Paste { .. } => 10,
-            Command::Mouse { .. } => 11,
-            Command::Key { .. } => 12,
-            Command::Scrollback { .. } => 13,
-            Command::SaveSession { .. } => 14,
-            Command::LoadSession { .. } => 15,
-            Command::LoadRecovery { .. } => 16,
-            Command::ListSessions => 17,
-            Command::Shutdown => 18,
+            Command::Paste { .. } => 9,
+            Command::Mouse { .. } => 10,
+            Command::Key { .. } => 11,
+            Command::Scrollback { .. } => 12,
+            Command::SaveSession { .. } => 13,
+            Command::LoadSession { .. } => 14,
+            Command::LoadRecovery { .. } => 15,
+            Command::ListSessions => 16,
+            Command::Shutdown => 17,
         }
     }
-    let mut seen = [false; 19];
+    let mut seen = [false; 18];
     for c in cases {
         seen[variant_index(&c)] = true;
         let (k, p) = encode_command(&c);
@@ -277,12 +272,14 @@ fn out_of_range_numerics_are_rejected() {
     }
 }
 
-/// Invalid base64 and non-string byte or path fields reject the command.
+/// Invalid base64, non-string byte or path fields, and the removed raw-input
+/// command are rejected.
 #[test]
-fn invalid_base64_is_rejected() {
+fn invalid_byte_commands_are_rejected() {
     for json in [
-        r#"{"t":"input","id":1,"bytes":"!!!"}"#,
-        r#"{"t":"input","id":1,"bytes":[0,27]}"#, // bytes must be a base64 string
+        r#"{"t":"input","id":1,"bytes":"ABtb/w=="}"#, // removed command, valid bytes
+        r#"{"t":"paste","id":1,"bytes":"!!!"}"#,
+        r#"{"t":"paste","id":1,"bytes":[0,27]}"#, // bytes must be a base64 string
         r#"{"t":"paste","id":1,"bytes":"AAAA="}"#, // bad padding length
         r#"{"t":"spawn","command":"ls","cwd":"/tmp/x"}"#, // plain path
     ] {

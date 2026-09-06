@@ -76,12 +76,9 @@ pub enum Command {
     /// Stream this task's screen (attach or peek), or `None` to stop.
     /// `attached` permits clipboard forwarding from the watched task.
     Watch { id: Option<u64>, attached: bool },
-    /// Forward raw keystroke bytes to a task's PTY.
-    Input { id: u64, bytes: Vec<u8> },
-    /// Clipboard paste for a task. Kept distinct from `Input` because the
-    /// encoding depends on state only the core can see: the task's emulator
-    /// knows whether the child enabled bracketed paste (DECSET 2004), which
-    /// decides between wrapping in paste markers and newline conversion.
+    /// Clipboard paste for a task. The core reads the child's bracketed-paste
+    /// mode (DECSET 2004) from its emulator to choose between paste markers
+    /// and newline conversion.
     Paste { id: u64, bytes: Vec<u8> },
     /// One mouse action over an attached task. `col`/`row` are 0-based pane
     /// cells. Routing is core-side for the same reason as `Paste`: the child's
@@ -592,13 +589,8 @@ pub fn encode_command(cmd: &Command) -> (u8, Vec<u8>) {
             // Preserve an absent watch ID as JSON null.
             jzon::object! { "t": "watch", "id": *id, "attached": *attached }
         }
-        // Encode both byte-carrying commands as base64. The paste-size bound in
-        // `app` accounts for base64 expansion and the frame limit.
-        Command::Input { id, bytes } => jzon::object! {
-            "t": "input",
-            "id": *id,
-            "bytes": B64.encode(bytes),
-        },
+        // The paste-size bound in `app` accounts for base64 expansion and
+        // the frame limit.
         Command::Paste { id, bytes } => jzon::object! {
             "t": "paste",
             "id": *id,
@@ -733,10 +725,6 @@ pub fn decode_command(kind: u8, payload: &[u8]) -> Option<Command> {
             },
             // Reject watch frames that do not specify an attachment mode.
             attached: v["attached"].as_bool()?,
-        },
-        "input" => Command::Input {
-            id: v["id"].as_u64()?,
-            bytes: B64.decode(v["bytes"].as_str()?).ok()?,
         },
         "paste" => Command::Paste {
             id: v["id"].as_u64()?,

@@ -2006,7 +2006,7 @@ fn attached_wheel_honors_the_childs_1007_veto() {
         app.on_mouse(wheel_up);
         if veto {
             // The sentinel follows the wheel on the writer queue.
-            app.transport.send(Command::Input {
+            app.transport.send(Command::Paste {
                 id,
                 bytes: b"zzz".to_vec(),
             });
@@ -3597,9 +3597,10 @@ fn mid_drag_mouse_enable_reroutes_the_gesture_to_the_child() {
     app.on_mouse(press(1, 2));
     assert!(app.selection.is_some(), "the press must start a drag");
     // Trigger the child's mouse enable and wait for the flip to arrive.
-    app.transport.send(Command::Input {
+    app.transport.send(Command::Key {
         id,
-        bytes: b"\n".to_vec(),
+        code: Key::Enter,
+        mods: Mods::default(),
     });
     assert!(
         wait_until(Duration::from_secs(5), || {

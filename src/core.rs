@@ -192,7 +192,7 @@ mod tests {
         );
     }
 
-    /// A keystroke to a watched task echoes back as a `Screen` event within a
+    /// Input to a watched task echoes back as a `Screen` event within a
     /// frame, not on the idle backstop. Exercises the real path (a live PTY, its
     /// reader thread signalling the waker, `run_loop` waking and ticking), so it
     /// fails loudly if the waker wiring breaks (echo would then only surface on
@@ -237,7 +237,7 @@ mod tests {
         // Time the echo of a distinctive marker.
         let sent = Instant::now();
         wake_tx
-            .send(Wake::Cmd(Command::Input {
+            .send(Wake::Cmd(Command::Paste {
                 id: 1,
                 bytes: b"zqmarkerqz\n".to_vec(),
             }))

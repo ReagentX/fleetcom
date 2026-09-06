@@ -180,7 +180,6 @@ fn affects_recipe(cmd: &Command) -> bool {
         | Command::Tag { .. }
         | Command::Resize { .. }
         | Command::Watch { .. }
-        | Command::Input { .. }
         | Command::Paste { .. }
         | Command::Mouse { .. }
         | Command::Key { .. }
@@ -406,10 +405,8 @@ impl Supervisor {
                 self.watched = id;
                 self.watch_attached = attached;
             }
-            Command::Input { id, bytes } => self.deliver(id, "input", |t| t.send_input(&bytes)),
-            // Paste and scroll land here (not as pre-encoded `Input`) because
-            // their encoding depends on the child's terminal state, which
-            // only this side of the socket can see.
+            // Paste and mouse encoding depend on the child's terminal modes,
+            // which only the core's emulator can see.
             Command::Paste { id, bytes } => self.deliver(id, "paste", |t| t.send_paste(&bytes)),
             Command::Mouse { id, kind, col, row } => {
                 self.deliver(id, "mouse input", |t| t.send_mouse(kind, col, row))

@@ -195,10 +195,8 @@ pub struct PreviewState {
     rendered: Preview,
     /// Last cascade output, carried while the resolution key is unchanged.
     candidate: Preview,
-    /// Latest demoted candidate while the demotion hold runs.
-    pending_candidate: Option<Preview>,
     /// Start of the demotion hold: the first resolution whose candidate
-    /// ranked below the rendered source. Pending-candidate changes never
+    /// ranked below the rendered source. Lower-ranked candidate changes never
     /// reset it: the timer measures continuous absence of
     /// rendered-or-higher, so a flapping demoted candidate cannot postpone
     /// the commit forever.
@@ -225,7 +223,6 @@ impl PreviewState {
         Self {
             rendered: empty.clone(),
             candidate: empty,
-            pending_candidate: None,
             downgrade_pending_since: None,
             last_title_render: None,
             last_key: None,
@@ -278,13 +275,13 @@ impl PreviewState {
         use std::cmp::Ordering;
         match self.candidate.source.cmp(&self.rendered.source) {
             Ordering::Greater => {
-                self.cancel_demotion();
+                self.downgrade_pending_since = None;
                 self.render(self.candidate.clone(), now, alt);
             }
             Ordering::Equal => {
                 // A recovered rank cancels a pending demotion without a
                 // visible change.
-                self.cancel_demotion();
+                self.downgrade_pending_since = None;
                 if self.candidate == self.rendered {
                     return;
                 }
@@ -312,12 +309,9 @@ impl PreviewState {
             }
             Ordering::Less => {
                 let since = *self.downgrade_pending_since.get_or_insert(now);
-                self.pending_candidate = Some(self.candidate.clone());
-                if now.duration_since(since) >= DEMOTION_HOLD
-                    && let Some(latest) = self.pending_candidate.take()
-                {
+                if now.duration_since(since) >= DEMOTION_HOLD {
                     self.downgrade_pending_since = None;
-                    self.render(latest, now, alt);
+                    self.render(self.candidate.clone(), now, alt);
                 }
             }
         }
@@ -333,11 +327,6 @@ impl PreviewState {
         self.rendered_under_alt = alt;
     }
 
-    fn cancel_demotion(&mut self) {
-        self.pending_candidate = None;
-        self.downgrade_pending_since = None;
-    }
-
     /// Freeze the preview once output is complete: the final screen is
     /// resolved without hold timers or retained primary titles.
     /// If an alternate-screen render is followed only by restoration of the
@@ -349,7 +338,7 @@ impl PreviewState {
             return;
         }
         self.finalized = true;
-        self.cancel_demotion();
+        self.downgrade_pending_since = None;
         let alt_torn_down_at_exit = self.rendered_under_alt
             && !screen.alternate_screen()
             && screen

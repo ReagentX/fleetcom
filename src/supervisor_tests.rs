@@ -678,18 +678,18 @@ fn overfull_writer_queue_refuses_message_with_notice() {
     s.set_kill_grace(Duration::from_millis(200));
     spawn(&mut s, "sleep 300", here());
     let id = first_id(&mut s);
-    // Newline-terminated input keeps the worker blocked and its admitted
-    // byte count pending while the child does not read.
+    // Unbracketed paste converts LF to CR; the PTY's ICRNL restores LF and
+    // fills the canonical queue while the child does not read.
     let big = b"x\n".repeat(4 << 20);
-    s.apply(Command::Input {
+    s.apply(Command::Paste {
         id,
         bytes: big.clone(),
     });
-    s.apply(Command::Input {
+    s.apply(Command::Paste {
         id,
         bytes: big.clone(),
     });
-    s.apply(Command::Input { id, bytes: big });
+    s.apply(Command::Paste { id, bytes: big });
     let evs = s.drain();
     assert!(
         evs.iter().any(|e| matches!(e, Event::Status(m)
