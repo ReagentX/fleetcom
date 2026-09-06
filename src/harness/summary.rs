@@ -400,15 +400,23 @@ fn codex_numbered_option(row: &str) -> bool {
 }
 
 /// Codex's approval modal: a selector row with an indented numbered sibling
-/// below it, pinned to the last nine painted rows. A quoted menu retains the
+/// adjacent to it, pinned to the last nine painted rows. A quoted menu retains the
 /// live composer below it, so any non-selector [`CODEX_PROMPT`] row after the
 /// selector suppresses the match. Suppression tests the glyph alone because
 /// modal detection must not reinterpret a live composer as quoted content.
 fn codex_approval(rows: &[String]) -> Option<(String, &'static str)> {
     let last = rows.iter().rposition(|r| !r.is_empty())?;
     let i = (last.saturating_sub(8)..=last).find(|&i| codex_menu_head(&rows[i]))?;
-    let sibling = rows[i + 1..].iter().find(|r| !r.is_empty())?;
-    if !(sibling.starts_with(' ') && codex_numbered_option(sibling)) {
+    // The last option has no numbered sibling below it.
+    let siblings = [
+        rows[..i].iter().rev().find(|r| !r.is_empty()),
+        rows[i + 1..].iter().find(|r| !r.is_empty()),
+    ];
+    if !siblings
+        .into_iter()
+        .flatten()
+        .any(|r| r.starts_with(' ') && codex_numbered_option(r))
+    {
         return None;
     }
     rows[i + 1..]

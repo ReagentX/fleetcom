@@ -47,7 +47,11 @@ The shape, not the version, discriminates the schema. An object-valued `dirs` ma
 
 Saves are atomic: `fleetcom` writes and syncs a private temporary file in the session directory, then renames it over the recipe. Recipes persist full command lines, which can embed secrets. [Security](README.md#security) documents the directory and file permissions.
 
-The file is plain JSON and practical to edit by hand. Editing the `name` field changes which session the file claims to be: collision checks compare it, so a save under the old name will be refused. On load, the daemon removes control characters, trims surrounding whitespace, and limits group and display names to 64 characters. `Unassigned` maps to no group but remains a legal display name. Invalid JSON fails the entire load. Within valid JSON, `fleetcom` drops any member that matches neither entry form, including a non-string scalar, an object without a string `cmd`, or an object with a non-string `group` or `name`.
+The file is plain JSON and practical to edit by hand. Editing the `name` field changes which session the file claims to be: collision checks compare it, so a save under the old name will be refused. A readable stored name still controls collision checks and picker labels when the command body is invalid or the version is unsupported.
+
+Loading validates the entire recipe before starting any commands. The root must be an object, every directory value must be an array, and every entry must be a command string or an object with a string `cmd`. Optional entry `group` and `name` fields, and the wrapped session's `name`, accept strings, `null`, or omission; other types fail. Unknown fields in wrapped metadata and entry objects are ignored. Empty maps, arrays, and strings are valid. Invalid JSON or any malformed field fails the whole load, leaves existing tasks intact, and preserves the recipe file. Schema errors identify the quoted directory key, the entry number (starting at 1), and the offending field where applicable.
+
+After validation, the daemon removes control characters, trims surrounding whitespace, and limits group and display names to 64 characters. `Unassigned` maps to no group but remains a legal display name. Missing directories and entries exceeding task or command limits are still skipped and counted in the load status. Spawn failures are reported separately; commands already started by a structurally valid recipe keep running.
 
 Commands with neither a group nor a name use the string form. String and object entries can appear in the same directory array.
 

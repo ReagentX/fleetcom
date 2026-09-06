@@ -929,11 +929,11 @@ fn home_only_launch_env_targets_the_clients_dot_codex() {
     );
     let codex_home = home.join(".codex");
     std::fs::create_dir_all(&codex_home).unwrap();
-    // A multi-line notify is Opaque: injection is suppressed only when
-    // the guard reads the client's config.toml through HOME.
+    // An empty argument cannot survive the chain transport: injection is
+    // suppressed only when the guard reads the client's config through HOME.
     std::fs::write(
         codex_home.join("config.toml"),
-        "notify = [\n  \"/my/thing\",\n]\n",
+        "notify = [\"/my/thing\", \"\"]\n",
     )
     .unwrap();
     install_stub(&bin, "codex", &dir);
@@ -1128,10 +1128,10 @@ fn unrepresentable_config_notify_suppresses_injection() {
     let (bin, runtime) = (dir.join("bin"), dir.join("run"));
     let codex_home = dir.join("codex_home");
     std::fs::create_dir_all(&codex_home).unwrap();
-    // A multi-line array is out of the line-based parser's reach.
+    // An empty argument cannot survive shell field splitting.
     std::fs::write(
         codex_home.join("config.toml"),
-        "notify = [\n  \"/my/thing\",\n]\n",
+        "notify = [\"/my/thing\", \"\"]\n",
     )
     .unwrap();
     install_stub(&bin, "codex", &dir);
@@ -1145,7 +1145,7 @@ fn unrepresentable_config_notify_suppresses_injection() {
     let argv = wait_argv(&mut s, &dir.join("argv"));
     assert!(
         !argv.iter().any(|a| a.contains("notify=")),
-        "fleetcom must not guess at an unparseable notify; argv: {argv:?}"
+        "fleetcom must preserve an unrepresentable notify; argv: {argv:?}"
     );
 
     // The same route commented out is inert: the injection returns.

@@ -79,42 +79,83 @@ enum NotifyRoute {
     Opaque,
 }
 
-/// Classify the `notify` route declared in `config.toml`. The parser is
-/// deliberately line-based: duplicate assignments are ambiguous and produce
-/// [`NotifyRoute::Opaque`].
+/// Read bare top-level keys until the first table. Unsupported syntax disables
+/// injection: it may contain a notifier that this reader cannot preserve.
 fn config_notify_route(home: Option<&Path>) -> NotifyRoute {
     let Some(root) = home_root(home, ".codex") else {
         return NotifyRoute::Vacant;
     };
-    let text = fs::read_to_string(root.join("config.toml")).unwrap_or_default();
-    let mut values = text.lines().filter_map(notify_value);
-    let Some(value) = values.next() else {
-        return NotifyRoute::Vacant;
+    let text = match fs::read_to_string(root.join("config.toml")) {
+        Ok(text) => text,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return NotifyRoute::Vacant,
+        Err(_) => return NotifyRoute::Opaque,
     };
-    if values.next().is_some() {
-        return NotifyRoute::Opaque;
-    }
-    route_for(value)
-}
-
-/// Classify one notify assignment for the newline-delimited chain transport.
-/// Newlines collide with the delimiter, empty elements disappear during shell
-/// field splitting, and an empty array names no program. Each case is opaque.
-fn route_for(value: &str) -> NotifyRoute {
-    match parse_notify_array(value) {
-        Some(argv)
-            if !argv.is_empty() && argv.iter().all(|a| !a.is_empty() && !a.contains('\n')) =>
-        {
-            NotifyRoute::Chain(argv)
+    let mut route = None;
+    for line in text.lines().map(str::trim) {
+        if line.is_empty() || line.starts_with('#') {
+            continue;
         }
-        _ => NotifyRoute::Opaque,
+        // TOML cannot return to the root table after a table header. Values
+        // above it must be complete so a header inside a string cannot stop us.
+        if line.starts_with('[') {
+            break;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            return NotifyRoute::Opaque;
+        };
+        let key = key.trim();
+        if key.is_empty()
+            || !key
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"_-".contains(&b))
+        {
+            return NotifyRoute::Opaque;
+        }
+        if key == "notify" {
+            if route.is_some() {
+                return NotifyRoute::Opaque;
+            }
+            let Some(argv) = parse_notify_array(value) else {
+                return NotifyRoute::Opaque;
+            };
+            if argv
+                .iter()
+                .any(|a| a.is_empty() || a.contains(['\n', '\0']))
+            {
+                return NotifyRoute::Opaque;
+            }
+            route = Some(if argv.is_empty() {
+                NotifyRoute::Vacant
+            } else {
+                NotifyRoute::Chain(argv)
+            });
+        } else if !complete_value(value.trim()) {
+            return NotifyRoute::Opaque;
+        }
     }
+    route.unwrap_or(NotifyRoute::Vacant)
 }
 
-/// Value after `=` of an uncommented bare `notify` assignment, or `None`.
-fn notify_value(line: &str) -> Option<&str> {
-    let rest = line.trim_start().strip_prefix("notify")?;
-    rest.trim_start_matches([' ', '\t']).strip_prefix('=')
+/// Recognize complete single-line values without interpreting unrelated settings.
+/// Multiline strings, arrays, and inline tables are outside the reader's scope.
+fn complete_value(value: &str) -> bool {
+    if value.starts_with("\"\"\"") || value.starts_with("'''") {
+        return false;
+    }
+    let tail = if let Some(rest) = value.strip_prefix('"') {
+        parse_basic_string(rest).map(|(_, tail)| tail)
+    } else if let Some(rest) = value.strip_prefix('\'') {
+        rest.find('\'').map(|i| &rest[i + 1..])
+    } else if value.starts_with('[') {
+        return parse_notify_array(value).is_some();
+    } else {
+        let scalar = value.split('#').next().unwrap_or_default().trim();
+        return matches!(scalar, "true" | "false") || scalar.parse::<f64>().is_ok();
+    };
+    tail.is_some_and(|tail| {
+        let tail = tail.trim();
+        tail.is_empty() || tail.starts_with('#')
+    })
 }
 
 /// Parse a one-line TOML array of basic strings. Literal strings, non-string
@@ -307,7 +348,7 @@ mod tests {
             "# notify = [\"/my/thing\"]\n",
             "  # notify = [\"/my/thing\"]\n",
             "notify_extra = 1\n",
-            "notify\n",
+            "notify = []\n",
         ] {
             fs::write(&cfg, inert).unwrap();
             let plan = Codex.instrument(&inv, &paths(), Some(&home));
@@ -345,19 +386,18 @@ mod tests {
         let cfg = home.join("config.toml");
         let inv = Codex.detect("codex").unwrap();
         for opaque in [
-            // Multi-line array: the value ends mid-structure.
-            "notify = [\n  \"/my/thing\",\n]\n",
-            // Literal strings are unsupported.
-            "notify = ['/my/thing']\n",
-            // Empty array: notify is routed, yet no program to chain.
-            "notify = []\n",
+            // Malformed TOML cannot identify an active route.
+            "notify = [\n",
+            "notify\n",
+            "notify = [1]\n",
+            "notify = [\"a\\u0000b\"]\n",
             // Empty element: the script's field split would drop it.
             "notify = [\"\"]\n",
             // Embedded newline: the chain encoding's delimiter.
             "notify = [\"a\\nb\"]\n",
             // Not an array.
             "notify = \"/my/thing\"\n",
-            // Two assignment lines (e.g. one inside a table): ambiguous.
+            // Duplicate top-level assignments are invalid TOML.
             "notify = [\"/a\"]\nnotify = [\"/b\"]\n",
         ] {
             fs::write(&cfg, opaque).unwrap();
@@ -393,6 +433,58 @@ mod tests {
             String::from_utf8(out.stdout).unwrap(),
             format!("-c\n{}\n", r#"notify=["/Odd Path/it's \"here\"\\now"]"#)
         );
+    }
+
+    /// Unknown syntax must not be mistaken for an absent notifier.
+    #[test]
+    fn config_notify_route_declines_unsupported_root_syntax() {
+        let home = temp("codex_unknown_notify");
+        for text in [
+            "\"notify\" = [\"/hook\"]",
+            "'notify' = ['/hook']",
+            "notify = ['/hook']",
+            "notify = [\n  \"/hook\",\n]",
+            "description = '''\n[other]\n'''\nnotify = [\"/hook\"]",
+            "description = \"\"\"\nnotify = [\"/quoted\"]\n\"\"\"",
+            "other = [\n  \"value\",\n]\nnotify = [\"/hook\"]",
+            "other = { value = 1 }\nnotify = [\"/hook\"]",
+            "other.key = true\nnotify = [\"/hook\"]",
+        ] {
+            fs::write(home.join("config.toml"), text).unwrap();
+            assert_eq!(
+                config_notify_route(Some(&home)),
+                NotifyRoute::Opaque,
+                "{text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn config_notify_route_stops_at_tables_after_complete_values() {
+        let home = temp("codex_root_notify");
+        let preamble = "model = \"example\" # comment\nname = 'literal'\nenabled = true\nlimit = 42\nother = [\"a\", \"b\"]\n";
+        for (root, expected) in [
+            ("", NotifyRoute::Vacant),
+            ("notify = []\n", NotifyRoute::Vacant),
+            (
+                "notify = [\"/hook\"]\n",
+                NotifyRoute::Chain(vec!["/hook".into()]),
+            ),
+        ] {
+            fs::write(
+                home.join("config.toml"),
+                format!("{preamble}{root}[other]\nnotify = [\"/ignored\"]\n"),
+            )
+            .unwrap();
+            assert_eq!(config_notify_route(Some(&home)), expected);
+        }
+    }
+
+    #[test]
+    fn config_notify_route_skips_unreadable_config() {
+        let home = temp("codex_unreadable_notify");
+        fs::create_dir(home.join("config.toml")).unwrap();
+        assert_eq!(config_notify_route(Some(&home)), NotifyRoute::Opaque);
     }
 
     #[test]
@@ -449,21 +541,6 @@ mod tests {
         }
     }
 
-    /// `route_for` rejects parsed arrays that the chain transport would alter.
-    #[test]
-    fn route_for_refuses_untransportable_argv() {
-        assert_eq!(
-            route_for(r#" ["/x", "y"]"#),
-            NotifyRoute::Chain(vec!["/x".into(), "y".into()])
-        );
-        // Newline elements collide with the join delimiter; empty elements
-        // are dropped by sh field splitting; an empty array has no program.
-        assert_eq!(route_for(r#"["a\nb"]"#), NotifyRoute::Opaque);
-        assert_eq!(route_for(r#"[""]"#), NotifyRoute::Opaque);
-        assert_eq!(route_for("[]"), NotifyRoute::Opaque);
-        assert_eq!(route_for("garbage"), NotifyRoute::Opaque);
-    }
-
     #[test]
     fn parse_capture_accepts_only_turn_complete_payloads() {
         let payload = format!(
@@ -497,7 +574,7 @@ mod tests {
             NotifyRoute::Chain(vec!["/base/hook".to_string()])
         );
 
-        // Two assignment lines remain ambiguous.
+        // Duplicate top-level assignments are invalid TOML.
         fs::write(&cfg, "notify = [\"/a\"]\nnotify = [\"/b\"]\n").unwrap();
         assert_eq!(config_notify_route(Some(&home)), NotifyRoute::Opaque);
     }

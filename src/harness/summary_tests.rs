@@ -1014,6 +1014,23 @@ fn codex_approval_modal_synthesizes_on_any_selection() {
         CodexSummary.live_preview(&on_second),
         Some(("awaiting approval".to_string(), "codex:approval-menu"))
     );
+
+    let on_last = rs(&[
+        "  1. Yes, proceed (y)",
+        "  2. Yes, and don't ask again (p)",
+        "› 3. No (esc)",
+        "",
+        "  Press enter to confirm or esc to cancel",
+    ]);
+    assert_eq!(
+        CodexSummary.live_preview(&on_last),
+        Some(("awaiting approval".to_string(), "codex:approval-menu"))
+    );
+    for glyph in CODEX_PROMPT {
+        let mut quoted = on_last.clone();
+        quoted.push(glyph.to_string());
+        assert_eq!(CodexSummary.live_preview(&quoted), None, "{glyph}");
+    }
 }
 
 /// A menu quoted in the conversation always has the live composer

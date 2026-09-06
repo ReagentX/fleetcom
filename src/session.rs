@@ -113,21 +113,25 @@ pub fn fingerprint_json(cfg: &SessionConfig) -> String {
 /// A top-level `version` must be an integer from 1 through [`FORMAT_VERSION`];
 /// a missing version is interpreted as 1.
 fn from_json(text: &str) -> io::Result<(Option<String>, SessionConfig)> {
-    let parsed = jzon::parse(text).map_err(|e| io::Error::other(e.to_string()))?;
+    let invalid = |message| io::Error::new(io::ErrorKind::InvalidData, message);
+    let parsed = jzon::parse(text).map_err(|e| invalid(e.to_string()))?;
+    if !parsed.is_object() {
+        return Err(invalid("session root: expected an object".into()));
+    }
     // Validate version metadata before detecting the schema shape.
     let version = &parsed["version"];
-    if !version.is_null() {
+    if parsed.has_key("version") {
         match version.as_u64() {
             Some(n) if (1..=FORMAT_VERSION).contains(&n) => {}
             Some(n) if n > FORMAT_VERSION => {
-                return Err(io::Error::other(format!(
+                return Err(invalid(format!(
                     "session format version {n} is newer than this fleetcom \
                      (supports {FORMAT_VERSION}); load it with a newer build"
                 )));
             }
             // Reject zero, fractional, negative, and non-numeric values.
             _ => {
-                return Err(io::Error::other(format!(
+                return Err(invalid(format!(
                     "session format version {} is not one this fleetcom reads \
                      (supports {FORMAT_VERSION}); load it with a newer build",
                     version.dump()
@@ -136,7 +140,8 @@ fn from_json(text: &str) -> io::Result<(Option<String>, SessionConfig)> {
         }
     }
     let (name, dirs, flat) = if parsed["dirs"].is_object() {
-        let name = parsed["name"].as_str().map(str::to_string);
+        let name = opt_str(&parsed["name"])
+            .ok_or_else(|| invalid("session field \"name\": expected a string or null".into()))?;
         (name, &parsed["dirs"], false)
     } else {
         (None, &parsed, true)
@@ -147,27 +152,55 @@ fn from_json(text: &str) -> io::Result<(Option<String>, SessionConfig)> {
         if flat && dir == "version" {
             continue;
         }
-        // Ignore members that match neither supported entry form.
-        let entries = val
-            .members()
-            .filter_map(|m| {
-                if let Some(cmd) = m.as_str() {
-                    return Some(SessionEntry {
-                        cmd: cmd.to_string(),
-                        group: None,
-                        name: None,
-                    });
-                }
-                // Indexing a non-object yields Null, so malformed members drop here.
-                let cmd = m["cmd"].as_str()?.to_string();
-                let group = opt_str(&m["group"])?;
-                let name = opt_str(&m["name"])?;
-                Some(SessionEntry { cmd, group, name })
-            })
-            .collect();
+        if !val.is_array() {
+            return Err(invalid(format!("directory {dir:?}: expected an array")));
+        }
+        let mut entries = Vec::new();
+        for (index, member) in val.members().enumerate() {
+            if let Some(cmd) = member.as_str() {
+                entries.push(SessionEntry {
+                    cmd: cmd.to_string(),
+                    group: None,
+                    name: None,
+                });
+                continue;
+            }
+            let location = format!("directory {dir:?}, entry {}", index + 1);
+            if !member.is_object() {
+                return Err(invalid(format!(
+                    "{location}: expected a command string or an object"
+                )));
+            }
+            let cmd = member["cmd"]
+                .as_str()
+                .ok_or_else(|| invalid(format!("{location}, field \"cmd\": expected a string")))?;
+            let label = |field| {
+                opt_str(&member[field]).ok_or_else(|| {
+                    invalid(format!(
+                        "{location}, field {field:?}: expected a string or null"
+                    ))
+                })
+            };
+            entries.push(SessionEntry {
+                cmd: cmd.to_string(),
+                group: label("group")?,
+                name: label("name")?,
+            });
+        }
         cfg.insert(dir.to_string(), entries);
     }
     Ok((name, cfg))
+}
+
+/// Inspect wrapper identity without validating its version or command body:
+/// an unloadable recipe still owns its name for listings and collision checks.
+fn stored_name(text: &str) -> Option<String> {
+    let parsed = jzon::parse(text).ok()?;
+    if parsed["dirs"].is_object() {
+        parsed["name"].as_str().map(str::to_string)
+    } else {
+        None
+    }
 }
 
 // --- fs surface: callers supply the root. The supervisor resolves it from the
@@ -237,7 +270,7 @@ pub fn save_in(dir: &Path, name: &str, cfg: &SessionConfig) -> io::Result<PathBu
     // same filename. Files without a parseable stored name remain overwritable.
     match fs::read_to_string(&file) {
         Ok(text) => {
-            if let Ok((Some(stored), _)) = from_json(&text)
+            if let Some(stored) = stored_name(&text)
                 && stored != trimmed
             {
                 return Err(io::Error::new(
@@ -271,10 +304,7 @@ pub fn list_in(dir: &Path) -> Vec<String> {
             if p.extension().and_then(|s| s.to_str()) == Some("json")
                 && let Some(stem) = p.file_stem().and_then(|s| s.to_str())
             {
-                let stored = fs::read_to_string(&p)
-                    .ok()
-                    .and_then(|t| from_json(&t).ok())
-                    .and_then(|(name, _)| name);
+                let stored = fs::read_to_string(&p).ok().and_then(|t| stored_name(&t));
                 names.push(stored.unwrap_or_else(|| stem.to_string()));
             }
         }
@@ -643,35 +673,156 @@ mod tests {
         assert_eq!(cfg["~/proj"], vec![e("vim")]);
     }
 
-    /// Malformed members are omitted rather than decoded into partial entries.
     #[test]
-    fn malformed_object_members_drop_without_error() {
-        let (_, cfg) = from_json(
-            r#"{"d": [
-                {"group": "g"},
-                {"cmd": 3},
-                {"cmd": "x", "group": 5},
-                {"cmd": "y", "name": 5},
-                42,
-                {"cmd": "bare"},
-                {"cmd": "n", "group": null},
-                {"cmd": "m", "name": null},
-                {"cmd": "ok", "group": "api"},
-                {"cmd": "named", "name": "web"},
-                "plain"
-            ]}"#,
-        )
-        .unwrap();
+    fn rejects_invalid_roots_and_syntax() {
+        for text in ["null", "true", "42", r#""text""#, "[]"] {
+            let err = from_json(text).unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::InvalidData, "{text}");
+            assert_eq!(err.to_string(), "session root: expected an object");
+        }
         assert_eq!(
-            cfg["d"],
-            vec![
-                e("bare"),
-                e("n"),
-                e("m"),
-                ge("ok", "api"),
-                ne("named", "web"),
-                e("plain")
-            ]
+            from_json("{not json").unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+    }
+
+    #[test]
+    fn rejects_non_array_directories_with_escaped_keys() {
+        let dir = "d\"\\\n";
+        for value in ["null", "true", "42", r#""command""#, "{}"] {
+            let mut body = jzon::JsonValue::new_object();
+            body.insert(dir, jzon::parse(value).unwrap()).unwrap();
+            for recipe in [body.clone(), jzon::object! { "dirs": body }] {
+                let err = from_json(&recipe.dump()).unwrap_err();
+                assert_eq!(err.kind(), io::ErrorKind::InvalidData, "{recipe}");
+                assert_eq!(
+                    err.to_string(),
+                    format!("directory {dir:?}: expected an array")
+                );
+            }
+        }
+        for value in ["null", "true", "42", r#""command""#] {
+            let err = from_json(&format!(r#"{{"dirs": {value}}}"#)).unwrap_err();
+            assert_eq!(err.to_string(), "directory \"dirs\": expected an array");
+        }
+    }
+
+    /// One invalid entry rejects the recipe, including preceding valid commands.
+    #[test]
+    fn rejects_malformed_entries_with_directory_position_and_field() {
+        let mut cases = Vec::new();
+        for value in ["null", "true", "42", "[]"] {
+            cases.push((
+                value.to_string(),
+                "expected a command string or an object".to_string(),
+            ));
+        }
+        cases.push(("{}".into(), "field \"cmd\": expected a string".into()));
+        for field in ["cmd", "group", "name"] {
+            for value in ["null", "true", "42", "[]", "{}"] {
+                if field != "cmd" && value == "null" {
+                    continue;
+                }
+                let mut entry = jzon::object! { "cmd": "secret-command" };
+                entry[field] = jzon::parse(value).unwrap();
+                let expected = if field == "cmd" {
+                    "a string"
+                } else {
+                    "a string or null"
+                };
+                cases.push((
+                    entry.dump(),
+                    format!("field {field:?}: expected {expected}"),
+                ));
+            }
+        }
+        for (entry, expected) in cases {
+            let body = format!(r#"{{"d": ["valid-command", {entry}]}}"#);
+            for text in [body.clone(), format!(r#"{{"dirs": {body}}}"#)] {
+                let err = from_json(&text).unwrap_err();
+                assert_eq!(err.kind(), io::ErrorKind::InvalidData, "{text}");
+                let separator = if expected.starts_with("field") {
+                    ", "
+                } else {
+                    ": "
+                };
+                assert_eq!(
+                    err.to_string(),
+                    format!("directory \"d\", entry 2{separator}{expected}")
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn rejects_invalid_wrapper_names_and_explicit_null_versions() {
+        for value in ["true", "42", "[]", "{}"] {
+            let err = from_json(&format!(r#"{{"name": {value}, "dirs": {{}}}}"#)).unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+            assert_eq!(
+                err.to_string(),
+                "session field \"name\": expected a string or null"
+            );
+        }
+        for value in ["null", "-1", "1.5", "true", "[]", "{}"] {
+            for body in [r#""dirs": {}"#, r#""d": []"#] {
+                let err = from_json(&format!(r#"{{"version": {value}, {body}}}"#)).unwrap_err();
+                assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+                assert!(
+                    err.to_string().contains(&format!("version {value}")),
+                    "{err}"
+                );
+                assert!(err.to_string().contains("supports 1"), "{err}");
+            }
+        }
+    }
+
+    #[test]
+    fn accepts_empty_recipes_and_dirs_named_directory() {
+        for text in [
+            "{}",
+            r#"{"version": 1}"#,
+            r#"{"dirs": {}}"#,
+            r#"{"name": null, "dirs": {}}"#,
+        ] {
+            assert_eq!(from_json(text).unwrap(), (None, SessionConfig::new()));
+        }
+        let (_, cfg) = from_json(r#"{"dirs": [], "name": [""], "": []}"#).unwrap();
+        assert_eq!(
+            cfg,
+            SessionConfig::from([
+                ("dirs".into(), vec![]),
+                ("name".into(), vec![e("")]),
+                ("".into(), vec![]),
+            ])
+        );
+    }
+
+    #[test]
+    fn preserves_authored_strings_nullable_labels_and_unknown_fields() {
+        let body = r#"{"d": ["", {"cmd": "bare"}, {"cmd": "n", "group": null},
+            {"cmd": "m", "name": null}, {"cmd": "", "group": "", "name": ""},
+            {"cmd": "  echo x\n", "group": "  api  ", "name": "\tweb\t", "extra": false}]}"#;
+        for text in [
+            body.to_string(),
+            format!(r#"{{"name": "", "dirs": {body}, "extra": false}}"#),
+        ] {
+            let (_, cfg) = from_json(&text).unwrap();
+            assert_eq!(
+                cfg["d"],
+                vec![
+                    e(""),
+                    e("bare"),
+                    e("n"),
+                    e("m"),
+                    gne("", "", ""),
+                    gne("  echo x\n", "  api  ", "\tweb\t"),
+                ]
+            );
+        }
+        assert_eq!(
+            from_json(r#"{"name": "", "dirs": {}}"#).unwrap().0,
+            Some("".into())
         );
     }
 
@@ -778,6 +929,45 @@ mod tests {
         assert!(err.to_string().contains("\"a.b\""), "{err}");
         assert!(err.to_string().contains("\"a/b\""), "{err}");
         assert_eq!(load_in(&dir, "a/b").unwrap(), first);
+    }
+
+    /// Invalid bodies and future versions retain their stored identity.
+    #[test]
+    fn unloadable_wrappers_keep_picker_names_and_collision_protection() {
+        let dir = temp("session_invalid_identity");
+        let file = dir.join("a_b.json");
+        for text in [
+            r#"{"name": "a/b", "dirs": {"d": ["valid", {"cmd": false}]}}"#,
+            r#"{"name": "a/b", "dirs": {"d": null}}"#,
+            r#"{"version": 2, "name": "a/b", "dirs": {}}"#,
+        ] {
+            fs::write(&file, text).unwrap();
+            assert!(load_in(&dir, "a/b").is_err());
+            assert_eq!(list_in(&dir), ["a/b"]);
+            let err = save_in(&dir, "a.b", &SessionConfig::new()).unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
+            assert_eq!(fs::read(&file).unwrap(), text.as_bytes());
+            save_in(&dir, "a/b", &SessionConfig::new()).unwrap();
+            assert!(load_in(&dir, "a/b").unwrap().is_empty());
+        }
+    }
+
+    #[test]
+    fn corrupt_and_nameless_recipes_keep_filename_fallback_and_allow_overwrite() {
+        let dir = temp("session_nameless_identity");
+        for text in [
+            "{not json",
+            "null",
+            r#"{"dirs": {}}"#,
+            r#"{"name": null, "dirs": {}}"#,
+            r#"{"name": false, "dirs": {}}"#,
+            r#"{"name": ["cmd"], "dirs": []}"#,
+        ] {
+            fs::write(dir.join("mine.json"), text).unwrap();
+            assert_eq!(list_in(&dir), ["mine"]);
+            save_in(&dir, "mine", &SessionConfig::new()).unwrap();
+            assert!(load_in(&dir, "mine").unwrap().is_empty());
+        }
     }
 
     /// Flat-schema files load and list by filename stem.
@@ -1094,6 +1284,42 @@ mod tests {
         assert!(
             entries.iter().all(|en| en.age_secs < 3600),
             "just-written files must read near-zero ages: {entries:?}"
+        );
+    }
+
+    #[test]
+    fn recovery_listing_skips_invalid_shapes_and_retains_empty_recipes() {
+        let rec = temp("session_recovery_shapes");
+        for (index, text) in [
+            "null",
+            "[]",
+            r#"{"d": null}"#,
+            r#"{"d": ["valid", 42]}"#,
+            r#"{"dirs": {"d": [{"cmd": "x", "name": false}]}}"#,
+            r#"{"version": null, "dirs": {}}"#,
+        ]
+        .iter()
+        .enumerate()
+        {
+            fs::write(rec.join(format!("invalid-{index}.json")), text).unwrap();
+        }
+        fs::write(rec.join("empty-flat.json"), "{}").unwrap();
+        fs::write(
+            rec.join("empty-wrapped.json"),
+            r#"{"name": "empty", "dirs": {"d": []}}"#,
+        )
+        .unwrap();
+        let entries = list_recovery_in(&rec);
+        let summary: Vec<_> = entries
+            .iter()
+            .map(|e| (e.stem.as_str(), e.label.as_str(), e.tasks))
+            .collect();
+        assert_eq!(
+            summary,
+            [
+                ("empty-wrapped", "empty", 0),
+                ("empty-flat", "empty-flat", 0)
+            ]
         );
     }
 

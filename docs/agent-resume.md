@@ -68,7 +68,7 @@ Codex does not let the caller choose an ID at launch. Both accepted forms instea
 
 After each turn, the notifier writes the `agent-turn-complete` JSON argument to `FLEETCOM_CAPTURE_FILE`; the harness reads `thread-id`. This captures in-TUI session changes after the resumed conversation completes a turn.
 
-Replacing a configured notifier would change user behavior. When the effective Codex configuration contains a one-line `notify` array of non-empty basic strings, the capture script executes that notifier after writing the capture file. Its argv is carried in `FLEETCOM_NOTIFY_CHAIN`, joined by newlines, and the notification payload is appended. An empty, multiline, ambiguous, or unsupported `notify` value disables the injected override so the configured route remains unchanged. The line-based configuration reader checks `config.toml` and the profile selected by its first `profile = ...` assignment; the profile's notify assignment takes precedence.
+Replacing a configured notifier would change user behavior. `fleetcom` reads bare top-level keys in `$CODEX_HOME/config.toml` until the first table header. A one-line `notify` array of non-empty basic strings is chained after the capture write. Its argv is carried in `FLEETCOM_NOTIFY_CHAIN`, joined by newlines, and the notification payload is appended. An absent setting or empty array lets capture run alone; empty arguments, newlines, and NUL cannot be transported and disable injection.
 
 ### `grok`
 

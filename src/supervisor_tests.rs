@@ -1678,6 +1678,55 @@ fn load_surfaces_parse_errors_instead_of_absence() {
     );
 }
 
+/// Both load paths validate every entry before admitting any recipe commands.
+#[test]
+fn malformed_session_and_recovery_loads_preserve_tasks_and_recipe_bytes() {
+    let dir = scratch("sess_schema_err");
+    let config = dir.join("config");
+    let sessions = config.join("sessions");
+    let recovery = sessions.join("recovery");
+    std::fs::create_dir_all(&recovery).unwrap();
+    let text = r#"{"dirs": {".": ["sleep 32", {"cmd": "sleep 33", "name": false}]}}"#;
+    let mut s = sup_ctx(config_ctx(&config, dir.to_path_buf(), &[]));
+    spawn(&mut s, "sleep 31", dir.to_path_buf());
+    let existing_id = first_id(&mut s);
+    s.drain();
+
+    for (file, command, subject) in [
+        (
+            sessions.join("broken.json"),
+            Command::LoadSession {
+                name: "broken".into(),
+            },
+            "session 'broken'",
+        ),
+        (
+            recovery.join("20260714-093015-11.json"),
+            Command::LoadRecovery {
+                stem: "20260714-093015-11".into(),
+            },
+            "recovery snapshot '20260714-093015-11'",
+        ),
+    ] {
+        std::fs::write(&file, text).unwrap();
+        s.apply(command);
+        assert_eq!(s.tasks.len(), 1, "{subject} must add no tasks");
+        assert_eq!(s.tasks[0].id, existing_id);
+        assert_eq!(s.tasks[0].command, "sleep 31");
+        let expected = format!(
+            "{subject} failed to load: directory \".\", entry 2, field \"name\": expected a string or null"
+        );
+        let events = s.drain();
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, Event::Status(message) if message == &expected)),
+            "{events:?}"
+        );
+        assert_eq!(std::fs::read(&file).unwrap(), text.as_bytes());
+    }
+}
+
 /// Missing recipes report "not found".
 #[test]
 fn load_missing_session_reads_as_not_found() {
