@@ -1,8 +1,8 @@
 //! Length-prefixed, kind-tagged framing over a byte stream: `[u32 len][u8 kind]
-//! [payload]`, `len` counting the payload only. `read_frame` uses `read_exact`,
-//! so a frame split across partial socket reads reassembles correctly. `kind`
-//! separates jzon control frames from the raw-bytes screen frames, so
-//! high-frequency pane data pays no base64/number-array tax.
+//! [payload]`, with only the payload counted in `len`. Read complete frames with
+//! `read_exact`, including across partial socket reads. Use `kind` to distinguish
+//! jzon control frames from raw-byte screen frames, avoiding base64 or number-array
+//! encoding for high-frequency pane data.
 
 use std::{
     io::{self, Read, Write},
@@ -18,9 +18,9 @@ pub const KIND_SCREEN: u8 = 2;
 /// context. Handshakes are not command frames.
 pub const KIND_HELLO: u8 = 3;
 
-/// Maximum frame payload size accepted from readers and emitted by writers.
-/// This bounds allocations from untrusted length prefixes and lets producers
-/// verify that their maximum encoded payload fits.
+/// Maximum frame payload size accepted from readers and emitted by writers. Bound
+/// allocations from untrusted length prefixes and check maximum encoded payloads
+/// against this limit.
 pub const MAX_FRAME: u32 = 64 * 1024 * 1024;
 
 /// Maximum time one frame write to a socket peer may block. A peer that
@@ -29,10 +29,9 @@ pub const MAX_FRAME: u32 = 64 * 1024 * 1024;
 /// both cap here and treat expiry as a dead connection.
 pub const SEND_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Write one frame and flush. Flushing per frame keeps latency low: the peer sees
-/// each command/event immediately. A firehose can't drown the socket because the
-/// core loop already coalesces screen emission to one frame per `FRAME_MIN` (see
-/// `core::run_loop`). The flush here is per *emitted* frame, not per output byte.
+/// Write one frame and flush immediately for command/event delivery. Screen emission is
+/// already coalesced to one frame per `FRAME_MIN` in `core::run_loop`; flush per
+/// emitted frame, not per output byte.
 pub fn write_frame(w: &mut impl Write, kind: u8, payload: &[u8]) -> io::Result<()> {
     // Reject an oversized payload before writing any part of the frame.
     let len = u32::try_from(payload.len())
@@ -93,8 +92,7 @@ mod tests {
         assert!(read_frame(&mut cur).is_err());
     }
 
-    /// A frame arriving in two reads (header, then payload) still reassembles.
-    /// `read_exact` is what makes partial socket reads safe.
+    /// Reassemble a frame split across header and payload reads through `read_exact`.
     #[test]
     fn split_read_reassembles() {
         let mut whole: Vec<u8> = Vec::new();
@@ -118,7 +116,7 @@ mod tests {
         );
     }
 
-    /// An oversized payload fails without writing a partial frame.
+    /// Reject an oversized payload before writing a partial frame.
     #[test]
     fn oversized_write_fails_locally() {
         let payload = vec![0u8; MAX_FRAME as usize + 1];

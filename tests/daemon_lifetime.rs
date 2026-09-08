@@ -1,7 +1,7 @@
-//! The fleet's lifetime is bounded by the daemon's: SIGKILLing the daemon
-//! closes every PTY master, and the resulting hangup SIGHUPs each task's
-//! foreground group. Ordinary tasks die; only HUP-immune tasks survive, unowned.
-//! These tests pin both halves so the docs stay honest.
+//! The fleet's lifetime is bounded by the daemon's: SIGKILLing the daemon closes every
+//! PTY master, and the resulting hangup SIGHUPs each task's foreground group. Ordinary
+//! tasks die; only HUP-immune tasks survive, unowned. Verify both cases against the
+//! documented lifetime guarantees.
 
 mod common;
 

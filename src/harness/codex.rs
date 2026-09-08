@@ -32,11 +32,11 @@ impl Harness for Codex {
         home: Option<&Path>,
     ) -> SpawnPlan {
         let chain = match config_notify_route(home) {
-            // An explicit empty value prevents an inherited chain from
-            // reaching the injected script.
+            // Set an explicit empty value to exclude an inherited chain from the
+            // injected script.
             NotifyRoute::Vacant => String::new(),
-            // A routed notifier rides along: the injected script execs this
-            // argv, payload appended, after the capture write.
+            // Chain the configured notifier after the capture write: exec this argv
+            // with the payload appended from the injected script.
             NotifyRoute::Chain(argv) => argv.join("\n"),
             // Skip injection when the configured route cannot be encoded.
             NotifyRoute::Opaque => return SpawnPlan::default(),
@@ -302,7 +302,7 @@ mod tests {
                         CAPTURE_ENV.into(),
                         PathBuf::from("/tmp/cap/session.json").into_os_string()
                     ),
-                    // The explicit empty value overrides any inherited chain.
+                    // Override any inherited chain with an explicit empty value.
                     (NOTIFY_CHAIN_ENV.into(), "".into()),
                 ],
                 "{cmd}"
@@ -310,9 +310,9 @@ mod tests {
         }
     }
 
-    /// A representable `notify` assignment passes through
-    /// [`NOTIFY_CHAIN_ENV`]. Comments, longer keys, and missing files do not
-    /// define a route, so capture runs alone.
+    /// Pass a representable `notify` assignment through [`NOTIFY_CHAIN_ENV`]. Run
+    /// capture alone for comments, longer keys, and missing files: no route is
+    /// configured.
     #[test]
     fn instrument_chains_a_config_toml_notify() {
         let home = temp("codex_cfg_notify");
@@ -341,7 +341,7 @@ mod tests {
             let plan = Codex.instrument(&inv, &paths(), Some(&home));
             assert!(!plan.args_suffix.is_empty(), "{active:?}");
             assert_eq!(chained(&plan), Some("/my/thing".into()), "{active:?}");
-            // The capture env still rides the chain case.
+            // Include the capture environment when chaining a notifier.
             assert!(plan.env.iter().any(|(k, _)| k == CAPTURE_ENV), "{active:?}");
         }
         for inert in [
@@ -357,7 +357,7 @@ mod tests {
         }
     }
 
-    /// The newline-joined chain preserves spaces within argv elements.
+    /// Preserve spaces within argv elements in the newline-joined chain.
     #[test]
     fn instrument_chains_the_vendor_desktop_entry() {
         let home = temp("codex_vendor_notify");
@@ -379,7 +379,7 @@ mod tests {
         )));
     }
 
-    /// An unrepresentable route disables capture injection.
+    /// Disable capture injection for an unrepresentable route.
     #[test]
     fn instrument_skips_an_unrepresentable_config_notify() {
         let home = temp("codex_opaque_notify");

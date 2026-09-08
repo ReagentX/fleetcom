@@ -105,7 +105,7 @@ fn render_dashboard(out: &mut impl Write, app: &App) -> io::Result<()> {
 
     queue!(out, Hide, MoveTo(0, 0))?;
 
-    // Lifecycle is pre-computed by the core, so the header just tallies it.
+    // Tally the lifecycle values pre-computed by the core.
     let (mut running, mut idle, mut done) = (0u32, 0u32, 0u32);
     for v in &app.views {
         match v.lifecycle {
@@ -201,7 +201,7 @@ fn render_dashboard(out: &mut impl Write, app: &App) -> io::Result<()> {
         y += 1;
     }
 
-    // Input modes show a prompt; otherwise show a notice, status, or key hint.
+    // Show a prompt in input modes; otherwise show a notice, status, or key hint.
     let cmd_y = rows.saturating_sub(2);
     let cmd = cmdline(app);
     match &cmd {
@@ -271,8 +271,8 @@ fn prompt_line(dir: Option<&str>, group: Option<&str>, input: &str) -> String {
     line
 }
 
-/// Header intensity for one output run. Each run emits Bold or Dim, followed
-/// by a reset, so the attributes never compete.
+/// Header intensity for one output run. Emit Bold or Dim per run, followed by a reset
+/// to avoid stacking attributes.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Intensity {
     Bold,
@@ -312,8 +312,8 @@ fn attached_title(v: &TaskView) -> String {
     }
 }
 
-/// Age shown for a task: time since exit when finished, last output when
-/// idle, or launch otherwise. Missing edge timestamps fall back to launch.
+/// Age shown for a task: time since exit when finished, last output when idle, or
+/// launch otherwise. Use launch time when the edge timestamp is missing.
 fn row_age(v: &TaskView) -> Duration {
     let edge = match v.lifecycle {
         Lifecycle::Ok | Lifecycle::Failed => v.finished_ago,
@@ -396,7 +396,7 @@ struct Overlay<'a> {
     bh: usize,
     /// Top-border label, truncated to fit.
     label: &'a str,
-    /// Body lines; missing rows render blank.
+    /// Body lines; blank for missing rows.
     body: &'a [String],
     /// Footer written over the bottom border.
     footer: &'a str,
@@ -404,7 +404,7 @@ struct Overlay<'a> {
 
 /// Paint a centered overlay, then overwrite the bottom border with its footer.
 fn render_overlay(out: &mut impl Write, o: &Overlay) -> io::Result<()> {
-    // Saturating: a box larger than the terminal pins to the origin.
+    // Saturate coordinates at the origin for a box larger than the terminal.
     let x0 = o.cols.saturating_sub(o.bw) / 2;
     let y0 = o.rows.saturating_sub(o.bh) / 2;
     let (inner_w, inner_h) = (o.bw.saturating_sub(2), o.bh.saturating_sub(2));
@@ -453,7 +453,7 @@ fn render_peek(out: &mut impl Write, app: &App) -> io::Result<()> {
         .map_or((&[], false), |s| (&s.lines, s.alt_screen));
     let tail = peek_window(lines, bh.saturating_sub(2), alt_screen);
 
-    // The peek footer identifies the preview source and in-process matcher.
+    // Include the preview source and in-process matcher in the peek footer.
     let footer = format!(
         " space/esc close · enter attach · preview: {} ",
         preview_provenance(&v.preview)
@@ -516,8 +516,8 @@ impl Control {
     }
 }
 
-/// Controls-overlay entries. Each group's first half fills the left column;
-/// the second half fills the right.
+/// Controls-overlay entries. Place the first half of each group in the left column and
+/// the second half in the right.
 const CONTROLS: [Control; 19] = [
     Control::new("↑↓ / kj", "move selection", "Navigate"),
     Control::new("Tab ⇧Tab", "jump section", "Navigate"),
@@ -540,7 +540,7 @@ const CONTROLS: [Control; 19] = [
     Control::new("Ctrl-\\", "background", "Attached"),
 ];
 
-/// Label `q` as quit in foreground mode because it stops in-process tasks.
+/// Label `q` as quit in foreground mode: in-process tasks are stopped on exit.
 fn control_desc(c: &Control, daemon_backed: bool) -> &'static str {
     match c.key {
         "q" if !daemon_backed => "quit",
@@ -603,8 +603,8 @@ fn render_controls(out: &mut impl Write, app: &App) -> io::Result<()> {
             .collect()
     };
 
-    // Reserve four rows for dashboard context when space permits. A three-row
-    // minimum preserves both borders and one entry row.
+    // Reserve four rows for dashboard context when space permits. Reserve at least
+    // three rows for both borders and one entry row.
     let avail = rows.saturating_sub(4).max(3);
     let body_h = avail - 2;
     let mut hidden = 0;
@@ -624,8 +624,8 @@ fn render_controls(out: &mut impl Write, app: &App) -> io::Result<()> {
         two_col(&CONTROLS[..shown])
     };
 
-    // Add two borders and one trailing padding column. The four-column minimum
-    // keeps the border valid; narrow terminals clip rows instead of reflowing.
+    // Add two borders and one trailing padding column. Reserve at least four columns
+    // for a valid border; clip rows at narrow widths instead of reflowing.
     let content_w = body.iter().map(|s| s.width()).max().unwrap_or(0);
     let bw = (content_w + 3).min(cols.max(4));
     let bh = body.len() + 2;
@@ -650,22 +650,22 @@ fn render_controls(out: &mut impl Write, app: &App) -> io::Result<()> {
     )
 }
 
-/// The varying content of a bottom-panel picker; `render_panel` owns the
-/// shared skeleton.
+/// The varying content of a bottom-panel picker; rendered within the shared skeleton in
+/// `render_panel`.
 struct Panel<'a> {
     /// Header line, painted reverse-video as the focused field.
     header: String,
-    /// Preformatted row labels; the skeleton indents and `▸`-marks them.
+    /// Preformatted row labels; indented and marked with `▸` in the skeleton.
     labels: &'a [String],
     /// Index of the highlighted row.
     sel: usize,
     /// Row cap before the list scrolls.
     max_rows: usize,
-    /// Footer hint; the skeleton appends the `x/y` position when clipped.
+    /// Footer hint; followed by the `x/y` position when clipped.
     hint: String,
     /// Dim placeholder shown instead of rows when `labels` is empty.
     empty: Option<&'a str>,
-    /// Cursor column on the header line; `None` hides the cursor.
+    /// Cursor column on the header line; hidden for `None`.
     cursor: Option<u16>,
 }
 
@@ -733,7 +733,7 @@ fn render_pickdir(out: &mut impl Write, app: &App) -> io::Result<()> {
             format!("{}{sep}", c.label)
         })
         .collect();
-    // Hint reflects what Enter does on the highlighted row.
+    // Describe the action on Enter for the highlighted row.
     let action = match app.dir_candidates.get(app.dir_sel).map(|c| c.kind) {
         Some(DirKind::Use) => "enter run here",
         Some(DirKind::Jump) => "enter run here · tab browse",
@@ -757,9 +757,8 @@ fn render_pickdir(out: &mut impl Write, app: &App) -> io::Result<()> {
     )
 }
 
-/// The `g` picker: a bottom panel with the typed name and matching groups,
-/// `group_sel` highlighted. Row 0 always provides Unassigned, so the list
-/// cannot be empty.
+/// The `g` picker: a bottom panel with the typed name and matching groups, `group_sel`
+/// highlighted. Unassigned is always present at row 0, so the list cannot be empty.
 fn render_pickgroup(out: &mut impl Write, app: &App) -> io::Result<()> {
     let labels: Vec<String> = app
         .group_candidates
@@ -979,13 +978,13 @@ fn selection_overlay<'a>(sel: Option<&Selection>, lines: &'a [String]) -> Vec<(u
         .collect()
 }
 
-/// Build the attached or scrollback bar. An active notice replaces the key
-/// hints in either view.
+/// Build the attached or scrollback bar. Replace key hints with an active notice in
+/// either view.
 fn attached_bar(title: &str, scrollback: usize, notice: Option<&str>) -> String {
     match (scrollback, notice) {
         (0, Some(n)) => format!("  [attached] {title}    {n}"),
         (0, None) => format!("  [attached] {title}    Ctrl-\\ background"),
-        // Active notices replace the scrollback key hints until they expire.
+        // Display an active notice in place of scrollback key hints until expiry.
         (n, Some(msg)) => format!("  [scroll ↑{n}] {title}    {msg}"),
         (n, None) => {
             format!("  [scroll ↑{n}] {title}    Esc live · PgUp/PgDn move · Ctrl-\\ background")
@@ -1055,8 +1054,8 @@ mod tests {
 
     #[test]
     fn peek_window_on_a_full_grid_is_the_bottom_slice() {
-        // A non-blank last row makes the content window the grid bottom:
-        // the scrolled-output case keeps its old crop exactly.
+        // With a non-blank last row, crop at the grid bottom, preserving the
+        // scrolled-output window.
         let g: Vec<String> = (0..39).map(|i| format!("row{i}")).collect();
         assert_eq!(peek_window(&g, 14, false), &g[25..]);
     }
@@ -1079,8 +1078,8 @@ mod tests {
 
     #[test]
     fn peek_window_pins_the_alternate_screen_to_the_grid_bottom() {
-        // A canvas with a blank tail keeps the bottom crop: a partial repaint
-        // must not shift the window.
+        // Keep the bottom crop on a canvas with a blank tail: do not shift the window
+        // after a partial repaint.
         let g = grid(&["dialog"], 39);
         assert_eq!(peek_window(&g, 14, true), &g[25..]);
         assert!(peek_window(&g, 14, true).iter().all(String::is_empty));
@@ -1112,7 +1111,7 @@ mod tests {
         }
     }
 
-    /// Recovery rows format age, task count, and label.
+    /// Format recovery rows with age, task count, and label.
     #[test]
     fn recovery_row_shapes() {
         assert_eq!(
@@ -1129,7 +1128,7 @@ mod tests {
         );
     }
 
-    /// Wide labels clip to the panel's exact column width.
+    /// Clip wide labels to the panel's exact column width.
     #[test]
     fn recovery_row_clips_column_exact_for_wide_labels() {
         let long = "日本語のラベルがここに延々と続いています";
@@ -1141,7 +1140,7 @@ mod tests {
         }
     }
 
-    /// The saved-page hint shows the recovery page only when it exists.
+    /// Include recovery in the saved-page hint only when snapshots exist.
     #[test]
     fn saved_page_hint_shows_the_count_only_when_nonzero() {
         assert_eq!(saved_page_hint(0), "↑↓ pick · enter load · esc");
@@ -1202,7 +1201,7 @@ mod tests {
         }
     }
 
-    /// The time column uses exit, quiet, or launch age according to task state.
+    /// Use exit, quiet, or launch age in the time column according to task state.
     #[test]
     fn task_row_time_column_follows_lifecycle() {
         let quiet = Some(Duration::from_secs(4 * 60)); // renders "4m"
@@ -1237,7 +1236,7 @@ mod tests {
         }
     }
 
-    /// The dashboard row titles a task by its custom name when one is set.
+    /// Title a dashboard row with the task's custom name when set.
     #[test]
     fn task_row_prefers_the_custom_name() {
         let row = task_row(&view(None), 80);
@@ -1320,7 +1319,7 @@ mod tests {
         assert_eq!(labels.len(), distinct, "a group must be one contiguous run");
     }
 
-    /// The grouped form adds one heading row per group to the flat entry rows.
+    /// Add one heading row per group to the flat entry rows in grouped form.
     #[test]
     fn control_forms_shrink_before_they_clip() {
         assert_eq!(flat_rows(), CONTROLS.len().div_ceil(2));
@@ -1339,7 +1338,7 @@ mod tests {
         assert_eq!(b.width(), 40, "{b:?}");
     }
 
-    /// The peek footer's provenance label composes source, rule, and frozen.
+    /// Compose the peek footer's provenance label from source, rule, and frozen state.
     #[test]
     fn preview_provenance_label_shapes() {
         let mut p = Preview::floor(String::new());
@@ -1353,7 +1352,7 @@ mod tests {
         assert_eq!(preview_provenance(&p), "anchor/claude-status");
     }
 
-    /// The attached bar shows both the name and the command for a named task.
+    /// Show both name and command in the attached bar for a named task.
     #[test]
     fn attached_title_shows_name_and_command() {
         assert_eq!(attached_title(&view(None)), "cargo test");
@@ -1363,7 +1362,7 @@ mod tests {
         );
     }
 
-    /// Both bars swap their key hints for an active notice.
+    /// Replace key hints with an active notice in both bars.
     #[test]
     fn attached_bar_swaps_the_hint_for_an_active_notice() {
         assert_eq!(
@@ -1384,7 +1383,7 @@ mod tests {
         );
     }
 
-    /// The dashboard command row prefers an active notice over status text.
+    /// Prefer an active notice over status text in the dashboard command row.
     #[test]
     fn transient_line_prefers_the_notice_over_the_status() {
         assert_eq!(

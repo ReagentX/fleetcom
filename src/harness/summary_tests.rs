@@ -93,8 +93,8 @@ fn select_covers_every_registered_shape() {
 /// adapter fires that CLI's rule on that CLI's screen shape.
 #[test]
 fn select_routes_to_the_matching_adapter() {
-    // The literal count keeps this hand-written routing coverage aligned with
-    // the registered adapters.
+    // Assert the literal count to detect missing routing coverage for the registered
+    // adapters.
     assert_eq!(
         crate::harness::AGENTS.len(),
         4,
@@ -132,8 +132,8 @@ fn select_routes_to_the_matching_adapter() {
     );
 }
 
-/// The spinner phrase survives, the elapsed/token parenthetical drops,
-/// and the concrete-action row wins over the spinner when present.
+/// Preserve the spinner phrase, omit the elapsed/token parenthetical, and prefer the
+/// concrete-action row over the spinner when present.
 #[test]
 fn claude_spinner_and_action_row() {
     // Rows below the input box are outside the status scan.
@@ -173,8 +173,8 @@ fn claude_spinner_and_action_row() {
     );
 }
 
-/// Task-derived spinner phrases may contain spaces, parentheses, and
-/// digits; extraction keeps everything through the first ellipsis.
+/// Task-derived spinner phrases may contain spaces, parentheses, and digits; keep
+/// everything through the first ellipsis during extraction.
 #[test]
 fn claude_spinner_extracts_task_derived_phrases() {
     let s = claude_screen(&[
@@ -230,8 +230,8 @@ fn claude_parenthetical_keeps_slow_segments_and_drops_tickers() {
     );
 }
 
-/// The action row wins the head while the spinner row's parenthetical
-/// still contributes the semantic tail.
+/// Use the action row as the head and append the semantic tail from the spinner row's
+/// parenthetical.
 #[test]
 fn claude_action_row_carries_the_spinner_rows_semantic_tail() {
     let screen = claude_screen(&[
@@ -1107,9 +1107,9 @@ fn grok_status_shapes() {
     assert_eq!(GrokSummary.model_label(&plain), None);
 }
 
-/// Still-running chrome: `◎` plus a count phrase or `waiting`. The
-/// interrupt hint drops; body-shaped lookalikes and pre-0.2.109 wording
-/// do not match. A closer Worked-for row wins: no upward scan.
+/// Still-running chrome: `◎` plus a count phrase or `waiting`. Drop the interrupt hint;
+/// body-shaped lookalikes and pre-0.2.109 wording do not match. Prefer a closer
+/// Worked-for row: no upward scan.
 #[test]
 fn grok_still_running_shapes() {
     let probe = |status: &str| GrokSummary.live_preview(&grok_screen(&[status, ""]));
@@ -1151,7 +1151,7 @@ fn grok_still_running_shapes() {
         assert_eq!(probe(row), None, "{row:?}");
     }
 
-    // The probe is a single row: Worked-for closer to the box wins.
+    // The probe is a single row: prefer Worked-for closer to the box.
     let rows = grok_screen(&[
         "    ◎ 1 subagent still running",
         "",
@@ -1197,8 +1197,8 @@ fn omp_selector_row(approve: &str, head: &str) -> Vec<String> {
     ])
 }
 
-/// The intent phrase survives verbatim across both anchoring bracket themes,
-/// the CLI's own truncating ellipsis included.
+/// Preserve the intent phrase verbatim across both anchoring bracket themes, the CLI's
+/// own truncating ellipsis included.
 #[test]
 fn omp_status_row_extracts_the_intent_phrase() {
     let probe = |row: &str| OmpSummary.live_preview(&omp_screen(&[row, ""]));
@@ -1317,8 +1317,8 @@ fn omp_approval_accepts_every_cursor_preset() {
             "{cursor:?}"
         );
     }
-    // The selected row must contain `Approve` exactly after the cursor: `>`
-    // also opens a quoted line and is trusted only in this exact shape.
+    // The selected row must contain `Approve` exactly after the cursor: `>` is also
+    // used for quoted lines; accept only this exact shape.
     for approve in [" > Approve now", " >Approve", " > approve", " * Approve"] {
         assert_eq!(
             OmpSummary.live_preview(&omp_selector_row(approve, " Allow tool: bash")),
@@ -1599,7 +1599,7 @@ fn corpus_omp_idle_titled_renders_the_title_tier() {
 /// codex fixtures hold `• Ran` in scrollback behind a finished turn.
 #[test]
 fn corpus_body_shaped_text_never_extracts() {
-    // Menu in the body, spinner live: the pinned spinner wins.
+    // Menu in the body, spinner live: prefer the pinned spinner.
     let got = corpus(
         include_bytes!("../../tests/corpus/preview_claude_body_menu.bin"),
         &ClaudeSummary,
@@ -1645,7 +1645,7 @@ fn corpus_body_shaped_text_never_extracts() {
     );
     assert_eq!(got, floor("gpt-5.6-sol high · 0 in · 0 out"));
 
-    // `• Ran` visible mid-turn with `• Working` at the pin: live wins.
+    // `• Ran` visible mid-turn with `• Working` at the pin: prefer live status.
     let got = corpus(
         include_bytes!("../../tests/corpus/preview_codex_working_over_ran.bin"),
         &CodexSummary,
@@ -1662,9 +1662,9 @@ fn corpus_body_shaped_text_never_extracts() {
     );
     assert_eq!(got, marker());
 
-    // omp: a status-shaped row quoted in the transcript with prose between
-    // it and the idle input box. The pin is the row directly above the box,
-    // not a substring search, so the quote never anchors and the floor wins.
+    // omp: a status-shaped row quoted in the transcript with prose between it and the
+    // idle input box. The pin is the row directly above the box, not a substring
+    // search, so exclude the quote from anchors and use the floor.
     let got = corpus(
         include_bytes!("../../tests/corpus/preview_omp_body_hint.bin"),
         &OmpSummary,
@@ -1673,9 +1673,8 @@ fn corpus_body_shaped_text_never_extracts() {
     assert_eq!(got, floor(&format!("╰─{}─╯", " ".repeat(116))));
 }
 
-/// 80-column truncation: the CLIs cut their status rows at a word
-/// boundary with their own ellipsis; head matching still extracts and
-/// the kept suffix keeps that ellipsis verbatim.
+/// 80-column truncation: status rows are cut at a word boundary with the CLI's own
+/// ellipsis. Extract by head match and preserve that ellipsis in the suffix.
 #[test]
 fn corpus_truncated_rows_still_anchor() {
     let got = corpus(
@@ -1683,7 +1682,7 @@ fn corpus_truncated_rows_still_anchor() {
         &ClaudeSummary,
         80,
     );
-    // No welcome box on the narrow screen: the label drops with it.
+    // With no welcome box on the narrow screen, omit the label.
     assert_eq!(got, anchor("Hashing…", "claude:spinner"));
 
     let got = corpus(

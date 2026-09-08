@@ -73,8 +73,8 @@ pub struct Task {
     pub cwd: PathBuf,
     /// Kept for resize (`TIOCSWINSZ`); `try_clone_reader`/`take_writer` borrow it.
     master: Box<dyn MasterPty + Send>,
-    /// Sender for the detached PTY writer worker. `None` after `force_kill`.
-    /// Queuing keeps a blocked PTY write off the core thread.
+    /// Sender for the detached PTY writer worker. `None` after `force_kill`. Queue
+    /// writes to avoid blocking the core thread on PTY I/O.
     input_tx: Option<Sender<Vec<u8>>>,
     /// Bytes admitted to the writer queue but not yet fully written. Two
     /// admitters: the core thread (`queue_write`, client input) and the reader
@@ -205,11 +205,10 @@ fn wait_code(status: &rustix::process::WaitIdStatus) -> i32 {
 }
 
 impl Task {
-    /// Spawn `exec_command` under `$SHELL -c` in a fresh `rows`×`cols` PTY
-    /// whose grid retains `scrollback` history rows. The task keeps `command`
-    /// for the UI and recipes, while only `exec_command` carries
-    /// instrumentation. The child receives exactly `env`; `waker` notifies
-    /// the core when terminal output arrives.
+    /// Spawn `exec_command` under `$SHELL -c` in a fresh `rows`×`cols` PTY with
+    /// `scrollback` history rows. Retain `command` for the UI and recipes; instrument
+    /// only `exec_command`. Pass exactly `env` to the child and notify the core through
+    /// `waker` on terminal output.
     #[allow(clippy::too_many_arguments)] // All arguments define task launch state.
     pub fn spawn(
         id: u64,
@@ -564,7 +563,7 @@ impl Task {
         self.queue_write(bytes.to_vec())
     }
 
-    /// Input returns the viewport to live before the bytes are queued.
+    /// Return the viewport to live before queuing input bytes.
     fn snap_live(&mut self) {
         let mut p = grid(&self.parser);
         if p.scrollback() > 0 {

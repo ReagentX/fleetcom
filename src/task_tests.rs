@@ -80,7 +80,7 @@ fn lifecycle_crosses_idle_threshold_and_resets_on_activity() {
     t.terminate();
 }
 
-/// Repeated output before the quiet threshold keeps a task active.
+/// Keep a task active on repeated output before the quiet threshold.
 #[test]
 fn sub_window_quiet_gaps_never_read_as_idle() {
     let mut t = spawn(7, "sleep 5");
@@ -203,7 +203,7 @@ fn exited_leader_is_collectible_only_after_kill() {
     assert!(t.try_collect());
 }
 
-/// Scrollback clamps at both ends and input returns to live output.
+/// Clamp scrollback at both ends; return to live output on input.
 #[test]
 fn viewport_scrolls_and_snaps_live_on_input() {
     let mut t = spawn(9, "cat");
@@ -228,7 +228,7 @@ fn viewport_scrolls_and_snaps_live_on_input() {
     t.scroll_view(ScrollAction::Live);
     t.scroll_view(ScrollAction::Up(10_000));
     assert_eq!(t.scroll_offset(), top);
-    // Input returns the viewport to live output.
+    // Return the viewport to live output on input.
     t.send_input(b"x").unwrap();
     assert_eq!(t.scroll_offset(), 0);
     t.terminate();
@@ -396,9 +396,9 @@ fn finalize_preview_lands_an_open_sync_frame() {
     assert_eq!((p.text.as_str(), p.frozen), ("test result: ok", true));
 }
 
-/// Primary-screen finalization re-resolves: a final line that lands
-/// after the last resolution tick (here: after the only pre-exit
-/// resolve) still reaches the frozen floor.
+/// Primary-screen finalization re-resolves: a final line written after the last
+/// resolution tick (here: after the only pre-exit resolve) still reaches the frozen
+/// floor.
 #[test]
 fn finalize_preview_freezes_the_final_primary_line() {
     use crate::protocol::PreviewSource;

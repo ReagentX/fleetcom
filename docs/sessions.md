@@ -1,10 +1,10 @@
 # Sessions
 
-A session is a launch recipe, not a process snapshot. It records commands, working directories, and each task's optional group assignment and display name. Loading always starts new processes. Live process continuity belongs to the [daemon](README.md#storage-paths), which keeps tasks running across client disconnects.
+A session is a launch recipe: commands, working directories, and each task's optional group assignment and display name. On load, new processes are always started. To keep live processes running across client disconnects, use the [daemon](README.md#storage-paths).
 
 ## Storage
 
-`fleetcom` stores one JSON file per session. The session directory resolves in this order:
+Each session is stored in one JSON file. The session directory is resolved in this order:
 
 | Condition | Session directory |
 | -- | -- |
@@ -12,13 +12,13 @@ A session is a launch recipe, not a process snapshot. It records commands, worki
 | Linux default | `${XDG_CONFIG_HOME:-~/.config}/fleetcom/sessions` |
 | macOS default | `~/Library/Application Support/fleetcom/sessions` |
 
-The first save creates the directory. This matches the [configuration path resolution](README.md#config-directory-sessions) used by save, list, and load.
+The directory is created on the first save. The same [configuration path resolution](README.md#config-directory-sessions) is used for save, list, and load.
 
-The filename derives from the session name. `fleetcom` trims leading and trailing whitespace, replaces control characters and any of `* " / \ < > : | ? .` with `_`, and limits the sanitized stem to 250 UTF-8 bytes so the `.json` filename fits within 255 bytes. The cap falls on a character boundary. `my/session` becomes `my_session.json`, and `a.b` becomes `a_b.json`. Replacing `.` prevents the session name from supplying another extension.
+The filename is derived from the session name: leading and trailing whitespace is trimmed, control characters and any of `* " / \ < > : | ? .` are replaced with `_`, and the sanitized stem is limited to 250 UTF-8 bytes at a character boundary. With `.json`, the filename is at most 255 bytes. `my/session` becomes `my_session.json`, and `a.b` becomes `a_b.json`. With `.` replaced, no other extension can be specified in the session name.
 
 ## Format
 
-A session file is a JSON object with three fields. `version` is the format version, currently 1. `name` holds the session name as typed, trimmed but not sanitized. `dirs` maps each working directory to an ordered list of entries. An entry with neither a group nor a name is a command string. An entry carrying either is an object with `cmd` plus the optional `group` and `name` fields:
+A session file is a JSON object with three fields. `version` is the format version, currently 1. In `name`, the session name is stored as typed, trimmed but not sanitized. Under `dirs`, each working directory is mapped to an ordered list of entries. An entry with neither a group nor a name is a command string. An entry carrying either is an object with `cmd` plus the optional `group` and `name` fields:
 
 ```json
 {
@@ -36,26 +36,26 @@ A session file is a JSON object with three fields. `version` is the format versi
 }
 ```
 
-- `name` exists because sanitization collapses distinct session names onto one filename: `a/b` and `a.b` both save to `a_b.json`. Saving compares the stored name against the incoming one and refuses a mismatch with an error naming both sessions. The load picker also displays it, so the list shows `a/b`, not `a_b`.
-- Keys under `dirs` are directory paths: each task's working directory. Saves write directories under `$HOME` as `~/...`; other paths stay absolute. On load, `~` expands to `$HOME`, and a relative key resolves against the invocation directory of the client loading the session.
-- Values are ordered lists. A string member is a bare shell command; the object form adds the optional group and display name assigned on load. Order is preserved, and each command runs in its own PTY under that directory.
-- Directories serialize alphabetically. Command order remains stable within each directory.
+- Store `name` to distinguish session names sanitized to the same filename: `a/b` and `a.b` are both saved to `a_b.json`. On save, the stored and incoming names are compared; a mismatch is refused with both names in the error. In the load picker, the stored name is displayed as `a/b`, not `a_b`.
+- Keys under `dirs` are directory paths: each task's working directory. On save, directories under `$HOME` are written as `~/...`; other paths are kept absolute. On load, `~` is expanded to `$HOME`, and relative keys are resolved against the invocation directory of the client loading the session.
+- Values are ordered lists. A string member is a bare shell command; in the object form, an optional group and display name can also be specified for assignment on load. Order is preserved, and each command is run in its own PTY under that directory.
+- Directories are serialized alphabetically. Command order remains stable within each directory.
 
-The `version` field must be an integer from 1 through the newest format supported by the running `fleetcom`. A missing field means version 1. Invalid or unsupported versions fail to load, and the error reports the file's value and the supported version.
+The `version` field must be an integer from 1 through the newest format supported by the running `fleetcom`. A missing field means version 1. Invalid or unsupported versions are refused on load, with the file's value and supported version in the error.
 
-The shape, not the version, discriminates the schema. An object-valued `dirs` marks the wrapped form shown above. The loader also accepts a flat map whose top-level keys are directories and whose values are entry arrays. In that form, an array-valued key named `dirs` remains a directory entry, but a top-level `version` member is always the format version, never a directory. Flat-map files list by filename stem because they have no stored name. Saving one writes the wrapped form and permits overwriting it without a stored-name collision check.
+The schema is identified by shape, independently of the version. With an object-valued `dirs`, the wrapped form above is used. A flat map is also accepted, with directories as top-level keys and entry arrays as values. In that form, an array-valued key named `dirs` remains a directory entry, but a top-level `version` member is always the format version, never a directory. Flat-map files are listed by filename stem because no name is stored. On save, the wrapped form is written, without a stored-name collision check.
 
-Saves are atomic: `fleetcom` writes and syncs a private temporary file in the session directory, then renames it over the recipe. Recipes persist full command lines, which can embed secrets. [Security](README.md#security) documents the directory and file permissions.
+Saves are atomic: a private temporary file is written and synced in the session directory, then renamed over the recipe. Full command lines are persisted, including any embedded secrets. See [Security](README.md#security) for directory and file permissions.
 
-The file is plain JSON and practical to edit by hand. Editing the `name` field changes which session the file claims to be: collision checks compare it, so a save under the old name will be refused. A readable stored name still controls collision checks and picker labels when the command body is invalid or the version is unsupported.
+The file is plain JSON and practical to edit by hand. Edit `name` to change the stored session identity: a subsequent save under the old name will be refused by the collision check. A readable stored name is still used for collision checks and picker labels when the command body is invalid or the version unsupported.
 
-Loading validates the entire recipe before starting any commands. The root must be an object, every directory value must be an array, and every entry must be a command string or an object with a string `cmd`. Optional entry `group` and `name` fields, and the wrapped session's `name`, accept strings, `null`, or omission; other types fail. Unknown fields in wrapped metadata and entry objects are ignored. Empty maps, arrays, and strings are valid. Invalid JSON or any malformed field fails the whole load, leaves existing tasks intact, and preserves the recipe file. Schema errors identify the quoted directory key, the entry number (starting at 1), and the offending field where applicable.
+The entire recipe is validated before any commands are started. The root must be an object, every directory value must be an array, and every entry must be a command string or an object with a string `cmd`. Strings, `null`, or omission are accepted for optional entry `group` and `name` fields and the wrapped session's `name`; other types are rejected. Unknown fields in wrapped metadata and entry objects are ignored. Empty maps, arrays, and strings are valid. With invalid JSON or any malformed field, the whole load is refused; existing tasks and the recipe file are left intact. In schema errors, the quoted directory key, entry number (starting at 1), and offending field are included where applicable.
 
-After validation, the daemon removes control characters, trims surrounding whitespace, and limits group and display names to 64 characters. `Unassigned` maps to no group but remains a legal display name. Missing directories and entries exceeding task or command limits are still skipped and counted in the load status. Spawn failures are reported separately; commands already started by a structurally valid recipe keep running.
+After validation, group and display names are stripped of control characters and surrounding whitespace and limited to 64 characters. `Unassigned` is treated as no group but is a legal display name. Missing directories and entries exceeding task or command limits are still skipped and counted in the load status. Spawn failures are reported separately; commands already started by a structurally valid recipe keep running.
 
-Commands with neither a group nor a name use the string form. String and object entries can appear in the same directory array.
+Use the string form for commands with neither a group nor a name. String and object entries can appear in the same directory array.
 
-A bare agent command does not identify its conversation, so saving it verbatim would start another one on load. When `fleetcom` captures an ID for `claude`, `codex`, `grok`, or `omp`, it stores the resume form instead. Without a known ID, named saves and recovery snapshots preserve the authored command. The result remains an ordinary command string that can run directly in a shell:
+No conversation ID is specified in a bare agent command; if saved verbatim, a new conversation would be started on load. With a captured ID for `claude`, `codex`, `grok`, or `omp`, the resume form is stored instead. Without a known ID, the authored command is preserved in named saves and recovery snapshots. You can run the resulting command directly in a shell:
 
 ```json
 {
@@ -72,23 +72,23 @@ A bare agent command does not identify its conversation, so saving it verbatim w
 
 ## Recovery
 
-`fleetcom` automatically snapshots the current task set under `recovery/` inside the session directory. Each daemon (or `--foreground` core) writes to a file named for its start time and process ID. After each write, the new file and files whose process IDs are still live are protected; among the remaining files, the nine newest names survive. A shared recovery directory can therefore contain more than ten snapshots while multiple writers are live.
+The current task set is automatically snapshotted under `recovery/` inside the session directory. A separate file is written for each daemon (or `--foreground` core), named for its start time and process ID. After each write, the new file and files whose process IDs are still live are protected; among the remaining files, the nine newest names are retained. A shared recovery directory can therefore contain more than ten snapshots while multiple writers are live.
 
-A snapshot pass runs two seconds after the last command that can change a saved recipe, coalescing a burst of commands. A pass writes a nonempty recipe when its content or destination changed, or when the expected snapshot file is missing. Every 60 seconds, `fleetcom` also checks for stored-command changes such as a newly captured agent resume ID.
+A snapshot pass is scheduled two seconds after the last command that can change a saved recipe, coalescing a burst of commands. A nonempty recipe is written when its content or destination changed, or when the expected snapshot file is missing. Stored-command changes, such as a newly captured agent resume ID, are also checked every 60 seconds.
 
-- An empty fleet does not write a snapshot, so removing every task does not replace the previous snapshot with an empty recipe.
-- Quitting, disconnecting, and `fleetcom --kill` leave snapshots in place.
+- No snapshot is written for an empty fleet. After removing every task, the previous snapshot is retained.
+- Snapshots are left in place after quitting, disconnecting, or `fleetcom --kill`.
 
-A snapshot uses the session format above, with an `autosaved <timestamp>` UTC label in its `name` field. Loading one spawns its commands like a named session and suggests saving the recovered fleet under a permanent name.
+Snapshots are stored in the session format above, with an `autosaved <timestamp>` UTC label in `name`. Load one to start its commands as with a named session, then save the recovered fleet under a permanent name when prompted.
 
-In the dashboard, `o` opens the [session picker](commands.md#the-o-session-picker) on the saved list; while snapshots exist, `Tab` flips it to the recovery list.
+In the dashboard, press `o` to open the [session picker](commands.md#the-o-session-picker) on the saved list, then `Tab` to view available recovery snapshots.
 
-Recovery files carry the same caveat as saved recipes: they persist full command lines, which can embed secrets.
+As with saved recipes, full command lines are persisted in recovery files, including any embedded secrets.
 
 ## Saving and loading
 
-- Save: `w` in the dashboard, type a name, `Enter`. Writes the session name plus each task's directory, command, and optional group and name to `<name>.json`.
+- Save: `w` in the dashboard, type a name, `Enter`. Store the session name plus each task's directory, command, and optional group and name to `<name>.json`.
 - Load in-app: `o`, pick from the list, `Enter`.
 - Load at launch: `fleetcom <name>`.
 
-Loading always spawns new processes from the stored commands. Existing tasks remain daemon state and never enter the session file. [Agent session resume](agent-resume.md) documents when supported agent commands can preserve their conversations across that relaunch.
+On load, new processes are always spawned from the stored commands. Live process state is retained by the daemon and never stored in session files. See [Agent session resume](agent-resume.md) for preserving supported agent conversations across relaunch.

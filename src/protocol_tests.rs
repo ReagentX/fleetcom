@@ -1,8 +1,7 @@
 use super::*;
 
-/// Every command survives encode→frame-payload→decode unchanged, including
-/// the `Watch{None}` null, `Paste` bytes (0 and 255), and the no-field
-/// `Shutdown`.
+/// Preserve every command through encode→frame-payload→decode, including the
+/// `Watch{None}` null, `Paste` bytes (0 and 255), and the no-field `Shutdown`.
 ///
 /// `variant_index` exhaustively matches `Command`, and `seen` verifies that
 /// `cases` covers every arm. This guards `decode_command`, whose unknown-tag

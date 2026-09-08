@@ -9,8 +9,8 @@ fn paste_wraps_only_when_child_opted_in() {
         paste_bytes(true, b"hello"),
         b"\x1b[200~hello\x1b[201~".to_vec()
     );
-    // Inside brackets the content rides verbatim: the child's own paste
-    // handling decides what a newline means.
+    // Preserve content verbatim inside brackets: newline interpretation is handled by
+    // the child.
     assert_eq!(
         paste_bytes(true, b"a\nb"),
         b"\x1b[200~a\nb\x1b[201~".to_vec()
@@ -172,7 +172,7 @@ fn buttons_respect_mode_granularity_and_encoding() {
             "mode {mode}: utf8 drag"
         );
 
-        // SGR encoding: parameterized fields, release keeps its code.
+        // SGR encoding: parameterized fields, preserve the code on release.
         p.process(b"\x1b[?1006h");
         assert_eq!(
             mouse_bytes(&p, press, 4, 2),

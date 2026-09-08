@@ -1,4 +1,4 @@
-//! The hello handshake rejects version-mismatched clients and commands sent before it.
+//! Reject version-mismatched clients and commands sent before the hello handshake.
 
 mod common;
 
@@ -46,8 +46,8 @@ fn version_mismatch_is_refused_with_both_versions_named() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// A hello that claims version 3 but fails strict field decoding is still
-/// reported as a version mismatch.
+/// A hello with version 3 but invalid field encoding is still reported as a version
+/// mismatch.
 #[test]
 fn v3_hello_is_refused_as_a_version_mismatch() {
     let (dir, daemon, mut stream) = start_daemon_raw("v3hello", |_| {});

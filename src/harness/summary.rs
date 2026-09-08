@@ -1,46 +1,45 @@
-//! Display-only summary adapters for the Anchor tier of the dashboard preview.
-//! Each adapter extracts status text from an agent CLI's bottom chrome.
+//! Display-only summary adapters for the Anchor tier of the dashboard preview. Extract
+//! status text from an agent CLI's bottom chrome.
 //!
 //! # Display-only contract
 //!
-//! Adapter output is rendered in the dashboard and never enters a shell
-//! command. It is therefore outside the session-ID validation boundary in
+//! Adapter output is rendered in the dashboard and never inserted into a shell command.
+//! It is therefore outside the session-ID validation boundary in
 //! [`is_uuid`](super::is_uuid).
 //!
 //! # Title tiers
 //!
-//! Adapters also normalize terminal titles for the preview cascade's Title
-//! tiers. An alternate-screen title falls back to the sanitized captured title
-//! when normalization rejects it. A retained primary-screen title renders only
-//! when the adapter recognizes its shape because any inline program can replace
-//! the terminal title.
+//! Normalize terminal titles for the preview cascade's Title tiers. On the alternate
+//! screen, use the sanitized captured title when normalization is unsuccessful. On the
+//! primary screen, render a retained title only when its shape is recognized by the
+//! adapter: the terminal title may have been replaced by another inline program.
 //!
 //! # Anchor discipline
 //!
-//! Status-shaped text can also appear in scrollback or conversation content.
-//! To avoid treating it as live status, every matcher:
+//! Status-shaped text can also appear in scrollback or conversation content. In each
+//! matcher, distinguish live status from that content:
 //!
-//! 1. locates the chrome region structurally (claude's separator-pair input
+//! 1. Locate the chrome region structurally (claude's separator-pair input
 //!    box, codex's composer, grok's bordered input box, omp's two-row input
-//!    box) and limits status candidates relative to it;
-//! 2. returns `None` when the expected structure is absent or inconsistent;
-//! 3. preserves CLI-generated ellipsis truncation. omp also requires its
-//!    trailing interrupt hint; wrapped rows fail that structural check.
+//!    box) and limit status candidates relative to it.
+//! 2. Return `None` when the expected structure is absent or inconsistent.
+//! 3. Preserve CLI-generated ellipsis truncation. For omp, also require the
+//!    trailing interrupt hint; reject wrapped rows without it.
 //!
-//! Normalization removes spinner glyphs, elapsed counters, throughput data,
-//! and key hints while preserving the CLI's status text. The only synthesized
-//! status is `awaiting approval`, for approval menus: claude's dialog,
-//! codex's modal, and omp's selector. Corpus fixtures in `tests/corpus` pin
-//! the supported screen structures.
+//! Remove spinner glyphs, elapsed counters, throughput data, and key hints during
+//! normalization; preserve the CLI's status text. The only synthesized status is
+//! `awaiting approval`, for approval menus: claude's dialog, codex's modal, and omp's
+//! selector. Supported screen structures are recorded in the corpus fixtures in
+//! `tests/corpus`.
 
 use std::path::Path;
 
 use crate::preview::SummaryAdapter;
 
-/// Select an adapter by the basename of the command's first
-/// whitespace-separated word. Arguments are accepted; environment prefixes
-/// and compound shell commands do not select an adapter. Selection is
-/// independent of session-capture instrumentation.
+/// Select an adapter by the basename of the command's first whitespace-separated word.
+/// Arguments are accepted; do not select an adapter for environment prefixes or
+/// compound shell commands. Selection is independent of session-capture
+/// instrumentation.
 pub fn select(command: &str) -> Option<&'static dyn SummaryAdapter> {
     let first = command.split_whitespace().next()?;
     let name = Path::new(first).file_name()?.to_str()?;
@@ -112,15 +111,14 @@ fn slow_segments(tail: &str, drop: impl Fn(&str) -> bool) -> String {
 /// space and an `…`-terminated status phrase.
 const CLAUDE_SPINNER: &[char] = &['·', '✢', '✳', '✶', '✻', '✽'];
 
-/// Maximum nonblank rows inspected above the input box. Blank rows do not
-/// consume the limit; indented hint and task-list rows do.
+/// Maximum nonblank rows inspected above the input box. Exclude blank rows from the
+/// limit; count indented hint and task-list rows.
 const CLAUDE_STATUS_WINDOW: usize = 16;
 
-/// claude (alt screen). Working state: a column-0 spinner row above the
-/// input box's top separator, within [`CLAUDE_STATUS_WINDOW`] nonblank rows
-/// of it.
-/// Approval state: the dialog replaces the input box entirely; the menu
-/// match fires only when that box is gone.
+/// claude (alt screen). Working state: a column-0 spinner row above the input box's top
+/// separator, within [`CLAUDE_STATUS_WINDOW`] nonblank rows of it. Approval state: the
+/// input box is replaced entirely by the dialog; match the menu only when that box is
+/// gone.
 pub struct ClaudeSummary;
 
 impl SummaryAdapter for ClaudeSummary {
@@ -136,8 +134,8 @@ impl SummaryAdapter for ClaudeSummary {
         claude_welcome_label(rows)
     }
 
-    /// Strip a recognized claude spinner, braille, or quadrant-circle frame
-    /// from a nonempty title. Other title shapes return `None`.
+    /// Strip a recognized claude spinner, braille, or quadrant-circle frame from a
+    /// nonempty title. Return `None` for other title shapes.
     fn normalize_title(&self, title: &str) -> Option<String> {
         let mut chars = title.chars();
         let frame = chars.next()?;
@@ -166,9 +164,9 @@ fn claude_box_top(rows: &[String]) -> Option<usize> {
         .then_some(top)
 }
 
-/// Scan upward from the input box for a spinner or waiting row. Blank rows do
-/// not consume the window; indented rows do. The first other column-0 row,
-/// including body prose or a wrapped status tail, invalidates the structure.
+/// Scan upward from the input box for a spinner or waiting row. Exclude blank rows from
+/// the window; count indented rows. Reject the structure at the first other column-0
+/// row, including body prose or a wrapped status tail.
 fn claude_spinner_status(rows: &[String], top: usize) -> Option<(String, &'static str)> {
     let mut content = 0usize;
     for i in (0..top).rev() {
@@ -184,10 +182,10 @@ fn claude_spinner_status(rows: &[String], top: usize) -> Option<(String, &'stati
             continue;
         }
         if let Some(verb) = spinner_text(row, |c| CLAUDE_SPINNER.contains(&c)) {
-            // The spinner row's parenthetical contributes its slow
-            // semantic tail to whichever text wins the head.
+            // Append the slow semantic tail from the spinner row's parenthetical to the
+            // selected head text.
             let tail = claude_semantic_tail(row);
-            // The spinner confirms the working state; only then prefer the
+            // Require a spinner as evidence of working state before preferring the
             // concrete-action row over the rotating verb.
             if let Some(action) = claude_action_row(rows, i) {
                 return Some((format!("{action}{tail}"), "claude:action-row"));
@@ -225,11 +223,10 @@ fn claude_waiting_text(row: &str) -> Option<String> {
         .then(|| text.to_string())
 }
 
-/// The spinner parenthetical's slow semantic tail:
-/// `(1m 8s · ↓ 2.1k tokens · thinking with high effort)` keeps
-/// ` · thinking with high effort`. Recognized ticker segments drop;
-/// everything else is kept in order as ` · {seg}`. No parenthetical yields
-/// an empty tail; an unclosed one is parsed to the cut.
+/// The spinner parenthetical's slow semantic tail: `(1m 8s · ↓ 2.1k tokens · thinking
+/// with high effort)` → ` · thinking with high effort`. Drop recognized ticker
+/// segments; keep everything else in order as ` · {seg}`. Return an empty tail without
+/// a parenthetical; parse an unclosed one to the cut.
 fn claude_semantic_tail(row: &str) -> String {
     let Some(open) = row.find("… (") else {
         return String::new();
@@ -263,12 +260,11 @@ fn claude_ticker_segment(seg: &str) -> bool {
         })
 }
 
-/// The concrete-action row above a confirmed spinner: skip the blank gap,
-/// probe exactly one row. `⏺ Running 1 shell command…` names real work while
-/// the spinner phrase rotates per request, so it wins when both are
-/// present. The probe requires the `⏺` head and a single trailing `…`
-/// (`⏺ ok`-style reply rows fail it); anything else keeps the spinner
-/// phrase; scanning further up could match conversation content.
+/// The concrete-action row above a confirmed spinner: skip the blank gap, probe exactly
+/// one row. Prefer a concrete action such as `⏺ Running 1 shell command…` over the
+/// spinner phrase, which is rotated per request. Require the `⏺` head and a single
+/// trailing `…`; reject `⏺ ok`-style reply rows. Otherwise, retain the spinner phrase.
+/// Do not scan further up: conversation content could be mistaken for status.
 fn claude_action_row(rows: &[String], spinner: usize) -> Option<String> {
     let row = rows[..spinner].iter().rev().find(|r| !r.is_empty())?;
     let text = row.strip_prefix("⏺ ")?.trim();
@@ -315,9 +311,9 @@ fn claude_welcome_label(rows: &[String]) -> Option<String> {
     None
 }
 
-/// Normalize `<model> with <effort> effort` and its ellipsis form to
-/// `<model> (<effort>)`. The ellipsis form requires a complete
-/// [`CLAUDE_EFFORT`] value; a partial token returns `None`.
+/// Normalize `<model> with <effort> effort` and its ellipsis form to `<model>
+/// (<effort>)`. The ellipsis form requires a complete [`CLAUDE_EFFORT`] value; return
+/// `None` for a partial token.
 fn claude_model_effort(head: &str) -> Option<String> {
     let (model, effort) = match head.strip_suffix(" effort") {
         Some(full) => full.rsplit_once(" with ")?,
@@ -334,8 +330,8 @@ fn claude_model_effort(head: &str) -> Option<String> {
 /// Column-0 glyphs accepted as the Codex composer prompt.
 const CODEX_PROMPT: &[char] = &['›', '»', '!'];
 
-/// Column-0 queued-message heads allowed between the status row and composer.
-/// Prefix matching admits runtime affordances appended to a head.
+/// Column-0 queued-message heads allowed between the status row and composer. Match by
+/// prefix to accept runtime affordances appended to a head.
 const CODEX_QUEUED_HEADS: &[&str] = &[
     "• Messages to be submitted after next tool call",
     "• Messages to be submitted at end of turn",
@@ -352,11 +348,11 @@ const CODEX_EFFORT: &[&str] = &[
 /// depth, so counting them would push the status row out of reach.
 const CODEX_STATUS_WINDOW: usize = 10;
 
-/// codex (inline UI, primary screen). The pin is its composer: the
-/// bottom-most column-0 prompt-glyph row that is not a modal selector;
-/// status rows sit above it, and scrollback beyond the first foreign row is
-/// out of bounds. The approval modal removes the composer and is checked
-/// first. The status line or indented hint rows may appear below the composer.
+/// codex (inline UI, primary screen). The pin is its composer: the bottom-most column-0
+/// prompt-glyph row that is not a modal selector; status rows sit above it, and
+/// scrollback beyond the first foreign row is out of bounds. Check for the approval
+/// modal first, with the composer absent. The status line or indented hint rows may
+/// appear below the composer.
 pub struct CodexSummary;
 
 impl SummaryAdapter for CodexSummary {
@@ -372,8 +368,8 @@ impl SummaryAdapter for CodexSummary {
         codex_model_label(rows)
     }
 
-    /// Fold braille frames to `⠋` and `[ . ] ` to `[ ! ] `. Other title
-    /// shapes return `None`.
+    /// Fold braille frames to `⠋` and `[ . ] ` to `[ ! ] `. Return `None` for other
+    /// title shapes.
     fn normalize_title(&self, title: &str) -> Option<String> {
         if let Some(rest) = title.strip_prefix("[ . ] ") {
             return Some(format!("[ ! ] {rest}"));
@@ -399,11 +395,11 @@ fn codex_numbered_option(row: &str) -> bool {
     t.len() > digits && digits >= 1 && t[digits..].starts_with(". ")
 }
 
-/// Codex's approval modal: a selector row with an indented numbered sibling
-/// adjacent to it, pinned to the last nine painted rows. A quoted menu retains the
-/// live composer below it, so any non-selector [`CODEX_PROMPT`] row after the
-/// selector suppresses the match. Suppression tests the glyph alone because
-/// modal detection must not reinterpret a live composer as quoted content.
+/// Codex's approval modal: a selector row with an indented numbered sibling adjacent to
+/// it, pinned to the last nine painted rows. A live composer is still present below a
+/// quoted menu. Reject the match on any non-selector [`CODEX_PROMPT`] row after the
+/// selector. Test the glyph alone: do not reinterpret a live composer as quoted content
+/// during modal detection.
 fn codex_approval(rows: &[String]) -> Option<(String, &'static str)> {
     let last = rows.iter().rposition(|r| !r.is_empty())?;
     let i = (last.saturating_sub(8)..=last).find(|&i| codex_menu_head(&rows[i]))?;
@@ -431,7 +427,7 @@ fn codex_approval(rows: &[String]) -> Option<(String, &'static str)> {
 ///
 /// Two shapes qualify:
 ///
-/// - a `{…} in · {…} out` tail, which pins the model to the first item;
+/// - a `{…} in · {…} out` tail, with the model in the first item;
 /// - a `model-with-reasoning` head, `{model} {effort}` with an optional third
 ///   word, matched by [`codex_model_with_reasoning`].
 ///
@@ -455,22 +451,21 @@ fn codex_model_label(rows: &[String]) -> Option<String> {
     })
 }
 
-/// Whether an item has the accepted `model-with-reasoning` shape: two or three
-/// words, with a recognized effort word second. The optional third word
-/// occupies the service-tier position. The fixed effort vocabulary limits
-/// prose-shaped false matches.
+/// Whether an item has the accepted `model-with-reasoning` shape: two or three words,
+/// with a recognized effort word second. The optional third word occupies the
+/// service-tier position. Require a fixed effort word to limit false matches against
+/// prose.
 fn codex_model_with_reasoning(item: &str) -> bool {
     let words: Vec<&str> = item.split_whitespace().collect();
     matches!(words.len(), 2 | 3) && CODEX_EFFORT.contains(&words[1])
 }
 
-/// The composer: the bottom-most column-0 [`CODEX_PROMPT`] row that is not a
-/// modal selector. The row is the glyph alone or the glyph and a space. Rows
-/// below it are tolerated, never required: blank rows, indented affordance
-/// hints (`tab to queue message`), or the status line. The working layout can
-/// paint hints below the composer with no status line at all. Prompt echoes in
-/// scrollback share the glyph but sit above the composer, so the
-/// bottom-most wins.
+/// The composer: the bottom-most column-0 [`CODEX_PROMPT`] row that is not a modal
+/// selector. The row is the glyph alone or the glyph and a space. Rows below it are
+/// tolerated, never required: blank rows, indented affordance hints (`tab to queue
+/// message`), or the status line. Hints may be painted below the composer without a
+/// status line. Prefer the bottom-most glyph: the same glyph is present in prompt
+/// echoes above the composer in scrollback.
 fn codex_composer(rows: &[String]) -> Option<usize> {
     rows.iter().rposition(|r| {
         let mut chars = r.chars();
@@ -480,18 +475,17 @@ fn codex_composer(rows: &[String]) -> Option<usize> {
     })
 }
 
-/// Walk up from the composer through the status region: blanks and indented
-/// rows (tool-output attachments like `└ ok`, wrapped continuations) are
-/// skipped, [`CODEX_QUEUED_HEADS`] are walked past, and the first other
-/// column-0 row decides. Only two shapes extract ([`codex_status_head`] and
-/// `• Ran `); any other column-0 row (a reply bullet, a `⚠` notice, a turn
-/// separator) stops the scan: scrollback holds `• Ran` rows from every
-/// prior turn, and skipping an unknown row to reach one would resurface
-/// stale work as live status. `• Ran ` is tested first because the status
-/// head matches on structure, not on a literal verb.
+/// Walk up from the composer through the status region: blanks and indented rows
+/// (tool-output attachments like `└ ok`, wrapped continuations) are skipped,
+/// [`CODEX_QUEUED_HEADS`] are walked past, then inspect the first other column-0 row.
+/// Extract only [`codex_status_head`] or `• Ran ` shapes; stop at any other column-0
+/// row (a reply bullet, a `⚠` notice, a turn separator): `• Ran` rows from prior turns
+/// are retained in scrollback, and skipping an unknown row to reach one would resurface
+/// stale work as live status. `• Ran ` is tested first because the status head matches
+/// on structure, not on a literal verb.
 fn codex_status(rows: &[String], composer: usize) -> Option<(String, &'static str)> {
-    // Indented rows crossed since the last column-0 row. A queued head
-    // claims the ones below it, so a deep queue never exhausts the window.
+    // Indented rows crossed since the last column-0 row. Exclude rows below a queued
+    // head from the count to avoid exhausting the window on a deep queue.
     let mut indented = 0usize;
     for row in rows[..composer].iter().rev() {
         if row.is_empty() {
@@ -533,8 +527,8 @@ fn codex_status_head(row: &str) -> Option<(&str, &str)> {
     if !rest.starts_with(char::is_alphanumeric) {
         return None;
     }
-    // The header can carry its own parentheses (`Starting MCP servers
-    // (1/3): a, b, c`), so the first ` (` opening a counter wins.
+    // The header may contain parentheses (`Starting MCP servers (1/3): a, b, c`);
+    // choose the first ` (` followed by a counter.
     rest.match_indices(" (").find_map(|(i, _)| {
         let after = &rest[i + " (".len()..];
         codex_interrupt_paren(after).then(|| (&rest[..i], after))
@@ -689,10 +683,9 @@ fn grok_still_running_count(seg: &str) -> bool {
     (1..=3).contains(&words.split_whitespace().count())
 }
 
-/// `╰──── Grok 4.5 (xhigh) · always-approve ─╯` → `Grok 4.5 (xhigh)`: the
-/// text grok embeds in its bottom border, first ` · ` segment (the second is
-/// the approval mode). A plain border has nothing after its last `─` and
-/// yields no label.
+/// `╰──── Grok 4.5 (xhigh) · always-approve ─╯` → `Grok 4.5 (xhigh)`: the text grok
+/// embeds in its bottom border, first ` · ` segment (the second is the approval mode).
+/// Return no label for a plain border with nothing after its last `─`.
 fn grok_border_label(row: &str) -> Option<String> {
     let t = row.trim().strip_suffix('╯')?;
     let t = t.trim_end_matches(['─', ' ']);
@@ -706,17 +699,17 @@ fn grok_border_label(row: &str) -> Option<String> {
 /// Interrupt-hint suffixes accepted on an anchored status row.
 const OMP_HINTS: &[&str] = &["⟦esc⟧", "⟨esc⟩"];
 
-/// Selector cursors accepted by [`omp_approve_row`]. The exact remainder check
-/// prevents the ASCII `>` cursor from matching quoted prose.
+/// Selector cursors accepted by [`omp_approve_row`]. Require an exact remainder after
+/// the ASCII `>` cursor to exclude quoted prose.
 const OMP_CURSORS: &[&str] = &["❯", "\u{f054}", ">"];
 
-/// omp inline-UI adapter. A two-row `╭…╮`/`╰…╯` input box anchors the nearest
-/// painted status row above it. The approval selector replaces the box, so its
-/// absence selects approval matching.
+/// omp inline-UI adapter. Use a two-row `╭…╮`/`╰…╯` input box to locate the nearest
+/// painted status row above it. Without the box, check for the approval selector
+/// displayed in its place.
 ///
-/// Unicode box corners anchor status. ASCII `+` and `-` do not: transcript
-/// tables and rules use the same glyphs. The plain-text approval selector still
-/// matches under ASCII.
+/// Locate status by Unicode box corners. Do not use ASCII `+` and `-`: the same glyphs
+/// are present in transcript tables and rules. Accept the plain-text approval selector
+/// under ASCII.
 pub struct OmpSummary;
 
 impl SummaryAdapter for OmpSummary {
@@ -733,10 +726,10 @@ impl SummaryAdapter for OmpSummary {
         None
     }
 
-    /// Normalize omp's `π {separator} {label}` and `π: {label}` titles. `>`
-    /// and `π:` yield a nonempty label, braille frames fold to `⠋`, and `!`
-    /// remains the waiting marker. Unsupported shapes and empty idle or
-    /// disabled labels return `None`.
+    /// Normalize omp's `π {separator} {label}` and `π: {label}` titles. Extract a
+    /// nonempty label after `>` or `π:`, normalize braille frames to `⠋`, and retain
+    /// `!` as the waiting marker. Return `None` for unsupported shapes and empty idle
+    /// or disabled labels.
     fn normalize_title(&self, title: &str) -> Option<String> {
         if let Some(label) = title.strip_prefix("π: ") {
             return (!label.is_empty()).then(|| label.to_string());
@@ -760,8 +753,9 @@ impl SummaryAdapter for OmpSummary {
     }
 }
 
-/// Inspect the bottom-most `╰…╯` row and return its predecessor only when that
-/// row is a `╭…╮` border. Adjacency rejects preview boxes containing a command.
+/// Inspect the bottom-most `╰…╯` row and return its predecessor only when that row is a
+/// `╭…╮` border. Require adjacent borders to exclude preview boxes containing a
+/// command.
 fn omp_input_box(rows: &[String]) -> Option<usize> {
     let bottom = rows.iter().rposition(|r| {
         let t = r.trim();
@@ -771,13 +765,11 @@ fn omp_input_box(rows: &[String]) -> Option<usize> {
     (t.starts_with('╭') && t.ends_with('╮')).then(|| bottom - 1)
 }
 
-/// The status row: the first painted row above the input box, shaped
-/// `{frame} {phrase} {hint}` one column in. Everything between the frame and
-/// the hint is the model's own streamed intent phrase (`Listing directory
-/// contents`; `Working…` when the model streams nothing) and is returned
-/// verbatim, the CLI's own truncating `…` included. A wrapped row left its
-/// hint on the next line and fails the suffix check rather than yielding half
-/// a phrase.
+/// The status row: the first painted row above the input box, shaped `{frame} {phrase}
+/// {hint}` one column in. Everything between the frame and the hint is the model's own
+/// streamed intent phrase (`Listing directory contents`; `Working…` when the model
+/// streams nothing) and is returned verbatim, the CLI's own truncating `…` included.
+/// Reject a wrapped row with its hint on the next line: do not extract half a phrase.
 fn omp_spinner_status(rows: &[String], top: usize) -> Option<(String, &'static str)> {
     let probe = rows[..top].iter().rev().find(|r| !r.is_empty())?;
     let mut chars = probe.trim_start().chars();
@@ -812,10 +804,9 @@ fn omp_approval(rows: &[String]) -> Option<(String, &'static str)> {
         .then(|| (AWAITING_APPROVAL.to_string(), "omp:approval-menu"))
 }
 
-/// The selector's chosen row: a cursor spelling, a space, then `Approve` and
-/// nothing more. Equality after the cursor is the whole check: the ascii
-/// cursor `>` also opens a quoted line, so the row's remainder has to be
-/// exact.
+/// The selector's chosen row: a cursor spelling, a space, then `Approve` and nothing
+/// more. Equality after the cursor is the whole check: the ascii `>` is also used for
+/// quoted lines, so require an exact remainder.
 fn omp_approve_row(row: &str) -> bool {
     let t = row.trim();
     OMP_CURSORS
@@ -823,9 +814,8 @@ fn omp_approve_row(row: &str) -> bool {
         .any(|c| t.strip_prefix(c) == Some(" Approve"))
 }
 
-/// The selector's head row: `Allow tool: {name}`. The prefix's trailing
-/// space carries the name requirement: a trimmed row cannot end in one, so
-/// a bare `Allow tool:` fails.
+/// The selector's head row: `Allow tool: {name}`. Require the prefix's trailing space:
+/// a trimmed row cannot end in a space, so a bare `Allow tool:` is rejected.
 fn omp_allow_head(row: &str) -> bool {
     row.trim().starts_with("Allow tool: ")
 }

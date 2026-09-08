@@ -165,8 +165,8 @@ fn spawn_moves_selection_to_the_new_task() {
     assert_eq!(app.pending_select, None, "the ack must be consumed");
 }
 
-/// When two spawn acknowledgements share a snapshot, the later id replaces the
-/// earlier pending id and wins selection.
+/// When two spawn acknowledgements share a snapshot, the later id replaces the earlier
+/// pending id and is selected.
 #[test]
 fn two_spawns_in_one_sync_select_the_last() {
     let mut app = App::new_local(30, 100);
@@ -244,7 +244,7 @@ fn pending_select_ignores_snapshots_without_the_id() {
     assert_eq!(app.pending_select, Some(9999), "the pending id stays armed");
 }
 
-/// Reconnect drops a pending spawn id because a replacement daemon may reuse it.
+/// Drop a pending spawn ID on reconnect: it may be reused by a replacement daemon.
 #[test]
 fn reconnect_reset_drops_the_pending_spawn_ack() {
     let mut app = App::new_local(30, 100);
@@ -853,8 +853,8 @@ fn app_with_config_dir(dir: &Path) -> App {
     )
 }
 
-/// `o` never touches the local filesystem: it sends `ListSessions`, opens
-/// the picker empty, and the core's `Sessions` reply fills it.
+/// On `o`, send `ListSessions` and open an empty picker without reading the local
+/// filesystem. Fill the picker on the core's `Sessions` reply.
 #[test]
 fn o_key_round_trips_the_session_list_through_the_core() {
     let dir = session_scratch("sess_list", &["b", "a"]);
@@ -1043,7 +1043,7 @@ fn tab_toggles_pages_and_selections_stay_independent() {
     assert_eq!(app.recovery_sel, 1, "the recovery selection survives too");
 }
 
-/// An empty recovery refresh returns the picker to the saved page.
+/// Return the picker to the saved page after an empty recovery refresh.
 #[test]
 fn emptied_recovery_list_returns_to_the_saved_page() {
     let dir = session_scratch("rec_empty", &["a"]);
@@ -1109,7 +1109,7 @@ fn enter_on_the_recovery_page_loads_the_selected_stem() {
     assert_eq!(app.views[0].command, "sleep 7");
 }
 
-/// Esc closes the recovery page.
+/// Close the recovery page on Esc.
 #[test]
 fn esc_closes_the_picker_from_the_recovery_page() {
     let dir = session_scratch("rec_esc", &[]);
@@ -1562,7 +1562,7 @@ fn backtab_jumps_to_previous_section_first_task() {
     );
 }
 
-/// Section navigation keeps a single task selected.
+/// Keep a single task selected during section navigation.
 #[test]
 fn section_nav_is_noop_with_one_task() {
     let mut app = App::new_local(30, 100);
@@ -1781,7 +1781,7 @@ fn cycle_tagged_mutates_no_task_state() {
     );
     assert!(app.notice().is_none() && app.status.is_none());
     assert!(app.mode == Mode::Dashboard);
-    // Five presses over two tags: an odd count lands on the second.
+    // Press five times over two tags to select the second.
     assert_eq!(app.selected_id, Some(3));
 }
 
@@ -1855,7 +1855,7 @@ fn unencodable_modifiers_and_keys_are_dropped() {
     );
 }
 
-/// An oversized attached paste is refused before it closes the connection.
+/// Refuse an oversized attached paste before sending it would close the connection.
 #[test]
 fn oversized_paste_is_refused_with_a_notice() {
     let mut app = App::new_local(30, 100);
@@ -1870,9 +1870,9 @@ fn oversized_paste_is_refused_with_a_notice() {
     assert!(app.status.is_none(), "boundary paste must not be refused");
 }
 
-/// A paste into a text-entry mode lands as one string with control
-/// characters stripped: a multi-line clipboard must not fake the Enter
-/// press that would launch a half-pasted command.
+/// Insert a paste into a text-entry mode as one string with control characters
+/// stripped: a multi-line clipboard must not fake the Enter press that would launch a
+/// half-pasted command.
 #[test]
 fn paste_into_text_entry_strips_controls() {
     let mut app = App::new_local(30, 100);
@@ -1922,7 +1922,7 @@ fn input_modes_match_screen_type() {
         Some(&screen(false, false, false)),
         false
     ));
-    // The scroll view overrides everything: the wheel must scroll it.
+    // Route wheel input to scrollback whenever history is visible.
     assert!(desired_mouse_capture(
         Some(&screen(false, false, false)),
         true
@@ -2028,7 +2028,7 @@ fn attached_wheel_honors_the_childs_1007_veto() {
     );
 }
 
-/// Scrollback opens with modified PageUp and closes on Esc or typing.
+/// Open scrollback on modified PageUp; close on Esc or typing.
 #[test]
 fn scroll_view_entry_and_exit() {
     let (mut app, _) = App::attached(30, 100, "sleep 5");
@@ -2050,7 +2050,7 @@ fn scroll_view_entry_and_exit() {
     assert!(!app.view_scroll);
 }
 
-/// A wheel notch on the dashboard moves the selection like an arrow key.
+/// Move the dashboard selection on a wheel notch as on an arrow key.
 #[test]
 fn wheel_moves_dashboard_selection() {
     let mut app = App::new_local(30, 100);
@@ -2074,8 +2074,8 @@ fn wheel_moves_dashboard_selection() {
 
 // --- `g` group picker -------------------------------------------------
 
-/// `g` opens the picker only when a task is selected, pinning the target
-/// to that task's id.
+/// Open the picker on `g` only with a selected task, pinning the target to that task's
+/// id.
 #[test]
 fn group_picker_opens_on_g_only_with_a_selection() {
     let mut app = App::new_local(30, 100);
@@ -2167,7 +2167,7 @@ fn group_filter_narrows_and_preselects_the_first_match() {
     app.spawn_grouped("sleep 5", inv.clone(), "alpha"); // id 1
     app.spawn_grouped("sleep 5", inv, "beta"); // id 2
     app.pump();
-    // Keep alpha selected so filtered beta carries no "(current)" mark.
+    // Keep alpha selected so filtered beta is not marked "(current)".
     app.selected_id = Some(1);
     app.on_key_dashboard(key(KeyCode::Char('g')));
     assert_eq!(app.group_candidates.len(), 3);
@@ -2231,7 +2231,7 @@ fn group_enter_on_novel_text_creates_the_group() {
     assert_eq!(v.group.as_deref(), Some("gamma"));
 }
 
-/// Empty input selects Unassigned, so Enter clears the target's group.
+/// With empty input, select Unassigned and clear the target's group on Enter.
 #[test]
 fn group_enter_on_empty_input_clears_to_unassigned() {
     let mut app = App::new_local(30, 100);
@@ -2247,7 +2247,7 @@ fn group_enter_on_empty_input_clears_to_unassigned() {
     assert_eq!(v.group, None);
 }
 
-/// Esc closes the picker without changing the target task.
+/// Close the picker on Esc without changing the target task.
 #[test]
 fn group_esc_cancels_without_sending() {
     let mut app = App::new_local(30, 100);
@@ -2333,7 +2333,7 @@ fn find_empty_input_lists_every_task() {
     app.on_key_dashboard(key(KeyCode::Char('/')));
     assert_eq!(find_ids(&app), vec![1, 2]);
 
-    // Typing then deleting returns the full fleet.
+    // Type, then delete, to list the full fleet again.
     find_type(&mut app, "alpha");
     assert_eq!(find_ids(&app), vec![2]);
     for _ in 0.."alpha".len() {
@@ -2429,7 +2429,7 @@ fn find_does_not_match_the_directory() {
     assert_eq!(find_ids(&app), vec![1]);
 }
 
-/// Enter jumps the dashboard selection to the highlighted task and closes.
+/// On Enter, select the highlighted task on the dashboard and close the palette.
 #[test]
 fn find_enter_jumps_the_selection() {
     let mut app = App::new_local(30, 100);
@@ -2454,7 +2454,7 @@ fn find_enter_jumps_the_selection() {
     assert!(app.find_input.is_empty() && app.find_candidates.is_empty());
 }
 
-/// Esc closes the palette and leaves the selection where it was.
+/// Close the palette on Esc without changing selection.
 #[test]
 fn find_esc_leaves_the_selection_alone() {
     let mut app = App::new_local(30, 100);
@@ -2474,7 +2474,7 @@ fn find_esc_leaves_the_selection_alone() {
     assert_eq!(app.find_sel, 0);
 }
 
-/// Enter with no candidates keeps the palette open and preserves selection.
+/// With no candidates, keep the palette open and preserve selection on Enter.
 #[test]
 fn find_enter_without_candidates_keeps_the_panel_open() {
     let mut app = App::new_local(30, 100);
@@ -2586,7 +2586,7 @@ fn unfocused_terminal_mutes_the_highlight_rows() {
     assert!(painted(&mut app).contains(&reverse));
 }
 
-/// `?` opens the overlay; `?`, `Esc`, and `q` each close it.
+/// Open the overlay on `?`; close on `?`, `Esc`, or `q`.
 #[test]
 fn controls_overlay_opens_on_question_and_closes_on_peeks_key_set() {
     let mut app = App::new_local(30, 100);
@@ -2614,8 +2614,7 @@ fn controls_overlay_accepts_both_spellings_of_the_chord() {
     }
 }
 
-/// Shift distinguishes the overlay from find: unmodified `/` still opens the
-/// find palette.
+/// Open controls on Shift-`/`, and the find palette on unmodified `/`.
 #[test]
 fn plain_slash_still_opens_the_find_palette() {
     let mut app = App::new_local(30, 100);
@@ -2743,7 +2742,7 @@ fn rename_prompt_opens_on_shift_r_only_with_a_selection() {
     assert_eq!(app.input.as_str(), "api");
 }
 
-/// Enter sends the trimmed name and returns to the dashboard.
+/// On Enter, send the trimmed name and return to the dashboard.
 #[test]
 fn rename_enter_sends_the_typed_name() {
     let mut app = App::new_local(30, 100);
@@ -2763,7 +2762,7 @@ fn rename_enter_sends_the_typed_name() {
     assert_eq!(v.name.as_deref(), Some("api server"));
 }
 
-/// Enter on an empty input clears the name.
+/// Clear the name on Enter with empty input.
 #[test]
 fn rename_enter_on_empty_input_clears_the_name() {
     let mut app = App::new_local(30, 100);
@@ -2786,7 +2785,7 @@ fn rename_enter_on_empty_input_clears_the_name() {
     assert_eq!(v.name, None);
 }
 
-/// Esc closes the prompt without changing the target task.
+/// Close the prompt on Esc without changing the target task.
 #[test]
 fn rename_esc_cancels_without_sending() {
     let mut app = App::new_local(30, 100);
@@ -2839,12 +2838,12 @@ fn rename_caret_keys_edit_mid_name() {
     app.on_key_rename(key(KeyCode::Char('z')));
     assert_eq!(app.input.as_str(), "zaxpi");
 
-    // Ctrl-E returns to the end; typing appends.
+    // On Ctrl-E, move to the end; append subsequent input.
     app.on_key_rename(ctrl(KeyCode::Char('e')));
     app.on_key_rename(key(KeyCode::Char('!')));
     assert_eq!(app.input.as_str(), "zaxpi!");
 
-    // Backspace removes only the char before the caret.
+    // On Backspace, remove only the character before the caret.
     app.on_key_rename(key(KeyCode::Left));
     app.on_key_rename(key(KeyCode::Backspace));
     assert_eq!(app.input.as_str(), "zaxp!");
@@ -2901,7 +2900,7 @@ fn pickdir_right_descends_only_from_the_end() {
     }
     assert_eq!(app.dir_sel, 1, "the fragment preselects alpha");
 
-    // Off the end (one left), Right moves the caret without descending.
+    // One position before the end, move the caret on Right without descending.
     app.on_key_pickdir(key(KeyCode::Left));
     app.on_key_pickdir(key(KeyCode::Right));
     assert_eq!(

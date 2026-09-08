@@ -122,8 +122,8 @@ pub fn wait_until(budget: Duration, mut ok: impl FnMut() -> bool) -> bool {
     ok()
 }
 
-/// Build a spawn control frame. The command embeds as a JSON string (quotes
-/// and backslashes escaped); the working directory rides base64-encoded.
+/// Build a spawn control frame. The command embeds as a JSON string (quotes and
+/// backslashes escaped); the working directory is base64-encoded.
 pub fn spawn_frame(command: &str, cwd: &Path) -> Vec<u8> {
     let cmd = command.replace('\\', "\\\\").replace('"', "\\\"");
     control_frame(&format!(

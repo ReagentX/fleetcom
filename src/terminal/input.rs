@@ -8,14 +8,14 @@ use crate::{
     protocol::{Key, Mods, MouseKind},
 };
 
-/// The bracketed-paste terminator. Stripped from paste *content* before
-/// wrapping: a clipboard that contains this sequence would otherwise end the
-/// paste early and smuggle the remainder in as live keystrokes.
+/// The bracketed-paste terminator. Stripped from paste *content* before wrapping: with
+/// this sequence embedded in the clipboard text, the paste could end early and the
+/// remainder be interpreted as live keystrokes.
 const PASTE_END: &[u8] = b"\x1b[201~";
 
-/// Encode a clipboard paste using the child's DECSET 2004 state. Bracketed
-/// mode wraps content and strips embedded terminators; unbracketed mode omits
-/// the markers and converts CRLF and LF line endings to CR.
+/// Encode a clipboard paste using the child's DECSET 2004 state. In bracketed mode,
+/// wrap content and strip embedded terminators; in unbracketed mode, omit markers and
+/// convert CRLF and LF line endings to CR.
 pub fn paste_bytes(bracketed: bool, content: &[u8]) -> Vec<u8> {
     if bracketed {
         let mut out = Vec::with_capacity(content.len() + 2 * PASTE_END.len() + 6);
@@ -47,17 +47,17 @@ pub fn paste_bytes(bracketed: bool, content: &[u8]) -> Vec<u8> {
     }
 }
 
-/// Encode a mouse action under the child's current terminal mode. The selected
-/// protocol determines which actions are valid and how they are encoded. With
-/// no mouse protocol, wheel actions become alternate-scroll arrows when the
-/// alternate screen and DECSET 1007 are both active. DECSET 1007 defaults on;
-/// see [`Emulator::alternate_scroll`]. Unsupported actions return `None`.
+/// Encode a mouse action under the child's current terminal mode. The selected protocol
+/// determines which actions are valid and how they are encoded. With no mouse protocol,
+/// wheel actions become alternate-scroll arrows when the alternate screen and DECSET
+/// 1007 are both active. DECSET 1007 defaults on; see [`Emulator::alternate_scroll`].
+/// Return `None` for unsupported actions.
 pub fn mouse_bytes(emu: &Emulator, kind: MouseKind, col: u16, row: u16) -> Option<Vec<u8>> {
     use crate::emulator::{MouseProtocolEncoding, MouseProtocolMode};
     let mode = emu.mouse_protocol_mode();
     if mode != MouseProtocolMode::None {
-        // Every supported mode reports presses, releases, and wheel events;
-        // only motion modes 1002 and 1003 report drags.
+        // Report presses, releases, and wheel events in every supported mode; report
+        // drags only in motion modes 1002 and 1003.
         if matches!(kind, MouseKind::Drag(_))
             && !matches!(
                 mode,
@@ -66,7 +66,7 @@ pub fn mouse_bytes(emu: &Emulator, kind: MouseKind, col: u16, row: u16) -> Optio
         {
             return None;
         }
-        // xterm button codes: wheel 64/65; drag adds 32.
+        // xterm button codes: wheel 64/65; add 32 for drag.
         let code: u16 = match kind {
             MouseKind::WheelUp => 64,
             MouseKind::WheelDown => 65,
@@ -75,12 +75,12 @@ pub fn mouse_bytes(emu: &Emulator, kind: MouseKind, col: u16, row: u16) -> Optio
         };
         let release = matches!(kind, MouseKind::Release(_));
         return Some(match emu.mouse_protocol_encoding() {
-            // SGR releases use the `m` suffix.
+            // Use the `m` suffix for SGR releases.
             MouseProtocolEncoding::Sgr => {
                 let suffix = if release { 'm' } else { 'M' };
                 format!("\x1b[<{};{};{}{}", code, col + 1, row + 1, suffix).into_bytes()
             }
-            // UTF-8 fields encode `32 + value` up to 2047; releases use code 3.
+            // UTF-8 fields encode `32 + value` up to 2047; use code 3 for releases.
             MouseProtocolEncoding::Utf8 => {
                 let code = if release { 3 } else { code };
                 let mut out = b"\x1b[M".to_vec();
@@ -92,7 +92,7 @@ pub fn mouse_bytes(emu: &Emulator, kind: MouseKind, col: u16, row: u16) -> Optio
                 }
                 out
             }
-            // Default fields are single bytes capped at 255; releases use code 3.
+            // Default fields are single bytes capped at 255; use code 3 for releases.
             MouseProtocolEncoding::Default => {
                 let code = if release { 3 } else { code };
                 vec![
@@ -158,8 +158,8 @@ fn char_bytes(c: char, mods: Mods) -> Option<Vec<u8>> {
     Some(out)
 }
 
-/// Encode F1–F4 as SS3 when unmodified and CSI when modified. F5–F12 use their
-/// CSI numeric forms. Numbers outside `1..=12` encode to nothing.
+/// Encode F1–F4 as SS3 when unmodified and CSI when modified. F5–F12 use their CSI
+/// numeric forms. Emit nothing for numbers outside `1..=12`.
 fn f_bytes(n: u8, m: Option<u8>) -> Option<Vec<u8>> {
     if let Some(letter) = match n {
         1 => Some('P'),
@@ -201,9 +201,9 @@ fn meta_bytes(meta: bool, base: &[u8]) -> Vec<u8> {
     out
 }
 
-/// Encode a key for the child. Application-cursor mode selects SS3 for
-/// unmodified cursor and Home/End keys; their modified forms use CSI.
-/// Unsupported key combinations return `None`.
+/// Encode a key for the child. In application-cursor mode, use SS3 for unmodified
+/// cursor and Home/End keys and CSI for modified forms. Return `None` for unsupported
+/// key combinations.
 pub fn key_bytes(app_cursor: bool, code: Key, mods: Mods) -> Option<Vec<u8>> {
     let m = mods.param();
     match code {
@@ -239,15 +239,15 @@ pub fn key_bytes(app_cursor: bool, code: Key, mods: Mods) -> Option<Vec<u8>> {
                 Some(m) => format!("\x1b[{n};{m}~").into_bytes(),
             })
         }
-        // Enter uses ESC CR for Shift or Alt; Control does not change plain CR.
+        // Encode Enter as ESC CR with Shift or Alt; keep plain CR with Control.
         Key::Enter => Some(meta_bytes(mods.shift || mods.alt, b"\x0d")),
-        // Alt prefixes Tab with ESC; Control and Shift do not change HT.
+        // Prefix Tab with ESC for Alt; keep HT with Control or Shift.
         Key::Tab => Some(meta_bytes(mods.alt, b"\x09")),
-        // Alt prefixes BackTab's CSI Z sequence; Control and Shift are ignored.
+        // Prefix BackTab's CSI Z sequence with ESC for Alt; ignore Control and Shift.
         Key::BackTab => Some(meta_bytes(mods.alt, b"\x1b[Z")),
-        // Backspace is DEL; Alt prefixes ESC, and Control/Shift leave it unchanged.
+        // Encode Backspace as DEL; prefix ESC for Alt and ignore Control/Shift.
         Key::Backspace => Some(meta_bytes(mods.alt, b"\x7f")),
-        // Alt+Esc is the ESC-ESC meta form; Ctrl/Shift fold into a plain ESC.
+        // Encode Alt+Esc as ESC-ESC; use plain ESC with Ctrl/Shift.
         Key::Esc => Some(meta_bytes(mods.alt, b"\x1b")),
     }
 }

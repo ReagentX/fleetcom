@@ -27,7 +27,7 @@
 //!   the glyph would fabricate a spacer over the neighbor, or wrap at the last
 //!   column, so orphans are emitted as blanks carrying the cell's attributes.
 //! - A `'\t'` cell under a pending-wrap cursor: `put_tab` never sets pending
-//!   wrap, so the cursor state wins and the cell is rewritten as a styled
+//!   wrap, so preserve cursor state and rewrite the cell as a styled
 //!   blank.
 //! - The source's pending SGR template: output ends with SGR 0 so the replay
 //!   target is left in a known attribute state.
@@ -57,10 +57,9 @@ const STYLE_FLAGS: Flags = Flags::BOLD
     .union(Flags::STRIKEOUT)
     .union(Flags::ALL_UNDERLINES);
 
-/// SGR state carried across cells and rows. Attributes survive CUP, so one
-/// running state covers the whole emission; a change triggers a full respec
-/// from SGR 0, which is what guarantees reset boundaries and default-color
-/// restoration without tracking per-attribute deltas.
+/// SGR state carried across cells and rows. Preserve one running state across CUP. On
+/// attribute change, specify all attributes from SGR 0 to restore defaults and reset
+/// boundaries without tracking per-attribute deltas.
 #[derive(PartialEq)]
 struct Sgr {
     fg: Color,
@@ -126,7 +125,8 @@ pub fn formatted<T>(term: &Term<T>) -> (Vec<u8>, (u16, u16), bool) {
             sync_sgr(&mut buf, &mut state, cell);
             if paired_wide(line, col, cols) {
                 push_char(&mut buf, cell);
-                // The glyph writes its own spacer with identical attributes.
+                // The spacer is written implicitly with identical attributes when
+                // writing the glyph.
                 col += 2;
                 continue;
             }
@@ -190,8 +190,8 @@ pub fn formatted<T>(term: &Term<T>) -> (Vec<u8>, (u16, u16), bool) {
         } else {
             buf.push(base.c);
         }
-        // Under pending wrap the attach column does not step back, so marks
-        // land on this same cell.
+        // Under pending wrap, keep the attach column unchanged to place marks on this
+        // cell.
         push_zerowidth(&mut buf, base);
     } else {
         cup(&mut buf, point.line.0.max(0) as usize, point.column.0);
@@ -213,13 +213,13 @@ pub fn formatted<T>(term: &Term<T>) -> (Vec<u8>, (u16, u16), bool) {
     )
 }
 
-/// Plain-text contents of the displayed screen, one line per row, honoring
-/// the display offset. Paired wide-char spacers are skipped so wide glyphs
-/// appear once; zero-width marks ride their base character; `'\t'` cells,
-/// concealed (SGR 8) cells, and orphaned wide halves read as the blank the
-/// replayed screen shows; trailing spaces are trimmed per row. This display
-/// policy differs from [`crate::emulator::Emulator::live_rows`], which
-/// preserves the stored glyphs for structural matching.
+/// Plain-text contents of the displayed screen, one line per row, honoring the display
+/// offset. Paired wide-char spacers are skipped so wide glyphs appear once; zero-width
+/// marks are included with their base character; `'\t'` cells, concealed (SGR 8) cells,
+/// and orphaned wide halves read as the blank the replayed screen shows; trailing
+/// spaces are trimmed per row. This display policy differs from
+/// [`crate::emulator::Emulator::live_rows`], which preserves the stored glyphs for
+/// structural matching.
 pub fn contents<T>(term: &Term<T>) -> String {
     let grid = term.grid();
     let cols = grid.columns();
@@ -443,7 +443,7 @@ mod tests {
     ///   `WIDE_CHAR`/`WIDE_CHAR_SPACER` bit are expected as a blank: no byte
     ///   stream recreates a lone half.
     /// - A `'\t'` cell under a pending-wrap cursor is expected as a blank:
-    ///   `put_tab` cannot set pending wrap, and cursor state wins.
+    ///   `put_tab` cannot set pending wrap, and cursor state is preserved.
     /// - Hyperlink extras are not compared because they are not serialized.
     fn assert_same_screen(source: &Term<VoidListener>, replay: &Term<VoidListener>, case: &str) {
         let sgrid = source.grid();
@@ -1107,9 +1107,8 @@ mod tests {
                         write!(out, "\x1b[{n}M")
                     };
                 }
-                // Partial escapes: a bare ESC or an unterminated CSI swallows
-                // the following token as parameter bytes: realistic torn
-                // input, deterministic parse.
+                // After a bare ESC or unterminated CSI, the following token is parsed
+                // as parameter bytes: deterministic parsing of partial input.
                 _ => {
                     if rng.below(2) == 0 {
                         out.push('\x1b');
