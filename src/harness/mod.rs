@@ -9,10 +9,10 @@
 //!
 //! # Security invariant
 //!
-//! Every ID returned by `parse_capture` or `live_session_id`
-//! eventually enters a shell command. These methods return only
-//! strings accepted by [`is_uuid`]; free text, paths, and malformed IDs yield
-//! `None`. Summary adapters and `live_blocked_status` are display-only.
+//! Every ID returned by `parse_capture` or `live_session_id` eventually enters a shell
+//! command. These methods return only strings accepted by [`is_uuid`]; return `None`
+//! for free text, paths, and malformed IDs. Summary adapters and `live_blocked_status`
+//! are display-only.
 
 pub mod assets;
 mod claude;
@@ -274,8 +274,8 @@ fn capture_id(v: &jzon::JsonValue, key: &str) -> Option<String> {
     is_uuid(id).then(|| id.to_string())
 }
 
-/// Generate a v4 UUID from `/dev/urandom`. A read failure returns `None`, which
-/// lets the caller launch without pinning an ID.
+/// Generate a v4 UUID from `/dev/urandom`. Return `None` on a read failure; launch
+/// without pinning an ID in that case.
 fn uuid_v4() -> Option<String> {
     use std::fmt::Write;
     let mut bytes = [0u8; 16];
@@ -326,8 +326,8 @@ pub(crate) mod fixtures {
     /// A second distinct ID for requote and precedence cases.
     pub(crate) const OTHER: &str = "11111111-2222-4333-8444-555555555555";
 
-    /// Capture-path fixture. The spaced asset paths keep the shell- and
-    /// TOML-quoting assertions honest.
+    /// Capture-path fixture. Include spaces in asset paths to test shell and TOML
+    /// quoting.
     pub(super) fn paths() -> CapturePaths {
         CapturePaths {
             capture_file: PathBuf::from("/tmp/cap/session.json"),
@@ -381,9 +381,8 @@ mod tests {
         }
     }
 
-    /// Both accepted shapes regenerate the canonical resume form while
-    /// preserving the program word as typed; invalid IDs leave the command
-    /// unchanged.
+    /// Regenerate the canonical resume form for both accepted shapes, preserving the
+    /// program word as typed. Keep the command unchanged for invalid IDs.
     #[test]
     fn every_harness_regenerates_the_canonical_resume_form() {
         for a in AGENTS {
@@ -553,8 +552,8 @@ mod tests {
 
     #[test]
     fn registry_detect_routes_to_the_matching_harness() {
-        // The literal count keeps this hand-written routing coverage aligned
-        // with `AGENTS`.
+        // Assert the literal count to detect additions to `AGENTS` missing from this
+        // routing test.
         assert_eq!(AGENTS.len(), 4, "route the new harness's command here");
         let (h, inv) = detect("claude").unwrap();
         assert_eq!(h.shape().0, "claude");

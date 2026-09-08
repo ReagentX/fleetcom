@@ -1,14 +1,13 @@
-//! Terminal parser changes can preserve plain text while shifting cursor state,
-//! styling, or scrollback. These golden tests replay the recorded PTY corpus
+//! Plain text can remain correct after terminal parser changes even with incorrect
+//! cursor state, styling, or scrollback. Replay the recorded PTY corpus
 //! (`tests/corpus`) and report the exact row, cell, or count on a mismatch.
 //!
-//! **Displayed state.** Each fixture pins every final plain-text row via
-//! [`ansi::contents`], cursor position and visibility via
-//! [`ansi::formatted`], and selected styled cells for the fixture's
-//! purpose (see `tests/corpus/README.md`).
+//! **Displayed state.** Verify every final plain-text row via [`ansi::contents`],
+//! cursor position and visibility via [`ansi::formatted`], and selected styled
+//! cells for each fixture (see `tests/corpus/README.md`).
 //!
-//! **Parser semantics.** Targeted fixtures pin exact scrollback retention,
-//! bold-plus-dim intensity stacking, DEC charset translation, and VS16 width.
+//! **Parser semantics.** Verify exact scrollback retention, bold-plus-dim intensity
+//! stacking, DEC charset translation, and VS16 width with targeted fixtures.
 
 use alacritty_terminal::{
     Term,

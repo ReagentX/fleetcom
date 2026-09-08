@@ -15,8 +15,7 @@ use crate::{
 /// Minimum interval between rendered title changes.
 pub const TITLE_MIN_HOLD: Duration = Duration::from_millis(500);
 
-/// Time a lower-ranked candidate must persist before it replaces the rendered
-/// preview.
+/// Hold duration before rendering a lower-ranked preview source.
 pub const DEMOTION_HOLD: Duration = Duration::from_millis(600);
 
 /// Preview text for an alternate-screen child with no usable title.
@@ -28,9 +27,8 @@ pub trait ScreenFacts {
     fn alt_epoch(&self) -> u64;
     fn alternate_screen(&self) -> bool;
     fn title(&self) -> Option<&str>;
-    /// Last sanitized primary-screen title. Printable output and
-    /// alternate-screen transitions do not clear it; an empty title or full
-    /// reset does.
+    /// Last sanitized primary-screen title. Retain across printable output and
+    /// alternate-screen transitions; clear on empty title or full reset.
     fn primary_title(&self) -> Option<&str>;
     fn live_floor(&self) -> String;
     /// Every live-viewport row, trailing padding trimmed: the summary
@@ -82,29 +80,30 @@ pub trait SummaryAdapter: Sync {
     /// removed.
     fn live_preview(&self, rows: &[String]) -> Option<(String, &'static str)>;
 
-    /// Return a model label from stable CLI chrome. The preview cascade
-    /// prepends it to live status as `{label} · `.
+    /// Return a model label from stable CLI chrome. Preview resolution prepends
+    /// the label and ` · ` to the live status.
     fn model_label(&self, rows: &[String]) -> Option<String>;
 
-    /// Normalize a title recognized as this CLI's output. On the alternate
-    /// screen, `None` preserves the captured title verbatim. On the primary
-    /// screen, `None` rejects the retained title and the cascade continues.
+    /// Normalize a title recognized as this CLI's output. On the alternate screen,
+    /// preserve the captured title verbatim for `None`. On the primary screen, reject
+    /// the retained title for `None` and continue resolution.
     fn normalize_title(&self, _title: &str) -> Option<String> {
         None
     }
 }
 
 /// Resolve the instantaneous candidate in descending priority:
+///
 /// 1. harness registry: the caller-provided blocked status
 /// 2. summary adapter: the normalized live status when the CLI's working
 ///    structure is present
 /// 3. alternate screen: the title while its epoch is current, else the marker
-/// 4. primary title: the retained primary-screen announce, only when the
-///    adapter affirmatively normalizes it
+/// 4. primary title: the retained primary-screen title, only when the
+///    adapter recognizes and normalizes it
 /// 5. primary screen: the live floor
 ///
-/// Tiers 1 and 2 both produce an Anchor. The adapter's model label prefixes
-/// either status when available.
+/// Classify tiers 1 and 2 as Anchor. Prefix either status with the adapter's model
+/// label when available.
 fn cascade(
     screen: &impl ScreenFacts,
     adapter: Option<&dyn SummaryAdapter>,
@@ -132,11 +131,10 @@ fn cascade(
     }
     if screen.alternate_screen() {
         return match screen.title() {
-            // The adapter may rewrite the title for display (claude's
-            // rotating spinner-frame prefix canonicalizes so the text
-            // stays constant); capture itself remains program-agnostic.
-            // Source stays Title and rule stays None: rules are anchor
-            // matcher ids, and a rewritten title is still a title.
+            // The adapter normalizes CLI-specific title text, such as Claude's
+            // rotating spinner prefix, so animation does not keep changing the
+            // preview. Capture itself remains program-agnostic. Keep Title and
+            // no rule ID: normalization does not make a title an anchor match.
             Some(text) => Preview {
                 text: adapter
                     .and_then(|a| a.normalize_title(text))
@@ -166,9 +164,9 @@ fn cascade(
             frozen: false,
         };
     }
-    // An indented status line can remain as the idle floor. Trim only the
-    // display candidate: `live_floor` also feeds teardown-snapshot comparison
-    // and must preserve the emulator row verbatim.
+    // An indented status line can remain as the idle floor. Trim only the display
+    // candidate: the emulator row must remain verbatim in `live_floor` for
+    // teardown-snapshot comparison.
     let floor = screen.live_floor();
     let trimmed = floor.trim_start();
     Preview::floor(if trimmed.len() == floor.len() {
@@ -188,18 +186,17 @@ type ResolveKey = (
     Option<(String, &'static str)>,
 );
 
-/// Per-task preview resolution state. A rerun replaces the `Task` and resets
-/// this state.
+/// Per-task preview resolution state. Reset this state when replacing the `Task` on
+/// rerun.
 #[derive(Debug)]
 pub struct PreviewState {
     rendered: Preview,
     /// Last cascade output, carried while the resolution key is unchanged.
     candidate: Preview,
-    /// Start of the demotion hold: the first resolution whose candidate
-    /// ranked below the rendered source. Lower-ranked candidate changes never
-    /// reset it: the timer measures continuous absence of
-    /// rendered-or-higher, so a flapping demoted candidate cannot postpone
-    /// the commit forever.
+    /// Start of the demotion hold: the first resolution whose candidate ranked below
+    /// the rendered source. Keep this timestamp when a lower-ranked candidate changes
+    /// so repeated changes cannot postpone the hold's expiry. The timer measures how
+    /// long no source of the rendered rank or higher has been available.
     downgrade_pending_since: Option<Instant>,
     /// Instant of the last rendered title: the min-hold deadline base.
     last_title_render: Option<Instant>,
@@ -236,12 +233,11 @@ impl PreviewState {
         self.finalized
     }
 
-    /// Resolve the rendered preview against the current screen. `now` is a
-    /// parameter, never read internally, so tests drive the holds with
-    /// synthetic instants. The candidate is recomputed only when the
-    /// resolution key changed; hold expiries commit the carried value
-    /// without a rescan. `adapter` is fixed for the task's lifetime; `blocked`
-    /// changes independently and is part of the resolution key.
+    /// Resolve the rendered preview against the current screen. `now` is a parameter,
+    /// never read internally, so tests drive the holds with synthetic instants. The
+    /// candidate is recomputed only when the resolution key changed; commit the carried
+    /// value on hold expiry without a rescan. `adapter` is fixed for the task's
+    /// lifetime; `blocked` changes independently and is part of the resolution key.
     pub fn resolve(
         &mut self,
         now: Instant,
@@ -279,8 +275,8 @@ impl PreviewState {
                 self.render(self.candidate.clone(), now, alt);
             }
             Ordering::Equal => {
-                // A recovered rank cancels a pending demotion without a
-                // visible change.
+                // Cancel pending demotion without a visible change when the rank
+                // recovers.
                 self.downgrade_pending_since = None;
                 if self.candidate == self.rendered {
                     return;
@@ -288,9 +284,9 @@ impl PreviewState {
                 match self.candidate.source {
                     // Static text: same source, same value.
                     PreviewSource::Marker => {}
-                    // Min-hold: at most one rendered title change per
-                    // `TITLE_MIN_HOLD`, the deadline fixed from the last
-                    // render; the newest carried candidate wins at expiry.
+                    // Min-hold: at most one rendered title change per `TITLE_MIN_HOLD`,
+                    // the deadline fixed from the last render; commit the newest
+                    // carried candidate at expiry.
                     PreviewSource::Title => {
                         let held = self
                             .last_title_render
@@ -351,8 +347,8 @@ impl PreviewState {
         // Finalization excludes registry state because the process has exited.
         let mut fin = cascade(screen, adapter, None);
         if !screen.alternate_screen() && fin.source == PreviewSource::Title {
-            // A retained title survives child exit and may still report a
-            // working or waiting state. Freeze the visible floor instead.
+            // A working or waiting title may still be retained after child exit. Freeze
+            // the visible floor instead.
             fin = cascade(screen, None, None);
         }
         fin.frozen = true;
@@ -495,8 +491,8 @@ mod tests {
         }
     }
 
-    /// The anchor tier outranks the title, carries its rule id, and prepends
-    /// the model label when the adapter reads one.
+    /// Prefer the anchor tier over the title; include its rule ID and prepend the model
+    /// label when available from the adapter.
     #[test]
     fn anchor_outranks_title_and_prepends_the_label() {
         let now = Instant::now();
@@ -518,7 +514,7 @@ mod tests {
             )
         );
 
-        // Without a label the anchor renders the bare status.
+        // Without a label, render the bare status for the anchor.
         let bare = StubAdapter {
             live: Some(("Working", "stub:working")),
             label: None,
@@ -558,7 +554,7 @@ mod tests {
         );
     }
 
-    /// Registry changes invalidate the candidate even when the screen is static.
+    /// Invalidate the candidate on registry changes even when the screen is static.
     #[test]
     fn a_probe_that_changes_on_a_static_screen_reaches_the_cascade() {
         let t0 = Instant::now();
@@ -570,7 +566,7 @@ mod tests {
             "premise: no probe, no anchor"
         );
 
-        // A rank increase renders on the resolution that observes it.
+        // Render a rank increase in the same resolution step.
         let probe = Some(("awaiting approval", "claude:registry-approval"));
         let p = st.resolve(t0, &s, None, probe).clone();
         assert_eq!(
@@ -676,7 +672,7 @@ mod tests {
         assert_eq!((p.text.as_str(), p.source), ("", PreviewSource::Floor));
     }
 
-    /// A retained omp idle title renders its label through the title tier.
+    /// Render the label from a retained omp idle title through the title tier.
     #[test]
     fn a_recognized_primary_title_renders_normalized() {
         let now = Instant::now();
@@ -690,7 +686,7 @@ mod tests {
         );
     }
 
-    /// A retained primary title that the adapter rejects falls to the floor.
+    /// Use the floor when a retained primary title is rejected by the adapter.
     #[test]
     fn a_refused_primary_title_falls_to_the_floor() {
         let now = Instant::now();
@@ -701,7 +697,7 @@ mod tests {
         assert_eq!((p.text.as_str(), p.source), ("shell", PreviewSource::Floor));
     }
 
-    /// Without an adapter, a retained primary title falls to the floor.
+    /// Use the floor for a retained primary title without an adapter.
     #[test]
     fn a_primary_title_without_an_adapter_falls_to_the_floor() {
         let now = Instant::now();
@@ -730,7 +726,7 @@ mod tests {
         );
     }
 
-    /// A primary-title change alone invalidates the resolve key.
+    /// Invalidate the resolve key on a primary-title change alone.
     #[test]
     fn a_primary_title_change_invalidates_the_key() {
         let t0 = Instant::now();
@@ -752,7 +748,7 @@ mod tests {
         );
     }
 
-    /// Rank increases render on the very resolution that observes them.
+    /// Render rank increases in the same resolution step.
     #[test]
     fn promotion_renders_immediately() {
         let now = Instant::now();
@@ -769,8 +765,7 @@ mod tests {
         assert_eq!((p.text.as_str(), p.source), ("app", PreviewSource::Title));
     }
 
-    /// A demotion holds the rendered preview through `DEMOTION_HOLD` and
-    /// commits at expiry.
+    /// Hold the rendered preview through `DEMOTION_HOLD` on demotion; commit at expiry.
     #[test]
     fn demotion_commits_only_after_the_hold() {
         let t0 = Instant::now();
@@ -828,8 +823,8 @@ mod tests {
         );
     }
 
-    /// A flapping pending candidate does not reset the demotion timer, and
-    /// the latest stored candidate commits at expiry.
+    /// Keep the demotion timer unchanged across pending-candidate changes; commit the
+    /// latest stored candidate at expiry.
     #[test]
     fn flapping_pending_keeps_the_timer_and_commits_the_latest() {
         let t0 = Instant::now();
@@ -842,7 +837,7 @@ mod tests {
         // First demoted candidate: the marker.
         s.clear_title();
         st.resolve(t0, &s, None, None);
-        // The pending candidate flaps to a floor; the timer keeps t0.
+        // Change the pending candidate to a floor; keep the timer at t0.
         s.leave_alt();
         s.set_floor("done 3 tests");
         assert_eq!(
@@ -858,8 +853,8 @@ mod tests {
         );
     }
 
-    /// Two title changes inside `TITLE_MIN_HOLD` render nothing; the newest
-    /// carried candidate wins at the deadline.
+    /// Defer rendering for two title changes inside `TITLE_MIN_HOLD`; commit the newest
+    /// carried candidate at the deadline.
     #[test]
     fn title_changes_render_at_most_once_per_min_hold() {
         let t0 = Instant::now();
@@ -892,8 +887,8 @@ mod tests {
         assert_eq!(st.resolve(t0, &s, None, None).text, "compiling bar");
     }
 
-    /// An unchanged resolution key carries the candidate without re-reading
-    /// the grid; a revision bump recomputes.
+    /// With an unchanged resolution key, retain the candidate without re-reading the
+    /// grid; recompute on a revision bump.
     #[test]
     fn unchanged_key_skips_the_candidate_recompute() {
         let t0 = Instant::now();
@@ -957,7 +952,7 @@ mod tests {
         s.set_title("agent: working");
         st.resolve(t0, &s, None, None);
 
-        // The exit's 1049l lands with no live resolution in between.
+        // Apply the exit's 1049l without an intervening live resolution.
         s.leave_alt();
         st.finalize(&s, None);
         let p = st.resolve(t0, &s, None, None).clone();
@@ -985,7 +980,7 @@ mod tests {
         s.set_title("agent: working");
         st.resolve(t0, &s, None, None);
 
-        // Teardown lands and a tick resolves before output completes.
+        // Apply teardown and resolve on a tick before output completion.
         s.leave_alt();
         let p = st.resolve(t0, &s, None, None).clone();
         assert_eq!(
@@ -1050,7 +1045,7 @@ mod tests {
         s.leave_alt();
         assert_eq!(st.resolve(t0, &s, None, None).source, PreviewSource::Title);
 
-        // A real final line lands before exit, inside the hold.
+        // Write a real final line before exit, inside the hold.
         s.set_floor("done");
         st.finalize(&s, None);
         let p = st.resolve(t0, &s, None, None).clone();

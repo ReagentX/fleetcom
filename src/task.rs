@@ -47,8 +47,8 @@ pub struct WriteRefused {
     pub len: usize,
 }
 
-/// Map a dependency error (portable-pty returns `anyhow`) into `io::Error` so
-/// the whole crate speaks stdlib `io::Result` and never grows an `anyhow` dep.
+/// Map a dependency error (`portable-pty` returns `anyhow`) into `io::Error` so
+/// the crate uses `io::Result` without a direct `anyhow` dependency.
 fn io_err(e: impl std::fmt::Display) -> io::Error {
     io::Error::other(e.to_string())
 }
@@ -73,8 +73,8 @@ pub struct Task {
     pub cwd: PathBuf,
     /// Kept for resize (`TIOCSWINSZ`); `try_clone_reader`/`take_writer` borrow it.
     master: Box<dyn MasterPty + Send>,
-    /// Sender for the detached PTY writer worker. `None` after `force_kill`.
-    /// Queuing keeps a blocked PTY write off the core thread.
+    /// Sender for the detached PTY writer worker. `None` after `force_kill`. Queue
+    /// writes to avoid blocking the core thread on PTY I/O.
     input_tx: Option<Sender<Vec<u8>>>,
     /// Bytes admitted to the writer queue but not yet fully written. Two
     /// admitters: the core thread (`queue_write`, client input) and the reader
@@ -133,10 +133,10 @@ pub struct Task {
     reaped: bool,
 }
 
-/// Wake the core loop that this task's screen advanced. Best-effort: the slot is
-/// empty between connections, and a closed channel just means the loop is gone.
-/// Either way the parser already holds the bytes, so a dropped signal only delays
-/// a repaint to the next backstop tick.
+/// Notify the core loop that this task's screen advanced. The slot is empty
+/// between connections, and a closed channel means the loop is gone. The parser
+/// already holds the bytes, so dropping a notification loses no output; a listening
+/// loop can pick up the change on its next backstop tick.
 fn signal(waker: &Waker) {
     if let Ok(slot) = waker.lock()
         && let Some(tx) = slot.as_ref()
@@ -205,11 +205,10 @@ fn wait_code(status: &rustix::process::WaitIdStatus) -> i32 {
 }
 
 impl Task {
-    /// Spawn `exec_command` under `$SHELL -c` in a fresh `rows`×`cols` PTY
-    /// whose grid retains `scrollback` history rows. The task keeps `command`
-    /// for the UI and recipes, while only `exec_command` carries
-    /// instrumentation. The child receives exactly `env`; `waker` notifies
-    /// the core when terminal output arrives.
+    /// Spawn `exec_command` under `$SHELL -c` in a fresh `rows`×`cols` PTY with
+    /// `scrollback` history rows. Retain `command` for the UI and recipes; instrument
+    /// only `exec_command`. Pass exactly `env` to the child and notify the core through
+    /// `waker` on terminal output.
     #[allow(clippy::too_many_arguments)] // All arguments define task launch state.
     pub fn spawn(
         id: u64,
@@ -231,12 +230,10 @@ impl Task {
             })
             .map_err(io_err)?;
 
-        // The launch context's shell, not the daemon's: a zsh client attached
-        // to a bash-started daemon still gets zsh word-splitting. No fallback
-        // through this process's own SHELL: for an autostarted daemon that is
-        // the *first* client's env, the exact coupling per-connection context
-        // exists to remove. A client env without SHELL gets the portable
-        // default.
+        // The daemon inherits the first client's environment, which may name a
+        // different shell from the connecting client's. Read SHELL from the launch
+        // context so a zsh client attached to a bash-started daemon still gets zsh
+        // word-splitting. Without SHELL, use the portable default.
         let shell = env_get(env, "SHELL")
             .map(OsString::from)
             .unwrap_or_else(|| "/bin/sh".into());
@@ -245,10 +242,9 @@ impl Task {
         // shell functions are not loaded.
         cmd.arg("-c");
         cmd.arg(exec_command);
-        // The task runs under the *client's* environment, verbatim: clear the
-        // builder's captured base (the daemon's own env, whatever the client
-        // that first autostarted it happened to have) so nothing leaks through
-        // where the client's env lacks a key.
+        // The builder inherits the daemon's environment. Clear it before applying
+        // the client's environment so keys absent from the client cannot leak in
+        // from the client that first autostarted the daemon.
         cmd.env_clear();
         for (k, v) in env {
             cmd.env(k, v);
@@ -515,8 +511,8 @@ impl Task {
         );
     }
 
-    /// Freeze the preview once output is complete. Any open `?2026` frame is
-    /// landed first.
+    /// Freeze the preview once output is complete. Apply any open `?2026` frame
+    /// first so the preview includes its buffered output.
     pub fn finalize_preview(&mut self) {
         if self.preview.finalized() || !self.output_complete() {
             return;
@@ -564,7 +560,7 @@ impl Task {
         self.queue_write(bytes.to_vec())
     }
 
-    /// Input returns the viewport to live before the bytes are queued.
+    /// Return the viewport to live before queuing input bytes.
     fn snap_live(&mut self) {
         let mut p = grid(&self.parser);
         if p.scrollback() > 0 {

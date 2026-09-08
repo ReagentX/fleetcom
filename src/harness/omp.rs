@@ -73,10 +73,9 @@ mod tests {
         assert_all_opaque(&Omp, ID, &opaque);
     }
 
-    /// Both accepted shapes load the extension and name the capture file, and
-    /// neither gains an ID: omp has no `--session-id`, so a pinned UUID would
-    /// name a session `--resume` cannot reach. The fixture's asset path
-    /// carries a space, so the quoting has to hold it to one word.
+    /// Load the extension and specify the capture file for both accepted shapes. Pin no
+    /// ID: omp has no `--session-id`, so a pinned UUID could not be resumed. Include a
+    /// space in the fixture's asset path to verify quoting as one word.
     #[test]
     fn instrument_loads_the_extension_for_either_accepted_shape() {
         for cmd in ["omp".to_string(), format!("omp --resume {ID}")] {
@@ -98,7 +97,7 @@ mod tests {
         }
     }
 
-    /// The extension payload yields only a validated ID.
+    /// Extract only a validated ID from the extension payload.
     #[test]
     fn parse_capture_returns_only_strict_ids() {
         for reason in ["session_start", "session_switch"] {
@@ -112,7 +111,7 @@ mod tests {
         assert_eq!(Omp.parse_capture("{}"), None);
         assert_eq!(Omp.parse_capture(r#"{"sessionId":"my session"}"#), None);
         assert_eq!(Omp.parse_capture(r#"{"sessionId":"x'; rm -rf ~'"}"#), None);
-        // UUID validation rejects uppercase hex.
+        // Reject uppercase hex during UUID validation.
         assert_eq!(
             Omp.parse_capture(&format!(r#"{{"sessionId":"{}"}}"#, CAPTURED.to_uppercase())),
             None

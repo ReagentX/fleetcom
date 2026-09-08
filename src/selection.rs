@@ -5,8 +5,8 @@ use unicode_width::UnicodeWidthChar;
 
 /// An in-progress drag selection: a pair of 0-based `(row, col)` cells.
 ///
-/// The anchor is the pressed cell and never moves; the head tracks the
-/// pointer. Either may precede the other: [`Selection::extract`] normalizes.
+/// Keep the anchor at the pressed cell and update the head to the pointer position.
+/// Either may precede the other; normalize their order in [`Selection::extract`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Selection {
     anchor: (u16, u16),
@@ -34,14 +34,14 @@ impl Selection {
 
     /// Extract the selected text from `rows`, the rendered screen top-down.
     ///
-    /// Endpoints are ordered by row and column. The first row starts at the
-    /// first endpoint, intermediate rows are included in full, and the final
-    /// row includes the cell under the second endpoint. A boundary inside a
-    /// wide glyph includes the whole glyph. Trailing whitespace is removed
-    /// from each segment, and segments are joined with `\n`.
+    /// Endpoints are ordered by row and column. The first row starts at the first
+    /// endpoint, intermediate rows are included in full, and the cell under the second
+    /// endpoint is included in the final row. Include the whole glyph for a boundary
+    /// inside a wide glyph. Trailing whitespace is removed from each segment, and
+    /// segments are joined with `\n`.
     ///
-    /// Rows below the screen clamp to its last row. Columns beyond a row select
-    /// no text, and an empty screen produces an empty string.
+    /// Clamp rows below the screen to its last row. Select no text for columns beyond a
+    /// row; return an empty string for an empty screen.
     ///
     /// Each selected screen row occupies one joined line, even when its
     /// selected span is empty.
@@ -50,7 +50,7 @@ impl Selection {
             return String::new();
         };
         let (start, end) = self.bounds(last);
-        // `bounds` clamps both rows to `last`, so indexing `rows` is in range.
+        // Both rows are clamped to `last` in `bounds`, so indexing `rows` is in range.
         (start.0..=end.0)
             .map(|row| {
                 self.row_segment(row, &rows[row], last)
@@ -83,8 +83,8 @@ impl Selection {
         (!seg.is_empty()).then_some((col as u16, seg))
     }
 
-    /// Clamp endpoints to the last row, then order them by row and column.
-    /// Clamping first handles endpoints that collapse onto the same row.
+    /// Clamp endpoints to the last row, then order them by row and column. Clamp before
+    /// ordering: both endpoints may be clamped to the same row.
     fn bounds(&self, last: usize) -> ((usize, usize), (usize, usize)) {
         let clamp = |(row, col): (u16, u16)| ((row as usize).min(last), col as usize);
         let (mut start, mut end) = (clamp(self.anchor), clamp(self.head));
@@ -95,10 +95,9 @@ impl Selection {
     }
 }
 
-/// Return the text overlapping display cells `from..=to` and its starting
-/// display column. `None` for `to` extends through the row. Wide glyphs are
-/// included whole, and zero-width characters following a selected glyph are
-/// included with it.
+/// Return the text overlapping display cells `from..=to` and its starting display
+/// column. With `None` for `to`, include the rest of the row. Wide glyphs are included
+/// whole, and zero-width characters following a selected glyph are included with it.
 fn segment_span(row: &str, from: usize, to: Option<usize>) -> Option<(usize, &str)> {
     // Exclusive right edge; `to` is the inclusive cell under the head.
     let to = to.map_or(usize::MAX, |t| t.saturating_add(1));
@@ -109,7 +108,7 @@ fn segment_span(row: &str, from: usize, to: Option<usize>) -> Option<(usize, &st
     for (i, c) in row.char_indices() {
         let w = c.width().unwrap_or(0);
         if w == 0 {
-            // A zero-width tail extends the glyph it follows.
+            // Include zero-width characters with the preceding glyph.
             if taken {
                 end = i + c.len_utf8();
             }
@@ -186,8 +185,7 @@ mod tests {
     #[test]
     fn trailing_padding_is_trimmed_per_row() {
         let rows = screen(&["top   ", "      ", "bottom"]);
-        // The all-space row contributes an empty segment but keeps its
-        // newline slot.
+        // Include an empty segment and its newline for the all-space row.
         assert_eq!(drag((0, 0), (2, 5)).extract(&rows), "top\n\nbottom");
     }
 
@@ -213,11 +211,11 @@ mod tests {
 
     #[test]
     fn zero_width_marks_travel_with_their_glyph() {
-        // VS16 reports zero width on the char walk; it rides in ❤'s cell.
+        // VS16 is zero-width in the char walk and included in ❤'s cell.
         let rows = screen(&["x❤\u{fe0f}y"]);
         assert_eq!(drag((0, 1), (0, 1)).extract(&rows), "❤\u{fe0f}");
         assert_eq!(drag((0, 1), (0, 2)).extract(&rows), "❤\u{fe0f}y");
-        // A combining mark rides with its base.
+        // Include a combining mark with its base.
         let rows = screen(&["e\u{0301}f"]);
         assert_eq!(drag((0, 0), (0, 0)).extract(&rows), "e\u{0301}");
     }
@@ -226,8 +224,8 @@ mod tests {
     fn columns_past_the_row_clamp() {
         let rows = screen(&["ab", "cd"]);
         assert_eq!(drag((0, 40), (0, 90)).extract(&rows), "");
-        // A start column beyond row 0 selects nothing there; row 1 still
-        // yields, and the empty first segment keeps its newline slot.
+        // Select no text beyond row 0's last column, but include row 1 and the empty
+        // first segment's newline.
         assert_eq!(drag((0, 40), (1, 0)).extract(&rows), "\nc");
     }
 
@@ -296,8 +294,8 @@ mod tests {
 
     #[test]
     fn normalization_is_row_major_not_column_major() {
-        // The anchor's column (4) is past the head's (1), but the head is on
-        // a later row: row order decides, not column order.
+        // The anchor's column (4) is past the head's (1), but the head is on a later
+        // row: order by row before column.
         let rows = screen(&["abcde", "fghij"]);
         let fwd = drag((0, 4), (1, 1)).extract(&rows);
         let rev = drag((1, 1), (0, 4)).extract(&rows);

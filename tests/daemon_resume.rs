@@ -280,7 +280,7 @@ fn claude_spawn_save_load_resumes_the_conversation() {
     let settings = PathBuf::from(value_after(&argv, "--settings"));
     assert_daemon_namespaced(&settings, daemon.0.id(), "settings overlay", &argv);
 
-    // The pinned id rides `resume_id` from spawn: one save suffices.
+    // The pinned ID is stored in `resume_id` at spawn: save once to verify it.
     let recipe = save_once(&mut stream, &s.recipe("story"), "story");
     assert!(
         recipe.contains(&format!("claude --resume '{id}'")),

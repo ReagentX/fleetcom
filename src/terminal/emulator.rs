@@ -127,8 +127,8 @@ fn is_digits(s: &str) -> bool {
     !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit())
 }
 
-/// Sanitized-title cap in UTF-8 bytes. Truncation lands on a char boundary,
-/// so the result can undershoot by up to three bytes.
+/// Sanitized-title cap in UTF-8 bytes. Truncate at a character boundary, so the result
+/// can undershoot by up to three bytes.
 const TITLE_MAX_BYTES: usize = 512;
 
 /// The bidi formatting controls stripped from titles: ALM, LRM/RLM, the
@@ -173,8 +173,8 @@ fn sanitize_title(raw: &str) -> String {
     out
 }
 
-/// A sanitized title and the alternate-screen epoch that owns it. Each
-/// alternate-screen entry starts a new epoch.
+/// A sanitized title associated with one alternate-screen epoch. Each alternate-screen
+/// entry starts a new epoch.
 struct CapturedTitle {
     text: String,
     alt_epoch: u64,
@@ -348,12 +348,11 @@ impl Emulator {
         self.land_sync_frame()
     }
 
-    /// Terminate an open `?2026` synchronized update regardless of its
-    /// timeout, landing the buffered frame in the grid; returns any
-    /// allowlisted probe replies the landed bytes generated. Exists for
-    /// reader EOF: every child fd is closed, so the closing ESU can never
-    /// arrive and `flush_expired_sync`'s deadline wait protects nothing:
-    /// the frame is landed, not torn. No-op when no sync is open.
+    /// Apply an open `?2026` synchronized update to the grid without waiting for
+    /// its timeout. Return any allowlisted probe replies the buffered bytes
+    /// generate. At reader EOF, every child fd is closed and no closing ESU can
+    /// arrive, so waiting for `flush_expired_sync` cannot protect an in-flight
+    /// frame. Do nothing when no synchronized update is open.
     pub fn finish_output(&mut self) -> Vec<String> {
         if self.parser.sync_timeout().sync_timeout().is_none() {
             return Vec::new();
@@ -372,9 +371,9 @@ impl Emulator {
         crate::ansi::contents(&self.term)
     }
 
-    /// Which mouse events the child asked for; the most recent DECSET wins
-    /// (the backend keeps the modes mutually exclusive). DECSET 9 (X10) is
-    /// not modeled, so an X10-only child gets no mouse reports.
+    /// Which mouse events the child asked for; use the most recent DECSET (modes are
+    /// kept mutually exclusive by the backend). DECSET 9 (X10) is not modeled, so an
+    /// X10-only child gets no mouse reports.
     pub fn mouse_protocol_mode(&self) -> MouseProtocolMode {
         let mode = self.term.mode();
         if mode.contains(TermMode::MOUSE_MOTION) {
@@ -388,8 +387,8 @@ impl Emulator {
         }
     }
 
-    /// How mouse coordinates are encoded on the wire. SGR wins over UTF-8
-    /// if both bits are set. Each DECSET normally clears the other bit.
+    /// How mouse coordinates are encoded on the wire. Prefer SGR over UTF-8 if both
+    /// bits are set. Normally, the other bit is cleared on each DECSET.
     pub fn mouse_protocol_encoding(&self) -> MouseProtocolEncoding {
         let mode = self.term.mode();
         if mode.contains(TermMode::SGR_MOUSE) {
@@ -493,14 +492,14 @@ impl Emulator {
         self.alt.leave_floor.as_deref()
     }
 
-    /// The window title. On the alternate screen: the captured title,
-    /// honored only while its alt-screen epoch is current; a title from a
-    /// previous alt session reads as `None`. On the primary screen: a live
-    /// staged announce (a title not yet disclaimed by printed output)
-    /// surfaces first, then a still-current captured title.
+    /// The window title. On the alternate screen: the captured title, honored only
+    /// while its alt-screen epoch is current; a title from a previous alt session reads
+    /// as `None`. On the primary screen: a live staged announce (a title still staged
+    /// because no printable output has been parsed) surfaces first, then a
+    /// still-current captured title.
     pub fn title(&self) -> Option<&str> {
-        // Surface a staged primary-screen title until printable output
-        // disclaims it or an alternate-screen entry claims it.
+        // Surface a staged primary-screen title until printable output is parsed or the
+        // alternate screen is entered.
         if !self.alternate_screen()
             && let Some(staged) = self.alt.staged_title.as_deref()
         {
@@ -585,10 +584,9 @@ fn live_row_text_of(term: &Term<ProbeSink>, row: i32) -> String {
     text
 }
 
-/// Alternate-screen and title state updated at parser-event boundaries. Each
-/// nonempty sanitized primary-screen title is retained and staged. An
-/// alternate-screen entry consumes the staged copy unless printable output
-/// disclaims it first.
+/// Alternate-screen and title state updated at parser-event boundaries. Each nonempty
+/// sanitized primary-screen title is retained and staged. On alternate-screen entry,
+/// consume the staged copy unless already discarded on printable output.
 #[derive(Default)]
 struct AltScreen {
     /// Count of alt-screen entries. Compared against
@@ -607,12 +605,10 @@ struct AltScreen {
     /// Sanitized title owned by an alt session, epoch-stamped at its event.
     title: Option<CapturedTitle>,
     /// Sanitized title announced on the primary screen and awaiting the next
-    /// alternate-screen entry. Printable output disclaims it; a reset clears
-    /// it.
+    /// alternate-screen entry. Discard on printable output or reset.
     staged_title: Option<String>,
-    /// Last sanitized primary-screen title. Unlike `staged_title`, printable
-    /// output and alternate-screen entry do not clear it. An empty title or
-    /// reset does.
+    /// Last sanitized primary-screen title. Unlike `staged_title`, retain across
+    /// printable output and alternate-screen entry. Clear on empty title or reset.
     primary_title: Option<String>,
     /// Mirror of the backend's raw (unsanitized) current title, kept only
     /// so the title-stack shadow pushes what the backend pushes.
@@ -637,11 +633,10 @@ const TITLE_STACK_SHADOW_MAX: usize = 4096;
 ///
 /// # Synchronized updates
 ///
-/// The parser buffers a synchronized-update frame and drives the handler
-/// only when the frame lands (in `advance` or `stop_sync`, both routed
-/// through this wrapper), so these events fire exactly when the grid
-/// moves: the observer can never see a transition the grid has not
-/// performed, which no byte-scanner could guarantee.
+/// Synchronized-update frames are buffered by the parser and applied through the
+/// handler only in `advance` or `stop_sync`, both routed through this wrapper. Observe
+/// transitions as they are applied to the grid; a byte scan could detect transitions
+/// before buffered updates are applied.
 struct ObservedTerm<'a> {
     term: &'a mut Term<ProbeSink>,
     alt: &'a mut AltScreen,
@@ -655,9 +650,8 @@ impl ObservedTerm<'_> {
         let alt = self.term.mode().contains(TermMode::ALT_SCREEN);
         if alt && !self.alt.last_alt {
             self.alt.epoch += 1;
-            // Promote a staged primary-screen announce into the new epoch:
-            // the announce belongs to exactly this entry, so promotion
-            // consumes it.
+            // Promote a staged primary-screen announce into the new epoch: consume the
+            // staged copy so it cannot be reused for another entry.
             if let Some(text) = self.alt.staged_title.take() {
                 self.alt.title = Some(CapturedTitle {
                     text,
@@ -671,10 +665,10 @@ impl ObservedTerm<'_> {
         self.alt.last_alt = alt;
     }
 
-    /// Assign a sanitized title to the current alternate-screen epoch, or
-    /// stage and retain it when on the primary screen. An empty title clears
-    /// captured, staged, and retained titles. Printable output, but not
-    /// control traffic, disclaims a staged title.
+    /// Assign a sanitized title to the current alternate-screen epoch, or stage and
+    /// retain it when on the primary screen. Clear captured, staged, and retained
+    /// titles on an empty title. Discard a staged title on printable output, but retain
+    /// it across control traffic.
     fn observe_title(&mut self, title: Option<String>) {
         self.alt.raw_title.clone_from(&title);
         let text = title
@@ -709,12 +703,12 @@ macro_rules! delegate {
     };
 }
 
-/// Handler delegation. Five methods also update observed state:
-/// `set_private_mode`, `unset_private_mode`, and `reset_state` observe the
-/// alt bit (RIS exits the alt screen too); `set_title` observes title
-/// ownership; `input` disclaims a staged title. `push_title`/`pop_title`
-/// maintain the shadow stack because the backend's pop restores through
-/// its own internal `set_title`, which never re-enters this wrapper.
+/// Handler delegation. Five methods also update observed state: `set_private_mode`,
+/// `unset_private_mode`, and `reset_state` observe the alt bit (RIS exits the alt
+/// screen too); `set_title` observes title ownership; discard a staged title in
+/// `input`. `push_title`/`pop_title` maintain the shadow stack because the backend's
+/// pop restores through its own internal `set_title`, which never re-enters this
+/// wrapper.
 impl Handler for ObservedTerm<'_> {
     fn set_title(&mut self, a0: Option<String>) {
         self.term.set_title(a0.clone());
@@ -726,7 +720,7 @@ impl Handler for ObservedTerm<'_> {
     }
     fn input(&mut self, a0: char) {
         self.term.input(a0);
-        // Printable output disclaims a staged primary-screen title.
+        // Discard a staged primary-screen title on printable output.
         if self.alt.staged_title.is_some() {
             self.alt.staged_title = None;
         }
@@ -872,8 +866,8 @@ mod tests {
 
     use super::*;
 
-    /// The allowlist accepts only the advertised response shapes and rejects
-    /// other backend responses, malformed variants, and unknown strings.
+    /// Accept only advertised response shapes; reject other backend responses,
+    /// malformed variants, and unknown strings.
     #[test]
     fn probe_allowlist_forwards_only_the_advertised_shapes() {
         // Allowed: CPR, DSR-5 ok, primary DA.
@@ -1055,7 +1049,7 @@ mod tests {
         );
     }
 
-    /// An oversized store clears its selector and records its length.
+    /// Clear the selector and record its length on an oversized store.
     #[test]
     fn osc52_oversized_store_supersedes_its_kind_and_records_length() {
         let mut emu = Emulator::new(4, 20, 0);
@@ -1109,9 +1103,9 @@ mod tests {
         assert!(emu.contents().contains("and on"));
     }
 
-    /// The end-of-life landing `finish_output` exists for: BSU, output, no
-    /// ESU ever. The frame must land without waiting out the sync timeout,
-    /// and a clean emulator must pass through untouched.
+    /// BSU followed by output and no ESU leaves a buffered frame at EOF.
+    /// `finish_output` must apply it without waiting for the sync timeout and
+    /// leave an emulator with no open frame unchanged.
     #[test]
     fn finish_output_lands_an_open_sync_frame() {
         let mut emu = Emulator::new(4, 20, 0);
@@ -1131,7 +1125,7 @@ mod tests {
             "finish_output must land the frame with the timeout still pending"
         );
 
-        // The emulator parses normally after the landing.
+        // Applying the buffered frame must leave the parser usable.
         emu.process(b" and on");
         assert!(emu.contents().contains("and on"));
     }
@@ -1333,8 +1327,7 @@ mod tests {
             let z = grid[Line(1)][Column(col)]
                 .zerowidth()
                 .expect("sprayed cell lost its marks entirely");
-            // Exactly the cap: truncation keeps the first marks, it does not
-            // clear the cell.
+            // At the cap, keep the first marks without clearing the cell.
             assert_eq!(z.len(), MAX_ZEROWIDTH, "column {col}");
             assert!(z.iter().all(|&m| m == '\u{0301}'));
         }
@@ -1352,7 +1345,7 @@ mod tests {
                        \x1b[0m\x1b]8;;\x1b\\";
         emu.process(cluster.as_bytes());
 
-        // CUP keeps the filler on row 2 while enough bytes trigger a scan.
+        // Use CUP to keep filler on row 2 while supplying enough bytes for a scan.
         let filler = format!("\x1b[2;1H{}", "x".repeat(64)).repeat(1024);
         let mut fed = cluster.len();
         while fed < SWEEP_INTERVAL_BYTES {
@@ -1400,7 +1393,7 @@ mod tests {
         assert!(line < 0);
         assert_eq!(len, 4096, "excess must predate the sweep");
 
-        // CUP keeps filler on the last row so the history position is stable.
+        // Use CUP to keep filler on the last row without changing the history position.
         let filler = "\x1b[4;1Hxxxxxxxx".repeat(1024);
         let mut fed = spam.len() + 12;
         while fed < SWEEP_INTERVAL_BYTES {
@@ -1496,8 +1489,8 @@ mod tests {
         assert_eq!(emu.title(), Some("app"));
     }
 
-    /// Printable primary-screen output disclaims a staged title; control-only
-    /// traffic leaves it available for the next alternate-screen entry.
+    /// Discard a staged title on printable primary-screen output; retain it across
+    /// control-only traffic for the next alternate-screen entry.
     #[test]
     fn title_before_alt_entry_in_a_prior_chunk_expires() {
         let mut emu = Emulator::new(4, 20, 0);
@@ -1535,9 +1528,9 @@ mod tests {
         }
     }
 
-    /// grok's announce shape: a primary-screen title, a control-only gap
-    /// (clears and cursor moves), then the alt entry. Honored on either
-    /// read boundary, because control traffic never disclaims staging.
+    /// grok's announce shape: a primary-screen title, a control-only gap (clears and
+    /// cursor moves), then the alt entry. Accept on either read boundary: staging is
+    /// retained across control traffic.
     #[test]
     fn staged_title_survives_a_control_only_gap_into_the_entry() {
         for split in [false, true] {
@@ -1553,9 +1546,9 @@ mod tests {
         }
     }
 
-    /// One printed glyph between a primary-screen title and the entry
-    /// disclaims the staging: a prompt-titling shell never leaks its title
-    /// into the next app.
+    /// Discard the staged title after one printed glyph between a primary-screen title
+    /// and alternate-screen entry: do not associate a shell prompt title with the next
+    /// app.
     #[test]
     fn staged_title_is_disclaimed_by_a_single_glyph() {
         let mut emu = Emulator::new(4, 20, 0);
@@ -1575,8 +1568,8 @@ mod tests {
         assert_eq!(emu.title(), Some("handoff"));
     }
 
-    /// Each alt entry advances the epoch and expires prior titles; leaving
-    /// does not advance it, so a title stays honored across the exit.
+    /// Advance the epoch and expire prior titles on each alt entry. Retain the epoch
+    /// and its title on exit.
     #[test]
     fn each_alt_entry_advances_the_epoch() {
         let mut emu = Emulator::new(4, 20, 0);
@@ -1590,9 +1583,9 @@ mod tests {
         assert_eq!(emu.title(), None, "re-entry expires the previous title");
     }
 
-    /// A title followed by leaving the alt screen: the title event fires
-    /// while the alt screen is still active, capturing into the current
-    /// epoch, and the exit keeps the epoch, so it stays honored.
+    /// A title followed by leaving the alt screen: the title event fires while the alt
+    /// screen is still active, capturing into the current epoch, and the epoch is
+    /// retained on exit, so the title remains valid.
     #[test]
     fn title_just_before_alt_exit_stays_honored() {
         let mut emu = Emulator::new(4, 20, 0);
@@ -1603,7 +1596,7 @@ mod tests {
         assert_eq!(emu.title(), Some("done"));
     }
 
-    /// Printable output clears the staged title but not the retained title.
+    /// Clear the staged title on printable output; keep the retained title.
     #[test]
     fn primary_title_survives_the_printable_output_that_disclaims_staging() {
         let mut emu = Emulator::new(4, 20, 0);
@@ -1615,7 +1608,7 @@ mod tests {
         assert_eq!(emu.primary_title(), Some("omp"), "retained: survives it");
     }
 
-    /// The latest nonempty primary-screen title replaces the retained title.
+    /// Replace the retained title with the latest nonempty primary-screen title.
     #[test]
     fn primary_title_is_overwritten_by_a_newer_announce() {
         let mut emu = Emulator::new(4, 20, 0);
@@ -1625,7 +1618,7 @@ mod tests {
         assert_eq!(emu.primary_title(), Some("\u{3c0} > check"));
     }
 
-    /// An empty title or RIS clears the retained primary-screen title.
+    /// Clear the retained primary-screen title on empty title or RIS.
     #[test]
     fn empty_announce_and_reset_clear_the_primary_title() {
         let mut emu = Emulator::new(4, 20, 0);
@@ -1640,8 +1633,7 @@ mod tests {
         assert_eq!(emu.primary_title(), None, "RIS clears");
     }
 
-    /// Alternate-screen title changes do not replace the retained primary
-    /// title.
+    /// Keep the retained primary title across alternate-screen title changes.
     #[test]
     fn primary_title_is_unaffected_by_an_alt_round_trip() {
         let mut emu = Emulator::new(4, 20, 0);
@@ -1659,9 +1651,9 @@ mod tests {
         assert_eq!(emu.primary_title(), Some("shell"));
     }
 
-    /// The end-of-life landing runs the same bookkeeping as `process`: a
-    /// title and alt entry buffered inside a never-closed ?2026 frame must
-    /// count when `finish_output` lands it.
+    /// The end-of-life landing runs the same bookkeeping as `process`: a title and alt
+    /// entry buffered inside a never-closed ?2026 frame must count when applied in
+    /// `finish_output`.
     #[test]
     fn finish_output_runs_the_advance_bookkeeping() {
         let mut emu = Emulator::new(4, 20, 0);
@@ -1675,8 +1667,8 @@ mod tests {
         assert_eq!(emu.title(), Some("app"));
     }
 
-    /// An expired synchronized frame updates the revision, alternate-screen
-    /// epoch, and title when it lands.
+    /// Update the revision, alternate-screen epoch, and title when applying an expired
+    /// synchronized frame.
     #[test]
     fn flush_expired_sync_runs_the_advance_bookkeeping() {
         let mut emu = Emulator::new(4, 20, 0);
@@ -1717,8 +1709,8 @@ mod tests {
         assert_eq!(emu.revision(), before + 1);
     }
 
-    /// The alternate-screen exit snapshot captures the restored floor before
-    /// any following bytes, including bytes coalesced into the same read.
+    /// Snapshot the restored floor on alternate-screen exit before parsing following
+    /// bytes, including bytes coalesced into the same read.
     #[test]
     fn alt_leave_floor_snapshots_the_restore() {
         let mut emu = Emulator::new(4, 20, 0);
@@ -1746,8 +1738,8 @@ mod tests {
         assert_eq!(emu.live_floor(), "coalesced");
     }
 
-    /// A leave and re-entry within one read advances the epoch and expires the
-    /// preceding alternate-screen title.
+    /// Advance the epoch and expire the preceding alternate-screen title on leave and
+    /// re-entry within one read.
     #[test]
     fn same_read_alt_bounce_advances_the_epoch_and_expires_the_title() {
         let mut emu = Emulator::new(4, 20, 0);

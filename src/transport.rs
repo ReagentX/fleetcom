@@ -20,9 +20,9 @@ use crate::{
     supervisor::{Supervisor, resolve_scrollback},
 };
 
-/// How the client is leaving, chosen by the exit key/signal. Only
-/// `SocketTransport` honors the difference: an in-process core has no daemon to
-/// leave running, so both intents kill everything there.
+/// How the client is leaving, chosen by the exit key/signal. Distinguish these intents
+/// only in `SocketTransport`. With no daemon to leave running in an in-process core,
+/// kill all tasks for either intent.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ExitIntent {
     /// Detach this client; the daemon and its tasks keep running.
@@ -31,8 +31,9 @@ pub enum ExitIntent {
     Quit,
 }
 
-/// The client↔core seam. Deliberately one-way-each: commands never return a
-/// value (results arrive as events), which is exactly what a socket enforces.
+/// Client↔core communication through commands and events. Commands return no
+/// result directly; results arrive as events, preserving the same interface
+/// for in-process channels and sockets.
 pub trait Transport {
     /// Dispatch a command to the core.
     fn send(&mut self, cmd: Command);
@@ -42,10 +43,10 @@ pub trait Transport {
     /// disconnects (the daemon died, or an in-process core panicked), which the
     /// client surfaces instead of freezing on a stale mirror.
     fn connected(&self) -> bool;
-    /// Tear down per `intent` before the client restores the terminal. `Quit`
-    /// requests core shutdown; `Disconnect` closes only the client connection.
-    /// An implementation may impose a deadline, then close its connection so a
-    /// stalled core cannot block terminal restoration indefinitely.
+    /// Tear down per `intent` before the client restores the terminal. On `Quit`,
+    /// request core shutdown; on `Disconnect`, close only the client connection. An
+    /// implementation may impose a deadline, then close its connection so a stalled
+    /// core cannot block terminal restoration indefinitely.
     fn shutdown(&mut self, intent: ExitIntent);
 }
 
@@ -153,8 +154,8 @@ impl Drop for ThreadTransport {
     }
 }
 
-/// Maximum encoded command frames awaiting the writer. `send` uses `try_send`:
-/// saturation closes the transport instead of blocking the caller.
+/// Maximum encoded command frames awaiting the writer. `send` uses `try_send`: close
+/// the transport on saturation instead of blocking the caller.
 const SEND_QUEUE: usize = 64;
 
 /// The core as a separate process (`fleetcom --daemon`), reached over a Unix
@@ -181,11 +182,10 @@ pub struct SocketTransport {
 }
 
 impl SocketTransport {
-    /// Build from three handles to one stream: `write` feeds the writer thread,
-    /// `read` feeds the reader thread, and `ctrl` remains available for forced
-    /// shutdowns. Callers duplicate the handles before construction so cloning
-    /// errors remain at the call site. `wait_tx` wakes the client for each
-    /// inbound event.
+    /// Build from three handles to one stream: use `write` in the writer thread and
+    /// `read` in the reader thread; retain `ctrl` for forced shutdowns. Callers
+    /// duplicate the handles before construction so cloning errors remain at the call
+    /// site. `wait_tx` wakes the client for each inbound event.
     pub fn from_halves(
         write: UnixStream,
         read: UnixStream,

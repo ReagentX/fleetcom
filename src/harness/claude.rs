@@ -66,7 +66,7 @@ impl Harness for Claude {
         home: Option<&Path>,
     ) -> Option<(String, &'static str)> {
         let rec = record_for_pid(pid, cwd, spawned, home)?;
-        // Only `waiting` overrides the screen-derived preview.
+        // Override the screen-derived preview only for `waiting`.
         rec.waiting
             .then(|| waiting_preview(rec.waiting_for.as_deref()))
     }
@@ -340,7 +340,7 @@ mod tests {
         assert!(record_for_pid(7, &tmp.join("gone"), spawned, Some(&home)).is_none());
     }
 
-    /// The process start rejects a stale record with a matching PID and CWD.
+    /// Reject a stale record with matching PID and CWD based on process start time.
     #[test]
     fn record_for_pid_rejects_a_recycled_pids_stale_record() {
         let home = temp("claude_registry_recycled");

@@ -1,6 +1,6 @@
 # `fleetcom`
 
-`fleetcom` supervises your local development fleet: multiplexers, application servers, REPLs, builds, tests, and AI agent sessions.
+Use `fleetcom` to supervise your local development fleet: multiplexers, application servers, REPLs, builds, tests, and AI agent sessions.
 
 ## Key Features
 
@@ -24,32 +24,32 @@ Press `Enter` to take control of a task, then `Ctrl-\` to return to the dashboar
 
 ### Custom groups
 
-Organize related tasks into named groups, even when they run in different directories.
+Organize related tasks into named groups across working directories.
 
 ![`fleetcom` custom-group view](docs/img/groups.png)
 
 ### Resume agent sessions
 
-Start `claude`, `codex`, `grok`, or `omp` normally. When you rerun the task or reload a saved session, `fleetcom` resumes the conversation when its ID is known; otherwise, it runs the authored command.
+Start `claude`, `codex`, `grok`, or `omp` normally. Rerun the task or reload a saved session to resume the conversation.
 
 ## Operational model
 
-Running several long-lived commands is pesky once they span terminal panes or need to survive a disconnect. `fleetcom`:
+Managing several long-lived commands across terminal panes is pesky, especially when you need to reconnect later. With `fleetcom`:
 
-- Runs each command in its own PTY and groups tasks by state, working directory, or named group.
-- Delegates tasks to a daemon, so a disconnecting client stops nothing.
-- Saves and reloads task recipes: directories, commands, group assignments, and display names.
-- Reruns a completed task in place, keeping its identity, group, and name.
-- Captures `claude`, `codex`, `grok`, and `omp` conversation IDs for saved and rerun tasks.
-- Automatically snapshots the current task set for recovery.
+- Run each command in its own PTY and group tasks by state, working directory, or named group.
+- Keep tasks running under a daemon across client disconnects.
+- Save and reload task recipes: directories, commands, group assignments, and display names.
+- Rerun a completed task in place, keeping its identity, group, and name.
+- Save and rerun `claude`, `codex`, `grok`, and `omp` tasks with captured conversation IDs.
+- Recover the current task set from automatic snapshots.
 
 ## Documentation
 
-The [`docs/`](docs/README.md) directory covers configuration, on-disk state, session files, resuming supported agent sessions, commands, and a complete first run.
+See [`docs/`](docs/README.md) for configuration, on-disk state, session files, resuming supported agent sessions, commands, and a complete first run.
 
 ## Installation
 
-Unix only: it relies on PTYs and process-group signals (`killpg`).
+Unix only: PTYs and process-group signals (`killpg`) are required.
 
 ### Cargo (recommended)
 
@@ -59,7 +59,7 @@ For normal use, install the published crate from [crates.io](https://crates.io/c
 cargo install fleetcom
 ```
 
-[Source installation](docs/README.md#installation-from-source) covers builds from a repository clone.
+See [Source installation](docs/README.md#installation-from-source) to build from a repository clone.
 
 ## Usage
 
@@ -69,13 +69,13 @@ Connect to the daemon, autostarting it when necessary, and open the dashboard by
 fleetcom
 ```
 
-The [invocation reference](docs/commands.md#invocation) covers sessions, foreground mode, scrollback, and daemon shutdown.
+See the [invocation reference](docs/commands.md#invocation) for sessions, foreground mode, scrollback, and daemon shutdown.
 
 ## Key Commands
 
 ### Dashboard
 
-The dashboard shows two short key hints; `?` opens an expanded key reference:
+Use the two dashboard hints for common actions; press `?` for the expanded key reference:
 
 ```text
   ❯ n run · @ dir · / find · s sort
@@ -84,35 +84,35 @@ The dashboard shows two short key hints; `?` opens an expanded key reference:
 
 ### Attached
 
-- `Ctrl-\` backgrounds the task and returns to the dashboard.
+- Press `Ctrl-\` to background the task and return to the dashboard.
 - Other supported input is forwarded to the task's PTY.
 
-[`docs/commands.md`](docs/commands.md#dashboard) covers every key and launch flag, including the routing mechanics.
+See [`docs/commands.md`](docs/commands.md#dashboard) for every key and launch flag, including the routing mechanics.
 
 ## How it works
 
-Every task runs in its own pseudo-terminal, emulated with `alacritty_terminal`. The dashboard preview, peek overlay, and attached view all read the same emulated screen grid, so full-screen programs such as `vim` and `htop` retain one consistent terminal state across views. [`docs/how-it-works.md`](docs/how-it-works.md) documents the terminal emulation, input routing, and activity grouping.
+`fleetcom` runs each task in a separate pseudo-terminal, emulated with `alacritty_terminal`. The dashboard preview, peek overlay, and attached view all read the same emulated screen grid. This preserves terminal state as you move between views, including for full-screen programs such as `vim` and `htop`. See [`docs/how-it-works.md`](docs/how-it-works.md) for terminal emulation, input routing, and activity grouping.
 
 ## Scope and tradeoffs
 
-`fleetcom` targets concurrent build, test, watch, server, and interactive-agent processes. Each task is one command rather than a persistent shell session.
+Use `fleetcom` for concurrent build, test, watch, server, and interactive-agent processes. Each task is one command rather than a persistent shell session.
 
 ### When to use `fleetcom`
 
-- Several long-lived commands need one place for observation, tagging, and attachment.
-- Jobs must survive a terminal closing and remain available for reattachment.
+- You need one place to observe, tag, and attach to several long-lived commands.
+- You need to reattach to jobs after closing a terminal.
 - The same command set is launched often enough to justify a saved session.
 - Captured agent conversations (`claude`, `codex`, `grok`, `omp`) should resume on rerun.
 
 ### When to avoid `fleetcom`
 
-- You primarily need persistent interactive shell workspaces; use `tmux` or `zellij` directly. `fleetcom` can supervise a multiplexer, but it does not replace one.
+- You primarily need persistent interactive shell workspaces; use `tmux` or `zellij` directly. You can supervise a multiplexer with `fleetcom`, but cannot use it as a persistent shell workspace.
 - You need a full process manager: the fleet’s lifetime is bounded by the daemon’s.
 
 ### Operational limits
 
-- The fleet dies with the daemon: the daemon process is the fleet's single point of failure.
-- Commands run through the client's non-interactive shell (`$SHELL -c`, or `/bin/sh` when `SHELL` is unset), so functions and aliases defined in `~/.zshrc` are not available.
-- The daemon serves one client at a time.
+- The fleet's lifetime is bounded by the daemon's: the daemon process is the single point of failure.
+- Commands are executed through the client's non-interactive shell (`$SHELL -c`, or `/bin/sh` when `SHELL` is unset), so functions and aliases defined in `~/.zshrc` are not available.
+- Only one client can be connected to the daemon at a time.
 
-[Operational constraints](docs/README.md#operational-constraints) documents the shutdown and signal mechanics.
+See [Operational constraints](docs/README.md#operational-constraints) for shutdown and signal mechanics.

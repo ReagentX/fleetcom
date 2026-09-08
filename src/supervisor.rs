@@ -64,7 +64,7 @@ const MAX_SCROLLBACK: usize = 100_000;
 /// Process-local value supplied by `--scrollback`.
 static SCROLLBACK_FLAG: OnceLock<usize> = OnceLock::new();
 
-/// Install the `--scrollback` flag value. The first call wins.
+/// Install the `--scrollback` flag value. Ignore subsequent calls.
 pub fn set_scrollback_flag(lines: usize) {
     let _ = SCROLLBACK_FLAG.set(lines);
 }
@@ -82,9 +82,8 @@ pub fn resolve_scrollback() -> usize {
     )
 }
 
-/// Resolve explicit scrollback sources. The flag takes precedence; invalid
-/// environment values use the default; overrides are clamped; zero disables
-/// history.
+/// Resolve explicit scrollback sources. The flag takes precedence; use the default for
+/// invalid environment values; clamp overrides; disable history for zero.
 fn effective_scrollback(flag: Option<usize>, env: Option<&str>) -> usize {
     flag.or_else(|| env.and_then(|v| v.parse().ok()))
         .map_or(DEFAULT_SCROLLBACK, |lines| lines.min(MAX_SCROLLBACK))
@@ -161,9 +160,8 @@ fn harness_home(env: &[(OsString, OsString)], h: &dyn harness::Harness) -> Optio
     h.resolve_home(&|key| env_get(env, key).map(PathBuf::from))
 }
 
-/// Whether `cmd` may change the task set or fields serialized by
-/// `session_config`. Exhaustive matching requires every command variant to
-/// declare its recovery effect.
+/// Whether `cmd` may change the task set or fields serialized by `session_config`.
+/// Match exhaustively to classify the recovery effect of every command variant.
 fn affects_recipe(cmd: &Command) -> bool {
     match cmd {
         Command::Spawn { .. }
@@ -236,8 +234,8 @@ pub struct Supervisor {
     /// leader's zombie is collected. Invisible to `tick` snapshots, so the row
     /// disappears instantly while the sweep runs behind it.
     ///
-    /// Entries keep their leader's zombie until SIGKILL has been sent:
-    /// collecting it earlier would release the process-group ID.
+    /// Retain each leader's zombie until SIGKILL has been sent: collecting it earlier
+    /// would release the process-group ID.
     graveyard: Vec<Task>,
     next_id: u64,
     /// PTY content size (rows already minus the client's status bar). Every task
@@ -258,10 +256,10 @@ pub struct Supervisor {
     /// Spawning is refused until one is installed.
     launch: Option<LaunchContext>,
     events: Vec<Event>,
-    /// Handed to every `Task` so its reader thread can wake the core loop when the
-    /// PTY produces output. The serving loop installs its sender on connect
-    /// (`set_waker`) and drops it on disconnect (`clear_waker`); between clients
-    /// it is `None`, so an unattached daemon's task output accumulates cost-free.
+    /// Handed to every `Task` so its reader thread can wake the core loop when the PTY
+    /// produces output. Install the serving loop's sender on connect (`set_waker`) and
+    /// drop it on disconnect (`clear_waker`). Between clients it is `None`; task output
+    /// is parsed without waking a serving loop.
     waker: Waker,
     /// TERM→KILL escalation window. `KILL_GRACE` in production; a field so tests
     /// shrink it instead of sleeping through real seconds.
@@ -582,7 +580,7 @@ impl Supervisor {
             self.recovery.dirty = false;
             return;
         }
-        // A missing config root disables this pass.
+        // Skip this pass without a config root.
         let Some(root) = self.sessions_root() else {
             self.recovery.dirty = false;
             return;
@@ -729,9 +727,8 @@ impl Supervisor {
         Some(self.capture.entry(key).or_insert(installed))
     }
 
-    /// Spawn a direct command, rerun, or session entry. Agent instrumentation
-    /// changes only the executed shell string; the task keeps the requested
-    /// command for display and persistence.
+    /// Spawn a direct command, rerun, or session entry. Instrument only the executed
+    /// shell string; retain the requested command for display and persistence.
     fn spawn_task(
         &mut self,
         id: u64,
@@ -823,9 +820,9 @@ impl Supervisor {
         }
     }
 
-    /// Rerun a finished task in place while preserving its ID, tag, group, and
-    /// name. If the task has a captured agent session, the replacement resumes
-    /// the best-known ID.
+    /// Rerun a finished task in place while preserving its ID, tag, group, and name. If
+    /// the task has a captured agent session, resume the best-known ID in the
+    /// replacement.
     fn rerun(&mut self, id: u64) {
         let Some(i) = self.index_of(id) else {
             self.status(format!("rerun failed: no task {id}"));
@@ -847,16 +844,16 @@ impl Supervisor {
             let command = Self::recipe_command(old);
             (command, old.cwd.clone())
         };
-        // Preserve the finished task if its replacement cannot start. The run
-        // number gives the replacement a distinct capture file.
+        // Preserve the finished task if its replacement cannot start. Use a distinct
+        // run number to isolate the replacement's capture file.
         let run = self.tasks[i].run + 1;
         match self.spawn_task(id, run, &command, &cwd, &launch.env) {
             Ok(mut fresh) => {
                 fresh.tagged = self.tasks[i].tagged;
                 fresh.group = self.tasks[i].group.clone();
                 fresh.name = self.tasks[i].name.clone();
-                // Derive the resume command before retirement removes the
-                // displaced run's capture file.
+                // Derive the resume command before removing the displaced run's capture
+                // file during retirement.
                 let old = std::mem::replace(&mut self.tasks[i], fresh);
                 self.retire(old);
                 // Reset the fingerprint for the replacement task's screen.
@@ -900,13 +897,13 @@ impl Supervisor {
     }
 
     /// Session-recipe root for this connection: `FLEETCOM_CONFIG_DIR` from the
-    /// installed launch context's env, else this process's
-    /// [`session::sessions_dir`]. The launch context wins because the daemon's
-    /// own env is frozen from whichever client first autostarted it, so save,
-    /// load, and list must all read the *connecting* client's override. A
-    /// client whose `HOME` alone differs still falls to the daemon's
-    /// `dirs::config_dir()`: resolving `dirs` against a foreign env would mean
-    /// reimplementing it, and `FLEETCOM_CONFIG_DIR` is the supported override.
+    /// installed launch context's env, else this process's [`session::sessions_dir`].
+    /// Prefer the launch context because the daemon's own env is frozen from whichever
+    /// client first autostarted it, so save, load, and list must all read the
+    /// *connecting* client's override. A client whose `HOME` alone differs still falls
+    /// to the daemon's `dirs::config_dir()`: resolving `dirs` against a foreign env
+    /// would mean reimplementing it, and `FLEETCOM_CONFIG_DIR` is the supported
+    /// override.
     fn sessions_root(&self) -> Option<PathBuf> {
         session::sessions_dir(self.launch_env_path(session::FLEETCOM_CONFIG_DIR))
     }

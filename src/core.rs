@@ -1,20 +1,17 @@
 //! The core event loop, shared by the daemon (`daemon::serve_client`) and the
-//! in-process foreground core (`transport::ThreadTransport`). Both drive one
-//! `Supervisor` identically: block until something happens (a client `Command`,
-//! or a task producing PTY output), apply it, then tick and ship the resulting
-//! `Event`s.
+//! in-process foreground core (`transport::ThreadTransport`). Drive one
+//! `Supervisor` in either mode: block until a client `Command` or PTY output is
+//! available, apply it, then tick and send the resulting `Event`s.
 //!
-//! It is fully event-driven. The loop waits on a single `Wake` channel that both
-//! the command source *and* every task's reader thread feed, so there is no fixed
-//! polling cadence: an idle core sleeps, and an attached keystroke's echo ships
-//! within a frame of the child emitting it. No round-trip stall. Two timers
-//! bound the extremes, neither on the interactive path:
+//! Block on a single `Wake` channel, fed by the command source and every task's
+//! reader thread. With no fixed polling cadence, an attached keystroke's echo is
+//! sent within a frame of child output. Bound screen emission and idle updates
+//! with two timers:
 //!
-//! - `FRAME_MIN` caps screen emission under a firehose (a watched `yes`): a burst
-//!   of output coalesces into at most one screen per interval.
-//! - `FALLBACK` is the idle backstop for the *time-based* dashboard state
-//!   (`started_ago`, the Active→Idle edge) that no wake announces, and the ceiling
-//!   on how long a missed wake could stall a repaint. A self-heal, not the norm.
+//! - `FRAME_MIN`: coalesce continuous output (a watched `yes`) into at most one
+//!   screen per interval.
+//! - `FALLBACK`: update time-based dashboard state (`started_ago`, the Active→Idle
+//!   edge) without an event, and bound repaint delay after a missed wake.
 
 use std::{
     sync::{
@@ -45,9 +42,9 @@ pub enum Wake {
     Hangup,
 }
 
-/// The slot the `Supervisor` hands to each `Task` so its reader thread can wake
-/// the core loop on output. `None` between connections (no loop is listening),
-/// so an unattached daemon's task output just accumulates in the parser, free.
+/// Shared sender through which each task's reader thread wakes the core loop on
+/// output. The slot is `None` between connections because no loop is listening;
+/// task output still advances the parser without sending wake notifications.
 pub type Waker = Arc<Mutex<Option<Sender<Wake>>>>;
 
 /// Why the loop returned.
@@ -59,10 +56,9 @@ pub enum LoopExit {
     ClientGone,
 }
 
-/// Screen-emission ceiling: coalesce a firehose to at most one screen per
-/// interval. 8 ms ⇒ ≤125 fps: under perception, yet a hard cap on the work a
-/// watched `yes` can induce. Interactive echo is sparse, so it never waits the
-/// full interval.
+/// Screen-emission ceiling: coalesce continuous output to at most one screen per
+/// interval. 8 ms ⇒ ≤125 fps: under perception, yet a hard cap on the work a watched
+/// `yes` can induce. Interactive echo is sparse, so it never waits the full interval.
 const FRAME_MIN: Duration = Duration::from_millis(8);
 
 /// Idle backstop: with nothing queued, tick this often anyway so time-based
@@ -70,9 +66,9 @@ const FRAME_MIN: Duration = Duration::from_millis(8);
 /// an event. It also bounds repaint delay after a missed wake.
 const FALLBACK: Duration = Duration::from_millis(200);
 
-/// How long to block before the next tick is due: honor the frame floor while
-/// work is pending, otherwise wait the idle backstop. `saturating_sub` yields
-/// `ZERO` when we are already past due (tick immediately).
+/// How long to block before the next tick is due: respect the frame floor while work is
+/// pending, otherwise wait the idle backstop. `saturating_sub` yields `ZERO` when we
+/// are already past due (tick immediately).
 fn wait_for(dirty: bool, since_last_tick: Duration) -> Duration {
     let target = if dirty { FRAME_MIN } else { FALLBACK };
     target.saturating_sub(since_last_tick)
@@ -120,8 +116,7 @@ pub fn run_loop(
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => return LoopExit::ClientGone,
         }
-        // Coalesce the rest of the burst before ticking, so a firehose (or a
-        // load-session's spawn storm) folds into a single tick.
+        // Coalesce a burst of output or session-load spawns into one tick.
         while let Ok(w) = wake_rx.try_recv() {
             if let Some(exit) = apply(sup, w, &mut dirty) {
                 return exit;
@@ -250,9 +245,9 @@ mod tests {
         let latency = sent.elapsed();
         assert!(echoed, "the echo never reached the client");
         eprintln!("echo latency: {latency:?}");
-        // Event-driven: the echo rides the output-wake within a frame (~8 ms). If
-        // the waker were broken it would wait the 200 ms backstop; 50 ms leaves
-        // slack for CI jitter while distinguishing it from the backstop path.
+        // Require echo delivery within 50 ms: one frame is ~8 ms, but without the
+        // output wake, delivery would be delayed until the 200 ms backstop. Allow for
+        // CI jitter while distinguishing those paths.
         assert!(
             latency < Duration::from_millis(50),
             "echo took {latency:?}: expected an event-driven wake, not a poll"
@@ -262,8 +257,8 @@ mod tests {
         core.join().unwrap();
     }
 
-    /// A raised stop flag ends the loop as `Shutdown` (killing the tasks) without
-    /// any command arriving: the path a signalled daemon takes.
+    /// Return `Shutdown` and kill tasks on a raised stop flag without a command: the
+    /// signalled-daemon path.
     #[test]
     fn stop_flag_ends_loop_with_shutdown() {
         let cwd = std::env::current_dir().unwrap();
@@ -288,7 +283,7 @@ mod tests {
         // With no TERM grace, only stop observation contributes to the bound:
         // the flag must be checked before a wake-starved loop sleeps.
         assert!(started.elapsed() < FALLBACK);
-        // Shutdown cleared the task set: a tick emits an empty snapshot.
+        // Expect an empty snapshot on tick after clearing the task set at shutdown.
         sup.tick();
         assert!(
             sup.drain()

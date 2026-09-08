@@ -1,19 +1,17 @@
-//! The daemon: `fleetcom --daemon`. Owns the one `Supervisor`, listens on a
-//! per-user Unix socket, and serves a client at a time: a hello handshake
-//! (protocol version + the client's launch context), then framed `Command`s in,
-//! framed `Event`s back. It runs the shared event-driven `core::run_loop`. The
-//! supervisor **outlives each client connection**: `q` disconnects, the tasks
-//! keep running, and the next `fleetcom` reattaches.
+//! The daemon (`fleetcom --daemon`), with one `Supervisor` retained across client
+//! connections. Serve one client at a time over a per-user Unix socket: read a
+//! hello handshake (protocol version and client launch context), then receive
+//! framed `Command`s and send framed `Event`s through `core::run_loop`. Press `q`
+//! to disconnect without stopping tasks; run `fleetcom` again to reattach.
 //!
-//! It also autostarts a detached daemon when no socket is available.
+//! Autostart a detached daemon when no socket is available.
 //!
-//! The fleet's lifetime is bounded by the daemon's. The daemon holds every
-//! task's PTY master, so daemon death of any kind closes them, and the kernel
-//! hangs up each task's controlling terminal: SIGHUP to its foreground process
-//! group, which (job control being off under `$SHELL -c`) is the whole task.
-//! A normal shutdown sends SIGTERM to each task group, then SIGKILL after a
-//! grace period, and removes the socket and lock. A crash or SIGKILL only
-//! closes the PTYs; HUP-immune tasks can survive without a supervisor.
+//! Every task's PTY master is held by the daemon. On daemon termination, the PTYs
+//! are closed and SIGHUP is sent by the kernel to each terminal's foreground
+//! process group: the whole task, with job control off under `$SHELL -c`. On
+//! normal shutdown, send SIGTERM to each task group, then SIGKILL after a grace
+//! period, and remove the socket and lock. After a crash or SIGKILL, only the PTYs
+//! are closed; HUP-immune tasks may be left running without a supervisor.
 
 use std::{
     fs,
@@ -151,10 +149,9 @@ fn validate_runtime_dir(dir: &Path, md: &fs::Metadata) -> io::Result<()> {
     Ok(())
 }
 
-/// Read one frame under a deadline, restoring the unbounded default after.
-/// Propagates `set_read_timeout` failures: silently proceeding would leave an
-/// unbounded read exactly where the deadline is load-bearing (the daemon's
-/// accept path, the client's in-UI reconnect).
+/// Read one frame under a deadline, then restore the unbounded default.
+/// Propagate `set_read_timeout` failures because an unbounded read would block
+/// the daemon's accept path or freeze the client's in-UI reconnect.
 fn read_frame_bounded(stream: &mut UnixStream, timeout: Duration) -> io::Result<(u8, Vec<u8>)> {
     stream.set_read_timeout(Some(timeout))?;
     let res = read_frame(stream);
@@ -168,10 +165,9 @@ fn is_timeout(e: &io::Error) -> bool {
     matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut)
 }
 
-/// Map a failed hello-reply read to an actionable error. EOF means the daemon
-/// went away mid-handshake (a racing `--kill` or shutdown): rerunning
-/// autostarts a fresh one, so say that, not "kill and retry", which would be
-/// advice to destroy a fleet the next paragraph says no longer exists.
+/// Map a failed hello-reply read to an error with a recovery instruction. EOF
+/// means the daemon went away mid-handshake, possibly during `--kill` or
+/// shutdown. Advise rerunning the client: it can autostart a fresh daemon.
 fn hello_read_error(e: io::Error) -> io::Error {
     if e.kind() == ErrorKind::UnexpectedEof {
         io::Error::new(
@@ -276,13 +272,12 @@ fn busy_daemon_error(e: io::Error) -> io::Error {
     }
 }
 
-/// The handshake for `reconnect`: called from inside the live UI (raw mode,
-/// alternate screen), where an unbounded wait would freeze the client and a
-/// printed notice would land on the alternate screen. A busy daemon surfaces
-/// as a status-line error instead; the user retries once the other client
-/// detaches. Write is bounded too: a full send buffer (large env, unaccepted
-/// connection) must not wedge the UI either. A timed-out write drops the
-/// connection, so a partial frame is never read.
+/// The handshake for `reconnect`: called from inside the live UI (raw mode, alternate
+/// screen), where an unbounded wait would freeze the client and a printed notice would
+/// land on the alternate screen. A busy daemon surfaces as a status-line error instead;
+/// the user retries once the other client detaches. Write is bounded too: a full send
+/// buffer (large env, unaccepted connection) must not wedge the UI either. Drop the
+/// connection on write timeout to avoid reading a partial frame.
 pub fn connect_ready_bounded() -> io::Result<UnixStream> {
     // Scrollback notices apply only to the initial connection.
     let (mut stream, _) = connect_or_autostart()?;
@@ -335,10 +330,9 @@ fn connect_or_autostart_in(dir: &Path) -> io::Result<(UnixStream, DaemonOrigin)>
 fn spawn_daemon() -> io::Result<()> {
     let exe = std::env::current_exe()?;
     let dir = runtime_dir();
-    // Propagate a validation failure instead of discarding it: creating
-    // `daemon.log` inside an unvalidated dir would follow a planted symlink
-    // (shared-`/tmp` attack) and truncate an attacker-chosen file *before* the
-    // daemon's own check aborted anything.
+    // Creating `daemon.log` inside an unvalidated directory could follow a planted
+    // symlink and truncate an attacker-chosen file before the daemon checks the
+    // directory. Propagate validation failures before opening the log.
     ensure_runtime_dir(&dir)?;
     let log = fs::File::create(dir.join("daemon.log")).ok();
     let mut cmd = std::process::Command::new(exe);
@@ -361,15 +355,15 @@ fn no_daemon() -> io::Result<()> {
     Ok(())
 }
 
-/// `fleetcom --kill`: stop the daemon and every task it owns. Signal path, not
-/// socket: the daemon serves one client at a time, so a `Shutdown` *frame*
-/// would sit in the accept backlog until an attached client detached.
-/// `--kill` must work while someone else is attached. The pid comes from the
-/// lock file (trustworthy while the flock is held: the holder wrote it), and
-/// daemon exit releases the flock, so acquiring it is the completion signal.
-/// A no-op (with a message) if no daemon is running. A held flock without a
-/// usable pid is an error: it may be the interval between lock acquisition and
-/// pid publication, so it cannot be treated as the no-daemon case.
+/// Stop the daemon and every task it owns for `fleetcom --kill`. Use a signal
+/// because the daemon serves one client at a time: a socket `Shutdown` frame
+/// would wait until the attached client disconnected.
+///
+/// Read the PID from the lock file while its `flock` is held. The holder wrote
+/// that PID, and daemon exit releases the lock, so acquiring it confirms
+/// completion. Report a no-op when no daemon is running. A held lock without a
+/// usable PID is an error: the daemon may be between lock acquisition and PID
+/// publication, so a missing PID does not establish that no daemon is running.
 pub fn run_kill() -> io::Result<()> {
     run_kill_in(&runtime_dir())
 }
@@ -560,8 +554,8 @@ enum ServeOutcome {
     Shutdown,
 }
 
-/// Read and validate the connection-opening hello frame.
-/// The bounded read prevents an idle peer from blocking the daemon.
+/// Read and validate the connection-opening hello frame. Bound the read so the daemon
+/// cannot be blocked indefinitely by an idle peer.
 fn handshake(stream: &mut UnixStream) -> Result<LaunchContext, String> {
     let (kind, payload) = read_frame_bounded(stream, HANDSHAKE_TIMEOUT)
         .map_err(|e| format!("no valid hello received: {e}"))?;
@@ -651,11 +645,11 @@ fn serve_client(sup: &mut Supervisor, stream: UnixStream, stop: &AtomicBool) -> 
     });
 
     let mut write = stream;
-    // A client that stops draining the socket (crashed, SIGSTOPped, or hostile)
-    // must not wedge the daemon: the serve loop is synchronous, so a `write_frame`
-    // blocked forever on a full send buffer would freeze reads, ticks, reaping,
-    // and `accept`, and `--kill` could never get in. Cap how long one event
-    // write may block; a timeout surfaces as an error below and drops the client.
+    // A client that stops draining the socket (crashed, SIGSTOPped, or hostile) must
+    // not wedge the daemon: the serve loop is synchronous, so a `write_frame` blocked
+    // forever on a full send buffer would freeze reads, ticks, reaping, and `accept`,
+    // and `--kill` could never get in. Cap how long one event write may block; on
+    // timeout, report the error below and drop the client.
     let _ = write.set_write_timeout(Some(SEND_TIMEOUT));
     let outcome = catch_unwind(AssertUnwindSafe(|| {
         run_loop(sup, &wake_rx, stop, |ev| send_event(&mut write, ev))
@@ -709,7 +703,7 @@ mod tests {
         assert!(ensure_runtime_dir(&path).is_err());
     }
 
-    /// Connection setup rejects symlinked and non-directory runtime paths.
+    /// Reject symlinked and non-directory runtime paths during connection setup.
     #[test]
     fn connect_refuses_untrusted_runtime_dir() {
         let base = temp("daemon_connect_untrusted");
@@ -784,7 +778,7 @@ mod tests {
     #[test]
     fn runtime_dir_resolution_order() {
         let tmp = PathBuf::from("/tmpdir");
-        // Explicit override wins over everything.
+        // Prefer the explicit override over all other sources.
         assert_eq!(
             resolve_runtime_dir(
                 Some("/override".into()),

@@ -1,23 +1,23 @@
 # Agent session resume
 
-Session files preserve launch commands, not process state. Relaunching a bare `claude`, `codex`, `grok`, or `omp` command ordinarily starts another conversation. For accepted commands, `fleetcom` captures a validated conversation ID when available and builds a canonical resume command when saving a session or rerunning a finished task (`r`).
+Session files store launch commands, not process state. If you relaunch a bare `claude`, `codex`, `grok`, or `omp` command, you ordinarily start another conversation. To preserve that conversation, `fleetcom` captures a validated ID when one is available for an accepted command. It uses that ID to construct a canonical resume command when you save a session or rerun a finished task (`r`).
 
 ## Workflow
 
 Start a supported agent without flags:
 
-1. Press `n` and run `claude`, `codex`, `grok`, or `omp`. The task appears in the dashboard under the command you typed. Instrumentation changes only the string executed through `$SHELL -c`, so a direct spawn still displays the requested command.
-2. Work in it. `Enter` attaches; `Ctrl-\` returns to the dashboard. Depending on the agent, `fleetcom` pins an ID at launch and may update it from a hook, notifier, extension, or matching live registry record.
-3. Press `w`, enter a session name, and press `Enter`. A captured bare command becomes its canonical resume form, such as `claude --resume '<uuid>'`. Without a known ID, the save preserves the authored command.
-4. Run `fleetcom <session>`, or press `o` in the dashboard, to start new processes from the saved commands. A stored resume command reopens its captured conversation.
+1. Press `n` and run `claude`, `codex`, `grok`, or `omp`. The task is listed under the command you typed. Only the string executed through `$SHELL -c` is instrumented; the requested command is still displayed for a direct spawn.
+2. Work in it. Press `Enter` to attach; press `Ctrl-\` to return to the dashboard. Depending on the agent, an ID is pinned at launch and may be updated from a hook, notifier, extension, or matching live registry record.
+3. Press `w`, enter a session name, and press `Enter`. A captured bare command is saved in canonical resume form, such as `claude --resume '<uuid>'`. Without a known ID, the authored command is preserved.
+4. Run `fleetcom <session>`, or press `o` in the dashboard, to start new processes from the saved commands. Use a stored resume command to reopen the captured conversation.
 
-On a finished agent task, `r` uses the captured launch, hook, notifier, extension, or registry ID. A registry record remains eligible after exit if it is still present. The replacement keeps the task's ID, tag, group, and name. After a successful rewrite, the row shows the resume command because it has become the task's launch recipe; a [saved session](sessions.md) records the same string.
+Press `r` on a finished agent task to rerun it with the captured launch, hook, notifier, extension, or registry ID. A registry record is still eligible after exit if present. The task's ID, tag, group, and name are preserved. After a successful rewrite, the resume command is displayed in the row and stored as the launch recipe. The same string is written to a [saved session](sessions.md).
 
-Capture is best-effort and narrow by design. A command carrying a prompt, extra flags, or shell syntax stays opaque and saves verbatim. An accepted command with no available ID also saves unchanged. In both cases, loading the recipe reruns the original command.
+Capture is best-effort and narrow by design. Commands with prompts, extra flags, or shell syntax are treated as opaque and saved verbatim. Accepted commands with no available ID are also saved unchanged. In both cases, the original command is rerun on load.
 
 ## Accepted command boundary
 
-The capture boundary is intentionally narrow. Only these forms participate:
+The capture boundary is intentionally narrow. Only these forms are accepted:
 
 - `claude`, `codex`, `grok`, or `omp`
 - `claude --resume <uuid>`
@@ -27,80 +27,80 @@ The capture boundary is intentionally narrow. Only these forms participate:
 
 The program word may be a path such as `/usr/local/bin/claude` when its basename matches and the token contains no shell syntax. A resume UUID may be bare or single-quoted, but it must be the final argument.
 
-Everything else remains opaque and runs, displays, and saves verbatim. This includes prompts, flags, alternate resume spellings, subcommands, trailing arguments, and shell syntax. The narrow boundary prevents injected arguments from binding to a different shell command than the detector recognized.
+Everything else is treated as opaque and executed, displayed, and saved verbatim. This includes prompts, flags, alternate resume spellings, subcommands, trailing arguments, and shell syntax. With this boundary, injected arguments cannot be bound to a different shell command than the one recognized during detection.
 
 ## Capture state and isolation
 
-Hooks, notifiers, and extension modules are loaded by the agent rather than the supervisor, so they need stable paths. The supervisor installs those assets once for each runtime root. An explicit `FLEETCOM_RUNTIME_DIR` becomes that root. Otherwise, `fleetcom` uses the platform runtime or cache directory and partitions it by session directory.
+Hooks, notifiers, and extension modules are loaded by the agent rather than the supervisor, so they need stable paths. Assets are installed once per runtime root. An explicit `FLEETCOM_RUNTIME_DIR` is used as the root; otherwise, the platform runtime or cache directory is used, partitioned by session directory.
 
-Each supervisor installation creates a private mode-`0700` `<root>/<pid>-<nonce>` namespace containing:
+For each supervisor installation, a private mode-`0700` `<root>/<pid>-<nonce>` namespace is created with:
 
 - `claude-settings.json`, mode `0600`
 - `codex-notify.sh`, mode `0700`
-- `omp-capture.js`, mode `0600`: omp imports the module rather than executing it, so it needs no executable bit
+- `omp-capture.js`, mode `0600`: imported as a module, so no executable bit is required
 - `task-<id>-<run>.json` capture paths
 
-The random nonce separates concurrent supervisors and prevents PID reuse from selecting an existing namespace. The run number gives each rerun a distinct capture file, so a displaced process cannot overwrite the replacement run's session state. Installation leaves every other root entry unchanged.
+The random nonce isolates concurrent supervisors and prevents PID reuse from selecting an existing namespace. Each rerun also gets a distinct run number, so a displaced process cannot overwrite the replacement run's capture file. Every other root entry is left unchanged during installation.
 
 ## Evidence sources
 
 ### `claude`
 
-A bare Claude command can accept an ID at launch. `fleetcom` therefore generates a v4 UUID and adds the settings overlay:
+Claude accepts an ID at launch. For a bare command, the harness therefore generates a v4 UUID and adds it with the settings overlay:
 
 ```text
 --session-id '<uuid>' --settings '<namespace>/claude-settings.json'
 ```
 
-A canonical resume command already supplies its conversation ID, so adding a second ID would be incorrect; it receives only `--settings`. The overlay installs a `SessionStart` hook that copies its JSON payload into `FLEETCOM_CAPTURE_FILE`, from which the harness reads `session_id`.
+Since a canonical resume command already specifies the conversation ID, the harness adds only `--settings`. The overlay installs a `SessionStart` hook that copies its JSON payload into `FLEETCOM_CAPTURE_FILE`. The harness then reads `session_id` from that payload.
 
-Claude also publishes one `<claude-home>/sessions/<pid>.json` record per session. `fleetcom` reads the direct path for the task leader's PID. When `$SHELL -c` leaves the shell as the task leader instead of replacing it with Claude, no matching record exists and the registry contributes no ID.
+Claude session records are also available at `<claude-home>/sessions/<pid>.json`, one per session. The direct path for the task leader's PID is read. When the shell is retained as task leader under `$SHELL -c` instead of being replaced with Claude, no matching record is available and no ID is read from the registry.
 
-A record counts only when its `kind` is `interactive` and its `pid`, `cwd`, and `startedAt` match the task. The PID must match the filename, the working directories must be identical or resolve to the same path, and the process start must fall within 30 seconds of the task spawn. Missing, malformed, or mismatched records contribute no evidence. The dashboard also maps a matching record's `waiting` status to the top tier of its [preview cascade](commands.md#peek); other statuses do not affect the preview.
+A record is accepted only when its `kind` is `interactive` and its `pid`, `cwd`, and `startedAt` match the task. The PID must match the filename, the working directories must be identical or resolve to the same path, and the process start must fall within 30 seconds of the task spawn. Missing, malformed, or mismatched records are ignored. A matching record's `waiting` status is also mapped to the top tier of the [preview cascade](commands.md#peek); the preview is unchanged for other statuses.
 
 ### `codex`
 
-Codex does not let the caller choose an ID at launch. Both accepted forms instead receive a notify override:
+You cannot choose a Codex ID at launch. A notify override is injected into both accepted forms:
 
 ```text
 -c 'notify=["<namespace>/codex-notify.sh"]'
 ```
 
-After each turn, the notifier writes the `agent-turn-complete` JSON argument to `FLEETCOM_CAPTURE_FILE`; the harness reads `thread-id`. This captures in-TUI session changes after the resumed conversation completes a turn.
+After each turn, the notifier writes the `agent-turn-complete` JSON argument to `FLEETCOM_CAPTURE_FILE`, and the harness reads `thread-id` from it. This captures an in-TUI session change after a turn completes in the resumed conversation.
 
-Replacing a configured notifier would change user behavior. `fleetcom` reads bare top-level keys in `$CODEX_HOME/config.toml` until the first table header. A one-line `notify` array of non-empty basic strings is chained after the capture write. Its argv is carried in `FLEETCOM_NOTIFY_CHAIN`, joined by newlines, and the notification payload is appended. An absent setting or empty array lets capture run alone; empty arguments, newlines, and NUL cannot be transported and disable injection.
+Replacing a configured notifier would change user behavior, so the harness reads bare top-level keys in `$CODEX_HOME/config.toml` until the first table header. If it finds a one-line `notify` array of non-empty basic strings, it chains that notifier after the capture write. `FLEETCOM_NOTIFY_CHAIN` carries its argv joined by newlines; the capture script appends the notification payload before invoking it. An absent setting or empty array means capture runs alone. This encoding cannot transport empty arguments, newlines, or NUL, so those values disable injection.
 
 ### `grok`
 
-Grok accepts a launch-time ID but exposes no injectable live-capture channel. A bare command therefore receives `--session-id '<uuid>'`, while a canonical resume command needs no instrumentation.
+You can specify a Grok ID at launch, but cannot inject a live-capture channel. For a bare command, `--session-id '<uuid>'` is added; no instrumentation is required for a canonical resume command.
 
 ### `omp`
 
-omp cannot pin an ID at launch: it has no `--session-id`, and `--resume` requires an existing session. Both accepted forms therefore receive the same injection and no pinned ID:
+You cannot pin an omp ID at launch: no `--session-id` flag is available, and an existing session is required for `--resume`. The same injection is therefore added to both accepted forms, without a pinned ID:
 
 ```text
 -e '<namespace>/omp-capture.js'
 ```
 
-`-e` loads the JavaScript module into the agent process and appends it to the user's extensions. Its `session_start` and `session_switch` handlers write `sessionId` as JSON to `FLEETCOM_CAPTURE_FILE`. The second handler follows in-TUI `/resume` changes. Capture writes are best-effort: the module returns when the capture path is empty and ignores write errors.
+The `-e` flag loads the JavaScript module into the agent process, appending it to the user's extensions. Its `session_start` and `session_switch` handlers write `sessionId` as JSON to `FLEETCOM_CAPTURE_FILE`, including after in-TUI `/resume` changes. Capture writes are best-effort: the handlers return immediately for an empty capture path and ignore write errors.
 
-The aliases `-r`, `--session`, and `-c` remain opaque because `fleetcom` rewrites only the canonical form it detects exactly.
+The aliases `-r`, `--session`, and `-c` remain opaque because only the exactly detected canonical form is rewritten.
 
 ## ID precedence
 
-Several channels can identify different conversations during one task. To make the result deterministic, `fleetcom` chooses the first available ID in this order:
+Different conversation IDs may be available from different channels during one task. The first available ID is selected in this order:
 
 1. The current capture-file payload.
 2. The live session registry, implemented by `claude`.
 3. The ID pinned or targeted at spawn.
 
-Named saves, recovery snapshots, and reruns use this same precedence. `fleetcom` does not scan session stores to infer conversation ownership: a nearby transcript or rollout cannot identify which task owns it.
+The same precedence is used for named saves, recovery snapshots, and reruns. Session stores are not scanned to infer conversation ownership: you cannot determine the owning task from a nearby transcript or rollout.
 
-Terminal output never supplies a session ID: examples, quoted commands, and tool output can contain another conversation's valid UUID. An ID available only in an exit hint is not recovered. Without a capture, registry, or launch ID, the authored command remains unchanged.
+Session IDs are never read from terminal output: another conversation's valid UUID may be present in examples, quoted commands, or tool output. An ID available only in an exit hint is not recovered. Without a capture, registry, or launch ID, the authored command remains unchanged.
 
-The registry outranks the spawn pin because it can contain a session ID selected after launch, including one created by `/clear`. The capture file outranks the registry.
+A registry ID is preferred over the spawn pin because it may have been selected after launch, including through `/clear`. A capture-file ID is preferred over the registry ID.
 
-Saving and rerunning rewrite accepted commands to one of these forms:
+On save and rerun, accepted commands are rewritten to one of these forms:
 
 ```text
 claude --resume '<uuid>'
@@ -109,24 +109,24 @@ grok --resume '<uuid>'
 omp --resume '<uuid>'
 ```
 
-The program word is preserved as typed. If no valid ID is available, the original command remains unchanged. A rerun increments the run number before spawning its replacement, so capture data from the displaced run cannot affect the new run.
+The program word is preserved as typed. If no valid ID is available, the original command remains unchanged. On rerun, the run number is incremented before the replacement is spawned, isolating it from capture data for the displaced run.
 
 ## Validation boundary
 
-Every captured value eventually enters a shell command, which makes validation the security boundary. Accepted IDs contain exactly lowercase hexadecimal characters in the `8-4-4-4-12` UUID shape. Capture payloads, registry records, and the final command builder all apply the same check. Malformed values are ignored rather than interpolated. A valid UUID alone does not establish conversation ownership.
+Every captured value eventually enters a shell command, so validation accepts only lowercase hexadecimal characters in the `8-4-4-4-12` UUID shape. The same check applies to capture payloads, registry records, and final command construction. Malformed values are ignored rather than interpolated. A valid UUID alone does not establish conversation ownership.
 
 ## Extending capture
 
-Each tool implements the `Harness` trait in [`src/harness/mod.rs`](../src/harness/mod.rs). The methods keep detection, evidence collection, and command construction separate:
+Implement the `Harness` trait in [`src/harness/mod.rs`](../src/harness/mod.rs) for each tool. Separate detection, evidence collection, and command construction through these methods:
 
-- `shape` supplies the program word and resume selector. The default `detect` and `resume_command` methods derive the accepted and canonical forms from that pair.
-- `instrument` returns spawn-time arguments, environment entries, and an optional pinned ID.
-- `parse_capture` reads an ID from hook, notify, or extension JSON.
-- `live_session_id` reads the ID a live session publishes on disk. It defaults to `None` for tools that publish no registry.
-- `live_blocked_status` reads that same registry for one display fact: whether the tool says it is blocked on the user. It returns preview text, never an ID, and defaults to `None`.
-- `resolve_home` resolves configuration needed by instrumentation or the live registry. It defaults to `None`.
+- `shape`: supply the program word and resume selector. Accepted and canonical forms are derived from that pair by the default `detect` and `resume_command` implementations.
+- `instrument`: return spawn-time arguments, environment entries, and an optional pinned ID.
+- `parse_capture`: read an ID from hook, notify, or extension JSON.
+- `live_session_id`: read the ID published on disk for a live session. Return `None` by default when no registry is available.
+- `live_blocked_status`: read that registry for blocked-on-user status. Return preview text, never an ID; return `None` by default.
+- `resolve_home`: resolve configuration needed by instrumentation or the live registry. Return `None` by default.
 
-The supervisor supplies the launch environment to `resolve_home`. Claude and Codex read their explicit override first, then `$HOME` plus their dot directory. When neither is supplied, configuration reads fall back to the supervisor's platform home. The resolved path stays attached to the task so Claude registry reads continue using its launch-time home after a reconnect. Grok and omp need no home resolution; their environment passes through to the child unchanged.
+The launch environment is passed to `resolve_home` by the supervisor. For Claude and Codex, the explicit override is read first, then `$HOME` plus the tool's dot directory. With neither supplied, the supervisor's platform home is used. The resolved path is stored with the task and used for Claude registry reads after reconnect, preserving the launch-time home. For Grok and omp, no home resolution is required; the environment is passed to the child unchanged.
 
 ## Environment variables
 

@@ -88,9 +88,8 @@ pub(crate) fn prefix_bytes(s: &str, max: usize) -> &str {
     &s[..end]
 }
 
-/// Sort key for human-readable names.
-/// The lowercase value provides case-insensitive collation; the exact value
-/// makes ordering deterministic and keeps case-distinct names separate.
+/// Sort key for human-readable names. Sort by lowercase value, then by exact value to
+/// order case-distinct names deterministically without merging them.
 pub(crate) fn collation_key(name: &str) -> (String, String) {
     (name.to_lowercase(), name.to_string())
 }
@@ -127,7 +126,8 @@ mod tests {
 
     #[test]
     fn truncate_counts_cjk_as_two_columns() {
-        // 7 chars × 2 columns = 14; budget 7 fits 日本語 (6) and drops の.
+        // 7 chars × 2 columns = 14; include 日本語 (6 columns) and omit の under a 7-column
+        // budget.
         let t = truncate("日本語のテスト", 8);
         assert_eq!(t, "日本語…");
         assert!(t.width() <= 8, "width {} overflows", t.width());

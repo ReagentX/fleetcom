@@ -190,9 +190,9 @@ pub struct App {
     /// task itself, so it can't jump to a neighbor when the list reorders
     /// (a task exits, or gets tagged into another bucket).
     pub selected_id: Option<u64>,
-    /// Task id awaiting its first snapshot row. A later `Spawned` event replaces
-    /// it; a snapshot clears it only after the row appears. This preserves
-    /// direct-spawn selection across event batching.
+    /// Task ID awaiting its first snapshot row. Replace on a later `Spawned` event;
+    /// clear only after the row is present in a snapshot, preserving direct-spawn
+    /// selection across event batching.
     pending_select: Option<u64>,
     pub mode: Mode,
     pub group_mode: GroupMode,
@@ -206,8 +206,8 @@ pub struct App {
     /// Id of the attached task, if any: by id (not index) so it survives the
     /// task list changing underneath it.
     pub focused_id: Option<u64>,
-    /// Whether the host terminal window has focus
-    /// While unfocused, highlight rows mute to a bright-black background
+    /// Whether the host terminal window has focus. While unfocused, highlighted
+    /// rows use a bright-black background.
     pub terminal_focused: bool,
     pub rows: u16,
     pub cols: u16,
@@ -260,8 +260,8 @@ pub struct App {
     input_tx: Option<Sender<CtEvent>>,
     /// Wake notifications from the input and transport reader threads.
     wait_rx: Receiver<()>,
-    /// Kept so `run` can hand the stdin thread a poker, and `reconnect` a fresh
-    /// transport one.
+    /// Sender retained for the stdin thread in `run` and each replacement
+    /// transport in `reconnect`, so both can wake the UI loop.
     wait_tx: Sender<()>,
     /// Set by an external SIGTERM/SIGHUP/SIGINT; the loop treats it as quit so
     /// teardown runs and the terminal is restored.
@@ -307,8 +307,8 @@ fn preselected_row(filter_empty: bool, cands: usize) -> usize {
     usize::from(!filter_empty && cands >= 2)
 }
 
-/// One Down keypress over a picker list: advance, clamped to the last row.
-/// Safe on an empty list because every picker pins its selection to 0 there.
+/// One Down keypress over a picker list: advance, clamped to the last row. Safe on an
+/// empty list: selection is pinned to 0 in every picker.
 fn step_down(sel: usize, len: usize) -> usize {
     (sel + 1).min(len.saturating_sub(1))
 }
@@ -598,8 +598,8 @@ impl App {
         self.sections().into_iter().flat_map(|(_, v)| v).collect()
     }
 
-    /// Dashboard rows in render order, with section headers interleaved.
-    /// Scrolling over rows keeps each header aligned with its tasks.
+    /// Dashboard rows in render order, with section headers interleaved. Scroll over
+    /// rows to keep each header aligned with its tasks.
     pub fn list_rows(&self) -> Vec<Row> {
         let mut out = Vec::new();
         for (label, idxs) in self.sections() {
@@ -858,7 +858,7 @@ impl App {
             }
 
             if self.term_signal.load(Ordering::Relaxed) {
-                // A terminating signal detaches: the daemon keeps the tasks.
+                // Detach on a terminating signal; leave tasks running under the daemon.
                 self.exit_intent = ExitIntent::Disconnect;
                 self.should_quit = true;
             }
@@ -894,8 +894,8 @@ impl App {
             let _ = self.wait_rx.recv_timeout(wait_for_paint(due, since_paint));
             while self.wait_rx.try_recv().is_ok() {} // coalesce wake tokens
 
-            // Handle every buffered key/resize in one pass: coalesces a paste and
-            // shaves the last keystroke's echo (no render between chars).
+            // Handle buffered keys and resizes before rendering so a burst of
+            // input does not require a frame between each character.
             while let Ok(ev) = self.input_rx.try_recv() {
                 // Terminal events make the next pass bypass `PAINT_MIN`.
                 self.force_paint = true;
@@ -990,7 +990,7 @@ impl App {
             });
         }
 
-        // Empty trailing input keeps the resolved path selected.
+        // Keep the resolved path selected when trailing input is empty.
         self.dir_sel = preselected_row(partial.is_empty(), cands.len());
         self.dir_candidates = cands;
     }
@@ -1084,7 +1084,7 @@ impl App {
             .filter(|g| g.to_lowercase().starts_with(&needle))
             .collect();
         names.sort_by_cached_key(|g| collation_key(g.as_str()));
-        // The exact-name tiebreak keeps duplicates adjacent for `dedup`.
+        // Break ties by exact name to keep duplicates adjacent for `dedup`.
         names.dedup();
         for name in names {
             cands.push(GroupCand {
@@ -1252,10 +1252,10 @@ impl App {
                 self.mode = Mode::SaveSession;
             }
             KeyCode::Char('o') => {
-                // The core owns the session dir (it resolves against the
-                // connection's launch context, not this process's env), so the
-                // names round-trip through it. The picker opens immediately and
-                // shows "(no saved sessions)" until the reply lands next sync.
+                // Request session names from the core: the directory is resolved
+                // against the connection's launch context, not this process's
+                // environment. Open the picker immediately with "(no saved sessions)"
+                // until the reply is received on the next sync.
                 self.transport.send(Command::ListSessions);
                 self.session_names.clear();
                 self.session_sel = 0;
@@ -1272,8 +1272,8 @@ impl App {
         }
     }
 
-    /// Shared editing for the single-line text prompts: Enter runs `submit`
-    /// with the trimmed input and closes; Esc closes without submitting.
+    /// Edit single-line text prompts. On Enter, call `submit` with trimmed input and
+    /// close. On Esc, close without submitting.
     fn on_key_textinput(&mut self, k: KeyEvent, submit: fn(&mut Self, &str)) {
         match k.code {
             KeyCode::Enter => {
@@ -1299,10 +1299,10 @@ impl App {
 
     fn on_key_rename(&mut self, k: KeyEvent) {
         self.on_key_textinput(k, |app, name| {
-            // Whitespace-only input clears the name; the supervisor applies
-            // the remaining label normalization.
+            // Clear the name on whitespace-only input; defer remaining label
+            // normalization to the supervisor.
             let name = Some(name.to_string()).filter(|s| !s.is_empty());
-            // The mode retains the target until submission closes the prompt.
+            // Retain the target until the prompt is closed on submission.
             if let Mode::Rename(id) = app.mode {
                 app.transport.send(Command::SetName { id, name });
             }
@@ -1353,7 +1353,7 @@ impl App {
     }
 
     fn on_key_pickdir(&mut self, k: KeyEvent) {
-        // Tab descends; Right descends at the end and moves the caret elsewhere.
+        // On Tab, descend. On Right, descend at the end; otherwise move the caret.
         if k.code == KeyCode::Tab || (k.code == KeyCode::Right && self.dir_input.at_end()) {
             // Descend into the highlighted directory; the resolved-path row is
             // a no-op.
@@ -1430,8 +1430,8 @@ impl App {
             KeyCode::Up => self.find_sel = self.find_sel.saturating_sub(1),
             KeyCode::Down => self.find_sel = step_down(self.find_sel, self.find_candidates.len()),
             KeyCode::Enter => {
-                // Select the highlighted task without attaching. An empty
-                // result set leaves the palette open.
+                // Select the highlighted task without attaching. Keep the palette open
+                // when no results are available.
                 if let Some(&id) = self.find_candidates.get(self.find_sel) {
                     self.selected_id = Some(id);
                     self.close_find_palette();
@@ -1474,13 +1474,13 @@ impl App {
     }
 
     fn on_key_attached(&mut self, out: &mut Stdout, k: KeyEvent) {
-        // Ctrl-\ backgrounds the task; crossterm may report it as Ctrl-4.
+        // Background on Ctrl-\; the chord may be reported by crossterm as Ctrl-4.
         let detach = k.modifiers.contains(KeyModifiers::CONTROL)
             && matches!(k.code, KeyCode::Char('\\') | KeyCode::Char('4'));
         if detach {
             self.mode = Mode::Dashboard;
             self.focused_id = None;
-            // The watch change resets the task viewport.
+            // Reset the task viewport on watch change.
             self.view_scroll = false;
             self.selection = None;
             // Repaint from scratch next tick; wipe the child's screen now.
@@ -1490,7 +1490,8 @@ impl App {
         // Keep one row of overlap between pages.
         let page = self.pane_rows().saturating_sub(1).max(1);
         if self.view_scroll {
-            // Scrollback keys can replace the displayed rows, invalidating the drag.
+            // Cancel the drag before replacing displayed rows during scrollback
+            // navigation.
             self.selection = None;
             // Scrollback navigation is not forwarded to the child.
             match k.code {
@@ -1503,7 +1504,7 @@ impl App {
                     self.view_scroll = false;
                     self.send_scrollback(ScrollAction::Live);
                 }
-                // Other input returns to live and is forwarded immediately.
+                // Return to live output and forward other input immediately.
                 _ => {
                     self.view_scroll = false;
                     self.forward_key(k);
@@ -1511,13 +1512,13 @@ impl App {
             }
             return;
         }
-        // Ctrl/Alt provide alternatives when the terminal intercepts Shift.
+        // Accept Ctrl/Alt as alternatives when Shift is intercepted by the terminal.
         if k.code == KeyCode::PageUp
             && k.modifiers
                 .intersects(KeyModifiers::SHIFT | KeyModifiers::CONTROL | KeyModifiers::ALT)
         {
             self.view_scroll = true;
-            // Entering scrollback replaces the selected live rows.
+            // Discard the selection before replacing live rows with scrollback.
             self.selection = None;
             self.send_scrollback(ScrollAction::Up(page));
             return;
@@ -1600,12 +1601,12 @@ impl App {
                 _ => {}
             },
             Mode::Attached => {
-                // In scrollback, the wheel moves the viewport and left-button
-                // gestures select displayed history. The child receives no mouse
-                // events while history is visible.
+                // In scrollback, move the viewport on wheel input and select displayed
+                // history on left-button gestures. Do not forward mouse events while
+                // history is visible.
                 if self.view_scroll {
                     match kind {
-                        // Scrolling can replace the rows beneath the drag.
+                        // Cancel the drag before replacing its rows on scroll.
                         MouseKind::WheelUp => {
                             self.selection = None;
                             self.send_scrollback(ScrollAction::Up(3));
@@ -1623,11 +1624,11 @@ impl App {
                     return;
                 }
                 if let Some(id) = self.focused_id {
-                    // Without child mouse reporting, left-button gestures
-                    // select text on captured live screens.
+                    // Without child mouse reporting, select text on captured live
+                    // screens on left-button gestures.
                     if matches!(self.screen_for(id), Some(s) if !s.wants_mouse) {
                         match kind {
-                            // Wheel navigation cancels the active drag.
+                            // Cancel the active drag on wheel navigation.
                             MouseKind::WheelUp | MouseKind::WheelDown => self.selection = None,
                             _ => {
                                 if self.on_selection_gesture(id, kind, m.row, m.column) {
@@ -1640,8 +1641,8 @@ impl App {
                         // client selection before forwarding subsequent events.
                         self.selection = None;
                     }
-                    // Wheel-up enters scrollback for inline children that do
-                    // not receive mouse events.
+                    // Enter scrollback on wheel-up for inline children without mouse
+                    // reporting.
                     let inline = matches!(
                         self.screen_for(id),
                         Some(s) if !s.wants_mouse && !s.alt_screen
@@ -1659,8 +1660,8 @@ impl App {
         }
     }
 
-    /// Handle a non-wheel drag-selection event over displayed live or scrollback
-    /// rows. The live view forwards unconsumed events to the child.
+    /// Handle a non-wheel drag-selection event over displayed live or scrollback rows.
+    /// In the live view, forward unconsumed events to the child.
     fn on_selection_gesture(&mut self, id: u64, kind: MouseKind, row: u16, col: u16) -> bool {
         match kind {
             MouseKind::Press(MouseBtn::Left) => {
@@ -1703,9 +1704,8 @@ impl App {
         let Some(text) = self.screen_for(id).map(|s| sel.extract(&s.lines)) else {
             return;
         };
-        // A drag released at the bottom of a mostly empty screen
-        // must not stuff the clipboard with newlines the user
-        // never saw selected
+        // Exclude unhighlighted blank rows when copying a drag released at the bottom
+        // of a mostly empty screen.
         let text = text.trim_end_matches('\n');
         if text.trim().is_empty() {
             return;
@@ -1733,8 +1733,8 @@ impl App {
             if capture {
                 execute!(out, EnableMouseCapture)?;
             } else {
-                // Disabling capture ends mouse delivery; clear the selection
-                // before its release event becomes unavailable.
+                // Clear the selection before disabling capture: no release event will
+                // be delivered afterward.
                 self.selection = None;
                 execute!(out, DisableMouseCapture)?;
             }
@@ -1784,15 +1784,15 @@ impl App {
             self.selected_id = neighbor;
             self.transport.send(Command::Remove { id });
         } else {
-            // Kill in place; the next tick reaps it into the Completed bucket.
+            // Kill in place; reap it into the Completed bucket on the next tick.
             self.transport.send(Command::Kill { id });
         }
     }
 
-    /// Leave, per `exit_intent`: `Disconnect` detaches and the daemon keeps the
-    /// tasks running; `Quit` group-kills every task and stops the daemon. Against
-    /// an in-process core (`--foreground`) both kill everything: there's no
-    /// daemon to outlive the UI.
+    /// Leave according to `exit_intent`: on `Disconnect`, detach and leave tasks
+    /// running under the daemon; on `Quit`, group-kill every task and stop the daemon.
+    /// With an in-process core (`--foreground`), kill everything for either intent: no
+    /// daemon is available after UI exit.
     fn shutdown(&mut self) {
         // Blocks until the transport has acted on the intent. On `Quit` the
         // tasks are dead before `main` restores the terminal; on `Disconnect` the
@@ -1801,8 +1801,8 @@ impl App {
     }
 }
 
-/// Map a crossterm key event to the semantic key representation sent to the
-/// daemon. Unsupported key codes return `None`.
+/// Map a crossterm key event to the semantic key representation sent to the daemon.
+/// Return `None` for unsupported key codes.
 fn key_event_to_key(ev: KeyEvent) -> Option<(Key, Mods)> {
     // The wire format carries only Shift, Alt, and Control modifiers.
     let mods = Mods {
@@ -1845,9 +1845,9 @@ fn is_controls_key(k: KeyEvent) -> bool {
     }
 }
 
-/// Apply prompt editing keys. Returns `Some(true)` for text changes,
-/// `Some(false)` for caret motion or ignored Ctrl chords, and `None` for
-/// unsupported keys. Ctrl-A and Ctrl-E move to the start and end.
+/// Apply prompt editing keys. Returns `Some(true)` for text changes, `Some(false)` for
+/// caret motion or ignored Ctrl chords, and `None` for unsupported keys. On Ctrl-A or
+/// Ctrl-E, move to the start or end.
 fn on_key_edit(buf: &mut EditBuffer, k: KeyEvent) -> Option<bool> {
     let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
     match k.code {
@@ -1910,8 +1910,8 @@ fn paste_into(buf: &mut EditBuffer, s: &str) {
     }
 }
 
-/// Split a typed path into its directory prefix and trailing search fragment.
-/// Candidate types apply their own matching rules to the fragment.
+/// Split a typed path into its directory prefix and trailing search fragment. Apply the
+/// matching rules for each candidate type to the fragment.
 fn split_input(input: &str) -> (&str, &str) {
     match input.rfind('/') {
         Some(pos) => (&input[..=pos], &input[pos + 1..]),
@@ -1929,9 +1929,9 @@ fn label_leaf(label: &str) -> &str {
         .unwrap_or(label)
 }
 
-/// Subdirectories of `base` whose names start with `partial`, ignoring case.
-/// Results use the same case-insensitive collation. Hidden entries appear only
-/// when `partial` starts with `.`.
+/// Subdirectories of `base` whose names start with `partial`, ignoring case. Sort
+/// results with the same case-insensitive collation. Include hidden entries only when
+/// `partial` starts with `.`.
 fn list_dirs(base: &Path, partial: &str) -> Vec<String> {
     let needle = partial.to_lowercase();
     let mut out: Vec<String> = Vec::new();

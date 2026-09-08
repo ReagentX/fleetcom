@@ -883,8 +883,7 @@ fn display_names_normalize_at_the_boundary() {
     assert_eq!(n("Unassigned"), Some("Unassigned".into()));
 }
 
-/// `SetGroup` normalizes assignments, clears with `None`, and ignores
-/// unknown task ids.
+/// Normalize assignments on `SetGroup`; clear with `None` and ignore unknown task IDs.
 #[test]
 fn set_group_round_trips_and_clears() {
     let mut s = sup(24, 80);
@@ -908,8 +907,8 @@ fn set_group_round_trips_and_clears() {
     assert_eq!(view_of(&mut s, id).group, None);
 }
 
-/// `SetName` normalizes assignments, keeps the literal `Unassigned`
-/// (unlike groups), clears with `None`, and ignores unknown task ids.
+/// Normalize assignments on `SetName`; retain the literal `Unassigned` (unlike groups),
+/// clear with `None`, and ignore unknown task IDs.
 #[test]
 fn set_name_round_trips_and_clears() {
     let mut s = sup(24, 80);
@@ -1528,10 +1527,9 @@ fn shutdown_is_prompt_when_the_fleet_is_empty() {
     assert!(t0.elapsed() < Duration::from_millis(500));
 }
 
-/// Session paths follow the connection's launch context: a hello env
-/// carrying `FLEETCOM_CONFIG_DIR` decides where save, list, and load look.
-/// The context env holds *only* the override, so anything this process's
-/// env says about config locations is provably ignored.
+/// Resolve session paths from `FLEETCOM_CONFIG_DIR` in the connection's hello
+/// environment for save, list, and load. Include only the override in that environment
+/// to verify independence from this process's config locations.
 #[test]
 fn session_commands_use_the_launch_context_config_dir() {
     let dir = scratch("sess_root");

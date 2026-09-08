@@ -11,7 +11,7 @@ use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
 
 use crate::frame::{KIND_CONTROL, KIND_HELLO, KIND_SCREEN};
 
-/// Wire-protocol version; the handshake rejects mismatched peers.
+/// Wire-protocol version; mismatched peers are rejected during the handshake.
 pub const PROTOCOL_VERSION: u32 = 12;
 
 /// Reserved dashboard label for tasks without a custom group.
@@ -56,19 +56,19 @@ pub enum Command {
         cwd: PathBuf,
         group: Option<String>,
     },
-    /// Signal-kill a live task's process group; it reaps into Completed.
+    /// Signal-kill a live task's process group; classify it as Completed on reap.
     Kill { id: u64 },
     /// Drop a task from the set entirely (used on already-finished tasks).
     Remove { id: u64 },
-    /// Re-run a finished task with the same id, cwd, tag, group, and name.
-    /// Captured agent sessions may replace the command with its resume form.
-    /// Running tasks reject this request.
+    /// Re-run a finished task with the same id, cwd, tag, group, and name. Use the
+    /// resume form when an agent session has been captured. Reject this request for
+    /// running tasks.
     Restart { id: u64 },
     /// Set the manual "in use" tag.
     Tag { id: u64, on: bool },
-    /// Set a task's group; `None` clears it back to unassigned.
+    /// Set a task's group; clear to unassigned for `None`.
     SetGroup { id: u64, group: Option<String> },
-    /// Set a task's display name; `None` clears it.
+    /// Set a task's display name; clear it for `None`.
     SetName { id: u64, name: Option<String> },
     /// Client terminal resized: `rows`×`cols` is the PTY *content* size. The
     /// client has already subtracted the row it reserves for its status bar.
@@ -80,11 +80,10 @@ pub enum Command {
     /// mode (DECSET 2004) from its emulator to choose between paste markers
     /// and newline conversion.
     Paste { id: u64, bytes: Vec<u8> },
-    /// One mouse action over an attached task. `col`/`row` are 0-based pane
-    /// cells. Routing is core-side for the same reason as `Paste`: the child's
-    /// mouse-protocol mode, encoding, and alternate-scroll state live in its
-    /// emulator, and they decide both whether the child hears about the
-    /// action at all and in which byte encoding.
+    /// One mouse action over an attached task. `col`/`row` are 0-based pane cells.
+    /// Routing is core-side for the same reason as `Paste`: the child's mouse-protocol
+    /// mode, encoding, and alternate-scroll state are stored in its emulator and
+    /// required to determine whether and how to encode the action.
     Mouse {
         id: u64,
         kind: MouseKind,
@@ -142,7 +141,7 @@ pub enum MouseKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Key {
     Char(char),
-    /// Function-key number. `1..=12` encode; anything else encodes to nothing.
+    /// Function-key number. Encode `1..=12`; emit nothing for other values.
     F(u8),
     Up,
     Down,
@@ -274,9 +273,9 @@ pub enum PreviewSource {
     Floor,
     /// The alternate screen is active with no usable title.
     Marker,
-    /// The child's window title. The alternate screen accepts its current
-    /// captured title; the primary screen requires a retained title that the
-    /// summary adapter normalizes.
+    /// The child's window title. On the alternate screen, use the current captured
+    /// title; on the primary screen, require a retained title normalized by the summary
+    /// adapter.
     Title,
     /// The cascade's top tier: a normalized screen or registry status.
     Anchor,
@@ -299,8 +298,8 @@ impl PreviewSource {
 pub struct Preview {
     pub text: String,
     pub source: PreviewSource,
-    /// Matcher ID for an Anchor preview; `None` for other sources. This field
-    /// is not encoded, so a wire-decoded view always carries `None`.
+    /// Matcher ID for an Anchor preview; `None` for other sources. This field is not
+    /// encoded, so a wire-decoded view is always assigned `None`.
     pub rule: Option<&'static str>,
     /// Whether the preview froze at output-complete and can no longer change.
     pub frozen: bool,
@@ -396,8 +395,8 @@ fn num_from<T: TryFrom<u64>>(v: &jzon::JsonValue) -> Option<T> {
     T::try_from(v.as_u64()?).ok()
 }
 
-/// Decode an optional boolean flag. Missing and null values mean `false`; any
-/// non-boolean value rejects the message.
+/// Decode an optional boolean flag. Use `false` for missing or null values; reject the
+/// message for other non-boolean values.
 fn bool_flag(v: &jzon::JsonValue) -> Option<bool> {
     if v.is_null() {
         return Some(false);
@@ -423,9 +422,9 @@ pub(crate) fn insert_opt_str(o: &mut jzon::JsonValue, key: &str, val: &Option<St
     }
 }
 
-/// Decode an optional duration field carried as whole milliseconds: missing
-/// and null both mean unknown (`Some(None)`), a number is the value, and any
-/// other type rejects the message (`None`), mirroring [`opt_str`].
+/// Decode an optional duration in whole milliseconds. Return unknown (`Some(None)`) for
+/// missing or null values, the duration for a number, or `None` to reject any other
+/// type, mirroring [`opt_str`].
 fn opt_ms(v: &jzon::JsonValue) -> Option<Option<Duration>> {
     if v.is_null() {
         return Some(None);
@@ -441,9 +440,8 @@ fn insert_opt_ms(o: &mut jzon::JsonValue, key: &str, val: Option<Duration>) {
     }
 }
 
-/// Decode a JSON array of strings one-to-one. A non-string member rejects
-/// the whole array, preserving the mapping between encoded and decoded
-/// positions.
+/// Decode a JSON array of strings one-to-one. Reject the whole array on any non-string
+/// member to preserve encoded and decoded positions.
 fn str_vec(v: &jzon::JsonValue) -> Option<Vec<String>> {
     let mut out = Vec::with_capacity(v.len());
     for m in v.members() {

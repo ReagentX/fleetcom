@@ -125,7 +125,7 @@ mod tests {
         b.insert('x');
         assert_eq!(b.as_str(), "caxfé");
         assert_eq!(b.before_caret(), "cax");
-        // Backspace removes the char before the caret only.
+        // On Backspace, remove only the character before the caret.
         b.backspace();
         assert_eq!(b.as_str(), "café");
         assert_eq!(b.before_caret(), "ca");

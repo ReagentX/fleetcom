@@ -1,5 +1,5 @@
-//! JSON session recipes stored one file per name in the user's config directory.
-//! Loading a recipe starts new commands; it does not restore live processes.
+//! JSON session recipes stored one file per name in the user's config directory. On
+//! recipe load, start new commands without restoring live processes.
 
 use std::{
     collections::BTreeMap,
@@ -16,8 +16,8 @@ use crate::{
     task::{pid_is_dead, positive_pid},
 };
 
-/// One recipe entry. Entries without a group or name serialize as strings;
-/// other entries use objects whose optional fields are written only when set.
+/// One recipe entry. Serialize entries without a group or name as strings; use objects
+/// for other entries, writing optional fields only when set.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionEntry {
     pub cmd: String,
@@ -28,7 +28,7 @@ pub struct SessionEntry {
 /// Session recipe mapping directories to ordered entries.
 pub type SessionConfig = BTreeMap<String, Vec<SessionEntry>>;
 
-/// Env var overriding the config root that session recipes live under.
+/// Environment variable overriding the configuration root for session recipes.
 pub const FLEETCOM_CONFIG_DIR: &str = "FLEETCOM_CONFIG_DIR";
 
 /// Characters replaced with `_` in session filenames.
@@ -55,10 +55,10 @@ fn sanitize(name: &str) -> String {
     out
 }
 
-/// Session-recipe directory: `<config root>/sessions`. A caller-supplied
-/// `root` wins (the supervisor passes the connecting client's
-/// [`FLEETCOM_CONFIG_DIR`]); otherwise the same var from this process's env,
-/// else `dirs::config_dir()/fleetcom`.
+/// Resolve `<config root>/sessions`. Prefer the caller-supplied `root`: the
+/// supervisor passes the connecting client's [`FLEETCOM_CONFIG_DIR`]. Otherwise,
+/// use that variable from this process's environment, falling back to
+/// `dirs::config_dir()/fleetcom`.
 pub fn sessions_dir(root: Option<PathBuf>) -> Option<PathBuf> {
     root.or_else(|| std::env::var(FLEETCOM_CONFIG_DIR).ok().map(PathBuf::from))
         .or_else(|| dirs::config_dir().map(|c| c.join("fleetcom")))
@@ -76,7 +76,7 @@ fn dirs_json(cfg: &SessionConfig) -> jzon::JsonValue {
         let mut arr = jzon::JsonValue::new_array();
         for e in entries {
             let member = if e.group.is_none() && e.name.is_none() {
-                // Entries without optional labels use the string form.
+                // Use the string form for entries without optional labels.
                 jzon::JsonValue::from(e.cmd.as_str())
             } else {
                 let mut m = jzon::object! { "cmd": e.cmd.as_str() };
@@ -91,8 +91,8 @@ fn dirs_json(cfg: &SessionConfig) -> jzon::JsonValue {
     dirs
 }
 
-/// Serialize the versioned wrapped schema. The stored name distinguishes
-/// names that sanitize to the same filename.
+/// Serialize the versioned wrapped schema. Store the name to distinguish names
+/// sanitized to the same filename.
 fn to_json(name: &str, cfg: &SessionConfig) -> String {
     jzon::object! {
         "version": FORMAT_VERSION,
@@ -192,8 +192,8 @@ fn from_json(text: &str) -> io::Result<(Option<String>, SessionConfig)> {
     Ok((name, cfg))
 }
 
-/// Inspect wrapper identity without validating its version or command body:
-/// an unloadable recipe still owns its name for listings and collision checks.
+/// Inspect wrapper identity without validating its version or command body: retain the
+/// stored name for listings and collision checks even for an unloadable recipe.
 fn stored_name(text: &str) -> Option<String> {
     let parsed = jzon::parse(text).ok()?;
     if parsed["dirs"].is_object() {
@@ -223,9 +223,9 @@ fn ensure_private_dir(dir: &Path) -> io::Result<()> {
     Ok(())
 }
 
-/// Write `contents` to `<dir>/<file_name>` atomically: a private temp file in
-/// `dir`, synced, then renamed over the target. The `.tmp` suffix keeps the
-/// temp out of `list_in`, and the rename gives the target mode 0600.
+/// Write `contents` to `<dir>/<file_name>` atomically: a private temp file in `dir`,
+/// synced, then renamed over the target. Exclude the temp from `list_in` with a `.tmp`
+/// suffix; preserve mode 0600 on rename to the target.
 fn write_atomic(dir: &Path, file_name: &str, contents: &str) -> io::Result<PathBuf> {
     let file = dir.join(file_name);
     let pid = std::process::id();
@@ -294,8 +294,8 @@ pub fn load_in(dir: &Path, name: &str) -> io::Result<SessionConfig> {
     from_json(&fs::read_to_string(file)?).map(|(_, cfg)| cfg)
 }
 
-/// Return recipe names under `dir`, collated case-insensitively. Wrapped files
-/// use their stored name; flat files use the filename stem.
+/// Return recipe names under `dir`, collated case-insensitively. Use the stored name
+/// for wrapped files and the filename stem for flat files.
 pub fn list_in(dir: &Path) -> Vec<String> {
     let mut names = Vec::new();
     if let Ok(entries) = fs::read_dir(dir) {
@@ -360,8 +360,8 @@ pub fn save_recovery_in(
     Ok(file)
 }
 
-/// List readable recovery snapshots in descending stem order. Invalid files
-/// are skipped, and files without a stored name use their stem as the label.
+/// List readable recovery snapshots in descending stem order. Invalid files are
+/// skipped, and filename stems are used as labels for files without stored names.
 pub fn list_recovery_in(dir: &Path) -> Vec<RecoveryEntry> {
     let mut out = Vec::new();
     if let Ok(entries) = fs::read_dir(dir) {
@@ -523,7 +523,7 @@ mod tests {
         );
     }
 
-    /// Mixed string and object entries survive one serialization round trip.
+    /// Preserve mixed string and object entries through one serialization round trip.
     #[test]
     fn round_trips_mixed_grouped_and_ungrouped_entries() {
         let dir = temp("session_mixed");
@@ -537,7 +537,7 @@ mod tests {
         assert_eq!(load_in(&dir, "mixed").unwrap(), cfg);
     }
 
-    /// Every group/name combination survives serialization.
+    /// Preserve every group/name combination through serialization.
     #[test]
     fn round_trips_named_entries() {
         let dir = temp("session_named");
@@ -707,7 +707,8 @@ mod tests {
         }
     }
 
-    /// One invalid entry rejects the recipe, including preceding valid commands.
+    /// Reject the whole recipe on one invalid entry, including preceding valid
+    /// commands.
     #[test]
     fn rejects_malformed_entries_with_directory_position_and_field() {
         let mut cases = Vec::new();
@@ -832,7 +833,7 @@ mod tests {
         assert_eq!(sanitize("  a.b  "), "a_b");
     }
 
-    /// The stem cap keeps 250 ASCII bytes and drops the remainder.
+    /// Keep at most 250 ASCII bytes in the stem.
     #[test]
     fn caps_names_at_250_bytes() {
         assert_eq!(sanitize(&"a".repeat(250)), "a".repeat(250));
@@ -841,7 +842,7 @@ mod tests {
         assert_eq!(format!("{capped}.json").len(), 255);
     }
 
-    /// The stem cap never splits a multibyte character.
+    /// Never split a multibyte character at the stem cap.
     #[test]
     fn cap_drops_a_multibyte_char_whole() {
         // 249 bytes used; the 2-byte 'é' would reach 251.
@@ -914,7 +915,7 @@ mod tests {
         assert_eq!(names, vec!["clean.json".to_string()]);
     }
 
-    /// Saves reject a different name that sanitizes to an occupied filename.
+    /// Reject a save under a different name sanitized to an occupied filename.
     #[test]
     fn refuses_saves_that_collide_after_sanitize() {
         let dir = temp("session_collide");
@@ -931,7 +932,7 @@ mod tests {
         assert_eq!(load_in(&dir, "a/b").unwrap(), first);
     }
 
-    /// Invalid bodies and future versions retain their stored identity.
+    /// Retain stored identity for invalid bodies and future versions.
     #[test]
     fn unloadable_wrappers_keep_picker_names_and_collision_protection() {
         let dir = temp("session_invalid_identity");
@@ -1055,7 +1056,7 @@ mod tests {
         assert_eq!(mode(&file), 0o600);
     }
 
-    /// Pruning keeps the lexically greatest [`RECOVERY_KEEP`] filenames.
+    /// Retain the lexically greatest [`RECOVERY_KEEP`] filenames on prune.
     #[test]
     fn recovery_prune_keeps_the_newest_ten() {
         let base = temp("session_recovery_prune");
@@ -1079,7 +1080,7 @@ mod tests {
         assert_eq!(names, expected, "prune must drop exactly the oldest two");
     }
 
-    /// Pruning retains the just-written stem even when it is the oldest.
+    /// Retain the just-written stem on prune even when it is oldest.
     #[test]
     fn recovery_prune_exempts_the_active_stem() {
         let base = temp("session_recovery_prune_active");
@@ -1112,7 +1113,7 @@ mod tests {
         );
     }
 
-    /// Below [`RECOVERY_KEEP`] files, pruning removes nothing.
+    /// Remove nothing when pruning fewer than [`RECOVERY_KEEP`] files.
     #[test]
     fn recovery_prune_below_limit_removes_nothing() {
         let base = temp("session_recovery_prune_few");
@@ -1131,7 +1132,7 @@ mod tests {
         );
     }
 
-    /// Pruning retains an older snapshot whose PID is still live.
+    /// Retain an older snapshot on prune when its PID is still live.
     #[test]
     fn recovery_prune_exempts_live_pid_stems() {
         let base = temp("session_recovery_prune_live");
@@ -1238,7 +1239,7 @@ mod tests {
         assert_eq!(list_in(&dir), vec!["real".to_string()]);
     }
 
-    /// Listing sorts by descending stem and skips corrupt files.
+    /// List by descending stem; skip corrupt files.
     #[test]
     fn recovery_listing_is_newest_first_and_skips_corrupt_files() {
         let base = temp("session_recovery_list");
@@ -1323,7 +1324,7 @@ mod tests {
         );
     }
 
-    /// Recovery loads reject empty, dotted, or path-shaped stems.
+    /// Reject empty, dotted, or path-shaped stems on recovery load.
     #[test]
     fn load_recovery_in_loads_by_stem_and_rejects_traversal() {
         let base = temp("session_recovery_load");
