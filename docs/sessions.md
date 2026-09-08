@@ -1,6 +1,6 @@
 # Sessions
 
-A session is a launch recipe: commands, working directories, and each task's optional group assignment and display name. On load, new processes are always started. To keep live processes running across client disconnects, use the [daemon](README.md#storage-paths).
+A session is a launch recipe: commands, working directories, and each task's optional group assignment and display name. Loading a session always starts new processes. To keep live processes running across client disconnects, use the [daemon](README.md#storage-paths).
 
 ## Storage
 
@@ -18,7 +18,7 @@ The filename is derived from the session name: leading and trailing whitespace i
 
 ## Format
 
-A session file is a JSON object with three fields. `version` is the format version, currently 1. In `name`, the session name is stored as typed, trimmed but not sanitized. Under `dirs`, each working directory is mapped to an ordered list of entries. An entry with neither a group nor a name is a command string. An entry carrying either is an object with `cmd` plus the optional `group` and `name` fields:
+A session file is a JSON object with three fields. `version` identifies the format version, currently 1. `name` holds the session name as typed, trimmed but not sanitized. `dirs` maps each working directory to an ordered list of entries. An entry with neither a group nor a name is a command string. An entry carrying either is an object with `cmd` plus the optional `group` and `name` fields:
 
 ```json
 {
@@ -36,7 +36,7 @@ A session file is a JSON object with three fields. `version` is the format versi
 }
 ```
 
-- Store `name` to distinguish session names sanitized to the same filename: `a/b` and `a.b` are both saved to `a_b.json`. On save, the stored and incoming names are compared; a mismatch is refused with both names in the error. In the load picker, the stored name is displayed as `a/b`, not `a_b`.
+- The stored `name` distinguishes session names that sanitize to the same filename: `a/b` and `a.b` both become `a_b.json`. Before saving, `fleetcom` compares the stored and incoming names and refuses a mismatch, reporting both names in the error. The load picker displays the stored name as `a/b`, not `a_b`.
 - Keys under `dirs` are directory paths: each task's working directory. On save, directories under `$HOME` are written as `~/...`; other paths are kept absolute. On load, `~` is expanded to `$HOME`, and relative keys are resolved against the invocation directory of the client loading the session.
 - Values are ordered lists. A string member is a bare shell command; in the object form, an optional group and display name can also be specified for assignment on load. Order is preserved, and each command is run in its own PTY under that directory.
 - Directories are serialized alphabetically. Command order remains stable within each directory.
@@ -55,7 +55,7 @@ After validation, group and display names are stripped of control characters and
 
 Use the string form for commands with neither a group nor a name. String and object entries can appear in the same directory array.
 
-No conversation ID is specified in a bare agent command; if saved verbatim, a new conversation would be started on load. With a captured ID for `claude`, `codex`, `grok`, or `omp`, the resume form is stored instead. Without a known ID, the authored command is preserved in named saves and recovery snapshots. You can run the resulting command directly in a shell:
+A bare agent command specifies no conversation ID, so saving it verbatim would start a new conversation on load. When `fleetcom` has captured an ID for `claude`, `codex`, `grok`, or `omp`, it stores the resume form instead. Without a known ID, it preserves the authored command in named saves and recovery snapshots. You can run the resulting command directly in a shell:
 
 ```json
 {
@@ -87,7 +87,7 @@ As with saved recipes, full command lines are persisted in recovery files, inclu
 
 ## Saving and loading
 
-- Save: `w` in the dashboard, type a name, `Enter`. Store the session name plus each task's directory, command, and optional group and name to `<name>.json`.
+- Save: press `w` in the dashboard, type a name, and press `Enter`. This writes the session name plus each task's directory, command, and optional group and name to `<name>.json`.
 - Load in-app: `o`, pick from the list, `Enter`.
 - Load at launch: `fleetcom <name>`.
 

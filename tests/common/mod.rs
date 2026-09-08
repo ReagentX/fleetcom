@@ -15,8 +15,8 @@ use std::{
     time::{Duration, Instant},
 };
 
-/// The protocol version this test suite speaks; must track
-/// `protocol::PROTOCOL_VERSION`
+/// Protocol version used by this test suite; must match
+/// `protocol::PROTOCOL_VERSION`.
 pub const PROTOCOL_VERSION: u32 = 12;
 
 /// One frame of the given kind: `[u32 len][kind][payload]`.

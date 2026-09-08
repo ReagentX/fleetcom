@@ -28,7 +28,7 @@ pub struct SessionEntry {
 /// Session recipe mapping directories to ordered entries.
 pub type SessionConfig = BTreeMap<String, Vec<SessionEntry>>;
 
-/// Env var overriding the config root that session recipes live under.
+/// Environment variable overriding the configuration root for session recipes.
 pub const FLEETCOM_CONFIG_DIR: &str = "FLEETCOM_CONFIG_DIR";
 
 /// Characters replaced with `_` in session filenames.
@@ -55,9 +55,10 @@ fn sanitize(name: &str) -> String {
     out
 }
 
-/// Session-recipe directory: `<config root>/sessions`. A caller-supplied `root` is
-/// preferred (the supervisor passes the connecting client's [`FLEETCOM_CONFIG_DIR`]);
-/// otherwise the same var from this process's env, else `dirs::config_dir()/fleetcom`.
+/// Resolve `<config root>/sessions`. Prefer the caller-supplied `root`: the
+/// supervisor passes the connecting client's [`FLEETCOM_CONFIG_DIR`]. Otherwise,
+/// use that variable from this process's environment, falling back to
+/// `dirs::config_dir()/fleetcom`.
 pub fn sessions_dir(root: Option<PathBuf>) -> Option<PathBuf> {
     root.or_else(|| std::env::var(FLEETCOM_CONFIG_DIR).ok().map(PathBuf::from))
         .or_else(|| dirs::config_dir().map(|c| c.join("fleetcom")))

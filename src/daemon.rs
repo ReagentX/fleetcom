@@ -149,10 +149,9 @@ fn validate_runtime_dir(dir: &Path, md: &fs::Metadata) -> io::Result<()> {
     Ok(())
 }
 
-/// Read one frame under a deadline, restoring the unbounded default after.
-/// Propagates `set_read_timeout` failures: silently proceeding would leave an
-/// unbounded read exactly where the deadline is load-bearing (the daemon's
-/// accept path, the client's in-UI reconnect).
+/// Read one frame under a deadline, then restore the unbounded default.
+/// Propagate `set_read_timeout` failures because an unbounded read would block
+/// the daemon's accept path or freeze the client's in-UI reconnect.
 fn read_frame_bounded(stream: &mut UnixStream, timeout: Duration) -> io::Result<(u8, Vec<u8>)> {
     stream.set_read_timeout(Some(timeout))?;
     let res = read_frame(stream);
@@ -166,10 +165,9 @@ fn is_timeout(e: &io::Error) -> bool {
     matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut)
 }
 
-/// Map a failed hello-reply read to an actionable error. EOF means the daemon
-/// went away mid-handshake (a racing `--kill` or shutdown): rerunning
-/// autostarts a fresh one, so say that, not "kill and retry", which would be
-/// advice to destroy a fleet the next paragraph says no longer exists.
+/// Map a failed hello-reply read to an error with a recovery instruction. EOF
+/// means the daemon went away mid-handshake, possibly during `--kill` or
+/// shutdown. Advise rerunning the client: it can autostart a fresh daemon.
 fn hello_read_error(e: io::Error) -> io::Error {
     if e.kind() == ErrorKind::UnexpectedEof {
         io::Error::new(
@@ -332,10 +330,9 @@ fn connect_or_autostart_in(dir: &Path) -> io::Result<(UnixStream, DaemonOrigin)>
 fn spawn_daemon() -> io::Result<()> {
     let exe = std::env::current_exe()?;
     let dir = runtime_dir();
-    // Propagate a validation failure instead of discarding it: creating
-    // `daemon.log` inside an unvalidated dir would follow a planted symlink
-    // (shared-`/tmp` attack) and truncate an attacker-chosen file *before* the
-    // daemon's own check aborted anything.
+    // Creating `daemon.log` inside an unvalidated directory could follow a planted
+    // symlink and truncate an attacker-chosen file before the daemon checks the
+    // directory. Propagate validation failures before opening the log.
     ensure_runtime_dir(&dir)?;
     let log = fs::File::create(dir.join("daemon.log")).ok();
     let mut cmd = std::process::Command::new(exe);
@@ -358,15 +355,15 @@ fn no_daemon() -> io::Result<()> {
     Ok(())
 }
 
-/// `fleetcom --kill`: stop the daemon and every task it owns. Signal path, not
-/// socket: the daemon serves one client at a time, so a `Shutdown` *frame*
-/// would sit in the accept backlog until an attached client detached.
-/// `--kill` must work while someone else is attached. The pid comes from the
-/// lock file (trustworthy while the flock is held: the holder wrote it), and
-/// daemon exit releases the flock, so acquiring it is the completion signal.
-/// A no-op (with a message) if no daemon is running. A held flock without a
-/// usable pid is an error: it may be the interval between lock acquisition and
-/// pid publication, so it cannot be treated as the no-daemon case.
+/// Stop the daemon and every task it owns for `fleetcom --kill`. Use a signal
+/// because the daemon serves one client at a time: a socket `Shutdown` frame
+/// would wait until the attached client disconnected.
+///
+/// Read the PID from the lock file while its `flock` is held. The holder wrote
+/// that PID, and daemon exit releases the lock, so acquiring it confirms
+/// completion. Report a no-op when no daemon is running. A held lock without a
+/// usable PID is an error: the daemon may be between lock acquisition and PID
+/// publication, so a missing PID does not establish that no daemon is running.
 pub fn run_kill() -> io::Result<()> {
     run_kill_in(&runtime_dir())
 }

@@ -47,8 +47,8 @@ pub struct WriteRefused {
     pub len: usize,
 }
 
-/// Map a dependency error (portable-pty returns `anyhow`) into `io::Error` so
-/// the whole crate speaks stdlib `io::Result` and never grows an `anyhow` dep.
+/// Map a dependency error (`portable-pty` returns `anyhow`) into `io::Error` so
+/// the crate uses `io::Result` without a direct `anyhow` dependency.
 fn io_err(e: impl std::fmt::Display) -> io::Error {
     io::Error::other(e.to_string())
 }
@@ -133,10 +133,10 @@ pub struct Task {
     reaped: bool,
 }
 
-/// Wake the core loop that this task's screen advanced. Best-effort: the slot is
-/// empty between connections, and a closed channel just means the loop is gone.
-/// Either way the parser already holds the bytes, so a dropped signal only delays
-/// a repaint to the next backstop tick.
+/// Notify the core loop that this task's screen advanced. The slot is empty
+/// between connections, and a closed channel means the loop is gone. The parser
+/// already holds the bytes, so dropping a notification loses no output; a listening
+/// loop can pick up the change on its next backstop tick.
 fn signal(waker: &Waker) {
     if let Ok(slot) = waker.lock()
         && let Some(tx) = slot.as_ref()
@@ -230,12 +230,10 @@ impl Task {
             })
             .map_err(io_err)?;
 
-        // The launch context's shell, not the daemon's: a zsh client attached
-        // to a bash-started daemon still gets zsh word-splitting. No fallback
-        // through this process's own SHELL: for an autostarted daemon that is
-        // the *first* client's env, the exact coupling per-connection context
-        // exists to remove. A client env without SHELL gets the portable
-        // default.
+        // The daemon inherits the first client's environment, which may name a
+        // different shell from the connecting client's. Read SHELL from the launch
+        // context so a zsh client attached to a bash-started daemon still gets zsh
+        // word-splitting. Without SHELL, use the portable default.
         let shell = env_get(env, "SHELL")
             .map(OsString::from)
             .unwrap_or_else(|| "/bin/sh".into());
@@ -244,10 +242,9 @@ impl Task {
         // shell functions are not loaded.
         cmd.arg("-c");
         cmd.arg(exec_command);
-        // The task runs under the *client's* environment, verbatim: clear the
-        // builder's captured base (the daemon's own env, whatever the client
-        // that first autostarted it happened to have) so nothing leaks through
-        // where the client's env lacks a key.
+        // The builder inherits the daemon's environment. Clear it before applying
+        // the client's environment so keys absent from the client cannot leak in
+        // from the client that first autostarted the daemon.
         cmd.env_clear();
         for (k, v) in env {
             cmd.env(k, v);
@@ -514,8 +511,8 @@ impl Task {
         );
     }
 
-    /// Freeze the preview once output is complete. Any open `?2026` frame is
-    /// landed first.
+    /// Freeze the preview once output is complete. Apply any open `?2026` frame
+    /// first so the preview includes its buffered output.
     pub fn finalize_preview(&mut self) {
         if self.preview.finalized() || !self.output_complete() {
             return;

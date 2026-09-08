@@ -104,7 +104,7 @@ Press uppercase `X` to kill a running task or remove a finished one. On removal,
 
 Press `r` to rerun a finished task. Running tasks cannot be rerun without first being killed and are left untouched.
 
-The replacement is started in the same directory with the requesting client's environment and the stored command. For a supported `claude`, `codex`, `grok`, or `omp` task with a valid captured conversation ID, the resume command is used instead.
+`fleetcom` starts the replacement in the same directory, using the requesting client's environment and the stored command. For a supported `claude`, `codex`, `grok`, or `omp` task with a valid captured conversation ID, it uses the resume command instead.
 
 On rerun, the task's ID, `◆` tag, group, name, and spawn order are preserved; its clock and screen are reset. Under lifecycle sorting, the restarted task may be listed in another section. You can also rerun inside peek without closing the overlay.
 
@@ -140,7 +140,7 @@ Press `R` to rename the selected task, starting with its current name. Press `En
 
 For a named task, the name is displayed in place of the command in the dashboard row and peek title. In the attached status bar, both are displayed as `name · command`.
 
-Display names are stripped of control characters and surrounding whitespace and limited to 64 characters by the daemon. An empty result is treated as no name. Unlike groups, `Unassigned` is a legal display name; the label is reserved only in the [group picker](#the-g-group-picker).
+The daemon removes control characters and surrounding whitespace from display names, then limits them to 64 characters. An empty result means no name. Unlike groups, `Unassigned` is a legal display name; the label is reserved only in the [group picker](#the-g-group-picker).
 
 ## The `@` directory picker
 
@@ -178,7 +178,7 @@ Press `Enter` to apply the action listed in the hint for the highlighted row:
 
 Use `↑`/`↓` to move the highlight; press `Esc` to cancel without changing anything.
 
-Group names received from the picker or a [session](sessions.md) file are normalized by the daemon: control characters and surrounding whitespace are removed, and the result is capped at 64 characters. An empty result or the exact name `Unassigned` means no group, preventing a user-defined name from colliding with the reserved section. Comparison remains case-sensitive, so `unassigned` is a valid group name.
+The daemon normalizes group names from the picker or a [session](sessions.md) file: it removes control characters and surrounding whitespace, then caps the result at 64 characters. An empty result or the exact name `Unassigned` means no group, preventing a user-defined name from colliding with the reserved section. Comparison remains case-sensitive, so `unassigned` is a valid group name.
 
 ## The `o` session picker
 
@@ -198,7 +198,7 @@ Bindings are arranged in two columns. At limited height, group headers are omitt
 
 ## Peek
 
-A centered box over the dashboard showing the selected task's live screen (the last screenful). Use `↑`/`↓` (or `k`/`j`) to switch tasks, `Enter` to attach, `r` to rerun a finished task, or `Space`, `Esc`, or `q` to close.
+Peek shows the selected task's live screen (the last screenful) in a centered box over the dashboard. Use `↑`/`↓` (or `k`/`j`) to switch tasks, `Enter` to attach, `r` to rerun a finished task, or `Space`, `Esc`, or `q` to close.
 
 Read the source of the row's dashboard preview in the footer's `preview:` segment: `floor` (the last non-blank row of the live screen), `marker` (a full-screen program with no usable title), `title` (the child's window title), or `anchor/<rule>` (a recognized agent status, tagged with the matcher that produced it). On the alternate screen, any current title is rendered; recognized title formats are normalized first. On the primary screen, only a retained title recognized by the task's agent adapter is rendered. Otherwise, `floor` is used. Most rules name a screen matcher, such as `claude:spinner` or `codex:approval-menu`. The `claude:registry-approval` and `claude:registry-waiting` rules instead come from Claude's on-disk session status.
 

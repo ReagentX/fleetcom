@@ -20,8 +20,8 @@ fleet there (task names, previews, ages, tags, selection), then regenerate:
 cargo test -- --ignored write_readme_screenshot_fixtures
 ```
 
-Every duration in the fixture is constant. With the same `$HOME`, identical bytes are written on
-each run; that path is abbreviated to `~` in section labels.
+Every duration in the fixture is constant, so repeated runs with the same `$HOME`
+write identical bytes. Section labels abbreviate that path to `~`.
 
 ## Capturing
 
@@ -32,8 +32,9 @@ clear; cat docs/img/groups.ansi;    read -rsk 1; printf '\033[?25h'
 clear; cat docs/img/controls.ansi;  read -rsk 1; printf '\033[?25h'
 ```
 
-Use `read` to pause until a keypress, then take the screenshot with nothing
-emitted after the frame. Restore the hidden cursor with the trailing `printf`.
+`read` pauses until a keypress, leaving the frame on screen without further output.
+Take the screenshot during this pause, then press a key so the trailing `printf`
+restores the hidden cursor.
 The flags are zsh's; use `read -rs -n1` in bash, or `read -r` in either shell
 to wait for Enter.
 

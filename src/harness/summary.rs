@@ -431,9 +431,9 @@ fn codex_approval(rows: &[String]) -> Option<(String, &'static str)> {
 /// - a `model-with-reasoning` head, `{model} {effort}` with an optional third
 ///   word, matched by [`codex_model_with_reasoning`].
 ///
-/// Neither shape means no label. The row must also be indented: the composer
-/// and reply bullets begin at column 0 and can otherwise satisfy the same text
-/// shapes.
+/// Return no label when neither shape matches. The row must also be indented:
+/// the composer and reply bullets begin at column 0 and can otherwise satisfy
+/// the same text shapes.
 fn codex_model_label(rows: &[String]) -> Option<String> {
     let last = rows.iter().rposition(|r| !r.is_empty())?;
     (last.saturating_sub(5)..=last).rev().find_map(|i| {
@@ -671,7 +671,7 @@ fn grok_still_running(t: &str) -> Option<String> {
         .then(|| rest.to_string())
 }
 
-/// One count segment: ascii digits, a space, then one to three words.
+/// One count segment: ASCII digits, a space, then one to three words.
 fn grok_still_running_count(seg: &str) -> bool {
     let digits = seg.chars().take_while(char::is_ascii_digit).count();
     if digits == 0 {
@@ -804,9 +804,8 @@ fn omp_approval(rows: &[String]) -> Option<(String, &'static str)> {
         .then(|| (AWAITING_APPROVAL.to_string(), "omp:approval-menu"))
 }
 
-/// The selector's chosen row: a cursor spelling, a space, then `Approve` and nothing
-/// more. Equality after the cursor is the whole check: the ascii `>` is also used for
-/// quoted lines, so require an exact remainder.
+/// Match a selector cursor, a space, and exactly `Approve`. The ASCII `>` also
+/// introduces quoted lines, so accepting an arbitrary suffix could match prose.
 fn omp_approve_row(row: &str) -> bool {
     let t = row.trim();
     OMP_CURSORS

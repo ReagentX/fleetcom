@@ -2551,7 +2551,7 @@ fn painted(app: &mut App) -> String {
 }
 
 /// Highlight rows swap reverse video for a bright-black background while the
-/// host terminal is unfocused
+/// host terminal is unfocused.
 #[test]
 fn unfocused_terminal_mutes_the_highlight_rows() {
     use crossterm::style::{Attribute, Color, SetAttribute, SetBackgroundColor};
@@ -3697,7 +3697,7 @@ fn capture_drop_clears_a_live_selection() {
     assert!(app.pending_clipboard.is_empty(), "nothing may copy");
 }
 
-/// A press queued before capture dropped is processed after it
+/// A press queued before mouse capture ended is processed after capture is off.
 #[test]
 fn press_after_capture_drop_starts_no_selection() {
     let mut app = App::attached_with_lines(&["alpha beta", "gamma"]);
@@ -3716,7 +3716,7 @@ fn press_on_a_stale_geometry_screen_starts_no_selection() {
     app.on_resize(40, 100);
     app.on_mouse(press(0, 0));
     assert!(app.selection().is_none(), "stale geometry must not select");
-    // The first post-resize frame restores eligibility
+    // The first post-resize frame restores eligibility.
     let rows = app.pane_rows() as usize;
     if let Some(s) = app.focused_screen.as_mut() {
         s.lines.resize(rows, String::new());

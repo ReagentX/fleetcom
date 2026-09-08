@@ -206,8 +206,8 @@ pub struct App {
     /// Id of the attached task, if any: by id (not index) so it survives the
     /// task list changing underneath it.
     pub focused_id: Option<u64>,
-    /// Whether the host terminal window has focus
-    /// While unfocused, highlight rows mute to a bright-black background
+    /// Whether the host terminal window has focus. While unfocused, highlighted
+    /// rows use a bright-black background.
     pub terminal_focused: bool,
     pub rows: u16,
     pub cols: u16,
@@ -260,8 +260,8 @@ pub struct App {
     input_tx: Option<Sender<CtEvent>>,
     /// Wake notifications from the input and transport reader threads.
     wait_rx: Receiver<()>,
-    /// Kept so `run` can hand the stdin thread a poker, and `reconnect` a fresh
-    /// transport one.
+    /// Sender retained for the stdin thread in `run` and each replacement
+    /// transport in `reconnect`, so both can wake the UI loop.
     wait_tx: Sender<()>,
     /// Set by an external SIGTERM/SIGHUP/SIGINT; the loop treats it as quit so
     /// teardown runs and the terminal is restored.
@@ -894,8 +894,8 @@ impl App {
             let _ = self.wait_rx.recv_timeout(wait_for_paint(due, since_paint));
             while self.wait_rx.try_recv().is_ok() {} // coalesce wake tokens
 
-            // Handle every buffered key/resize in one pass: coalesces a paste and
-            // shaves the last keystroke's echo (no render between chars).
+            // Handle buffered keys and resizes before rendering so a burst of
+            // input does not require a frame between each character.
             while let Ok(ev) = self.input_rx.try_recv() {
                 // Terminal events make the next pass bypass `PAINT_MIN`.
                 self.force_paint = true;

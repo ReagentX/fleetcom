@@ -42,9 +42,9 @@ pub enum Wake {
     Hangup,
 }
 
-/// The slot the `Supervisor` hands to each `Task` so its reader thread can wake
-/// the core loop on output. `None` between connections (no loop is listening),
-/// so an unattached daemon's task output just accumulates in the parser, free.
+/// Shared sender through which each task's reader thread wakes the core loop on
+/// output. The slot is `None` between connections because no loop is listening;
+/// task output still advances the parser without sending wake notifications.
 pub type Waker = Arc<Mutex<Option<Sender<Wake>>>>;
 
 /// Why the loop returned.

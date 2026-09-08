@@ -348,12 +348,11 @@ impl Emulator {
         self.land_sync_frame()
     }
 
-    /// Terminate an open `?2026` synchronized update regardless of its
-    /// timeout, landing the buffered frame in the grid; returns any
-    /// allowlisted probe replies the landed bytes generated. Exists for
-    /// reader EOF: every child fd is closed, so the closing ESU can never
-    /// arrive and `flush_expired_sync`'s deadline wait protects nothing:
-    /// the frame is landed, not torn. No-op when no sync is open.
+    /// Apply an open `?2026` synchronized update to the grid without waiting for
+    /// its timeout. Return any allowlisted probe replies the buffered bytes
+    /// generate. At reader EOF, every child fd is closed and no closing ESU can
+    /// arrive, so waiting for `flush_expired_sync` cannot protect an in-flight
+    /// frame. Do nothing when no synchronized update is open.
     pub fn finish_output(&mut self) -> Vec<String> {
         if self.parser.sync_timeout().sync_timeout().is_none() {
             return Vec::new();
@@ -1104,9 +1103,9 @@ mod tests {
         assert!(emu.contents().contains("and on"));
     }
 
-    /// The end-of-life landing `finish_output` exists for: BSU, output, no
-    /// ESU ever. The frame must land without waiting out the sync timeout,
-    /// and a clean emulator must pass through untouched.
+    /// BSU followed by output and no ESU leaves a buffered frame at EOF.
+    /// `finish_output` must apply it without waiting for the sync timeout and
+    /// leave an emulator with no open frame unchanged.
     #[test]
     fn finish_output_lands_an_open_sync_frame() {
         let mut emu = Emulator::new(4, 20, 0);
@@ -1126,7 +1125,7 @@ mod tests {
             "finish_output must land the frame with the timeout still pending"
         );
 
-        // The emulator parses normally after the landing.
+        // Applying the buffered frame must leave the parser usable.
         emu.process(b" and on");
         assert!(emu.contents().contains("and on"));
     }

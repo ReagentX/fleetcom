@@ -80,8 +80,8 @@ pub trait SummaryAdapter: Sync {
     /// removed.
     fn live_preview(&self, rows: &[String]) -> Option<(String, &'static str)>;
 
-    /// Return a model label from stable CLI chrome. Prepend to live status as `{label}
-    /// · ` during preview resolution.
+    /// Return a model label from stable CLI chrome. Preview resolution prepends
+    /// the label and ` · ` to the live status.
     fn model_label(&self, rows: &[String]) -> Option<String>;
 
     /// Normalize a title recognized as this CLI's output. On the alternate screen,
@@ -93,12 +93,13 @@ pub trait SummaryAdapter: Sync {
 }
 
 /// Resolve the instantaneous candidate in descending priority:
+///
 /// 1. harness registry: the caller-provided blocked status
 /// 2. summary adapter: the normalized live status when the CLI's working
 ///    structure is present
 /// 3. alternate screen: the title while its epoch is current, else the marker
-/// 4. primary title: the retained primary-screen announce, only when the
-///    adapter affirmatively normalizes it
+/// 4. primary title: the retained primary-screen title, only when the
+///    adapter recognizes and normalizes it
 /// 5. primary screen: the live floor
 ///
 /// Classify tiers 1 and 2 as Anchor. Prefix either status with the adapter's model
@@ -130,11 +131,10 @@ fn cascade(
     }
     if screen.alternate_screen() {
         return match screen.title() {
-            // The adapter may rewrite the title for display (claude's
-            // rotating spinner-frame prefix canonicalizes so the text
-            // stays constant); capture itself remains program-agnostic.
-            // Source stays Title and rule stays None: rules are anchor
-            // matcher ids, and a rewritten title is still a title.
+            // The adapter normalizes CLI-specific title text, such as Claude's
+            // rotating spinner prefix, so animation does not keep changing the
+            // preview. Capture itself remains program-agnostic. Keep Title and
+            // no rule ID: normalization does not make a title an anchor match.
             Some(text) => Preview {
                 text: adapter
                     .and_then(|a| a.normalize_title(text))
@@ -194,9 +194,9 @@ pub struct PreviewState {
     /// Last cascade output, carried while the resolution key is unchanged.
     candidate: Preview,
     /// Start of the demotion hold: the first resolution whose candidate ranked below
-    /// the rendered source. Do not reset it on lower-ranked candidate changes: measure
-    /// the continuous absence of rendered-or-higher, without postponing the commit on
-    /// each demoted candidate change.
+    /// the rendered source. Keep this timestamp when a lower-ranked candidate changes
+    /// so repeated changes cannot postpone the hold's expiry. The timer measures how
+    /// long no source of the rendered rank or higher has been available.
     downgrade_pending_since: Option<Instant>,
     /// Instant of the last rendered title: the min-hold deadline base.
     last_title_render: Option<Instant>,

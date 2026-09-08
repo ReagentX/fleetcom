@@ -1,6 +1,6 @@
 # fleetcom Documentation
 
-Live processes are supervised by the daemon; repeatable launch recipes are stored in session files. Keep those lifetimes separate when shutting down, reconnecting, or loading sessions. Use this guide for storage paths, lifecycle details, and a complete first run.
+The daemon supervises live processes; session files store repeatable launch recipes. Reconnecting returns you to the daemon's running tasks, while loading a session starts new processes from its recipe. Use this guide for storage paths, lifecycle details, and a complete first run.
 
 ## Index
 
@@ -29,7 +29,7 @@ The daemon socket, lock, and log are stored under the runtime path; durable sess
 
 ### Runtime directory (socket + lock + log)
 
-In the runtime directory: `default.sock`, the client↔daemon socket; `daemon.lock`, the single-instance `flock`; and `daemon.log`, the stderr of an autostarted daemon. The daemon PID is recorded in the lock file and used for `--kill`, without waiting for the socket. See [Security](#security) for the required permissions and ownership checks.
+The runtime directory contains three files: `default.sock` carries client↔daemon traffic, `daemon.lock` holds the single-instance `flock`, and `daemon.log` records an autostarted daemon's stderr. The daemon writes its PID to the lock file so `--kill` can signal it without waiting for the socket. See [Security](#security) for the required permissions and ownership checks.
 
 Resolved in this order:
 
@@ -139,7 +139,7 @@ Press `w`, type a name, and press `Enter` to save the fleet as a [session](sessi
 
 ## Security
 
-`fleetcom` is run entirely as your user, without raising or dropping privileges. Access is controlled through filesystem permissions rather than authentication: the socket is mode `0600` inside a mode-`0700` directory, and no peer check is performed by the daemon. Any process running as your user can therefore connect, spawn commands, and read task output. That is the trust boundary.
+`fleetcom` runs entirely as your user, without raising or dropping privileges. Filesystem permissions control access: the socket is mode `0600` inside a mode-`0700` directory, and the daemon performs no peer authentication. Any process running as your user can therefore connect, spawn commands, and read task output. That is the trust boundary.
 
 ### On-disk state
 
@@ -169,7 +169,7 @@ The client environment is not persisted. Each client's environment and working d
 
 ### Captured IDs in shell commands
 
-To resume an agent conversation, its captured ID is inserted into a command run through `$SHELL -c`. Validate IDs at this shell boundary: only lowercase hexadecimal in the `8-4-4-4-12` UUID shape is accepted. The same check is applied to capture payloads, live session records, and final command construction. No session IDs are read from terminal output. Only a bare program word or its canonical resume form is instrumented, never arbitrary shell text. See [Agent session resume](agent-resume.md#validation-boundary) for both boundaries.
+To resume an agent conversation, `fleetcom` inserts its captured ID into a command run through `$SHELL -c`. Because the ID becomes shell input, validation accepts only lowercase hexadecimal in the `8-4-4-4-12` UUID shape. The same check applies to capture payloads, live session records, and final command construction. `fleetcom` does not read session IDs from terminal output and instruments only a bare program word or its canonical resume form. See [Agent session resume](agent-resume.md#validation-boundary) for both boundaries.
 
 ### Copying text through the terminal
 
@@ -183,7 +183,7 @@ Each PTY master is held by the daemon. On daemon termination, the terminals are 
 
 ### Commands run through the client's non-interactive shell
 
-(`$SHELL -c`, or `/bin/sh` when `SHELL` is unset), so functions and aliases from `~/.zshrc` are unavailable.
+`fleetcom` invokes `$SHELL -c`, falling back to `/bin/sh` when `SHELL` is unset. Because the shell is non-interactive, functions and aliases from `~/.zshrc` are unavailable.
 
 ### Environment and directory
 

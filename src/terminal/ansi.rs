@@ -304,9 +304,9 @@ fn push_zerowidth(buf: &mut String, cell: &Cell) {
 }
 
 /// Emit SGR only when the cell's attributes differ from the running state.
-/// The respec always starts from 0: omitted parameters are thereby the
-/// defaults, which is what makes default-color restoration and reset
-/// boundaries fall out without per-attribute cancel codes.
+/// Start each replacement with SGR 0 so omitted parameters return to their
+/// defaults. This restores default colors and reset boundaries without
+/// per-attribute cancel codes.
 fn sync_sgr(buf: &mut String, state: &mut Sgr, cell: &Cell) {
     let want = Sgr::of(cell);
     if *state == want {

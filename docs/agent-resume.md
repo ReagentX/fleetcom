@@ -1,6 +1,6 @@
 # Agent session resume
 
-Launch commands are stored in session files; process state is not. If you relaunch a bare `claude`, `codex`, `grok`, or `omp` command, you ordinarily start another conversation. For accepted commands, a validated conversation ID is captured when available and used to construct a canonical resume command on session save or finished-task rerun (`r`).
+Session files store launch commands, not process state. If you relaunch a bare `claude`, `codex`, `grok`, or `omp` command, you ordinarily start another conversation. To preserve that conversation, `fleetcom` captures a validated ID when one is available for an accepted command. It uses that ID to construct a canonical resume command when you save a session or rerun a finished task (`r`).
 
 ## Workflow
 
@@ -40,19 +40,19 @@ For each supervisor installation, a private mode-`0700` `<root>/<pid>-<nonce>` n
 - `omp-capture.js`, mode `0600`: imported as a module, so no executable bit is required
 - `task-<id>-<run>.json` capture paths
 
-With a random nonce, concurrent supervisors are isolated and an existing namespace cannot be selected after PID reuse. With a distinct run number per rerun, capture files are separate and the replacement run's session state cannot be overwritten by a displaced process. Every other root entry is left unchanged during installation.
+The random nonce isolates concurrent supervisors and prevents PID reuse from selecting an existing namespace. Each rerun also gets a distinct run number, so a displaced process cannot overwrite the replacement run's capture file. Every other root entry is left unchanged during installation.
 
 ## Evidence sources
 
 ### `claude`
 
-For a bare Claude command, an ID can be specified at launch. A v4 UUID is therefore generated and added with the settings overlay:
+Claude accepts an ID at launch. For a bare command, the harness therefore generates a v4 UUID and adds it with the settings overlay:
 
 ```text
 --session-id '<uuid>' --settings '<namespace>/claude-settings.json'
 ```
 
-In a canonical resume command, the conversation ID is already specified; only `--settings` is added. A `SessionStart` hook is installed through the overlay. Its JSON payload is copied into `FLEETCOM_CAPTURE_FILE`, then `session_id` is read by the harness.
+Since a canonical resume command already specifies the conversation ID, the harness adds only `--settings`. The overlay installs a `SessionStart` hook that copies its JSON payload into `FLEETCOM_CAPTURE_FILE`. The harness then reads `session_id` from that payload.
 
 Claude session records are also available at `<claude-home>/sessions/<pid>.json`, one per session. The direct path for the task leader's PID is read. When the shell is retained as task leader under `$SHELL -c` instead of being replaced with Claude, no matching record is available and no ID is read from the registry.
 
@@ -66,9 +66,9 @@ You cannot choose a Codex ID at launch. A notify override is injected into both 
 -c 'notify=["<namespace>/codex-notify.sh"]'
 ```
 
-After each turn, the `agent-turn-complete` JSON argument is written to `FLEETCOM_CAPTURE_FILE` by the notifier; `thread-id` is then read by the harness. In-TUI session changes are captured after a turn is completed in the resumed conversation.
+After each turn, the notifier writes the `agent-turn-complete` JSON argument to `FLEETCOM_CAPTURE_FILE`, and the harness reads `thread-id` from it. This captures an in-TUI session change after a turn completes in the resumed conversation.
 
-Replacing a configured notifier would change user behavior. Bare top-level keys in `$CODEX_HOME/config.toml` are read until the first table header. A one-line `notify` array of non-empty basic strings is chained after the capture write. Its argv is carried in `FLEETCOM_NOTIFY_CHAIN`, joined by newlines, and the notification payload is appended. With an absent setting or empty array, capture is run alone. Empty arguments, newlines, and NUL cannot be transported; injection is disabled for these values.
+Replacing a configured notifier would change user behavior, so the harness reads bare top-level keys in `$CODEX_HOME/config.toml` until the first table header. If it finds a one-line `notify` array of non-empty basic strings, it chains that notifier after the capture write. `FLEETCOM_NOTIFY_CHAIN` carries its argv joined by newlines; the capture script appends the notification payload before invoking it. An absent setting or empty array means capture runs alone. This encoding cannot transport empty arguments, newlines, or NUL, so those values disable injection.
 
 ### `grok`
 
@@ -82,7 +82,7 @@ You cannot pin an omp ID at launch: no `--session-id` flag is available, and an 
 -e '<namespace>/omp-capture.js'
 ```
 
-Use `-e` to load the JavaScript module into the agent process, appended to the user's extensions. In its `session_start` and `session_switch` handlers, `sessionId` is written as JSON to `FLEETCOM_CAPTURE_FILE`, including after in-TUI `/resume` changes. Capture writes are best-effort: with an empty capture path, return immediately; ignore write errors.
+The `-e` flag loads the JavaScript module into the agent process, appending it to the user's extensions. Its `session_start` and `session_switch` handlers write `sessionId` as JSON to `FLEETCOM_CAPTURE_FILE`, including after in-TUI `/resume` changes. Capture writes are best-effort: the handlers return immediately for an empty capture path and ignore write errors.
 
 The aliases `-r`, `--session`, and `-c` remain opaque because only the exactly detected canonical form is rewritten.
 
@@ -113,7 +113,7 @@ The program word is preserved as typed. If no valid ID is available, the origina
 
 ## Validation boundary
 
-Every captured value is eventually inserted into a shell command. Validate at this boundary: only lowercase hexadecimal characters in the `8-4-4-4-12` UUID shape are accepted. The same check is applied to capture payloads, registry records, and final command construction. Malformed values are ignored rather than interpolated. You cannot establish conversation ownership from a valid UUID alone.
+Every captured value eventually enters a shell command, so validation accepts only lowercase hexadecimal characters in the `8-4-4-4-12` UUID shape. The same check applies to capture payloads, registry records, and final command construction. Malformed values are ignored rather than interpolated. A valid UUID alone does not establish conversation ownership.
 
 ## Extending capture
 

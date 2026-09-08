@@ -91,7 +91,7 @@ See [`docs/commands.md`](docs/commands.md#dashboard) for every key and launch fl
 
 ## How it works
 
-Run each task in a separate pseudo-terminal, emulated with `alacritty_terminal`. View the same emulated screen grid in the dashboard preview, peek overlay, and attached view: terminal state is preserved across views, including for full-screen programs such as `vim` and `htop`. See [`docs/how-it-works.md`](docs/how-it-works.md) for terminal emulation, input routing, and activity grouping.
+`fleetcom` runs each task in a separate pseudo-terminal, emulated with `alacritty_terminal`. The dashboard preview, peek overlay, and attached view all read the same emulated screen grid. This preserves terminal state as you move between views, including for full-screen programs such as `vim` and `htop`. See [`docs/how-it-works.md`](docs/how-it-works.md) for terminal emulation, input routing, and activity grouping.
 
 ## Scope and tradeoffs
 
