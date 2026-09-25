@@ -173,6 +173,26 @@ pub enum Row {
     Task(usize),
 }
 
+/// Where a flagship jump started, so the chord can return there.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Origin {
+    Dashboard,
+    Task(u64),
+}
+
+/// Where `Ctrl-]` goes next. The key handler and the attached bar both read
+/// it from `App::chord_target`, so the hint never disagrees with the key.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Target {
+    /// Return to the task the jump started from; the id is in `views`.
+    Task(u64),
+    /// Return to the dashboard: the jump started there, or its origin task
+    /// has left `views`.
+    Dashboard,
+    /// Jump to the flagship with this id.
+    Flagship(u64),
+}
+
 pub struct App {
     /// Connection to the task-owning core.
     transport: Box<dyn Transport>,
@@ -206,6 +226,12 @@ pub struct App {
     /// Id of the attached task, if any: by id (not index) so it survives the
     /// task list changing underneath it.
     pub focused_id: Option<u64>,
+    /// Where `Ctrl-]` returns to. Set only by attaching to the flagship, so
+    /// attached-to-flagship implies `Some`; it outlives the flagship's mark
+    /// (the daemon unmarks on exit) to keep the way back open. Cleared on
+    /// every exit from attached mode and on reconnect, since task ids are
+    /// daemon-local.
+    return_to: Option<Origin>,
     /// Whether the host terminal window has focus. While unfocused, highlighted
     /// rows use a bright-black background.
     pub terminal_focused: bool,
@@ -394,6 +420,7 @@ impl App {
         self.watched = None;
         self.selected_id = None;
         self.pending_select = None;
+        self.return_to = None;
         self.mode = Mode::Dashboard;
     }
 
@@ -439,6 +466,7 @@ impl App {
             spawn_cwd: invocation_dir.clone(),
             spawn_group: None,
             focused_id: None,
+            return_to: None,
             terminal_focused: true,
             rows,
             cols,
@@ -849,13 +877,7 @@ impl App {
             self.set_watch(watch);
             self.sync();
 
-            // Replace an unreachable daemon's snapshot with the reconnect banner.
-            if self.mode != Mode::Disconnected && !self.transport.connected() {
-                self.mode = Mode::Disconnected;
-                self.focused_id = None;
-                self.status = None;
-                self.selection = None;
-            }
+            self.check_connection();
 
             if self.term_signal.load(Ordering::Relaxed) {
                 // Detach on a terminating signal; leave tasks running under the daemon.
@@ -866,13 +888,7 @@ impl App {
                 break;
             }
             self.resolve_selection();
-            // If the attached task is gone, fall back to the dashboard rather
-            // than pointing `focused_id` at nothing.
-            if self.mode == Mode::Attached && self.focused_task().is_none() {
-                self.mode = Mode::Dashboard;
-                self.focused_id = None;
-                self.selection = None;
-            }
+            self.check_attached_task();
 
             // Flush clipboard output and synchronize terminal input modes.
             self.flush_clipboard(out)?;
@@ -917,6 +933,28 @@ impl App {
         }
         self.shutdown();
         Ok(())
+    }
+
+    /// Replace an unreachable daemon's snapshot with the reconnect banner.
+    fn check_connection(&mut self) {
+        if self.mode != Mode::Disconnected && !self.transport.connected() {
+            self.mode = Mode::Disconnected;
+            self.focused_id = None;
+            self.return_to = None;
+            self.status = None;
+            self.selection = None;
+        }
+    }
+
+    /// If the attached task is gone, fall back to the dashboard rather than
+    /// pointing `focused_id` at nothing.
+    fn check_attached_task(&mut self) {
+        if self.mode == Mode::Attached && self.focused_task().is_none() {
+            self.mode = Mode::Dashboard;
+            self.focused_id = None;
+            self.return_to = None;
+            self.selection = None;
+        }
     }
 
     fn on_resize(&mut self, rows: u16, cols: u16) {
@@ -1170,6 +1208,16 @@ impl App {
             self.should_quit = true;
             return;
         }
+        // `Ctrl-]` is reserved from children, like `Ctrl-\`. Dispatch it ahead of
+        // the mode handlers: in scrollback, `on_key_attached`'s catch-all would
+        // leave scrollback and forward it. Other modes drop it, since jumping
+        // out of a prompt would discard its buffer.
+        if is_chord_key(k) {
+            if matches!(self.mode, Mode::Dashboard | Mode::Peek | Mode::Attached) {
+                self.on_chord(out);
+            }
+            return;
+        }
         match self.mode {
             Mode::Dashboard => self.on_key_dashboard(k),
             Mode::Spawn => self.on_key_spawn(k),
@@ -1229,6 +1277,17 @@ impl App {
                 }
             }
             KeyCode::Char('M') => self.select_next_tagged(),
+            // `]` toggles the flagship mark. The daemon unmarks a finished task
+            // on its next tick, so marking one would be a silent no-op anyway.
+            KeyCode::Char(']') => {
+                if let Some(i) = self.selected_task()
+                    && !matches!(self.views[i].lifecycle, Lifecycle::Ok | Lifecycle::Failed)
+                {
+                    let v = &self.views[i];
+                    let id = (!v.flagship).then_some(v.id);
+                    self.transport.send(Command::Flagship { id });
+                }
+            }
             KeyCode::Char('g') => self.open_group_picker(),
             KeyCode::Char('/') => self.open_find_palette(),
             // Uppercase R renames; lowercase r reruns.
@@ -1478,13 +1537,7 @@ impl App {
         let detach = k.modifiers.contains(KeyModifiers::CONTROL)
             && matches!(k.code, KeyCode::Char('\\') | KeyCode::Char('4'));
         if detach {
-            self.mode = Mode::Dashboard;
-            self.focused_id = None;
-            // Reset the task viewport on watch change.
-            self.view_scroll = false;
-            self.selection = None;
-            // Repaint from scratch next tick; wipe the child's screen now.
-            let _ = execute!(out, Clear(ClearType::All), MoveTo(0, 0));
+            self.detach(out);
             return;
         }
         // Keep one row of overlap between pages.
@@ -1743,14 +1796,76 @@ impl App {
         Ok(())
     }
 
+    /// Attach to the selected task from the dashboard or Peek.
     fn attach(&mut self) {
         if let Some(i) = self.selected_task() {
-            // All tasks already run at the client's content size, so there's no
-            // resize to do: just take focus. The screen arrives via `Watch`,
-            // sent from the run loop next tick.
-            self.focused_id = Some(self.views[i].id);
-            self.mode = Mode::Attached;
-            self.view_scroll = false;
+            self.attach_to(self.views[i].id, Origin::Dashboard);
+        }
+    }
+
+    /// Attach to task `id`. Every attach funnels through here, so attaching to
+    /// the flagship always records `origin` and attaching elsewhere drops it:
+    /// attached-to-flagship implies `return_to` is `Some`.
+    fn attach_to(&mut self, id: u64, origin: Origin) {
+        // All tasks already run at the client's content size, so there's no
+        // resize to do: just take focus. The screen arrives via `Watch`, sent
+        // from the run loop next tick.
+        let flagship = self.task_index(id).is_some_and(|i| self.views[i].flagship);
+        self.focused_id = Some(id);
+        self.mode = Mode::Attached;
+        self.view_scroll = false;
+        self.return_to = flagship.then_some(origin);
+    }
+
+    /// Background the attached task and return to the dashboard. The
+    /// selection is untouched, so the list reopens on the same row.
+    fn detach(&mut self, out: &mut Stdout) {
+        self.mode = Mode::Dashboard;
+        self.focused_id = None;
+        self.return_to = None;
+        // Reset the task viewport on watch change.
+        self.view_scroll = false;
+        self.selection = None;
+        // Repaint from scratch next tick; wipe the child's screen now.
+        let _ = execute!(out, Clear(ClearType::All), MoveTo(0, 0));
+    }
+
+    /// Where `Ctrl-]` goes next, first match wins:
+    /// 1. A recorded origin: back to that task while it is still in `views`
+    ///    (finished or not), else back to the dashboard.
+    /// 2. A marked flagship: jump to it.
+    /// 3. Nothing.
+    ///
+    /// Arm 1 needs no "already on the flagship" guard: `attach_to` records an
+    /// origin whenever the target is the flagship.
+    pub fn chord_target(&self) -> Option<Target> {
+        if let Some(origin) = self.return_to {
+            return Some(match origin {
+                Origin::Task(id) if self.task_index(id).is_some() => Target::Task(id),
+                _ => Target::Dashboard,
+            });
+        }
+        self.views
+            .iter()
+            .find(|v| v.flagship)
+            .map(|v| Target::Flagship(v.id))
+    }
+
+    /// Follow `Ctrl-]` to `chord_target`. A jump from the dashboard or Peek
+    /// records the dashboard as its origin (the jump closes Peek); a jump from
+    /// an attached task records that task. Returning to a task is an attach
+    /// to a non-flagship, which clears `return_to`.
+    fn on_chord(&mut self, out: &mut Stdout) {
+        let Some(target) = self.chord_target() else {
+            return;
+        };
+        let here = match (self.mode, self.focused_id) {
+            (Mode::Attached, Some(id)) => Origin::Task(id),
+            _ => Origin::Dashboard,
+        };
+        match target {
+            Target::Dashboard => self.detach(out),
+            Target::Task(id) | Target::Flagship(id) => self.attach_to(id, here),
         }
     }
 
@@ -1833,6 +1948,13 @@ fn key_event_to_key(ev: KeyEvent) -> Option<(Key, Mods)> {
         _ => return None,
     };
     Some((code, mods))
+}
+
+/// Recognize `Ctrl-]`. Kitty reports the real key; crossterm reports legacy
+/// 0x1D as Ctrl-5, since it maps 0x1C..=0x1F to `'4'..='7'`.
+fn is_chord_key(k: KeyEvent) -> bool {
+    k.modifiers.contains(KeyModifiers::CONTROL)
+        && matches!(k.code, KeyCode::Char(']') | KeyCode::Char('5'))
 }
 
 /// Recognize either Shift-`/` event: `?`, or `/` with the Shift modifier.
