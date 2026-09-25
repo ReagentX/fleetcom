@@ -85,6 +85,7 @@ Use the two dashboard hints for common actions; press `?` for the expanded key r
 ### Attached
 
 - Press `Ctrl-\` to background the task and return to the dashboard.
+- Press `Ctrl-]` to jump to the flagship task (marked with `]` on the dashboard), and again to go back.
 - Other supported input is forwarded to the task's PTY.
 
 See [`docs/commands.md`](docs/commands.md#dashboard) for every key and launch flag, including the routing mechanics.

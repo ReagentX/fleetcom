@@ -2674,13 +2674,13 @@ fn controls_overlay_drops_the_group_headers_before_any_entry() {
     );
 }
 
-/// At 12 rows, the overlay clips seven entries and reports the count.
+/// At 12 rows, the overlay shows twelve of 21 entries and reports the other nine.
 #[test]
 fn controls_overlay_reports_clipped_entries_on_its_border() {
     let mut app = App::new_local(12, 100);
     app.on_key_dashboard(key(KeyCode::Char('?')));
     let f = painted(&mut app);
-    assert!(f.contains("? esc close · +7 more"), "{f:?}");
+    assert!(f.contains("? esc close · +9 more"), "{f:?}");
     assert!(!f.contains("save session"), "the tail is clipped: {f:?}");
 }
 
