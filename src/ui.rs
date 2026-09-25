@@ -1175,6 +1175,7 @@ mod tests {
             command: "cargo test".into(),
             cwd: std::path::PathBuf::from("/tmp"),
             tagged: false,
+            flagship: false,
             group: None,
             name: name.map(str::to_string),
             lifecycle: Lifecycle::Active,

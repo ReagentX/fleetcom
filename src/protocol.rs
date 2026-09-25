@@ -12,7 +12,7 @@ use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
 use crate::frame::{KIND_CONTROL, KIND_HELLO, KIND_SCREEN};
 
 /// Wire-protocol version; mismatched peers are rejected during the handshake.
-pub const PROTOCOL_VERSION: u32 = 12;
+pub const PROTOCOL_VERSION: u32 = 13;
 
 /// Reserved dashboard label for tasks without a custom group.
 pub const UNASSIGNED: &str = "Unassigned";
@@ -66,6 +66,9 @@ pub enum Command {
     Restart { id: u64 },
     /// Set the manual "in use" tag.
     Tag { id: u64, on: bool },
+    /// Mark the flagship, displacing any prior mark, or clear it for `None`.
+    /// The core drops the mark once the task finishes or leaves the set.
+    Flagship { id: Option<u64> },
     /// Set a task's group; clear to unassigned for `None`.
     SetGroup { id: u64, group: Option<String> },
     /// Set a task's display name; clear it for `None`.
@@ -328,6 +331,9 @@ pub struct TaskView {
     pub command: String,
     pub cwd: PathBuf,
     pub tagged: bool,
+    /// Whether this task is the flagship. At most one view in a snapshot
+    /// carries it, and never a finished one.
+    pub flagship: bool,
     /// Dashboard group; `None` means unassigned.
     pub group: Option<String>,
     /// Custom display name; `None` means unnamed.
@@ -566,6 +572,8 @@ pub fn encode_command(cmd: &Command) -> (u8, Vec<u8>) {
         Command::Remove { id } => jzon::object! { "t": "remove", "id": *id },
         Command::Restart { id } => jzon::object! { "t": "restart", "id": *id },
         Command::Tag { id, on } => jzon::object! { "t": "tag", "id": *id, "on": *on },
+        // Preserve a cleared mark as JSON null.
+        Command::Flagship { id } => jzon::object! { "t": "flagship", "id": *id },
         Command::SetGroup { id, group } => {
             let mut o = jzon::object! { "t": "group", "id": *id };
             // Absence of `g` encodes an unassigned task.
@@ -703,6 +711,13 @@ pub fn decode_command(kind: u8, payload: &[u8]) -> Option<Command> {
             id: v["id"].as_u64()?,
             on: v["on"].as_bool()?,
         },
+        "flagship" => Command::Flagship {
+            id: if v["id"].is_null() {
+                None
+            } else {
+                Some(v["id"].as_u64()?)
+            },
+        },
         "group" => Command::SetGroup {
             id: v["id"].as_u64()?,
             group: opt_str(&v["g"])?,
@@ -833,6 +848,7 @@ pub fn encode_event(ev: &Event) -> (u8, Vec<u8>) {
                 let _ = o.insert("command", tv.command.as_str());
                 let _ = o.insert("cwd", path_b64(&tv.cwd));
                 let _ = o.insert("tagged", tv.tagged);
+                let _ = o.insert("flagship", tv.flagship);
                 // Group and name fields are present only when set.
                 insert_opt_str(&mut o, "group", &tv.group);
                 insert_opt_str(&mut o, "name", &tv.name);
@@ -925,6 +941,7 @@ pub fn decode_event(kind: u8, payload: &[u8]) -> Option<Event> {
                             command: tv["command"].as_str()?.to_string(),
                             cwd: path_from_b64(&tv["cwd"])?,
                             tagged: tv["tagged"].as_bool()?,
+                            flagship: tv["flagship"].as_bool()?,
                             // Missing and null both mean unassigned/unnamed.
                             group: opt_str(&tv["group"])?,
                             name: opt_str(&tv["name"])?,
