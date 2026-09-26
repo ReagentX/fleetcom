@@ -52,8 +52,8 @@ Choose the operating mode with launch arguments. Use keys to control the dashboa
 | `∙` | Idle: running, but quiet |
 | `✓` | Completed, exit 0 |
 | `✗` | Completed, non-zero exit |
-| `◆` | Tagged "in use" |
-| `⚑` | The [flagship](#the-flagship), in the row's first column |
+| `◆` | Tagged "in use", in the row's first column |
+| `⚑` | The [flagship](#the-flagship), in the row's second column |
 
 After 10 seconds without output, a task is marked `∙` and grouped under Idle.
 

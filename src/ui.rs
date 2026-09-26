@@ -353,19 +353,20 @@ fn title_width(cols: usize) -> usize {
 /// can be styled independently. Each cell is padded to its display-column
 /// budget, and the budgets sum to `cols`.
 fn task_row_parts(v: &TaskView, cols: usize) -> (String, String, String) {
+    let tag = if v.tagged { "◆" } else { " " };
     let flag = if v.flagship { "⚑" } else { " " };
     let glyph = status_glyph(v);
-    let tag = if v.tagged { "◆" } else { " " };
     let time = rel_time(row_age(v));
     let title_w = title_width(cols);
 
-    // flag(1) sp(1) glyph(1) sp(1) tag(1) title(title_w) sp(1) preview(prev_w) sp(1) time
-    // The flag occupies the indent's first column, so an unmarked row keeps
-    // the two-space indent and nothing shifts when the mark moves.
-    let used = 1 + 1 + 1 + 1 + 1 + title_w + 1 + 1 + time.width();
+    // tag(1) flag(1) glyph(1) sp(1) title(title_w) sp(1) preview(prev_w) sp(1) time
+    // The marks form a gutter in the two-column indent, so an unmarked row
+    // keeps the indent and nothing shifts when a mark moves. The common tag
+    // takes the outer column; the single flagship sits against the glyph.
+    let used = 1 + 1 + 1 + 1 + title_w + 1 + 1 + time.width();
     let prev_w = cols.saturating_sub(used);
     (
-        format!("{flag} {glyph} {tag}{} ", pad(display_label(v), title_w)),
+        format!("{tag}{flag}{glyph} {} ", pad(display_label(v), title_w)),
         pad(&v.preview.text, prev_w),
         format!(" {time}"),
     )
@@ -1301,7 +1302,9 @@ mod tests {
                     Lifecycle::Ok => "✓",
                     Lifecycle::Failed => "✗",
                 };
-                assert!(row.starts_with(&format!("  {glyph} ")), "{row:?}");
+                // The glyph follows the two-column mark gutter.
+                let body: String = row.chars().skip(2).collect();
+                assert!(body.starts_with(&format!("{glyph} ")), "{row:?}");
             }
         }
     }
@@ -1556,9 +1559,9 @@ mod tests {
         assert_eq!(dashboard_hint(Some(Target::Task(3))), base);
     }
 
-    /// The flag takes the indent's first column; no other cell moves.
+    /// The tag and flag share the indent as a gutter; no other cell moves.
     #[test]
-    fn task_row_flag_occupies_the_indent_without_shifting() {
+    fn task_row_marks_occupy_the_indent_without_shifting() {
         for cols in [40usize, 80] {
             let plain = task_row(&timed_view(Lifecycle::Active, None, None), cols);
             for (tagged, flagship) in [(false, false), (true, false), (false, true), (true, true)] {
@@ -1570,14 +1573,14 @@ mod tests {
                 let cells: Vec<char> = row.chars().collect();
                 let want_flag = if flagship { '⚑' } else { ' ' };
                 let want_tag = if tagged { '◆' } else { ' ' };
-                assert_eq!(cells[0], want_flag, "{row:?}");
+                assert_eq!(cells[0], want_tag, "{row:?}");
+                assert_eq!(cells[1], want_flag, "{row:?}");
                 assert_eq!(cells[2], '✻', "{row:?}");
-                assert_eq!(cells[4], want_tag, "{row:?}");
                 // Every other column matches the unmarked row.
                 let rest = |r: &str| -> String {
                     r.chars()
                         .enumerate()
-                        .filter(|(i, _)| *i != 0 && *i != 4)
+                        .filter(|(i, _)| *i > 1)
                         .map(|(_, c)| c)
                         .collect()
                 };
