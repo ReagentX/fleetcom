@@ -353,20 +353,26 @@ fn title_width(cols: usize) -> usize {
 /// can be styled independently. Each cell is padded to its display-column
 /// budget, and the budgets sum to `cols`.
 fn task_row_parts(v: &TaskView, cols: usize) -> (String, String, String) {
-    let tag = if v.tagged { "◆" } else { " " };
-    let flag = if v.flagship { "⚑" } else { " " };
+    // Marks fill the two-column indent from the left, tag before flag, so a
+    // lone mark keeps a space before the glyph and an unmarked row keeps the
+    // plain indent. Nothing past the gutter shifts when a mark changes.
+    let marks: String = [(v.tagged, '◆'), (v.flagship, '⚑')]
+        .into_iter()
+        .filter_map(|(on, c)| on.then_some(c))
+        .collect();
     let glyph = status_glyph(v);
     let time = rel_time(row_age(v));
     let title_w = title_width(cols);
 
-    // tag(1) flag(1) glyph(1) sp(1) title(title_w) sp(1) preview(prev_w) sp(1) time
-    // The marks form a gutter in the two-column indent, so an unmarked row
-    // keeps the indent and nothing shifts when a mark moves. The common tag
-    // takes the outer column; the single flagship sits against the glyph.
-    let used = 1 + 1 + 1 + 1 + title_w + 1 + 1 + time.width();
+    // marks(2) glyph(1) sp(1) title(title_w) sp(1) preview(prev_w) sp(1) time
+    let used = 2 + 1 + 1 + title_w + 1 + 1 + time.width();
     let prev_w = cols.saturating_sub(used);
     (
-        format!("{tag}{flag}{glyph} {} ", pad(display_label(v), title_w)),
+        format!(
+            "{}{glyph} {} ",
+            pad(&marks, 2),
+            pad(display_label(v), title_w)
+        ),
         pad(&v.preview.text, prev_w),
         format!(" {time}"),
     )
@@ -1559,7 +1565,7 @@ mod tests {
         assert_eq!(dashboard_hint(Some(Target::Task(3))), base);
     }
 
-    /// The tag and flag share the indent as a gutter; no other cell moves.
+    /// Marks fill the indent from the left, tag before flag; no other cell moves.
     #[test]
     fn task_row_marks_occupy_the_indent_without_shifting() {
         for cols in [40usize, 80] {
@@ -1571,10 +1577,13 @@ mod tests {
                 let row = task_row(&v, cols);
                 assert_eq!(row.width(), cols, "{row:?}");
                 let cells: Vec<char> = row.chars().collect();
-                let want_flag = if flagship { '⚑' } else { ' ' };
-                let want_tag = if tagged { '◆' } else { ' ' };
-                assert_eq!(cells[0], want_tag, "{row:?}");
-                assert_eq!(cells[1], want_flag, "{row:?}");
+                let want = match (tagged, flagship) {
+                    (false, false) => [' ', ' '],
+                    (true, false) => ['◆', ' '],
+                    (false, true) => ['⚑', ' '],
+                    (true, true) => ['◆', '⚑'],
+                };
+                assert_eq!(cells[..2], want, "{row:?}");
                 assert_eq!(cells[2], '✻', "{row:?}");
                 // Every other column matches the unmarked row.
                 let rest = |r: &str| -> String {
