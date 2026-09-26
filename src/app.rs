@@ -226,8 +226,8 @@ pub struct App {
     /// Id of the attached task, if any: by id (not index) so it survives the
     /// task list changing underneath it.
     pub focused_id: Option<u64>,
-    /// Where `Ctrl-]` returns to. Set only by attaching to the flagship, so
-    /// attached-to-flagship implies `Some`; it outlives the flagship's mark
+    /// Where `Ctrl-]` returns to. Set only by attaching to a task the snapshot
+    /// marks as the flagship; it outlives the flagship's mark
     /// (the daemon unmarks on exit) to keep the way back open. Cleared on
     /// every exit from attached mode and on reconnect, since task ids are
     /// daemon-local.
@@ -1804,8 +1804,9 @@ impl App {
     }
 
     /// Attach to task `id`. Every attach funnels through here, so attaching to
-    /// the flagship always records `origin` and attaching elsewhere drops it:
-    /// attached-to-flagship implies `return_to` is `Some`.
+    /// the flagship records `origin` and attaching elsewhere drops it. The
+    /// mark comes from the snapshot, so an attach racing this client's own
+    /// `]` records nothing; `chord_target` covers that case.
     fn attach_to(&mut self, id: u64, origin: Origin) {
         // All tasks already run at the client's content size, so there's no
         // resize to do: just take focus. The screen arrives via `Watch`, sent
@@ -1833,11 +1834,14 @@ impl App {
     /// Where `Ctrl-]` goes next, first match wins:
     /// 1. A recorded origin: back to that task while it is still in `views`
     ///    (finished or not), else back to the dashboard.
-    /// 2. A marked flagship: jump to it.
+    /// 2. A marked flagship: jump to it, or, already attached to it, back to
+    ///    the dashboard.
     /// 3. Nothing.
     ///
-    /// Arm 1 needs no "already on the flagship" guard: `attach_to` records an
-    /// origin whenever the target is the flagship.
+    /// Arm 2's guard covers an attach that beat the mark: `attach_to` reads the
+    /// mark from the snapshot, which lags this client's own `]`, so `]` then
+    /// `Enter` in one input batch lands on the flagship with no origin. Without
+    /// the guard the chord would record the flagship as its own origin.
     pub fn chord_target(&self) -> Option<Target> {
         if let Some(origin) = self.return_to {
             return Some(match origin {
@@ -1845,10 +1849,11 @@ impl App {
                 _ => Target::Dashboard,
             });
         }
-        self.views
-            .iter()
-            .find(|v| v.flagship)
-            .map(|v| Target::Flagship(v.id))
+        let id = self.views.iter().find(|v| v.flagship)?.id;
+        if self.mode == Mode::Attached && self.focused_id == Some(id) {
+            return Some(Target::Dashboard);
+        }
+        Some(Target::Flagship(id))
     }
 
     /// Follow `Ctrl-]` to `chord_target`. A jump from the dashboard or Peek

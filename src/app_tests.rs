@@ -4255,6 +4255,31 @@ fn enter_onto_flagship_sets_dashboard_return() {
     assert_eq!(app.return_to, Some(Origin::Dashboard));
 }
 
+/// `]` then `Enter` before the next snapshot attaches with no origin. Once the
+/// mark lands, the chord must return to the dashboard, not re-attach the
+/// flagship to itself.
+#[test]
+fn mark_then_enter_before_snapshot_returns_to_dashboard() {
+    let mut app = App::new_local(30, 100);
+    let dir = app.invocation_dir.clone();
+    app.spawn_in("sleep 30", dir);
+    let q = app.views[0].id;
+    app.selected_id = Some(q);
+
+    // One input batch: no sync between the keys.
+    app.hit(key(KeyCode::Char(']')));
+    app.hit(key(KeyCode::Enter));
+    assert_eq!(app.return_to, None, "premise: the attach beat the mark");
+    app.pump();
+    assert_eq!(app.flagship(), Some(q), "premise: the mark has landed");
+
+    assert_eq!(app.chord_target(), Some(Target::Dashboard));
+    app.hit(chord());
+    assert!(app.mode == Mode::Dashboard);
+    assert_eq!(app.focused_id, None);
+    assert_eq!(app.return_to, None);
+}
+
 /// A finished origin is still in `views`, so the chord returns to it.
 #[test]
 fn return_to_finished_origin() {
