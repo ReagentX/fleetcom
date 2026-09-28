@@ -1,2 +1,3 @@
 # Treat raw PTY captures as binary data.
 tests/corpus/*.bin binary
+tests/corpus/**/*.bin binary

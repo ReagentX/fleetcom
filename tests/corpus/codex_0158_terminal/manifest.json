@@ -1,0 +1,234 @@
+{
+  "captured_date": "2026-09-28",
+  "platform": "macOS-27.0-arm64-arm-64bit-Mach-O",
+  "machine": "arm64",
+  "fleetcom_head": "d138a752dd10afc80b9a4c6830327da2474c09be",
+  "dirty_patch_sha256": "a0e37cbc2c4877c058a3bcf295cde301086049ea6ed300b7b9244c3d0d15e182",
+  "fleetcom_binary_sha256": "175904b97d627cdac27f1d062c04a99ff6c63e85f3801a98c5f6920da4a529c6",
+  "versions": {
+    "0.157.1": {
+      "binary_sha256": "27ceb5f9b957b43a519efe4eaa3816a0bffb0a531a2c89af18840c0a3c016a7d",
+      "tarball_sha256": "3c45b162b7a76f51325015b1d0a8112c73219b7a9b59cd5762c37c9ba55894fa"
+    },
+    "0.158.0": {
+      "binary_sha256": "788a818fbb9596869c7a487554507cb8bdca17584b8671112b23f9e225ba35c8",
+      "tarball_sha256": "341c4a08f9ce1935b3007376dc2a3d50a0a89112930e9a474ae61367218f6e8a"
+    }
+  },
+  "source_commits": {
+    "0.157.1": "36650394c5b38c2990ccf2a3457165ca3e9d9726",
+    "0.158.0": "064c6b8c737f5b41d171fdda80bd9ef10ad06eb3"
+  },
+  "fixtures": [
+    {
+      "name": "0.157.1-fullscreen-transitions",
+      "surface": "direct Codex",
+      "initial_rows": 40,
+      "initial_cols": 120,
+      "bytes": 23780,
+      "sha256": "6757c1fe0246248da21ce43cb8745f54661942f69359a5c1b26bab2688b18a60",
+      "source_session_sha256": "6757c1fe0246248da21ce43cb8745f54661942f69359a5c1b26bab2688b18a60",
+      "marks": [
+        {
+          "name": "startup",
+          "offset": 2396,
+          "rows": 40,
+          "cols": 120
+        },
+        {
+          "name": "completed",
+          "offset": 16312,
+          "rows": 40,
+          "cols": 120
+        },
+        {
+          "name": "copy-menu",
+          "offset": 17320,
+          "rows": 40,
+          "cols": 120
+        },
+        {
+          "name": "copied",
+          "offset": 18119,
+          "rows": 40,
+          "cols": 120
+        },
+        {
+          "name": "narrow",
+          "offset": 19460,
+          "rows": 20,
+          "cols": 60
+        },
+        {
+          "name": "restored",
+          "offset": 21163,
+          "rows": 40,
+          "cols": 120
+        },
+        {
+          "name": "new-thread",
+          "offset": 23499,
+          "rows": 40,
+          "cols": 120
+        },
+        {
+          "name": "exit",
+          "offset": 23780,
+          "rows": 40,
+          "cols": 120
+        }
+      ],
+      "resizes": [
+        {
+          "offset": 18119,
+          "resize": [
+            20,
+            60
+          ]
+        },
+        {
+          "offset": 19460,
+          "resize": [
+            40,
+            120
+          ]
+        }
+      ]
+    },
+    {
+      "name": "0.157.1-fullscreen-fleetcom-load",
+      "surface": "outer fleetcom client",
+      "initial_rows": 40,
+      "initial_cols": 120,
+      "bytes": 227987,
+      "sha256": "1a72dbf52c4db51de4ca0e7b57dec5873eb29d82891a79243995a1911ec2c531",
+      "source_session_sha256": "045e070f0dd09b9427db1c23bd5b2f0d64a2abcaf80f73a9485776d6de53fcaa",
+      "marks": [
+        {
+          "name": "attached",
+          "offset": 47465,
+          "rows": 40,
+          "cols": 120
+        },
+        {
+          "name": "completed",
+          "offset": 199735,
+          "rows": 40,
+          "cols": 120
+        },
+        {
+          "name": "copied",
+          "offset": 227987,
+          "rows": 40,
+          "cols": 120
+        }
+      ],
+      "resizes": []
+    },
+    {
+      "name": "0.158.0-fullscreen-transitions",
+      "surface": "direct Codex",
+      "initial_rows": 40,
+      "initial_cols": 120,
+      "bytes": 23701,
+      "sha256": "8282b5a8ac3361e8f2420d72c1bcf54a0adfe2326d553441e3b2107570c19701",
+      "source_session_sha256": "8282b5a8ac3361e8f2420d72c1bcf54a0adfe2326d553441e3b2107570c19701",
+      "marks": [
+        {
+          "name": "startup",
+          "offset": 3069,
+          "rows": 40,
+          "cols": 120
+        },
+        {
+          "name": "completed",
+          "offset": 16969,
+          "rows": 40,
+          "cols": 120
+        },
+        {
+          "name": "copy-menu",
+          "offset": 17958,
+          "rows": 40,
+          "cols": 120
+        },
+        {
+          "name": "copied",
+          "offset": 18660,
+          "rows": 40,
+          "cols": 120
+        },
+        {
+          "name": "narrow",
+          "offset": 19555,
+          "rows": 20,
+          "cols": 60
+        },
+        {
+          "name": "restored",
+          "offset": 20676,
+          "rows": 40,
+          "cols": 120
+        },
+        {
+          "name": "new-thread",
+          "offset": 23420,
+          "rows": 40,
+          "cols": 120
+        },
+        {
+          "name": "exit",
+          "offset": 23701,
+          "rows": 40,
+          "cols": 120
+        }
+      ],
+      "resizes": [
+        {
+          "offset": 18660,
+          "resize": [
+            20,
+            60
+          ]
+        },
+        {
+          "offset": 19555,
+          "resize": [
+            40,
+            120
+          ]
+        }
+      ]
+    },
+    {
+      "name": "0.158.0-fullscreen-fleetcom-load",
+      "surface": "outer fleetcom client",
+      "initial_rows": 40,
+      "initial_cols": 120,
+      "bytes": 222355,
+      "sha256": "5931cc47124b06ec3f91b7127af98e2651f3e622f90a2bec9987eea2ef765c74",
+      "source_session_sha256": "86e16d5b683b6ea9579e548951f4aff80c777275eb4d2ca73b2d30cb39c21fe5",
+      "marks": [
+        {
+          "name": "attached",
+          "offset": 47445,
+          "rows": 40,
+          "cols": 120
+        },
+        {
+          "name": "completed",
+          "offset": 188465,
+          "rows": 40,
+          "cols": 120
+        },
+        {
+          "name": "copied",
+          "offset": 222355,
+          "rows": 40,
+          "cols": 120
+        }
+      ],
+      "resizes": []
+    }
+  ]
+}
