@@ -239,7 +239,7 @@ fn live_fleet(dirs: &Dirs) -> Vec<TaskView> {
             command: "zellij".to_string(),
             cwd: dirs.home.clone(),
             tagged: false,
-            flagship: false,
+            flagship: true,
             group: Some("desktop".to_string()),
             name: Some("Zellij".to_string()),
             lifecycle: Lifecycle::Active,
