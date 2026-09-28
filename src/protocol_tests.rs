@@ -783,7 +783,7 @@ fn watch_wire_form_requires_the_attached_flag() {
     }
 }
 
-/// A flagship frame carries its id as a number, or null to clear the mark.
+/// Encode the flagship id as a number, or null to clear the mark.
 #[test]
 fn flagship_wire_form() {
     let (k, p) = encode_command(&Command::Flagship { id: Some(5) });

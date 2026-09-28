@@ -2093,7 +2093,7 @@ fn recovery_arms_on_structural_mutations_not_tag() {
     assert!(take_dirty(&mut s), "Remove must arm");
 }
 
-/// Tick once and return the ids the snapshot marks as flagship.
+/// Tick once and return the flagship ids from the snapshot.
 fn flagship_ids(s: &mut Supervisor) -> Vec<u64> {
     s.tick();
     s.drain()
@@ -2105,7 +2105,7 @@ fn flagship_ids(s: &mut Supervisor) -> Vec<u64> {
         .expect("expected a Tasks snapshot")
 }
 
-/// Take the id from the `Spawned` ack without ticking, so no `reap` runs.
+/// Take the id from the `Spawned` acknowledgement without calling `tick` or `reap`.
 fn spawned_id(s: &mut Supervisor) -> u64 {
     s.drain()
         .iter()
@@ -2116,7 +2116,7 @@ fn spawned_id(s: &mut Supervisor) -> u64 {
         .expect("spawn must ack with Spawned")
 }
 
-/// Marking a second task displaces the first; `None` clears the mark.
+/// Replace the mark when marking a second task; clear it for `None`.
 #[test]
 fn flagship_marks_at_most_one() {
     let mut s = sup(24, 80);
@@ -2133,7 +2133,7 @@ fn flagship_marks_at_most_one() {
     assert_eq!(flagship_ids(&mut s), Vec::<u64>::new());
 }
 
-/// The first snapshot that shows the flagship finished shows it unmarked.
+/// Clear the mark before the first snapshot after the flagship's exit.
 #[test]
 fn tick_clears_exited_flagship() {
     let mut s = sup(24, 80);
@@ -2155,7 +2155,7 @@ fn tick_clears_exited_flagship() {
     assert_eq!(s.flagship, None);
 }
 
-/// Removing the flagship leaves no stale id behind.
+/// Clear the stored flagship id after removal.
 #[test]
 fn tick_clears_removed_flagship() {
     let mut s = sup(24, 80);
@@ -2169,7 +2169,7 @@ fn tick_clears_removed_flagship() {
     assert_eq!(s.flagship, None, "the removed id must not linger");
 }
 
-/// A mark placed on an already-finished task never reaches a snapshot.
+/// Exclude marks placed on already-finished tasks from snapshots.
 #[test]
 fn flagship_on_finished_task_never_surfaces() {
     let mut s = sup(24, 80);
@@ -2182,10 +2182,10 @@ fn flagship_on_finished_task_never_surfaces() {
     assert_eq!(s.flagship, None);
 }
 
-/// `Restart` unmarks the flagship even when its exit latches inside `rerun`
-/// and the replacement is alive by the next tick, so the tick check alone
-/// would keep the mark. The first run exits; the rerun finds the marker and
-/// stays up.
+/// Clear the flagship mark on `Restart`, even with exit latched in `rerun`
+/// and a live replacement by the next tick. In that case, cleanup in `tick`
+/// would be too late. Exit on the first run; on rerun, sleep after checking
+/// for the marker file.
 #[test]
 fn rerun_clears_flagship() {
     use crate::protocol::Lifecycle;
@@ -2203,8 +2203,8 @@ fn rerun_clears_flagship() {
     let id = spawned_id(&mut s);
     s.apply(Command::Flagship { id: Some(id) });
 
-    // No tick runs until the rerun proceeds: every refusal means the exit
-    // had not happened yet, and the accepted attempt latched it itself.
+    // Do not tick until the restart is accepted, so exit must be latched in
+    // `rerun`. Retry while the original task is still running.
     let rerun = wait_until(Duration::from_secs(5), || {
         s.apply(Command::Restart { id });
         !s.drain()
@@ -2223,13 +2223,13 @@ fn rerun_clears_flagship() {
     assert_eq!(s.flagship, None);
 }
 
-/// Neither marking nor clearing the flagship arms recovery.
+/// Do not arm recovery when marking or clearing the flagship.
 #[test]
 fn flagship_does_not_affect_recipe() {
     let mut s = sup(24, 80);
     spawn(&mut s, "sleep 30", here());
     let id = spawned_id(&mut s);
-    s.recovery.dirty = false; // Spawn armed; reassert a clean baseline
+    s.recovery.dirty = false; // Reset after spawning to test the mark in isolation.
 
     s.apply(Command::Flagship { id: Some(id) });
     assert!(!take_dirty(&mut s), "marking must not arm");

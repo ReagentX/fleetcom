@@ -2674,7 +2674,7 @@ fn controls_overlay_drops_the_group_headers_before_any_entry() {
     );
 }
 
-/// At 12 rows, the overlay shows twelve of 21 entries and reports the other nine.
+/// At 12 rows, show twelve of 21 controls and report nine hidden entries.
 #[test]
 fn controls_overlay_reports_clipped_entries_on_its_border() {
     let mut app = App::new_local(12, 100);
@@ -3970,7 +3970,7 @@ fn input_and_attached_echo_bypass_the_repaint_floor() {
 
 // --- flagship ----------------------------------------------------------------
 
-/// A transport whose core is gone: sends vanish and `connected` reports false.
+/// Simulate a disconnected core: discard commands and return false from `connected`.
 struct Unplugged;
 
 impl Transport for Unplugged {
@@ -4029,7 +4029,7 @@ impl App {
         self.on_key(&mut io::stdout(), k);
     }
 
-    /// The id the latest snapshot marks as the flagship.
+    /// Return the flagship id from the latest snapshot.
     fn flagship(&self) -> Option<u64> {
         self.views.iter().find(|v| v.flagship).map(|v| v.id)
     }
@@ -4072,7 +4072,7 @@ fn flagship_pair() -> (App, u64, u64) {
     (app, a, q)
 }
 
-/// `]` marks the selected task, displacing a prior mark.
+/// Mark the selected task with `]`, replacing the prior mark.
 #[test]
 fn bracket_marks_selected() {
     let (mut app, a, _) = flagship_pair();
@@ -4082,7 +4082,7 @@ fn bracket_marks_selected() {
     assert!(app.mode == Mode::Dashboard);
 }
 
-/// `]` on the flagship clears the mark.
+/// Clear the mark with `]` on the flagship.
 #[test]
 fn bracket_on_flagship_clears() {
     let (mut app, _, q) = flagship_pair();
@@ -4098,7 +4098,7 @@ fn bracket_on_flagship_clears() {
     );
 }
 
-/// `]` on a finished row sends nothing: the mark stays where it was.
+/// Send no command for `]` on a finished row; preserve the existing mark.
 #[test]
 fn bracket_on_finished_row_noops() {
     let (mut app, a, q) = flagship_pair();
@@ -4110,7 +4110,7 @@ fn bracket_on_finished_row_noops() {
     assert_eq!(app.flagship(), Some(q));
 }
 
-/// `]` with nothing selected sends nothing.
+/// Send no command for `]` without a selected task.
 #[test]
 fn bracket_without_selection_noops() {
     let mut app = App::new_local(30, 100);
@@ -4120,7 +4120,7 @@ fn bracket_without_selection_noops() {
     assert!(app.mode == Mode::Dashboard);
 }
 
-/// `]` is a dashboard key only: Peek ignores it.
+/// Handle `]` only on the dashboard; ignore it in Peek.
 #[test]
 fn bracket_in_peek_noops() {
     let (mut app, _, q) = flagship_pair();
@@ -4134,8 +4134,8 @@ fn bracket_in_peek_noops() {
     assert!(app.mode == Mode::Peek);
 }
 
-/// Without a mark the chord goes nowhere, from the dashboard or attached,
-/// and is not forwarded to the child.
+/// Without a flagship, ignore the chord on the dashboard and while attached.
+/// Do not forward it to the child.
 #[test]
 fn ctrl_bracket_noops_without_flagship() {
     let (mut app, a) = App::attached(30, 100, "sleep 30");
@@ -4153,8 +4153,8 @@ fn ctrl_bracket_noops_without_flagship() {
     assert!(sent.lock().unwrap().is_empty(), "nothing reaches the core");
 }
 
-/// Dashboard → flagship → dashboard lands on the same row, through the
-/// detach body.
+/// Preserve the selected row after a dashboard → flagship → dashboard round trip.
+/// Return through `detach`.
 #[test]
 fn jump_from_dashboard_and_back() {
     let (mut app, a, q) = flagship_pair();
@@ -4181,8 +4181,8 @@ fn jump_from_dashboard_and_back() {
     );
 }
 
-/// Task → flagship → task, starting in scrollback: the chord is handled, not
-/// forwarded, and both ends come up live.
+/// Start a task → flagship → task round trip in scrollback. Switch to live
+/// output at each destination and do not forward the chord to the child.
 #[test]
 fn jump_from_task_and_back() {
     let (mut app, a, q) = flagship_pair();
@@ -4218,7 +4218,7 @@ fn jump_from_task_and_back() {
     );
 }
 
-/// A jump from Peek closes it; the return lands on the dashboard.
+/// Close Peek on attachment to the flagship; return to the dashboard.
 #[test]
 fn jump_from_peek_lands_on_dashboard() {
     let (mut app, a, q) = flagship_pair();
@@ -4238,8 +4238,8 @@ fn jump_from_peek_lands_on_dashboard() {
     assert_eq!(app.selected_id, Some(a));
 }
 
-/// `Enter` onto the flagship records the dashboard as the way back, from the
-/// dashboard and from Peek.
+/// Record the dashboard as the return destination on `Enter` attachment to the
+/// flagship, from both the dashboard and Peek.
 #[test]
 fn enter_onto_flagship_sets_dashboard_return() {
     let (mut app, _, q) = flagship_pair();
@@ -4255,9 +4255,9 @@ fn enter_onto_flagship_sets_dashboard_return() {
     assert_eq!(app.return_to, Some(Origin::Dashboard));
 }
 
-/// `]` then `Enter` before the next snapshot attaches with no origin. Once the
-/// mark lands, the chord must return to the dashboard, not re-attach the
-/// flagship to itself.
+/// Press `]` then `Enter` before the next snapshot to attach without a recorded
+/// origin. After synchronization, return to the dashboard with the chord;
+/// do not reattach to the flagship.
 #[test]
 fn mark_then_enter_before_snapshot_returns_to_dashboard() {
     let mut app = App::new_local(30, 100);
@@ -4280,7 +4280,7 @@ fn mark_then_enter_before_snapshot_returns_to_dashboard() {
     assert_eq!(app.return_to, None);
 }
 
-/// A finished origin is still in `views`, so the chord returns to it.
+/// Return to a finished origin task if it is still in `views`.
 #[test]
 fn return_to_finished_origin() {
     let (mut app, a, q) = flagship_pair();
@@ -4296,7 +4296,7 @@ fn return_to_finished_origin() {
     assert_eq!(app.return_to, None);
 }
 
-/// An origin that left `views` degrades the return to the dashboard.
+/// Return to the dashboard if the origin task is absent from `views`.
 #[test]
 fn return_to_removed_origin_degrades_to_dashboard() {
     let (mut app, a, q) = flagship_pair();
@@ -4315,8 +4315,8 @@ fn return_to_removed_origin_degrades_to_dashboard() {
     assert!(app.task_index(q).is_some());
 }
 
-/// The flagship dies while attached: the chord still returns, then no-ops
-/// because the daemon unmarked it.
+/// After the flagship's exit while attached, return to the origin with the
+/// chord. Ignore subsequent presses because no task is marked.
 #[test]
 fn dead_flagship_returns_then_noops() {
     // Jumped from A.
@@ -4346,7 +4346,7 @@ fn dead_flagship_returns_then_noops() {
     assert_eq!(app.focused_id, None);
 }
 
-/// `Ctrl-\` clears the way back.
+/// Clear the return destination on `Ctrl-\` detach.
 #[test]
 fn return_to_clears_on_detach() {
     let (mut app, _, _) = flagship_pair();
@@ -4357,7 +4357,7 @@ fn return_to_clears_on_detach() {
     assert_eq!(app.return_to, None);
 }
 
-/// The run loop's fallback for a vanished attached task clears the way back.
+/// Clear the return destination when the attached task is no longer present.
 #[test]
 fn return_to_clears_on_vanish() {
     let (mut app, a, q) = flagship_pair();
@@ -4371,8 +4371,8 @@ fn return_to_clears_on_vanish() {
     assert_eq!(app.return_to, None);
 }
 
-/// Losing the daemon clears the way back, and so does the reconnect reset:
-/// a replacement daemon may reuse the origin's id.
+/// Clear the return destination on disconnect and during reconnect reset:
+/// the origin's id may be reused in a replacement daemon.
 #[test]
 fn return_to_clears_on_disconnect() {
     let (mut app, _, _) = flagship_pair();
@@ -4388,7 +4388,7 @@ fn return_to_clears_on_disconnect() {
     assert_eq!(app.return_to, None);
 }
 
-/// Legacy terminals send 0x1D, which crossterm reports as Ctrl-5.
+/// Accept Ctrl-5, the crossterm representation of legacy 0x1D.
 #[test]
 fn ctrl_bracket_matches_legacy_ctrl_5() {
     for k in [chord(), ctrl(KeyCode::Char('5'))] {
@@ -4400,7 +4400,7 @@ fn ctrl_bracket_matches_legacy_ctrl_5() {
     }
 }
 
-/// In scrollback the chord navigates; scrollback's catch-all never sees it.
+/// Handle the chord before the scrollback catch-all; do not forward it.
 #[test]
 fn ctrl_bracket_in_scrollback_is_not_forwarded() {
     let (mut app, a) = App::attached(30, 100, "sleep 30");
@@ -4421,8 +4421,8 @@ fn ctrl_bracket_in_scrollback_is_not_forwarded() {
     );
 }
 
-/// Prompts, Controls, and Disconnected ignore both keys: a jump would
-/// discard a half-typed buffer, and `]` there is text or nothing.
+/// Do not navigate or change the mark in prompts, Controls, or Disconnected.
+/// Ignore the chord to preserve prompt input; accept `]` only as text or ignore it.
 #[test]
 fn flagship_keys_ignored_outside_navigation_modes() {
     let (mut app, a, q) = flagship_pair();
@@ -4450,8 +4450,8 @@ fn flagship_keys_ignored_outside_navigation_modes() {
     }
 }
 
-/// `chord_target` arms in order: a recorded origin beats a marked flagship,
-/// and a missing origin task degrades to the dashboard.
+/// Prefer a recorded origin over the flagship; return to the dashboard if the
+/// origin task is absent.
 #[test]
 fn chord_target_arms() {
     let (mut app, a, q) = flagship_pair();
