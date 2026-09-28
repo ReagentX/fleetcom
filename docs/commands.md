@@ -55,7 +55,7 @@ Choose the operating mode with launch arguments. Use keys to control the dashboa
 | `◆` | Tagged "in use" |
 | `⚑` | The [flagship](#the-flagship) |
 
-Marks fill the row's two leading columns from the left, `◆` before `⚑`.
+Look for marks in the row's two leading columns, aligned left with `◆` before `⚑`.
 
 After 10 seconds without output, a task is marked `∙` and grouped under Idle.
 
@@ -73,7 +73,7 @@ Cursor keys are encoded according to the child's live cursor-key mode. In applic
 
 `Ctrl-\` is the physical chord. The same chord may be reported by Crossterm as `Ctrl-4`; both representations are accepted.
 
-Press `Ctrl-]` to jump to the [flagship](#the-flagship), then again to go back to where the jump started. Like `Ctrl-\`, it is reserved from children, so an attached `vim` loses tag-jump and readline loses character search. Crossterm may report it as `Ctrl-5`; both are accepted.
+Press `Ctrl-]` to attach to the [flagship](#the-flagship), then again to return to your previous task or the dashboard. As with `Ctrl-\`, you cannot send this key combination to a child: use another binding for tag-jump in `vim` or character search in readline. Both `Ctrl-]` and `Ctrl-5` are accepted; the latter is the Crossterm representation of the legacy encoding.
 
 #### Modified keys, paste, and mouse input
 
@@ -143,16 +143,16 @@ In custom mode only, a new command is assigned the selected task's group, throug
 
 #### The flagship
 
-Press `]` to mark the selected task as the flagship, marked `⚑`; press it again to clear the mark. At most one task is the flagship, so marking another moves the mark. `]` on a finished task does nothing. The mark does not affect sorting.
+Press `]` to mark the selected task as the flagship, shown as `⚑`; press it again to clear the mark. You can mark only one task at a time. Select another task and press `]` to move the mark. Finished tasks cannot be marked. Sorting is unchanged.
 
 Press `Ctrl-]` from the dashboard, peek, or an attached task to attach to the flagship, and again to go back:
 
 - From an attached task: back to that task, even if it has finished since. If it was removed, back to the dashboard.
 - From the dashboard or peek: back to the dashboard, with the selection on the same row. Peek is not reopened.
 
-Attaching to the flagship with `Enter` also sets the way back to the dashboard.
+After attaching to the flagship with `Enter`, press `Ctrl-]` to return to the dashboard.
 
-The mark clears when the flagship exits or is removed, and sessions do not save it. `m` tags, by contrast, survive exit.
+The flagship mark is cleared on task completion or removal and is not saved in sessions. Tags set with `m` are retained after task completion.
 
 #### Renaming
 
@@ -208,7 +208,7 @@ A recovery row is formatted as `<age> ago · <tasks> task(s) · <label>`: the fi
 
 ## The `?` controls overlay
 
-Use the two dashboard hints for common actions: `↑↓ select · enter attach · space peek · ? controls` and `❯ n run · @ dir · / find · s sort`. Press `?` for the expanded reference, including dashboard actions and the attached-mode background and flagship chords. While a flagship is marked, the first hint ends in `· Ctrl-] flagship`.
+Use the two dashboard hints for common actions: `↑↓ select · enter attach · space peek · ? controls` and `❯ n run · @ dir · / find · s sort`. Press `?` for the expanded reference, including dashboard actions and the attached-mode background and flagship chords. With a flagship marked, look for `· Ctrl-] flagship` at the end of the first hint.
 
 Bindings are grouped by purpose in a centered, non-scrolling box. Press `?`, `Esc`, or `q` to return to the dashboard, or `Ctrl-C` to disconnect. Other keys are ignored.
 
@@ -224,7 +224,7 @@ Read the source of the row's dashboard preview in the footer's `preview:` segmen
 
 ## Attached
 
-Interact with the task in the terminal. The status bar is formatted as `[attached] <command>    Ctrl-\ background`, or `[attached] <name> · <command>` for a named task. When `Ctrl-]` has somewhere to go, the hint gains `· Ctrl-] flagship`, `· Ctrl-] back to <task>`, or `· Ctrl-] back to dashboard`. A long title is shortened with `…` so the hints stay visible. Press `Ctrl-\` to return to the dashboard. Other supported input normally goes to the child; navigation keys are reserved in [scrollback](#scrollback).
+Interact with the task in the terminal. The status bar is formatted as `[attached] <command>    Ctrl-\ background`, or `[attached] <name> · <command>` for a named task. When you can navigate with `Ctrl-]`, look for `· Ctrl-] flagship`, `· Ctrl-] back to <task>`, or `· Ctrl-] back to dashboard` in the hint. Long titles are shortened with `…` to leave room for the hints. Press `Ctrl-\` to return to the dashboard. Other supported input is normally forwarded to the child; navigation keys are reserved in [scrollback](#scrollback).
 
 ## Connection loss
 
