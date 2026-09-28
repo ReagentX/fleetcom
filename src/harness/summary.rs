@@ -440,8 +440,15 @@ fn codex_model_label(rows: &[String]) -> Option<String> {
         if !rows[i].starts_with(' ') {
             return None;
         }
-        let segs: Vec<&str> = rows[i].trim().split(" · ").collect();
+        let row = rows[i].trim();
+        let footer = codex_footer_without_warning(row)?;
+        let segs: Vec<&str> = footer.split(" · ").collect();
         if segs[0].is_empty() {
+            return None;
+        }
+        // The warning reduces footer width; an ellipsis in the model item is
+        // truncation, even when the remaining words satisfy the effort shape.
+        if footer != row && (segs[0].contains('…') || segs[0].contains("...")) {
             return None;
         }
         let in_out = segs.len() >= 3
@@ -449,6 +456,79 @@ fn codex_model_label(rows: &[String]) -> Option<String> {
             && segs[segs.len() - 1].ends_with(" out");
         (in_out || codex_model_with_reasoning(segs[0])).then(|| segs[0].to_string())
     })
+}
+
+/// The warning occupies a separate right-aligned area with at least two spaces
+/// before it. Its middle dot belongs to the badge, not the model status line.
+fn codex_footer_without_warning(row: &str) -> Option<&str> {
+    if !row.contains('⚠') {
+        return Some(row);
+    }
+    let (footer, badge) = row.rsplit_once("  ⚠ ")?;
+    let (count_label, hint) = badge
+        .split_once(" · ")
+        .map_or((badge, None), |(count, hint)| (count, Some(hint)));
+    let count_text = count_label.split(' ').next()?;
+    let count = count_text.parse::<usize>().ok()?;
+    if count == 0 || count.to_string() != count_text || footer.contains('⚠') {
+        return None;
+    }
+    if count_label != count_text {
+        let suffix = if count == 1 { " warning" } else { " warnings" };
+        if count_label.strip_prefix(count_text)? != suffix
+            || !codex_warning_shortcut(hint?.strip_suffix(" to view")?)
+        {
+            return None;
+        }
+    } else if hint.is_some_and(|hint| !codex_warning_shortcut(hint)) {
+        return None;
+    }
+    Some(footer.trim_end())
+}
+
+/// Warning hints are one key, a two-key chord, or the unbound command fallback.
+fn codex_warning_shortcut(hint: &str) -> bool {
+    if hint == "/warnings" {
+        return true;
+    }
+    let key_label = |mut key: &str| {
+        for modifier in ["ctrl+", "shift+"] {
+            key = key.strip_prefix(modifier).unwrap_or(key);
+        }
+        key = key
+            .strip_prefix("alt+")
+            .or_else(|| key.strip_prefix("⌥+"))
+            .unwrap_or(key);
+        (key.len() == 1 && !key.starts_with(char::is_whitespace))
+            || matches!(
+                key,
+                "enter"
+                    | "space"
+                    | "tab"
+                    | "esc"
+                    | "backspace"
+                    | "delete"
+                    | "del"
+                    | "fwd del"
+                    | "home"
+                    | "end"
+                    | "pgup"
+                    | "pgdn"
+                    | "↑"
+                    | "↓"
+                    | "←"
+                    | "→"
+            )
+            || key.strip_prefix('f').is_some_and(|number| {
+                number
+                    .parse::<u8>()
+                    .is_ok_and(|n| (1..=24).contains(&n) && n.to_string() == number)
+            })
+    };
+    key_label(hint)
+        || hint
+            .match_indices(' ')
+            .any(|(i, _)| key_label(&hint[..i]) && key_label(&hint[i + 1..]))
 }
 
 /// Whether an item has the accepted `model-with-reasoning` shape: two or three words,

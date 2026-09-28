@@ -3,6 +3,8 @@
 //! events into PTY bytes.
 
 pub(crate) mod ansi;
+#[cfg(test)]
+mod codex_tests;
 pub(crate) mod emulator;
 // Differential emulator tests over recorded PTY output.
 #[cfg(test)]

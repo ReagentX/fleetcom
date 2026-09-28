@@ -7,8 +7,12 @@ parser assertions checked against captured behavior.
 
 ## Capture method
 
-Each fixture is raw output from a 40×120 PTY with `TERM=xterm-256color`. Feed
-the bytes to the emulator verbatim in tests.
+The raw captures listed below start in a 40×120 PTY with
+`TERM=xterm-256color`. Feed their bytes to the emulator verbatim. The
+`preview_*.bin` fixtures are constructed repaints, described separately below.
+Versioned capture directories record their own geometry, checkpoints, and
+resize events; they also distinguish direct child output from an outer
+fleetcom client's output.
 
 ## Fixtures
 
@@ -91,6 +95,32 @@ fix the parser BEL` title announce.
 | `preview_trunc_codex.bin` | synthetic 40×80: working row truncated inside the `/ps` hint | head still matched; key-hint suffix omitted |
 | `preview_trunc_grok.bin` | synthetic 40×80: spinner label truncated with the CLI's ellipsis | CLI's own `…` kept verbatim |
 | `preview_wrap_grok.bin` | synthetic 40×30: ellipsis wrapped onto the next row | structure rejected; marker fallback |
+
+## Codex 0.157.1 and 0.158.0 captures
+
+The versioned directories contain raw PTY streams from the official macOS arm64
+release executables, recorded on 2026-09-28. Codex ran with isolated homes,
+`--no-daemon`, and a loopback Responses server supplying scripted replies:
+
+- [`codex_0158_preview`](codex_0158_preview/README.md) covers working status,
+  queued input, Shift-Left draft retrieval, completed-turn rejection by the
+  working matcher, ordinary command approval, and the additional terminal-input
+  approval in 0.158.0. The existing approval matcher recognizes both menus.
+- [`codex_0158_terminal`](codex_0158_terminal/README.md) covers direct Codex
+  output across resize, `/new`, alternate-screen teardown, and OSC 52 copy.
+  Separate outer fleetcom captures show resumed history and the exact clipboard
+  payload forwarded to the terminal.
+
+Each directory documents provenance and replay boundaries. The terminal
+manifest records the capture fleetcom tree: `d138a752` plus the recorded dirty
+patch, not a clean release checkout. Tests replay the bytes without Codex,
+network access, or accounts. Replaying a saved-thread capture checks its display
+and clipboard output; it does not execute save/load. See
+[agent session resume](../../docs/agent-resume.md#codex) for the live validation.
+
+These recordings do not establish Linux release behavior, real-account
+behavior, native clipboard or mouse behavior, or shared-daemon compatibility.
+Replay tests are portable; the live capture platform was macOS arm64.
 
 ## Validation coverage
 

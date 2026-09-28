@@ -694,6 +694,82 @@ fn codex_label_reads_either_status_line_shape() {
     );
 }
 
+#[test]
+fn codex_label_separates_right_aligned_warning_badges() {
+    let label = |row: &str| CodexSummary.model_label(&rs(&["›", "", row]));
+    for badge in [
+        "⚠ 1 warning · f2 to view",
+        "⚠ 12 warnings · ctrl+w to view",
+        "⚠ 2 warnings · ctrl+x w to view",
+        "⚠ 1 warning · /warnings to view",
+        "⚠ 1 · f2",
+        "⚠ 2 · shift+←",
+        "⚠ 3 · ⌥+w",
+        "⚠ 4 · alt+w",
+        "⚠ 5 · ctrl+x ctrl+w",
+        "⚠ 6 · /warnings",
+        "⚠ 1 warning · ctrl+shift+⌥+f24 to view",
+        "⚠ 1 · fwd del",
+        "⚠ 1 · ctrl+x ctrl+fwd del",
+        "⚠ 1",
+        "⚠ 12",
+    ] {
+        for (footer, want) in [
+            ("gpt-5.4 high", "gpt-5.4 high"),
+            ("gpt-5.4 xhigh fast", "gpt-5.4 xhigh fast"),
+            ("gpt-5.4 high · /tmp/project", "gpt-5.4 high"),
+            ("gpt-5.4 · 28.2K in · 78 out", "gpt-5.4"),
+            ("gpt-5.4 high · 5.26K used · 0 in · 0 out", "gpt-5.4 high"),
+        ] {
+            for padding in ["  ", "                "] {
+                let row = format!("  {footer}{padding}{badge}");
+                assert_eq!(label(&row), Some(want.to_string()), "{row:?}");
+            }
+        }
+    }
+}
+
+#[test]
+fn codex_label_rejects_warning_prose_and_incomplete_footers() {
+    let label = |row: &str| CodexSummary.model_label(&rs(&["›", "", row]));
+    for row in [
+        "  gpt-5.4 high  ⚠",
+        "  gpt-5.4 high  ⚠ check your configuration",
+        "  gpt-5.4 high  ⚠ 1 warning · read documentation to view",
+        "  gpt-5.4 high  ⚠ 1 · read documentation",
+        "  gpt-5.4 high  ⚠ 1 warning · f2",
+        "  gpt-5.4 high  ⚠ 1 warning",
+        "  gpt-5.4 high  ⚠ 1 warnings · f2 to view",
+        "  gpt-5.4 high  ⚠ 2 warning · f2 to view",
+        "  gpt-5.4 high  ⚠ 0",
+        "  gpt-5.4 high  ⚠ 01",
+        "  gpt-5.4 high  ⚠ -1",
+        "  gpt-5.4 high  ⚠ 1 ·",
+        "  gpt-5.4 high  ⚠ 1 · f2 extra words",
+        "  gpt-5.4 high  ⚠ 1 · f25",
+        "  gpt-5.4 high  ⚠ 1 warning · f2 to vie…",
+        "  gpt-5.4 high ⚠ 1 warning · f2 to view",
+        "  gpt-5.4 high⚠ 1",
+        "  /tmp/project · gpt-5.4 high  ⚠ 1",
+        "gpt-5.4 high  ⚠ 1",
+        "  gpt-5.4  ⚠ 1",
+        "  gpt-5.4 none  ⚠ 1",
+        "  gpt-5.4 very high fast  ⚠ 1",
+        "  gpt-5.4 h…  ⚠ 1",
+        "  gpt-5.4 high fa…  ⚠ 1",
+        "  gpt-5.4… high  ⚠ 1",
+        "  gpt-5.4 high...  ⚠ 1",
+        "  gpt-5.4 · 0 in · 0 ou…  ⚠ 1",
+        "  gpt-5.4… · 0 in · 0 out  ⚠ 1",
+    ] {
+        assert_eq!(label(row), None, "{row:?}");
+    }
+
+    let mut rows = rs(&["  gpt-5.4 high  ⚠ 1"]);
+    rows.extend(rs(&["one", "two", "three", "four", "five", "six"]));
+    assert_eq!(CodexSummary.model_label(&rows), None);
+}
+
 /// The braille spinner and the blocked-on-user blink each canonicalize to a
 /// single string; idle and foreign titles pass through.
 #[test]
@@ -1392,6 +1468,174 @@ fn omp_ascii_box_glyphs_do_not_anchor() {
 }
 
 // ------------------------------------------------------- corpus replay --
+
+/// Each offset is a cumulative PTY byte checkpoint, not a standalone repaint.
+fn codex_0158_checkpoint(bytes: &[u8], offset: usize, alternate: bool) -> Vec<String> {
+    let mut emu = Emulator::new(40, 120, 2000);
+    emu.process(&bytes[..offset]);
+    assert_eq!(emu.alternate_screen(), alternate);
+    emu.live_rows()
+}
+
+#[test]
+fn corpus_codex_0158_working_queue_and_completed_turns() {
+    for (bytes, offsets, queue_hint) in [
+        (
+            include_bytes!("../../tests/corpus/codex_0158_preview/0.157.1-inline.bin").as_slice(),
+            [12405, 15613, 17650, 18716],
+            "    ⌥+↑ edit last queued message",
+        ),
+        (
+            include_bytes!("../../tests/corpus/codex_0158_preview/0.158.0-inline.bin").as_slice(),
+            [11311, 14478, 16558, 17253],
+            "    shift+← edit last queued message",
+        ),
+    ] {
+        for (state, offset) in offsets.into_iter().enumerate() {
+            let rows = codex_0158_checkpoint(bytes, offset, false);
+            let has = |text: &str| rows.iter().any(|row| row == text);
+            let queued = state == 1;
+            let draft = state == 2;
+            assert_eq!(has("• Queued follow-up inputs"), queued);
+            assert_eq!(has("  ↳ Queued phase zero message"), queued);
+            assert_eq!(has(queue_hint), queued);
+            assert_eq!(has("› Queued phase zero message"), draft);
+            assert_eq!(has("› Ask Codex to do anything"), !draft);
+            assert_eq!(
+                has("• PHASE0 COMPLETE. Deterministic local response."),
+                state == 3
+            );
+            assert_eq!(
+                CodexSummary.live_preview(&rows),
+                (state != 3).then(|| ("Working".to_string(), "codex:working")),
+                "checkpoint {offset}"
+            );
+        }
+    }
+}
+
+fn codex_warning_footer_prefixes_working_preview(bytes: &[u8], offset: usize) {
+    let rows = codex_0158_checkpoint(bytes, offset, false);
+    assert_eq!(
+        CodexSummary.model_label(&rows),
+        Some("phase0-fixture-model default".to_string()),
+        "checkpoint {offset}"
+    );
+    assert_eq!(
+        corpus(&bytes[..offset], &CodexSummary, 120),
+        anchor("phase0-fixture-model default · Working", "codex:working"),
+        "checkpoint {offset}"
+    );
+}
+
+#[test]
+fn corpus_codex_0157_warning_footer_prefixes_working_preview() {
+    codex_warning_footer_prefixes_working_preview(
+        include_bytes!("../../tests/corpus/codex_0158_preview/0.157.1-inline.bin"),
+        12405,
+    );
+}
+
+#[test]
+fn corpus_codex_0158_warning_footer_prefixes_working_preview() {
+    codex_warning_footer_prefixes_working_preview(
+        include_bytes!("../../tests/corpus/codex_0158_preview/0.158.0-inline.bin"),
+        11311,
+    );
+}
+
+#[test]
+fn corpus_codex_0158_command_approvals() {
+    for (bytes, offset) in [
+        (
+            include_bytes!("../../tests/corpus/codex_0158_preview/0.157.1-fullscreen-approval.bin")
+                .as_slice(),
+            11965,
+        ),
+        (
+            include_bytes!("../../tests/corpus/codex_0158_preview/0.158.0-fullscreen-approval.bin")
+                .as_slice(),
+            12967,
+        ),
+    ] {
+        let rows = codex_0158_checkpoint(bytes, offset, true);
+        for text in [
+            "  Would you like to run the following command?",
+            "  $ printf 'PHASE0 APPROVAL\\n'",
+            "› 1. Yes, proceed (y)",
+            "  3. No, and tell Codex what to do differently (esc)",
+        ] {
+            assert!(rows.iter().any(|row| row == text), "{text}");
+        }
+        assert_eq!(
+            corpus(&bytes[..offset], &CodexSummary, 120),
+            anchor("awaiting approval", "codex:approval-menu")
+        );
+    }
+}
+
+#[test]
+fn corpus_codex_0158_stdin_requires_a_second_approval() {
+    for (bytes, command, input, needs_approval) in [
+        (
+            include_bytes!("../../tests/corpus/codex_0158_preview/0.157.1-fullscreen-stdin.bin")
+                .as_slice(),
+            12494,
+            16518,
+            false,
+        ),
+        (
+            include_bytes!("../../tests/corpus/codex_0158_preview/0.158.0-fullscreen-stdin.bin")
+                .as_slice(),
+            13496,
+            17417,
+            true,
+        ),
+    ] {
+        let rows = codex_0158_checkpoint(bytes, command, true);
+        assert!(
+            rows.iter()
+                .any(|row| row == "  Would you like to run the following command?")
+        );
+        assert_eq!(
+            CodexSummary.live_preview(&rows),
+            Some(("awaiting approval".to_string(), "codex:approval-menu"))
+        );
+        let rows = codex_0158_checkpoint(bytes, input, true);
+        assert!(
+            rows.iter()
+                .any(|row| row.starts_with("✔ You approved codex to run read line;"))
+        );
+        assert_eq!(
+            rows.iter()
+                .any(|row| row.starts_with("  Would you like to send input to terminal ")),
+            needs_approval
+        );
+        assert_eq!(
+            rows.iter().any(|row| row == "  Input: \"fixture\\n\""),
+            needs_approval
+        );
+        assert_eq!(
+            rows.iter()
+                .any(|row| row == "• PHASE0 COMPLETE. Deterministic local response."),
+            !needs_approval
+        );
+        assert_eq!(
+            rows.iter().any(|row| row == "    PHASE0 INPUT: fixture"),
+            !needs_approval
+        );
+        assert_eq!(
+            CodexSummary.live_preview(&rows),
+            needs_approval.then(|| ("awaiting approval".to_string(), "codex:approval-menu"))
+        );
+        if needs_approval {
+            assert_eq!(
+                corpus(&bytes[..input], &CodexSummary, 120),
+                anchor("awaiting approval", "codex:approval-menu")
+            );
+        }
+    }
+}
 
 /// Positive per-state fixtures at capture geometry (40×120): exact
 /// normalized text, Anchor provenance, and the matcher id.
