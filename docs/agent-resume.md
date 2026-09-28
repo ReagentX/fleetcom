@@ -70,6 +70,10 @@ After each turn, the notifier writes the `agent-turn-complete` JSON argument to 
 
 Replacing a configured notifier would change user behavior, so the harness reads bare top-level keys in `$CODEX_HOME/config.toml` until the first table header. If it finds a one-line `notify` array of non-empty basic strings, it chains that notifier after the capture write. `FLEETCOM_NOTIFY_CHAIN` carries its argv joined by newlines; the capture script appends the notification payload before invoking it. An absent setting or empty array means capture runs alone. This encoding cannot transport empty arguments, newlines, or NUL, so those values disable injection.
 
+Live validation on 2026-09-28 used the official macOS arm64 Codex 0.157.1 and 0.158.0 executables with isolated homes and a scripted loopback Responses server. In both releases, the real capture script preserved the notification JSON and passed it to the configured notifier. Saving and loading through foreground fleetcom preserved the thread ID and reopened its history. These runs used `--no-daemon`; separate default-launch probes also captured and saved the ID, but their fresh homes had no managed Codex daemon installed or running. Shared-daemon behavior and real-account behavior remain unverified.
+
+The [recorded terminal fixtures](../tests/corpus/codex_0158_terminal/README.md) preserve resumed-history and clipboard output from those runs. Offline replay checks the recorded display and OSC 52 forwarding; it does not run the notifier or execute save/load. The separate `tests/daemon_resume.rs` integration tests exercise session resume with stub agents.
+
 ### `grok`
 
 You can specify a Grok ID at launch, but cannot inject a live-capture channel. For a bare command, `--session-id '<uuid>'` is added; no instrumentation is required for a canonical resume command.
