@@ -227,8 +227,8 @@ fn render_dashboard(out: &mut impl Write, app: &App) -> io::Result<()> {
     Ok(())
 }
 
-/// The dashboard's bottom key hint. The `Ctrl-]` segment appears only when the
-/// chord would jump to a flagship, so an unmarked fleet shows no dead key.
+/// Build the dashboard's bottom key hint. Include `Ctrl-]` only with a
+/// flagship destination; omit the hint when no task is marked.
 fn dashboard_hint(chord: Option<Target>) -> String {
     let mut hint = String::from("  ↑↓ select · enter attach · space peek · ? controls");
     if let Some(Target::Flagship(_)) = chord {
@@ -343,8 +343,8 @@ fn status_glyph(v: &TaskView) -> &'static str {
     }
 }
 
-/// Display-column budget for a task label: the dashboard title cell, and the
-/// `Ctrl-]` origin in the attached bar, so both elide a label at the same point.
+/// Shared display-column budget for task labels in the dashboard title cell
+/// and the attached bar's `Ctrl-]` return hint. Truncate at the same point in both.
 fn title_width(cols: usize) -> usize {
     26.min(cols / 3)
 }
@@ -353,9 +353,8 @@ fn title_width(cols: usize) -> usize {
 /// can be styled independently. Each cell is padded to its display-column
 /// budget, and the budgets sum to `cols`.
 fn task_row_parts(v: &TaskView, cols: usize) -> (String, String, String) {
-    // Marks fill the two-column indent from the left, tag before flag, so a
-    // lone mark keeps a space before the glyph and an unmarked row keeps the
-    // plain indent. Nothing past the gutter shifts when a mark changes.
+    // Place marks at the left of the two-column indent, tag before flag.
+    // Pad unused columns to keep the status glyph and later cells aligned.
     let marks: String = [(v.tagged, '◆'), (v.flagship, '⚑')]
         .into_iter()
         .filter_map(|(on, c)| on.then_some(c))
@@ -1013,14 +1012,14 @@ fn selection_overlay<'a>(sel: Option<&Selection>, lines: &'a [String]) -> Vec<(u
         .collect()
 }
 
-/// The attached bar's `Ctrl-]` hint for `chord`, or `None` when the chord does
-/// nothing. A return to a task names it by `display_label`, elided at the
-/// dashboard title budget so the origin reads as it does in its row.
+/// Build the attached bar's `Ctrl-]` hint, or return `None` without a destination.
+/// For a task destination, use `display_label` and the dashboard title budget
+/// to match the label and truncation in its row.
 fn chord_hint(chord: Option<Target>, views: &[TaskView], cols: usize) -> Option<String> {
     match chord? {
         Target::Flagship(_) => Some("Ctrl-] flagship".to_string()),
         Target::Dashboard => Some("Ctrl-] back to dashboard".to_string()),
-        // `chord_target` yields `Task` only while the id is in `views`.
+        // For a `Task` destination from `chord_target`, the id is present in `views`.
         Target::Task(id) => views.iter().find(|v| v.id == id).map(|v| {
             format!(
                 "Ctrl-] back to {}",
@@ -1030,14 +1029,13 @@ fn chord_hint(chord: Option<Target>, views: &[TaskView], cols: usize) -> Option<
     }
 }
 
-/// Build the attached or scrollback bar, at most `cols` wide when the right-hand
-/// segment fits. An active notice replaces the key hints in either view; `chord`
-/// is appended to the hints.
+/// Build the attached or scrollback bar. Show an active notice in place of key
+/// hints; otherwise append `chord` to the hints. Limit the bar to `cols` when
+/// the prefix, separator, and right-hand segment fit within that width.
 ///
-/// The right-hand segment is built first and the title elides into the width
-/// left over: the hints are what a user needs mid-task, and an agent's command
-/// line alone can outrun the terminal. When the segment itself overflows, the
-/// title collapses to nothing and the caller's `pad` cuts the rest at `cols`.
+/// Reserve space for the right-hand segment before truncating the title, so
+/// users can read the hints even with a long agent command line. If no space
+/// remains, omit the title and truncate to `cols` with `pad` at the call site.
 fn attached_bar(
     title: &str,
     scrollback: usize,
@@ -1308,7 +1306,7 @@ mod tests {
                     Lifecycle::Ok => "✓",
                     Lifecycle::Failed => "✗",
                 };
-                // The glyph follows the two-column mark gutter.
+                // Skip the two-column mark gutter before checking the glyph.
                 let body: String = row.chars().skip(2).collect();
                 assert!(body.starts_with(&format!("{glyph} ")), "{row:?}");
             }
@@ -1463,7 +1461,7 @@ mod tests {
         );
     }
 
-    /// Each `chord_target` arm yields its own tail in the live and scrollback bars.
+    /// Show the corresponding hint for each destination in live and scrollback bars.
     #[test]
     fn attached_bar_appends_the_chord_segment_for_each_target() {
         let origin = TaskView {
@@ -1494,7 +1492,7 @@ mod tests {
         }
     }
 
-    /// The origin label elides at the dashboard title budget, as in its row.
+    /// Truncate the origin label at the same width as its dashboard row label.
     #[test]
     fn chord_hint_elides_the_origin_at_the_title_budget() {
         let long = "a-very-long-origin-task-name-that-overruns";
@@ -1510,20 +1508,20 @@ mod tests {
             assert!(label.ends_with('…'), "{hint:?}");
             assert!(task_row(&v, cols).contains(label), "row and hint disagree");
         }
-        // Without a name the command stands in, as `display_label` does.
+        // Use the command for an unnamed task, consistent with `display_label`.
         let hint = chord_hint(Some(Target::Task(1)), &[view(None)], 80);
         assert_eq!(hint.as_deref(), Some("Ctrl-] back to cargo test"));
     }
 
-    /// A long title elides so the hints survive; the bar fills `cols` exactly.
+    /// Truncate a long title to keep the hints visible within exactly `cols` columns.
     #[test]
     fn attached_bar_elides_the_title_before_the_hints() {
         let title = format!(
             "claude · {}",
             "claude --dangerously-skip-permissions ".repeat(4)
         );
-        // The scrollback hints plus the chord take 83 columns before any
-        // title, so that variant is checked wider.
+        // Allow 83 columns for the scrollback hints and chord before the title;
+        // use a wider terminal for that case.
         for (scrollback, cols) in [(0, 80), (0, 100), (3, 100)] {
             let bar = attached_bar(&title, scrollback, None, Some("Ctrl-] flagship"), cols);
             assert!(
@@ -1536,8 +1534,8 @@ mod tests {
         }
     }
 
-    /// When the hints alone overflow, the title collapses and `pad` clips at
-    /// `cols` without panicking.
+    /// Omit the title when the hints exceed the available width, then truncate
+    /// to `cols` with `pad` without panicking.
     #[test]
     fn attached_bar_degrades_at_narrow_widths() {
         let chord = Some("Ctrl-] back to dashboard");
@@ -1552,7 +1550,7 @@ mod tests {
         }
     }
 
-    /// The flagship chord shows on the dashboard only when it would jump.
+    /// Show the dashboard chord hint only with a flagship destination.
     #[test]
     fn dashboard_hint_names_the_chord_only_for_a_flagship() {
         let base = "  ↑↓ select · enter attach · space peek · ? controls";
@@ -1565,7 +1563,7 @@ mod tests {
         assert_eq!(dashboard_hint(Some(Target::Task(3))), base);
     }
 
-    /// Marks fill the indent from the left, tag before flag; no other cell moves.
+    /// Place marks at the left of the indent, tag before flag; preserve other cells.
     #[test]
     fn task_row_marks_occupy_the_indent_without_shifting() {
         for cols in [40usize, 80] {
@@ -1585,7 +1583,7 @@ mod tests {
                 };
                 assert_eq!(cells[..2], want, "{row:?}");
                 assert_eq!(cells[2], '✻', "{row:?}");
-                // Every other column matches the unmarked row.
+                // Compare all columns after the gutter with the unmarked row.
                 let rest = |r: &str| -> String {
                     r.chars()
                         .enumerate()
@@ -1598,7 +1596,7 @@ mod tests {
         }
     }
 
-    /// Both flagship keys appear in the overlay, each in its own group.
+    /// List both flagship keys in the controls overlay under their respective groups.
     #[test]
     fn controls_list_the_flagship_keys_in_their_groups() {
         let group_of = |key: &str| CONTROLS.iter().find(|c| c.key == key).map(|c| c.group);

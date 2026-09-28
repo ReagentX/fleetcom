@@ -67,7 +67,7 @@ pub enum Command {
     /// Set the manual "in use" tag.
     Tag { id: u64, on: bool },
     /// Mark the flagship, displacing any prior mark, or clear it for `None`.
-    /// The core drops the mark once the task finishes or leaves the set.
+    /// Clear the mark in the core after task completion or removal.
     Flagship { id: Option<u64> },
     /// Set a task's group; clear to unassigned for `None`.
     SetGroup { id: u64, group: Option<String> },
@@ -331,8 +331,8 @@ pub struct TaskView {
     pub command: String,
     pub cwd: PathBuf,
     pub tagged: bool,
-    /// Whether this task is the flagship. At most one view in a snapshot
-    /// carries it, and never a finished one.
+    /// Whether this task is the flagship. True for at most one task per
+    /// snapshot, and never for a finished task.
     pub flagship: bool,
     /// Dashboard group; `None` means unassigned.
     pub group: Option<String>,

@@ -171,9 +171,8 @@ fn affects_recipe(cmd: &Command) -> bool {
         | Command::SetName { .. }
         | Command::LoadSession { .. }
         | Command::LoadRecovery { .. } => true,
-        // `Kill` changes lifecycle; `Tag` and `Flagship` change dashboard
-        // state. None changes the task set or serialized fields. The remaining
-        // variants also leave the recipe unchanged.
+        // Preserve the recipe for lifecycle (`Kill`) and dashboard-state
+        // (`Tag`, `Flagship`) updates, and for the remaining commands.
         Command::Kill { .. }
         | Command::Tag { .. }
         | Command::Flagship { .. }
@@ -249,9 +248,9 @@ pub struct Supervisor {
     watched: Option<u64>,
     /// Whether the current watch permits clipboard forwarding.
     watch_attached: bool,
-    /// The one flagship task, or `None`. A single id makes at-most-one a
-    /// property of the type. `tick` drops an id that names a finished or
-    /// missing task, so no snapshot carries a dead mark.
+    /// The flagship task id, or `None`: at most one id is representable.
+    /// Clear in `tick` if the task is finished or absent, before including
+    /// the mark in a snapshot.
     flagship: Option<u64>,
     /// The last emitted screen fingerprint. `lines` stays empty because only
     /// emitted copies carry them. Cleared when `watched` changes to force a
@@ -478,8 +477,8 @@ impl Supervisor {
     /// `drain`ed events, never a `Task`.
     pub fn tick(&mut self) {
         self.reap();
-        // Level-triggered: one check covers exit, removal, session load, and a
-        // mark placed on an already-finished task.
+        // Check current state rather than individual transitions to handle exit,
+        // removal, session load, and marks placed on already-finished tasks.
         if let Some(id) = self.flagship
             && self
                 .index_of(id)
@@ -851,8 +850,9 @@ impl Supervisor {
             self.status("rerun failed: task is still running");
             return;
         }
-        // The exit may have latched just above, between ticks, and the live
-        // replacement keeps this id, so the tick check would read it as alive.
+        // Exit may have been latched just above, between ticks. Clear the mark
+        // before reusing the id for a live replacement. At the next tick, the
+        // replacement would be live and the mark would be retained.
         if self.flagship == Some(id) {
             self.flagship = None;
         }

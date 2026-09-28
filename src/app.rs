@@ -173,21 +173,20 @@ pub enum Row {
     Task(usize),
 }
 
-/// Where a flagship jump started, so the chord can return there.
+/// Return destination after attaching to the flagship.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Origin {
     Dashboard,
     Task(u64),
 }
 
-/// Where `Ctrl-]` goes next. The key handler and the attached bar both read
-/// it from `App::chord_target`, so the hint never disagrees with the key.
+/// Destination for `Ctrl-]`, from `App::chord_target`. Use the same value for
+/// navigation and the attached-bar hint to keep them consistent.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Target {
-    /// Return to the task the jump started from; the id is in `views`.
+    /// Return to the previously attached task; the id is in `views`.
     Task(u64),
-    /// Return to the dashboard: the jump started there, or its origin task
-    /// has left `views`.
+    /// Return to the dashboard: no previous task, or its id is absent from `views`.
     Dashboard,
     /// Jump to the flagship with this id.
     Flagship(u64),
@@ -226,11 +225,10 @@ pub struct App {
     /// Id of the attached task, if any: by id (not index) so it survives the
     /// task list changing underneath it.
     pub focused_id: Option<u64>,
-    /// Where `Ctrl-]` returns to. Set only by attaching to a task the snapshot
-    /// marks as the flagship; it outlives the flagship's mark
-    /// (the daemon unmarks on exit) to keep the way back open. Cleared on
-    /// every exit from attached mode and on reconnect, since task ids are
-    /// daemon-local.
+    /// Return destination for `Ctrl-]`. Set on attachment only if the target
+    /// is marked as flagship in the current snapshot. Retain after the
+    /// flagship's exit so the user can still return. Clear on every exit from
+    /// attached mode and on reconnect: task ids are daemon-local.
     return_to: Option<Origin>,
     /// Whether the host terminal window has focus. While unfocused, highlighted
     /// rows use a bright-black background.
@@ -1208,10 +1206,9 @@ impl App {
             self.should_quit = true;
             return;
         }
-        // `Ctrl-]` is reserved from children, like `Ctrl-\`. Dispatch it ahead of
-        // the mode handlers: in scrollback, `on_key_attached`'s catch-all would
-        // leave scrollback and forward it. Other modes drop it, since jumping
-        // out of a prompt would discard its buffer.
+        // Reserve `Ctrl-]` from children, like `Ctrl-\`. Handle it before mode
+        // dispatch to avoid forwarding it through the scrollback catch-all in
+        // `on_key_attached`. Ignore it in other modes to preserve prompt input.
         if is_chord_key(k) {
             if matches!(self.mode, Mode::Dashboard | Mode::Peek | Mode::Attached) {
                 self.on_chord(out);
@@ -1277,8 +1274,8 @@ impl App {
                 }
             }
             KeyCode::Char('M') => self.select_next_tagged(),
-            // `]` toggles the flagship mark. The daemon unmarks a finished task
-            // on its next tick, so marking one would be a silent no-op anyway.
+            // Do not mark finished tasks: the mark would be cleared on the
+            // next daemon tick, before inclusion in a snapshot.
             KeyCode::Char(']') => {
                 if let Some(i) = self.selected_task()
                     && !matches!(self.views[i].lifecycle, Lifecycle::Ok | Lifecycle::Failed)
@@ -1803,14 +1800,13 @@ impl App {
         }
     }
 
-    /// Attach to task `id`. Every attach funnels through here, so attaching to
-    /// the flagship records `origin` and attaching elsewhere drops it. The
-    /// mark comes from the snapshot, so an attach racing this client's own
-    /// `]` records nothing; `chord_target` covers that case.
+    /// Attach to task `id`. Record `origin` if the target is marked as flagship
+    /// in the current snapshot; otherwise clear `return_to`. After `]`, the
+    /// updated snapshot may not yet be available: handle attachment to the
+    /// flagship without a recorded origin in `chord_target`.
     fn attach_to(&mut self, id: u64, origin: Origin) {
-        // All tasks already run at the client's content size, so there's no
-        // resize to do: just take focus. The screen arrives via `Watch`, sent
-        // from the run loop next tick.
+        // No resize is needed: each task is already at the client's content
+        // size. Request its screen through `Watch` on the next run-loop tick.
         let flagship = self.task_index(id).is_some_and(|i| self.views[i].flagship);
         self.focused_id = Some(id);
         self.mode = Mode::Attached;
@@ -1818,8 +1814,8 @@ impl App {
         self.return_to = flagship.then_some(origin);
     }
 
-    /// Background the attached task and return to the dashboard. The
-    /// selection is untouched, so the list reopens on the same row.
+    /// Background the attached task and return to the dashboard. Preserve the
+    /// selected row.
     fn detach(&mut self, out: &mut Stdout) {
         self.mode = Mode::Dashboard;
         self.focused_id = None;
@@ -1831,17 +1827,16 @@ impl App {
         let _ = execute!(out, Clear(ClearType::All), MoveTo(0, 0));
     }
 
-    /// Where `Ctrl-]` goes next, first match wins:
-    /// 1. A recorded origin: back to that task while it is still in `views`
-    ///    (finished or not), else back to the dashboard.
-    /// 2. A marked flagship: jump to it, or, already attached to it, back to
-    ///    the dashboard.
-    /// 3. Nothing.
+    /// Return the destination for `Ctrl-]`, in priority order:
+    /// 1. With a recorded origin, return to that task if present in `views`,
+    ///    even if finished. Otherwise return to the dashboard.
+    /// 2. With a marked flagship, attach to it, or return to the dashboard if
+    ///    already attached to it.
+    /// 3. Without either, do nothing.
     ///
-    /// Arm 2's guard covers an attach that beat the mark: `attach_to` reads the
-    /// mark from the snapshot, which lags this client's own `]`, so `]` then
-    /// `Enter` in one input batch lands on the flagship with no origin. Without
-    /// the guard the chord would record the flagship as its own origin.
+    /// If `]` then `Enter` are processed before the updated snapshot, no origin
+    /// is recorded. Check for attachment to the flagship in arm 2 to avoid
+    /// recording a return to the same task.
     pub fn chord_target(&self) -> Option<Target> {
         if let Some(origin) = self.return_to {
             return Some(match origin {
@@ -1856,10 +1851,9 @@ impl App {
         Some(Target::Flagship(id))
     }
 
-    /// Follow `Ctrl-]` to `chord_target`. A jump from the dashboard or Peek
-    /// records the dashboard as its origin (the jump closes Peek); a jump from
-    /// an attached task records that task. Returning to a task is an attach
-    /// to a non-flagship, which clears `return_to`.
+    /// Navigate to `chord_target`. From the dashboard or Peek, record the
+    /// dashboard as the origin and close Peek. From an attached task, record
+    /// that task instead. On return to a non-flagship task, clear `return_to`.
     fn on_chord(&mut self, out: &mut Stdout) {
         let Some(target) = self.chord_target() else {
             return;
@@ -1955,8 +1949,8 @@ fn key_event_to_key(ev: KeyEvent) -> Option<(Key, Mods)> {
     Some((code, mods))
 }
 
-/// Recognize `Ctrl-]`. Kitty reports the real key; crossterm reports legacy
-/// 0x1D as Ctrl-5, since it maps 0x1C..=0x1F to `'4'..='7'`.
+/// Recognize `Ctrl-]` in kitty and legacy encodings. Accept Ctrl-5 for legacy
+/// 0x1D: in crossterm, 0x1C..=0x1F are mapped to Ctrl-'4'..=Ctrl-'7'.
 fn is_chord_key(k: KeyEvent) -> bool {
     k.modifiers.contains(KeyModifiers::CONTROL)
         && matches!(k.code, KeyCode::Char(']') | KeyCode::Char('5'))
