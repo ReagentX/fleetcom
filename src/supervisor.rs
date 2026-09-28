@@ -171,11 +171,11 @@ fn affects_recipe(cmd: &Command) -> bool {
         | Command::SetName { .. }
         | Command::LoadSession { .. }
         | Command::LoadRecovery { .. } => true,
-        // `Kill` changes lifecycle and `Tag` changes dashboard state; neither
-        // changes the task set or serialized fields. The remaining variants
-        // also leave the recipe unchanged.
+        // Preserve the recipe for lifecycle (`Kill`) and dashboard-state
+        // (`Tag`, `Flagship`) updates, and for the remaining commands.
         Command::Kill { .. }
         | Command::Tag { .. }
+        | Command::Flagship { .. }
         | Command::Resize { .. }
         | Command::Watch { .. }
         | Command::Paste { .. }
@@ -248,6 +248,10 @@ pub struct Supervisor {
     watched: Option<u64>,
     /// Whether the current watch permits clipboard forwarding.
     watch_attached: bool,
+    /// The flagship task id, or `None`: at most one id is representable.
+    /// Clear in `tick` if the task is finished or absent, before including
+    /// the mark in a snapshot.
+    flagship: Option<u64>,
     /// The last emitted screen fingerprint. `lines` stays empty because only
     /// emitted copies carry them. Cleared when `watched` changes to force a
     /// fresh screen after attachment.
@@ -282,6 +286,7 @@ impl Supervisor {
             scrollback,
             watched: None,
             watch_attached: false,
+            flagship: None,
             last_screen: None,
             launch: None,
             events: Vec::new(),
@@ -365,6 +370,7 @@ impl Supervisor {
             }
             Command::Restart { id } => self.rerun(id),
             Command::Tag { id, on } => self.with_task(id, |t| t.tagged = on),
+            Command::Flagship { id } => self.flagship = id,
             Command::SetGroup { id, group } => {
                 self.with_task(id, |t| t.group = normalize_group(group))
             }
@@ -471,6 +477,15 @@ impl Supervisor {
     /// `drain`ed events, never a `Task`.
     pub fn tick(&mut self) {
         self.reap();
+        // Check current state rather than individual transitions to handle exit,
+        // removal, session load, and marks placed on already-finished tasks.
+        if let Some(id) = self.flagship
+            && self
+                .index_of(id)
+                .is_none_or(|i| self.tasks[i].finished.is_some())
+        {
+            self.flagship = None;
+        }
         let now = Instant::now();
         // vte re-checks its ?2026 sync timeout only when bytes arrive, so a
         // child that opens BSU and stalls would freeze its view. This tick is
@@ -500,6 +515,7 @@ impl Supervisor {
                     command: t.command.clone(),
                     cwd: t.cwd.clone(),
                     tagged: t.tagged,
+                    flagship: self.flagship == Some(t.id),
                     group: t.group.clone(),
                     name: t.name.clone(),
                     lifecycle: t.lifecycle(now, IDLE_AFTER),
@@ -833,6 +849,12 @@ impl Supervisor {
         if self.tasks[i].finished.is_none() {
             self.status("rerun failed: task is still running");
             return;
+        }
+        // Exit may have been latched just above, between ticks. Clear the mark
+        // before reusing the id for a live replacement. At the next tick, the
+        // replacement would be live and the mark would be retained.
+        if self.flagship == Some(id) {
+            self.flagship = None;
         }
         let Some(launch) = self.launch_or_refuse() else {
             return;

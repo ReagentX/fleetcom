@@ -29,6 +29,8 @@ fn command_round_trips() {
         Command::Remove { id: 3 },
         Command::Restart { id: 4 },
         Command::Tag { id: 2, on: true },
+        Command::Flagship { id: Some(2) },
+        Command::Flagship { id: None },
         Command::SetGroup {
             id: 2,
             group: Some("infra".into()),
@@ -163,9 +165,10 @@ fn command_round_trips() {
             Command::LoadRecovery { .. } => 15,
             Command::ListSessions => 16,
             Command::Shutdown => 17,
+            Command::Flagship { .. } => 18,
         }
     }
-    let mut seen = [false; 18];
+    let mut seen = [false; 19];
     for c in cases {
         seen[variant_index(&c)] = true;
         let (k, p) = encode_command(&c);
@@ -305,6 +308,7 @@ fn tv(id: u64) -> TaskView {
         command: "x".into(),
         cwd: PathBuf::from("/"),
         tagged: false,
+        flagship: false,
         group: None,
         name: None,
         lifecycle: Lifecycle::Ok,
@@ -334,11 +338,11 @@ fn mistyped_event_members_are_rejected() {
     for json in [
         r#"{"t":"tasks","tasks":[{"id":"nope"}]}"#,
         // The cwd must be a base64 string.
-        r#"{"t":"tasks","tasks":[{"id":1,"command":"x","cwd":"/x","tagged":true,"life":"ok","preview":"","src":"floor","frozen":false,"started_ms":0}]}"#,
+        r#"{"t":"tasks","tasks":[{"id":1,"command":"x","cwd":"/x","tagged":true,"flagship":false,"life":"ok","preview":"","src":"floor","frozen":false,"started_ms":0}]}"#,
         // A present group must be a string; only missing/null means unassigned.
-        r#"{"t":"tasks","tasks":[{"id":1,"command":"x","cwd":"Lw==","tagged":true,"life":"ok","preview":"","src":"floor","frozen":false,"started_ms":0,"group":5}]}"#,
+        r#"{"t":"tasks","tasks":[{"id":1,"command":"x","cwd":"Lw==","tagged":true,"flagship":false,"life":"ok","preview":"","src":"floor","frozen":false,"started_ms":0,"group":5}]}"#,
         // A present name must be a string.
-        r#"{"t":"tasks","tasks":[{"id":1,"command":"x","cwd":"Lw==","tagged":true,"life":"ok","preview":"","src":"floor","frozen":false,"started_ms":0,"name":5}]}"#,
+        r#"{"t":"tasks","tasks":[{"id":1,"command":"x","cwd":"Lw==","tagged":true,"flagship":false,"life":"ok","preview":"","src":"floor","frozen":false,"started_ms":0,"name":5}]}"#,
         r#"{"t":"tasks","tasks":["flat"]}"#,
         // Numeric member in `names`.
         r#"{"t":"sessions","names":["ok",5]}"#,
@@ -367,6 +371,7 @@ fn tasks_and_status_round_trip() {
             command: "vim".into(),
             cwd: PathBuf::from("/home/x"),
             tagged: true,
+            flagship: true,
             group: Some("x".into()),
             name: Some("editor".into()),
             lifecycle: Lifecycle::Idle,
@@ -468,7 +473,7 @@ fn set_name_wire_form() {
 #[test]
 fn tasks_frame_group_key_is_optional() {
     // "Lw==" is the base64 encoding of "/".
-    let ungrouped = r#"{"t":"tasks","tasks":[{"id":1,"command":"x","cwd":"Lw==","tagged":false,"life":"ok","preview":"","src":"floor","frozen":false,"started_ms":0}]}"#;
+    let ungrouped = r#"{"t":"tasks","tasks":[{"id":1,"command":"x","cwd":"Lw==","tagged":false,"flagship":false,"life":"ok","preview":"","src":"floor","frozen":false,"started_ms":0}]}"#;
     match decode_event(KIND_CONTROL, ungrouped.as_bytes()) {
         Some(Event::Tasks(v)) => assert_eq!(v[0].group, None),
         other => panic!("expected tasks event, got {other:?}"),
@@ -477,7 +482,7 @@ fn tasks_frame_group_key_is_optional() {
     let (_, p) = encode_event(&Event::Tasks(vec![tv(1)]));
     assert_eq!(std::str::from_utf8(&p).unwrap(), ungrouped);
 
-    let grouped = r#"{"t":"tasks","tasks":[{"id":1,"command":"x","cwd":"Lw==","tagged":false,"group":"infra","life":"ok","preview":"","src":"floor","frozen":false,"started_ms":0}]}"#;
+    let grouped = r#"{"t":"tasks","tasks":[{"id":1,"command":"x","cwd":"Lw==","tagged":false,"flagship":false,"group":"infra","life":"ok","preview":"","src":"floor","frozen":false,"started_ms":0}]}"#;
     match decode_event(KIND_CONTROL, grouped.as_bytes()) {
         Some(Event::Tasks(v)) => assert_eq!(v[0].group.as_deref(), Some("infra")),
         other => panic!("expected tasks event, got {other:?}"),
@@ -489,7 +494,7 @@ fn tasks_frame_group_key_is_optional() {
 #[test]
 fn tasks_frame_name_key_is_optional() {
     // "Lw==" is the base64 encoding of "/".
-    let unnamed = r#"{"t":"tasks","tasks":[{"id":1,"command":"x","cwd":"Lw==","tagged":false,"life":"ok","preview":"","src":"floor","frozen":false,"started_ms":0}]}"#;
+    let unnamed = r#"{"t":"tasks","tasks":[{"id":1,"command":"x","cwd":"Lw==","tagged":false,"flagship":false,"life":"ok","preview":"","src":"floor","frozen":false,"started_ms":0}]}"#;
     match decode_event(KIND_CONTROL, unnamed.as_bytes()) {
         Some(Event::Tasks(v)) => assert_eq!(v[0].name, None),
         other => panic!("expected tasks event, got {other:?}"),
@@ -498,7 +503,7 @@ fn tasks_frame_name_key_is_optional() {
     let (_, p) = encode_event(&Event::Tasks(vec![tv(1)]));
     assert_eq!(std::str::from_utf8(&p).unwrap(), unnamed);
 
-    let named = r#"{"t":"tasks","tasks":[{"id":1,"command":"x","cwd":"Lw==","tagged":false,"name":"build","life":"ok","preview":"","src":"floor","frozen":false,"started_ms":0}]}"#;
+    let named = r#"{"t":"tasks","tasks":[{"id":1,"command":"x","cwd":"Lw==","tagged":false,"flagship":false,"name":"build","life":"ok","preview":"","src":"floor","frozen":false,"started_ms":0}]}"#;
     match decode_event(KIND_CONTROL, named.as_bytes()) {
         Some(Event::Tasks(v)) => assert_eq!(v[0].name.as_deref(), Some("build")),
         other => panic!("expected tasks event, got {other:?}"),
@@ -769,6 +774,32 @@ fn watch_wire_form_requires_the_attached_flag() {
         r#"{"t":"watch","id":null}"#,              // missing flag on unwatch
         r#"{"t":"watch","id":5,"attached":null}"#, // null is not a kind
         r#"{"t":"watch","id":5,"attached":1}"#,    // flag must be a boolean
+    ] {
+        assert_eq!(
+            decode_command(KIND_CONTROL, json.as_bytes()),
+            None,
+            "should reject {json}"
+        );
+    }
+}
+
+/// Encode the flagship id as a number, or null to clear the mark.
+#[test]
+fn flagship_wire_form() {
+    let (k, p) = encode_command(&Command::Flagship { id: Some(5) });
+    assert_eq!(k, KIND_CONTROL);
+    assert_eq!(
+        std::str::from_utf8(&p).unwrap(),
+        r#"{"t":"flagship","id":5}"#
+    );
+    let (_, p) = encode_command(&Command::Flagship { id: None });
+    assert_eq!(
+        std::str::from_utf8(&p).unwrap(),
+        r#"{"t":"flagship","id":null}"#
+    );
+    for json in [
+        r#"{"t":"flagship","id":"5"}"#, // id must be a number
+        r#"{"t":"flagship","id":-1}"#,  // id must be unsigned
     ] {
         assert_eq!(
             decode_command(KIND_CONTROL, json.as_bytes()),

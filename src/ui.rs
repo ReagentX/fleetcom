@@ -17,7 +17,7 @@ use crossterm::{
 use unicode_width::UnicodeWidthStr;
 
 use crate::{
-    app::{App, DirKind, GroupMode, Mode, Row, SessionPage},
+    app::{App, DirKind, GroupMode, Mode, Row, SessionPage, Target},
     editbuf::EditBuffer,
     format::{pad, rel_time, truncate},
     path,
@@ -216,7 +216,7 @@ fn render_dashboard(out: &mut impl Write, app: &App) -> io::Result<()> {
     dim(
         out,
         rows.saturating_sub(1),
-        "  ↑↓ select · enter attach · space peek · ? controls",
+        &dashboard_hint(app.chord_target()),
         cols,
     )?;
 
@@ -225,6 +225,16 @@ fn render_dashboard(out: &mut impl Write, app: &App) -> io::Result<()> {
         None => queue!(out, Hide)?,
     }
     Ok(())
+}
+
+/// Build the dashboard's bottom key hint. Include `Ctrl-]` only with a
+/// flagship destination; omit the hint when no task is marked.
+fn dashboard_hint(chord: Option<Target>) -> String {
+    let mut hint = String::from("  ↑↓ select · enter attach · space peek · ? controls");
+    if let Some(Target::Flagship(_)) = chord {
+        hint.push_str(" · Ctrl-] flagship");
+    }
+    hint
 }
 
 /// Prefer an active notice over persistent status text.
@@ -333,20 +343,35 @@ fn status_glyph(v: &TaskView) -> &'static str {
     }
 }
 
+/// Shared display-column budget for task labels in the dashboard title cell
+/// and the attached bar's `Ctrl-]` return hint. Truncate at the same point in both.
+fn title_width(cols: usize) -> usize {
+    26.min(cols / 3)
+}
+
 /// Split a task row into its leading, preview, and time cells so the preview
 /// can be styled independently. Each cell is padded to its display-column
 /// budget, and the budgets sum to `cols`.
 fn task_row_parts(v: &TaskView, cols: usize) -> (String, String, String) {
+    // Place marks at the left of the two-column indent, tag before flag.
+    // Pad unused columns to keep the status glyph and later cells aligned.
+    let marks: String = [(v.tagged, '◆'), (v.flagship, '⚑')]
+        .into_iter()
+        .filter_map(|(on, c)| on.then_some(c))
+        .collect();
     let glyph = status_glyph(v);
-    let tag = if v.tagged { "◆" } else { " " };
     let time = rel_time(row_age(v));
-    let title_w = 26.min(cols / 3);
+    let title_w = title_width(cols);
 
-    // indent(2) glyph(1) sp(1) tag(1) title(title_w) sp(1) preview(prev_w) sp(1) time
-    let used = 2 + 1 + 1 + 1 + title_w + 1 + 1 + time.width();
+    // marks(2) glyph(1) sp(1) title(title_w) sp(1) preview(prev_w) sp(1) time
+    let used = 2 + 1 + 1 + title_w + 1 + 1 + time.width();
     let prev_w = cols.saturating_sub(used);
     (
-        format!("  {glyph} {tag}{} ", pad(display_label(v), title_w)),
+        format!(
+            "{}{glyph} {} ",
+            pad(&marks, 2),
+            pad(display_label(v), title_w)
+        ),
         pad(&v.preview.text, prev_w),
         format!(" {time}"),
     )
@@ -518,7 +543,7 @@ impl Control {
 
 /// Controls-overlay entries. Place the first half of each group in the left column and
 /// the second half in the right.
-const CONTROLS: [Control; 19] = [
+const CONTROLS: [Control; 21] = [
     Control::new("↑↓ / kj", "move selection", "Navigate"),
     Control::new("Tab ⇧Tab", "jump section", "Navigate"),
     Control::new("/", "find a task", "Navigate"),
@@ -528,6 +553,7 @@ const CONTROLS: [Control; 19] = [
     Control::new("r", "rerun finished", "Act"),
     Control::new("X", "kill or remove", "Act"),
     Control::new("m", "tag in use", "Organize"),
+    Control::new("]", "flagship", "Organize"),
     Control::new("g", "assign group", "Organize"),
     Control::new("R", "rename", "Organize"),
     Control::new("s", "cycle grouping", "Organize"),
@@ -538,6 +564,7 @@ const CONTROLS: [Control; 19] = [
     Control::new("q", "detach", "Leave"),
     Control::new("Q", "quit and kill", "Leave"),
     Control::new("Ctrl-\\", "background", "Attached"),
+    Control::new("Ctrl-]", "flagship / back", "Attached"),
 ];
 
 /// Label `q` as quit in foreground mode: in-process tasks are stopped on exit.
@@ -944,7 +971,14 @@ fn render_attached(out: &mut impl Write, app: &App) -> io::Result<()> {
 
     let cols = app.cols as usize;
     let title = attached_title(v);
-    let bar = attached_bar(&title, screen.map_or(0, |s| s.scrollback), app.notice());
+    let chord = chord_hint(app.chord_target(), &app.views, cols);
+    let bar = attached_bar(
+        &title,
+        screen.map_or(0, |s| s.scrollback),
+        app.notice(),
+        chord.as_deref(),
+        cols,
+    );
     rev(
         out,
         app.rows.saturating_sub(1),
@@ -978,18 +1012,58 @@ fn selection_overlay<'a>(sel: Option<&Selection>, lines: &'a [String]) -> Vec<(u
         .collect()
 }
 
-/// Build the attached or scrollback bar. Replace key hints with an active notice in
-/// either view.
-fn attached_bar(title: &str, scrollback: usize, notice: Option<&str>) -> String {
-    match (scrollback, notice) {
-        (0, Some(n)) => format!("  [attached] {title}    {n}"),
-        (0, None) => format!("  [attached] {title}    Ctrl-\\ background"),
-        // Display an active notice in place of scrollback key hints until expiry.
-        (n, Some(msg)) => format!("  [scroll ↑{n}] {title}    {msg}"),
-        (n, None) => {
-            format!("  [scroll ↑{n}] {title}    Esc live · PgUp/PgDn move · Ctrl-\\ background")
-        }
+/// Build the attached bar's `Ctrl-]` hint, or return `None` without a destination.
+/// For a task destination, use `display_label` and the dashboard title budget
+/// to match the label and truncation in its row.
+fn chord_hint(chord: Option<Target>, views: &[TaskView], cols: usize) -> Option<String> {
+    match chord? {
+        Target::Flagship(_) => Some("Ctrl-] flagship".to_string()),
+        Target::Dashboard => Some("Ctrl-] back to dashboard".to_string()),
+        // For a `Task` destination from `chord_target`, the id is present in `views`.
+        Target::Task(id) => views.iter().find(|v| v.id == id).map(|v| {
+            format!(
+                "Ctrl-] back to {}",
+                truncate(display_label(v), title_width(cols))
+            )
+        }),
     }
+}
+
+/// Build the attached or scrollback bar. Show an active notice in place of key
+/// hints; otherwise append `chord` to the hints. Limit the bar to `cols` when
+/// the prefix, separator, and right-hand segment fit within that width.
+///
+/// Reserve space for the right-hand segment before truncating the title, so
+/// users can read the hints even with a long agent command line. If no space
+/// remains, omit the title and truncate to `cols` with `pad` at the call site.
+fn attached_bar(
+    title: &str,
+    scrollback: usize,
+    notice: Option<&str>,
+    chord: Option<&str>,
+    cols: usize,
+) -> String {
+    const SEP: &str = "    ";
+    let prefix = match scrollback {
+        0 => "  [attached] ".to_string(),
+        n => format!("  [scroll ↑{n}] "),
+    };
+    let right = match notice {
+        Some(msg) => msg.to_string(),
+        None => {
+            let mut hints = match scrollback {
+                0 => "Ctrl-\\ background".to_string(),
+                _ => "Esc live · PgUp/PgDn move · Ctrl-\\ background".to_string(),
+            };
+            if let Some(c) = chord {
+                hints.push_str(" · ");
+                hints.push_str(c);
+            }
+            hints
+        }
+    };
+    let room = cols.saturating_sub(prefix.width() + SEP.width() + right.width());
+    format!("{prefix}{}{SEP}{right}", truncate(title, room))
 }
 
 /// Visible `(start, count)` window that includes the selected list item.
@@ -1175,6 +1249,7 @@ mod tests {
             command: "cargo test".into(),
             cwd: std::path::PathBuf::from("/tmp"),
             tagged: false,
+            flagship: false,
             group: None,
             name: name.map(str::to_string),
             lifecycle: Lifecycle::Active,
@@ -1231,7 +1306,9 @@ mod tests {
                     Lifecycle::Ok => "✓",
                     Lifecycle::Failed => "✗",
                 };
-                assert!(row.starts_with(&format!("  {glyph} ")), "{row:?}");
+                // Skip the two-column mark gutter before checking the glyph.
+                let body: String = row.chars().skip(2).collect();
+                assert!(body.starts_with(&format!("{glyph} ")), "{row:?}");
             }
         }
     }
@@ -1365,22 +1442,170 @@ mod tests {
     /// Replace key hints with an active notice in both bars.
     #[test]
     fn attached_bar_swaps_the_hint_for_an_active_notice() {
+        let chord = Some("Ctrl-] flagship");
         assert_eq!(
-            attached_bar("cargo test", 0, None),
+            attached_bar("cargo test", 0, None, None, 80),
             "  [attached] cargo test    Ctrl-\\ background"
         );
         assert_eq!(
-            attached_bar("cargo test", 0, Some("copied 5 chars")),
+            attached_bar("cargo test", 0, Some("copied 5 chars"), chord, 80),
             "  [attached] cargo test    copied 5 chars"
         );
         assert_eq!(
-            attached_bar("cargo test", 3, None),
+            attached_bar("cargo test", 3, None, None, 80),
             "  [scroll ↑3] cargo test    Esc live · PgUp/PgDn move · Ctrl-\\ background"
         );
         assert_eq!(
-            attached_bar("cargo test", 3, Some("copied 5 chars")),
+            attached_bar("cargo test", 3, Some("copied 5 chars"), chord, 80),
             "  [scroll ↑3] cargo test    copied 5 chars"
         );
+    }
+
+    /// Show the corresponding hint for each destination in live and scrollback bars.
+    #[test]
+    fn attached_bar_appends_the_chord_segment_for_each_target() {
+        let origin = TaskView {
+            id: 7,
+            ..view(Some("api server"))
+        };
+        let views = [view(None), origin];
+        let cases = [
+            (None, None),
+            (Some(Target::Flagship(1)), Some("Ctrl-] flagship")),
+            (Some(Target::Task(7)), Some("Ctrl-] back to api server")),
+            (Some(Target::Dashboard), Some("Ctrl-] back to dashboard")),
+        ];
+        for (target, want) in cases {
+            let chord = chord_hint(target, &views, 120);
+            assert_eq!(chord.as_deref(), want, "{target:?}");
+            let tail = want.map_or(String::new(), |c| format!(" · {c}"));
+            assert_eq!(
+                attached_bar("cargo test", 0, None, chord.as_deref(), 120),
+                format!("  [attached] cargo test    Ctrl-\\ background{tail}")
+            );
+            assert_eq!(
+                attached_bar("cargo test", 3, None, chord.as_deref(), 120),
+                format!(
+                    "  [scroll ↑3] cargo test    Esc live · PgUp/PgDn move · Ctrl-\\ background{tail}"
+                )
+            );
+        }
+    }
+
+    /// Truncate the origin label at the same width as its dashboard row label.
+    #[test]
+    fn chord_hint_elides_the_origin_at_the_title_budget() {
+        let long = "a-very-long-origin-task-name-that-overruns";
+        let v = TaskView {
+            id: 7,
+            ..view(Some(long))
+        };
+        // 26 columns at 80 wide; cols / 3 below 78.
+        for (cols, budget) in [(80usize, 26usize), (60, 20)] {
+            let hint = chord_hint(Some(Target::Task(7)), std::slice::from_ref(&v), cols).unwrap();
+            let label = hint.strip_prefix("Ctrl-] back to ").unwrap();
+            assert_eq!(label.width(), budget, "cols {cols}: {hint:?}");
+            assert!(label.ends_with('…'), "{hint:?}");
+            assert!(task_row(&v, cols).contains(label), "row and hint disagree");
+        }
+        // Use the command for an unnamed task, consistent with `display_label`.
+        let hint = chord_hint(Some(Target::Task(1)), &[view(None)], 80);
+        assert_eq!(hint.as_deref(), Some("Ctrl-] back to cargo test"));
+    }
+
+    /// Truncate a long title to keep the hints visible within exactly `cols` columns.
+    #[test]
+    fn attached_bar_elides_the_title_before_the_hints() {
+        let title = format!(
+            "claude · {}",
+            "claude --dangerously-skip-permissions ".repeat(4)
+        );
+        // Allow 83 columns for the scrollback hints and chord before the title;
+        // use a wider terminal for that case.
+        for (scrollback, cols) in [(0, 80), (0, 100), (3, 100)] {
+            let bar = attached_bar(&title, scrollback, None, Some("Ctrl-] flagship"), cols);
+            assert!(
+                bar.ends_with("Ctrl-\\ background · Ctrl-] flagship"),
+                "{bar:?}"
+            );
+            assert!(bar.contains("…    "), "title not elided: {bar:?}");
+            assert_eq!(bar.width(), cols, "{bar:?}");
+            assert_eq!(pad(&bar, cols), bar);
+        }
+    }
+
+    /// Omit the title when the hints exceed the available width, then truncate
+    /// to `cols` with `pad` without panicking.
+    #[test]
+    fn attached_bar_degrades_at_narrow_widths() {
+        let chord = Some("Ctrl-] back to dashboard");
+        for cols in 0..=40usize {
+            for scrollback in [0, 3] {
+                let bar = attached_bar("cargo test", scrollback, None, chord, cols);
+                assert_eq!(pad(&bar, cols).width(), cols, "cols {cols}: {bar:?}");
+                if bar.width() > cols {
+                    assert!(!bar.contains("cargo"), "title kept at {cols}: {bar:?}");
+                }
+            }
+        }
+    }
+
+    /// Show the dashboard chord hint only with a flagship destination.
+    #[test]
+    fn dashboard_hint_names_the_chord_only_for_a_flagship() {
+        let base = "  ↑↓ select · enter attach · space peek · ? controls";
+        assert_eq!(dashboard_hint(None), base);
+        assert_eq!(
+            dashboard_hint(Some(Target::Flagship(3))),
+            format!("{base} · Ctrl-] flagship")
+        );
+        assert_eq!(dashboard_hint(Some(Target::Dashboard)), base);
+        assert_eq!(dashboard_hint(Some(Target::Task(3))), base);
+    }
+
+    /// Place marks at the left of the indent, tag before flag; preserve other cells.
+    #[test]
+    fn task_row_marks_occupy_the_indent_without_shifting() {
+        for cols in [40usize, 80] {
+            let plain = task_row(&timed_view(Lifecycle::Active, None, None), cols);
+            for (tagged, flagship) in [(false, false), (true, false), (false, true), (true, true)] {
+                let mut v = timed_view(Lifecycle::Active, None, None);
+                v.tagged = tagged;
+                v.flagship = flagship;
+                let row = task_row(&v, cols);
+                assert_eq!(row.width(), cols, "{row:?}");
+                let cells: Vec<char> = row.chars().collect();
+                let want = match (tagged, flagship) {
+                    (false, false) => [' ', ' '],
+                    (true, false) => ['◆', ' '],
+                    (false, true) => ['⚑', ' '],
+                    (true, true) => ['◆', '⚑'],
+                };
+                assert_eq!(cells[..2], want, "{row:?}");
+                assert_eq!(cells[2], '✻', "{row:?}");
+                // Compare all columns after the gutter with the unmarked row.
+                let rest = |r: &str| -> String {
+                    r.chars()
+                        .enumerate()
+                        .filter(|(i, _)| *i > 1)
+                        .map(|(_, c)| c)
+                        .collect()
+                };
+                assert_eq!(rest(&row), rest(&plain));
+            }
+        }
+    }
+
+    /// List both flagship keys in the controls overlay under their respective groups.
+    #[test]
+    fn controls_list_the_flagship_keys_in_their_groups() {
+        let group_of = |key: &str| CONTROLS.iter().find(|c| c.key == key).map(|c| c.group);
+        assert_eq!(group_of("]"), Some("Organize"));
+        assert_eq!(group_of("Ctrl-]"), Some("Attached"));
+        let keys: Vec<&str> = CONTROLS.iter().map(|c| c.key).collect();
+        let at = |k: &str| keys.iter().position(|x| *x == k).unwrap();
+        assert_eq!(at("]"), at("m") + 1);
+        assert_eq!(at("Ctrl-]"), at("Ctrl-\\") + 1);
     }
 
     /// Prefer an active notice over status text in the dashboard command row.

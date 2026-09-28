@@ -17,7 +17,7 @@ use std::{
 
 /// Protocol version used by this test suite; must match
 /// `protocol::PROTOCOL_VERSION`.
-pub const PROTOCOL_VERSION: u32 = 12;
+pub const PROTOCOL_VERSION: u32 = 13;
 
 /// One frame of the given kind: `[u32 len][kind][payload]`.
 pub fn frame(kind: u8, payload: &[u8]) -> Vec<u8> {

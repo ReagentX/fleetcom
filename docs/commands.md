@@ -30,6 +30,8 @@ Choose the operating mode with launch arguments. Use keys to control the dashboa
 | `s` | Cycle grouping: by state / by directory / by custom group |
 | `m` | Tag the selected task "in use" (toggles) |
 | `M` | Select the next tagged task in dashboard order, wrapping at the end |
+| `]` | Mark the selected task as the [flagship](#the-flagship) (toggles; one at a time) |
+| `Ctrl-]` | Attach to the flagship |
 | `g` | Assign the selected task to a group (through the group picker) |
 | `R` | Rename the selected task: a display name shown in place of the command |
 | `r` | Rerun a finished task; use the captured resume command for supported agent tasks |
@@ -51,6 +53,9 @@ Choose the operating mode with launch arguments. Use keys to control the dashboa
 | `✓` | Completed, exit 0 |
 | `✗` | Completed, non-zero exit |
 | `◆` | Tagged "in use" |
+| `⚑` | The [flagship](#the-flagship) |
+
+Look for marks in the row's two leading columns, aligned left with `◆` before `⚑`.
 
 After 10 seconds without output, a task is marked `∙` and grouped under Idle.
 
@@ -67,6 +72,8 @@ While attached, send terminal input to the child. Press `Ctrl-\` to return to th
 Cursor keys are encoded according to the child's live cursor-key mode. In application-cursor mode, unmodified cursor keys are encoded with `SS3` (`ESC O A` for Up); modified cursor keys are encoded with `CSI`. Function keys, modified navigation such as `Alt+Left`, and standard `Ctrl` combinations are also supported.
 
 `Ctrl-\` is the physical chord. The same chord may be reported by Crossterm as `Ctrl-4`; both representations are accepted.
+
+Press `Ctrl-]` to attach to the [flagship](#the-flagship), then again to return to your previous task or the dashboard. As with `Ctrl-\`, you cannot send this key combination to a child: use another binding for tag-jump in `vim` or character search in readline. Both `Ctrl-]` and `Ctrl-5` are accepted; the latter is the Crossterm representation of the legacy encoding.
 
 #### Modified keys, paste, and mouse input
 
@@ -134,6 +141,19 @@ Press `M` to select the next tagged task in dashboard order, wrapping after the 
 
 In custom mode only, a new command is assigned the selected task's group, through both `n` and the `@` picker. The destination is shown in the spawn prompt as `❯ dir ▸ group ▸ command`, each segment present only when it applies: the dir segment for a non-default directory, the group segment when a group will be inherited. New tasks are unassigned in state and dir modes.
 
+#### The flagship
+
+Press `]` to mark the selected task as the flagship, shown as `⚑`; press it again to clear the mark. You can mark only one task at a time. Select another task and press `]` to move the mark. Finished tasks cannot be marked. Sorting is unchanged.
+
+Press `Ctrl-]` from the dashboard, peek, or an attached task to attach to the flagship, and again to go back:
+
+- From an attached task: back to that task, even if it has finished since. If it was removed, back to the dashboard.
+- From the dashboard or peek: back to the dashboard, with the selection on the same row. Peek is not reopened.
+
+After attaching to the flagship with `Enter`, press `Ctrl-]` to return to the dashboard.
+
+The flagship mark is cleared on task completion or removal and is not saved in sessions. Tags set with `m` are retained after task completion.
+
 #### Renaming
 
 Press `R` to rename the selected task, starting with its current name. Press `Enter` to save, or `Esc` to cancel. Leave the field empty to clear the name and display the command again. Use lowercase `r` to rerun.
@@ -188,7 +208,7 @@ A recovery row is formatted as `<age> ago · <tasks> task(s) · <label>`: the fi
 
 ## The `?` controls overlay
 
-Use the two dashboard hints for common actions: `↑↓ select · enter attach · space peek · ? controls` and `❯ n run · @ dir · / find · s sort`. Press `?` for the expanded reference, including dashboard actions and the attached-mode background chord.
+Use the two dashboard hints for common actions: `↑↓ select · enter attach · space peek · ? controls` and `❯ n run · @ dir · / find · s sort`. Press `?` for the expanded reference, including dashboard actions and the attached-mode background and flagship chords. With a flagship marked, look for `· Ctrl-] flagship` at the end of the first hint.
 
 Bindings are grouped by purpose in a centered, non-scrolling box. Press `?`, `Esc`, or `q` to return to the dashboard, or `Ctrl-C` to disconnect. Other keys are ignored.
 
@@ -204,7 +224,7 @@ Read the source of the row's dashboard preview in the footer's `preview:` segmen
 
 ## Attached
 
-Interact with the task in the terminal. The status bar is formatted as `[attached] <command>    Ctrl-\ background`, or `[attached] <name> · <command>` for a named task. Press `Ctrl-\` to return to the dashboard. Other supported input normally goes to the child; navigation keys are reserved in [scrollback](#scrollback).
+Interact with the task in the terminal. The status bar is formatted as `[attached] <command>    Ctrl-\ background`, or `[attached] <name> · <command>` for a named task. When you can navigate with `Ctrl-]`, look for `· Ctrl-] flagship`, `· Ctrl-] back to <task>`, or `· Ctrl-] back to dashboard` in the hint. Long titles are shortened with `…` to leave room for the hints. Press `Ctrl-\` to return to the dashboard. Other supported input is normally forwarded to the child; navigation keys are reserved in [scrollback](#scrollback).
 
 ## Connection loss
 

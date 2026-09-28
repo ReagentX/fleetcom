@@ -113,6 +113,7 @@ fn view(id: u64, cwd: PathBuf, tagged: bool, group: Option<&str>) -> TaskView {
         command: "true".to_string(),
         cwd,
         tagged,
+        flagship: false,
         group: group.map(str::to_string),
         name: None,
         lifecycle: Lifecycle::Active,
@@ -2673,13 +2674,13 @@ fn controls_overlay_drops_the_group_headers_before_any_entry() {
     );
 }
 
-/// At 12 rows, the overlay clips seven entries and reports the count.
+/// At 12 rows, show twelve of 21 controls and report nine hidden entries.
 #[test]
 fn controls_overlay_reports_clipped_entries_on_its_border() {
     let mut app = App::new_local(12, 100);
     app.on_key_dashboard(key(KeyCode::Char('?')));
     let f = painted(&mut app);
-    assert!(f.contains("? esc close · +7 more"), "{f:?}");
+    assert!(f.contains("? esc close · +9 more"), "{f:?}");
     assert!(!f.contains("save session"), "the tail is clipped: {f:?}");
 }
 
@@ -3965,6 +3966,505 @@ fn input_and_attached_echo_bypass_the_repaint_floor() {
     );
     // Before the floor elapses, wait for its remaining duration.
     assert_eq!(wait_for_paint(false, Duration::ZERO), PAINT_MIN);
+}
+
+// --- flagship ----------------------------------------------------------------
+
+/// Simulate a disconnected core: discard commands and return false from `connected`.
+struct Unplugged;
+
+impl Transport for Unplugged {
+    fn send(&mut self, _cmd: Command) {}
+
+    fn poll(&mut self) -> Vec<Event> {
+        Vec::new()
+    }
+
+    fn connected(&self) -> bool {
+        false
+    }
+
+    fn shutdown(&mut self, _intent: ExitIntent) {}
+}
+
+/// Pass commands through to a real core and log each one.
+struct Recording {
+    inner: Box<dyn Transport>,
+    sent: Arc<std::sync::Mutex<Vec<Command>>>,
+}
+
+impl Transport for Recording {
+    fn send(&mut self, cmd: Command) {
+        self.sent.lock().unwrap().push(cmd.clone());
+        self.inner.send(cmd);
+    }
+
+    fn poll(&mut self) -> Vec<Event> {
+        self.inner.poll()
+    }
+
+    fn connected(&self) -> bool {
+        self.inner.connected()
+    }
+
+    fn shutdown(&mut self, intent: ExitIntent) {
+        self.inner.shutdown(intent);
+    }
+}
+
+impl App {
+    /// Wrap the transport in `Recording` and return its log.
+    fn record_sends(&mut self) -> Arc<std::sync::Mutex<Vec<Command>>> {
+        let sent = Arc::default();
+        let inner = std::mem::replace(&mut self.transport, Box::new(Unplugged));
+        self.transport = Box::new(Recording {
+            inner,
+            sent: Arc::clone(&sent),
+        });
+        sent
+    }
+
+    /// Dispatch `k` through `on_key`, the run loop's entry point.
+    fn hit(&mut self, k: KeyEvent) {
+        self.on_key(&mut io::stdout(), k);
+    }
+
+    /// Return the flagship id from the latest snapshot.
+    fn flagship(&self) -> Option<u64> {
+        self.views.iter().find(|v| v.flagship).map(|v| v.id)
+    }
+
+    /// Kill `id` and pump until its row is finished and unmarked.
+    fn finish(&mut self, id: u64) {
+        self.transport.send(Command::Kill { id });
+        assert!(
+            wait_until(Duration::from_secs(5), || {
+                self.pump();
+                self.views.iter().any(|v| {
+                    v.id == id
+                        && !v.flagship
+                        && matches!(v.lifecycle, Lifecycle::Ok | Lifecycle::Failed)
+                })
+            }),
+            "task {id} never finished"
+        );
+    }
+}
+
+/// The chord in its kitty encoding.
+fn chord() -> KeyEvent {
+    ctrl(KeyCode::Char(']'))
+}
+
+/// Two live tasks, A and Q, with Q marked through the daemon by `]` and the
+/// selection back on A.
+fn flagship_pair() -> (App, u64, u64) {
+    let mut app = App::new_local(30, 100);
+    let dir = app.invocation_dir.clone();
+    app.spawn_in("sleep 30", dir.clone());
+    app.spawn_in("sleep 30", dir);
+    let (a, q) = (app.views[0].id, app.views[1].id);
+    app.selected_id = Some(q);
+    app.hit(key(KeyCode::Char(']')));
+    app.pump();
+    assert_eq!(app.flagship(), Some(q), "premise: Q is marked");
+    app.selected_id = Some(a);
+    (app, a, q)
+}
+
+/// Mark the selected task with `]`, replacing the prior mark.
+#[test]
+fn bracket_marks_selected() {
+    let (mut app, a, _) = flagship_pair();
+    app.hit(key(KeyCode::Char(']')));
+    app.pump();
+    assert_eq!(app.flagship(), Some(a), "the mark moves to A");
+    assert!(app.mode == Mode::Dashboard);
+}
+
+/// Clear the mark with `]` on the flagship.
+#[test]
+fn bracket_on_flagship_clears() {
+    let (mut app, _, q) = flagship_pair();
+    app.selected_id = Some(q);
+    let sent = app.record_sends();
+    app.hit(key(KeyCode::Char(']')));
+    app.pump();
+    assert_eq!(app.flagship(), None);
+    assert_eq!(
+        *sent.lock().unwrap(),
+        vec![Command::Flagship { id: None }],
+        "a clear names no id"
+    );
+}
+
+/// Send no command for `]` on a finished row; preserve the existing mark.
+#[test]
+fn bracket_on_finished_row_noops() {
+    let (mut app, a, q) = flagship_pair();
+    app.finish(a);
+    let sent = app.record_sends();
+    app.hit(key(KeyCode::Char(']')));
+    app.pump();
+    assert!(sent.lock().unwrap().is_empty(), "no command for a dead row");
+    assert_eq!(app.flagship(), Some(q));
+}
+
+/// Send no command for `]` without a selected task.
+#[test]
+fn bracket_without_selection_noops() {
+    let mut app = App::new_local(30, 100);
+    let sent = app.record_sends();
+    app.hit(key(KeyCode::Char(']')));
+    assert!(sent.lock().unwrap().is_empty());
+    assert!(app.mode == Mode::Dashboard);
+}
+
+/// Handle `]` only on the dashboard; ignore it in Peek.
+#[test]
+fn bracket_in_peek_noops() {
+    let (mut app, _, q) = flagship_pair();
+    app.hit(key(KeyCode::Char(' ')));
+    assert!(app.mode == Mode::Peek, "premise: peeking at A");
+    let sent = app.record_sends();
+    app.hit(key(KeyCode::Char(']')));
+    app.pump();
+    assert!(sent.lock().unwrap().is_empty());
+    assert_eq!(app.flagship(), Some(q));
+    assert!(app.mode == Mode::Peek);
+}
+
+/// Without a flagship, ignore the chord on the dashboard and while attached.
+/// Do not forward it to the child.
+#[test]
+fn ctrl_bracket_noops_without_flagship() {
+    let (mut app, a) = App::attached(30, 100, "sleep 30");
+    assert_eq!(app.chord_target(), None);
+    let sent = app.record_sends();
+
+    app.hit(chord());
+    assert!(app.mode == Mode::Attached);
+    assert_eq!(app.focused_id, Some(a));
+
+    app.hit(ctrl(KeyCode::Char('\\')));
+    app.hit(chord());
+    assert!(app.mode == Mode::Dashboard);
+    assert_eq!(app.focused_id, None);
+    assert!(sent.lock().unwrap().is_empty(), "nothing reaches the core");
+}
+
+/// Preserve the selected row after a dashboard → flagship → dashboard round trip.
+/// Return through `detach`.
+#[test]
+fn jump_from_dashboard_and_back() {
+    let (mut app, a, q) = flagship_pair();
+    let row = app.selected_row(&app.list_rows());
+    assert_eq!(app.chord_target(), Some(Target::Flagship(q)));
+
+    app.hit(chord());
+    assert!(app.mode == Mode::Attached);
+    assert_eq!(app.focused_id, Some(q));
+    assert_eq!(app.return_to, Some(Origin::Dashboard));
+    assert_eq!(app.selected_id, Some(a), "the jump leaves selection alone");
+    assert_eq!(app.chord_target(), Some(Target::Dashboard));
+
+    app.hit(chord());
+    assert!(app.mode == Mode::Dashboard);
+    assert_eq!(app.focused_id, None);
+    assert!(!app.view_scroll);
+    assert_eq!(app.return_to, None);
+    assert_eq!(app.selected_id, Some(a));
+    assert_eq!(
+        app.selected_row(&app.list_rows()),
+        row,
+        "same row, same window"
+    );
+}
+
+/// Start a task → flagship → task round trip in scrollback. Switch to live
+/// output at each destination and do not forward the chord to the child.
+#[test]
+fn jump_from_task_and_back() {
+    let (mut app, a, q) = flagship_pair();
+    app.hit(key(KeyCode::Enter));
+    assert_eq!(app.focused_id, Some(a));
+    assert_eq!(app.return_to, None, "A is not the flagship");
+    app.hit(shift(KeyCode::PageUp));
+    assert!(app.view_scroll, "premise: scrollback on A");
+    let sent = app.record_sends();
+
+    app.hit(chord());
+    assert_eq!(
+        app.focused_id,
+        Some(q),
+        "the chord jumped, not just left scrollback"
+    );
+    assert!(!app.view_scroll);
+    assert_eq!(app.return_to, Some(Origin::Task(a)));
+    assert_eq!(app.chord_target(), Some(Target::Task(a)));
+
+    app.hit(chord());
+    assert!(app.mode == Mode::Attached);
+    assert_eq!(app.focused_id, Some(a));
+    assert!(!app.view_scroll);
+    assert_eq!(app.return_to, None);
+    assert!(
+        !sent
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|c| matches!(c, Command::Key { .. })),
+        "no keystroke reaches a child"
+    );
+}
+
+/// Close Peek on attachment to the flagship; return to the dashboard.
+#[test]
+fn jump_from_peek_lands_on_dashboard() {
+    let (mut app, a, q) = flagship_pair();
+    app.hit(key(KeyCode::Char(' ')));
+    assert!(app.mode == Mode::Peek);
+
+    app.hit(chord());
+    assert!(app.mode == Mode::Attached);
+    assert_eq!(app.focused_id, Some(q));
+    assert_eq!(app.return_to, Some(Origin::Dashboard));
+
+    app.hit(chord());
+    assert!(
+        app.mode == Mode::Dashboard,
+        "back to the fleet view, not Peek"
+    );
+    assert_eq!(app.selected_id, Some(a));
+}
+
+/// Record the dashboard as the return destination on `Enter` attachment to the
+/// flagship, from both the dashboard and Peek.
+#[test]
+fn enter_onto_flagship_sets_dashboard_return() {
+    let (mut app, _, q) = flagship_pair();
+    app.selected_id = Some(q);
+    app.hit(key(KeyCode::Enter));
+    assert_eq!(app.focused_id, Some(q));
+    assert_eq!(app.return_to, Some(Origin::Dashboard));
+
+    app.hit(ctrl(KeyCode::Char('\\')));
+    app.hit(key(KeyCode::Char(' ')));
+    app.hit(key(KeyCode::Enter));
+    assert_eq!(app.focused_id, Some(q));
+    assert_eq!(app.return_to, Some(Origin::Dashboard));
+}
+
+/// Press `]` then `Enter` before the next snapshot to attach without a recorded
+/// origin. After synchronization, return to the dashboard with the chord;
+/// do not reattach to the flagship.
+#[test]
+fn mark_then_enter_before_snapshot_returns_to_dashboard() {
+    let mut app = App::new_local(30, 100);
+    let dir = app.invocation_dir.clone();
+    app.spawn_in("sleep 30", dir);
+    let q = app.views[0].id;
+    app.selected_id = Some(q);
+
+    // One input batch: no sync between the keys.
+    app.hit(key(KeyCode::Char(']')));
+    app.hit(key(KeyCode::Enter));
+    assert_eq!(app.return_to, None, "premise: the attach beat the mark");
+    app.pump();
+    assert_eq!(app.flagship(), Some(q), "premise: the mark has landed");
+
+    assert_eq!(app.chord_target(), Some(Target::Dashboard));
+    app.hit(chord());
+    assert!(app.mode == Mode::Dashboard);
+    assert_eq!(app.focused_id, None);
+    assert_eq!(app.return_to, None);
+}
+
+/// Return to a finished origin task if it is still in `views`.
+#[test]
+fn return_to_finished_origin() {
+    let (mut app, a, q) = flagship_pair();
+    app.hit(key(KeyCode::Enter));
+    app.hit(chord());
+    assert_eq!(app.focused_id, Some(q));
+    app.finish(a);
+
+    assert_eq!(app.chord_target(), Some(Target::Task(a)));
+    app.hit(chord());
+    assert!(app.mode == Mode::Attached);
+    assert_eq!(app.focused_id, Some(a));
+    assert_eq!(app.return_to, None);
+}
+
+/// Return to the dashboard if the origin task is absent from `views`.
+#[test]
+fn return_to_removed_origin_degrades_to_dashboard() {
+    let (mut app, a, q) = flagship_pair();
+    app.hit(key(KeyCode::Enter));
+    app.hit(chord());
+    app.finish(a);
+    app.transport.send(Command::Remove { id: a });
+    app.pump();
+    assert!(app.task_index(a).is_none(), "premise: A is gone");
+
+    assert_eq!(app.chord_target(), Some(Target::Dashboard));
+    app.hit(chord());
+    assert!(app.mode == Mode::Dashboard);
+    assert_eq!(app.focused_id, None);
+    assert_eq!(app.return_to, None);
+    assert!(app.task_index(q).is_some());
+}
+
+/// After the flagship's exit while attached, return to the origin with the
+/// chord. Ignore subsequent presses because no task is marked.
+#[test]
+fn dead_flagship_returns_then_noops() {
+    // Jumped from A.
+    let (mut app, a, q) = flagship_pair();
+    app.hit(key(KeyCode::Enter));
+    app.hit(chord());
+    assert_eq!(app.focused_id, Some(q));
+    app.finish(q);
+    assert_eq!(app.flagship(), None, "the daemon unmarks a dead flagship");
+    app.hit(chord());
+    assert_eq!(app.focused_id, Some(a));
+    assert_eq!(app.chord_target(), None);
+    app.hit(chord());
+    assert!(app.mode == Mode::Attached);
+    assert_eq!(app.focused_id, Some(a), "second press no-ops");
+
+    // Entered by `Enter`.
+    let (mut app, _, q) = flagship_pair();
+    app.selected_id = Some(q);
+    app.hit(key(KeyCode::Enter));
+    app.finish(q);
+    app.hit(chord());
+    assert!(app.mode == Mode::Dashboard);
+    assert_eq!(app.chord_target(), None);
+    app.hit(chord());
+    assert!(app.mode == Mode::Dashboard, "second press no-ops");
+    assert_eq!(app.focused_id, None);
+}
+
+/// Clear the return destination on `Ctrl-\` detach.
+#[test]
+fn return_to_clears_on_detach() {
+    let (mut app, _, _) = flagship_pair();
+    app.hit(chord());
+    assert!(app.return_to.is_some());
+    app.hit(ctrl(KeyCode::Char('\\')));
+    assert!(app.mode == Mode::Dashboard);
+    assert_eq!(app.return_to, None);
+}
+
+/// Clear the return destination when the attached task is no longer present.
+#[test]
+fn return_to_clears_on_vanish() {
+    let (mut app, a, q) = flagship_pair();
+    app.hit(key(KeyCode::Enter));
+    app.hit(chord());
+    assert_eq!(app.return_to, Some(Origin::Task(a)));
+    app.views.retain(|v| v.id != q);
+    app.check_attached_task();
+    assert!(app.mode == Mode::Dashboard);
+    assert_eq!(app.focused_id, None);
+    assert_eq!(app.return_to, None);
+}
+
+/// Clear the return destination on disconnect and during reconnect reset:
+/// the origin's id may be reused in a replacement daemon.
+#[test]
+fn return_to_clears_on_disconnect() {
+    let (mut app, _, _) = flagship_pair();
+    app.hit(chord());
+    assert!(app.return_to.is_some());
+    app.transport = Box::new(Unplugged);
+    app.check_connection();
+    assert!(app.mode == Mode::Disconnected);
+    assert_eq!(app.return_to, None);
+
+    app.return_to = Some(Origin::Task(1));
+    app.reset_for_reconnect();
+    assert_eq!(app.return_to, None);
+}
+
+/// Accept Ctrl-5, the crossterm representation of legacy 0x1D.
+#[test]
+fn ctrl_bracket_matches_legacy_ctrl_5() {
+    for k in [chord(), ctrl(KeyCode::Char('5'))] {
+        let (mut app, _, q) = flagship_pair();
+        app.hit(k);
+        assert_eq!(app.focused_id, Some(q), "{k:?} must jump");
+        app.hit(k);
+        assert!(app.mode == Mode::Dashboard, "{k:?} must return");
+    }
+}
+
+/// Handle the chord before the scrollback catch-all; do not forward it.
+#[test]
+fn ctrl_bracket_in_scrollback_is_not_forwarded() {
+    let (mut app, a) = App::attached(30, 100, "sleep 30");
+    app.hit(shift(KeyCode::PageUp));
+    assert!(app.view_scroll, "premise: scrollback");
+    let sent = app.record_sends();
+    app.hit(chord());
+    app.hit(ctrl(KeyCode::Char('5')));
+    assert!(app.view_scroll, "a no-op chord leaves scrollback alone");
+    assert_eq!(app.focused_id, Some(a));
+    assert!(
+        !sent
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|c| matches!(c, Command::Key { .. })),
+        "the chord is reserved from children"
+    );
+}
+
+/// Do not navigate or change the mark in prompts, Controls, or Disconnected.
+/// Ignore the chord to preserve prompt input; accept `]` only as text or ignore it.
+#[test]
+fn flagship_keys_ignored_outside_navigation_modes() {
+    let (mut app, a, q) = flagship_pair();
+    let modes = [
+        Mode::Spawn,
+        Mode::PickDir,
+        Mode::PickGroup { target: a },
+        Mode::Find,
+        Mode::SaveSession,
+        Mode::Rename(a),
+        Mode::LoadSession,
+        Mode::Controls,
+        Mode::Disconnected,
+    ];
+    for mode in modes {
+        app.mode = mode;
+        for k in [key(KeyCode::Char(']')), chord(), ctrl(KeyCode::Char('5'))] {
+            app.hit(k);
+            app.pump();
+            assert!(app.mode == mode, "{k:?} changed the mode");
+            assert_eq!(app.focused_id, None, "{k:?} attached");
+            assert_eq!(app.return_to, None);
+            assert_eq!(app.flagship(), Some(q), "{k:?} moved the mark");
+        }
+    }
+}
+
+/// Prefer a recorded origin over the flagship; return to the dashboard if the
+/// origin task is absent.
+#[test]
+fn chord_target_arms() {
+    let (mut app, a, q) = flagship_pair();
+    assert_eq!(app.chord_target(), Some(Target::Flagship(q)));
+    app.return_to = Some(Origin::Dashboard);
+    assert_eq!(app.chord_target(), Some(Target::Dashboard));
+    app.return_to = Some(Origin::Task(a));
+    assert_eq!(app.chord_target(), Some(Target::Task(a)));
+    app.return_to = Some(Origin::Task(9999));
+    assert_eq!(app.chord_target(), Some(Target::Dashboard));
+    app.return_to = None;
+    app.views.iter_mut().for_each(|v| v.flagship = false);
+    assert_eq!(app.chord_target(), None);
 }
 
 #[path = "app_readme_tests.rs"]
