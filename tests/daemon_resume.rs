@@ -99,7 +99,7 @@ impl Scratch {
 
 impl Drop for Scratch {
     fn drop(&mut self) {
-        // A failed test keeps its stubs, stores, and argv records for inspection.
+        // Preserve stubs, stores, and argv records for inspection after failure.
         if !std::thread::panicking() {
             let _ = std::fs::remove_dir_all(&self.root);
         }

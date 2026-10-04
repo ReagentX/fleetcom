@@ -181,9 +181,8 @@ impl Drop for KillOnDrop {
     }
 }
 
-/// A test daemon's runtime directory. Dropping it removes the tree unless the
-/// test is panicking: a failed test keeps its socket, config, and snapshots
-/// for inspection.
+/// A test daemon's runtime directory. Remove the tree on drop, except during
+/// unwinding: preserve the socket, config, and snapshots to inspect after failure.
 pub struct RuntimeDir(PathBuf);
 impl std::ops::Deref for RuntimeDir {
     type Target = Path;
@@ -204,10 +203,10 @@ impl Drop for RuntimeDir {
 /// itself. `configure` tweaks the daemon's `Command` (extra env vars) before
 /// spawn.
 ///
-/// The tuple order is load-bearing: pattern bindings drop in reverse
-/// declaration order, so binding the directory first drops it last, after
-/// `KillOnDrop` has reaped the daemon that owns the files inside. Bind it by
-/// name even when unused (`_dir`): a bare `_` drops it at the end of the `let`.
+/// Bind the directory first so it is dropped last: pattern bindings are
+/// dropped in reverse declaration order. Reap the daemon through `KillOnDrop`
+/// before removing its runtime files. Use a named binding even when unused
+/// (`_dir`); with a bare `_`, the directory is dropped at the end of the `let`.
 pub fn start_daemon_raw(
     tag: &str,
     configure: impl FnOnce(&mut Command),
