@@ -335,7 +335,7 @@ impl Task {
             name: None,
             harness: None,
             harness_home: None,
-            summary_adapter: crate::harness::summary::select(command),
+            summary_adapter: crate::harness::select(command),
             run: 0,
             resume_id: None,
             capture_file: None,

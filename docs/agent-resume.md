@@ -68,7 +68,7 @@ You cannot choose a Codex ID at launch. A notify override is injected into both 
 
 After each turn, the notifier writes the `agent-turn-complete` JSON argument to `FLEETCOM_CAPTURE_FILE`, and the harness reads `thread-id` from it. This captures an in-TUI session change after a turn completes in the resumed conversation.
 
-Replacing a configured notifier would change user behavior, so the harness reads bare top-level keys in `$CODEX_HOME/config.toml` until the first table header. If it finds a one-line `notify` array of non-empty basic strings, it chains that notifier after the capture write. `FLEETCOM_NOTIFY_CHAIN` carries its argv joined by newlines; the capture script appends the notification payload before invoking it. An absent setting or empty array means capture runs alone. This encoding cannot transport empty arguments, newlines, or NUL, so those values disable injection.
+Replacing a configured notifier would change user behavior, so the harness reads bare top-level keys in `$CODEX_HOME/config.toml` until the first table header. If it finds a one-line `notify` array of non-empty basic strings, it chains that notifier after the capture write. `FLEETCOM_NOTIFY_CHAIN` carries its argv joined by newlines; the capture script appends the notification payload before invoking it. An absent setting or empty array means capture runs alone. This encoding cannot transport empty arguments, newlines, or NUL, so those values disable injection. Injection is also disabled, and no ID is captured, when `config.toml` exists but cannot be read, or when a line above the first table header is not a bare key assigned a single-line value the reader recognizes.
 
 Live validation on 2026-09-28 used the official macOS arm64 Codex 0.157.1 and 0.158.0 executables with isolated homes and a scripted loopback Responses server. In both releases, the real capture script preserved the notification JSON and passed it to the configured notifier. Saving and loading through foreground fleetcom preserved the thread ID and reopened its history. These runs used `--no-daemon`; separate default-launch probes also captured and saved the ID, but their fresh homes had no managed Codex daemon installed or running. Shared-daemon behavior and real-account behavior remain unverified.
 
@@ -121,7 +121,7 @@ Every captured value eventually enters a shell command, so validation accepts on
 
 ## Extending capture
 
-Implement the `Harness` trait in [`src/harness/mod.rs`](../src/harness/mod.rs) for each tool. Separate detection, evidence collection, and command construction through these methods:
+Implement the `Harness` trait in [`src/harness/mod.rs`](../src/harness/mod.rs) for each tool. Register it in that file's `AGENTS` table, the only list detection consults; each entry also requires a `SummaryAdapter` for the dashboard preview, as implemented in [`src/harness/summary.rs`](../src/harness/summary.rs). Separate detection, evidence collection, and command construction through these methods:
 
 - `shape`: supply the program word and resume selector. Accepted and canonical forms are derived from that pair by the default `detect` and `resume_command` implementations.
 - `instrument`: return spawn-time arguments, environment entries, and an optional pinned ID.

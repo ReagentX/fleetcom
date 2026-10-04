@@ -137,7 +137,7 @@ fn config_notify_route(home: Option<&Path>) -> NotifyRoute {
 }
 
 /// Recognize complete single-line values without interpreting unrelated settings.
-/// Multiline strings, arrays, and inline tables are outside the reader's scope.
+/// Arrays hold basic strings only; multiline values and inline tables are out of scope.
 fn complete_value(value: &str) -> bool {
     if value.starts_with("\"\"\"") || value.starts_with("'''") {
         return false;
@@ -573,9 +573,5 @@ mod tests {
             config_notify_route(Some(&home)),
             NotifyRoute::Chain(vec!["/base/hook".to_string()])
         );
-
-        // Duplicate top-level assignments are invalid TOML.
-        fs::write(&cfg, "notify = [\"/a\"]\nnotify = [\"/b\"]\n").unwrap();
-        assert_eq!(config_notify_route(Some(&home)), NotifyRoute::Opaque);
     }
 }

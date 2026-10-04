@@ -106,14 +106,11 @@ fn claude_settings_json() -> String {
     .dump()
 }
 
-/// Capture-root resolver. An explicit override is what the supervisor passes
-/// when `FLEETCOM_RUNTIME_DIR` is set; otherwise `dirs::runtime_dir()/fleetcom`,
-/// then `dirs::cache_dir()/fleetcom/run`. Those fallbacks are not
-/// `daemon::resolve_runtime_dir`.
-pub fn runtime_root(override_dir: Option<&Path>) -> Option<PathBuf> {
-    if let Some(dir) = override_dir {
-        return Some(dir.to_path_buf());
-    }
+/// Platform capture root: `dirs::runtime_dir()/fleetcom`, then
+/// `dirs::cache_dir()/fleetcom/run`. Those fallbacks are not
+/// `daemon::resolve_runtime_dir`. The supervisor calls this only when the
+/// launch context carries no `FLEETCOM_RUNTIME_DIR`.
+pub fn runtime_root() -> Option<PathBuf> {
     if let Some(run) = dirs::runtime_dir() {
         return Some(run.join("fleetcom"));
     }
@@ -275,11 +272,9 @@ mod tests {
     }
 
     #[test]
-    fn runtime_root_prefers_the_override_verbatim() {
-        let dir = Path::new("/custom/run dir");
-        assert_eq!(runtime_root(Some(dir)).as_deref(), Some(dir));
+    fn runtime_root_resolves_under_fleetcom() {
         // Every supported platform resolves a fallback under `fleetcom`.
-        let fallback = runtime_root(None).expect("platform dirs must resolve");
+        let fallback = runtime_root().expect("platform dirs must resolve");
         assert!(fallback.components().any(|c| c.as_os_str() == "fleetcom"));
     }
 
@@ -329,6 +324,7 @@ mod tests {
             fs::read_to_string(&second.omp_capture).unwrap(),
             OMP_CAPTURE_MODULE
         );
+        assert!(OMP_CAPTURE_MODULE.contains(CAPTURE_ENV));
         assert_eq!(
             fs::read_to_string(&first.claude_settings).unwrap(),
             "garbage",

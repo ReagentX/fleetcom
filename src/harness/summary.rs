@@ -32,40 +32,11 @@
 //! selector. Supported screen structures are recorded in the corpus fixtures in
 //! `tests/corpus`.
 
-use std::path::Path;
-
 use crate::preview::SummaryAdapter;
-
-/// Select an adapter by the basename of the command's first whitespace-separated word.
-/// Arguments are accepted; do not select an adapter for environment prefixes or
-/// compound shell commands. Selection is independent of session-capture
-/// instrumentation.
-pub fn select(command: &str) -> Option<&'static dyn SummaryAdapter> {
-    let first = command.split_whitespace().next()?;
-    let name = Path::new(first).file_name()?.to_str()?;
-    super::AGENTS
-        .iter()
-        .find(|a| a.harness.shape().0 == name)
-        .map(|a| a.summary)
-}
 
 /// Preview text shared by approval-menu matchers and Claude's registry
 /// permission prompt.
 pub(crate) const AWAITING_APPROVAL: &str = "awaiting approval";
-
-/// Whether `row` is a full-width horizontal rule: nothing but `─`, long
-/// enough that box borders and inline list rules never qualify. claude's
-/// input box is fenced by two such rows.
-fn is_rule_row(row: &str) -> bool {
-    let mut n = 0usize;
-    for c in row.trim().chars() {
-        if c != '─' {
-            return false;
-        }
-        n += 1;
-    }
-    n >= 40
-}
 
 /// Whether `c` is a Unicode Braille Patterns code point used as a spinner
 /// frame by the supported CLIs.
@@ -73,16 +44,18 @@ fn braille_frame(c: char) -> bool {
     ('\u{2800}'..='\u{28FF}').contains(&c)
 }
 
+/// The text after a leading frame char accepted by `is_frame` and one space.
+fn after_frame(s: &str, is_frame: impl Fn(char) -> bool) -> Option<&str> {
+    let mut chars = s.chars();
+    (is_frame(chars.next()?) && chars.next()? == ' ').then_some(chars.as_str())
+}
+
 /// The status phrase of a spinner row: a frame char accepted by `is_frame`,
 /// a space, then text through the first `…` inclusive. The phrase must open
 /// alphanumeric; past that it is task-derived and unconstrained. Trailing
 /// text is left for the caller to interpret.
 fn spinner_text(row: &str, is_frame: impl Fn(char) -> bool) -> Option<String> {
-    let mut chars = row.chars();
-    if !is_frame(chars.next()?) || chars.next()? != ' ' {
-        return None;
-    }
-    let rest = chars.as_str();
+    let rest = after_frame(row, is_frame)?;
     let text = &rest[..rest.find('…')? + '…'.len_utf8()];
     text.chars()
         .next()?
@@ -137,15 +110,28 @@ impl SummaryAdapter for ClaudeSummary {
     /// Strip a recognized claude spinner, braille, or quadrant-circle frame from a
     /// nonempty title. Return `None` for other title shapes.
     fn normalize_title(&self, title: &str) -> Option<String> {
-        let mut chars = title.chars();
-        let frame = chars.next()?;
-        let framed = CLAUDE_SPINNER.contains(&frame)
-            || braille_frame(frame)
-            || ('\u{25D0}'..='\u{25D3}').contains(&frame);
+        let rest = after_frame(title, |c| {
+            CLAUDE_SPINNER.contains(&c)
+                || braille_frame(c)
+                || ('\u{25D0}'..='\u{25D3}').contains(&c)
+        })?;
         // An empty payload cannot produce a usable preview.
-        (framed && chars.next()? == ' ' && !chars.as_str().is_empty())
-            .then(|| chars.as_str().to_string())
+        (!rest.is_empty()).then(|| rest.to_string())
     }
+}
+
+/// Whether `row` is a full-width horizontal rule: nothing but `─`, long
+/// enough that box borders and inline list rules never qualify. claude's
+/// input box is fenced by two such rows.
+fn is_rule_row(row: &str) -> bool {
+    let mut n = 0usize;
+    for c in row.trim().chars() {
+        if c != '─' {
+            return false;
+        }
+        n += 1;
+    }
+    n >= 40
 }
 
 /// Index of the input box's top separator. The bottom-most full-width rule
@@ -205,11 +191,7 @@ fn claude_spinner_status(rows: &[String], top: usize) -> Option<(String, &'stati
 /// Match a spinner-framed `Waiting for {digits} {subject} to finish` row and
 /// return its text verbatim. The subject must contain one to three words.
 fn claude_waiting_text(row: &str) -> Option<String> {
-    let mut chars = row.chars();
-    if !CLAUDE_SPINNER.contains(&chars.next()?) || chars.next()? != ' ' {
-        return None;
-    }
-    let text = chars.as_str();
+    let text = after_frame(row, |c| CLAUDE_SPINNER.contains(&c))?;
     let rest = text.strip_prefix("Waiting for ")?;
     let digits = rest.chars().take_while(char::is_ascii_digit).count();
     if digits == 0 {
@@ -348,11 +330,11 @@ const CODEX_EFFORT: &[&str] = &[
 /// depth, so counting them would push the status row out of reach.
 const CODEX_STATUS_WINDOW: usize = 10;
 
-/// codex (inline UI, primary screen). The pin is its composer: the bottom-most column-0
-/// prompt-glyph row that is not a modal selector; status rows sit above it, and
-/// scrollback beyond the first foreign row is out of bounds. Check for the approval
-/// modal first, with the composer absent. The status line or indented hint rows may
-/// appear below the composer.
+/// codex (inline UI on the primary screen; approval modals also paint on the alternate
+/// screen). The pin is its composer: the bottom-most column-0 prompt-glyph row that is
+/// not a modal selector; status rows sit above it, and scrollback beyond the first
+/// foreign row is out of bounds. Check for the approval modal first, with the composer
+/// absent. The status line or indented hint rows may appear below the composer.
 pub struct CodexSummary;
 
 impl SummaryAdapter for CodexSummary {
@@ -374,9 +356,7 @@ impl SummaryAdapter for CodexSummary {
         if let Some(rest) = title.strip_prefix("[ . ] ") {
             return Some(format!("[ ! ] {rest}"));
         }
-        let mut chars = title.chars();
-        let frame = chars.next()?;
-        (braille_frame(frame) && chars.next()? == ' ').then(|| format!("⠋ {}", chars.as_str()))
+        after_frame(title, braille_frame).map(|rest| format!("⠋ {rest}"))
     }
 }
 
@@ -852,11 +832,7 @@ fn omp_input_box(rows: &[String]) -> Option<usize> {
 /// Reject a wrapped row with its hint on the next line: do not extract half a phrase.
 fn omp_spinner_status(rows: &[String], top: usize) -> Option<(String, &'static str)> {
     let probe = rows[..top].iter().rev().find(|r| !r.is_empty())?;
-    let mut chars = probe.trim_start().chars();
-    if !braille_frame(chars.next()?) || chars.next()? != ' ' {
-        return None;
-    }
-    let rest = chars.as_str();
+    let rest = after_frame(probe.trim_start(), braille_frame)?;
     let text = OMP_HINTS
         .iter()
         .find_map(|h| rest.strip_suffix(h))?

@@ -725,7 +725,7 @@ impl Supervisor {
         let root = self
             .launch_env_path(path::FLEETCOM_RUNTIME_DIR)
             .or_else(|| {
-                assets::runtime_root(None).map(|base| {
+                assets::runtime_root().map(|base| {
                     let key = self
                         .sessions_root()
                         .map(PathBuf::into_os_string)

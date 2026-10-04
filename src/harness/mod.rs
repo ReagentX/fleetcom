@@ -161,6 +161,19 @@ pub fn detect(cmd: &str) -> Option<(&'static dyn Harness, Invocation)> {
         .find_map(|a| a.harness.detect(cmd).map(|inv| (a.harness, inv)))
 }
 
+/// Select a summary adapter by the basename of the command's first
+/// whitespace-separated word. Arguments are accepted; do not select an adapter
+/// for environment prefixes or compound shell commands. Selection is
+/// independent of session-capture instrumentation.
+pub fn select(command: &str) -> Option<&'static dyn crate::preview::SummaryAdapter> {
+    let first = command.split_whitespace().next()?;
+    let name = Path::new(first).file_name()?.to_str()?;
+    AGENTS
+        .iter()
+        .find(|a| a.harness.shape().0 == name)
+        .map(|a| a.summary)
+}
+
 /// Classification of an accepted agent-CLI command.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Invocation {
@@ -552,21 +565,13 @@ mod tests {
 
     #[test]
     fn registry_detect_routes_to_the_matching_harness() {
-        // Assert the literal count to detect additions to `AGENTS` missing from this
-        // routing test.
-        assert_eq!(AGENTS.len(), 4, "route the new harness's command here");
-        let (h, inv) = detect("claude").unwrap();
-        assert_eq!(h.shape().0, "claude");
-        assert_eq!(inv, Invocation::Bare);
-        let (h, inv) = detect(&format!("codex resume {ID}")).unwrap();
-        assert_eq!(h.shape().0, "codex");
-        assert_eq!(inv, Invocation::Resume(ID.into()));
-        let (h, inv) = detect("grok").unwrap();
-        assert_eq!(h.shape().0, "grok");
-        assert_eq!(inv, Invocation::Bare);
-        let (h, inv) = detect("omp").unwrap();
-        assert_eq!(h.shape().0, "omp");
-        assert_eq!(inv, Invocation::Bare);
+        for a in AGENTS {
+            let (prog, sel) = a.harness.shape();
+            let (h, inv) = detect(prog).unwrap();
+            assert_eq!((h.shape().0, inv), (prog, Invocation::Bare));
+            let (h, inv) = detect(&format!("{prog} {sel} {ID}")).unwrap();
+            assert_eq!((h.shape().0, inv), (prog, Invocation::Resume(ID.into())));
+        }
         assert!(detect("vim").is_none());
         assert!(detect("").is_none());
     }

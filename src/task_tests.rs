@@ -541,7 +541,7 @@ fn summary_adapter_anchors_live_and_freezes_completion_at_exit() {
     );
     let mut t = Task::spawn(42, &cmd, &cmd, &here(), 24, 80, 2000, &sh_env(), no_waker()).unwrap();
     assert!(t.summary_adapter.is_none(), "printf selects nothing");
-    t.summary_adapter = crate::harness::summary::select("codex");
+    t.summary_adapter = crate::harness::select("codex");
     assert!(t.summary_adapter.is_some());
 
     let mut live = t.resolve_preview(Instant::now());
