@@ -40,7 +40,7 @@ pub fn render(out: &mut impl Write, app: &mut App) -> io::Result<bool> {
             render_dashboard(&mut buf, app)?;
             render_pickdir(&mut buf, app)?;
         }
-        Mode::PickGroup { .. } => {
+        Mode::PickGroup(_) => {
             render_dashboard(&mut buf, app)?;
             render_pickgroup(&mut buf, app)?;
         }
