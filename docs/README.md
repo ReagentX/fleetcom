@@ -72,14 +72,14 @@ Use the hints for common dashboard actions; press `?` for the expanded key refer
   fleetcom   2 running · 0 idle · 0 done      by state · dir · custom
 
   Running
-  ✻  cargo watch -x test      test result: ok. 42 passed         9s
-  ✻  npm run dev              VITE v5.0  ready in 312 ms         4s
+  ✻ cargo watch -x test       test result: ok. 42 passed         9s
+  ✻ npm run dev               VITE v5.0  ready in 312 ms         4s
 
   ❯ n run · @ dir · / find · s sort
   ↑↓ select · enter attach · space peek · ? controls
 ```
 
-Each row is `glyph · tag · command · latest output · age`. Age is measured from launch while running, last output once idle, or exit once completed. Press `Space` to peek at the selected task's live screen in a read-only box over the dashboard:
+Each row is `marks · glyph · command · latest output · age`. Age is measured from launch while running, last output once idle, or exit once completed. Press `Space` to peek at the selected task's live screen in a read-only box over the dashboard:
 
 ```text
   ┌─ cargo watch -x test ───────────────────────────────┐
@@ -101,10 +101,10 @@ Press `Ctrl-\` to return to the dashboard. Press `m` to tag the selected task "i
   fleetcom   2 running · 0 idle · 0 done      by state · dir · custom
 
   In use
-  ✻ ◆cargo watch -x test      test result: ok. 42 passed        1m
+◆ ✻ cargo watch -x test       test result: ok. 42 passed        1m
 
   Running
-  ✻  npm run dev              VITE v5.0  ready in 312 ms        1m
+  ✻ npm run dev               VITE v5.0  ready in 312 ms        1m
 ```
 
 Press `s` to cycle through state, directory, and custom grouping. The active mode is bold in the header. In custom mode, press `g` to assign the selected task to a named group. Named sections are sorted without regard to case, so `API` and `api` are adjacent. They remain separate because group identity is case-sensitive. Unassigned is listed last when at least one task has no group:
@@ -113,10 +113,10 @@ Press `s` to cycle through state, directory, and custom grouping. The active mod
   fleetcom   2 running · 0 idle · 0 done      by state · dir · custom
 
   api
-  ✻ ◆cargo watch -x test      test result: ok. 42 passed        2m
+◆ ✻ cargo watch -x test       test result: ok. 42 passed        2m
 
   Unassigned
-  ✻  npm run dev              VITE v5.0  ready in 312 ms        2m
+  ✻ npm run dev               VITE v5.0  ready in 312 ms        2m
 ```
 
 In custom mode, a new command is assigned the selected task's group, shown in the spawn prompt (`❯ api ▸ cargo run`). Group assignments are stored with task state and preserved across detach and rerun. See the [command reference](commands.md#the-g-group-picker) for picker mechanics.
@@ -127,10 +127,10 @@ Press `R` to rename the selected task, starting with its current name. Press `En
   fleetcom   2 running · 0 idle · 0 done      by state · dir · custom
 
   api
-  ✻ ◆api tests                test result: ok. 42 passed        3m
+◆ ✻ api tests                 test result: ok. 42 passed        3m
 
   Unassigned
-  ✻  npm run dev              VITE v5.0  ready in 312 ms        3m
+  ✻ npm run dev               VITE v5.0  ready in 312 ms        3m
 ```
 
 In the attached status bar, both are displayed: `[attached] api tests · cargo watch -x test`. Names are stored in daemon state, preserved across detach and rerun, and included in saved [sessions](sessions.md).

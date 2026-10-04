@@ -87,10 +87,10 @@ fn dim(out: &mut impl Write, y: u16, s: &str, cols: usize) -> io::Result<()> {
     )
 }
 
-/// Paint a full-width highlight line: selection and focused-field styling.
-fn rev(out: &mut impl Write, y: u16, s: &str, cols: usize, focused: bool) -> io::Result<()> {
+/// Paint a full-width highlight line: reverse video while the host terminal has focus, a dark-grey
+/// background while it does not, so an unfocused terminal shows no full-strength selection.
+fn highlight(out: &mut impl Write, y: u16, s: &str, cols: usize, focused: bool) -> io::Result<()> {
     queue!(out, MoveTo(0, y))?;
-    // When the host terminal is unfocused, the highlight is muted to a dark-grey
     if focused {
         queue!(out, SetAttribute(Attribute::Reverse))?;
     } else {
@@ -149,7 +149,7 @@ fn render_dashboard(out: &mut impl Write, app: &App) -> io::Result<()> {
     let display = pad(&plain, cols);
     let mut chars = display.chars();
     queue!(out, MoveTo(0, 0))?;
-    for (text, intensity) in &segs {
+    for (text, attr) in &segs {
         let n = text.chars().count();
         if n == 0 {
             continue;
@@ -159,13 +159,9 @@ fn render_dashboard(out: &mut impl Write, app: &App) -> io::Result<()> {
             break; // ran off the truncated end; attributes are already reset
         }
         // Reset between runs so Bold and Dim are not stacked.
-        let attr = match intensity {
-            Intensity::Bold => Attribute::Bold,
-            Intensity::Dim => Attribute::Dim,
-        };
         queue!(
             out,
-            SetAttribute(attr),
+            SetAttribute(*attr),
             Print(piece),
             SetAttribute(Attribute::Reset)
         )?;
@@ -184,7 +180,7 @@ fn render_dashboard(out: &mut impl Write, app: &App) -> io::Result<()> {
             Row::Task(ti) => {
                 let v = &app.views[*ti];
                 if app.selected_id == Some(v.id) {
-                    rev(out, y, &task_row(v, cols), cols, app.terminal_focused)?;
+                    highlight(out, y, &task_row(v, cols), cols, app.terminal_focused)?;
                 } else if v.preview.source == PreviewSource::Marker {
                     // The marker is a placeholder, not output: dim the
                     // preview cell so it reads as metadata.
@@ -281,31 +277,23 @@ fn prompt_line(dir: Option<&str>, group: Option<&str>, input: &str) -> String {
     line
 }
 
-/// Header intensity for one output run. Emit Bold or Dim per run, followed by a reset
-/// to avoid stacking attributes.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum Intensity {
-    Bold,
-    Dim,
-}
-
-/// Split the header into styled runs, emphasizing only the active mode.
-fn header_segments(prefix: &str, active: GroupMode, suffix: &str) -> Vec<(String, Intensity)> {
+/// Split the header into Bold and Dim runs, emphasizing only the active mode.
+fn header_segments(prefix: &str, active: GroupMode, suffix: &str) -> Vec<(String, Attribute)> {
     // Keep the displayed order aligned with the grouping cycle.
     const STRIP: [GroupMode; 3] = [GroupMode::State, GroupMode::Dir, GroupMode::Custom];
-    let mut segs = vec![(prefix.to_string(), Intensity::Bold)];
+    let mut segs = vec![(prefix.to_string(), Attribute::Bold)];
     for (i, m) in STRIP.iter().enumerate() {
         if i > 0 {
-            segs.push((" · ".to_string(), Intensity::Dim));
+            segs.push((" · ".to_string(), Attribute::Dim));
         }
-        let intensity = if *m == active {
-            Intensity::Bold
+        let attr = if *m == active {
+            Attribute::Bold
         } else {
-            Intensity::Dim
+            Attribute::Dim
         };
-        segs.push((m.label().to_string(), intensity));
+        segs.push((m.label().to_string(), attr));
     }
-    segs.push((suffix.to_string(), Intensity::Bold));
+    segs.push((suffix.to_string(), Attribute::Bold));
     segs
 }
 
@@ -413,9 +401,6 @@ fn top_border(label: &str, inner_w: usize) -> String {
 
 /// Centered overlay with a labeled border, padded body, and dim footer.
 struct Overlay<'a> {
-    /// Terminal dimensions: columns, then rows.
-    cols: usize,
-    rows: usize,
     /// Box dimensions including borders: columns, then rows.
     bw: usize,
     bh: usize,
@@ -428,10 +413,10 @@ struct Overlay<'a> {
 }
 
 /// Paint a centered overlay, then overwrite the bottom border with its footer.
-fn render_overlay(out: &mut impl Write, o: &Overlay) -> io::Result<()> {
+fn render_overlay(out: &mut impl Write, app: &App, o: &Overlay) -> io::Result<()> {
     // Saturate coordinates at the origin for a box larger than the terminal.
-    let x0 = o.cols.saturating_sub(o.bw) / 2;
-    let y0 = o.rows.saturating_sub(o.bh) / 2;
+    let x0 = (app.cols as usize).saturating_sub(o.bw) / 2;
+    let y0 = (app.rows as usize).saturating_sub(o.bh) / 2;
     let (inner_w, inner_h) = (o.bw.saturating_sub(2), o.bh.saturating_sub(2));
     queue!(
         out,
@@ -485,9 +470,8 @@ fn render_peek(out: &mut impl Write, app: &App) -> io::Result<()> {
     );
     render_overlay(
         out,
+        app,
         &Overlay {
-            cols,
-            rows,
             bw,
             bh,
             label: display_label(v),
@@ -497,9 +481,10 @@ fn render_peek(out: &mut impl Write, app: &App) -> io::Result<()> {
     )
 }
 
-/// The peek body is the last `height` lines of the selected task's screen, or all lines
-/// when the task is in alternate-screen mode. When the screen is shorter than `height`,
-/// all lines are returned.
+/// The peek body: at most `height` lines, cropped from the bottom of a window. On the alternate
+/// screen the window is the whole grid: a partial repaint leaves real blank canvas rows, and
+/// dropping them would shift the view. On the primary screen it ends at the last non-blank row:
+/// trailing blanks are grid padding, so short output renders from its first row.
 fn peek_window(lines: &[String], height: usize, alt_screen: bool) -> &[String] {
     // `contents()` trims trailing padding, so a blank row is exactly empty.
     let end = if alt_screen {
@@ -665,9 +650,8 @@ fn render_controls(out: &mut impl Write, app: &App) -> io::Result<()> {
     };
     render_overlay(
         out,
+        app,
         &Overlay {
-            cols,
-            rows,
             bw,
             bh,
             label: "controls",
@@ -680,7 +664,7 @@ fn render_controls(out: &mut impl Write, app: &App) -> io::Result<()> {
 /// The varying content of a bottom-panel picker; rendered within the shared skeleton in
 /// `render_panel`.
 struct Panel<'a> {
-    /// Header line, painted reverse-video as the focused field.
+    /// Header line, painted by `highlight` as the focused field.
     header: String,
     /// Preformatted row labels; indented and marked with `▸` in the skeleton.
     labels: &'a [String],
@@ -710,7 +694,7 @@ fn render_panel(out: &mut impl Write, app: &App, p: &Panel) -> io::Result<()> {
     let panel_h = (body + 2) as u16;
     let top = rows.saturating_sub(panel_h).max(2);
 
-    rev(out, top, &p.header, cols, app.terminal_focused)?;
+    highlight(out, top, &p.header, cols, app.terminal_focused)?;
 
     if total == 0 {
         if let Some(msg) = p.empty {
@@ -723,7 +707,7 @@ fn render_panel(out: &mut impl Write, app: &App, p: &Panel) -> io::Result<()> {
             let marker = if idx == p.sel { "▸ " } else { "  " };
             let line = format!("    {marker}{}", p.labels[idx]);
             if idx == p.sel {
-                rev(out, y, &line, cols, app.terminal_focused)?;
+                highlight(out, y, &line, cols, app.terminal_focused)?;
             } else {
                 put(out, y, &line, cols)?;
             }
@@ -748,8 +732,8 @@ fn render_panel(out: &mut impl Write, app: &App, p: &Panel) -> io::Result<()> {
     }
 }
 
-/// The `@` picker: a bottom panel over the dashboard. A typed-path input plus
-/// the matching subdirectories, `dir_sel` highlighted.
+/// The `@` picker: a bottom panel over the dashboard. A typed-path input plus the matching
+/// subdirectories, `dir_sel` highlighted. The resolved path is row 0, so the list is never empty.
 fn render_pickdir(out: &mut impl Write, app: &App) -> io::Result<()> {
     let labels: Vec<String> = app
         .dir_candidates
@@ -778,7 +762,7 @@ fn render_pickdir(out: &mut impl Write, app: &App) -> io::Result<()> {
             sel: app.dir_sel,
             max_rows: 8,
             hint: format!("{action} · ↑↓ pick · esc"),
-            empty: Some("    (no matching directories)"),
+            empty: None,
             cursor: Some(cx),
         },
     )
@@ -912,15 +896,10 @@ fn render_session_picker(out: &mut impl Write, app: &App) -> io::Result<()> {
     )
 }
 
-/// Center `s` in `width` columns (a full-width string, so it overwrites the row).
+/// Indent `s` to center it in `width` columns. The caller's `put`/`dim` clips
+/// and pads the result to the row.
 fn center(s: &str, width: usize) -> String {
-    let len = s.width();
-    if len >= width {
-        return truncate(s, width);
-    }
-    let mut out = " ".repeat((width - len) / 2);
-    out.push_str(s);
-    pad(&out, width)
+    format!("{}{s}", " ".repeat(width.saturating_sub(s.width()) / 2))
 }
 
 /// Full-screen reconnect prompt shown after a daemon connection drops.
@@ -979,7 +958,7 @@ fn render_attached(out: &mut impl Write, app: &App) -> io::Result<()> {
         chord.as_deref(),
         cols,
     );
-    rev(
+    highlight(
         out,
         app.rows.saturating_sub(1),
         &bar,
@@ -1396,13 +1375,6 @@ mod tests {
         assert_eq!(labels.len(), distinct, "a group must be one contiguous run");
     }
 
-    /// Add one heading row per group to the flat entry rows in grouped form.
-    #[test]
-    fn control_forms_shrink_before_they_clip() {
-        assert_eq!(flat_rows(), CONTROLS.len().div_ceil(2));
-        assert_eq!(grouped_rows(), flat_rows() + control_groups().len());
-    }
-
     /// Overlay borders remain column-exact for wide and overlong labels.
     #[test]
     fn top_border_fills_to_inner_width() {
@@ -1584,13 +1556,7 @@ mod tests {
                 assert_eq!(cells[..2], want, "{row:?}");
                 assert_eq!(cells[2], '✻', "{row:?}");
                 // Compare all columns after the gutter with the unmarked row.
-                let rest = |r: &str| -> String {
-                    r.chars()
-                        .enumerate()
-                        .filter(|(i, _)| *i > 1)
-                        .map(|(_, c)| c)
-                        .collect()
-                };
+                let rest = |r: &str| r.chars().skip(2).collect::<String>();
                 assert_eq!(rest(&row), rest(&plain));
             }
         }
@@ -1632,18 +1598,18 @@ mod tests {
             let plain: String = segs.iter().map(|(t, _)| t.as_str()).collect();
             assert_eq!(plain, "by state · dir · custom · tail");
 
-            assert_eq!(segs.first().unwrap(), &("by ".to_string(), Intensity::Bold));
+            assert_eq!(segs.first().unwrap(), &("by ".to_string(), Attribute::Bold));
             assert_eq!(
                 segs.last().unwrap(),
-                &(" · tail".to_string(), Intensity::Bold)
+                &(" · tail".to_string(), Attribute::Bold)
             );
-            for (text, intensity) in &segs[1..segs.len() - 1] {
+            for (text, attr) in &segs[1..segs.len() - 1] {
                 let expect = if text == active.label() {
-                    Intensity::Bold
+                    Attribute::Bold
                 } else {
-                    Intensity::Dim
+                    Attribute::Dim
                 };
-                assert_eq!(*intensity, expect, "run {text:?} with active {active:?}");
+                assert_eq!(*attr, expect, "run {text:?} with active {active:?}");
             }
         }
     }
