@@ -1,9 +1,19 @@
 //! Codex does not let the caller select an ID at launch. This harness instead
 //! injects a `notify` override and chains compatible configured notifiers.
+//!
+//! Every thread a Codex process runs reports through that notifier: the
+//! conversation on screen, each sub-agent it spawns, and the hidden thread the
+//! TUI starts to title a new session. Only the first is the task's
+//! conversation. `codex resume` exits 1 for a sub-agent whose parent is not
+//! loaded, and for the title thread, which is never saved. `parse_capture`
+//! therefore resolves the notified thread to the root thread of its session
+//! tree through that thread's rollout header, and refuses a thread it cannot
+//! classify.
 
 use std::{
     fmt::Write as _,
     fs,
+    io::{BufRead, BufReader, Read},
     path::{Path, PathBuf},
 };
 
@@ -11,6 +21,26 @@ use super::{
     CAPTURE_ENV, CapturePaths, Harness, Invocation, NOTIFY_CHAIN_ENV, SpawnPlan, capture_id,
     home_root, resolve_home, shell_quote,
 };
+
+/// Config override that makes an instrumented launch's embedded mode explicit.
+/// Since codex 0.157.0 a plain `codex` attaches to a shared background server,
+/// and a `-c` override outside a short allowlist forces embedded mode. `notify`
+/// is not on that list, so the notify override alone raises a "Running without
+/// the shared background server" warning at startup. Codex emits the warning
+/// only while this feature is enabled, and the key is on the allowlist.
+/// Embedded mode is deliberate: `fleetcom` owns the lifecycle of the task's
+/// process, so that process must hold the conversation.
+///
+/// `--no-daemon` selects the same mode, but a codex that predates the flag
+/// refuses to start on it. An unknown `features.*` key only adds an
+/// unrecognized-setting warning.
+const EMBEDDED_OVERRIDE: &str = "features.daemon_auto_start=false";
+
+/// Upper bound on a rollout's first line, terminator included. The line embeds
+/// the session's base instructions: about 22 KB in rollouts written by codex
+/// 0.135.0 through 0.160.0. 1 MiB leaves that text room to grow over 45-fold
+/// and bounds the read from a file whose first line never ends.
+const HEADER_MAX: u64 = 1024 * 1024;
 
 pub struct Codex;
 
@@ -46,7 +76,11 @@ impl Harness for Codex {
             toml_escape(&capture.codex_notify.to_string_lossy())
         );
         SpawnPlan {
-            args_suffix: format!(" -c {}", shell_quote(&toml)),
+            args_suffix: format!(
+                " -c {} -c {}",
+                shell_quote(&toml),
+                shell_quote(EMBEDDED_OVERRIDE)
+            ),
             env: vec![
                 (
                     CAPTURE_ENV.into(),
@@ -58,18 +92,105 @@ impl Harness for Codex {
         }
     }
 
+    /// Accept an `agent-turn-complete` notification and return the root
+    /// thread of the notified thread's session tree: the conversation the
+    /// task's TUI is on. A sub-agent's notification maps to its root; a thread
+    /// [`root_thread`] cannot classify is refused, and the next ID source
+    /// decides.
+    ///
+    /// The session store is not scanned to infer which conversation the task
+    /// owns: nothing is discovered there. The task's own notifier names one
+    /// thread, and that thread's rollout header classifies it.
     fn parse_capture(
         &self,
         payload: &str,
+        // Every thread of the task notifies from the task's own process.
         _pid: Option<u32>,
-        _home: Option<&Path>,
+        home: Option<&Path>,
     ) -> Option<String> {
         let v = jzon::parse(payload).ok()?;
         if v["type"].as_str() != Some("agent-turn-complete") {
             return None;
         }
-        capture_id(&v, "thread-id")
+        let thread = capture_id(&v, "thread-id")?;
+        root_thread(&home_root(home, ".codex")?, &thread)
     }
+}
+
+/// Resolve `thread` to the root thread of its session tree from the header of
+/// its rollout under the Codex `home`. `thread` must already satisfy
+/// [`is_uuid`](super::is_uuid): it is matched against file names.
+///
+/// Codex saves each thread as
+/// `sessions/<YYYY>/<MM>/<DD>/rollout-<local time>-<thread>.jsonl`. The first
+/// line is `{"type":"session_meta","payload":{…}}`: `payload.id` is the thread
+/// and `payload.session_id` is the root thread of its tree. A root thread
+/// carries its own ID in both and no `subagent` member in `source`. A
+/// sub-agent carries the root's ID in `session_id` and a `source` object with
+/// a `subagent` member.
+///
+/// Return `None` unless exactly one rollout is named for `thread` and its
+/// header has one of those two shapes. The title thread has no rollout. Only
+/// directory listings and that first line are examined.
+fn root_thread(home: &Path, thread: &str) -> Option<String> {
+    let mut rollouts = Vec::new();
+    collect_rollouts(
+        &home.join("sessions"),
+        // Year, month, and day directories.
+        3,
+        &format!("-{thread}.jsonl"),
+        &mut rollouts,
+    )?;
+    let [rollout] = rollouts.as_slice() else {
+        return None;
+    };
+    let v = jzon::parse(&read_header(rollout)?).ok()?;
+    let meta = &v["payload"];
+    if v["type"].as_str() != Some("session_meta") || meta["id"].as_str() != Some(thread) {
+        return None;
+    }
+    let root = capture_id(meta, "session_id")?;
+    // Exactly one may hold. codex 0.140.0 and 0.141.0 wrote a sub-agent's own
+    // ID as its `session_id`: that header names no root.
+    ((root == thread) != meta["source"].has_key("subagent")).then_some(root)
+}
+
+/// Push every entry whose name ends with `suffix` and that sits exactly
+/// `depth` directory levels below `dir`. Entries above that level that are not
+/// directories are skipped. Return `None` when a directory cannot be listed:
+/// it may hold a second match.
+fn collect_rollouts(dir: &Path, depth: u8, suffix: &str, found: &mut Vec<PathBuf>) -> Option<()> {
+    for entry in fs::read_dir(dir).ok()? {
+        let entry = entry.ok()?;
+        if depth == 0 {
+            if entry
+                .file_name()
+                .to_str()
+                .is_some_and(|name| name.ends_with(suffix))
+            {
+                found.push(entry.path());
+            }
+        } else if entry.path().is_dir() {
+            collect_rollouts(&entry.path(), depth - 1, suffix, found)?;
+        }
+    }
+    Some(())
+}
+
+/// Read the first line of `path` without its terminator. Return `None` when
+/// the first [`HEADER_MAX`] bytes hold no newline: the file is empty, Codex is
+/// still writing the line, or the line exceeds the bound. Also return `None`
+/// for an unreadable file and for a line that is not UTF-8.
+fn read_header(path: &Path) -> Option<String> {
+    let mut line = Vec::new();
+    BufReader::new(fs::File::open(path).ok()?)
+        .take(HEADER_MAX)
+        .read_until(b'\n', &mut line)
+        .ok()?;
+    if line.pop() != Some(b'\n') {
+        return None;
+    }
+    String::from_utf8(line).ok()
 }
 
 /// Whether Codex notification capture can preserve the configured route.
@@ -245,12 +366,24 @@ mod tests {
     use super::*;
     use crate::{
         harness::fixtures::{assert_all_opaque, paths},
-        testutil::{Scratch, temp},
+        testutil::{Scratch, codex_session_meta, install_codex_rollout, install_codex_root, temp},
     };
 
     /// Codex's own launch and resume commands carry v7 IDs; the shared v4
     /// fixture stays valid for detection, which is version-agnostic.
     const ID: &str = "019f5453-de22-7240-b2e5-0d32692aa6d9";
+    /// A sub-agent thread and a second-level sub-agent thread in the session
+    /// rooted at [`ID`].
+    const CHILD: &str = "019f5454-0c11-7b33-9a4e-5f0e6d7c8b9a";
+    const GRANDCHILD: &str = "019f5454-3d70-7e02-b1c8-2a4b6c8d0e1f";
+    /// The hidden title thread: it notifies but has no rollout.
+    const TITLE: &str = "019f5453-de9f-7e61-8c0d-1a2b3c4d5e6f";
+
+    /// Suffix of every instrumented launch that uses [`paths`].
+    const SUFFIX: &str = concat!(
+        r#" -c 'notify=["/tmp/Application Support/notify.sh"]'"#,
+        " -c 'features.daemon_auto_start=false'",
+    );
 
     /// Codex-specific opaque shapes: subcommands (including `exec` and
     /// single-letter aliases), flags, `-c` overrides, `--resume` (the wrong
@@ -288,17 +421,14 @@ mod tests {
         temp("codex_no_config_home")
     }
 
-    /// Both accepted shapes receive the same notify override because Codex
-    /// cannot pin an ID at launch.
+    /// Both accepted shapes receive the same two overrides because Codex
+    /// cannot pin an ID at launch: the notifier, then explicit embedded mode.
     #[test]
-    fn instrument_installs_the_notify_override() {
+    fn instrument_installs_the_notify_and_embedded_overrides() {
         for cmd in ["codex".to_string(), format!("codex resume {ID}")] {
             let inv = Codex.detect(&cmd).unwrap();
             let plan = Codex.instrument(&inv, &paths(), Some(&no_config_home()));
-            assert_eq!(
-                plan.args_suffix, r#" -c 'notify=["/tmp/Application Support/notify.sh"]'"#,
-                "{cmd}"
-            );
+            assert_eq!(plan.args_suffix, SUFFIX, "{cmd}");
             assert_eq!(plan.injected_id, None, "{cmd}");
             assert_eq!(
                 plan.env,
@@ -373,10 +503,7 @@ mod tests {
         .unwrap();
         let inv = Codex.detect("codex").unwrap();
         let plan = Codex.instrument(&inv, &paths(), Some(&home));
-        assert_eq!(
-            plan.args_suffix,
-            r#" -c 'notify=["/tmp/Application Support/notify.sh"]'"#
-        );
+        assert_eq!(plan.args_suffix, SUFFIX);
         assert!(plan.env.contains(&(
             NOTIFY_CHAIN_ENV.into(),
             "/Applications/Codex Computer Use.app/Contents/MacOS/SkyComputerUseClient\nturn-ended"
@@ -384,7 +511,8 @@ mod tests {
         )));
     }
 
-    /// Disable capture injection for an unrepresentable route.
+    /// Disable capture injection for an unrepresentable route: the launch
+    /// receives neither override and no environment.
     #[test]
     fn instrument_skips_an_unrepresentable_config_notify() {
         let home = temp("codex_opaque_notify");
@@ -436,7 +564,10 @@ mod tests {
             .expect("sh must run");
         assert_eq!(
             String::from_utf8(out.stdout).unwrap(),
-            format!("-c\n{}\n", r#"notify=["/Odd Path/it's \"here\"\\now"]"#)
+            format!(
+                "-c\n{}\n-c\nfeatures.daemon_auto_start=false\n",
+                r#"notify=["/Odd Path/it's \"here\"\\now"]"#
+            )
         );
     }
 
@@ -546,21 +677,360 @@ mod tests {
         }
     }
 
+    /// Notification JSON for a completed turn of `thread`.
+    fn turn_complete(thread: &str) -> String {
+        format!(
+            r#"{{"type":"agent-turn-complete","thread-id":"{thread}","turn-id":"t","cwd":"/w"}}"#
+        )
+    }
+
+    /// Resolve a completed-turn notification for `thread` against `home`.
+    fn resolve(home: &Path, thread: &str) -> Option<String> {
+        Codex.parse_capture(&turn_complete(thread), None, Some(home))
+    }
+
+    /// `session_meta` payload with raw JSON for `source`.
+    fn meta(id: &str, session: &str, source: &str) -> String {
+        format!(r#"{{"id":"{id}","session_id":"{session}","source":{source}}}"#)
+    }
+
+    /// `session_meta` payload of a sub-agent of `parent` in the session
+    /// rooted at `root`, with raw JSON for `source`.
+    fn child_meta(id: &str, parent: &str, root: &str, source: &str) -> String {
+        format!(
+            r#"{{"id":"{id}","session_id":"{root}","parent_thread_id":"{parent}","source":{source}}}"#
+        )
+    }
+
+    /// `source` of a thread the model's `spawn_agent` tool started.
+    fn thread_spawn(parent: &str, depth: u8) -> String {
+        format!(
+            r#"{{"subagent":{{"thread_spawn":{{"parent_thread_id":"{parent}","depth":{depth},"agent_path":"/root/pong","agent_nickname":"Pong"}}}}}}"#
+        )
+    }
+
+    /// The payload checks precede the rollout lookup: with the root's rollout
+    /// in place, only a turn-complete payload naming a strict ID resolves.
     #[test]
     fn parse_capture_accepts_only_turn_complete_payloads() {
-        let payload = format!(
-            r#"{{"type":"agent-turn-complete","thread-id":"{ID}","turn-id":"t","cwd":"/w"}}"#
-        );
-        let parse = |payload: &str| Codex.parse_capture(payload, None, None);
-        assert_eq!(parse(&payload).as_deref(), Some(ID));
+        let home = temp("codex_capture_payload");
+        install_codex_root(&home, ID);
+        let parse = |payload: &str| Codex.parse_capture(payload, None, Some(&home));
+        assert_eq!(parse(&turn_complete(ID)).as_deref(), Some(ID));
 
         let wrong_type = format!(r#"{{"type":"other","thread-id":"{ID}"}}"#);
         assert_eq!(parse(&wrong_type), None);
-        assert_eq!(
-            parse(r#"{"type":"agent-turn-complete","thread-id":"my session"}"#),
-            None
-        );
+        for thread in ["my session", "../../../config", "*", ""] {
+            let payload = format!(r#"{{"type":"agent-turn-complete","thread-id":"{thread}"}}"#);
+            assert_eq!(parse(&payload), None, "{thread:?}");
+        }
+        assert_eq!(parse(r#"{"type":"agent-turn-complete"}"#), None);
         assert_eq!(parse("not json"), None);
+        assert_eq!(parse(""), None);
+    }
+
+    /// A root thread carries its own ID as `session_id` under every observed
+    /// string `source`. The task's PID plays no part.
+    #[test]
+    fn parse_capture_accepts_a_root_thread() {
+        for source in ["cli", "vscode", "exec"] {
+            let home = temp("codex_capture_root");
+            install_codex_rollout(
+                &home,
+                ID,
+                codex_session_meta(&meta(ID, ID, &format!("\"{source}\""))),
+            );
+            assert_eq!(resolve(&home, ID).as_deref(), Some(ID), "{source}");
+            assert_eq!(
+                Codex
+                    .parse_capture(&turn_complete(ID), Some(4242), Some(&home))
+                    .as_deref(),
+                Some(ID),
+                "{source}"
+            );
+        }
+    }
+
+    /// A spawned sub-agent resolves to `session_id`, not to its parent: the
+    /// second-level thread's parent is itself a sub-agent. The root's own
+    /// rollout is not consulted, so none is installed.
+    #[test]
+    fn parse_capture_maps_a_spawned_sub_agent_to_its_root() {
+        let home = temp("codex_capture_spawned");
+        install_codex_rollout(
+            &home,
+            CHILD,
+            codex_session_meta(&child_meta(CHILD, ID, ID, &thread_spawn(ID, 1))),
+        );
+        install_codex_rollout(
+            &home,
+            GRANDCHILD,
+            codex_session_meta(&child_meta(GRANDCHILD, CHILD, ID, &thread_spawn(CHILD, 2))),
+        );
+        assert_eq!(resolve(&home, CHILD).as_deref(), Some(ID));
+        assert_eq!(resolve(&home, GRANDCHILD).as_deref(), Some(ID));
+        assert_eq!(resolve(&home, ID), None, "the root has no rollout here");
+    }
+
+    /// The guardian sub-agent's `source` names no parent; the `subagent`
+    /// member alone classifies it.
+    #[test]
+    fn parse_capture_maps_a_guardian_sub_agent_to_its_root() {
+        let home = temp("codex_capture_guardian");
+        install_codex_rollout(
+            &home,
+            CHILD,
+            codex_session_meta(&child_meta(
+                CHILD,
+                ID,
+                ID,
+                r#"{"subagent":{"other":"guardian"}}"#,
+            )),
+        );
+        assert_eq!(resolve(&home, CHILD).as_deref(), Some(ID));
+    }
+
+    /// codex 0.140.0 and 0.141.0 wrote a sub-agent's own ID as `session_id`.
+    /// Such a header has the root's `id == session_id` shape and a `subagent`
+    /// source: it names no root, and the sub-agent's ID is not resumable.
+    #[test]
+    fn parse_capture_refuses_a_sub_agent_that_names_itself_as_root() {
+        let home = temp("codex_capture_self_rooted");
+        for source in [
+            thread_spawn(ID, 1),
+            r#"{"subagent":{"other":"guardian"}}"#.to_string(),
+            r#"{"subagent":"review"}"#.to_string(),
+        ] {
+            install_codex_rollout(
+                &home,
+                CHILD,
+                codex_session_meta(&child_meta(CHILD, ID, CHILD, &source)),
+            );
+            assert_eq!(resolve(&home, CHILD), None, "{source}");
+        }
+    }
+
+    /// The title thread notifies but is never saved: no rollout names it,
+    /// whether the store is absent, empty, or holds other threads.
+    #[test]
+    fn parse_capture_refuses_a_thread_without_a_rollout() {
+        let home = temp("codex_capture_title");
+        assert_eq!(resolve(&home, TITLE), None, "no sessions directory");
+        fs::create_dir_all(home.join("sessions/2026/10/04")).unwrap();
+        assert_eq!(resolve(&home, TITLE), None, "empty day directory");
+        install_codex_root(&home, ID);
+        assert_eq!(resolve(&home, TITLE), None, "another thread's rollout");
+        assert_eq!(resolve(&home, ID).as_deref(), Some(ID));
+    }
+
+    /// Rollouts sit exactly three directories below `sessions`. A matching
+    /// name at any other depth is not a rollout, and a file among the
+    /// directories does not stop the search.
+    #[test]
+    fn parse_capture_finds_rollouts_only_in_day_directories() {
+        let home = temp("codex_capture_depth");
+        let name = format!("rollout-2026-10-04T13-49-56-{ID}.jsonl");
+        let header = codex_session_meta(&meta(ID, ID, r#""cli""#));
+        for dir in [
+            "sessions",
+            "sessions/2026",
+            "sessions/2026/10",
+            "sessions/2026/10/04/extra",
+        ] {
+            let dir = home.join(dir);
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(dir.join(&name), &header).unwrap();
+        }
+        assert_eq!(resolve(&home, ID), None);
+
+        fs::write(home.join("sessions/2026/10/04").join(&name), &header).unwrap();
+        fs::write(home.join("sessions/.DS_Store"), "").unwrap();
+        assert_eq!(resolve(&home, ID).as_deref(), Some(ID));
+    }
+
+    /// Two rollouts for one thread are ambiguous, in one day directory or
+    /// across two. Removing the extra restores the capture.
+    #[test]
+    fn parse_capture_refuses_two_rollouts_for_one_thread() {
+        let header = codex_session_meta(&meta(ID, ID, r#""cli""#));
+        for day in ["2026/10/04", "2026/10/05", "2027/01/01"] {
+            let home = temp("codex_capture_twins");
+            install_codex_root(&home, ID);
+            let dir = home.join("sessions").join(day);
+            fs::create_dir_all(&dir).unwrap();
+            let twin = dir.join(format!("rollout-2026-10-05T09-00-00-{ID}.jsonl"));
+            fs::write(&twin, &header).unwrap();
+            assert_eq!(resolve(&home, ID), None, "{day}");
+            fs::remove_file(&twin).unwrap();
+            assert_eq!(resolve(&home, ID).as_deref(), Some(ID), "{day}");
+        }
+    }
+
+    /// A day directory that cannot be listed may hold a second rollout, so
+    /// the thread's one visible rollout is not enough.
+    #[test]
+    fn parse_capture_refuses_a_store_it_cannot_list() {
+        use std::os::unix::fs::PermissionsExt;
+        let home = temp("codex_capture_unlistable");
+        install_codex_root(&home, ID);
+        let locked = home.join("sessions/2026/10/05");
+        fs::create_dir_all(&locked).unwrap();
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+        let refused = resolve(&home, ID);
+        // Restore access before asserting so the scratch tree stays removable.
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(refused, None);
+        assert_eq!(resolve(&home, ID).as_deref(), Some(ID));
+    }
+
+    /// The header must describe the notified thread and place it in a
+    /// session tree: every other shape is unclassified.
+    #[test]
+    fn parse_capture_refuses_an_unclassified_header() {
+        let spawned = thread_spawn(ID, 1);
+        for (what, header) in [
+            (
+                "the header's id is another thread",
+                codex_session_meta(&meta(CHILD, CHILD, r#""cli""#)),
+            ),
+            (
+                "a sub-agent's header that names the notified thread as its root",
+                codex_session_meta(&child_meta(CHILD, ID, ID, &spawned)),
+            ),
+            (
+                "no session_id",
+                codex_session_meta(&format!(r#"{{"id":"{ID}","source":"cli"}}"#)),
+            ),
+            (
+                "session_id is not a string",
+                codex_session_meta(&format!(r#"{{"id":"{ID}","session_id":7,"source":"cli"}}"#)),
+            ),
+            (
+                "session_id is not a strict ID",
+                codex_session_meta(&meta(ID, "x'; rm -rf ~'", &spawned)),
+            ),
+            (
+                "session_id is uppercase",
+                codex_session_meta(&meta(ID, &CHILD.to_uppercase(), &spawned)),
+            ),
+            (
+                "a foreign session_id under a string source",
+                codex_session_meta(&meta(ID, CHILD, r#""cli""#)),
+            ),
+            (
+                "a foreign session_id without a source",
+                codex_session_meta(&format!(r#"{{"id":"{ID}","session_id":"{CHILD}"}}"#)),
+            ),
+            (
+                "a foreign session_id under an object source that names no sub-agent",
+                codex_session_meta(&meta(ID, CHILD, r#"{"custom":"x"}"#)),
+            ),
+            (
+                "a foreign session_id under a string source spelled like the member",
+                codex_session_meta(&meta(ID, CHILD, r#""subagent""#)),
+            ),
+            (
+                "the wrong record type",
+                format!(
+                    r#"{{"timestamp":"2026-10-04T17:49:56.012Z","ordinal":0,"type":"turn_context","payload":{}}}"#,
+                    meta(ID, ID, r#""cli""#)
+                ) + "\n",
+            ),
+            (
+                "no record type",
+                format!(r#"{{"payload":{}}}"#, meta(ID, ID, r#""cli""#)) + "\n",
+            ),
+            ("no payload", "{\"type\":\"session_meta\"}\n".to_string()),
+            ("a JSON array", "[]\n".to_string()),
+            ("not JSON", "not json\n".to_string()),
+            (
+                "a blank first line",
+                format!("\n{}", codex_session_meta(&meta(ID, ID, r#""cli""#))),
+            ),
+        ] {
+            let home = temp("codex_capture_unclassified");
+            install_codex_rollout(&home, ID, header);
+            assert_eq!(resolve(&home, ID), None, "{what}");
+        }
+    }
+
+    /// A reader that races the header's write can observe any prefix of it.
+    /// Only the terminated line is a header: the empty file and the complete
+    /// object without its newline are both refused.
+    #[test]
+    fn parse_capture_refuses_empty_and_torn_headers() {
+        let home = temp("codex_capture_torn");
+        let header = codex_session_meta(&meta(ID, ID, r#""cli""#));
+        for cut in 0..header.len() {
+            install_codex_rollout(&home, ID, &header[..cut]);
+            assert_eq!(resolve(&home, ID), None, "{:?}", &header[..cut]);
+        }
+        install_codex_rollout(&home, ID, &header);
+        assert_eq!(resolve(&home, ID).as_deref(), Some(ID));
+    }
+
+    /// The first line must end within [`HEADER_MAX`] bytes, terminator
+    /// included. The bound applies to the line, not the file.
+    #[test]
+    fn parse_capture_bounds_the_header_line() {
+        let home = temp("codex_capture_bound");
+        let header = |pad: usize| {
+            codex_session_meta(&format!(
+                r#"{{"id":"{ID}","session_id":"{ID}","source":"cli","base_instructions":{{"text":"{}"}}}}"#,
+                "x".repeat(pad)
+            ))
+        };
+        let max = usize::try_from(HEADER_MAX).unwrap();
+        let fill = max - header(0).len();
+
+        let at_bound = header(fill);
+        assert_eq!(at_bound.len(), max);
+        install_codex_rollout(&home, ID, at_bound.clone() + &at_bound);
+        assert_eq!(resolve(&home, ID).as_deref(), Some(ID));
+
+        let over = header(fill + 1);
+        assert_eq!(over.len(), max + 1);
+        install_codex_rollout(&home, ID, over);
+        assert_eq!(resolve(&home, ID), None);
+    }
+
+    /// Nothing past the first line is examined: a header alone resolves, and
+    /// a body that is neither JSON nor UTF-8 changes nothing.
+    #[test]
+    fn parse_capture_reads_nothing_after_the_header() {
+        let home = temp("codex_capture_body");
+        let header = codex_session_meta(&meta(ID, ID, r#""cli""#));
+        install_codex_rollout(&home, ID, &header);
+        assert_eq!(resolve(&home, ID).as_deref(), Some(ID));
+
+        let mut with_body = header.into_bytes();
+        with_body.extend_from_slice(b"\xff\xfe not json\n{\"type\":\"session_meta\"");
+        install_codex_rollout(&home, ID, with_body);
+        assert_eq!(resolve(&home, ID).as_deref(), Some(ID));
+    }
+
+    /// A rollout that cannot be read as a file, and a first line that is not
+    /// UTF-8, are refused. The invalid byte sits inside a string the gate
+    /// does not read, so only strict decoding refuses it.
+    #[test]
+    fn parse_capture_refuses_an_unreadable_header() {
+        let home = temp("codex_capture_unreadable");
+        let path = install_codex_root(&home, ID);
+        fs::remove_file(&path).unwrap();
+        fs::create_dir(&path).unwrap();
+        assert_eq!(resolve(&home, ID), None, "a directory");
+
+        fs::remove_dir(&path).unwrap();
+        let header = codex_session_meta(&format!(
+            r#"{{"id":"{ID}","session_id":"{ID}","source":"cli","cwd":"/w"}}"#
+        ));
+        install_codex_rollout(&home, ID, &header);
+        assert_eq!(resolve(&home, ID).as_deref(), Some(ID));
+        let mut bytes = header.into_bytes();
+        let cwd = bytes.windows(2).position(|w| w == b"/w").unwrap();
+        bytes.insert(cwd, 0xff);
+        install_codex_rollout(&home, ID, bytes);
+        assert_eq!(resolve(&home, ID), None, "invalid UTF-8");
     }
 
     /// Notification chaining reads `config.toml` and ignores sibling files.

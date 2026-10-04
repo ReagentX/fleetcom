@@ -23,6 +23,10 @@ const RUN_MARKER: &str = "-- run --";
 /// Fixed v7-shaped thread ID reported by the `codex` stub.
 const CODEX_ID: &str = "019f5453-de22-7240-b2e5-0d32692aa6d9";
 
+/// Config override that follows the notify override on every instrumented
+/// `codex` launch and keeps it in embedded mode.
+const CODEX_EMBEDDED: &str = "features.daemon_auto_start=false";
+
 /// Scratch tree containing every executable, store, working directory, and argv
 /// record used by one test.
 struct Scratch {
@@ -154,12 +158,17 @@ printf 'Resume this session with:\nclaude --resume %s\n' "$id""#,
     install_stub(s, "claude", &body);
 }
 
-/// `codex` stub that records argv and writes `CODEX_ID` only to the capture
-/// file.
+/// `codex` stub that records argv and reports `CODEX_ID` only through the
+/// capture file. Like a real root thread, it saves its rollout header under
+/// `$CODEX_HOME` before it notifies: `session_id` equals `id` and `source` is
+/// a string.
 fn install_codex_stub(s: &Scratch) {
     let body = format!(
         r#"printf '%s\n' '{marker}' "$@" >> '{rec}'
 if [ -n "$FLEETCOM_CAPTURE_FILE" ]; then
+  day="$CODEX_HOME/sessions/2026/10/04"
+  mkdir -p "$day"
+  printf '%s\n' '{{"timestamp":"2026-10-04T17:49:56.012Z","ordinal":0,"type":"session_meta","payload":{{"id":"{id}","session_id":"{id}","source":"cli"}}}}' > "$day/rollout-2026-10-04T13-49-56-{id}.jsonl"
   printf '{{"type":"agent-turn-complete","thread-id":"{id}"}}' > "$FLEETCOM_CAPTURE_FILE"
 fi"#,
         marker = RUN_MARKER,
@@ -337,6 +346,11 @@ fn codex_capture_file_drives_save_and_load_resumes() {
         .map(PathBuf::from)
         .unwrap_or_else(|| panic!("spawn must route notify at one script: {argv:?}"));
     assert_daemon_namespaced(&script, daemon.0.id(), "notify script", &argv);
+    assert_eq!(
+        argv,
+        ["-c", notify.as_str(), "-c", CODEX_EMBEDDED],
+        "a bare spawn must receive the two overrides and nothing else"
+    );
 
     // The stub exits silently, so its capture write is the only id channel;
     // wait for the file, then a single save must persist the resuming form.
@@ -360,9 +374,9 @@ fn codex_capture_file_drives_save_and_load_resumes() {
         "the respawn must lead with the resume form: {argv:?}"
     );
     assert_eq!(
-        value_after(&argv, "-c"),
-        notify,
-        "the respawn must be re-instrumented with the notify override: {argv:?}"
+        argv[2..],
+        ["-c", notify.as_str(), "-c", CODEX_EMBEDDED],
+        "the respawn must be re-instrumented with both overrides: {argv:?}"
     );
 
     stop_daemon(&mut daemon);
