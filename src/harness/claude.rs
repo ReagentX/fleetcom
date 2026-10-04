@@ -2,6 +2,13 @@
 //! hook, and the live session registry. Bare launches pin a v4 UUID; accepted
 //! launches install the hook through `--settings`.
 //! Live lookup reads `<claude-home>/sessions/<pid>.json`.
+//!
+//! Claude can move a conversation into its own background daemon. The daemon's
+//! processes inherit the capture environment and the `--settings` flag, so
+//! they fire the same hook against the task's capture file with IDs that are
+//! not the task's conversation. The overlay disables agent view, which removes
+//! those handoffs, and the hook stamps the PID of the Claude process that ran
+//! it, so `parse_capture` accepts a payload from the task's own process alone.
 
 use std::{
     fs,
@@ -44,8 +51,26 @@ impl Harness for Claude {
         plan
     }
 
-    fn parse_capture(&self, payload: &str) -> Option<String> {
-        capture_id(&jzon::parse(payload).ok()?, "session_id")
+    /// Accept a hook payload only from the task's own process. The first line
+    /// is the PID of the Claude process that ran the hook and must be exactly
+    /// the decimal form of `pid`; the remainder is the hook's JSON. The JSON
+    /// cannot identify the writer: `/branch` in the task's process and a
+    /// background fork both report `source: "fork"`.
+    ///
+    /// The task leader is the Claude process only when `$SHELL -c` replaces
+    /// itself with the command, the precondition [`record_for_pid`] shares. A
+    /// shell retained as task leader never matches the stamp: the capture is
+    /// refused, and the registry and the spawn-time ID decide. Without a PID
+    /// there is no owner to match.
+    fn parse_capture(
+        &self,
+        payload: &str,
+        pid: Option<u32>,
+        // Ownership is decided by the stamp alone.
+        _home: Option<&Path>,
+    ) -> Option<String> {
+        let json = payload.strip_prefix(&format!("{}\n", pid?))?;
+        capture_id(&jzon::parse(json).ok()?, "session_id")
     }
 
     fn live_session_id(
@@ -242,20 +267,97 @@ mod tests {
         assert_eq!(plan.env.len(), 1, "env still names the capture file");
     }
 
-    #[test]
-    fn parse_capture_returns_only_strict_ids() {
-        let payload = format!(
-            r#"{{"session_id":"{ID}","transcript_path":"/t/x.jsonl","cwd":"/w","hook_event_name":"SessionStart","source":"startup"}}"#
-        );
-        assert_eq!(Claude.parse_capture(&payload).as_deref(), Some(ID));
+    /// Task leader PID used by the capture-gate cases.
+    const OWNER: u32 = 4242;
 
-        assert_eq!(Claude.parse_capture(r#"{"session_id":"NOT-VALID"}"#), None);
-        assert_eq!(
-            Claude.parse_capture(r#"{"session_id":"x'; rm -rf ~'"}"#),
-            None
-        );
-        assert_eq!(Claude.parse_capture("not json"), None);
-        assert_eq!(Claude.parse_capture("{}"), None);
+    /// `SessionStart` JSON as the hook receives it: one object and a trailing
+    /// newline.
+    fn hook_json(id: &str, source: &str) -> String {
+        format!(
+            r#"{{"session_id":"{id}","transcript_path":"/t/x.jsonl","cwd":"/w","hook_event_name":"SessionStart","source":"{source}"}}"#
+        ) + "\n"
+    }
+
+    /// Parse `payload` as the capture file of a task led by [`OWNER`].
+    fn parse_owned(payload: &str) -> Option<String> {
+        Claude.parse_capture(payload, Some(OWNER), None)
+    }
+
+    /// The leader's stamp is accepted for every `source`, including the
+    /// `fork` that `/branch` reports from the task's own process.
+    #[test]
+    fn parse_capture_accepts_the_task_leaders_stamp() {
+        for source in ["startup", "resume", "clear", "fork"] {
+            let payload = format!("{OWNER}\n{}", hook_json(ID, source));
+            assert_eq!(parse_owned(&payload).as_deref(), Some(ID), "{source}");
+        }
+    }
+
+    /// Any other PID is another process's session, including PIDs that share
+    /// a decimal prefix with the leader's and a leader that has no PID.
+    #[test]
+    fn parse_capture_refuses_a_foreign_stamp() {
+        let json = hook_json(ID, "startup");
+        for foreign in [1, 424, 4243, 42420, 14242] {
+            assert_eq!(
+                parse_owned(&format!("{foreign}\n{json}")),
+                None,
+                "{foreign}"
+            );
+        }
+        let owned = format!("{OWNER}\n{json}");
+        assert_eq!(Claude.parse_capture(&owned, Some(424), None), None);
+        assert_eq!(Claude.parse_capture(&owned, Some(42420), None), None);
+        assert_eq!(Claude.parse_capture(&owned, None, None), None);
+    }
+
+    /// The first line must be exactly the leader's decimal PID. The unstamped
+    /// format an older overlay wrote fails here: its first line is the JSON.
+    #[test]
+    fn parse_capture_refuses_a_missing_or_malformed_stamp() {
+        let json = hook_json(ID, "startup");
+        assert_eq!(parse_owned(&json), None, "bare JSON");
+        assert_eq!(parse_owned(json.trim_end()), None, "bare JSON, no newline");
+        for stamp in [
+            "", "pid", "+4242", "-4242", "04242", " 4242", "4242 ", "4242\r", "0x1092", "4242.0",
+        ] {
+            assert_eq!(parse_owned(&format!("{stamp}\n{json}")), None, "{stamp:?}");
+        }
+    }
+
+    /// The hook truncates the file, writes the stamp, then copies the JSON, so
+    /// a reader can observe every prefix of a complete capture.
+    #[test]
+    fn parse_capture_refuses_empty_and_torn_payloads() {
+        let complete = format!("{OWNER}\n{}", hook_json(ID, "startup"));
+        assert_eq!(parse_owned(&complete).as_deref(), Some(ID));
+        // Dropping the trailing newline leaves the object whole; every
+        // shorter prefix lacks the stamp, its newline, or the object's close.
+        let whole = complete.trim_end().len();
+        for cut in 0..whole {
+            assert_eq!(
+                parse_owned(&complete[..cut]),
+                None,
+                "{:?}",
+                &complete[..cut]
+            );
+        }
+        assert_eq!(parse_owned(&complete[..whole]).as_deref(), Some(ID));
+    }
+
+    /// A valid stamp does not relax the shell-insertion boundary.
+    #[test]
+    fn parse_capture_returns_only_strict_ids_under_a_valid_stamp() {
+        for json in [
+            r#"{"session_id":"NOT-VALID"}"#,
+            r#"{"session_id":"x'; rm -rf ~'"}"#,
+            r#"{"session_id":"C8C4A5CC-0B32-4BA0-A6B4-6ED08C218E0D"}"#,
+            r#"{"session_id":7}"#,
+            "not json",
+            "{}",
+        ] {
+            assert_eq!(parse_owned(&format!("{OWNER}\n{json}\n")), None, "{json}");
+        }
     }
 
     /// A complete matching record exposes its validated session ID.

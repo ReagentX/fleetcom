@@ -88,6 +88,15 @@ fn install_status_record(home: &Path, pid: u32, cwd: &Path, status: &str) {
     .unwrap();
 }
 
+/// Capture-file contents as the task's own `SessionStart` hook writes them:
+/// the leader PID on the first line, then the hook's JSON and its newline.
+fn stamped(task: &Task, json: &str) -> String {
+    format!(
+        "{}\n{json}\n",
+        task.pid().expect("a spawned task has a pid")
+    )
+}
+
 /// Save a recipe and return its persisted JSON.
 fn save_and_read(s: &mut Supervisor, config: &Path, name: &str) -> String {
     s.apply(Command::SaveSession { name: name.into() });
@@ -243,8 +252,11 @@ fn rerun_resumes_the_captured_conversation() {
     let cap = s.tasks[0].capture_file.clone().expect("capture file set");
     std::fs::write(
         &cap,
-        format!(
-            r#"{{"session_id":"{CAP_OTHER}","hook_event_name":"SessionStart","source":"clear"}}"#
+        stamped(
+            &s.tasks[0],
+            &format!(
+                r#"{{"session_id":"{CAP_OTHER}","hook_event_name":"SessionStart","source":"clear"}}"#
+            ),
         ),
     )
     .unwrap();
@@ -293,11 +305,12 @@ fn rerun_cannot_read_the_old_runs_stale_capture() {
     spawn(&mut s, "claude", dir.to_path_buf());
     let id = s.tasks[0].id;
     // The old run's final capture becomes the new run's launch ID.
-    let stale = format!(
-        r#"{{"session_id":"{CAP_OTHER}","hook_event_name":"SessionStart","source":"startup"}}"#
-    );
     let old_cap = s.tasks[0].capture_file.clone().expect("capture file set");
-    std::fs::write(&old_cap, format!(r#"{{"session_id":"{CAP_ID}"}}"#)).unwrap();
+    std::fs::write(
+        &old_cap,
+        stamped(&s.tasks[0], &format!(r#"{{"session_id":"{CAP_ID}"}}"#)),
+    )
+    .unwrap();
     assert!(reap_until(&mut s, Duration::from_secs(5), |s| s.tasks[0]
         .finished
         .is_some()));
@@ -312,6 +325,13 @@ fn rerun_cannot_read_the_old_runs_stale_capture() {
     );
 
     // A late hook write can recreate the old path, but the new run cannot read it.
+    // The stamp names the new run's leader, so the path alone keeps it out.
+    let stale = stamped(
+        &s.tasks[0],
+        &format!(
+            r#"{{"session_id":"{CAP_OTHER}","hook_event_name":"SessionStart","source":"startup"}}"#
+        ),
+    );
     std::fs::write(&old_cap, &stale).unwrap();
     let text = save_and_read(&mut s, &config, "stalecap");
     assert!(
@@ -618,7 +638,7 @@ fn printed_resume_hints_do_not_change_saved_recovery_or_rerun_commands() {
             "claude" => {
                 std::fs::write(
                     s.tasks[0].capture_file.as_ref().unwrap(),
-                    format!(r#"{{"session_id":"{CAP_OTHER}"}}"#),
+                    stamped(&s.tasks[0], &format!(r#"{{"session_id":"{CAP_OTHER}"}}"#)),
                 )
                 .unwrap();
                 Some(CAP_OTHER.to_string())
@@ -780,8 +800,11 @@ fn resume_id_precedence_registry_over_spawn_under_capture() {
     let cap = s.tasks[0].capture_file.clone().expect("capture file set");
     std::fs::write(
         &cap,
-        format!(
-            r#"{{"session_id":"{CAP_OTHER}","hook_event_name":"SessionStart","source":"clear"}}"#
+        stamped(
+            &s.tasks[0],
+            &format!(
+                r#"{{"session_id":"{CAP_OTHER}","hook_event_name":"SessionStart","source":"clear"}}"#
+            ),
         ),
     )
     .unwrap();
@@ -791,6 +814,124 @@ fn resume_id_precedence_registry_over_spawn_under_capture() {
         "the capture file must beat the registry; got {text}"
     );
     std::fs::write(&done, b"").unwrap();
+}
+
+/// Session ID reported by a process that is not the task.
+const FOREIGN_ID: &str = "22222222-3333-4444-8555-666666666666";
+
+/// The installed hook, fired by a process other than the task leader, replaces
+/// the capture with that process's session. The stamp names the foreign
+/// parent, so the capture is refused: the spawn-time ID decides, then the
+/// registry once it holds a record.
+#[test]
+fn capture_stamped_by_a_foreign_process_falls_back_to_the_next_source() {
+    let dir = scratch("cap_foreign");
+    let (bin, runtime, config) = (dir.join("bin"), dir.join("run"), dir.join("config"));
+    let claude_home = dir.join("claude_home");
+    let json = |id: &str, source: &str| {
+        format!(r#"{{"session_id":"{id}","hook_event_name":"SessionStart","source":"{source}"}}"#)
+    };
+    // `/bin/sh -c` execs the stub in place, so the stub is the task leader.
+    // Each marker releases one stage. The first runs the hook as the leader's
+    // child, where `$PPID` is the leader, as in the task's own Claude process.
+    // The second runs it under an intermediate shell that inherits the same
+    // environment, as a session in Claude's daemon does: the trailing `:`
+    // stops that shell from replacing itself with the pipeline's last command,
+    // so the hook's `$PPID` is the intermediate shell and not the leader.
+    install_script(
+        &bin,
+        "claude",
+        &format!(
+            r#"until [ -e '{d}/own' ]; do sleep 0.05; done
+printf '%s\n' '{own}' | sh '{d}/hook'
+: > '{d}/own-done'
+until [ -e '{d}/foreign' ]; do sleep 0.05; done
+sh -c 'printf "%s\n" "$1" | sh "$0"; :' '{d}/hook' '{foreign}'
+: > '{d}/foreign-done'
+until [ -e '{d}/done' ]; do sleep 0.05; done"#,
+            d = dir.display(),
+            own = json(CAP_OTHER, "clear"),
+            foreign = json(FOREIGN_ID, "startup"),
+        ),
+    );
+    let mut s = sup_ctx(agent_ctx_plus(
+        &bin,
+        &runtime,
+        dir.to_path_buf(),
+        &[
+            ("FLEETCOM_CONFIG_DIR", &config),
+            ("CLAUDE_CONFIG_DIR", &claude_home),
+        ],
+    ));
+    spawn(&mut s, "claude", dir.to_path_buf());
+    let pinned = s.tasks[0]
+        .resume_id
+        .clone()
+        .expect("a fresh claude launch pins an id");
+    let pid = s.tasks[0].pid().expect("a live task has a pid");
+    let cap = s.tasks[0].capture_file.clone().expect("capture file set");
+
+    // Both stages run the hook command as the installed overlay carries it.
+    let overlay = std::fs::read_to_string(cap.with_file_name("claude-settings.json")).unwrap();
+    let hook = jzon::parse(&overlay).unwrap()["hooks"]["SessionStart"][0]["hooks"][0]["command"]
+        .as_str()
+        .expect("the overlay must carry the hook command")
+        .to_string();
+    std::fs::write(dir.join("hook"), hook).unwrap();
+
+    std::fs::write(dir.join("own"), b"").unwrap();
+    assert!(
+        wait_until(Duration::from_secs(5), || dir.join("own-done").exists()),
+        "the stub never ran the hook as the leader's child"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&cap).unwrap(),
+        format!("{pid}\n{}\n", json(CAP_OTHER, "clear")),
+        "the leader's own hook must stamp the leader's pid"
+    );
+    assert_eq!(
+        current_resume_id(&s.tasks[0]).as_deref(),
+        Some(CAP_OTHER),
+        "the task's own capture must beat the pin"
+    );
+
+    std::fs::write(dir.join("foreign"), b"").unwrap();
+    assert!(
+        wait_until(Duration::from_secs(5), || dir.join("foreign-done").exists()),
+        "the stub never ran the hook under the intermediate shell"
+    );
+    let text = std::fs::read_to_string(&cap).unwrap();
+    let (stamp, rest) = text
+        .split_once('\n')
+        .expect("the hook must write a stamp line");
+    assert_eq!(
+        rest,
+        format!("{}\n", json(FOREIGN_ID, "startup")),
+        "the foreign session must have replaced the task's capture"
+    );
+    assert!(
+        stamp.parse::<u32>().is_ok_and(|p| p != pid),
+        "the stamp must name the hook's own parent, not the leader: {stamp:?}"
+    );
+
+    // No registry record exists yet, so the refused capture leaves the pin.
+    assert_eq!(
+        current_resume_id(&s.tasks[0]).as_deref(),
+        Some(pinned.as_str()),
+        "a foreign capture must fall through to the spawn-time id"
+    );
+    install_status_record(&claude_home, pid, &dir, r#""status":"idle""#);
+    assert_eq!(
+        current_resume_id(&s.tasks[0]).as_deref(),
+        Some(CAP_ID),
+        "a foreign capture must fall through to the registry"
+    );
+    let text = save_and_read(&mut s, &config, "foreign");
+    assert!(
+        text.contains(&format!("claude --resume '{CAP_ID}'")) && !text.contains(FOREIGN_ID),
+        "the recipe must never resume the foreign session; got {text}"
+    );
+    std::fs::write(dir.join("done"), b"").unwrap();
 }
 
 /// Two tasks sharing a directory do not own a nearby rollout. Named saves
@@ -1227,8 +1368,11 @@ fn recovery_cadence_rewrites_on_capture_drift_and_skips_when_static() {
     let cap = s.tasks[0].capture_file.clone().expect("capture file set");
     std::fs::write(
         &cap,
-        format!(
-            r#"{{"session_id":"{CAP_OTHER}","hook_event_name":"SessionStart","source":"clear"}}"#
+        stamped(
+            &s.tasks[0],
+            &format!(
+                r#"{{"session_id":"{CAP_OTHER}","hook_event_name":"SessionStart","source":"clear"}}"#
+            ),
         ),
     )
     .unwrap();

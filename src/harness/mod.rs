@@ -71,9 +71,17 @@ pub trait Harness: Sync {
         home: Option<&Path>,
     ) -> SpawnPlan;
 
-    /// Extract a session ID from hook or notify JSON. Defaults to `None` for
-    /// tools without an injected capture channel.
-    fn parse_capture(&self, _payload: &str) -> Option<String> {
+    /// Extract a session ID from the capture file's contents. `pid` is the
+    /// task's session leader and `home` the launch-time harness home: a
+    /// harness whose capture channel is reachable from other processes uses
+    /// them to refuse a payload the task's own process did not write.
+    /// Defaults to `None` for tools without an injected capture channel.
+    fn parse_capture(
+        &self,
+        _payload: &str,
+        _pid: Option<u32>,
+        _home: Option<&Path>,
+    ) -> Option<String> {
         None
     }
 

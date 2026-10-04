@@ -58,7 +58,12 @@ impl Harness for Codex {
         }
     }
 
-    fn parse_capture(&self, payload: &str) -> Option<String> {
+    fn parse_capture(
+        &self,
+        payload: &str,
+        _pid: Option<u32>,
+        _home: Option<&Path>,
+    ) -> Option<String> {
         let v = jzon::parse(payload).ok()?;
         if v["type"].as_str() != Some("agent-turn-complete") {
             return None;
@@ -546,15 +551,16 @@ mod tests {
         let payload = format!(
             r#"{{"type":"agent-turn-complete","thread-id":"{ID}","turn-id":"t","cwd":"/w"}}"#
         );
-        assert_eq!(Codex.parse_capture(&payload).as_deref(), Some(ID));
+        let parse = |payload: &str| Codex.parse_capture(payload, None, None);
+        assert_eq!(parse(&payload).as_deref(), Some(ID));
 
         let wrong_type = format!(r#"{{"type":"other","thread-id":"{ID}"}}"#);
-        assert_eq!(Codex.parse_capture(&wrong_type), None);
+        assert_eq!(parse(&wrong_type), None);
         assert_eq!(
-            Codex.parse_capture(r#"{"type":"agent-turn-complete","thread-id":"my session"}"#),
+            parse(r#"{"type":"agent-turn-complete","thread-id":"my session"}"#),
             None
         );
-        assert_eq!(Codex.parse_capture("not json"), None);
+        assert_eq!(parse("not json"), None);
     }
 
     /// Notification chaining reads `config.toml` and ignores sibling files.

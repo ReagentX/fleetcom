@@ -8,11 +8,15 @@
 //! `install` reaps sibling namespaces whose owner no longer exists.
 //!
 //! Asset contracts:
-//! - `claude`: `--settings <claude-settings.json>` layers a `SessionStart` hook
-//!   (`cat > "$FLEETCOM_CAPTURE_FILE"`) over the user's settings. The hook
-//!   copies each JSON payload from stdin into the path named by
-//!   [`CAPTURE_ENV`](super::CAPTURE_ENV), which `fleetcom` sets in the task's
-//!   environment.
+//! - `claude`: `--settings <claude-settings.json>` layers two keys over the
+//!   user's settings for that process alone. `disableAgentView` turns off
+//!   `claude agents`, `--bg`, `/background`, and the on-demand daemon, so the
+//!   conversation stays in the task's process. A `SessionStart` hook
+//!   (`{ printf '%s\n' "$PPID"; cat; } > "$FLEETCOM_CAPTURE_FILE"`) overwrites
+//!   the path named by [`CAPTURE_ENV`](super::CAPTURE_ENV), which `fleetcom`
+//!   sets in the task's environment: the first line is the PID of the Claude
+//!   process that ran the hook, and the remainder is the JSON payload from
+//!   stdin, unmodified.
 //! - `codex`: `-c notify=["<codex-notify.sh>"]` names an executable that
 //!   `codex` invokes with notification JSON. The script writes its first
 //!   argument verbatim (no trailing newline) over `$FLEETCOM_CAPTURE_FILE`,
@@ -87,16 +91,31 @@ export default function (pi) {
 }
 "#;
 
-/// Build the `claude` settings overlay containing the `SessionStart` hook.
+/// Build the `claude` settings overlay: `disableAgentView` and the
+/// `SessionStart` capture hook.
+///
+/// With agent view on, Claude can park or fork a conversation into its own
+/// daemon, whose processes inherit [`CAPTURE_ENV`](super::CAPTURE_ENV) and
+/// this overlay and then report sessions that are not the task's. The setting
+/// applies to the launched process only. `CLAUDE_CODE_DISABLE_AGENT_VIEW=1` is
+/// equivalent but would also reach the agent's child processes.
+///
+/// The hook's shell is a child of the Claude process that fired it, so `$PPID`
+/// stamps that process's PID ahead of the payload. `Claude::parse_capture`
+/// compares the stamp with the task leader.
 fn claude_settings_json() -> String {
     jzon::object! {
+        "disableAgentView": true,
         "hooks": {
             "SessionStart": [
                 {
                     "hooks": [
                         {
                             "type": "command",
-                            "command": format!("cat > \"${}\"", super::CAPTURE_ENV),
+                            "command": format!(
+                                r#"{{ printf '%s\n' "$PPID"; cat; }} > "${}""#,
+                                super::CAPTURE_ENV
+                            ),
                         },
                     ],
                 },
@@ -244,7 +263,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        harness::{CAPTURE_ENV, NOTIFY_CHAIN_ENV, fixtures::ID},
+        harness::{CAPTURE_ENV, Claude, Harness, NOTIFY_CHAIN_ENV, fixtures::ID},
         testutil::{dead_pid, install_fake_notifier, temp, write_executable},
     };
 
@@ -582,13 +601,32 @@ mod tests {
         assert_eq!(fs::read_to_string(&record).unwrap(), "payload\n");
     }
 
-    /// The hook command serialized into the settings file copies stdin into
-    /// the configured capture file.
+    /// The overlay is valid JSON that disables agent view and carries the
+    /// stamped hook command verbatim.
     #[test]
-    fn hook_command_from_settings_copies_stdin_to_the_capture_file() {
+    fn claude_settings_disable_agent_view_and_stamp_the_hook() {
+        let parsed = jzon::parse(&claude_settings_json()).expect("the overlay must be valid JSON");
+        assert_eq!(parsed["disableAgentView"].as_bool(), Some(true));
+        assert_eq!(
+            parsed["hooks"]["SessionStart"][0]["hooks"][0]["command"].as_str(),
+            Some(r#"{ printf '%s\n' "$PPID"; cat; } > "$FLEETCOM_CAPTURE_FILE""#)
+        );
+        assert_eq!(
+            parsed["hooks"]["SessionStart"][0]["hooks"][0]["type"].as_str(),
+            Some("command")
+        );
+    }
+
+    /// The hook command serialized into the settings file writes its parent's
+    /// PID, then stdin, over the configured capture file. Only that parent
+    /// passes the capture gate.
+    #[test]
+    fn hook_command_from_settings_stamps_its_parent_and_copies_stdin() {
         let root = temp("assets_hook");
         let assets = CaptureAssets::install(&root, std::process::id()).unwrap();
         let cap = assets.paths_for(2, 0).capture_file;
+        // An earlier, longer capture must not survive the next write.
+        fs::write(&cap, "9".repeat(4096)).unwrap();
 
         let text = fs::read_to_string(&assets.claude_settings).unwrap();
         let parsed = jzon::parse(&text).unwrap();
@@ -596,9 +634,12 @@ mod tests {
             .as_str()
             .expect("settings must carry the hook command");
 
+        // Claude ends the hook's JSON with a newline.
         let payload = format!(
             r#"{{"session_id":"{ID}","hook_event_name":"SessionStart","source":"startup"}}"#
-        );
+        ) + "\n";
+        // This process spawns the hook's shell directly, as Claude does.
+        let parent = std::process::id();
         let mut child = Command::new("sh")
             .arg("-c")
             .arg(command)
@@ -614,7 +655,15 @@ mod tests {
             .write_all(payload.as_bytes())
             .unwrap();
         assert!(child.wait().unwrap().success());
-        assert_eq!(fs::read_to_string(&cap).unwrap(), payload);
+        let written = fs::read_to_string(&cap).unwrap();
+        assert_eq!(written, format!("{parent}\n{payload}"));
+        assert_eq!(
+            Claude
+                .parse_capture(&written, Some(parent), None)
+                .as_deref(),
+            Some(ID)
+        );
+        assert_eq!(Claude.parse_capture(&written, Some(parent + 1), None), None);
     }
 
     /// Drop removes only the owned namespace and its contents.

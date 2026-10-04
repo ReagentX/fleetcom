@@ -78,7 +78,7 @@ mod tests {
     fn parse_capture_is_unconditionally_none() {
         // No injected channel exists, so no payload is ever trusted.
         let payload = format!(r#"{{"session_id":"{ID}"}}"#);
-        assert_eq!(Grok.parse_capture(&payload), None);
-        assert_eq!(Grok.parse_capture(""), None);
+        assert_eq!(Grok.parse_capture(&payload, None, None), None);
+        assert_eq!(Grok.parse_capture("", None, None), None);
     }
 }

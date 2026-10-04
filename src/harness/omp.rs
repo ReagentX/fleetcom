@@ -41,7 +41,12 @@ impl Harness for Omp {
     }
 
     /// Return `sessionId` from a valid extension payload.
-    fn parse_capture(&self, payload: &str) -> Option<String> {
+    fn parse_capture(
+        &self,
+        payload: &str,
+        _pid: Option<u32>,
+        _home: Option<&Path>,
+    ) -> Option<String> {
         capture_id(&jzon::parse(payload).ok()?, "sessionId")
     }
 }
@@ -100,22 +105,23 @@ mod tests {
     /// Extract only a validated ID from the extension payload.
     #[test]
     fn parse_capture_returns_only_strict_ids() {
+        let parse = |payload: &str| Omp.parse_capture(payload, None, None);
         for reason in ["session_start", "session_switch"] {
             let payload = format!(
                 r#"{{"reason":"{reason}","sessionId":"{CAPTURED}","sessionFile":"/s/2026-08-15T22-13-39-854Z_{CAPTURED}.jsonl","cwd":"/work/proj"}}"#
             );
-            assert_eq!(Omp.parse_capture(&payload).as_deref(), Some(CAPTURED));
+            assert_eq!(parse(&payload).as_deref(), Some(CAPTURED));
         }
 
-        assert_eq!(Omp.parse_capture("not json"), None);
-        assert_eq!(Omp.parse_capture("{}"), None);
-        assert_eq!(Omp.parse_capture(r#"{"sessionId":"my session"}"#), None);
-        assert_eq!(Omp.parse_capture(r#"{"sessionId":"x'; rm -rf ~'"}"#), None);
+        assert_eq!(parse("not json"), None);
+        assert_eq!(parse("{}"), None);
+        assert_eq!(parse(r#"{"sessionId":"my session"}"#), None);
+        assert_eq!(parse(r#"{"sessionId":"x'; rm -rf ~'"}"#), None);
         // Reject uppercase hex during UUID validation.
         assert_eq!(
-            Omp.parse_capture(&format!(r#"{{"sessionId":"{}"}}"#, CAPTURED.to_uppercase())),
+            parse(&format!(r#"{{"sessionId":"{}"}}"#, CAPTURED.to_uppercase())),
             None
         );
-        assert_eq!(Omp.parse_capture(""), None);
+        assert_eq!(parse(""), None);
     }
 }

@@ -132,7 +132,9 @@ fn install_stub(s: &Scratch, name: &str, body: &str) {
 }
 
 /// `claude` stub that records argv, writes a `SessionStart` payload to the
-/// capture file, and prints a resumable exit hint.
+/// capture file, and prints a resumable exit hint. The payload carries the
+/// stamp the real hook writes on its first line: the shell execs the stub in
+/// place, so `$$` is the task leader PID.
 fn install_claude_stub(s: &Scratch) {
     let body = format!(
         r#"id=''
@@ -143,7 +145,7 @@ for a in "$@"; do
 done
 printf '%s\n' '{marker}' "$@" >> '{rec}'
 if [ -n "$id" ] && [ -n "$FLEETCOM_CAPTURE_FILE" ]; then
-  printf '{{"session_id":"%s","hook_event_name":"SessionStart","source":"startup"}}' "$id" > "$FLEETCOM_CAPTURE_FILE"
+  printf '%s\n{{"session_id":"%s","hook_event_name":"SessionStart","source":"startup"}}\n' "$$" "$id" > "$FLEETCOM_CAPTURE_FILE"
 fi
 printf 'Resume this session with:\nclaude --resume %s\n' "$id""#,
         marker = RUN_MARKER,
