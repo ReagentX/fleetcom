@@ -584,7 +584,7 @@ fn assert_wrapper_matches(file: &str, bytes: &[u8]) {
     emu.process(bytes);
     let (al_bytes, al_cursor, al_hidden) = ansi::formatted(&al);
     let (emu_bytes, emu_cursor, emu_hidden) = emu.formatted();
-    // `assert!`, not `assert_eq!`: a failure must not dump two serialized screens.
+    // Use `assert!` to omit both serialized screens from the failure output.
     assert!(emu_bytes == al_bytes, "{file}: styled cells");
     assert_eq!(emu.contents(), ansi::contents(&al), "{file}: screen");
     assert_eq!(

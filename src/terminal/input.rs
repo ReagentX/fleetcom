@@ -1,7 +1,7 @@
 //! The input-direction mirror of `ansi`: protocol events in, VT byte
 //! sequences out. Encoding only: no PTY writes and no `Task` state.
-//! `key_bytes` and `paste_bytes` take the child's negotiated modes as values;
-//! `mouse_bytes` reads its four off the `Emulator` its caller holds locked.
+//! Pass the child's negotiated modes as values to `key_bytes` and `paste_bytes`.
+//! For `mouse_bytes`, hold the `Emulator` lock while reading its four mouse modes.
 
 use crate::{
     emulator::{Emulator, MouseProtocolEncoding, MouseProtocolMode},
@@ -151,9 +151,9 @@ fn char_bytes(c: char, mods: Mods) -> Option<Vec<u8>> {
     Some(out)
 }
 
-/// The letter-final shape of cursor keys, Home/End, and F1–F4: SS3 `letter` when
-/// unmodified under `ss3`, CSI `letter` when unmodified otherwise, CSI `1;m letter`
-/// when modified.
+/// Encode cursor keys, Home/End, and F1–F4 with a final letter. For unmodified
+/// keys, use SS3 when `ss3` is true and CSI otherwise. With modifiers, use
+/// CSI `1;{m}{letter}`.
 fn letter_bytes(ss3: bool, letter: char, m: Option<u8>) -> Vec<u8> {
     match m {
         None if ss3 => format!("\x1bO{letter}"),
@@ -163,8 +163,8 @@ fn letter_bytes(ss3: bool, letter: char, m: Option<u8>) -> Vec<u8> {
     .into_bytes()
 }
 
-/// The tilde-final shape of the navigation cluster and F5–F12: CSI `n~`, or CSI
-/// `n;m~` when modified.
+/// Encode the navigation cluster and F5–F12 as CSI `n~`, or CSI `n;m~`
+/// with modifiers.
 fn tilde_bytes(n: u8, m: Option<u8>) -> Vec<u8> {
     match m {
         None => format!("\x1b[{n}~"),
@@ -225,7 +225,7 @@ pub fn key_bytes(app_cursor: bool, code: Key, mods: Mods) -> Option<Vec<u8>> {
         Key::Left => Some(letter_bytes(app_cursor, 'D', m)),
         Key::Home => Some(letter_bytes(app_cursor, 'H', m)),
         Key::End => Some(letter_bytes(app_cursor, 'F', m)),
-        // Navigation-cluster keys always use CSI `<n>~`.
+        // Encode navigation-cluster keys with CSI `<n>~`.
         Key::Insert => Some(tilde_bytes(2, m)),
         Key::Delete => Some(tilde_bytes(3, m)),
         Key::PageUp => Some(tilde_bytes(5, m)),

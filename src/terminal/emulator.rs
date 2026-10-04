@@ -469,9 +469,9 @@ impl Emulator {
 /// Capture accessors for the dashboard-preview resolution layer
 /// (`crate::preview`).
 impl Emulator {
-    /// Monotonic count of grid advances. Bumps on every `process` call, on
-    /// each sync-frame landing, and on `resize`; equal reads mean the grid did
-    /// not advance in between, so a poller can skip re-reading it.
+    /// Monotonic count of grid advances: incremented on every `process` call,
+    /// each sync-frame landing, and `resize`. If unchanged between polls,
+    /// skip re-reading the grid.
     pub fn revision(&self) -> u64 {
         self.revision
     }
@@ -545,13 +545,13 @@ fn live_floor_of(term: &Term<ProbeSink>) -> String {
 }
 
 /// Plain text of one live-viewport row: wide-character spacers omitted, tabs
-/// mapped to spaces, combining marks preserved, trailing padding trimmed. Rows
-/// `0..screen_lines` address live output regardless of the display
-/// offset; only display iteration follows the offset.
+/// mapped to spaces, combining marks preserved, trailing padding trimmed.
+/// Index rows `0..screen_lines` for live output regardless of the display
+/// offset; apply the offset only when iterating for display.
 ///
-/// Unlike [`crate::ansi::contents`], this scan view preserves glyphs in
-/// concealed (SGR 8) cells and orphaned wide halves. Harness matchers inspect
-/// stored grid text, not replay-equivalent display text.
+/// Unlike [`crate::ansi::contents`], preserve glyphs in concealed (SGR 8) cells
+/// and orphaned wide halves: match harness output against stored grid text,
+/// not replay-equivalent display text.
 fn live_row_text_of(term: &Term<ProbeSink>, row: i32) -> String {
     let mut text = String::new();
     for cell in &term.grid()[Line(row)] {
@@ -612,10 +612,11 @@ const TITLE_STACK_SHADOW_MAX: usize = 4096;
 ///
 /// # Forwarding invariant
 ///
-/// `Handler` methods default to no-ops, so every method must delegate to `Term`.
-/// The `golden::wrapper_*` tests detect missing delegation: each replays one raw fixture
-/// through wrapper and raw backend, then compares styled bytes, text, cursor, and alt bit.
-/// `clipboard_store` is captured by this wrapper instead of delegated.
+/// Delegate every `Handler` method to `Term` to avoid the default no-op.
+/// Check delegation in `golden::wrapper_*`: replay each raw fixture through
+/// the wrapper and raw backend, then compare styled bytes, text, cursor, and
+/// alternate-screen state. Capture `clipboard_store` in this wrapper instead
+/// of delegating it.
 ///
 /// # Synchronized updates
 ///
