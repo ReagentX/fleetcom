@@ -361,11 +361,11 @@ pub struct ScreenView {
 
 // --- wire format -------------------------------------------------------------
 //
-// Control messages (every `Command`, and every event but `Screen`) go over as
-// jzon: low-frequency and human-debuggable. The `Screen` event is the exception:
-// its `contents_formatted` bytes are the high-frequency firehose, so they ride a
-// raw tail after a small jzon header rather than bloating into a JSON number
-// array. A socket peer is just `decode_*(read_frame(...))`.
+// Encode control messages (every `Command`, and every event but `Screen`) as
+// jzon: low-frequency and human-debuggable. For the high-frequency `Screen`
+// events, append raw `contents_formatted` bytes after a small jzon header to
+// avoid expansion into a JSON number array. Decode at the socket peer with
+// `decode_*(read_frame(...))`.
 
 /// Encode an `OsStr` as lossless base64 for a JSON string.
 fn os_b64(s: &OsStr) -> String {

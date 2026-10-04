@@ -288,9 +288,9 @@ pub struct App {
     /// Set by an external SIGTERM/SIGHUP/SIGINT; the loop treats it as quit so
     /// teardown runs and the terminal is restored.
     term_signal: Arc<AtomicBool>,
-    /// Set to leave the run loop, and how: `q`/Ctrl-C/signals disconnect
-    /// (daemon + tasks survive), `Q` quits and kills. `shutdown` reads `None` as
-    /// the safe `Disconnect` so an unexpected exit never reaps the daemon.
+    /// Pending exit intent: disconnect on `q`, Ctrl-C, or a terminating signal;
+    /// kill tasks and stop the daemon on `Q`. In `shutdown`, default to
+    /// `Disconnect` for `None` to preserve the daemon after an unexpected exit.
     exit_intent: Option<ExitIntent>,
     /// Whether the client currently captures terminal mouse events.
     mouse_captured: bool,
@@ -1935,7 +1935,7 @@ fn is_controls_key(k: KeyEvent) -> bool {
     }
 }
 
-/// Apply prompt editing keys. Returns `true` for Backspace or an inserted character,
+/// Apply prompt editing keys. Return `true` for Backspace or an inserted character,
 /// `false` for caret motion, ignored Ctrl chords, and unsupported keys. On Ctrl-A or
 /// Ctrl-E, move to the start or end.
 fn on_key_edit(buf: &mut EditBuffer, k: KeyEvent) -> bool {
@@ -1955,7 +1955,7 @@ fn on_key_edit(buf: &mut EditBuffer, k: KeyEvent) -> bool {
         KeyCode::End => buf.end(),
         KeyCode::Char('a') if ctrl => buf.home(),
         KeyCode::Char('e') if ctrl => buf.end(),
-        // Ignore unsupported keys, and unbound Ctrl chords without inserting their character.
+        // Ignore unsupported keys and unbound Ctrl chords without inserting a character.
         _ => {}
     }
     false

@@ -87,8 +87,8 @@ fn dim(out: &mut impl Write, y: u16, s: &str, cols: usize) -> io::Result<()> {
     )
 }
 
-/// Paint a full-width highlight line: reverse video while the host terminal has focus, a dark-grey
-/// background while it does not, so an unfocused terminal shows no full-strength selection.
+/// Paint a full-width highlight line: use reverse video with host-terminal
+/// focus and a muted dark-grey background without it.
 fn highlight(out: &mut impl Write, y: u16, s: &str, cols: usize, focused: bool) -> io::Result<()> {
     queue!(out, MoveTo(0, y))?;
     if focused {
@@ -481,10 +481,10 @@ fn render_peek(out: &mut impl Write, app: &App) -> io::Result<()> {
     )
 }
 
-/// The peek body: at most `height` lines, cropped from the bottom of a window. On the alternate
-/// screen the window is the whole grid: a partial repaint leaves real blank canvas rows, and
-/// dropping them would shift the view. On the primary screen it ends at the last non-blank row:
-/// trailing blanks are grid padding, so short output renders from its first row.
+/// Return at most `height` lines from the bottom of the peek window. On the
+/// alternate screen, include the whole grid: preserve blank rows after partial
+/// repaints to avoid shifting the view. On the primary screen, end at the last
+/// non-blank row to omit grid padding and show short output from its first row.
 fn peek_window(lines: &[String], height: usize, alt_screen: bool) -> &[String] {
     // `contents()` trims trailing padding, so a blank row is exactly empty.
     let end = if alt_screen {
@@ -896,8 +896,8 @@ fn render_session_picker(out: &mut impl Write, app: &App) -> io::Result<()> {
     )
 }
 
-/// Indent `s` to center it in `width` columns. The caller's `put`/`dim` clips
-/// and pads the result to the row.
+/// Indent `s` to center it in `width` columns. Clip and pad to the row with
+/// `put` or `dim` at the call site.
 fn center(s: &str, width: usize) -> String {
     format!("{}{s}", " ".repeat(width.saturating_sub(s.width()) / 2))
 }

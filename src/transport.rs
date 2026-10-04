@@ -261,9 +261,10 @@ impl SocketTransport {
         self.join_workers();
     }
 
-    /// Join the reader, then drop the queue sender and join the writer. An idle
-    /// writer exits `recv`; socket closure releases an in-flight write. Call
-    /// only after the reader ends or `ctrl` shuts down the socket.
+    /// Join the reader, then drop the queue sender and join the writer. Drop
+    /// the sender to unblock an idle writer in `recv`; close the socket to
+    /// unblock an in-flight write. Call only after the reader has ended or
+    /// after shutting down the socket through `ctrl`.
     fn join_workers(&mut self) {
         if let Some(h) = self.reader.take() {
             let _ = h.join();

@@ -183,10 +183,9 @@ fn command_round_trips() {
     }
 }
 
-/// The `command_round_trips` guard for `decode_event`: every event survives
-/// encode→frame-payload→decode, on a control frame for all but `Screen`. The
-/// socket reader drops an undecodable frame, so an omitted decode arm passes
-/// every in-process transport test and loses the event only in daemon mode.
+/// Round-trip every event through encoding and decoding, using control frames
+/// for all but `Screen`. In-process transport tests do not exercise decoding:
+/// without a decode arm, the event is discarded as undecodable in daemon mode.
 #[test]
 fn event_round_trips() {
     let screen = r#"{"id":9,"cursor":[3,12],"hide":false,"mouse":true,"alt":false,"ascr":true,"sb":42,"lines":["row0"]}"#;
@@ -196,7 +195,7 @@ fn event_round_trips() {
         decode_event(KIND_SCREEN, &screen_payload(screen)).expect("valid screen header"),
         Event::Status("saved 'x'".into()),
         Event::Spawned {
-            // An id above `u32::MAX` must survive.
+            // Preserve IDs above `u32::MAX` through the round trip.
             id: u64::from(u32::MAX) + 7,
         },
         Event::Sessions {
@@ -209,7 +208,8 @@ fn event_round_trips() {
             text: "hello".into(),
         },
     ];
-    // Exhaustive: a new variant fails to compile until it is given an index.
+    // Assign an index to every variant; leave the match exhaustive so adding
+    // a variant without an index is a compile error.
     fn variant_index(e: &Event) -> usize {
         match e {
             Event::HelloOk => 0,

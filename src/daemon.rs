@@ -295,11 +295,11 @@ fn connect_or_autostart() -> io::Result<(UnixStream, DaemonOrigin)> {
 
 /// Validate `dir`, connect or autostart, and report which path succeeded.
 fn connect_or_autostart_in(dir: &Path) -> io::Result<(UnixStream, DaemonOrigin)> {
-    // Validate before connecting because the hello sends the client's
-    // environment and a successful connection skips daemon-side validation.
-    // `spawn_daemon` depends on it too: creating `daemon.log` inside an
-    // unvalidated directory could follow a planted symlink and truncate an
-    // attacker-chosen file before the daemon checks the directory.
+    // Validate before connecting: the client's environment is sent in the
+    // hello, without daemon-side directory validation on an existing connection.
+    // Validate before `spawn_daemon` too: when creating `daemon.log` in an
+    // unvalidated directory, we could follow a planted symlink and truncate an
+    // attacker-chosen file before directory validation in the new daemon.
     ensure_runtime_dir(dir)?;
     let path = socket_in(dir);
     if let Ok(s) = UnixStream::connect(&path) {

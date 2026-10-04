@@ -2034,7 +2034,7 @@ fn recovery_files(config: &Path) -> Vec<String> {
     names
 }
 
-/// Read and clear whether a recipe change awaits a debounced pass.
+/// Check for a pending debounced recipe pass, then clear its timestamp.
 fn take_dirty(s: &mut Supervisor) -> bool {
     s.recovery.last_mutation.take().is_some()
 }
@@ -2049,7 +2049,7 @@ fn recovery_arms_on_structural_mutations_not_tag() {
     assert!(take_dirty(&mut s), "Spawn must arm");
     let id = first_id(&mut s);
 
-    s.recovery.last_mutation = None; // first_id ticks; reassert a clean baseline
+    s.recovery.last_mutation = None; // Reset after the tick in first_id.
     s.apply(Command::Tag { id, on: true });
     assert!(
         !take_dirty(&mut s),

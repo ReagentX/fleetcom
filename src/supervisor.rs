@@ -1,9 +1,8 @@
-//! The task owner: holds every `Task`, allocates ids, reaps exits, and answers
-//! `Command`s with `Event`s. It speaks only `protocol` types, never UI state.
-//! A serving loop drives it through `apply` (one `Command`), `tick` (reap, then
-//! emit a task snapshot plus the watched screen), and `drain` (take the queued
-//! `Event`s). Between clients the daemon calls `reap` and
-//! `recovery_maintenance` directly.
+//! Task ownership, ID allocation, exit reaping, and `Command` handling through
+//! `Event` responses. Use only `protocol` types at this boundary, never UI state.
+//! In the serving loop, call `apply` for one `Command`, `tick` to reap and emit
+//! a task snapshot plus the watched screen, and `drain` to take queued `Event`s.
+//! Between clients, call `reap` and `recovery_maintenance` directly in the daemon.
 
 use std::{
     collections::BTreeMap,
@@ -202,8 +201,8 @@ fn affects_recipe(cmd: &Command) -> bool {
 struct Recovery {
     /// Recovery writes are opt-in in unit tests.
     enabled: bool,
-    /// The most recent potentially recipe-changing command still awaiting a
-    /// debounced pass: the debounce anchor. `None` once a pass has run.
+    /// Time of the most recent potentially recipe-changing command pending
+    /// a debounced pass. Use as the debounce anchor; clear after the pass.
     last_mutation: Option<Instant>,
     /// The start of the most recent cadence interval.
     last_cadence: Instant,
@@ -472,9 +471,9 @@ impl Supervisor {
     }
 
     /// One step of the core's own loop: reap exits, then emit a fresh task
-    /// snapshot (plus the watched task's screen). `core::run_loop` is the only
-    /// production caller, in process and in the daemon alike; the client only
-    /// ever sees `drain`ed events, never a `Task`.
+    /// snapshot (plus the watched task's screen). Call only from `core::run_loop`
+    /// in production, both in process and in the daemon. Access state from the
+    /// client through `drain`ed events, never through a `Task`.
     pub fn tick(&mut self) {
         self.reap();
         // Check current state rather than individual transitions to handle exit,
