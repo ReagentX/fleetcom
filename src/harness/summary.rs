@@ -331,8 +331,9 @@ const CODEX_EFFORT: &[&str] = &[
 /// depth, so counting them would push the status row out of reach.
 const CODEX_STATUS_WINDOW: usize = 10;
 
-/// Codex summary adapter for the primary-screen inline UI and approval modals
-/// on either screen. Anchor at the composer: the bottom-most column-0 prompt-glyph
+/// Codex summary adapter for the inline UI on the primary screen and the
+/// fullscreen transcript on the alternate screen, with the same matchers on
+/// either screen. Anchor at the composer: the bottom-most column-0 prompt-glyph
 /// row that is not a modal selector. Scan above it for status rows, stopping at
 /// the first foreign row. Check for an approval modal first, with the composer
 /// absent. Also check below the composer for a status line or indented hints.
@@ -476,9 +477,12 @@ fn codex_warning_shortcut(hint: &str) -> bool {
         for modifier in ["ctrl+", "shift+"] {
             key = key.strip_prefix(modifier).unwrap_or(key);
         }
+        // Codex 0.160.0 dropped the `+` after `⌥`: `⌥w`, where 0.159 rendered
+        // `⌥+w`. A `+` with nothing after it is therefore the key itself.
         key = key
             .strip_prefix("alt+")
-            .or_else(|| key.strip_prefix("⌥+"))
+            .or_else(|| key.strip_prefix("⌥+").filter(|rest| !rest.is_empty()))
+            .or_else(|| key.strip_prefix('⌥'))
             .unwrap_or(key);
         (key.len() == 1 && !key.starts_with(char::is_whitespace))
             || matches!(
