@@ -576,14 +576,16 @@ fn semantic_dec_scrollregion_charset_translation() {
     assert_eq!(al.grid().cursor.point, Point::new(Line(39), Column(0)));
 }
 
-/// Assert identical screen text, cursor state, and alternate-screen mode for
-/// one fixture replayed through [`crate::emulator::Emulator`] and a raw `Term`.
+/// Assert identical styled cells, screen text, cursor state, and alternate-screen mode
+/// for one fixture replayed through [`crate::emulator::Emulator`] and a raw `Term`.
 fn assert_wrapper_matches(file: &str, bytes: &[u8]) {
     let al = alacritty(bytes);
     let mut emu = crate::testutil::corpus_emulator();
     emu.process(bytes);
-    let (_, al_cursor, al_hidden) = ansi::formatted(&al);
-    let (_, emu_cursor, emu_hidden) = emu.formatted();
+    let (al_bytes, al_cursor, al_hidden) = ansi::formatted(&al);
+    let (emu_bytes, emu_cursor, emu_hidden) = emu.formatted();
+    // `assert!`, not `assert_eq!`: a failure must not dump two serialized screens.
+    assert!(emu_bytes == al_bytes, "{file}: styled cells");
     assert_eq!(emu.contents(), ansi::contents(&al), "{file}: screen");
     assert_eq!(
         (emu_cursor, emu_hidden),

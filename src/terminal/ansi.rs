@@ -256,9 +256,7 @@ pub fn contents<T>(term: &Term<T>) -> String {
             }
             push_zerowidth(&mut out, cell);
         }
-        while out.len() > row_start && out.ends_with(' ') {
-            out.pop();
-        }
+        out.truncate(row_start + out[row_start..].trim_end_matches(' ').len());
     }
     out
 }
@@ -578,7 +576,9 @@ mod tests {
         };
     }
 
+    corpus_oracle!(corpus_claude_resume, "claude_resume.bin");
     corpus_oracle!(corpus_codex_resume, "codex_resume.bin");
+    corpus_oracle!(corpus_grok_resume, "grok_resume.bin");
     corpus_oracle!(corpus_tmux_split, "tmux_split.bin");
     corpus_oracle!(corpus_vim_session, "vim_session.bin");
     corpus_oracle!(corpus_less_altscreen, "less_altscreen.bin");
@@ -587,6 +587,7 @@ mod tests {
     corpus_oracle!(corpus_build_log, "build_log.bin");
     corpus_oracle!(corpus_wide_emoji, "wide_emoji.bin");
     corpus_oracle!(corpus_dec_scrollregion, "dec_scrollregion.bin");
+    corpus_oracle!(corpus_topregion_scroll, "topregion_scroll.bin");
 
     /// Scrolled-viewport oracle: a nonzero display offset must serialize the
     /// displayed (offset) content, not the live screen.

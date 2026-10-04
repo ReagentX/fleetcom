@@ -172,15 +172,6 @@ pub struct Mods {
     pub ctrl: bool,
 }
 
-impl Mods {
-    /// Return xterm's modifier parameter `1 + shift + 2·alt + 4·ctrl`, or
-    /// `None` when no modifier is held.
-    pub fn param(self) -> Option<u8> {
-        let bits = self.shift as u8 + 2 * self.alt as u8 + 4 * self.ctrl as u8;
-        (bits != 0).then_some(1 + bits)
-    }
-}
-
 /// A core→client message. The client keeps a local mirror of the task set and
 /// the watched screen, updated only by these.
 #[derive(Debug, Clone, PartialEq)]

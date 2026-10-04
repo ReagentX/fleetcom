@@ -1,7 +1,6 @@
 //! Replay release-binary output; the model responses were scripted locally.
 
-use super::emulator::Emulator;
-use crate::protocol::ClipboardKind;
+use crate::{emulator::Emulator, protocol::ClipboardKind};
 
 const REPLY: &str = "PHASE0 COMPLETE. Deterministic local response.";
 const PROMPT: &str = "Phase zero fixture: reply with the completion marker.";
@@ -75,7 +74,8 @@ fn codex_release_terminal_transitions() {
                         assert!(!text.contains(PROMPT), "{context}: stale prompt");
                         assert!(!text.contains(REPLY), "{context}: stale reply");
                     }
-                    _ => {}
+                    "startup" | "copy-menu" => {}
+                    other => panic!("{context}: unknown checkpoint {other}"),
                 }
                 if checkpoint == "copied" {
                     assert!(
