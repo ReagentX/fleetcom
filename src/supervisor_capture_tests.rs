@@ -371,8 +371,7 @@ fn returning_to_a_prior_root_preserves_its_live_captures() {
     let dir = scratch("cap_aba");
     let (bin, root_a, root_b) = (dir.join("bin"), dir.join("run-a"), dir.join("run-b"));
     install_stub(&bin, "claude", &dir);
-    let mut s = Supervisor::new(24, 80, 2000);
-    s.set_launch_context(agent_ctx(&bin, &root_a, dir.to_path_buf()));
+    let mut s = sup_ctx(agent_ctx(&bin, &root_a, dir.to_path_buf()));
     spawn(&mut s, "claude", dir.to_path_buf());
     let cap_a = s.tasks[0].capture_file.clone().expect("capture file set");
     std::fs::write(&cap_a, "{}").unwrap();
@@ -409,8 +408,7 @@ fn remove_deletes_the_capture_file_under_the_spawn_root() {
     let dir = scratch("cap_remove_cross");
     let (bin, root_a, root_b) = (dir.join("bin"), dir.join("run-a"), dir.join("run-b"));
     install_stub(&bin, "claude", &dir);
-    let mut s = Supervisor::new(24, 80, 2000);
-    s.set_launch_context(agent_ctx(&bin, &root_a, dir.to_path_buf()));
+    let mut s = sup_ctx(agent_ctx(&bin, &root_a, dir.to_path_buf()));
     spawn(&mut s, "claude", dir.to_path_buf());
     let _ = wait_argv(&mut s, &dir.join("argv"));
     let id = s.tasks[0].id;
@@ -991,7 +989,6 @@ fn stale_inherited_notify_chain_is_never_executed() {
         "codex",
         &format!("\"${{FLEETCOM_CAPTURE_FILE%/*}}/codex-notify.sh\" '{payload}'"),
     );
-    let mut s = Supervisor::new(24, 80, 2000);
     let mut ctx = agent_ctx_plus(
         &bin,
         &runtime,
@@ -1002,7 +999,7 @@ fn stale_inherited_notify_chain_is_never_executed() {
         crate::harness::NOTIFY_CHAIN_ENV.into(),
         stale.as_os_str().to_os_string(),
     ));
-    s.set_launch_context(ctx);
+    let mut s = sup_ctx(ctx);
     spawn(&mut s, "codex", dir.to_path_buf());
     assert!(reap_until(&mut s, Duration::from_secs(5), |s| s.tasks[0]
         .finished

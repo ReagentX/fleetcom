@@ -384,11 +384,10 @@ impl Task {
     /// can reach the grid. A missing reader handle counts as complete; the
     /// reader treats EOF and read errors identically.
     fn output_complete(&self) -> bool {
-        self.finished.is_some() && self.handle.as_ref().is_none_or(JoinHandle::is_finished)
+        self.finished.is_some() && self.reader_done()
     }
 
     /// Report whether the reader reached EOF without driving the reap loop.
-    #[cfg(test)]
     pub(crate) fn reader_done(&self) -> bool {
         self.handle.as_ref().is_none_or(|h| h.is_finished())
     }
@@ -553,19 +552,12 @@ impl Task {
         Ok(())
     }
 
-    /// Queue `bytes` for the PTY as one message without blocking the caller.
-    /// Refuse it whole if admission would exceed `MAX_PENDING_WRITE`.
-    pub fn send_input(&mut self, bytes: &[u8]) -> Result<(), WriteRefused> {
-        self.snap_live();
-        self.queue_write(bytes.to_vec())
-    }
-
-    /// Return the viewport to live before queuing input bytes.
-    fn snap_live(&mut self) {
-        let mut p = grid(&self.parser);
-        if p.scrollback() > 0 {
-            p.set_scrollback(0);
-        }
+    /// Return the viewport to live, then queue `bytes` for the PTY as one
+    /// message without blocking the caller. Refuse it whole if admission would
+    /// exceed `MAX_PENDING_WRITE`.
+    pub fn send_input(&mut self, bytes: Vec<u8>) -> Result<(), WriteRefused> {
+        self.scroll_view(ScrollAction::Live);
+        self.queue_write(bytes)
     }
 
     /// Admit one whole message to the writer queue, or refuse it whole.
@@ -599,9 +591,7 @@ impl Task {
     /// grid lock, then queue it as one PTY write.
     pub fn send_paste(&mut self, content: &[u8]) -> Result<(), WriteRefused> {
         let bracketed = grid(&self.parser).bracketed_paste();
-        let msg = input::paste_bytes(bracketed, content);
-        self.snap_live();
-        self.queue_write(msg)
+        self.send_input(input::paste_bytes(bracketed, content))
     }
 
     /// Encode and queue one mouse action using the child's screen modes.
@@ -611,7 +601,7 @@ impl Task {
             let p = grid(&self.parser);
             input::mouse_bytes(&p, kind, col, row)
         };
-        bytes.map_or(Ok(()), |b| self.send_input(&b))
+        bytes.map_or(Ok(()), |b| self.send_input(b))
     }
 
     /// Encode and queue one key using the child's cursor-key mode, read under
@@ -621,7 +611,7 @@ impl Task {
             let p = grid(&self.parser);
             input::key_bytes(p.application_cursor(), code, mods)
         };
-        bytes.map_or(Ok(()), |b| self.send_input(&b))
+        bytes.map_or(Ok(()), |b| self.send_input(b))
     }
 
     /// Return the child's mouse, alternate-screen, and alternate-scroll modes
