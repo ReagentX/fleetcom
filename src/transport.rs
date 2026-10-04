@@ -258,16 +258,16 @@ impl SocketTransport {
                 Err(RecvTimeoutError::Disconnected) => break, // reader ended
             }
         }
+        self.join_workers();
+    }
+
+    /// Join the reader, then drop the queue sender and join the writer. An idle
+    /// writer exits `recv`; socket closure releases an in-flight write. Call
+    /// only after the reader ends or `ctrl` shuts down the socket.
+    fn join_workers(&mut self) {
         if let Some(h) = self.reader.take() {
             let _ = h.join();
         }
-        self.join_writer();
-    }
-
-    /// Drop the queue sender and join the writer after socket I/O has ended. An
-    /// idle writer exits `recv`; socket closure releases an in-flight write.
-    /// Call only after the reader ends or `ctrl` shuts down the socket.
-    fn join_writer(&mut self) {
         self.frame_tx.take();
         if let Some(h) = self.writer.take() {
             let _ = h.join();
@@ -317,10 +317,7 @@ impl Transport for SocketTransport {
             // before both threads are joined.
             ExitIntent::Disconnect => {
                 let _ = self.ctrl.shutdown(Shutdown::Both);
-                if let Some(h) = self.reader.take() {
-                    let _ = h.join();
-                }
-                self.join_writer();
+                self.join_workers();
             }
         }
     }
@@ -401,7 +398,7 @@ mod tests {
         t.reader.take().unwrap().join().unwrap();
         // Dropping the sender releases the writer if it has not observed the
         // failed write yet.
-        t.join_writer();
+        t.join_workers();
     }
 
     /// A peer that stops reading cannot block `send` on the run-loop thread.

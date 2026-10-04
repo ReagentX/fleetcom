@@ -29,7 +29,7 @@ fn kill_works_while_a_client_is_attached() {
     // Keep `stream` open while `fleetcom --kill` runs.
     let mut killer = Command::new(env!("CARGO_BIN_EXE_fleetcom"))
         .arg("--kill")
-        .env("FLEETCOM_RUNTIME_DIR", &dir)
+        .env("FLEETCOM_RUNTIME_DIR", &*dir)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -60,6 +60,4 @@ fn kill_works_while_a_client_is_attached() {
         "task survived --kill"
     );
     assert!(!sock.exists(), "socket file left behind");
-
-    let _ = std::fs::remove_dir_all(&dir);
 }

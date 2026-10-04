@@ -34,7 +34,6 @@ fn ordinary_tasks_die_with_a_sigkilled_daemon() {
         wait_until(Duration::from_secs(5), || kill(task, None).is_err()),
         "an ordinary task must die with the daemon (PTY hangup)"
     );
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
@@ -66,5 +65,4 @@ fn hup_immune_tasks_survive_a_sigkilled_daemon_unowned() {
         survived,
         "a HUP-immune task should have outlived the daemon (unowned)"
     );
-    let _ = std::fs::remove_dir_all(&dir);
 }

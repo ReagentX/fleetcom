@@ -43,7 +43,6 @@ fn load_session_resolves_relative_dirs_against_the_client_cwd() {
     );
 
     stop_daemon(&mut daemon);
-    let _ = std::fs::remove_dir_all(&dir);
     let _ = std::fs::remove_dir_all(&config);
 }
 
@@ -112,7 +111,6 @@ fn session_commands_follow_the_hello_config_dir() {
     );
 
     stop_daemon(&mut daemon);
-    let _ = std::fs::remove_dir_all(&dir);
     let _ = std::fs::remove_dir_all(&daemon_cfg);
     let _ = std::fs::remove_dir_all(&client_cfg);
 }

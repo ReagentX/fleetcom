@@ -99,7 +99,10 @@ impl Scratch {
 
 impl Drop for Scratch {
     fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.root);
+        // A failed test keeps its stubs, stores, and argv records for inspection.
+        if !std::thread::panicking() {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
     }
 }
 
@@ -266,7 +269,7 @@ fn has_capture(runtime: &Path) -> bool {
 fn claude_spawn_save_load_resumes_the_conversation() {
     let s = Scratch::new("claude");
     install_claude_stub(&s);
-    let (dir, mut daemon, mut stream) = start_daemon_raw("resume_claude", |_| {});
+    let (_dir, mut daemon, mut stream) = start_daemon_raw("resume_claude", |_| {});
     hello(&mut stream, &s);
     drain_events(&stream);
 
@@ -310,7 +313,6 @@ fn claude_spawn_save_load_resumes_the_conversation() {
     );
 
     stop_daemon(&mut daemon);
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// A Codex capture payload persists the resume command, and loading that command
@@ -319,7 +321,7 @@ fn claude_spawn_save_load_resumes_the_conversation() {
 fn codex_capture_file_drives_save_and_load_resumes() {
     let s = Scratch::new("codex");
     install_codex_stub(&s);
-    let (dir, mut daemon, mut stream) = start_daemon_raw("resume_codex", |_| {});
+    let (_dir, mut daemon, mut stream) = start_daemon_raw("resume_codex", |_| {});
     hello(&mut stream, &s);
     drain_events(&stream);
 
@@ -362,7 +364,6 @@ fn codex_capture_file_drives_save_and_load_resumes() {
     );
 
     stop_daemon(&mut daemon);
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// A persisted resume command survives daemon replacement and targets the same
@@ -373,7 +374,7 @@ fn saved_recipe_resumes_across_a_daemon_restart() {
     install_claude_stub(&s);
     let rec = s.record("claude");
 
-    let (dir_a, mut daemon_a, mut stream_a) = start_daemon_raw("resume_restart_a", |_| {});
+    let (_dir_a, mut daemon_a, mut stream_a) = start_daemon_raw("resume_restart_a", |_| {});
     hello(&mut stream_a, &s);
     drain_events(&stream_a);
     stream_a
@@ -388,10 +389,9 @@ fn saved_recipe_resumes_across_a_daemon_restart() {
     );
     stop_daemon(&mut daemon_a);
     drop(stream_a);
-    let _ = std::fs::remove_dir_all(&dir_a);
 
     // Start another daemon with the same config and handshake environment.
-    let (dir_b, mut daemon_b, mut stream_b) = start_daemon_raw("resume_restart_b", |_| {});
+    let (_dir_b, mut daemon_b, mut stream_b) = start_daemon_raw("resume_restart_b", |_| {});
     hello(&mut stream_b, &s);
     drain_events(&stream_b);
     stream_b
@@ -409,5 +409,4 @@ fn saved_recipe_resumes_across_a_daemon_restart() {
     );
 
     stop_daemon(&mut daemon_b);
-    let _ = std::fs::remove_dir_all(&dir_b);
 }
