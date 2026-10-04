@@ -44,7 +44,8 @@ fn braille_frame(c: char) -> bool {
     ('\u{2800}'..='\u{28FF}').contains(&c)
 }
 
-/// The text after a leading frame char accepted by `is_frame` and one space.
+/// Return the text after a leading frame character accepted by `is_frame`
+/// and a single space.
 fn after_frame(s: &str, is_frame: impl Fn(char) -> bool) -> Option<&str> {
     let mut chars = s.chars();
     (is_frame(chars.next()?) && chars.next()? == ' ').then_some(chars.as_str())
@@ -120,9 +121,9 @@ impl SummaryAdapter for ClaudeSummary {
     }
 }
 
-/// Whether `row` is a full-width horizontal rule: nothing but `─`, long
-/// enough that box borders and inline list rules never qualify. claude's
-/// input box is fenced by two such rows.
+/// Match a full-width horizontal rule: at least 40 `─` characters after trimming.
+/// Exclude box borders and short inline rules. Claude's input box is fenced
+/// by two full-width rules.
 fn is_rule_row(row: &str) -> bool {
     let mut n = 0usize;
     for c in row.trim().chars() {
@@ -330,11 +331,11 @@ const CODEX_EFFORT: &[&str] = &[
 /// depth, so counting them would push the status row out of reach.
 const CODEX_STATUS_WINDOW: usize = 10;
 
-/// codex (inline UI on the primary screen; approval modals also paint on the alternate
-/// screen). The pin is its composer: the bottom-most column-0 prompt-glyph row that is
-/// not a modal selector; status rows sit above it, and scrollback beyond the first
-/// foreign row is out of bounds. Check for the approval modal first, with the composer
-/// absent. The status line or indented hint rows may appear below the composer.
+/// Codex summary adapter for the primary-screen inline UI and approval modals
+/// on either screen. Anchor at the composer: the bottom-most column-0 prompt-glyph
+/// row that is not a modal selector. Scan above it for status rows, stopping at
+/// the first foreign row. Check for an approval modal first, with the composer
+/// absent. Also check below the composer for a status line or indented hints.
 pub struct CodexSummary;
 
 impl SummaryAdapter for CodexSummary {

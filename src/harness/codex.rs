@@ -137,7 +137,7 @@ fn config_notify_route(home: Option<&Path>) -> NotifyRoute {
 }
 
 /// Recognize complete single-line values without interpreting unrelated settings.
-/// Arrays hold basic strings only; multiline values and inline tables are out of scope.
+/// Accept only basic strings in arrays; exclude multiline values and inline tables.
 fn complete_value(value: &str) -> bool {
     if value.starts_with("\"\"\"") || value.starts_with("'''") {
         return false;

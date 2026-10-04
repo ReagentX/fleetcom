@@ -108,8 +108,8 @@ fn claude_settings_json() -> String {
 
 /// Platform capture root: `dirs::runtime_dir()/fleetcom`, then
 /// `dirs::cache_dir()/fleetcom/run`. Those fallbacks are not
-/// `daemon::resolve_runtime_dir`. The supervisor calls this only when the
-/// launch context carries no `FLEETCOM_RUNTIME_DIR`.
+/// `daemon::resolve_runtime_dir`. Call this from the supervisor only when
+/// `FLEETCOM_RUNTIME_DIR` is absent from the launch context.
 pub fn runtime_root() -> Option<PathBuf> {
     if let Some(run) = dirs::runtime_dir() {
         return Some(run.join("fleetcom"));
