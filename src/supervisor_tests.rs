@@ -1805,11 +1805,7 @@ fn spawn_acks_with_spawned_before_the_snapshot() {
 #[test]
 fn refused_spawn_emits_no_spawned() {
     let mut s = sup(24, 80);
-    s.apply(Command::Spawn {
-        command: "x".repeat(MAX_COMMAND_LEN + 1),
-        cwd: here(),
-        group: None,
-    });
+    spawn(&mut s, "x".repeat(MAX_COMMAND_LEN + 1), here());
     let evs = s.drain();
     assert!(
         !evs.iter().any(|e| matches!(e, Event::Spawned { .. })),
@@ -1849,11 +1845,7 @@ fn session_load_emits_no_spawned() {
 #[test]
 fn spawn_refuses_over_length_command() {
     let mut s = sup(24, 80);
-    s.apply(Command::Spawn {
-        command: "x".repeat(MAX_COMMAND_LEN + 1),
-        cwd: here(),
-        group: None,
-    });
+    spawn(&mut s, "x".repeat(MAX_COMMAND_LEN + 1), here());
     assert!(
         s.drain()
             .iter()
@@ -2042,22 +2034,22 @@ fn recovery_files(config: &Path) -> Vec<String> {
     names
 }
 
-/// Read and clear the writer's dirty flag.
+/// Check for a pending debounced recipe pass, then clear its timestamp.
 fn take_dirty(s: &mut Supervisor) -> bool {
-    std::mem::replace(&mut s.recovery.dirty, false)
+    s.recovery.last_mutation.take().is_some()
 }
 
 /// Recipe-changing commands arm recovery even when rejected; tags do not.
 #[test]
 fn recovery_arms_on_structural_mutations_not_tag() {
     let mut s = sup(24, 80);
-    assert!(!s.recovery.dirty, "a fresh supervisor starts clean");
+    assert!(!take_dirty(&mut s), "a fresh supervisor starts clean");
 
     spawn(&mut s, "sleep 30", here());
     assert!(take_dirty(&mut s), "Spawn must arm");
     let id = first_id(&mut s);
 
-    s.recovery.dirty = false; // first_id ticks; reassert a clean baseline
+    s.recovery.last_mutation = None; // Reset after the tick in first_id.
     s.apply(Command::Tag { id, on: true });
     assert!(
         !take_dirty(&mut s),
@@ -2229,7 +2221,7 @@ fn flagship_does_not_affect_recipe() {
     let mut s = sup(24, 80);
     spawn(&mut s, "sleep 30", here());
     let id = spawned_id(&mut s);
-    s.recovery.dirty = false; // Reset after spawning to test the mark in isolation.
+    s.recovery.last_mutation = None; // Reset after spawning to test the mark in isolation.
 
     s.apply(Command::Flagship { id: Some(id) });
     assert!(!take_dirty(&mut s), "marking must not arm");
@@ -2417,7 +2409,7 @@ fn recovery_debounce_coalesces_a_mutation_burst() {
     for cmd in ["sleep 30", "sleep 31", "sleep 32"] {
         assert!(text.contains(cmd), "snapshot must carry {cmd:?}: {text}");
     }
-    assert!(!s.recovery.dirty, "a completed pass clears the flag");
+    assert!(!take_dirty(&mut s), "a completed pass clears the flag");
 }
 
 /// Empty fleets do not create or replace recovery snapshots.
@@ -2543,7 +2535,6 @@ fn recovery_dedup_is_per_destination_root() {
 
     // Move the unchanged recipe to a new destination and arm recovery.
     s.set_launch_context(config_ctx(&config_b, dir.to_path_buf(), &[]));
-    s.recovery.dirty = true;
     s.recovery.last_mutation = Some(Instant::now());
     assert!(
         wait_until(Duration::from_secs(5), || {

@@ -2,9 +2,10 @@
 
 use std::path::{Component, Path, PathBuf};
 
-/// Shared env key for the runtime directory. Both the socket/lock resolver
-/// (`resolve_runtime_dir`) and the capture-root resolver (`runtime_root`)
-/// honor it; their fallbacks differ.
+/// Shared env key for the runtime directory. For sockets and locks, read it
+/// from the process environment in `resolve_runtime_dir`. For captures, read
+/// it from the launch context, falling back to `runtime_root`. The fallback
+/// directories differ between these uses.
 pub const FLEETCOM_RUNTIME_DIR: &str = "FLEETCOM_RUNTIME_DIR";
 
 /// Shorten a path for display: `$HOME` collapses to `~`. Everything else stays

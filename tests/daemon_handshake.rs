@@ -43,7 +43,6 @@ fn version_mismatch_is_refused_with_both_versions_named() {
     common::shake_hands(&mut retry, &cwd);
 
     drop(daemon);
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// A hello with version 3 but invalid field encoding is still reported as a version
@@ -56,7 +55,6 @@ fn v3_hello_is_refused_as_a_version_mismatch() {
     stream.write_all(&frame(3, v3.as_bytes())).unwrap();
     expect_refusal(&mut stream, "v3");
     drop(daemon);
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// A v2 control-frame hello is reported as a version mismatch.
@@ -68,19 +66,17 @@ fn v2_hello_is_refused_as_a_version_mismatch() {
     stream.write_all(&control_frame(&v2)).unwrap();
     expect_refusal(&mut stream, "v2");
     drop(daemon);
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
 fn pre_handshake_command_is_refused() {
-    let (dir, daemon, mut stream) = start_daemon_raw("nohello", |_| {});
+    let (_dir, daemon, mut stream) = start_daemon_raw("nohello", |_| {});
     // A command before `Hello` is rejected.
     stream
         .write_all(&control_frame(r#"{"t":"resize","rows":40,"cols":120}"#))
         .unwrap();
     expect_refusal(&mut stream, "hello");
     drop(daemon);
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
@@ -105,7 +101,6 @@ fn silent_client_cannot_wedge_the_daemon() {
     assert!(served_next, "daemon wedged behind a silent connection");
     drop(stream);
     drop(daemon);
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// The documented single-client semantics: a second client's hello gets no
@@ -155,5 +150,4 @@ fn second_client_queues_until_first_detaches() {
     );
 
     drop(daemon);
-    let _ = std::fs::remove_dir_all(&dir);
 }

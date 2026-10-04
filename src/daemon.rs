@@ -93,10 +93,6 @@ fn resolve_runtime_dir(
     tmp.join(format!("fleetcom-{uid}"))
 }
 
-fn socket_path() -> PathBuf {
-    socket_in(&runtime_dir())
-}
-
 /// Return the daemon socket path under `dir`.
 fn socket_in(dir: &Path) -> PathBuf {
     dir.join("default.sock")
@@ -299,8 +295,11 @@ fn connect_or_autostart() -> io::Result<(UnixStream, DaemonOrigin)> {
 
 /// Validate `dir`, connect or autostart, and report which path succeeded.
 fn connect_or_autostart_in(dir: &Path) -> io::Result<(UnixStream, DaemonOrigin)> {
-    // Validate before connecting because the hello sends the client's
-    // environment and a successful connection skips daemon-side validation.
+    // Validate before connecting: the client's environment is sent in the
+    // hello, without daemon-side directory validation on an existing connection.
+    // Validate before `spawn_daemon` too: when creating `daemon.log` in an
+    // unvalidated directory, we could follow a planted symlink and truncate an
+    // attacker-chosen file before directory validation in the new daemon.
     ensure_runtime_dir(dir)?;
     let path = socket_in(dir);
     if let Ok(s) = UnixStream::connect(&path) {
@@ -310,7 +309,7 @@ fn connect_or_autostart_in(dir: &Path) -> io::Result<(UnixStream, DaemonOrigin)>
     // live daemon's accept backlog is momentarily full.
     // Starting another daemon is safe because the lock permits only one daemon
     // to bind or reclaim a stale socket.
-    spawn_daemon()?;
+    spawn_daemon(dir)?;
     for _ in 0..100 {
         if let Ok(s) = UnixStream::connect(&path) {
             return Ok((s, DaemonOrigin::Autostarted));
@@ -326,14 +325,10 @@ fn connect_or_autostart_in(dir: &Path) -> io::Result<(UnixStream, DaemonOrigin)>
     ))
 }
 
-/// Spawn a detached daemon with terminal I/O disconnected.
-fn spawn_daemon() -> io::Result<()> {
+/// Spawn a detached daemon with terminal I/O disconnected, logging to
+/// `daemon.log` under `dir`, which the caller has validated.
+fn spawn_daemon(dir: &Path) -> io::Result<()> {
     let exe = std::env::current_exe()?;
-    let dir = runtime_dir();
-    // Creating `daemon.log` inside an unvalidated directory could follow a planted
-    // symlink and truncate an attacker-chosen file before the daemon checks the
-    // directory. Propagate validation failures before opening the log.
-    ensure_runtime_dir(&dir)?;
     let log = fs::File::create(dir.join("daemon.log")).ok();
     let mut cmd = std::process::Command::new(exe);
     cmd.arg("--daemon")
@@ -437,7 +432,7 @@ fn run_kill_in(dir: &Path) -> io::Result<()> {
 pub fn run_daemon() -> io::Result<()> {
     let dir = runtime_dir();
     ensure_runtime_dir(&dir)?; // private 0700 directory
-    let path = socket_path();
+    let path = socket_in(&dir);
 
     // Only the holder of `daemon.lock` may own the
     // socket. A concurrent autostart (two clients racing to spawn a daemon) or a
@@ -609,15 +604,13 @@ fn serve_client(sup: &mut Supervisor, stream: UnixStream, stop: &AtomicBool) -> 
     match handshake(&mut stream) {
         Ok(ctx) => {
             sup.set_launch_context(ctx);
-            let (kind, payload) = encode_event(&Event::HelloOk);
-            if write_frame(&mut stream, kind, &payload).is_err() {
+            if !send_event(&mut stream, &Event::HelloOk) {
                 return ServeOutcome::Disconnected;
             }
         }
         Err(reason) => {
             eprintln!("fleetcom: refusing client: {reason}");
-            let (kind, payload) = encode_event(&Event::Status(reason));
-            let _ = write_frame(&mut stream, kind, &payload);
+            let _ = send_event(&mut stream, &Event::Status(reason));
             return ServeOutcome::Disconnected;
         }
     }

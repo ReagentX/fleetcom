@@ -1,10 +1,10 @@
 //! The input-direction mirror of `ansi`: protocol events in, VT byte
-//! sequences out. Encoding only: no PTY writes and no `Task` state;
-//! callers read the child's negotiated modes under their own locks and
-//! pass them in.
+//! sequences out. Encoding only: no PTY writes and no `Task` state.
+//! Pass the child's negotiated modes as values to `key_bytes` and `paste_bytes`.
+//! For `mouse_bytes`, hold the `Emulator` lock while reading its four mouse modes.
 
 use crate::{
-    emulator::Emulator,
+    emulator::{Emulator, MouseProtocolEncoding, MouseProtocolMode},
     protocol::{Key, Mods, MouseKind},
 };
 
@@ -53,7 +53,6 @@ pub fn paste_bytes(bracketed: bool, content: &[u8]) -> Vec<u8> {
 /// 1007 are both active. DECSET 1007 defaults on; see [`Emulator::alternate_scroll`].
 /// Return `None` for unsupported actions.
 pub fn mouse_bytes(emu: &Emulator, kind: MouseKind, col: u16, row: u16) -> Option<Vec<u8>> {
-    use crate::emulator::{MouseProtocolEncoding, MouseProtocolMode};
     let mode = emu.mouse_protocol_mode();
     if mode != MouseProtocolMode::None {
         // Report presses, releases, and wheel events in every supported mode; report
@@ -107,19 +106,13 @@ pub fn mouse_bytes(emu: &Emulator, kind: MouseKind, col: u16, row: u16) -> Optio
         });
     }
     if emu.alternate_scroll() {
-        let up = match kind {
-            MouseKind::WheelUp => true,
-            MouseKind::WheelDown => false,
+        let key = match kind {
+            MouseKind::WheelUp => Key::Up,
+            MouseKind::WheelDown => Key::Down,
             // Only wheel actions map to alternate-scroll arrows.
             _ => return None,
         };
-        let arrow: &[u8] = match (emu.application_cursor(), up) {
-            (true, true) => b"\x1bOA",
-            (true, false) => b"\x1bOB",
-            (false, true) => b"\x1b[A",
-            (false, false) => b"\x1b[B",
-        };
-        return Some(arrow.repeat(3));
+        return key_bytes(emu.application_cursor(), key, Mods::default()).map(|b| b.repeat(3));
     }
     None
 }
@@ -158,35 +151,45 @@ fn char_bytes(c: char, mods: Mods) -> Option<Vec<u8>> {
     Some(out)
 }
 
+/// Encode cursor keys, Home/End, and F1–F4 with a final letter. For unmodified
+/// keys, use SS3 when `ss3` is true and CSI otherwise. With modifiers, use
+/// CSI `1;{m}{letter}`.
+fn letter_bytes(ss3: bool, letter: char, m: Option<u8>) -> Vec<u8> {
+    match m {
+        None if ss3 => format!("\x1bO{letter}"),
+        None => format!("\x1b[{letter}"),
+        Some(m) => format!("\x1b[1;{m}{letter}"),
+    }
+    .into_bytes()
+}
+
+/// Encode the navigation cluster and F5–F12 as CSI `n~`, or CSI `n;m~`
+/// with modifiers.
+fn tilde_bytes(n: u8, m: Option<u8>) -> Vec<u8> {
+    match m {
+        None => format!("\x1b[{n}~"),
+        Some(m) => format!("\x1b[{n};{m}~"),
+    }
+    .into_bytes()
+}
+
 /// Encode F1–F4 as SS3 when unmodified and CSI when modified. F5–F12 use their CSI
 /// numeric forms. Emit nothing for numbers outside `1..=12`.
 fn f_bytes(n: u8, m: Option<u8>) -> Option<Vec<u8>> {
-    if let Some(letter) = match n {
-        1 => Some('P'),
-        2 => Some('Q'),
-        3 => Some('R'),
-        4 => Some('S'),
-        _ => None,
-    } {
-        return Some(match m {
-            None => format!("\x1bO{letter}").into_bytes(),
-            Some(m) => format!("\x1b[1;{m}{letter}").into_bytes(),
-        });
-    }
-    let code = match n {
-        5 => 15,
-        6 => 17,
-        7 => 18,
-        8 => 19,
-        9 => 20,
-        10 => 21,
-        11 => 23,
-        12 => 24,
+    Some(match n {
+        1 => letter_bytes(true, 'P', m),
+        2 => letter_bytes(true, 'Q', m),
+        3 => letter_bytes(true, 'R', m),
+        4 => letter_bytes(true, 'S', m),
+        5 => tilde_bytes(15, m),
+        6 => tilde_bytes(17, m),
+        7 => tilde_bytes(18, m),
+        8 => tilde_bytes(19, m),
+        9 => tilde_bytes(20, m),
+        10 => tilde_bytes(21, m),
+        11 => tilde_bytes(23, m),
+        12 => tilde_bytes(24, m),
         _ => return None,
-    };
-    Some(match m {
-        None => format!("\x1b[{code}~").into_bytes(),
-        Some(m) => format!("\x1b[{code};{m}~").into_bytes(),
     })
 }
 
@@ -201,44 +204,32 @@ fn meta_bytes(meta: bool, base: &[u8]) -> Vec<u8> {
     out
 }
 
+/// Return xterm's modifier parameter `1 + shift + 2·alt + 4·ctrl`, or
+/// `None` when no modifier is held.
+fn mod_param(mods: Mods) -> Option<u8> {
+    let bits = mods.shift as u8 + 2 * mods.alt as u8 + 4 * mods.ctrl as u8;
+    (bits != 0).then_some(1 + bits)
+}
+
 /// Encode a key for the child. In application-cursor mode, use SS3 for unmodified
 /// cursor and Home/End keys and CSI for modified forms. Return `None` for unsupported
 /// key combinations.
 pub fn key_bytes(app_cursor: bool, code: Key, mods: Mods) -> Option<Vec<u8>> {
-    let m = mods.param();
+    let m = mod_param(mods);
     match code {
         Key::Char(c) => char_bytes(c, mods),
         Key::F(n) => f_bytes(n, m),
-        Key::Up | Key::Down | Key::Left | Key::Right | Key::Home | Key::End => {
-            let letter = match code {
-                Key::Up => 'A',
-                Key::Down => 'B',
-                Key::Right => 'C',
-                Key::Left => 'D',
-                Key::Home => 'H',
-                Key::End => 'F',
-                _ => unreachable!(),
-            };
-            Some(match m {
-                None if app_cursor => format!("\x1bO{letter}").into_bytes(),
-                None => format!("\x1b[{letter}").into_bytes(),
-                Some(m) => format!("\x1b[1;{m}{letter}").into_bytes(),
-            })
-        }
-        Key::Insert | Key::Delete | Key::PageUp | Key::PageDown => {
-            // Navigation-cluster keys always use CSI `<n>~`.
-            let n = match code {
-                Key::Insert => 2,
-                Key::Delete => 3,
-                Key::PageUp => 5,
-                Key::PageDown => 6,
-                _ => unreachable!(),
-            };
-            Some(match m {
-                None => format!("\x1b[{n}~").into_bytes(),
-                Some(m) => format!("\x1b[{n};{m}~").into_bytes(),
-            })
-        }
+        Key::Up => Some(letter_bytes(app_cursor, 'A', m)),
+        Key::Down => Some(letter_bytes(app_cursor, 'B', m)),
+        Key::Right => Some(letter_bytes(app_cursor, 'C', m)),
+        Key::Left => Some(letter_bytes(app_cursor, 'D', m)),
+        Key::Home => Some(letter_bytes(app_cursor, 'H', m)),
+        Key::End => Some(letter_bytes(app_cursor, 'F', m)),
+        // Encode navigation-cluster keys with CSI `<n>~`.
+        Key::Insert => Some(tilde_bytes(2, m)),
+        Key::Delete => Some(tilde_bytes(3, m)),
+        Key::PageUp => Some(tilde_bytes(5, m)),
+        Key::PageDown => Some(tilde_bytes(6, m)),
         // Encode Enter as ESC CR with Shift or Alt; keep plain CR with Control.
         Key::Enter => Some(meta_bytes(mods.shift || mods.alt, b"\x0d")),
         // Prefix Tab with ESC for Alt; keep HT with Control or Shift.

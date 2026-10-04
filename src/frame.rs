@@ -9,7 +9,7 @@ use std::{
     time::Duration,
 };
 
-/// jzon-encoded control data (a `Command`, or a `Tasks`/`Status` event).
+/// jzon-encoded control data (a `Command`, or any event but `Screen`).
 pub const KIND_CONTROL: u8 = 1;
 /// A `Screen` event: a jzon header (id, cursor, lines) followed by the raw
 /// `contents_formatted` bytes, spliced by [`crate::protocol`].

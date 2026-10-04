@@ -64,5 +64,4 @@ fn detached_daemon_writes_the_pending_snapshot() {
     }
 
     stop_daemon(&mut daemon);
-    let _ = std::fs::remove_dir_all(&dir);
 }

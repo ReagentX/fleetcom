@@ -172,15 +172,6 @@ pub struct Mods {
     pub ctrl: bool,
 }
 
-impl Mods {
-    /// Return xterm's modifier parameter `1 + shift + 2·alt + 4·ctrl`, or
-    /// `None` when no modifier is held.
-    pub fn param(self) -> Option<u8> {
-        let bits = self.shift as u8 + 2 * self.alt as u8 + 4 * self.ctrl as u8;
-        (bits != 0).then_some(1 + bits)
-    }
-}
-
 /// A core→client message. The client keeps a local mirror of the task set and
 /// the watched screen, updated only by these.
 #[derive(Debug, Clone, PartialEq)]
@@ -370,11 +361,11 @@ pub struct ScreenView {
 
 // --- wire format -------------------------------------------------------------
 //
-// Control messages (every `Command`, and the `Tasks`/`Status` events) go over as
-// jzon: low-frequency and human-debuggable. The `Screen` event is the exception:
-// its `contents_formatted` bytes are the high-frequency firehose, so they ride a
-// raw tail after a small jzon header rather than bloating into a JSON number
-// array. A socket peer is just `decode_*(read_frame(...))`.
+// Encode control messages (every `Command`, and every event but `Screen`) as
+// jzon: low-frequency and human-debuggable. For the high-frequency `Screen`
+// events, append raw `contents_formatted` bytes after a small jzon header to
+// avoid expansion into a JSON number array. Decode at the socket peer with
+// `decode_*(read_frame(...))`.
 
 /// Encode an `OsStr` as lossless base64 for a JSON string.
 fn os_b64(s: &OsStr) -> String {
@@ -428,14 +419,19 @@ pub(crate) fn insert_opt_str(o: &mut jzon::JsonValue, key: &str, val: &Option<St
     }
 }
 
-/// Decode an optional duration in whole milliseconds. Return unknown (`Some(None)`) for
-/// missing or null values, the duration for a number, or `None` to reject any other
-/// type, mirroring [`opt_str`].
-fn opt_ms(v: &jzon::JsonValue) -> Option<Option<Duration>> {
+/// Decode an optional unsigned integer. Return unset (`Some(None)`) for missing or
+/// null values, the integer for a number, or `None` to reject any other type,
+/// mirroring [`opt_str`].
+fn opt_u64(v: &jzon::JsonValue) -> Option<Option<u64>> {
     if v.is_null() {
         return Some(None);
     }
-    Some(Some(Duration::from_millis(v.as_u64()?)))
+    Some(Some(v.as_u64()?))
+}
+
+/// Decode an optional duration in whole milliseconds, with [`opt_u64`]'s contract.
+fn opt_ms(v: &jzon::JsonValue) -> Option<Option<Duration>> {
+    Some(opt_u64(v)?.map(Duration::from_millis))
 }
 
 /// Insert `key` only when the optional duration is set; absence encodes
@@ -712,11 +708,7 @@ pub fn decode_command(kind: u8, payload: &[u8]) -> Option<Command> {
             on: v["on"].as_bool()?,
         },
         "flagship" => Command::Flagship {
-            id: if v["id"].is_null() {
-                None
-            } else {
-                Some(v["id"].as_u64()?)
-            },
+            id: opt_u64(&v["id"])?,
         },
         "group" => Command::SetGroup {
             id: v["id"].as_u64()?,
@@ -731,11 +723,7 @@ pub fn decode_command(kind: u8, payload: &[u8]) -> Option<Command> {
             cols: num_from(&v["cols"])?,
         },
         "watch" => Command::Watch {
-            id: if v["id"].is_null() {
-                None
-            } else {
-                Some(v["id"].as_u64()?)
-            },
+            id: opt_u64(&v["id"])?,
             // Reject watch frames that do not specify an attachment mode.
             attached: v["attached"].as_bool()?,
         },
@@ -831,15 +819,12 @@ pub fn decode_command(kind: u8, payload: &[u8]) -> Option<Command> {
     Some(cmd)
 }
 
-/// Serialize an event to `(kind, payload)`. `Tasks`/`Status` are jzon control
-/// frames; `Screen` is a `KIND_SCREEN` frame (`[u32 header_len][jzon header]
+/// Serialize an event to `(kind, payload)`. Every event but `Screen` is a jzon
+/// control frame; `Screen` is a `KIND_SCREEN` frame (`[u32 header_len][jzon header]
 /// [raw formatted bytes]`), so the formatted firehose stays raw.
 pub fn encode_event(ev: &Event) -> (u8, Vec<u8>) {
-    match ev {
-        Event::HelloOk => {
-            let o = jzon::object! { "t": "hello_ok" };
-            (KIND_CONTROL, o.dump().into_bytes())
-        }
+    let o = match ev {
+        Event::HelloOk => jzon::object! { "t": "hello_ok" },
         Event::Tasks(views) => {
             let mut arr = jzon::JsonValue::new_array();
             for tv in views {
@@ -864,17 +849,10 @@ pub fn encode_event(ev: &Event) -> (u8, Vec<u8>) {
                 insert_opt_ms(&mut o, "finished_ms", tv.finished_ago);
                 let _ = arr.push(o);
             }
-            let root = jzon::object! { "t": "tasks", "tasks": arr };
-            (KIND_CONTROL, root.dump().into_bytes())
+            jzon::object! { "t": "tasks", "tasks": arr }
         }
-        Event::Status(msg) => {
-            let o = jzon::object! { "t": "status", "msg": msg.as_str() };
-            (KIND_CONTROL, o.dump().into_bytes())
-        }
-        Event::Spawned { id } => {
-            let o = jzon::object! { "t": "spawned", "id": *id };
-            (KIND_CONTROL, o.dump().into_bytes())
-        }
+        Event::Status(msg) => jzon::object! { "t": "status", "msg": msg.as_str() },
+        Event::Spawned { id } => jzon::object! { "t": "spawned", "id": *id },
         Event::Sessions { names, recovery } => {
             let mut rec = jzon::JsonValue::new_array();
             for r in recovery {
@@ -885,23 +863,19 @@ pub fn encode_event(ev: &Event) -> (u8, Vec<u8>) {
                     "age": r.age_secs,
                 });
             }
-            let o = jzon::object! {
+            jzon::object! {
                 "t": "sessions",
                 "names": names.iter().map(String::as_str).collect::<Vec<_>>(),
                 "recovery": rec,
-            };
-            (KIND_CONTROL, o.dump().into_bytes())
+            }
         }
         // Base64 preserves arbitrary clipboard text in the JSON frame.
-        Event::ClipboardCopy { id, kind, text } => {
-            let o = jzon::object! {
-                "t": "clip",
-                "id": *id,
-                "k": kind.selector(),
-                "text": B64.encode(text.as_bytes()),
-            };
-            (KIND_CONTROL, o.dump().into_bytes())
-        }
+        Event::ClipboardCopy { id, kind, text } => jzon::object! {
+            "t": "clip",
+            "id": *id,
+            "k": kind.selector(),
+            "text": B64.encode(text.as_bytes()),
+        },
         Event::Screen(sv) => {
             let header = jzon::object! {
                 "id": sv.id,
@@ -919,9 +893,10 @@ pub fn encode_event(ev: &Event) -> (u8, Vec<u8>) {
             payload.extend_from_slice(&(hbytes.len() as u32).to_be_bytes());
             payload.extend_from_slice(&hbytes);
             payload.extend_from_slice(&sv.formatted);
-            (KIND_SCREEN, payload)
+            return (KIND_SCREEN, payload);
         }
-    }
+    };
+    (KIND_CONTROL, o.dump().into_bytes())
 }
 
 /// Parse an event from a received frame. `None` on any malformed input, mirroring
@@ -935,7 +910,6 @@ pub fn decode_event(kind: u8, payload: &[u8]) -> Option<Event> {
                 "tasks" => {
                     let mut views = Vec::new();
                     for tv in v["tasks"].members() {
-                        let lifecycle = lifecycle_from(tv["life"].as_str()?)?;
                         views.push(TaskView {
                             id: tv["id"].as_u64()?,
                             command: tv["command"].as_str()?.to_string(),
@@ -945,7 +919,7 @@ pub fn decode_event(kind: u8, payload: &[u8]) -> Option<Event> {
                             // Missing and null both mean unassigned/unnamed.
                             group: opt_str(&tv["group"])?,
                             name: opt_str(&tv["name"])?,
-                            lifecycle,
+                            lifecycle: lifecycle_from(tv["life"].as_str()?)?,
                             preview: Preview {
                                 text: tv["preview"].as_str()?.to_string(),
                                 source: source_from(tv["src"].as_str()?)?,

@@ -183,12 +183,59 @@ fn command_round_trips() {
     }
 }
 
+/// Round-trip every event through encoding and decoding, using control frames
+/// for all but `Screen`. In-process transport tests do not exercise decoding:
+/// without a decode arm, the event is discarded as undecodable in daemon mode.
 #[test]
-fn hello_ok_round_trips() {
-    let ack = Event::HelloOk;
-    let (k, p) = encode_event(&ack);
-    assert_eq!(k, KIND_CONTROL);
-    assert_eq!(decode_event(k, &p), Some(ack));
+fn event_round_trips() {
+    let screen = r#"{"id":9,"cursor":[3,12],"hide":false,"mouse":true,"alt":false,"ascr":true,"sb":42,"lines":["row0"]}"#;
+    let cases = [
+        Event::HelloOk,
+        Event::Tasks(vec![tv(1)]),
+        decode_event(KIND_SCREEN, &screen_payload(screen)).expect("valid screen header"),
+        Event::Status("saved 'x'".into()),
+        Event::Spawned {
+            // Preserve IDs above `u32::MAX` through the round trip.
+            id: u64::from(u32::MAX) + 7,
+        },
+        Event::Sessions {
+            names: vec!["work".into()],
+            recovery: Vec::new(),
+        },
+        Event::ClipboardCopy {
+            id: 1,
+            kind: ClipboardKind::Clipboard,
+            text: "hello".into(),
+        },
+    ];
+    // Assign an index to every variant; leave the match exhaustive so adding
+    // a variant without an index is a compile error.
+    fn variant_index(e: &Event) -> usize {
+        match e {
+            Event::HelloOk => 0,
+            Event::Tasks(_) => 1,
+            Event::Screen(_) => 2,
+            Event::Status(_) => 3,
+            Event::Spawned { .. } => 4,
+            Event::Sessions { .. } => 5,
+            Event::ClipboardCopy { .. } => 6,
+        }
+    }
+    let mut seen = [false; 7];
+    for ev in cases {
+        seen[variant_index(&ev)] = true;
+        let (k, p) = encode_event(&ev);
+        let control = !matches!(ev, Event::Screen(_));
+        assert_eq!(k == KIND_CONTROL, control, "frame kind of {ev:?}");
+        assert_eq!(decode_event(k, &p).as_ref(), Some(&ev), "round-trip {ev:?}");
+    }
+    for (i, covered) in seen.iter().enumerate() {
+        assert!(
+            covered,
+            "Event variant #{i} (see variant_index) never round-tripped: \
+             add a `cases` entry above and its decode arm in decode_event"
+        );
+    }
 }
 
 /// Handshake environment entries and the cwd round-trip byte-for-byte,
@@ -401,17 +448,6 @@ fn tasks_and_status_round_trip() {
     let status = Event::Status("saved 'x'".into());
     let (k, p) = encode_event(&status);
     assert_eq!(decode_event(k, &p), Some(status));
-}
-
-/// A spawn acknowledgement round-trips with an id above `u32::MAX`.
-#[test]
-fn spawned_round_trips() {
-    let ev = Event::Spawned {
-        id: u64::from(u32::MAX) + 7,
-    };
-    let (k, p) = encode_event(&ev);
-    assert_eq!(k, KIND_CONTROL);
-    assert_eq!(decode_event(k, &p), Some(ev));
 }
 
 /// `SetGroup` emits `"g"` only for an assignment. A missing or null `"g"`

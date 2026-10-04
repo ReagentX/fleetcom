@@ -181,14 +181,36 @@ impl Drop for KillOnDrop {
     }
 }
 
+/// A test daemon's runtime directory. Remove the tree on drop, except during
+/// unwinding: preserve the socket, config, and snapshots to inspect after failure.
+pub struct RuntimeDir(PathBuf);
+impl std::ops::Deref for RuntimeDir {
+    type Target = Path;
+    fn deref(&self) -> &Path {
+        &self.0
+    }
+}
+impl Drop for RuntimeDir {
+    fn drop(&mut self) {
+        if !std::thread::panicking() {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+}
+
 /// Start a `fleetcom --daemon` against an isolated runtime dir and connect a
 /// raw socket to it with no handshake, for tests that exercise the handshake
 /// itself. `configure` tweaks the daemon's `Command` (extra env vars) before
 /// spawn.
+///
+/// Bind the directory first so it is dropped last: pattern bindings are
+/// dropped in reverse declaration order. Reap the daemon through `KillOnDrop`
+/// before removing its runtime files. Use a named binding even when unused
+/// (`_dir`); with a bare `_`, the directory is dropped at the end of the `let`.
 pub fn start_daemon_raw(
     tag: &str,
     configure: impl FnOnce(&mut Command),
-) -> (PathBuf, KillOnDrop, UnixStream) {
+) -> (RuntimeDir, KillOnDrop, UnixStream) {
     let dir = std::env::temp_dir().join(format!("fleetcom_it_{tag}_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
@@ -211,7 +233,7 @@ pub fn start_daemon_raw(
         stream.is_some()
     });
     let stream = stream.expect("daemon never bound its socket");
-    (dir, daemon, stream)
+    (RuntimeDir(dir), daemon, stream)
 }
 
 /// `start_daemon_raw` plus the standard handshake: the connection is ready for
@@ -219,7 +241,7 @@ pub fn start_daemon_raw(
 pub fn start_daemon(
     tag: &str,
     configure: impl FnOnce(&mut Command),
-) -> (PathBuf, KillOnDrop, UnixStream) {
+) -> (RuntimeDir, KillOnDrop, UnixStream) {
     let (dir, daemon, mut stream) = start_daemon_raw(tag, configure);
     let cwd = dir.display().to_string();
     shake_hands(&mut stream, &cwd);

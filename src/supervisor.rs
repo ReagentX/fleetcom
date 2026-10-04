@@ -1,8 +1,8 @@
-//! The task owner: holds every `Task`, allocates ids, reaps exits, and answers
-//! `Command`s with `Event`s. It speaks only `protocol` types, never UI state.
-//! Driven through three calls: `apply` (one `Command`), `tick` (reap, then emit
-//! a task snapshot plus the watched screen), and `drain` (take the queued
-//! `Event`s).
+//! Task ownership, ID allocation, exit reaping, and `Command` handling through
+//! `Event` responses. Use only `protocol` types at this boundary, never UI state.
+//! In the serving loop, call `apply` for one `Command`, `tick` to reap and emit
+//! a task snapshot plus the watched screen, and `drain` to take queued `Event`s.
+//! Between clients, call `reap` and `recovery_maintenance` directly in the daemon.
 
 use std::{
     collections::BTreeMap,
@@ -24,8 +24,7 @@ use crate::{
     task::{Task, WriteRefused},
 };
 
-/// Quiet period after which a live task becomes idle. Lifecycle and placement
-/// use this same threshold.
+/// Quiet period after which a live task becomes idle.
 const IDLE_AFTER: Duration = Duration::from_secs(10);
 
 /// Per-dimension PTY size limit. Resizes are clamped to `[1, MAX_DIM]` to keep
@@ -155,6 +154,15 @@ fn current_resume_id(task: &Task) -> Option<String> {
     task.resume_id.clone()
 }
 
+/// Build the saved or rerun command from the task's best-known ID.
+/// Without an ID, preserve the requested command exactly.
+fn recipe_command(t: &Task) -> String {
+    match (t.harness, current_resume_id(t)) {
+        (Some(h), Some(id)) => h.resume_command(&t.command, &id),
+        _ => t.command.clone(),
+    }
+}
+
 /// Resolve harness configuration from the task's launch environment.
 fn harness_home(env: &[(OsString, OsString)], h: &dyn harness::Harness) -> Option<PathBuf> {
     h.resolve_home(&|key| env_get(env, key).map(PathBuf::from))
@@ -193,9 +201,8 @@ fn affects_recipe(cmd: &Command) -> bool {
 struct Recovery {
     /// Recovery writes are opt-in in unit tests.
     enabled: bool,
-    /// Whether a potentially recipe-changing command awaits a debounced pass.
-    dirty: bool,
-    /// The most recent scheduled recipe change: the debounce anchor.
+    /// Time of the most recent potentially recipe-changing command pending
+    /// a debounced pass. Use as the debounce anchor; clear after the pass.
     last_mutation: Option<Instant>,
     /// The start of the most recent cadence interval.
     last_cadence: Instant,
@@ -215,7 +222,6 @@ impl Recovery {
     fn new() -> Self {
         Self {
             enabled: !cfg!(test),
-            dirty: false,
             last_mutation: None,
             last_cadence: Instant::now(),
             last_written: None,
@@ -335,15 +341,10 @@ impl Supervisor {
     /// Clear connection-owned watch state and restore the watched task's live
     /// viewport before another client connects.
     pub fn clear_watch(&mut self) {
-        // Restore the previous target to live output.
-        if let Some(old) = self.watched
-            && let Some(t) = self.by_id_mut(old)
-        {
-            t.scroll_view(ScrollAction::Live);
-        }
-        self.watched = None;
-        self.watch_attached = false;
-        self.last_screen = None;
+        self.apply(Command::Watch {
+            id: None,
+            attached: false,
+        });
     }
 
     /// Apply one client request. Fire-and-forget: any result (a save/load
@@ -352,7 +353,6 @@ impl Supervisor {
         // Recipe-affecting command variants arm recovery before validation;
         // fingerprinting filters rejected commands and other no-ops.
         if affects_recipe(&cmd) {
-            self.recovery.dirty = true;
             self.recovery.last_mutation = Some(Instant::now());
         }
         match cmd {
@@ -471,10 +471,9 @@ impl Supervisor {
     }
 
     /// One step of the core's own loop: reap exits, then emit a fresh task
-    /// snapshot (plus the watched task's screen). In process the client calls
-    /// this each UI tick; in the daemon it runs on the core's thread and the
-    /// events flow over the socket. Either way the client only ever sees
-    /// `drain`ed events, never a `Task`.
+    /// snapshot (plus the watched task's screen). Call only from `core::run_loop`
+    /// in production, both in process and in the daemon. Access state from the
+    /// client through `drain`ed events, never through a `Task`.
     pub fn tick(&mut self) {
         self.reap();
         // Check current state rather than individual transitions to handle exit,
@@ -494,11 +493,7 @@ impl Supervisor {
         // preview resolution reads the grid, letting the same tick ship it.
         // Resolution mutates per-task hold state; all tasks use one timestamp.
         // Only the attached watch may forward clipboard stores.
-        let forwarding = if self.watch_attached {
-            self.watched
-        } else {
-            None
-        };
+        let forwarding = self.watched.filter(|_| self.watch_attached);
         let mut clipboard = None;
         let views = self
             .tasks
@@ -579,11 +574,10 @@ impl Supervisor {
         if !self.recovery.enabled {
             return;
         }
-        let debounce_due = self.recovery.dirty
-            && self
-                .recovery
-                .last_mutation
-                .is_some_and(|t| now.duration_since(t) >= self.recovery.debounce);
+        let debounce_due = self
+            .recovery
+            .last_mutation
+            .is_some_and(|t| now.duration_since(t) >= self.recovery.debounce);
         let cadence_due = now.duration_since(self.recovery.last_cadence) >= self.recovery.cadence;
         if !(debounce_due || cadence_due) {
             return;
@@ -593,12 +587,12 @@ impl Supervisor {
         }
         // Do not replace an existing snapshot with an empty recipe.
         if self.tasks.is_empty() {
-            self.recovery.dirty = false;
+            self.recovery.last_mutation = None;
             return;
         }
         // Skip this pass without a config root.
         let Some(root) = self.sessions_root() else {
-            self.recovery.dirty = false;
+            self.recovery.last_mutation = None;
             return;
         };
         let cfg = self.session_config();
@@ -613,7 +607,7 @@ impl Supervisor {
             .as_ref()
             .is_some_and(|(r, dest, h)| *r == root && *h == hash && std::fs::metadata(dest).is_ok())
         {
-            self.recovery.dirty = false;
+            self.recovery.last_mutation = None;
             return;
         }
         let label = session::recovery_label(std::time::SystemTime::now());
@@ -636,7 +630,7 @@ impl Supervisor {
                 }
             }
         }
-        self.recovery.dirty = false;
+        self.recovery.last_mutation = None;
     }
 
     /// Run recovery maintenance between clients without queuing task or screen
@@ -682,16 +676,11 @@ impl Supervisor {
         f: impl FnOnce(&mut Task) -> Result<(), WriteRefused>,
     ) {
         if let Some(r) = self.by_id_mut(id).and_then(|t| f(t).err()) {
-            self.notice_refused(id, what, r.len);
+            self.status(format!(
+                "task {id} is not reading input; dropped {} {what}",
+                crate::format::bytes(r.len)
+            ));
         }
-    }
-
-    /// Report the task and message size for a bounded writer-queue refusal.
-    fn notice_refused(&mut self, id: u64, what: &str, len: usize) {
-        self.status(format!(
-            "task {id} is not reading input; dropped {} {what}",
-            crate::format::bytes(len)
-        ));
     }
 
     fn index_of(&self, id: u64) -> Option<usize> {
@@ -725,7 +714,7 @@ impl Supervisor {
         let root = self
             .launch_env_path(path::FLEETCOM_RUNTIME_DIR)
             .or_else(|| {
-                assets::runtime_root(None).map(|base| {
+                assets::runtime_root().map(|base| {
                     let key = self
                         .sessions_root()
                         .map(PathBuf::into_os_string)
@@ -863,7 +852,7 @@ impl Supervisor {
         // targeted conversation.
         let (command, cwd) = {
             let old = &self.tasks[i];
-            let command = Self::recipe_command(old);
+            let command = recipe_command(old);
             (command, old.cwd.clone())
         };
         // Preserve the finished task if its replacement cannot start. Use a distinct
@@ -901,21 +890,12 @@ impl Supervisor {
             cfg.entry(path::abbreviate(&t.cwd))
                 .or_default()
                 .push(SessionEntry {
-                    cmd: Self::recipe_command(t),
+                    cmd: recipe_command(t),
                     group: t.group.clone(),
                     name: t.name.clone(),
                 });
         }
         cfg
-    }
-
-    /// Build the saved or rerun command from the task's best-known ID.
-    /// Without an ID, preserve the requested command exactly.
-    fn recipe_command(t: &Task) -> String {
-        match (t.harness, current_resume_id(t)) {
-            (Some(h), Some(id)) => h.resume_command(&t.command, &id),
-            _ => t.command.clone(),
-        }
     }
 
     /// Session-recipe root for this connection: `FLEETCOM_CONFIG_DIR` from the

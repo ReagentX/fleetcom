@@ -259,7 +259,7 @@ fn reconnect_reset_drops_the_pending_spawn_ack() {
     assert_eq!(app.pending_select, None, "the stale ack must not survive");
     assert_eq!(app.selected_id, None);
     assert!(app.views.is_empty());
-    assert!(app.mode == Mode::Dashboard);
+    assert_eq!(app.mode, Mode::Dashboard);
 }
 
 /// Dir mode makes one section per distinct cwd (invocation dir first); state
@@ -1699,7 +1699,7 @@ fn cycle_tagged_is_noop_without_tags() {
 
     app.on_key_dashboard(key(KeyCode::Char('M')));
     assert_eq!(app.selected_id, Some(1), "no tags: the selection stands");
-    assert!(app.mode == Mode::Dashboard, "no tags: the mode stands");
+    assert_eq!(app.mode, Mode::Dashboard, "no tags: the mode stands");
     assert!(app.notice().is_none() && app.status.is_none());
 }
 
@@ -1781,7 +1781,7 @@ fn cycle_tagged_mutates_no_task_state() {
         "order is unchanged, so nothing reordered the list"
     );
     assert!(app.notice().is_none() && app.status.is_none());
-    assert!(app.mode == Mode::Dashboard);
+    assert_eq!(app.mode, Mode::Dashboard);
     // Press five times over two tags to select the second.
     assert_eq!(app.selected_id, Some(3));
 }
@@ -1880,7 +1880,7 @@ fn paste_into_text_entry_strips_controls() {
     app.mode = Mode::Spawn;
     app.on_paste("cargo\ttest\r\n --all");
     assert_eq!(app.input.as_str(), "cargotest --all");
-    assert!(app.mode == Mode::Spawn, "paste must not submit");
+    assert_eq!(app.mode, Mode::Spawn, "paste must not submit");
 }
 
 /// Select mouse capture by screen type.
@@ -2033,8 +2033,8 @@ fn attached_wheel_honors_the_childs_1007_veto() {
 #[test]
 fn scroll_view_entry_and_exit() {
     let (mut app, _) = App::attached(30, 100, "sleep 5");
-    assert!(app.mode == Mode::Attached);
-    let mut out = io::stdout();
+    assert_eq!(app.mode, Mode::Attached);
+    let mut out = io::sink();
 
     app.on_key_attached(&mut out, shift(KeyCode::PageUp));
     assert!(app.view_scroll, "Shift+PageUp must enter the scroll view");
@@ -2081,14 +2081,14 @@ fn wheel_moves_dashboard_selection() {
 fn group_picker_opens_on_g_only_with_a_selection() {
     let mut app = App::new_local(30, 100);
     app.on_key_dashboard(key(KeyCode::Char('g')));
-    assert!(app.mode == Mode::Dashboard, "no selection: g must no-op");
+    assert_eq!(app.mode, Mode::Dashboard, "no selection: g must no-op");
 
     let inv = app.invocation_dir.clone();
     app.spawn_in("sleep 5", inv);
     app.pump();
     app.resolve_selection();
     app.on_key_dashboard(key(KeyCode::Char('g')));
-    assert!(app.mode == Mode::PickGroup { target: 1 });
+    assert_eq!(app.mode, Mode::PickGroup(1));
 }
 
 /// Group candidates are distinct, case-insensitively sorted, and follow
@@ -2207,7 +2207,7 @@ fn group_enter_on_a_candidate_assigns_it() {
     app.on_key_dashboard(key(KeyCode::Char('g')));
     app.on_key_pickgroup(key(KeyCode::Char('a'))); // highlights "alpha"
     app.on_key_pickgroup(key(KeyCode::Enter));
-    assert!(app.mode == Mode::Dashboard);
+    assert_eq!(app.mode, Mode::Dashboard);
     app.pump();
     let v = app.views.iter().find(|v| v.id == 2).unwrap();
     assert_eq!(v.group.as_deref(), Some("alpha"));
@@ -2261,7 +2261,7 @@ fn group_esc_cancels_without_sending() {
         app.on_key_pickgroup(key(KeyCode::Char(c)));
     }
     app.on_key_pickgroup(key(KeyCode::Esc));
-    assert!(app.mode == Mode::Dashboard);
+    assert_eq!(app.mode, Mode::Dashboard);
     assert!(app.group_input.is_empty() && app.group_candidates.is_empty());
     app.pump();
     let v = app.views.iter().find(|v| v.id == 1).unwrap();
@@ -2287,7 +2287,7 @@ fn find_type(app: &mut App, text: &str) {
 fn find_palette_opens_on_slash_only_with_tasks() {
     let mut app = App::new_local(30, 100);
     app.on_key_dashboard(key(KeyCode::Char('/')));
-    assert!(app.mode == Mode::Dashboard, "empty fleet: / must no-op");
+    assert_eq!(app.mode, Mode::Dashboard, "empty fleet: / must no-op");
     assert!(app.find_candidates.is_empty());
 
     let inv = app.invocation_dir.clone();
@@ -2296,7 +2296,7 @@ fn find_palette_opens_on_slash_only_with_tasks() {
     // Exercise opening find without a current selection.
     app.selected_id = None;
     app.on_key_dashboard(key(KeyCode::Char('/')));
-    assert!(app.mode == Mode::Find);
+    assert_eq!(app.mode, Mode::Find);
     assert_eq!(find_ids(&app), vec![1]);
 }
 
@@ -2469,7 +2469,7 @@ fn find_esc_leaves_the_selection_alone() {
     find_type(&mut app, "true");
     assert_eq!(find_ids(&app), vec![2]);
     app.on_key_find(key(KeyCode::Esc));
-    assert!(app.mode == Mode::Dashboard);
+    assert_eq!(app.mode, Mode::Dashboard);
     assert_eq!(app.selected_id, Some(1), "Esc must not move the selection");
     assert!(app.find_input.is_empty() && app.find_candidates.is_empty());
     assert_eq!(app.find_sel, 0);
@@ -2488,7 +2488,7 @@ fn find_enter_without_candidates_keeps_the_panel_open() {
     find_type(&mut app, "zzz");
     assert!(find_ids(&app).is_empty());
     app.on_key_find(key(KeyCode::Enter));
-    assert!(app.mode == Mode::Find, "no match: Enter must not close");
+    assert_eq!(app.mode, Mode::Find, "no match: Enter must not close");
     assert_eq!(app.selected_id, Some(1), "selection is untouched");
 
     // Editing the query refreshes candidates.
@@ -2593,9 +2593,9 @@ fn controls_overlay_opens_on_question_and_closes_on_peeks_key_set() {
     let mut app = App::new_local(30, 100);
     for close in [KeyCode::Char('?'), KeyCode::Esc, KeyCode::Char('q')] {
         app.on_key_dashboard(key(KeyCode::Char('?')));
-        assert!(app.mode == Mode::Controls, "? must open the overlay");
+        assert_eq!(app.mode, Mode::Controls, "? must open the overlay");
         app.on_key_controls(key(close));
-        assert!(app.mode == Mode::Dashboard, "{close:?} must close it");
+        assert_eq!(app.mode, Mode::Dashboard, "{close:?} must close it");
     }
 }
 
@@ -2611,7 +2611,7 @@ fn controls_overlay_accepts_both_spellings_of_the_chord() {
             "{chord:?} must open the overlay"
         );
         app.on_key_controls(chord);
-        assert!(app.mode == Mode::Dashboard, "{chord:?} must close it");
+        assert_eq!(app.mode, Mode::Dashboard, "{chord:?} must close it");
     }
 }
 
@@ -2623,7 +2623,7 @@ fn plain_slash_still_opens_the_find_palette() {
     app.spawn_in("sleep 5", inv);
     app.pump();
     app.on_key_dashboard(key(KeyCode::Char('/')));
-    assert!(app.mode == Mode::Find);
+    assert_eq!(app.mode, Mode::Find);
 }
 
 /// Dashboard bindings are inert while the controls overlay is open.
@@ -2639,7 +2639,7 @@ fn controls_overlay_ignores_dashboard_keys() {
     app.on_key_controls(key(KeyCode::Char('m')));
     app.on_key_controls(key(KeyCode::Char('n')));
     app.pump();
-    assert!(app.mode == Mode::Controls, "neither key closes the overlay");
+    assert_eq!(app.mode, Mode::Controls, "neither key closes the overlay");
     assert!(!app.views[0].tagged, "m must not reach the task");
     assert!(app.input.as_str().is_empty(), "n must not open the prompt");
 
@@ -2722,14 +2722,14 @@ fn dashboard_hints_defer_the_long_tail_to_the_overlay() {
 fn rename_prompt_opens_on_shift_r_only_with_a_selection() {
     let mut app = App::new_local(30, 100);
     app.on_key_dashboard(key(KeyCode::Char('R')));
-    assert!(app.mode == Mode::Dashboard, "no selection: R must no-op");
+    assert_eq!(app.mode, Mode::Dashboard, "no selection: R must no-op");
 
     let inv = app.invocation_dir.clone();
     app.spawn_in("sleep 5", inv);
     app.pump();
     app.resolve_selection();
     app.on_key_dashboard(key(KeyCode::Char('R')));
-    assert!(app.mode == Mode::Rename(1));
+    assert_eq!(app.mode, Mode::Rename(1));
     assert_eq!(app.input.as_str(), "", "an unnamed task prefills empty");
 
     // A named task prefills its name.
@@ -2756,7 +2756,7 @@ fn rename_enter_sends_the_typed_name() {
         app.on_key_rename(key(KeyCode::Char(c)));
     }
     app.on_key_rename(key(KeyCode::Enter));
-    assert!(app.mode == Mode::Dashboard);
+    assert_eq!(app.mode, Mode::Dashboard);
     assert!(app.input.is_empty());
     app.pump();
     let v = app.views.iter().find(|v| v.id == 1).unwrap();
@@ -2803,7 +2803,7 @@ fn rename_esc_cancels_without_sending() {
         app.on_key_rename(key(KeyCode::Char(c)));
     }
     app.on_key_rename(key(KeyCode::Esc));
-    assert!(app.mode == Mode::Dashboard);
+    assert_eq!(app.mode, Mode::Dashboard);
     assert!(app.input.is_empty());
     app.pump();
     let v = app.views.iter().find(|v| v.id == 1).unwrap();
@@ -3019,7 +3019,7 @@ fn custom_mode_spawn_inherits_the_selected_group() {
     app.resolve_selection();
 
     app.on_key_dashboard(key(KeyCode::Char('n')));
-    assert!(app.mode == Mode::Spawn);
+    assert_eq!(app.mode, Mode::Spawn);
     assert_eq!(app.spawn_group.as_deref(), Some("alpha"));
 
     for c in "sleep 5".chars() {
@@ -3046,10 +3046,10 @@ fn dir_picker_handoff_inherits_the_selected_group_in_custom_mode() {
     app.resolve_selection();
 
     app.on_key_dashboard(key(KeyCode::Char('@')));
-    assert!(app.mode == Mode::PickDir);
+    assert_eq!(app.mode, Mode::PickDir);
     // Row 0 is the current dir (DirKind::Use): Enter hands off to Spawn.
     app.on_key_pickdir(key(KeyCode::Enter));
-    assert!(app.mode == Mode::Spawn);
+    assert_eq!(app.mode, Mode::Spawn);
     assert_eq!(app.spawn_group.as_deref(), Some("alpha"));
 }
 
@@ -3497,7 +3497,7 @@ fn coordinate_invalidation_clears_the_selection() {
         app.on_mouse(drag_to(0, 4));
         assert!(app.selection.is_some(), "the drag must be live");
     };
-    let mut out = io::stdout();
+    let mut out = io::sink();
 
     let mut app = App::attached_with_lines(&["hello world"]);
     start(&mut app);
@@ -3507,7 +3507,7 @@ fn coordinate_invalidation_clears_the_selection() {
     let mut app = App::attached_with_lines(&["hello world"]);
     start(&mut app);
     app.on_key_attached(&mut out, ctrl(KeyCode::Char('\\')));
-    assert!(app.mode == Mode::Dashboard, "ctrl-\\ detaches");
+    assert_eq!(app.mode, Mode::Dashboard, "ctrl-\\ detaches");
     assert!(app.selection.is_none(), "detach must clear");
 
     let mut app = App::attached_with_lines(&["hello world"]);
@@ -3692,7 +3692,7 @@ fn capture_drop_clears_a_live_selection() {
         s.alt_screen = true;
         s.alt_scroll = true;
     }
-    app.sync_input_modes(&mut std::io::stdout()).unwrap();
+    app.sync_input_modes(&mut io::sink()).unwrap();
     assert!(!app.mouse_captured, "premise: capture dropped");
     assert!(app.selection().is_none(), "the drop must clear the drag");
     assert!(app.pending_clipboard.is_empty(), "nothing may copy");
@@ -3793,7 +3793,7 @@ fn scrollback_wheel_cancels_the_drag() {
 /// Scrollback navigation and exit keys cancel an active drag.
 #[test]
 fn scrollback_keys_clear_the_drag() {
-    let mut out = io::stdout();
+    let mut out = io::sink();
     let mut app = App::attached_with_lines(&["old line one"]);
     app.enter_scrollback(5);
     app.on_mouse(press(0, 0));
@@ -4026,7 +4026,7 @@ impl App {
 
     /// Dispatch `k` through `on_key`, the run loop's entry point.
     fn hit(&mut self, k: KeyEvent) {
-        self.on_key(&mut io::stdout(), k);
+        self.on_key(&mut io::sink(), k);
     }
 
     /// Return the flagship id from the latest snapshot.
@@ -4079,7 +4079,7 @@ fn bracket_marks_selected() {
     app.hit(key(KeyCode::Char(']')));
     app.pump();
     assert_eq!(app.flagship(), Some(a), "the mark moves to A");
-    assert!(app.mode == Mode::Dashboard);
+    assert_eq!(app.mode, Mode::Dashboard);
 }
 
 /// Clear the mark with `]` on the flagship.
@@ -4117,7 +4117,7 @@ fn bracket_without_selection_noops() {
     let sent = app.record_sends();
     app.hit(key(KeyCode::Char(']')));
     assert!(sent.lock().unwrap().is_empty());
-    assert!(app.mode == Mode::Dashboard);
+    assert_eq!(app.mode, Mode::Dashboard);
 }
 
 /// Handle `]` only on the dashboard; ignore it in Peek.
@@ -4125,13 +4125,13 @@ fn bracket_without_selection_noops() {
 fn bracket_in_peek_noops() {
     let (mut app, _, q) = flagship_pair();
     app.hit(key(KeyCode::Char(' ')));
-    assert!(app.mode == Mode::Peek, "premise: peeking at A");
+    assert_eq!(app.mode, Mode::Peek, "premise: peeking at A");
     let sent = app.record_sends();
     app.hit(key(KeyCode::Char(']')));
     app.pump();
     assert!(sent.lock().unwrap().is_empty());
     assert_eq!(app.flagship(), Some(q));
-    assert!(app.mode == Mode::Peek);
+    assert_eq!(app.mode, Mode::Peek);
 }
 
 /// Without a flagship, ignore the chord on the dashboard and while attached.
@@ -4143,12 +4143,12 @@ fn ctrl_bracket_noops_without_flagship() {
     let sent = app.record_sends();
 
     app.hit(chord());
-    assert!(app.mode == Mode::Attached);
+    assert_eq!(app.mode, Mode::Attached);
     assert_eq!(app.focused_id, Some(a));
 
     app.hit(ctrl(KeyCode::Char('\\')));
     app.hit(chord());
-    assert!(app.mode == Mode::Dashboard);
+    assert_eq!(app.mode, Mode::Dashboard);
     assert_eq!(app.focused_id, None);
     assert!(sent.lock().unwrap().is_empty(), "nothing reaches the core");
 }
@@ -4162,14 +4162,14 @@ fn jump_from_dashboard_and_back() {
     assert_eq!(app.chord_target(), Some(Target::Flagship(q)));
 
     app.hit(chord());
-    assert!(app.mode == Mode::Attached);
+    assert_eq!(app.mode, Mode::Attached);
     assert_eq!(app.focused_id, Some(q));
     assert_eq!(app.return_to, Some(Origin::Dashboard));
     assert_eq!(app.selected_id, Some(a), "the jump leaves selection alone");
     assert_eq!(app.chord_target(), Some(Target::Dashboard));
 
     app.hit(chord());
-    assert!(app.mode == Mode::Dashboard);
+    assert_eq!(app.mode, Mode::Dashboard);
     assert_eq!(app.focused_id, None);
     assert!(!app.view_scroll);
     assert_eq!(app.return_to, None);
@@ -4204,7 +4204,7 @@ fn jump_from_task_and_back() {
     assert_eq!(app.chord_target(), Some(Target::Task(a)));
 
     app.hit(chord());
-    assert!(app.mode == Mode::Attached);
+    assert_eq!(app.mode, Mode::Attached);
     assert_eq!(app.focused_id, Some(a));
     assert!(!app.view_scroll);
     assert_eq!(app.return_to, None);
@@ -4223,10 +4223,10 @@ fn jump_from_task_and_back() {
 fn jump_from_peek_lands_on_dashboard() {
     let (mut app, a, q) = flagship_pair();
     app.hit(key(KeyCode::Char(' ')));
-    assert!(app.mode == Mode::Peek);
+    assert_eq!(app.mode, Mode::Peek);
 
     app.hit(chord());
-    assert!(app.mode == Mode::Attached);
+    assert_eq!(app.mode, Mode::Attached);
     assert_eq!(app.focused_id, Some(q));
     assert_eq!(app.return_to, Some(Origin::Dashboard));
 
@@ -4275,7 +4275,7 @@ fn mark_then_enter_before_snapshot_returns_to_dashboard() {
 
     assert_eq!(app.chord_target(), Some(Target::Dashboard));
     app.hit(chord());
-    assert!(app.mode == Mode::Dashboard);
+    assert_eq!(app.mode, Mode::Dashboard);
     assert_eq!(app.focused_id, None);
     assert_eq!(app.return_to, None);
 }
@@ -4291,7 +4291,7 @@ fn return_to_finished_origin() {
 
     assert_eq!(app.chord_target(), Some(Target::Task(a)));
     app.hit(chord());
-    assert!(app.mode == Mode::Attached);
+    assert_eq!(app.mode, Mode::Attached);
     assert_eq!(app.focused_id, Some(a));
     assert_eq!(app.return_to, None);
 }
@@ -4309,7 +4309,7 @@ fn return_to_removed_origin_degrades_to_dashboard() {
 
     assert_eq!(app.chord_target(), Some(Target::Dashboard));
     app.hit(chord());
-    assert!(app.mode == Mode::Dashboard);
+    assert_eq!(app.mode, Mode::Dashboard);
     assert_eq!(app.focused_id, None);
     assert_eq!(app.return_to, None);
     assert!(app.task_index(q).is_some());
@@ -4330,7 +4330,7 @@ fn dead_flagship_returns_then_noops() {
     assert_eq!(app.focused_id, Some(a));
     assert_eq!(app.chord_target(), None);
     app.hit(chord());
-    assert!(app.mode == Mode::Attached);
+    assert_eq!(app.mode, Mode::Attached);
     assert_eq!(app.focused_id, Some(a), "second press no-ops");
 
     // Entered by `Enter`.
@@ -4339,10 +4339,10 @@ fn dead_flagship_returns_then_noops() {
     app.hit(key(KeyCode::Enter));
     app.finish(q);
     app.hit(chord());
-    assert!(app.mode == Mode::Dashboard);
+    assert_eq!(app.mode, Mode::Dashboard);
     assert_eq!(app.chord_target(), None);
     app.hit(chord());
-    assert!(app.mode == Mode::Dashboard, "second press no-ops");
+    assert_eq!(app.mode, Mode::Dashboard, "second press no-ops");
     assert_eq!(app.focused_id, None);
 }
 
@@ -4353,7 +4353,7 @@ fn return_to_clears_on_detach() {
     app.hit(chord());
     assert!(app.return_to.is_some());
     app.hit(ctrl(KeyCode::Char('\\')));
-    assert!(app.mode == Mode::Dashboard);
+    assert_eq!(app.mode, Mode::Dashboard);
     assert_eq!(app.return_to, None);
 }
 
@@ -4366,7 +4366,7 @@ fn return_to_clears_on_vanish() {
     assert_eq!(app.return_to, Some(Origin::Task(a)));
     app.views.retain(|v| v.id != q);
     app.check_attached_task();
-    assert!(app.mode == Mode::Dashboard);
+    assert_eq!(app.mode, Mode::Dashboard);
     assert_eq!(app.focused_id, None);
     assert_eq!(app.return_to, None);
 }
@@ -4380,7 +4380,7 @@ fn return_to_clears_on_disconnect() {
     assert!(app.return_to.is_some());
     app.transport = Box::new(Unplugged);
     app.check_connection();
-    assert!(app.mode == Mode::Disconnected);
+    assert_eq!(app.mode, Mode::Disconnected);
     assert_eq!(app.return_to, None);
 
     app.return_to = Some(Origin::Task(1));
@@ -4396,7 +4396,7 @@ fn ctrl_bracket_matches_legacy_ctrl_5() {
         app.hit(k);
         assert_eq!(app.focused_id, Some(q), "{k:?} must jump");
         app.hit(k);
-        assert!(app.mode == Mode::Dashboard, "{k:?} must return");
+        assert_eq!(app.mode, Mode::Dashboard, "{k:?} must return");
     }
 }
 
@@ -4429,7 +4429,7 @@ fn flagship_keys_ignored_outside_navigation_modes() {
     let modes = [
         Mode::Spawn,
         Mode::PickDir,
-        Mode::PickGroup { target: a },
+        Mode::PickGroup(a),
         Mode::Find,
         Mode::SaveSession,
         Mode::Rename(a),
@@ -4442,7 +4442,7 @@ fn flagship_keys_ignored_outside_navigation_modes() {
         for k in [key(KeyCode::Char(']')), chord(), ctrl(KeyCode::Char('5'))] {
             app.hit(k);
             app.pump();
-            assert!(app.mode == mode, "{k:?} changed the mode");
+            assert_eq!(app.mode, mode, "{k:?} changed the mode");
             assert_eq!(app.focused_id, None, "{k:?} attached");
             assert_eq!(app.return_to, None);
             assert_eq!(app.flagship(), Some(q), "{k:?} moved the mark");

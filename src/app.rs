@@ -77,7 +77,7 @@ enum NoticeLevel {
     Info,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Mode {
     Dashboard,
     /// Typing a command to spawn in `spawn_cwd` (bottom command line focused).
@@ -86,9 +86,7 @@ pub enum Mode {
     PickDir,
     /// Live group picker (the `g` flow). Its target remains fixed if a snapshot
     /// reorders the dashboard selection.
-    PickGroup {
-        target: u64,
-    },
+    PickGroup(u64),
     /// Find palette for selecting a task from filtered results.
     Find,
     /// Typing a name to save the current tasks as a session.
@@ -290,11 +288,10 @@ pub struct App {
     /// Set by an external SIGTERM/SIGHUP/SIGINT; the loop treats it as quit so
     /// teardown runs and the terminal is restored.
     term_signal: Arc<AtomicBool>,
-    should_quit: bool,
-    /// How to leave when `should_quit` fires: `q`/Ctrl-C/signals disconnect
-    /// (daemon + tasks survive), `Q` quits and kills. Defaults to the safe
-    /// `Disconnect` so an unexpected exit never reaps the daemon.
-    exit_intent: ExitIntent,
+    /// Pending exit intent: disconnect on `q`, Ctrl-C, or a terminating signal;
+    /// kill tasks and stop the daemon on `Q`. In `shutdown`, default to
+    /// `Disconnect` for `None` to preserve the daemon after an unexpected exit.
+    exit_intent: Option<ExitIntent>,
     /// Whether the client currently captures terminal mouse events.
     mouse_captured: bool,
     /// Whether the attached task is displaying scrollback.
@@ -337,16 +334,16 @@ fn step_down(sel: usize, len: usize) -> usize {
     (sel + 1).min(len.saturating_sub(1))
 }
 
-/// State-section order: In use, Running, Idle, then Completed.
+/// State-section rank and label: In use, Running, Idle, then Completed.
 /// Tags take precedence over lifecycle.
-fn section_rank(v: &TaskView) -> u8 {
+fn state_section(v: &TaskView) -> (u8, &'static str) {
     if v.tagged {
-        0
+        (0, "In use")
     } else {
         match v.lifecycle {
-            Lifecycle::Active => 1,
-            Lifecycle::Idle => 2,
-            Lifecycle::Ok | Lifecycle::Failed => 3,
+            Lifecycle::Active => (1, "Running"),
+            Lifecycle::Idle => (2, "Idle"),
+            Lifecycle::Ok | Lifecycle::Failed => (3, "Completed"),
         }
     }
 }
@@ -495,11 +492,10 @@ impl App {
             wait_rx,
             wait_tx,
             term_signal: Arc::new(AtomicBool::new(false)),
-            should_quit: false,
             mouse_captured: false,
             view_scroll: false,
             selection: None,
-            exit_intent: ExitIntent::Disconnect,
+            exit_intent: None,
         }
     }
 
@@ -571,14 +567,8 @@ impl App {
             .map(|(i, v)| {
                 let (rank, label) = match self.group_mode {
                     GroupMode::State => {
-                        let b = section_rank(v);
-                        let l = match b {
-                            0 => "In use",
-                            1 => "Running",
-                            2 => "Idle",
-                            _ => "Completed",
-                        };
-                        (b, l.to_string())
+                        let (rank, label) = state_section(v);
+                        (rank, label.to_string())
                     }
                     GroupMode::Dir => {
                         let label = path::abbreviate(&v.cwd);
@@ -879,10 +869,9 @@ impl App {
 
             if self.term_signal.load(Ordering::Relaxed) {
                 // Detach on a terminating signal; leave tasks running under the daemon.
-                self.exit_intent = ExitIntent::Disconnect;
-                self.should_quit = true;
+                self.exit_intent = Some(ExitIntent::Disconnect);
             }
-            if self.should_quit {
+            if self.exit_intent.is_some() {
                 break;
             }
             self.resolve_selection();
@@ -982,7 +971,7 @@ impl App {
     /// subdirectories of the resolved path come last.
     fn refresh_dir_candidates(&mut self) {
         let (base_str, partial) = split_input(&self.dir_input);
-        let base = self.resolve(base_str);
+        let base = path::resolve(&self.invocation_dir, base_str);
 
         let mut cands = vec![DirCand {
             label: path::abbreviate(&base),
@@ -1044,18 +1033,12 @@ impl App {
     }
 
     /// Lock in `dir` as the spawn target and move to command entry.
-    fn confirm_dir(&mut self, dir: PathBuf) {
+    fn open_spawn_prompt(&mut self, dir: PathBuf) {
         self.spawn_cwd = dir;
         self.spawn_group = self.inherited_group();
         self.input.clear();
         self.dir_candidates.clear();
         self.mode = Mode::Spawn;
-    }
-
-    /// Turn a typed path fragment into a fully-qualified, lexically-clean
-    /// absolute path (see `path::resolve`), resolved against the invocation dir.
-    fn resolve(&self, s: &str) -> PathBuf {
-        path::resolve(&self.invocation_dir, s)
     }
 
     /// Navigate into `dir`: retype the input as its path (trailing slash) so
@@ -1080,9 +1063,7 @@ impl App {
     fn open_group_picker(&mut self) {
         if let Some(i) = self.selected_task() {
             // Store the target before building its candidate list.
-            self.mode = Mode::PickGroup {
-                target: self.views[i].id,
-            };
+            self.mode = Mode::PickGroup(self.views[i].id);
             self.group_input.clear();
             self.refresh_group_candidates();
         }
@@ -1093,7 +1074,7 @@ impl App {
     fn refresh_group_candidates(&mut self) {
         // Mark the pinned target's group even if dashboard selection changes.
         let current = match self.mode {
-            Mode::PickGroup { target } => self
+            Mode::PickGroup(target) => self
                 .task_index(target)
                 .and_then(|i| self.views[i].group.clone()),
             _ => None,
@@ -1193,7 +1174,7 @@ impl App {
         self.mode = Mode::Dashboard;
     }
 
-    fn on_key(&mut self, out: &mut Stdout, k: KeyEvent) {
+    fn on_key(&mut self, out: &mut impl Write, k: KeyEvent) {
         // Any key dismisses a lingering save/load notice.
         self.status = None;
         // Global escape hatch, except while attached (Ctrl-C belongs to the child).
@@ -1202,8 +1183,7 @@ impl App {
             && k.code == KeyCode::Char('c')
             && k.modifiers.contains(KeyModifiers::CONTROL)
         {
-            self.exit_intent = ExitIntent::Disconnect;
-            self.should_quit = true;
+            self.exit_intent = Some(ExitIntent::Disconnect);
             return;
         }
         // Reserve `Ctrl-]` from children, like `Ctrl-\`. Handle it before mode
@@ -1219,7 +1199,7 @@ impl App {
             Mode::Dashboard => self.on_key_dashboard(k),
             Mode::Spawn => self.on_key_spawn(k),
             Mode::PickDir => self.on_key_pickdir(k),
-            Mode::PickGroup { .. } => self.on_key_pickgroup(k),
+            Mode::PickGroup(_) => self.on_key_pickgroup(k),
             Mode::Find => self.on_key_find(k),
             Mode::SaveSession => self.on_key_savesession(k),
             Mode::Rename(_) => self.on_key_rename(k),
@@ -1236,7 +1216,9 @@ impl App {
             // Reconnect only makes sense against a daemon; a dead in-process core
             // has nothing to reconnect to, so `--foreground` just quits.
             KeyCode::Char('r') if self.daemon_backed => self.reconnect(),
-            KeyCode::Char('q') | KeyCode::Char('Q') | KeyCode::Esc => self.should_quit = true,
+            KeyCode::Char('q') | KeyCode::Char('Q') | KeyCode::Esc => {
+                self.exit_intent = Some(ExitIntent::Disconnect);
+            }
             _ => {}
         }
     }
@@ -1248,14 +1230,8 @@ impl App {
         }
         match k.code {
             // `q` detaches (daemon + tasks live on); `Q` kills all and stops it.
-            KeyCode::Char('q') => {
-                self.exit_intent = ExitIntent::Disconnect;
-                self.should_quit = true;
-            }
-            KeyCode::Char('Q') => {
-                self.exit_intent = ExitIntent::Quit;
-                self.should_quit = true;
-            }
+            KeyCode::Char('q') => self.exit_intent = Some(ExitIntent::Disconnect),
+            KeyCode::Char('Q') => self.exit_intent = Some(ExitIntent::Quit),
             KeyCode::Up | KeyCode::Char('k') => self.select_up(),
             KeyCode::Down | KeyCode::Char('j') => self.select_down(),
             KeyCode::Tab => self.select_next_section(),
@@ -1289,12 +1265,7 @@ impl App {
             KeyCode::Char('/') => self.open_find_palette(),
             // Uppercase R renames; lowercase r reruns.
             KeyCode::Char('R') => self.open_rename_prompt(),
-            KeyCode::Char('n') => {
-                self.input.clear();
-                self.spawn_cwd = self.invocation_dir.clone();
-                self.spawn_group = self.inherited_group();
-                self.mode = Mode::Spawn;
-            }
+            KeyCode::Char('n') => self.open_spawn_prompt(self.invocation_dir.clone()),
             KeyCode::Char('@') => {
                 self.dir_input.clear();
                 self.refresh_dir_candidates();
@@ -1366,16 +1337,13 @@ impl App {
     }
 
     fn on_key_loadsession(&mut self, k: KeyEvent) {
-        if matches!(k.code, KeyCode::Tab | KeyCode::BackTab) {
-            if !self.session_recovery.is_empty() {
+        match k.code {
+            KeyCode::Tab | KeyCode::BackTab if !self.session_recovery.is_empty() => {
                 self.session_page = match self.session_page {
                     SessionPage::Saved => SessionPage::Recovery,
                     SessionPage::Recovery => SessionPage::Saved,
                 };
             }
-            return;
-        }
-        match k.code {
             KeyCode::Esc => self.mode = Mode::Dashboard,
             KeyCode::Up | KeyCode::Down => {
                 let (sel, len) = match self.session_page {
@@ -1434,7 +1402,7 @@ impl App {
                     let path = c.path.clone();
                     match c.kind {
                         // Resolved path or current-task directory: run there.
-                        DirKind::Use | DirKind::Jump => self.confirm_dir(path),
+                        DirKind::Use | DirKind::Jump => self.open_spawn_prompt(path),
                         // Subdirectory: descend and select its resolved-path row.
                         DirKind::Into => self.enter_dir(path),
                     }
@@ -1442,7 +1410,7 @@ impl App {
             }
             // Caret motion does not affect directory candidates.
             _ => {
-                if on_key_edit(&mut self.dir_input, k) == Some(true) {
+                if on_key_edit(&mut self.dir_input, k) {
                     self.refresh_dir_candidates();
                 }
             }
@@ -1466,14 +1434,14 @@ impl App {
                         .get(self.group_sel)
                         .and_then(|c| c.group.clone())
                 };
-                if let Mode::PickGroup { target } = self.mode {
+                if let Mode::PickGroup(target) = self.mode {
                     self.transport.send(Command::SetGroup { id: target, group });
                 }
                 self.close_group_picker();
             }
             // Caret motion does not affect group candidates.
             _ => {
-                if on_key_edit(&mut self.group_input, k) == Some(true) {
+                if on_key_edit(&mut self.group_input, k) {
                     self.refresh_group_candidates();
                 }
             }
@@ -1495,7 +1463,7 @@ impl App {
             }
             // Caret motion does not affect the matches.
             _ => {
-                if on_key_edit(&mut self.find_input, k) == Some(true) {
+                if on_key_edit(&mut self.find_input, k) {
                     self.refresh_find_candidates();
                 }
             }
@@ -1529,7 +1497,7 @@ impl App {
         }
     }
 
-    fn on_key_attached(&mut self, out: &mut Stdout, k: KeyEvent) {
+    fn on_key_attached(&mut self, out: &mut impl Write, k: KeyEvent) {
         // Background on Ctrl-\; the chord may be reported by crossterm as Ctrl-4.
         let detach = k.modifiers.contains(KeyModifiers::CONTROL)
             && matches!(k.code, KeyCode::Char('\\') | KeyCode::Char('4'));
@@ -1615,7 +1583,7 @@ impl App {
                 paste_into(&mut self.dir_input, s);
                 self.refresh_dir_candidates();
             }
-            Mode::PickGroup { .. } => {
+            Mode::PickGroup(_) => {
                 paste_into(&mut self.group_input, s);
                 self.refresh_group_candidates();
             }
@@ -1772,7 +1740,7 @@ impl App {
     }
 
     /// Apply input-mode changes for the current focus.
-    fn sync_input_modes(&mut self, out: &mut Stdout) -> io::Result<()> {
+    fn sync_input_modes(&mut self, out: &mut impl Write) -> io::Result<()> {
         let attached = match self.mode {
             Mode::Attached => self.focused_id.and_then(|id| self.screen_for(id)),
             _ => None,
@@ -1816,7 +1784,7 @@ impl App {
 
     /// Background the attached task and return to the dashboard. Preserve the
     /// selected row.
-    fn detach(&mut self, out: &mut Stdout) {
+    fn detach(&mut self, out: &mut impl Write) {
         self.mode = Mode::Dashboard;
         self.focused_id = None;
         self.return_to = None;
@@ -1854,7 +1822,7 @@ impl App {
     /// Navigate to `chord_target`. From the dashboard or Peek, record the
     /// dashboard as the origin and close Peek. From an attached task, record
     /// that task instead. On return to a non-flagship task, clear `return_to`.
-    fn on_chord(&mut self, out: &mut Stdout) {
+    fn on_chord(&mut self, out: &mut impl Write) {
         let Some(target) = self.chord_target() else {
             return;
         };
@@ -1908,10 +1876,11 @@ impl App {
     /// With an in-process core (`--foreground`), kill everything for either intent: no
     /// daemon is available after UI exit.
     fn shutdown(&mut self) {
+        let intent = self.exit_intent.unwrap_or(ExitIntent::Disconnect);
         // Blocks until the transport has acted on the intent. On `Quit` the
         // tasks are dead before `main` restores the terminal; on `Disconnect` the
         // daemon keeps running.
-        self.transport.shutdown(self.exit_intent);
+        self.transport.shutdown(intent);
     }
 }
 
@@ -1966,48 +1935,30 @@ fn is_controls_key(k: KeyEvent) -> bool {
     }
 }
 
-/// Apply prompt editing keys. Returns `Some(true)` for text changes, `Some(false)` for
-/// caret motion or ignored Ctrl chords, and `None` for unsupported keys. On Ctrl-A or
+/// Apply prompt editing keys. Return `true` for Backspace or an inserted character,
+/// `false` for caret motion, ignored Ctrl chords, and unsupported keys. On Ctrl-A or
 /// Ctrl-E, move to the start or end.
-fn on_key_edit(buf: &mut EditBuffer, k: KeyEvent) -> Option<bool> {
+fn on_key_edit(buf: &mut EditBuffer, k: KeyEvent) -> bool {
     let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
     match k.code {
         KeyCode::Backspace => {
             buf.backspace();
-            Some(true)
-        }
-        KeyCode::Left => {
-            buf.left();
-            Some(false)
-        }
-        KeyCode::Right => {
-            buf.right();
-            Some(false)
-        }
-        KeyCode::Home => {
-            buf.home();
-            Some(false)
-        }
-        KeyCode::End => {
-            buf.end();
-            Some(false)
-        }
-        KeyCode::Char('a') if ctrl => {
-            buf.home();
-            Some(false)
-        }
-        KeyCode::Char('e') if ctrl => {
-            buf.end();
-            Some(false)
+            return true;
         }
         KeyCode::Char(c) if !ctrl => {
             buf.insert(c);
-            Some(true)
+            return true;
         }
-        // Ignore unbound Ctrl chords without inserting their character.
-        KeyCode::Char(_) => Some(false),
-        _ => None,
+        KeyCode::Left => buf.left(),
+        KeyCode::Right => buf.right(),
+        KeyCode::Home => buf.home(),
+        KeyCode::End => buf.end(),
+        KeyCode::Char('a') if ctrl => buf.home(),
+        KeyCode::Char('e') if ctrl => buf.end(),
+        // Ignore unsupported keys and unbound Ctrl chords without inserting a character.
+        _ => {}
     }
+    false
 }
 
 /// Match a lowercased query against a task's name, command, or group.

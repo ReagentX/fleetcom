@@ -167,13 +167,7 @@ fn cascade(
     // An indented status line can remain as the idle floor. Trim only the display
     // candidate: the emulator row must remain verbatim in `live_floor` for
     // teardown-snapshot comparison.
-    let floor = screen.live_floor();
-    let trimmed = floor.trim_start();
-    Preview::floor(if trimmed.len() == floor.len() {
-        floor
-    } else {
-        trimmed.to_string()
-    })
+    Preview::floor(screen.live_floor().trim_start().to_string())
 }
 
 /// Screen and registry state that invalidates the cached preview candidate.
@@ -205,13 +199,6 @@ pub struct PreviewState {
     /// Finalization combines this with the exit snapshot to detect a restored
     /// primary screen.
     rendered_under_alt: bool,
-    finalized: bool,
-}
-
-impl Default for PreviewState {
-    fn default() -> Self {
-        Self::new()
-    }
 }
 
 impl PreviewState {
@@ -224,13 +211,12 @@ impl PreviewState {
             last_title_render: None,
             last_key: None,
             rendered_under_alt: false,
-            finalized: false,
         }
     }
 
     /// Whether the preview froze: the caller's once-per-life finalize gate.
     pub fn finalized(&self) -> bool {
-        self.finalized
+        self.rendered.frozen
     }
 
     /// Resolve the rendered preview against the current screen. `now` is a parameter,
@@ -245,7 +231,7 @@ impl PreviewState {
         adapter: Option<&dyn SummaryAdapter>,
         blocked: Option<(&str, &'static str)>,
     ) -> &Preview {
-        if self.finalized {
+        if self.rendered.frozen {
             return &self.rendered;
         }
         let key = (
@@ -330,10 +316,9 @@ impl PreviewState {
     /// different final floor is resolved normally.
     /// Repeated calls are no-ops.
     pub fn finalize(&mut self, screen: &impl ScreenFacts, adapter: Option<&dyn SummaryAdapter>) {
-        if self.finalized {
+        if self.rendered.frozen {
             return;
         }
-        self.finalized = true;
         self.downgrade_pending_since = None;
         let alt_torn_down_at_exit = self.rendered_under_alt
             && !screen.alternate_screen()

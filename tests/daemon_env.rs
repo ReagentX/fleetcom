@@ -33,9 +33,7 @@ fn spawn_runs_under_the_hello_env() {
         r#"printf '%s:%s' "$FLEETCOM_MARKER" "${{FLEETCOM_DAEMON_ONLY:-absent}}" > {}"#,
         out.display()
     );
-    stream
-        .write_all(&spawn_frame(&command, dir.as_path()))
-        .unwrap();
+    stream.write_all(&spawn_frame(&command, &dir)).unwrap();
 
     let wrote = wait_until(Duration::from_secs(5), || {
         std::fs::read_to_string(&out).is_ok_and(|c| !c.is_empty())
@@ -49,5 +47,4 @@ fn spawn_runs_under_the_hello_env() {
 
     // Clean shutdown; the task already exited on its own.
     stop_daemon(&mut daemon);
-    let _ = std::fs::remove_dir_all(&dir);
 }

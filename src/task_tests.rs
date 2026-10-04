@@ -109,18 +109,7 @@ fn finished_lifecycle_ignores_quiet_time() {
 
 #[test]
 fn resize_is_reflected_in_the_grid() {
-    let mut t = Task::spawn(
-        3,
-        "sleep 5",
-        "sleep 5",
-        &here(),
-        24,
-        80,
-        2000,
-        &env_here(),
-        no_waker(),
-    )
-    .unwrap();
+    let mut t = spawn(3, "sleep 5");
     t.resize(30, 100).unwrap();
     assert_eq!(t.parser.lock().size(), (30, 100));
     t.terminate();
@@ -229,7 +218,7 @@ fn viewport_scrolls_and_snaps_live_on_input() {
     t.scroll_view(ScrollAction::Up(10_000));
     assert_eq!(t.scroll_offset(), top);
     // Return the viewport to live output on input.
-    t.send_input(b"x").unwrap();
+    t.send_input(b"x".to_vec()).unwrap();
     assert_eq!(t.scroll_offset(), 0);
     t.terminate();
 }
@@ -251,8 +240,8 @@ fn screen_lines_yields_one_entry_per_grid_row() {
 #[test]
 fn queued_writes_reach_the_child_in_order() {
     let mut t = spawn(10, "cat");
-    t.send_input(b"zqfirstqz\n").unwrap();
-    t.send_input(b"zqsecondqz\n").unwrap();
+    t.send_input(b"zqfirstqz\n".to_vec()).unwrap();
+    t.send_input(b"zqsecondqz\n".to_vec()).unwrap();
     let mut contents = String::new();
     wait_until(Duration::from_secs(5), || {
         contents = grid(&t.parser).contents();
@@ -541,7 +530,7 @@ fn summary_adapter_anchors_live_and_freezes_completion_at_exit() {
     );
     let mut t = Task::spawn(42, &cmd, &cmd, &here(), 24, 80, 2000, &sh_env(), no_waker()).unwrap();
     assert!(t.summary_adapter.is_none(), "printf selects nothing");
-    t.summary_adapter = crate::harness::summary::select("codex");
+    t.summary_adapter = crate::harness::select("codex");
     assert!(t.summary_adapter.is_some());
 
     let mut live = t.resolve_preview(Instant::now());

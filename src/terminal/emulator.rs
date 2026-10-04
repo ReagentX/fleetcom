@@ -9,7 +9,7 @@ use std::{
 use alacritty_terminal::{
     Term,
     event::{Event, EventListener},
-    grid::{Dimensions, Row, Scroll},
+    grid::{Dimensions, Scroll},
     index::Line,
     term::{
         Config, TermMode,
@@ -293,11 +293,6 @@ impl Emulator {
         }
     }
 
-    /// Record one parser or synchronized-frame advance.
-    fn observe_advance(&mut self) {
-        self.revision += 1;
-    }
-
     /// Parse raw child output into the grid. Returns the probe replies the
     /// backend generated that pass the allowlist, in generation order; the
     /// caller owns delivering them to the child.
@@ -308,7 +303,7 @@ impl Emulator {
             clipboard: &mut self.clipboard,
         };
         self.parser.advance(&mut observed, bytes);
-        self.observe_advance();
+        self.revision += 1;
         self.bytes_since_sweep = self.bytes_since_sweep.saturating_add(bytes.len());
         if self.bytes_since_sweep >= SWEEP_INTERVAL_BYTES {
             self.bytes_since_sweep = 0;
@@ -325,7 +320,7 @@ impl Emulator {
             clipboard: &mut self.clipboard,
         };
         self.parser.stop_sync(&mut observed);
-        self.observe_advance();
+        self.revision += 1;
         self.drain_allowed()
     }
 
@@ -474,9 +469,9 @@ impl Emulator {
 /// Capture accessors for the dashboard-preview resolution layer
 /// (`crate::preview`).
 impl Emulator {
-    /// Monotonic count of grid advances. Bumps on every `process` call and
-    /// on each sync-frame landing; equal reads mean the grid did not advance
-    /// in between, so a poller can skip re-reading it.
+    /// Monotonic count of grid advances: incremented on every `process` call,
+    /// each sync-frame landing, and `resize`. If unchanged between polls,
+    /// skip re-reading the grid.
     pub fn revision(&self) -> u64 {
         self.revision
     }
@@ -549,38 +544,29 @@ fn live_floor_of(term: &Term<ProbeSink>) -> String {
     String::new()
 }
 
-/// Append a grid row's glyphs, omitting wide-character spacers, mapping tabs
-/// to spaces, and preserving combining marks. Callers handle trailing spaces.
+/// Plain text of one live-viewport row: wide-character spacers omitted, tabs
+/// mapped to spaces, combining marks preserved, trailing padding trimmed.
+/// Index rows `0..screen_lines` for live output regardless of the display
+/// offset; apply the offset only when iterating for display.
 ///
-/// Unlike [`crate::ansi::contents`], this scan view preserves glyphs in
-/// concealed (SGR 8) cells and orphaned wide halves. Harness matchers inspect
-/// stored grid text, not replay-equivalent display text.
-fn push_row_glyphs(out: &mut String, row: &Row<Cell>) {
-    for cell in row {
+/// Unlike [`crate::ansi::contents`], preserve glyphs in concealed (SGR 8) cells
+/// and orphaned wide halves: match harness output against stored grid text,
+/// not replay-equivalent display text.
+fn live_row_text_of(term: &Term<ProbeSink>, row: i32) -> String {
+    let mut text = String::new();
+    for cell in &term.grid()[Line(row)] {
         if cell
             .flags
             .intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER)
         {
             continue;
         }
-        out.push(if cell.c == '\t' { ' ' } else { cell.c });
+        text.push(if cell.c == '\t' { ' ' } else { cell.c });
         if let Some(zerowidth) = cell.zerowidth() {
-            out.extend(zerowidth.iter());
+            text.extend(zerowidth.iter());
         }
     }
-}
-
-/// Plain text of one live-viewport row, trailing padding trimmed. Rows
-/// `0..screen_lines` address live output regardless of the display
-/// offset; only display iteration follows the offset.
-fn live_row_text_of(term: &Term<ProbeSink>, row: i32) -> String {
-    let grid = term.grid();
-    let line = &grid[Line(row)];
-    let mut text = String::new();
-    push_row_glyphs(&mut text, line);
-    while text.ends_with(' ') {
-        text.pop();
-    }
+    text.truncate(text.trim_end_matches(' ').len());
     text
 }
 
@@ -626,10 +612,11 @@ const TITLE_STACK_SHADOW_MAX: usize = 4096;
 ///
 /// # Forwarding invariant
 ///
-/// `Handler` methods default to no-ops, so every method must delegate to
-/// `Term`. `golden::emulator_wrapper_matches_the_raw_backend_on_every_fixture`
-/// compares wrapper and raw-backend replays to detect missing delegation.
-/// `clipboard_store` is captured by this wrapper instead of delegated.
+/// Delegate every `Handler` method to `Term` to avoid the default no-op.
+/// Check delegation in `golden::wrapper_*`: replay each raw fixture through
+/// the wrapper and raw backend, then compare styled bytes, text, cursor, and
+/// alternate-screen state. Capture `clipboard_store` in this wrapper instead
+/// of delegating it.
 ///
 /// # Synchronized updates
 ///
@@ -721,9 +708,7 @@ impl Handler for ObservedTerm<'_> {
     fn input(&mut self, a0: char) {
         self.term.input(a0);
         // Discard a staged primary-screen title on printable output.
-        if self.alt.staged_title.is_some() {
-            self.alt.staged_title = None;
-        }
+        self.alt.staged_title = None;
     }
     delegate! {
         goto(a0: i32, a1: usize);
@@ -816,12 +801,10 @@ impl Handler for ObservedTerm<'_> {
         }
         self.clipboard.stores.push((selector, text));
     }
-    fn clipboard_load(&mut self, a0: u8, a1: &str) {
+    delegate! {
         // The configured terminal policy denies clipboard loads.
-        self.term.clipboard_load(a0, a1);
-    }
-    fn decaln(&mut self) {
-        self.term.decaln();
+        clipboard_load(a0: u8, a1: &str);
+        decaln();
     }
     fn push_title(&mut self) {
         self.term.push_title();

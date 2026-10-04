@@ -132,9 +132,10 @@ Verify display and parser behavior against these fixtures:
 - `codex_resume`, `wide_emoji`, `dec_scrollregion`, and `topregion_scroll` for
   parser semantics: scrollback retention, intensity stacking, charset
   translation, and VS16 width.
-- `claude_resume`, `codex_resume`, and `grok_resume` for comparison of the
-  emulator's final display, cursor, and alternate-screen state with the terminal backend.
+- Every raw capture listed above for comparison of the emulator's final styled
+  cells, text, cursor, and alternate-screen state with the terminal backend,
+  and for a serialize-and-replay round trip.
 
 See `src/terminal/golden.rs` for absolute display and parser expectations and
-terminal-backend comparisons, and `src/harness/summary_tests.rs` for
-preview-fixture expectations.
+terminal-backend comparisons, `src/terminal/ansi.rs` for the round trip, and
+`src/harness/summary_tests.rs` for preview-fixture expectations.

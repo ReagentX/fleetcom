@@ -41,6 +41,4 @@ fn sigterm_kills_daemon_and_its_tasks() {
 
     // Clean shutdown removes the socket.
     assert!(!sock.exists(), "socket file left behind");
-
-    let _ = std::fs::remove_dir_all(&dir);
 }

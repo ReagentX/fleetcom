@@ -5,8 +5,8 @@
 
 use super::*;
 
-/// Fixture dimensions. Thirty rows fit every section; 107 columns produce a
-/// 71-column preview cell and an 80-column peek box.
+/// Use 30 rows to fit every section and 107 columns for a 72-column preview
+/// cell and an 80-column peek box.
 const FIXTURE_ROWS: u16 = 30;
 const FIXTURE_COLS: u16 = 107;
 

@@ -3,6 +3,7 @@ use std::time::Instant;
 use super::*;
 use crate::{
     emulator::Emulator,
+    harness::select,
     preview::{MARKER, PreviewState, SummaryAdapter},
     protocol::PreviewSource,
 };
@@ -1471,7 +1472,7 @@ fn omp_ascii_box_glyphs_do_not_anchor() {
 
 /// Each offset is a cumulative PTY byte checkpoint, not a standalone repaint.
 fn codex_0158_checkpoint(bytes: &[u8], offset: usize, alternate: bool) -> Vec<String> {
-    let mut emu = Emulator::new(40, 120, 2000);
+    let mut emu = crate::testutil::corpus_emulator();
     emu.process(&bytes[..offset]);
     assert_eq!(emu.alternate_screen(), alternate);
     emu.live_rows()
@@ -2015,7 +2016,7 @@ fn corpus_non_agent_tuis_keep_their_tiers() {
             .windows(8)
             .rposition(|w| w == b"\x1b[?1049l")
             .expect("fixture exits the alt screen");
-        let mut emu = Emulator::new(40, 120, 2000);
+        let mut emu = crate::testutil::corpus_emulator();
         emu.process(&bytes[..cut]);
         assert!(emu.alternate_screen(), "{name}: alt screen active at cut");
         let mut st = PreviewState::new();
