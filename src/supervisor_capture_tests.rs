@@ -836,25 +836,22 @@ fn capture_stamped_by_a_foreign_process_falls_back_to_the_next_source() {
     let json = |id: &str, source: &str| {
         format!(r#"{{"session_id":"{id}","hook_event_name":"SessionStart","source":"{source}"}}"#)
     };
-    // After an exec from `/bin/sh -c`, the stub is the task leader. Use one
-    // marker per stage. First, run the hook as the leader's child, with the
-    // leader as `$PPID`, as in the task's own Claude process. Then run it
-    // under an intermediate shell with the same inherited environment, as
-    // in Claude's daemon. Append `:` to prevent an exec of the pipeline's
-    // last command: the hook's `$PPID` must be the intermediate shell.
+    // The stub is the task leader only when `/bin/sh -c` replaces itself with
+    // it, which Ubuntu's `/bin/sh` does not. The test therefore writes the
+    // task's own capture itself, with the leader's stamp. The stub runs the
+    // installed hook under an intermediate shell with the same inherited
+    // environment, as in Claude's daemon. Append `:` to prevent an exec of
+    // the pipeline's last command: the hook's `$PPID` must be the
+    // intermediate shell, which is never the leader.
     install_script(
         &bin,
         "claude",
         &format!(
-            r#"until [ -e '{d}/own' ]; do sleep 0.05; done
-printf '%s\n' '{own}' | sh '{d}/hook'
-: > '{d}/own-done'
-until [ -e '{d}/foreign' ]; do sleep 0.05; done
+            r#"until [ -e '{d}/foreign' ]; do sleep 0.05; done
 sh -c 'printf "%s\n" "$1" | sh "$0"; :' '{d}/hook' '{foreign}'
 : > '{d}/foreign-done'
 until [ -e '{d}/done' ]; do sleep 0.05; done"#,
             d = dir.display(),
-            own = json(CAP_OTHER, "clear"),
             foreign = json(FOREIGN_ID, "startup"),
         ),
     );
@@ -875,7 +872,7 @@ until [ -e '{d}/done' ]; do sleep 0.05; done"#,
     let pid = s.tasks[0].pid().expect("a live task has a pid");
     let cap = s.tasks[0].capture_file.clone().expect("capture file set");
 
-    // Use the hook command from the installed overlay in both stages.
+    // The foreign stage runs the hook command from the installed overlay.
     let overlay = std::fs::read_to_string(cap.with_file_name("claude-settings.json")).unwrap();
     let hook = jzon::parse(&overlay).unwrap()["hooks"]["SessionStart"][0]["hooks"][0]["command"]
         .as_str()
@@ -883,16 +880,7 @@ until [ -e '{d}/done' ]; do sleep 0.05; done"#,
         .to_string();
     std::fs::write(dir.join("hook"), hook).unwrap();
 
-    std::fs::write(dir.join("own"), b"").unwrap();
-    assert!(
-        wait_until(Duration::from_secs(5), || dir.join("own-done").exists()),
-        "the stub never ran the hook as the leader's child"
-    );
-    assert_eq!(
-        std::fs::read_to_string(&cap).unwrap(),
-        format!("{pid}\n{}\n", json(CAP_OTHER, "clear")),
-        "the leader's own hook must stamp the leader's pid"
-    );
+    std::fs::write(&cap, stamped(&s.tasks[0], &json(CAP_OTHER, "clear"))).unwrap();
     assert_eq!(
         current_resume_id(&s.tasks[0]).as_deref(),
         Some(CAP_OTHER),
