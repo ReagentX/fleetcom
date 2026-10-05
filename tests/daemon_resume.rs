@@ -23,8 +23,8 @@ const RUN_MARKER: &str = "-- run --";
 /// Fixed v7-shaped thread ID reported by the `codex` stub.
 const CODEX_ID: &str = "019f5453-de22-7240-b2e5-0d32692aa6d9";
 
-/// Config override that follows the notify override on every instrumented
-/// `codex` launch and keeps it in embedded mode.
+/// Config override for embedded mode, placed after the notify override on
+/// every instrumented `codex` launch.
 const CODEX_EMBEDDED: &str = "features.daemon_auto_start=false";
 
 /// Scratch tree containing every executable, store, working directory, and argv
@@ -135,10 +135,10 @@ fn install_stub(s: &Scratch, name: &str, body: &str) {
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
 }
 
-/// `claude` stub that records argv, writes a `SessionStart` payload to the
-/// capture file, and prints a resumable exit hint. The payload carries the
-/// stamp the real hook writes on its first line: the shell execs the stub in
-/// place, so `$$` is the task leader PID.
+/// Install a `claude` stub to record argv, write a `SessionStart` payload,
+/// and print a resumable exit hint. Prefix the payload with the same PID
+/// stamp as the real hook: after an exec from the shell, the stub's `$$`
+/// is the task leader PID.
 fn install_claude_stub(s: &Scratch) {
     let body = format!(
         r#"id=''
@@ -158,10 +158,9 @@ printf 'Resume this session with:\nclaude --resume %s\n' "$id""#,
     install_stub(s, "claude", &body);
 }
 
-/// `codex` stub that records argv and reports `CODEX_ID` only through the
-/// capture file. Like a real root thread, it saves its rollout header under
-/// `$CODEX_HOME` before it notifies: `session_id` equals `id` and `source` is
-/// a string.
+/// Install a `codex` stub to record argv and report `CODEX_ID` only through
+/// the capture file. Before notifying, save a root rollout header under
+/// `$CODEX_HOME`: set `session_id` to `id` and use a string `source`.
 fn install_codex_stub(s: &Scratch) {
     let body = format!(
         r#"printf '%s\n' '{marker}' "$@" >> '{rec}'
