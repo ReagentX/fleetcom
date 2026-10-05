@@ -1,5 +1,6 @@
 //! Codex does not let the caller select an ID at launch. This harness instead
-//! injects a `notify` override and chains compatible configured notifiers.
+//! injects a `notify` override, chains compatible configured notifiers, and
+//! adds a second override that keeps the launch in embedded mode.
 //!
 //! Every thread a Codex process runs reports through that notifier: the
 //! conversation on screen, each sub-agent it spawns, and the hidden thread the

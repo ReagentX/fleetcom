@@ -44,8 +44,9 @@ pub const NOTIFY_CHAIN_ENV: &str = "FLEETCOM_NOTIFY_CHAIN";
 
 /// Detection, capture, and resume behavior for one agent CLI.
 pub trait Harness: Sync {
-    /// Resolve configuration needed by instrumentation or the live registry
-    /// from the launch environment. Tools that need neither return `None`.
+    /// Resolve configuration needed by instrumentation, capture parsing, or
+    /// the live registry from the launch environment. Tools that need none
+    /// return `None`.
     fn resolve_home(&self, _env: &dyn Fn(&str) -> Option<PathBuf>) -> Option<PathBuf> {
         None
     }
@@ -288,8 +289,8 @@ pub fn is_uuid(s: &str) -> bool {
         })
 }
 
-/// Validated session ID at `key` in hook or notify JSON; [`is_uuid`] is the
-/// shell-insertion boundary.
+/// Validated session ID at `key` in a capture payload or a Codex rollout
+/// header; [`is_uuid`] is the shell-insertion boundary.
 fn capture_id(v: &jzon::JsonValue, key: &str) -> Option<String> {
     let id = v[key].as_str()?;
     is_uuid(id).then(|| id.to_string())
