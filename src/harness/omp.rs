@@ -1,7 +1,14 @@
-//! omp cannot pin a session ID at launch: it has no `--session-id` flag, and
-//! `--resume` requires an existing session. Live capture therefore loads an
-//! extension whose `session_start` and `session_switch` handlers write the
-//! current ID.
+//! An omp session ID cannot be pinned at launch: no `--session-id` flag is
+//! available, and an existing session is required for `--resume`. For live
+//! capture, load an extension to report the top-level ID on `session_start`,
+//! `session_switch`, `session_branch`, and `agent_end`.
+//!
+//! Report only IDs usable with `omp --resume`. Skip sub-agent sessions:
+//! the same handlers are registered for them, but their IDs are not resumable.
+//! Wait until the session file is created after the first assistant message.
+//! For a bare `omp` task, no ID is captured until the end of the first turn.
+//! Capture is unavailable before omp 18.3.2: without the agent kind in the
+//! extension context, top-level sessions cannot be distinguished from sub-agents.
 //!
 //! omp's IDs are UUIDv7. [`is_uuid`](super::is_uuid) validates the 8-4-4-4-12
 //! lowercase-hex shape and not the version field, so they pass unchanged.
@@ -40,8 +47,15 @@ impl Harness for Omp {
         }
     }
 
-    /// Return `sessionId` from a valid extension payload.
-    fn parse_capture(&self, payload: &str) -> Option<String> {
+    /// Return `sessionId` from a valid extension payload. Check the agent
+    /// kind in the extension: without that field in the payload, the check
+    /// cannot be repeated here.
+    fn parse_capture(
+        &self,
+        payload: &str,
+        _pid: Option<u32>,
+        _home: Option<&Path>,
+    ) -> Option<String> {
         capture_id(&jzon::parse(payload).ok()?, "sessionId")
     }
 }
@@ -100,22 +114,28 @@ mod tests {
     /// Extract only a validated ID from the extension payload.
     #[test]
     fn parse_capture_returns_only_strict_ids() {
-        for reason in ["session_start", "session_switch"] {
+        let parse = |payload: &str| Omp.parse_capture(payload, None, None);
+        for reason in [
+            "session_start",
+            "session_switch",
+            "session_branch",
+            "agent_end",
+        ] {
             let payload = format!(
                 r#"{{"reason":"{reason}","sessionId":"{CAPTURED}","sessionFile":"/s/2026-08-15T22-13-39-854Z_{CAPTURED}.jsonl","cwd":"/work/proj"}}"#
             );
-            assert_eq!(Omp.parse_capture(&payload).as_deref(), Some(CAPTURED));
+            assert_eq!(parse(&payload).as_deref(), Some(CAPTURED));
         }
 
-        assert_eq!(Omp.parse_capture("not json"), None);
-        assert_eq!(Omp.parse_capture("{}"), None);
-        assert_eq!(Omp.parse_capture(r#"{"sessionId":"my session"}"#), None);
-        assert_eq!(Omp.parse_capture(r#"{"sessionId":"x'; rm -rf ~'"}"#), None);
+        assert_eq!(parse("not json"), None);
+        assert_eq!(parse("{}"), None);
+        assert_eq!(parse(r#"{"sessionId":"my session"}"#), None);
+        assert_eq!(parse(r#"{"sessionId":"x'; rm -rf ~'"}"#), None);
         // Reject uppercase hex during UUID validation.
         assert_eq!(
-            Omp.parse_capture(&format!(r#"{{"sessionId":"{}"}}"#, CAPTURED.to_uppercase())),
+            parse(&format!(r#"{{"sessionId":"{}"}}"#, CAPTURED.to_uppercase())),
             None
         );
-        assert_eq!(Omp.parse_capture(""), None);
+        assert_eq!(parse(""), None);
     }
 }

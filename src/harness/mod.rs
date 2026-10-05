@@ -44,8 +44,9 @@ pub const NOTIFY_CHAIN_ENV: &str = "FLEETCOM_NOTIFY_CHAIN";
 
 /// Detection, capture, and resume behavior for one agent CLI.
 pub trait Harness: Sync {
-    /// Resolve configuration needed by instrumentation or the live registry
-    /// from the launch environment. Tools that need neither return `None`.
+    /// Resolve configuration needed by instrumentation, capture parsing, or
+    /// the live registry from the launch environment. Return `None` when no
+    /// configuration is needed.
     fn resolve_home(&self, _env: &dyn Fn(&str) -> Option<PathBuf>) -> Option<PathBuf> {
         None
     }
@@ -71,9 +72,17 @@ pub trait Harness: Sync {
         home: Option<&Path>,
     ) -> SpawnPlan;
 
-    /// Extract a session ID from hook or notify JSON. Defaults to `None` for
-    /// tools without an injected capture channel.
-    fn parse_capture(&self, _payload: &str) -> Option<String> {
+    /// Extract a session ID from the capture file's contents. `pid` is the
+    /// task's session leader and `home` the launch-time harness home. When
+    /// other processes can write to the capture channel, use these arguments
+    /// to reject payloads written outside the task's own process.
+    /// Return `None` by default for tools without an injected capture channel.
+    fn parse_capture(
+        &self,
+        _payload: &str,
+        _pid: Option<u32>,
+        _home: Option<&Path>,
+    ) -> Option<String> {
         None
     }
 
@@ -280,8 +289,8 @@ pub fn is_uuid(s: &str) -> bool {
         })
 }
 
-/// Validated session ID at `key` in hook or notify JSON; [`is_uuid`] is the
-/// shell-insertion boundary.
+/// Validated session ID at `key` in a capture payload or a Codex rollout
+/// header; [`is_uuid`] is the shell-insertion boundary.
 fn capture_id(v: &jzon::JsonValue, key: &str) -> Option<String> {
     let id = v[key].as_str()?;
     is_uuid(id).then(|| id.to_string())

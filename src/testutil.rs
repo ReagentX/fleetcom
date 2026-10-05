@@ -196,6 +196,41 @@ pub(crate) fn install_fake_notifier(path: &Path, record: &Path) {
     );
 }
 
+/// First line of a Codex rollout: the `session_meta` envelope around
+/// `payload`, newline-terminated like every rollout line.
+pub(crate) fn codex_session_meta(payload: &str) -> String {
+    format!(
+        r#"{{"timestamp":"2026-10-04T17:49:56.012Z","ordinal":0,"type":"session_meta","payload":{payload}}}"#
+    ) + "\n"
+}
+
+/// Write `contents` as the rollout of `thread` under the Codex `home` and
+/// return its path.
+pub(crate) fn install_codex_rollout(
+    home: &Path,
+    thread: &str,
+    contents: impl AsRef<[u8]>,
+) -> PathBuf {
+    let day = home.join("sessions/2026/10/04");
+    fs::create_dir_all(&day).unwrap();
+    let path = day.join(format!("rollout-2026-10-04T13-49-56-{thread}.jsonl"));
+    fs::write(&path, contents).unwrap();
+    path
+}
+
+/// Install the rollout header of a root thread: `session_id` equals `id` and
+/// `source` is a string. Include only the fields used for capture validation;
+/// other fields are present in a real header.
+pub(crate) fn install_codex_root(home: &Path, thread: &str) -> PathBuf {
+    install_codex_rollout(
+        home,
+        thread,
+        codex_session_meta(&format!(
+            r#"{{"id":"{thread}","session_id":"{thread}","source":"cli"}}"#
+        )),
+    )
+}
+
 /// Corpus geometry: the fixture recordings in `tests/corpus/` were captured
 /// under a 40-row, 120-column PTY (tests/corpus/README.md).
 pub(crate) const CORPUS_LINES: usize = 40;

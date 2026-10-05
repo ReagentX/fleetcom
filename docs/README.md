@@ -169,7 +169,7 @@ The client environment is not persisted. Each client's environment and working d
 
 ### Captured IDs in shell commands
 
-To resume an agent conversation, `fleetcom` inserts its captured ID into a command run through `$SHELL -c`. Because the ID becomes shell input, validation accepts only lowercase hexadecimal in the `8-4-4-4-12` UUID shape. The same check applies to capture payloads, live session records, and final command construction. `fleetcom` does not read session IDs from terminal output and instruments only a bare program word or its canonical resume form. See [Agent session resume](agent-resume.md#validation-boundary) for both boundaries.
+To resume an agent conversation, insert its captured ID into a command run through `$SHELL -c`. Before shell insertion, accept only lowercase hexadecimal in the `8-4-4-4-12` UUID format. Validate capture payloads, Codex rollout headers, live session records, and the final command construction. Never read session IDs from terminal output; instrument only a bare program word or its canonical resume form. See [Agent session resume](agent-resume.md#validation-boundary) for both boundaries.
 
 ### Copying text through the terminal
 

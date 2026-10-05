@@ -23,6 +23,10 @@ const RUN_MARKER: &str = "-- run --";
 /// Fixed v7-shaped thread ID reported by the `codex` stub.
 const CODEX_ID: &str = "019f5453-de22-7240-b2e5-0d32692aa6d9";
 
+/// Config override for embedded mode, placed after the notify override on
+/// every instrumented `codex` launch.
+const CODEX_EMBEDDED: &str = "features.daemon_auto_start=false";
+
 /// Scratch tree containing every executable, store, working directory, and argv
 /// record used by one test.
 struct Scratch {
@@ -131,8 +135,10 @@ fn install_stub(s: &Scratch, name: &str, body: &str) {
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
 }
 
-/// `claude` stub that records argv, writes a `SessionStart` payload to the
-/// capture file, and prints a resumable exit hint.
+/// Install a `claude` stub to record argv, write a `SessionStart` payload,
+/// and print a resumable exit hint. Prefix the payload with the same PID
+/// stamp as the real hook: after an exec from the shell, the stub's `$$`
+/// is the task leader PID.
 fn install_claude_stub(s: &Scratch) {
     let body = format!(
         r#"id=''
@@ -143,7 +149,7 @@ for a in "$@"; do
 done
 printf '%s\n' '{marker}' "$@" >> '{rec}'
 if [ -n "$id" ] && [ -n "$FLEETCOM_CAPTURE_FILE" ]; then
-  printf '{{"session_id":"%s","hook_event_name":"SessionStart","source":"startup"}}' "$id" > "$FLEETCOM_CAPTURE_FILE"
+  printf '%s\n{{"session_id":"%s","hook_event_name":"SessionStart","source":"startup"}}\n' "$$" "$id" > "$FLEETCOM_CAPTURE_FILE"
 fi
 printf 'Resume this session with:\nclaude --resume %s\n' "$id""#,
         marker = RUN_MARKER,
@@ -152,12 +158,16 @@ printf 'Resume this session with:\nclaude --resume %s\n' "$id""#,
     install_stub(s, "claude", &body);
 }
 
-/// `codex` stub that records argv and writes `CODEX_ID` only to the capture
-/// file.
+/// Install a `codex` stub to record argv and report `CODEX_ID` only through
+/// the capture file. Before notifying, save a root rollout header under
+/// `$CODEX_HOME`: set `session_id` to `id` and use a string `source`.
 fn install_codex_stub(s: &Scratch) {
     let body = format!(
         r#"printf '%s\n' '{marker}' "$@" >> '{rec}'
 if [ -n "$FLEETCOM_CAPTURE_FILE" ]; then
+  day="$CODEX_HOME/sessions/2026/10/04"
+  mkdir -p "$day"
+  printf '%s\n' '{{"timestamp":"2026-10-04T17:49:56.012Z","ordinal":0,"type":"session_meta","payload":{{"id":"{id}","session_id":"{id}","source":"cli"}}}}' > "$day/rollout-2026-10-04T13-49-56-{id}.jsonl"
   printf '{{"type":"agent-turn-complete","thread-id":"{id}"}}' > "$FLEETCOM_CAPTURE_FILE"
 fi"#,
         marker = RUN_MARKER,
@@ -335,6 +345,11 @@ fn codex_capture_file_drives_save_and_load_resumes() {
         .map(PathBuf::from)
         .unwrap_or_else(|| panic!("spawn must route notify at one script: {argv:?}"));
     assert_daemon_namespaced(&script, daemon.0.id(), "notify script", &argv);
+    assert_eq!(
+        argv,
+        ["-c", notify.as_str(), "-c", CODEX_EMBEDDED],
+        "a bare spawn must receive the two overrides and nothing else"
+    );
 
     // The stub exits silently, so its capture write is the only id channel;
     // wait for the file, then a single save must persist the resuming form.
@@ -358,9 +373,9 @@ fn codex_capture_file_drives_save_and_load_resumes() {
         "the respawn must lead with the resume form: {argv:?}"
     );
     assert_eq!(
-        value_after(&argv, "-c"),
-        notify,
-        "the respawn must be re-instrumented with the notify override: {argv:?}"
+        argv[2..],
+        ["-c", notify.as_str(), "-c", CODEX_EMBEDDED],
+        "the respawn must be re-instrumented with both overrides: {argv:?}"
     );
 
     stop_daemon(&mut daemon);

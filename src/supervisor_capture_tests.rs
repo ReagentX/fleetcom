@@ -2,6 +2,7 @@ use super::*;
 use crate::{
     harness::fixtures::{ID as CAP_ID, OTHER as CAP_OTHER},
     protocol::{Preview, PreviewSource},
+    testutil::{codex_session_meta, install_codex_rollout, install_codex_root},
 };
 
 // --- session-capture wiring -------------------------------------------
@@ -86,6 +87,15 @@ fn install_status_record(home: &Path, pid: u32, cwd: &Path, status: &str) {
         ),
     )
     .unwrap();
+}
+
+/// Capture-file contents from the task's own `SessionStart` hook:
+/// the leader PID on the first line, then the hook's JSON and its newline.
+fn stamped(task: &Task, json: &str) -> String {
+    format!(
+        "{}\n{json}\n",
+        task.pid().expect("a spawned task has a pid")
+    )
 }
 
 /// Save a recipe and return its persisted JSON.
@@ -243,8 +253,11 @@ fn rerun_resumes_the_captured_conversation() {
     let cap = s.tasks[0].capture_file.clone().expect("capture file set");
     std::fs::write(
         &cap,
-        format!(
-            r#"{{"session_id":"{CAP_OTHER}","hook_event_name":"SessionStart","source":"clear"}}"#
+        stamped(
+            &s.tasks[0],
+            &format!(
+                r#"{{"session_id":"{CAP_OTHER}","hook_event_name":"SessionStart","source":"clear"}}"#
+            ),
         ),
     )
     .unwrap();
@@ -293,11 +306,12 @@ fn rerun_cannot_read_the_old_runs_stale_capture() {
     spawn(&mut s, "claude", dir.to_path_buf());
     let id = s.tasks[0].id;
     // The old run's final capture becomes the new run's launch ID.
-    let stale = format!(
-        r#"{{"session_id":"{CAP_OTHER}","hook_event_name":"SessionStart","source":"startup"}}"#
-    );
     let old_cap = s.tasks[0].capture_file.clone().expect("capture file set");
-    std::fs::write(&old_cap, format!(r#"{{"session_id":"{CAP_ID}"}}"#)).unwrap();
+    std::fs::write(
+        &old_cap,
+        stamped(&s.tasks[0], &format!(r#"{{"session_id":"{CAP_ID}"}}"#)),
+    )
+    .unwrap();
     assert!(reap_until(&mut s, Duration::from_secs(5), |s| s.tasks[0]
         .finished
         .is_some()));
@@ -312,6 +326,13 @@ fn rerun_cannot_read_the_old_runs_stale_capture() {
     );
 
     // A late hook write can recreate the old path, but the new run cannot read it.
+    // Stamp with the new leader's PID to test isolation by path alone.
+    let stale = stamped(
+        &s.tasks[0],
+        &format!(
+            r#"{{"session_id":"{CAP_OTHER}","hook_event_name":"SessionStart","source":"startup"}}"#
+        ),
+    );
     std::fs::write(&old_cap, &stale).unwrap();
     let text = save_and_read(&mut s, &config, "stalecap");
     assert!(
@@ -439,10 +460,10 @@ fn remove_deletes_the_capture_file_under_the_spawn_root() {
     );
 }
 
-/// A `codex` spawn receives a `notify=[...]` override naming an executable
-/// capture script.
+/// For a `codex` spawn, add `notify=[...]` with the executable capture script,
+/// then the override for embedded mode.
 #[test]
-fn spawn_codex_installs_the_notify_override() {
+fn spawn_codex_installs_the_notify_and_embedded_overrides() {
     use std::os::unix::fs::PermissionsExt;
     let dir = scratch("cap_codex");
     let (bin, runtime) = (dir.join("bin"), dir.join("run"));
@@ -465,6 +486,11 @@ fn spawn_codex_installs_the_notify_override() {
         .strip_prefix("notify=[\"")
         .and_then(|t| t.strip_suffix("\"]"))
         .unwrap_or_else(|| panic!("malformed notify override: {:?}", argv[ci + 1]));
+    assert_eq!(
+        argv[ci + 2..],
+        ["-c", "features.daemon_auto_start=false"],
+        "the embedded-mode override must follow the notify override"
+    );
     let meta = std::fs::metadata(script).expect("the notify program must exist");
     assert!(
         meta.permissions().mode() & 0o111 != 0,
@@ -618,7 +644,7 @@ fn printed_resume_hints_do_not_change_saved_recovery_or_rerun_commands() {
             "claude" => {
                 std::fs::write(
                     s.tasks[0].capture_file.as_ref().unwrap(),
-                    format!(r#"{{"session_id":"{CAP_OTHER}"}}"#),
+                    stamped(&s.tasks[0], &format!(r#"{{"session_id":"{CAP_OTHER}"}}"#)),
                 )
                 .unwrap();
                 Some(CAP_OTHER.to_string())
@@ -780,8 +806,11 @@ fn resume_id_precedence_registry_over_spawn_under_capture() {
     let cap = s.tasks[0].capture_file.clone().expect("capture file set");
     std::fs::write(
         &cap,
-        format!(
-            r#"{{"session_id":"{CAP_OTHER}","hook_event_name":"SessionStart","source":"clear"}}"#
+        stamped(
+            &s.tasks[0],
+            &format!(
+                r#"{{"session_id":"{CAP_OTHER}","hook_event_name":"SessionStart","source":"clear"}}"#
+            ),
         ),
     )
     .unwrap();
@@ -793,6 +822,110 @@ fn resume_id_precedence_registry_over_spawn_under_capture() {
     std::fs::write(&done, b"").unwrap();
 }
 
+/// Session ID reported by a process that is not the task.
+const FOREIGN_ID: &str = "22222222-3333-4444-8555-666666666666";
+
+/// Run the installed hook from a process other than the task leader to
+/// replace the capture with a foreign session. Reject the foreign parent's
+/// PID stamp and use the spawn-time ID, then the registry ID once available.
+#[test]
+fn capture_stamped_by_a_foreign_process_falls_back_to_the_next_source() {
+    let dir = scratch("cap_foreign");
+    let (bin, runtime, config) = (dir.join("bin"), dir.join("run"), dir.join("config"));
+    let claude_home = dir.join("claude_home");
+    let json = |id: &str, source: &str| {
+        format!(r#"{{"session_id":"{id}","hook_event_name":"SessionStart","source":"{source}"}}"#)
+    };
+    // The stub is the task leader only when `/bin/sh -c` replaces itself with
+    // it, which Ubuntu's `/bin/sh` does not. The test therefore writes the
+    // task's own capture itself, with the leader's stamp. The stub runs the
+    // installed hook under an intermediate shell with the same inherited
+    // environment, as in Claude's daemon. Append `:` to prevent an exec of
+    // the pipeline's last command: the hook's `$PPID` must be the
+    // intermediate shell, which is never the leader.
+    install_script(
+        &bin,
+        "claude",
+        &format!(
+            r#"until [ -e '{d}/foreign' ]; do sleep 0.05; done
+sh -c 'printf "%s\n" "$1" | sh "$0"; :' '{d}/hook' '{foreign}'
+: > '{d}/foreign-done'
+until [ -e '{d}/done' ]; do sleep 0.05; done"#,
+            d = dir.display(),
+            foreign = json(FOREIGN_ID, "startup"),
+        ),
+    );
+    let mut s = sup_ctx(agent_ctx_plus(
+        &bin,
+        &runtime,
+        dir.to_path_buf(),
+        &[
+            ("FLEETCOM_CONFIG_DIR", &config),
+            ("CLAUDE_CONFIG_DIR", &claude_home),
+        ],
+    ));
+    spawn(&mut s, "claude", dir.to_path_buf());
+    let pinned = s.tasks[0]
+        .resume_id
+        .clone()
+        .expect("a fresh claude launch pins an id");
+    let pid = s.tasks[0].pid().expect("a live task has a pid");
+    let cap = s.tasks[0].capture_file.clone().expect("capture file set");
+
+    // The foreign stage runs the hook command from the installed overlay.
+    let overlay = std::fs::read_to_string(cap.with_file_name("claude-settings.json")).unwrap();
+    let hook = jzon::parse(&overlay).unwrap()["hooks"]["SessionStart"][0]["hooks"][0]["command"]
+        .as_str()
+        .expect("the overlay must carry the hook command")
+        .to_string();
+    std::fs::write(dir.join("hook"), hook).unwrap();
+
+    std::fs::write(&cap, stamped(&s.tasks[0], &json(CAP_OTHER, "clear"))).unwrap();
+    assert_eq!(
+        current_resume_id(&s.tasks[0]).as_deref(),
+        Some(CAP_OTHER),
+        "the task's own capture must beat the pin"
+    );
+
+    std::fs::write(dir.join("foreign"), b"").unwrap();
+    assert!(
+        wait_until(Duration::from_secs(5), || dir.join("foreign-done").exists()),
+        "the stub never ran the hook under the intermediate shell"
+    );
+    let text = std::fs::read_to_string(&cap).unwrap();
+    let (stamp, rest) = text
+        .split_once('\n')
+        .expect("the hook must write a stamp line");
+    assert_eq!(
+        rest,
+        format!("{}\n", json(FOREIGN_ID, "startup")),
+        "the foreign session must have replaced the task's capture"
+    );
+    assert!(
+        stamp.parse::<u32>().is_ok_and(|p| p != pid),
+        "the stamp must name the hook's own parent, not the leader: {stamp:?}"
+    );
+
+    // With no registry record yet, use the pinned ID after rejecting the capture.
+    assert_eq!(
+        current_resume_id(&s.tasks[0]).as_deref(),
+        Some(pinned.as_str()),
+        "a foreign capture must fall through to the spawn-time id"
+    );
+    install_status_record(&claude_home, pid, &dir, r#""status":"idle""#);
+    assert_eq!(
+        current_resume_id(&s.tasks[0]).as_deref(),
+        Some(CAP_ID),
+        "a foreign capture must fall through to the registry"
+    );
+    let text = save_and_read(&mut s, &config, "foreign");
+    assert!(
+        text.contains(&format!("claude --resume '{CAP_ID}'")) && !text.contains(FOREIGN_ID),
+        "the recipe must never resume the foreign session; got {text}"
+    );
+    std::fs::write(dir.join("done"), b"").unwrap();
+}
+
 /// Two tasks sharing a directory do not own a nearby rollout. Named saves
 /// and recovery must preserve both authored commands when capture is silent.
 #[test]
@@ -802,8 +935,9 @@ fn silent_codex_tasks_keep_authored_commands_in_saves_and_recovery() {
     let codex_home = dir.join("codex_home");
     install_script(&bin, "codex", "exit 0");
 
-    // This sole rollout matches the directory and the former 30-second
-    // window for both tasks, but predates both launches.
+    // Use the same directory and the former 30-second window for both tasks,
+    // but write the rollout before either launch. Include a complete root
+    // header; it must be read only after a notification for this thread.
     let ms = now_ms();
     let id = format!(
         "{:08x}-{:04x}-7000-8000-000000000001",
@@ -815,10 +949,10 @@ fn silent_codex_tasks_keep_authored_commands_in_saves_and_recovery() {
     std::fs::create_dir_all(&rollouts).unwrap();
     std::fs::write(
         rollouts.join(format!("rollout-2026-07-13T09-00-00-{id}.jsonl")),
-        format!(
-            r#"{{"type":"session_meta","payload":{{"id":"{id}","cwd":"{}"}}}}"#,
+        codex_session_meta(&format!(
+            r#"{{"id":"{id}","session_id":"{id}","source":"cli","cwd":"{}"}}"#,
             dir.display()
-        ),
+        )),
     )
     .unwrap();
 
@@ -890,6 +1024,138 @@ fn silent_codex_tasks_keep_authored_commands_in_saves_and_recovery() {
     );
 }
 
+/// Thread IDs reported through one codex process's notifier: the
+/// conversation, a spawned sub-agent, and the hidden title thread.
+const CODEX_ROOT: &str = "019f5453-de22-7240-b2e5-0d32692aa6d9";
+const CODEX_CHILD: &str = "019f5454-0c11-7b33-9a4e-5f0e6d7c8b9a";
+const CODEX_TITLE: &str = "019f5453-de9f-7e61-8c0d-1a2b3c4d5e6f";
+
+/// Capture contents for a completed turn of `thread`: the notification JSON
+/// written by the injected notifier. `last` is the final assistant message,
+/// already escaped for a JSON string.
+fn turn_complete(thread: &str, last: &str) -> String {
+    format!(
+        r#"{{"type":"agent-turn-complete","thread-id":"{thread}","turn-id":"t","cwd":"/w","input-messages":["ping"],"last-assistant-message":"{last}"}}"#
+    )
+}
+
+/// The title thread's notification: its final message is the generated title.
+fn title_turn() -> String {
+    turn_complete(CODEX_TITLE, r#"{\"title\":\"Ping the sub-agent\"}"#)
+}
+
+/// Replace the sole task's capture with `payload`, save under `name`, and
+/// return the persisted command.
+fn saved_command(s: &mut Supervisor, config: &Path, name: &str, payload: &str) -> String {
+    let cap = s.tasks[0].capture_file.clone().expect("capture file set");
+    std::fs::write(&cap, payload).unwrap();
+    save_and_read(s, config, name);
+    session::load_in(&config.join("sessions"), name)
+        .unwrap()
+        .into_values()
+        .flatten()
+        .next()
+        .expect("the recipe must hold the task")
+        .cmd
+}
+
+/// Report three threads from one codex process in the order observed after
+/// the first prompt: the title thread, a sub-agent, then the conversation.
+/// Replace the capture on each write. With no rollout for the title thread,
+/// preserve the authored command. Resolve the sub-agent to its conversation
+/// and the conversation to itself.
+#[test]
+fn codex_capture_resolves_each_notifying_thread_to_the_root() {
+    let dir = scratch("codex_threads");
+    let (bin, runtime, config) = (dir.join("bin"), dir.join("run"), dir.join("config"));
+    let codex_home = dir.join("codex_home");
+    install_script(&bin, "codex", "exit 0");
+    install_codex_root(&codex_home, CODEX_ROOT);
+    install_codex_rollout(
+        &codex_home,
+        CODEX_CHILD,
+        codex_session_meta(&format!(
+            r#"{{"id":"{CODEX_CHILD}","session_id":"{CODEX_ROOT}","parent_thread_id":"{CODEX_ROOT}","source":{{"subagent":{{"thread_spawn":{{"parent_thread_id":"{CODEX_ROOT}","depth":1,"agent_path":"/root/pong","agent_nickname":"Pong"}}}}}}}}"#
+        )),
+    );
+    let mut s = sup_ctx(agent_ctx_plus(
+        &bin,
+        &runtime,
+        dir.to_path_buf(),
+        &[
+            ("FLEETCOM_CONFIG_DIR", &config),
+            ("CODEX_HOME", &codex_home),
+        ],
+    ));
+    spawn(&mut s, "codex", dir.to_path_buf());
+    assert!(s.tasks[0].resume_id.is_none(), "codex pins no id at launch");
+
+    assert_eq!(
+        saved_command(&mut s, &config, "title", &title_turn()),
+        "codex",
+        "the title thread must not become the resume target"
+    );
+    let resumes_root = format!("codex resume '{CODEX_ROOT}'");
+    assert_eq!(
+        saved_command(
+            &mut s,
+            &config,
+            "child",
+            &turn_complete(CODEX_CHILD, "pong")
+        ),
+        resumes_root,
+        "a sub-agent's turn must resume the conversation that spawned it"
+    );
+    assert_eq!(
+        saved_command(&mut s, &config, "root", &turn_complete(CODEX_ROOT, "done")),
+        resumes_root,
+        "the conversation's own turn must resume it"
+    );
+}
+
+/// For `codex resume`, preserve the launch ID after rejecting notifications
+/// for the title thread or a rollout outside the launch-time Codex home.
+/// Prefer a captured root thread in the task's own home over the launch ID.
+#[test]
+fn refused_codex_capture_keeps_the_launch_target() {
+    /// A root thread saved under another Codex home.
+    const FOREIGN: &str = "019f5460-1a2b-7c3d-8e4f-5a6b7c8d9e0f";
+    let dir = scratch("codex_refused");
+    let (bin, runtime, config) = (dir.join("bin"), dir.join("run"), dir.join("config"));
+    let codex_home = dir.join("codex_home");
+    install_script(&bin, "codex", "exit 0");
+    install_codex_root(&dir.join("other_home"), FOREIGN);
+    install_codex_root(&codex_home, CODEX_ROOT);
+    let mut s = sup_ctx(agent_ctx_plus(
+        &bin,
+        &runtime,
+        dir.to_path_buf(),
+        &[
+            ("FLEETCOM_CONFIG_DIR", &config),
+            ("CODEX_HOME", &codex_home),
+        ],
+    ));
+    let authored = format!("codex resume '{CAP_ID}'");
+    spawn(&mut s, &authored, dir.to_path_buf());
+    assert_eq!(s.tasks[0].resume_id.as_deref(), Some(CAP_ID));
+
+    assert_eq!(
+        saved_command(&mut s, &config, "title", &title_turn()),
+        authored,
+        "the title thread must not displace the launch target"
+    );
+    assert_eq!(
+        saved_command(&mut s, &config, "foreign", &turn_complete(FOREIGN, "hi")),
+        authored,
+        "a thread outside the task's Codex home must not displace the launch target"
+    );
+    assert_eq!(
+        saved_command(&mut s, &config, "root", &turn_complete(CODEX_ROOT, "done")),
+        format!("codex resume '{CODEX_ROOT}'"),
+        "the task's own root thread must still outrank the launch target"
+    );
+}
+
 /// Home resolution order: the tool's own var, then the launch env's HOME
 /// joined with the tool's dot directory, then nothing.
 #[test]
@@ -948,9 +1214,10 @@ fn home_only_launch_env_targets_the_clients_dot_codex() {
         "HOME alone must resolve the harness home"
     );
     let argv = wait_argv(&mut s, &dir.join("argv"));
-    assert!(
-        !argv.iter().any(|a| a.contains("notify=")),
-        "the guard must read <home>/.codex/config.toml; argv: {argv:?}"
+    assert_eq!(
+        argv,
+        [""],
+        "the guard must read <home>/.codex/config.toml and inject nothing"
     );
     assert!(reap_until(&mut s, Duration::from_secs(5), |s| s.tasks[0]
         .finished
@@ -976,6 +1243,7 @@ fn stale_inherited_notify_chain_is_never_executed() {
     let (bin, runtime) = (dir.join("bin"), dir.join("run"));
     // No config.toml exists: nothing routed, so nothing may be chained.
     let codex_home = dir.join("codex_home");
+    install_codex_root(&codex_home, CAP_ID);
     let stale = dir.join("stale");
     let record = dir.join("stale-record");
     write_executable(&stale, &format!("touch '{}'", record.display()));
@@ -1013,6 +1281,11 @@ fn stale_inherited_notify_chain_is_never_executed() {
     assert!(
         !record.exists(),
         "the stale inherited chain must not execute"
+    );
+    assert_eq!(
+        current_resume_id(&s.tasks[0]).as_deref(),
+        Some(CAP_ID),
+        "the notifier's payload for a root thread must pass the capture gate"
     );
 }
 
@@ -1057,7 +1330,7 @@ fn config_toml_notify_chains_through_the_injected_script() {
     let dir = scratch("cfg_chain");
     let (bin, runtime) = (dir.join("bin"), dir.join("run"));
     let codex_home = dir.join("codex_home");
-    std::fs::create_dir_all(&codex_home).unwrap();
+    install_codex_root(&codex_home, CAP_ID);
     // The notifier path contains spaces and carries a fixed argument.
     let notifier = dir.join("Fake App.app").join("Sky Client");
     let record = dir.join("notifier-record");
@@ -1115,6 +1388,11 @@ fn config_toml_notify_chains_through_the_injected_script() {
         payload,
         "the capture write must precede the chain handoff"
     );
+    assert_eq!(
+        current_resume_id(&s.tasks[0]).as_deref(),
+        Some(CAP_ID),
+        "the notifier's payload for a root thread must pass the capture gate"
+    );
 }
 
 /// An unrepresentable `notify` value disables injection, while a commented
@@ -1140,9 +1418,10 @@ fn unrepresentable_config_notify_suppresses_injection() {
     ));
     spawn(&mut s, "codex", dir.to_path_buf());
     let argv = wait_argv(&mut s, &dir.join("argv"));
-    assert!(
-        !argv.iter().any(|a| a.contains("notify=")),
-        "fleetcom must preserve an unrepresentable notify; argv: {argv:?}"
+    assert_eq!(
+        argv,
+        [""],
+        "fleetcom must preserve an unrepresentable notify and inject nothing"
     );
 
     // The same route commented out is inert: the injection returns.
@@ -1227,8 +1506,11 @@ fn recovery_cadence_rewrites_on_capture_drift_and_skips_when_static() {
     let cap = s.tasks[0].capture_file.clone().expect("capture file set");
     std::fs::write(
         &cap,
-        format!(
-            r#"{{"session_id":"{CAP_OTHER}","hook_event_name":"SessionStart","source":"clear"}}"#
+        stamped(
+            &s.tasks[0],
+            &format!(
+                r#"{{"session_id":"{CAP_OTHER}","hook_event_name":"SessionStart","source":"clear"}}"#
+            ),
         ),
     )
     .unwrap();
