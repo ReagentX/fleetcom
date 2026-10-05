@@ -1,15 +1,13 @@
-//! Codex does not let the caller select an ID at launch. This harness instead
-//! injects a `notify` override, chains compatible configured notifiers, and
-//! adds a second override that keeps the launch in embedded mode.
+//! A Codex ID cannot be selected at launch. Inject a `notify` override,
+//! chain compatible configured notifiers, and explicitly enable embedded mode
+//! with a second override.
 //!
-//! Every thread a Codex process runs reports through that notifier: the
-//! conversation on screen, each sub-agent it spawns, and the hidden thread the
-//! TUI starts to title a new session. Only the first is the task's
-//! conversation. `codex resume` exits 1 for a sub-agent whose parent is not
-//! loaded, and for the title thread, which is never saved. `parse_capture`
-//! therefore resolves the notified thread to the root thread of its session
-//! tree through that thread's rollout header, and refuses a thread it cannot
-//! classify.
+//! Notifications are emitted for every thread in one Codex process: the
+//! conversation on screen, each spawned sub-agent, and the hidden thread used
+//! to title a new session. Only the first is the task's conversation. Resuming
+//! a sub-agent with an unloaded parent or the unsaved title thread exits 1.
+//! In `parse_capture`, use the notified thread's rollout header to resolve its
+//! session tree's root. Reject threads that cannot be classified.
 
 use std::{
     fmt::Write as _,
@@ -23,24 +21,24 @@ use super::{
     home_root, resolve_home, shell_quote,
 };
 
-/// Config override that makes an instrumented launch's embedded mode explicit.
-/// Since codex 0.157.0 a plain `codex` attaches to a shared background server,
-/// and a `-c` override outside a short allowlist forces embedded mode. `notify`
-/// is not on that list, so the notify override alone raises a "Running without
-/// the shared background server" warning at startup. Codex emits the warning
-/// only while this feature is enabled, and the key is on the allowlist.
-/// Embedded mode is deliberate: `fleetcom` owns the lifecycle of the task's
-/// process, so that process must hold the conversation.
+/// Config override for explicitly launching in embedded mode.
+/// Since codex 0.157.0, running plain `codex` attaches to a shared background
+/// server. With a `-c` override outside a short allowlist, embedded mode is
+/// used instead. `notify` is not on that list, so with only the notify override,
+/// "Running without the shared background server" is displayed at startup.
+/// The warning is displayed only with this feature enabled; its key is on
+/// the allowlist. Use embedded mode to keep the conversation in the task's
+/// process, under `fleetcom` supervision.
 ///
-/// `--no-daemon` selects the same mode, but a codex that predates the flag
-/// refuses to start on it. An unknown `features.*` key only adds an
-/// unrecognized-setting warning.
+/// With `--no-daemon`, the same mode is selected, but versions predating the
+/// flag fail to start. With an unknown `features.*` key, only an
+/// unrecognized-setting warning is displayed.
 const EMBEDDED_OVERRIDE: &str = "features.daemon_auto_start=false";
 
-/// Upper bound on a rollout's first line, terminator included. The line embeds
-/// the session's base instructions: about 22 KB in rollouts written by codex
-/// 0.135.0 through 0.160.0. 1 MiB leaves that text room to grow over 45-fold
-/// and bounds the read from a file whose first line never ends.
+/// Upper bound on a rollout's first line, terminator included. The session's
+/// base instructions are included in this line: about 22 KB in rollouts from
+/// codex 0.135.0 through 0.160.0. Use 1 MiB to allow over 45 times that size
+/// while bounding the read even when no newline is present.
 const HEADER_MAX: u64 = 1024 * 1024;
 
 pub struct Codex;
@@ -95,17 +93,16 @@ impl Harness for Codex {
 
     /// Accept an `agent-turn-complete` notification and return the root
     /// thread of the notified thread's session tree: the conversation the
-    /// task's TUI is on. A sub-agent's notification maps to its root; a thread
-    /// [`root_thread`] cannot classify is refused, and the next ID source
-    /// decides.
+    /// task's TUI is on. For a sub-agent, return its root. If the thread cannot
+    /// be classified in [`root_thread`], return `None` to try the next ID source.
     ///
-    /// The session store is not scanned to infer which conversation the task
-    /// owns: nothing is discovered there. The task's own notifier names one
-    /// thread, and that thread's rollout header classifies it.
+    /// Look up only the thread ID from the task's own notification and
+    /// classify it from its rollout header. Do not infer conversation
+    /// ownership from other sessions in the store.
     fn parse_capture(
         &self,
         payload: &str,
-        // Every thread of the task notifies from the task's own process.
+        // Notifications for every thread originate in the task's own process.
         _pid: Option<u32>,
         home: Option<&Path>,
     ) -> Option<String> {
@@ -122,17 +119,17 @@ impl Harness for Codex {
 /// its rollout under the Codex `home`. `thread` must already satisfy
 /// [`is_uuid`](super::is_uuid): it is matched against file names.
 ///
-/// Codex saves each thread as
+/// Each thread is saved as
 /// `sessions/<YYYY>/<MM>/<DD>/rollout-<local time>-<thread>.jsonl`. The first
 /// line is `{"type":"session_meta","payload":{…}}`: `payload.id` is the thread
-/// and `payload.session_id` is the root thread of its tree. A root thread
-/// carries its own ID in both and no `subagent` member in `source`. A
-/// sub-agent carries the root's ID in `session_id` and a `source` object with
-/// a `subagent` member.
+/// and `payload.session_id` is the root thread of its tree. For a root thread,
+/// both IDs are its own, with no `subagent` member in `source`. For a
+/// sub-agent, `session_id` is the root's ID, with a `subagent` member in the
+/// `source` object.
 ///
 /// Return `None` unless exactly one rollout is named for `thread` and its
-/// header has one of those two shapes. The title thread has no rollout. Only
-/// directory listings and that first line are examined.
+/// header is in one of those two formats. No rollout is saved for the title
+/// thread. Examine only directory listings and the first line.
 fn root_thread(home: &Path, thread: &str) -> Option<String> {
     let mut rollouts = Vec::new();
     collect_rollouts(
@@ -151,15 +148,14 @@ fn root_thread(home: &Path, thread: &str) -> Option<String> {
         return None;
     }
     let root = capture_id(meta, "session_id")?;
-    // Exactly one may hold. codex 0.140.0 and 0.141.0 wrote a sub-agent's own
-    // ID as its `session_id`: that header names no root.
+    // Require exactly one condition. In codex 0.140.0 and 0.141.0, a
+    // sub-agent's own ID was stored as `session_id`, so its root is unknown.
     ((root == thread) != meta["source"].has_key("subagent")).then_some(root)
 }
 
-/// Push every entry whose name ends with `suffix` and that sits exactly
-/// `depth` directory levels below `dir`. Entries above that level that are not
-/// directories are skipped. Return `None` when a directory cannot be listed:
-/// it may hold a second match.
+/// Push every entry with a name ending in `suffix`, exactly `depth` directory
+/// levels below `dir`. Skip non-directory entries above that level. Return
+/// `None` when a directory cannot be listed: a second match may be inside.
 fn collect_rollouts(dir: &Path, depth: u8, suffix: &str, found: &mut Vec<PathBuf>) -> Option<()> {
     for entry in fs::read_dir(dir).ok()? {
         let entry = entry.ok()?;
@@ -179,8 +175,8 @@ fn collect_rollouts(dir: &Path, depth: u8, suffix: &str, found: &mut Vec<PathBuf
 }
 
 /// Read the first line of `path` without its terminator. Return `None` when
-/// the first [`HEADER_MAX`] bytes hold no newline: the file is empty, Codex is
-/// still writing the line, or the line exceeds the bound. Also return `None`
+/// no newline is present in the first [`HEADER_MAX`] bytes: the file is empty,
+/// the write is incomplete, or the line is too long. Also return `None`
 /// for an unreadable file and for a line that is not UTF-8.
 fn read_header(path: &Path) -> Option<String> {
     let mut line = Vec::new();
@@ -377,7 +373,7 @@ mod tests {
     /// rooted at [`ID`].
     const CHILD: &str = "019f5454-0c11-7b33-9a4e-5f0e6d7c8b9a";
     const GRANDCHILD: &str = "019f5454-3d70-7e02-b1c8-2a4b6c8d0e1f";
-    /// The hidden title thread: it notifies but has no rollout.
+    /// Hidden title thread ID, reported through notify but never saved in a rollout.
     const TITLE: &str = "019f5453-de9f-7e61-8c0d-1a2b3c4d5e6f";
 
     /// Suffix of every instrumented launch that uses [`paths`].
@@ -422,8 +418,8 @@ mod tests {
         temp("codex_no_config_home")
     }
 
-    /// Both accepted shapes receive the same two overrides because Codex
-    /// cannot pin an ID at launch: the notifier, then explicit embedded mode.
+    /// Apply the same two overrides to both accepted forms: the notifier,
+    /// then explicit embedded mode. No ID can be pinned at launch.
     #[test]
     fn instrument_installs_the_notify_and_embedded_overrides() {
         for cmd in ["codex".to_string(), format!("codex resume {ID}")] {
@@ -512,8 +508,7 @@ mod tests {
         )));
     }
 
-    /// Disable capture injection for an unrepresentable route: the launch
-    /// receives neither override and no environment.
+    /// For an unrepresentable route, inject neither override nor environment.
     #[test]
     fn instrument_skips_an_unrepresentable_config_notify() {
         let home = temp("codex_opaque_notify");
@@ -703,15 +698,15 @@ mod tests {
         )
     }
 
-    /// `source` of a thread the model's `spawn_agent` tool started.
+    /// `source` of a thread started through the model's `spawn_agent` tool.
     fn thread_spawn(parent: &str, depth: u8) -> String {
         format!(
             r#"{{"subagent":{{"thread_spawn":{{"parent_thread_id":"{parent}","depth":{depth},"agent_path":"/root/pong","agent_nickname":"Pong"}}}}}}"#
         )
     }
 
-    /// The payload checks precede the rollout lookup: with the root's rollout
-    /// in place, only a turn-complete payload naming a strict ID resolves.
+    /// Validate the payload before looking up its rollout. Even with a root
+    /// rollout present, accept only a turn-complete payload with a strict ID.
     #[test]
     fn parse_capture_accepts_only_turn_complete_payloads() {
         let home = temp("codex_capture_payload");
@@ -730,8 +725,8 @@ mod tests {
         assert_eq!(parse(""), None);
     }
 
-    /// A root thread carries its own ID as `session_id` under every observed
-    /// string `source`. The task's PID plays no part.
+    /// For a root thread, `session_id` is its own ID under every observed
+    /// string `source`. Accept the capture regardless of the task's PID.
     #[test]
     fn parse_capture_accepts_a_root_thread() {
         for source in ["cli", "vscode", "exec"] {
@@ -752,9 +747,9 @@ mod tests {
         }
     }
 
-    /// A spawned sub-agent resolves to `session_id`, not to its parent: the
-    /// second-level thread's parent is itself a sub-agent. The root's own
-    /// rollout is not consulted, so none is installed.
+    /// Resolve a spawned sub-agent to `session_id`, not its parent: for the
+    /// second-level thread, the parent is itself a sub-agent. Omit the root's
+    /// rollout to verify that no lookup is needed for it.
     #[test]
     fn parse_capture_maps_a_spawned_sub_agent_to_its_root() {
         let home = temp("codex_capture_spawned");
@@ -773,8 +768,8 @@ mod tests {
         assert_eq!(resolve(&home, ID), None, "the root has no rollout here");
     }
 
-    /// The guardian sub-agent's `source` names no parent; the `subagent`
-    /// member alone classifies it.
+    /// No parent is specified in a guardian sub-agent's `source`; classify
+    /// it by the `subagent` member alone.
     #[test]
     fn parse_capture_maps_a_guardian_sub_agent_to_its_root() {
         let home = temp("codex_capture_guardian");
@@ -791,9 +786,9 @@ mod tests {
         assert_eq!(resolve(&home, CHILD).as_deref(), Some(ID));
     }
 
-    /// codex 0.140.0 and 0.141.0 wrote a sub-agent's own ID as `session_id`.
-    /// Such a header has the root's `id == session_id` shape and a `subagent`
-    /// source: it names no root, and the sub-agent's ID is not resumable.
+    /// In codex 0.140.0 and 0.141.0, a sub-agent's own ID was stored as
+    /// `session_id`. Reject `id == session_id` with a `subagent` source:
+    /// the root is unknown, and the sub-agent's ID is not resumable.
     #[test]
     fn parse_capture_refuses_a_sub_agent_that_names_itself_as_root() {
         let home = temp("codex_capture_self_rooted");
@@ -811,8 +806,8 @@ mod tests {
         }
     }
 
-    /// The title thread notifies but is never saved: no rollout names it,
-    /// whether the store is absent, empty, or holds other threads.
+    /// No rollout is saved for the title thread. Reject its notification
+    /// with an absent store, an empty store, or rollouts for other threads.
     #[test]
     fn parse_capture_refuses_a_thread_without_a_rollout() {
         let home = temp("codex_capture_title");
@@ -824,9 +819,8 @@ mod tests {
         assert_eq!(resolve(&home, ID).as_deref(), Some(ID));
     }
 
-    /// Rollouts sit exactly three directories below `sessions`. A matching
-    /// name at any other depth is not a rollout, and a file among the
-    /// directories does not stop the search.
+    /// Look for rollouts exactly three directories below `sessions`.
+    /// Ignore matching names at other depths and files among the directories.
     #[test]
     fn parse_capture_finds_rollouts_only_in_day_directories() {
         let home = temp("codex_capture_depth");
@@ -849,8 +843,8 @@ mod tests {
         assert_eq!(resolve(&home, ID).as_deref(), Some(ID));
     }
 
-    /// Two rollouts for one thread are ambiguous, in one day directory or
-    /// across two. Removing the extra restores the capture.
+    /// Reject duplicate rollouts for one thread, within or across day
+    /// directories. Accept the capture after removing the extra rollout.
     #[test]
     fn parse_capture_refuses_two_rollouts_for_one_thread() {
         let header = codex_session_meta(&meta(ID, ID, r#""cli""#));
@@ -867,8 +861,8 @@ mod tests {
         }
     }
 
-    /// A day directory that cannot be listed may hold a second rollout, so
-    /// the thread's one visible rollout is not enough.
+    /// Reject the capture if a day directory cannot be listed: a second
+    /// rollout may be present even when only one is visible.
     #[test]
     fn parse_capture_refuses_a_store_it_cannot_list() {
         use std::os::unix::fs::PermissionsExt;
@@ -878,14 +872,14 @@ mod tests {
         fs::create_dir_all(&locked).unwrap();
         fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
         let refused = resolve(&home, ID);
-        // Restore access before asserting so the scratch tree stays removable.
+        // Restore access before asserting so the scratch tree can be removed.
         fs::set_permissions(&locked, fs::Permissions::from_mode(0o700)).unwrap();
         assert_eq!(refused, None);
         assert_eq!(resolve(&home, ID).as_deref(), Some(ID));
     }
 
-    /// The header must describe the notified thread and place it in a
-    /// session tree: every other shape is unclassified.
+    /// Require the notified thread's ID and its session tree in the header.
+    /// Reject every other format as unclassified.
     #[test]
     fn parse_capture_refuses_an_unclassified_header() {
         let spawned = thread_spawn(ID, 1);
@@ -955,9 +949,9 @@ mod tests {
         }
     }
 
-    /// A reader that races the header's write can observe any prefix of it.
-    /// Only the terminated line is a header: the empty file and the complete
-    /// object without its newline are both refused.
+    /// A read during the header write can return any prefix of it. Accept
+    /// only a terminated line; reject an empty file or a complete object
+    /// without its newline.
     #[test]
     fn parse_capture_refuses_empty_and_torn_headers() {
         let home = temp("codex_capture_torn");
@@ -970,8 +964,8 @@ mod tests {
         assert_eq!(resolve(&home, ID).as_deref(), Some(ID));
     }
 
-    /// The first line must end within [`HEADER_MAX`] bytes, terminator
-    /// included. The bound applies to the line, not the file.
+    /// Require a newline within the first [`HEADER_MAX`] bytes. Bound the
+    /// line length, not the file size.
     #[test]
     fn parse_capture_bounds_the_header_line() {
         let home = temp("codex_capture_bound");
@@ -995,8 +989,8 @@ mod tests {
         assert_eq!(resolve(&home, ID), None);
     }
 
-    /// Nothing past the first line is examined: a header alone resolves, and
-    /// a body that is neither JSON nor UTF-8 changes nothing.
+    /// Accept a header alone or followed by bytes that are neither JSON nor
+    /// UTF-8: nothing past the first line is examined.
     #[test]
     fn parse_capture_reads_nothing_after_the_header() {
         let home = temp("codex_capture_body");
@@ -1010,9 +1004,8 @@ mod tests {
         assert_eq!(resolve(&home, ID).as_deref(), Some(ID));
     }
 
-    /// A rollout that cannot be read as a file, and a first line that is not
-    /// UTF-8, are refused. The invalid byte sits inside a string the gate
-    /// does not read, so only strict decoding refuses it.
+    /// Reject unreadable rollouts and non-UTF-8 first lines. Place the invalid
+    /// byte in a field unused for classification to test strict decoding.
     #[test]
     fn parse_capture_refuses_an_unreadable_header() {
         let home = temp("codex_capture_unreadable");

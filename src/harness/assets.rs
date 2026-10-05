@@ -8,15 +8,14 @@
 //! `install` reaps sibling namespaces whose owner no longer exists.
 //!
 //! Asset contracts:
-//! - `claude`: `--settings <claude-settings.json>` layers two keys over the
-//!   user's settings for that process alone. `disableAgentView` turns off
-//!   `claude agents`, `--bg`, `/background`, and the on-demand daemon, so the
-//!   conversation stays in the task's process. A `SessionStart` hook
-//!   (`{ printf '%s\n' "$PPID"; cat; } > "$FLEETCOM_CAPTURE_FILE"`) overwrites
-//!   the path named by [`CAPTURE_ENV`](super::CAPTURE_ENV), which `fleetcom`
-//!   sets in the task's environment: the first line is the PID of the Claude
-//!   process that ran the hook, and the remainder is the JSON payload from
-//!   stdin, unmodified.
+//! - `claude`: layer two keys over the user's settings for this process alone
+//!   through `--settings <claude-settings.json>`. With `disableAgentView`,
+//!   disable `claude agents`, `--bg`, `/background`, and the on-demand daemon
+//!   to keep the conversation in the task's process. In a `SessionStart` hook
+//!   (`{ printf '%s\n' "$PPID"; cat; } > "$FLEETCOM_CAPTURE_FILE"`), overwrite
+//!   the file at [`CAPTURE_ENV`](super::CAPTURE_ENV), set in the task's launch
+//!   environment. Write the parent Claude process's PID on the first line,
+//!   followed by the JSON payload from stdin, unmodified.
 //! - `codex`: `-c notify=["<codex-notify.sh>"]` names an executable that
 //!   `codex` invokes with notification JSON. The script writes its first
 //!   argument verbatim (no trailing newline) over `$FLEETCOM_CAPTURE_FILE`,
@@ -25,17 +24,16 @@
 //!   newline-joined argv with the payload appended, so the displaced notifier
 //!   receives the same final argument `codex` would have passed; otherwise
 //!   exit 0.
-//! - `omp`: `-e <omp-capture.js>` loads an extension module inside the agent's
-//!   own process, appending to the user's extensions rather than replacing
-//!   them. Its `session_start`, `session_switch`, `session_branch`, and
-//!   `agent_end` handlers replace `$FLEETCOM_CAPTURE_FILE` with the JSON
-//!   object `{reason, sessionId, sessionFile, cwd}`: the module writes
-//!   `<capture file>.<pid>.tmp` beside the capture file and renames it over
-//!   the capture file, so a reader never sees a partial payload. A handler
-//!   writes only for the top-level session (`ctx.agent.kind` is `"main"`; an
-//!   omp older than 18.3.2 has no `ctx.agent` and writes nothing) and only
-//!   when `sessionFile` exists on disk. It skips the write when the variable
-//!   is unset or empty and swallows every error.
+//! - `omp`: load an extension module inside the agent's own process through
+//!   `-e <omp-capture.js>`, appending to the user's extensions. On
+//!   `session_start`, `session_switch`, `session_branch`, and `agent_end`,
+//!   replace `$FLEETCOM_CAPTURE_FILE` with `{reason, sessionId, sessionFile,
+//!   cwd}` JSON. Write `<capture file>.<pid>.tmp` beside the capture file and
+//!   rename it over the destination to avoid reads of partial payloads.
+//!   Report only the top-level session (`ctx.agent.kind` is `"main"`) and
+//!   only when `sessionFile` exists on disk. On omp older than 18.3.2,
+//!   `ctx.agent` is absent, so write nothing. Skip unset or empty capture
+//!   paths and ignore all errors.
 
 use std::{
     fs, io,
@@ -68,49 +66,45 @@ set -- $FLEETCOM_NOTIFY_CHAIN "$1"
 exec "$@"
 "#;
 
-/// Extension module loaded by `omp -e`. omp imports the module, so the asset
-/// needs no executable bit. Its default export registers one reporter for four
-/// events:
+/// Extension module imported through `omp -e`; no executable bit is needed.
+/// Register one reporter in the default export for four events:
 ///
 /// - `session_start`, `session_switch`, `session_branch`: the launch, an
-///   in-TUI switch or `/fork`, and omp's branch into a new session. Each can
-///   put the live session on a new ID. A rewind keeps the session's ID and
-///   raises none of them.
-/// - `agent_end`: the end of every turn. Two changes raise no event of their
-///   own. omp creates the session file after the first assistant message, and
-///   since 18.5.0 a session whose lease another live process holds moves to a
-///   new ID on its first write. The next turn's report covers both.
+///   in-TUI switch or `/fork`, and a branch into a new session. A new ID may
+///   be assigned during each operation. During a rewind, the ID is unchanged
+///   and none of these events is emitted.
+/// - `agent_end`: the end of every turn. Report two changes without dedicated
+///   events: session file creation after the first assistant message and,
+///   since 18.5.0, assignment of a new ID on the first write when the session
+///   lease is held by another live process.
 ///
-/// The reporter writes only an ID that `omp --resume` can open:
+/// Report only an ID usable with `omp --resume`:
 ///
-/// - The top-level session's alone. omp binds the same handlers to each
-///   sub-agent session, whose session manager returns the child's ID.
+/// - Only the top-level session's ID. The same handlers are registered for
+///   sub-agent sessions, with the child's ID in their session manager.
 /// - None on an omp older than 18.3.2. `ctx.agent` is absent there, so the
 ///   top-level session cannot be told from a sub-agent.
-/// - Only that of a session whose file is on disk. A fresh session therefore
-///   first reports at its first `agent_end`.
+/// - Only after the session file exists on disk. For a fresh session, first
+///   report at `agent_end`.
 ///
-/// The temporary file's name ends in `.tmp`, so it never equals a
-/// `task-<id>-<run>.json` capture path, and carries the PID, so one process
-/// leaves at most one behind. It shares the capture file's directory: the
-/// rename stays on one filesystem, and `Drop` removes a stray with the
-/// namespace.
+/// Include the PID and a `.tmp` suffix in the temporary filename to avoid
+/// collisions with `task-<id>-<run>.json` and leave at most one file per
+/// process. Use the capture file's directory to rename within one filesystem.
+/// Remove any remaining temporary file with the namespace during `Drop`.
 const OMP_CAPTURE_MODULE: &str = r#"import * as fs from "node:fs";
 
 function write(ctx, reason) {
   try {
     const path = process.env.FLEETCOM_CAPTURE_FILE;
     if (!path) return;
-    // omp binds these handlers to every sub-agent session as well, and
-    // `omp --resume` cannot open a sub-agent's ID. omp older than 18.3.2 has
-    // no `ctx.agent`: it reports nothing.
+    // These handlers are also registered for sub-agent sessions, which cannot
+    // be resumed by ID. Without `ctx.agent` (before 18.3.2), report nothing.
     if (ctx.agent?.kind !== "main") return;
-    // omp creates the session file after the first assistant message. Until
-    // then `omp --resume` cannot find the ID.
+    // The session file is created after the first assistant message. Until
+    // then, the ID cannot be found through `omp --resume`.
     const sessionFile = ctx.sessionManager.getSessionFile();
     if (!sessionFile || !fs.existsSync(sessionFile)) return;
-    // Rename over the capture file: a reader sees the previous payload or
-    // this one, never a truncated file.
+    // Rename over the capture file to expose only complete payloads to readers.
     const partial = `${path}.${process.pid}.tmp`;
     fs.writeFileSync(
       partial,
@@ -131,8 +125,8 @@ export default function (pi) {
   pi.on("session_start", (_e, ctx) => write(ctx, "session_start"));
   pi.on("session_switch", (_e, ctx) => write(ctx, "session_switch"));
   pi.on("session_branch", (_e, ctx) => write(ctx, "session_branch"));
-  // A lease move and the session file's creation raise no event of their
-  // own: report again after every turn.
+  // No dedicated event is emitted for a lease move or session file creation:
+  // report again after every turn.
   pi.on("agent_end", (_e, ctx) => write(ctx, "agent_end"));
 }
 "#;
@@ -140,15 +134,16 @@ export default function (pi) {
 /// Build the `claude` settings overlay: `disableAgentView` and the
 /// `SessionStart` capture hook.
 ///
-/// With agent view on, Claude can park or fork a conversation into its own
-/// daemon, whose processes inherit [`CAPTURE_ENV`](super::CAPTURE_ENV) and
-/// this overlay and then report sessions that are not the task's. The setting
-/// applies to the launched process only. `CLAUDE_CODE_DISABLE_AGENT_VIEW=1` is
-/// equivalent but would also reach the agent's child processes.
+/// With agent view enabled, a conversation can be parked or forked into
+/// Claude's daemon. In those processes, the inherited
+/// [`CAPTURE_ENV`](super::CAPTURE_ENV) and overlay are used to report other
+/// sessions to the same capture file. Disable agent view for the launched
+/// process only. With `CLAUDE_CODE_DISABLE_AGENT_VIEW=1`, agent view would
+/// also be disabled in the agent's child processes.
 ///
-/// The hook's shell is a child of the Claude process that fired it, so `$PPID`
-/// stamps that process's PID ahead of the payload. `Claude::parse_capture`
-/// compares the stamp with the task leader.
+/// The hook's shell is a child of the Claude process, so prefix the payload
+/// with `$PPID`. Compare that stamp with the task leader's PID in
+/// `Claude::parse_capture`.
 fn claude_settings_json() -> String {
     jzon::object! {
         "disableAgentView": true,
@@ -316,7 +311,7 @@ mod tests {
         testutil::{dead_pid, install_fake_notifier, temp, write_executable},
     };
 
-    /// The events the `omp` module registers, in registration order.
+    /// Events registered in the `omp` module, in registration order.
     const OMP_EVENTS: [&str; 4] = [
         "session_start",
         "session_switch",
@@ -324,8 +319,8 @@ mod tests {
         "agent_end",
     ];
 
-    /// Runtimes that can load the `omp` module, in preference order, with the
-    /// arguments that precede a script path. omp itself runs on Bun.
+    /// Runtimes usable with the `omp` module, in preference order, with
+    /// arguments to place before the script path. omp is run on Bun.
     const JS_RUNTIMES: &[(&str, &[&str])] = &[
         ("bun", &[]),
         ("node", &[]),
@@ -335,9 +330,9 @@ mod tests {
     /// Stand-in for omp's extension host. Load the module, collect its
     /// registrations, and fire one event with a context built from the
     /// arguments `<event> <agent kind> <session id> <session file>`. An empty
-    /// kind omits `ctx.agent`, as an omp older than 18.3.2 does; an empty file
-    /// makes `getSessionFile()` return `undefined`. Print the registered event
-    /// names in registration order.
+    /// kind means no `ctx.agent`, as before omp 18.3.2; an empty file means
+    /// `undefined` from `getSessionFile()`. Print the registered event names
+    /// in registration order.
     const OMP_HOST_DRIVER: &str = r#"import register from "./omp-capture.mjs";
 
 const handlers = {};
@@ -689,8 +684,8 @@ console.log(Object.keys(handlers).join(" "));
         assert_eq!(fs::read_to_string(&record).unwrap(), "payload\n");
     }
 
-    /// The overlay is valid JSON that disables agent view and carries the
-    /// stamped hook command verbatim.
+    /// Require valid JSON, disabled agent view, and the exact stamped hook
+    /// command in the overlay.
     #[test]
     fn claude_settings_disable_agent_view_and_stamp_the_hook() {
         let parsed = jzon::parse(&claude_settings_json()).expect("the overlay must be valid JSON");
@@ -705,15 +700,14 @@ console.log(Object.keys(handlers).join(" "));
         );
     }
 
-    /// The hook command serialized into the settings file writes its parent's
-    /// PID, then stdin, over the configured capture file. Only that parent
-    /// passes the capture gate.
+    /// Run the hook command from the settings file. Require the parent PID
+    /// followed by stdin in the capture file; accept only that parent's stamp.
     #[test]
     fn hook_command_from_settings_stamps_its_parent_and_copies_stdin() {
         let root = temp("assets_hook");
         let assets = CaptureAssets::install(&root, std::process::id()).unwrap();
         let cap = assets.paths_for(2, 0).capture_file;
-        // An earlier, longer capture must not survive the next write.
+        // Verify full replacement of an earlier, longer capture.
         fs::write(&cap, "9".repeat(4096)).unwrap();
 
         let text = fs::read_to_string(&assets.claude_settings).unwrap();
@@ -722,11 +716,11 @@ console.log(Object.keys(handlers).join(" "));
             .as_str()
             .expect("settings must carry the hook command");
 
-        // Claude ends the hook's JSON with a newline.
+        // Include the trailing newline supplied by Claude.
         let payload = format!(
             r#"{{"session_id":"{ID}","hook_event_name":"SessionStart","source":"startup"}}"#
         ) + "\n";
-        // This process spawns the hook's shell directly, as Claude does.
+        // Spawn the hook's shell directly, as in Claude.
         let parent = std::process::id();
         let mut child = Command::new("sh")
             .arg("-c")
@@ -754,9 +748,8 @@ console.log(Object.keys(handlers).join(" "));
         assert_eq!(Claude.parse_capture(&written, Some(parent + 1), None), None);
     }
 
-    /// The module's text carries each load-bearing point of the `omp`
-    /// contract, in order: both gates return before the one write, and the
-    /// rename follows it. No JavaScript runtime is needed to check this.
+    /// Check the `omp` module without a JavaScript runtime: require both
+    /// validation checks before the sole write, then rename the file.
     #[test]
     fn omp_module_text_gates_then_writes_then_renames() {
         let module = OMP_CAPTURE_MODULE;
@@ -788,11 +781,11 @@ console.log(Object.keys(handlers).join(" "));
                 .unwrap_or_else(|| panic!("missing or out of order: {step:?}"));
             at += found + step.len();
         }
-        // The temporary file takes the only write.
+        // Write only to the temporary file.
         assert_eq!(module.matches("fs.writeFileSync(").count(), 1);
 
-        // Exactly these four registrations: a `tool_call`, `tool_result`, or
-        // `tool_approval_*` handler would disable omp's speculation.
+        // Register only these four events. With `tool_call`, `tool_result`,
+        // or `tool_approval_*` handlers, omp's speculation is disabled.
         assert_eq!(module.matches("pi.on(").count(), OMP_EVENTS.len());
         for event in OMP_EVENTS {
             let registration = format!(r#"pi.on("{event}", (_e, ctx) => write(ctx, "{event}"));"#);
@@ -802,7 +795,7 @@ console.log(Object.keys(handlers).join(" "));
 
     /// Fire the installed module's handlers under a JavaScript runtime. A
     /// report is written only for the top-level session and only once its
-    /// session file exists; each write replaces the capture file whole.
+    /// session file exists. Verify replacement of the entire capture file.
     #[test]
     fn omp_module_reports_only_a_materialized_main_session() {
         let Some((program, prefix)) = JS_RUNTIMES.iter().find(|(program, _)| {
@@ -811,8 +804,8 @@ console.log(Object.keys(handlers).join(" "));
                 .output()
                 .is_ok_and(|out| out.status.success())
         }) else {
-            // The test harness captures `eprintln!`. A direct write shows the
-            // skip in a passing run.
+            // Write directly to stderr to report the skip even on success;
+            // `eprintln!` output is captured by the test harness.
             writeln!(
                 io::stderr(),
                 "skipped omp_module_reports_only_a_materialized_main_session: \
@@ -826,8 +819,8 @@ console.log(Object.keys(handlers).join(" "));
         let assets = CaptureAssets::install(&root, std::process::id()).unwrap();
         let ns = namespace(&assets, &root);
         let cap = assets.paths_for(5, 0).capture_file;
-        // Node takes a `.js` file's module system from the nearest
-        // `package.json`; `.mjs` is an ES module under every runtime.
+        // In Node, a `.js` file's module system depends on the nearest
+        // `package.json`; use `.mjs` for ES modules under every runtime.
         let host = root.join("host");
         fs::create_dir(&host).unwrap();
         fs::copy(&assets.omp_capture, host.join("omp-capture.mjs")).unwrap();
@@ -867,17 +860,17 @@ console.log(Object.keys(handlers).join(" "));
             Omp.parse_capture(&written, None, None)
         };
 
-        // No capture path, an empty one, and one in a missing directory: the
-        // handler returns normally, and the last case swallows the write error.
+        // Require a normal return for absent and empty capture paths, and
+        // for a write error from a missing parent directory.
         let orphan = root.join("missing").join("task-5-0.json");
         for capture in [None, Some(Path::new("")), Some(orphan.as_path())] {
             fire("session_start", "main", ID, &session, capture);
         }
         assert!(!orphan.parent().unwrap().exists());
 
-        // The sub-agent and the omp without `ctx.agent` both name a session
-        // file that exists, so the agent gate alone refuses them. The two
-        // top-level cases have no file on disk.
+        // Use an existing file for the sub-agent and absent-`ctx.agent` cases
+        // to test rejection by agent kind alone. For the top-level cases,
+        // omit the file on disk.
         for (kind, file) in [
             ("sub", session.as_str()),
             ("", session.as_str()),
@@ -891,7 +884,7 @@ console.log(Object.keys(handlers).join(" "));
         }
 
         for event in OMP_EVENTS {
-            // An earlier, longer capture must not survive the next write.
+            // Verify full replacement of an earlier, longer capture.
             fs::write(&cap, "9".repeat(4096)).unwrap();
             fire(event, "main", ID, &session, Some(&cap));
             let payload = jzon::parse(&fs::read_to_string(&cap).unwrap()).unwrap();
@@ -912,11 +905,11 @@ console.log(Object.keys(handlers).join(" "));
             assert_eq!(captured().as_deref(), Some(ID), "{event}");
         }
 
-        // A sub-agent's turn leaves the top-level session's capture in place.
+        // Preserve the top-level capture after a sub-agent's turn.
         fire("agent_end", "sub", OTHER, &session, Some(&cap));
         assert_eq!(captured().as_deref(), Some(ID));
 
-        // A lease move raises no event; the next turn reports the new ID.
+        // No event is emitted for a lease move; report the new ID after the turn.
         fire("agent_end", "main", OTHER, &session_file(OTHER), Some(&cap));
         assert_eq!(captured().as_deref(), Some(OTHER));
 

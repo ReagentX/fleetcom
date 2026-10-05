@@ -710,7 +710,7 @@ fn codex_label_separates_right_aligned_warning_badges() {
         "⚠ 5 · ctrl+x ctrl+w",
         "⚠ 6 · /warnings",
         "⚠ 1 warning · ctrl+shift+⌥+f24 to view",
-        // Codex 0.160.0 renders `⌥` with no `+` before the key.
+        // Since Codex 0.160.0, `⌥` is displayed without `+` before the key.
         "⚠ 3 · ⌥w",
         "⚠ 2 warnings · ⌥w to view",
         "⚠ 1 warning · ctrl+shift+⌥f24 to view",
@@ -756,8 +756,7 @@ fn codex_label_rejects_warning_prose_and_incomplete_footers() {
         "  gpt-5.4 high  ⚠ 1 ·",
         "  gpt-5.4 high  ⚠ 1 · f2 extra words",
         "  gpt-5.4 high  ⚠ 1 · f25",
-        // `⌥` names no key alone, a space after it starts a second key, and it
-        // prefixes a key once.
+        // Require a key immediately after `⌥`, with no space or repeated modifier.
         "  gpt-5.4 high  ⚠ 1 · ⌥",
         "  gpt-5.4 high  ⚠ 1 · ⌥ w",
         "  gpt-5.4 high  ⚠ 1 warning · ⌥ to view",

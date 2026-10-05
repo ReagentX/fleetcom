@@ -45,8 +45,8 @@ pub const NOTIFY_CHAIN_ENV: &str = "FLEETCOM_NOTIFY_CHAIN";
 /// Detection, capture, and resume behavior for one agent CLI.
 pub trait Harness: Sync {
     /// Resolve configuration needed by instrumentation, capture parsing, or
-    /// the live registry from the launch environment. Tools that need none
-    /// return `None`.
+    /// the live registry from the launch environment. Return `None` when no
+    /// configuration is needed.
     fn resolve_home(&self, _env: &dyn Fn(&str) -> Option<PathBuf>) -> Option<PathBuf> {
         None
     }
@@ -73,10 +73,10 @@ pub trait Harness: Sync {
     ) -> SpawnPlan;
 
     /// Extract a session ID from the capture file's contents. `pid` is the
-    /// task's session leader and `home` the launch-time harness home: a
-    /// harness whose capture channel is reachable from other processes uses
-    /// them to refuse a payload the task's own process did not write.
-    /// Defaults to `None` for tools without an injected capture channel.
+    /// task's session leader and `home` the launch-time harness home. When
+    /// other processes can write to the capture channel, use these arguments
+    /// to reject payloads written outside the task's own process.
+    /// Return `None` by default for tools without an injected capture channel.
     fn parse_capture(
         &self,
         _payload: &str,

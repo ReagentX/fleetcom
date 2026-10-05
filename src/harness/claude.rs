@@ -3,12 +3,12 @@
 //! launches install the hook through `--settings`.
 //! Live lookup reads `<claude-home>/sessions/<pid>.json`.
 //!
-//! Claude can move a conversation into its own background daemon. The daemon's
-//! processes inherit the capture environment and the `--settings` flag, so
-//! they fire the same hook against the task's capture file with IDs that are
-//! not the task's conversation. The overlay disables agent view, which removes
-//! those handoffs, and the hook stamps the PID of the Claude process that ran
-//! it, so `parse_capture` accepts a payload from the task's own process alone.
+//! With agent view enabled, a conversation can be moved into Claude's own
+//! background daemon. In that daemon's processes, the inherited capture
+//! environment and `--settings` flag are used to run the same hook with IDs
+//! from other conversations. Disable agent view in the overlay to prevent
+//! those handoffs. Stamp each payload with the parent Claude process's PID
+//! and accept only captures from the task's own process.
 
 use std::{
     fs,
@@ -53,15 +53,15 @@ impl Harness for Claude {
 
     /// Accept a hook payload only from the task's own process. The first line
     /// is the PID of the Claude process that ran the hook and must be exactly
-    /// the decimal form of `pid`; the remainder is the hook's JSON. The JSON
-    /// cannot identify the writer: `/branch` in the task's process and a
-    /// background fork both report `source: "fork"`.
+    /// the decimal form of `pid`; the remainder is the hook's JSON. Ownership
+    /// cannot be determined from the JSON: `source: "fork"` is reported for
+    /// both `/branch` in the task's process and a background fork.
     ///
-    /// The task leader is the Claude process only when `$SHELL -c` replaces
-    /// itself with the command, the precondition [`record_for_pid`] shares. A
-    /// shell retained as task leader never matches the stamp: the capture is
-    /// refused, and the registry and the spawn-time ID decide. Without a PID
-    /// there is no owner to match.
+    /// The task leader is the Claude process only after an exec from
+    /// `$SHELL -c`, as required for [`record_for_pid`]. With a shell retained
+    /// as task leader, the stamped PID differs: reject the capture and fall
+    /// back to the registry, then the spawn-time ID. Without a task PID,
+    /// ownership cannot be checked.
     fn parse_capture(
         &self,
         payload: &str,
@@ -270,7 +270,7 @@ mod tests {
     /// Task leader PID used by the capture-gate cases.
     const OWNER: u32 = 4242;
 
-    /// `SessionStart` JSON as the hook receives it: one object and a trailing
+    /// `SessionStart` JSON supplied to the hook: one object and a trailing
     /// newline.
     fn hook_json(id: &str, source: &str) -> String {
         format!(
@@ -283,8 +283,8 @@ mod tests {
         Claude.parse_capture(payload, Some(OWNER), None)
     }
 
-    /// The leader's stamp is accepted for every `source`, including the
-    /// `fork` that `/branch` reports from the task's own process.
+    /// Accept the leader's stamp for every `source`, including `fork` after
+    /// `/branch` in the task's own process.
     #[test]
     fn parse_capture_accepts_the_task_leaders_stamp() {
         for source in ["startup", "resume", "clear", "fork"] {
@@ -293,8 +293,8 @@ mod tests {
         }
     }
 
-    /// Any other PID is another process's session, including PIDs that share
-    /// a decimal prefix with the leader's and a leader that has no PID.
+    /// Reject another process's PID, even with a shared decimal prefix.
+    /// Also reject captures when the task has no PID.
     #[test]
     fn parse_capture_refuses_a_foreign_stamp() {
         let json = hook_json(ID, "startup");
@@ -311,8 +311,8 @@ mod tests {
         assert_eq!(Claude.parse_capture(&owned, None, None), None);
     }
 
-    /// The first line must be exactly the leader's decimal PID. The unstamped
-    /// format an older overlay wrote fails here: its first line is the JSON.
+    /// Require the leader's exact decimal PID on the first line. Reject the
+    /// older, unstamped format, with JSON on the first line.
     #[test]
     fn parse_capture_refuses_a_missing_or_malformed_stamp() {
         let json = hook_json(ID, "startup");
@@ -325,14 +325,14 @@ mod tests {
         }
     }
 
-    /// The hook truncates the file, writes the stamp, then copies the JSON, so
-    /// a reader can observe every prefix of a complete capture.
+    /// Truncate the file, write the stamp, then copy the JSON. A read between
+    /// writes can return any prefix of the complete capture.
     #[test]
     fn parse_capture_refuses_empty_and_torn_payloads() {
         let complete = format!("{OWNER}\n{}", hook_json(ID, "startup"));
         assert_eq!(parse_owned(&complete).as_deref(), Some(ID));
-        // Dropping the trailing newline leaves the object whole; every
-        // shorter prefix lacks the stamp, its newline, or the object's close.
+        // The object is complete without its trailing newline. For every
+        // shorter prefix, the stamp, its newline, or the closing brace is missing.
         let whole = complete.trim_end().len();
         for cut in 0..whole {
             assert_eq!(
@@ -345,7 +345,7 @@ mod tests {
         assert_eq!(parse_owned(&complete[..whole]).as_deref(), Some(ID));
     }
 
-    /// A valid stamp does not relax the shell-insertion boundary.
+    /// Require a strict ID even with a valid stamp before shell insertion.
     #[test]
     fn parse_capture_returns_only_strict_ids_under_a_valid_stamp() {
         for json in [

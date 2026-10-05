@@ -1,14 +1,14 @@
-//! omp cannot pin a session ID at launch: it has no `--session-id` flag, and
-//! `--resume` requires an existing session. Live capture therefore loads an
-//! extension that reports the top-level session's ID on `session_start`,
+//! An omp session ID cannot be pinned at launch: no `--session-id` flag is
+//! available, and an existing session is required for `--resume`. For live
+//! capture, load an extension to report the top-level ID on `session_start`,
 //! `session_switch`, `session_branch`, and `agent_end`.
 //!
-//! The extension reports only an ID that `omp --resume` can open. It skips
-//! sub-agent sessions: omp binds the same handlers to them, and their IDs are
-//! not resumable. It waits for the session file, which omp creates after the
-//! first assistant message. A bare `omp` task therefore has no ID until its
-//! first turn ends, and never has one on an omp older than 18.3.2, which does
-//! not tell the extension whether its session is a sub-agent's.
+//! Report only IDs usable with `omp --resume`. Skip sub-agent sessions:
+//! the same handlers are registered for them, but their IDs are not resumable.
+//! Wait until the session file is created after the first assistant message.
+//! For a bare `omp` task, no ID is captured until the end of the first turn.
+//! Capture is unavailable before omp 18.3.2: without the agent kind in the
+//! extension context, top-level sessions cannot be distinguished from sub-agents.
 //!
 //! omp's IDs are UUIDv7. [`is_uuid`](super::is_uuid) validates the 8-4-4-4-12
 //! lowercase-hex shape and not the version field, so they pass unchanged.
@@ -47,9 +47,9 @@ impl Harness for Omp {
         }
     }
 
-    /// Return `sessionId` from a valid extension payload. The extension
-    /// decides which sessions report: the payload does not carry the agent
-    /// kind, so that gate cannot be repeated here.
+    /// Return `sessionId` from a valid extension payload. Check the agent
+    /// kind in the extension: without that field in the payload, the check
+    /// cannot be repeated here.
     fn parse_capture(
         &self,
         payload: &str,

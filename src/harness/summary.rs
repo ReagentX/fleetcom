@@ -477,8 +477,8 @@ fn codex_warning_shortcut(hint: &str) -> bool {
         for modifier in ["ctrl+", "shift+"] {
             key = key.strip_prefix(modifier).unwrap_or(key);
         }
-        // Codex 0.160.0 dropped the `+` after `⌥`: `⌥w`, where 0.159 rendered
-        // `⌥+w`. A `+` with nothing after it is therefore the key itself.
+        // Since Codex 0.160.0, `⌥w` is displayed instead of `⌥+w`.
+        // Treat a trailing `+` as the key itself.
         key = key
             .strip_prefix("alt+")
             .or_else(|| key.strip_prefix("⌥+").filter(|rest| !rest.is_empty()))
