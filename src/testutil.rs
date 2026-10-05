@@ -219,8 +219,8 @@ pub(crate) fn install_codex_rollout(
 }
 
 /// Install the rollout header of a root thread: `session_id` equals `id` and
-/// `source` is a string. These are the members the capture gate reads; a real
-/// header carries more.
+/// `source` is a string. Include only the fields used for capture validation;
+/// other fields are present in a real header.
 pub(crate) fn install_codex_root(home: &Path, thread: &str) -> PathBuf {
     install_codex_rollout(
         home,

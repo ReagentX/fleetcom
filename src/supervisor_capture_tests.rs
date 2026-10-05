@@ -89,7 +89,7 @@ fn install_status_record(home: &Path, pid: u32, cwd: &Path, status: &str) {
     .unwrap();
 }
 
-/// Capture-file contents as the task's own `SessionStart` hook writes them:
+/// Capture-file contents from the task's own `SessionStart` hook:
 /// the leader PID on the first line, then the hook's JSON and its newline.
 fn stamped(task: &Task, json: &str) -> String {
     format!(
@@ -326,7 +326,7 @@ fn rerun_cannot_read_the_old_runs_stale_capture() {
     );
 
     // A late hook write can recreate the old path, but the new run cannot read it.
-    // The stamp names the new run's leader, so the path alone keeps it out.
+    // Stamp with the new leader's PID to test isolation by path alone.
     let stale = stamped(
         &s.tasks[0],
         &format!(
@@ -460,8 +460,8 @@ fn remove_deletes_the_capture_file_under_the_spawn_root() {
     );
 }
 
-/// A `codex` spawn receives a `notify=[...]` override naming an executable
-/// capture script, then the override that keeps the launch embedded.
+/// For a `codex` spawn, add `notify=[...]` with the executable capture script,
+/// then the override for embedded mode.
 #[test]
 fn spawn_codex_installs_the_notify_and_embedded_overrides() {
     use std::os::unix::fs::PermissionsExt;
@@ -825,10 +825,9 @@ fn resume_id_precedence_registry_over_spawn_under_capture() {
 /// Session ID reported by a process that is not the task.
 const FOREIGN_ID: &str = "22222222-3333-4444-8555-666666666666";
 
-/// The installed hook, fired by a process other than the task leader, replaces
-/// the capture with that process's session. The stamp names the foreign
-/// parent, so the capture is refused: the spawn-time ID decides, then the
-/// registry once it holds a record.
+/// Run the installed hook from a process other than the task leader to
+/// replace the capture with a foreign session. Reject the foreign parent's
+/// PID stamp and use the spawn-time ID, then the registry ID once available.
 #[test]
 fn capture_stamped_by_a_foreign_process_falls_back_to_the_next_source() {
     let dir = scratch("cap_foreign");
@@ -837,13 +836,12 @@ fn capture_stamped_by_a_foreign_process_falls_back_to_the_next_source() {
     let json = |id: &str, source: &str| {
         format!(r#"{{"session_id":"{id}","hook_event_name":"SessionStart","source":"{source}"}}"#)
     };
-    // `/bin/sh -c` execs the stub in place, so the stub is the task leader.
-    // Each marker releases one stage. The first runs the hook as the leader's
-    // child, where `$PPID` is the leader, as in the task's own Claude process.
-    // The second runs it under an intermediate shell that inherits the same
-    // environment, as a session in Claude's daemon does: the trailing `:`
-    // stops that shell from replacing itself with the pipeline's last command,
-    // so the hook's `$PPID` is the intermediate shell and not the leader.
+    // After an exec from `/bin/sh -c`, the stub is the task leader. Use one
+    // marker per stage. First, run the hook as the leader's child, with the
+    // leader as `$PPID`, as in the task's own Claude process. Then run it
+    // under an intermediate shell with the same inherited environment, as
+    // in Claude's daemon. Append `:` to prevent an exec of the pipeline's
+    // last command: the hook's `$PPID` must be the intermediate shell.
     install_script(
         &bin,
         "claude",
@@ -877,7 +875,7 @@ until [ -e '{d}/done' ]; do sleep 0.05; done"#,
     let pid = s.tasks[0].pid().expect("a live task has a pid");
     let cap = s.tasks[0].capture_file.clone().expect("capture file set");
 
-    // Both stages run the hook command as the installed overlay carries it.
+    // Use the hook command from the installed overlay in both stages.
     let overlay = std::fs::read_to_string(cap.with_file_name("claude-settings.json")).unwrap();
     let hook = jzon::parse(&overlay).unwrap()["hooks"]["SessionStart"][0]["hooks"][0]["command"]
         .as_str()
@@ -920,7 +918,7 @@ until [ -e '{d}/done' ]; do sleep 0.05; done"#,
         "the stamp must name the hook's own parent, not the leader: {stamp:?}"
     );
 
-    // No registry record exists yet, so the refused capture leaves the pin.
+    // With no registry record yet, use the pinned ID after rejecting the capture.
     assert_eq!(
         current_resume_id(&s.tasks[0]).as_deref(),
         Some(pinned.as_str()),
@@ -949,9 +947,9 @@ fn silent_codex_tasks_keep_authored_commands_in_saves_and_recovery() {
     let codex_home = dir.join("codex_home");
     install_script(&bin, "codex", "exit 0");
 
-    // This sole rollout matches the directory and the former 30-second
-    // window for both tasks, but predates both launches. Its header is a
-    // complete root header: only a notification naming the thread reads it.
+    // Use the same directory and the former 30-second window for both tasks,
+    // but write the rollout before either launch. Include a complete root
+    // header; it must be read only after a notification for this thread.
     let ms = now_ms();
     let id = format!(
         "{:08x}-{:04x}-7000-8000-000000000001",
@@ -1038,14 +1036,14 @@ fn silent_codex_tasks_keep_authored_commands_in_saves_and_recovery() {
     );
 }
 
-/// Thread IDs one codex process reports through its notifier: the
-/// conversation, a sub-agent it spawned, and the hidden title thread.
+/// Thread IDs reported through one codex process's notifier: the
+/// conversation, a spawned sub-agent, and the hidden title thread.
 const CODEX_ROOT: &str = "019f5453-de22-7240-b2e5-0d32692aa6d9";
 const CODEX_CHILD: &str = "019f5454-0c11-7b33-9a4e-5f0e6d7c8b9a";
 const CODEX_TITLE: &str = "019f5453-de9f-7e61-8c0d-1a2b3c4d5e6f";
 
 /// Capture contents for a completed turn of `thread`: the notification JSON
-/// as the injected notifier writes it. `last` is the final assistant message,
+/// written by the injected notifier. `last` is the final assistant message,
 /// already escaped for a JSON string.
 fn turn_complete(thread: &str, last: &str) -> String {
     format!(
@@ -1073,11 +1071,11 @@ fn saved_command(s: &mut Supervisor, config: &Path, name: &str, payload: &str) -
         .cmd
 }
 
-/// One codex process notifies for three threads, in this order on the first
-/// prompt of a session: the title thread, a sub-agent, then the conversation.
-/// Each write replaces the capture. The title thread has no rollout, so the
-/// authored command survives; the sub-agent resolves to the conversation it
-/// belongs to; the conversation resolves to itself.
+/// Report three threads from one codex process in the order observed after
+/// the first prompt: the title thread, a sub-agent, then the conversation.
+/// Replace the capture on each write. With no rollout for the title thread,
+/// preserve the authored command. Resolve the sub-agent to its conversation
+/// and the conversation to itself.
 #[test]
 fn codex_capture_resolves_each_notifying_thread_to_the_root() {
     let dir = scratch("codex_threads");
@@ -1127,10 +1125,9 @@ fn codex_capture_resolves_each_notifying_thread_to_the_root() {
     );
 }
 
-/// A `codex resume` task targets a conversation from launch. A notification
-/// the gate refuses leaves that ID in force: the title thread, and a thread
-/// whose rollout sits under a Codex home the task did not launch with. A root
-/// thread in the task's own home still outranks the launch ID.
+/// For `codex resume`, preserve the launch ID after rejecting notifications
+/// for the title thread or a rollout outside the launch-time Codex home.
+/// Prefer a captured root thread in the task's own home over the launch ID.
 #[test]
 fn refused_codex_capture_keeps_the_launch_target() {
     /// A root thread saved under another Codex home.
