@@ -27,9 +27,15 @@
 //!   exit 0.
 //! - `omp`: `-e <omp-capture.js>` loads an extension module inside the agent's
 //!   own process, appending to the user's extensions rather than replacing
-//!   them. Its `session_start` and `session_switch` handlers write the session
-//!   id as JSON over `$FLEETCOM_CAPTURE_FILE`, skip the write when that
-//!   variable is unset or empty, and swallow every error.
+//!   them. Its `session_start`, `session_switch`, `session_branch`, and
+//!   `agent_end` handlers replace `$FLEETCOM_CAPTURE_FILE` with the JSON
+//!   object `{reason, sessionId, sessionFile, cwd}`: the module writes
+//!   `<capture file>.<pid>.tmp` beside the capture file and renames it over
+//!   the capture file, so a reader never sees a partial payload. A handler
+//!   writes only for the top-level session (`ctx.agent.kind` is `"main"`; an
+//!   omp older than 18.3.2 has no `ctx.agent` and writes nothing) and only
+//!   when `sessionFile` exists on disk. It skips the write when the variable
+//!   is unset or empty and swallows every error.
 
 use std::{
     fs, io,
@@ -62,24 +68,60 @@ set -- $FLEETCOM_NOTIFY_CHAIN "$1"
 exec "$@"
 "#;
 
-/// Extension module loaded by `omp -e`. Its default export registers handlers
-/// for initial sessions and in-TUI session changes. omp imports the module, so
-/// the asset needs no executable bit.
+/// Extension module loaded by `omp -e`. omp imports the module, so the asset
+/// needs no executable bit. Its default export registers one reporter for four
+/// events:
+///
+/// - `session_start`, `session_switch`, `session_branch`: the launch, an
+///   in-TUI switch or `/fork`, and omp's branch into a new session. Each can
+///   put the live session on a new ID. A rewind keeps the session's ID and
+///   raises none of them.
+/// - `agent_end`: the end of every turn. Two changes raise no event of their
+///   own. omp creates the session file after the first assistant message, and
+///   since 18.5.0 a session whose lease another live process holds moves to a
+///   new ID on its first write. The next turn's report covers both.
+///
+/// The reporter writes only an ID that `omp --resume` can open:
+///
+/// - The top-level session's alone. omp binds the same handlers to each
+///   sub-agent session, whose session manager returns the child's ID.
+/// - None on an omp older than 18.3.2. `ctx.agent` is absent there, so the
+///   top-level session cannot be told from a sub-agent.
+/// - Only that of a session whose file is on disk. A fresh session therefore
+///   first reports at its first `agent_end`.
+///
+/// The temporary file's name ends in `.tmp`, so it never equals a
+/// `task-<id>-<run>.json` capture path, and carries the PID, so one process
+/// leaves at most one behind. It shares the capture file's directory: the
+/// rename stays on one filesystem, and `Drop` removes a stray with the
+/// namespace.
 const OMP_CAPTURE_MODULE: &str = r#"import * as fs from "node:fs";
 
 function write(ctx, reason) {
-  const path = process.env.FLEETCOM_CAPTURE_FILE;
-  if (!path) return;
   try {
+    const path = process.env.FLEETCOM_CAPTURE_FILE;
+    if (!path) return;
+    // omp binds these handlers to every sub-agent session as well, and
+    // `omp --resume` cannot open a sub-agent's ID. omp older than 18.3.2 has
+    // no `ctx.agent`: it reports nothing.
+    if (ctx.agent?.kind !== "main") return;
+    // omp creates the session file after the first assistant message. Until
+    // then `omp --resume` cannot find the ID.
+    const sessionFile = ctx.sessionManager.getSessionFile();
+    if (!sessionFile || !fs.existsSync(sessionFile)) return;
+    // Rename over the capture file: a reader sees the previous payload or
+    // this one, never a truncated file.
+    const partial = `${path}.${process.pid}.tmp`;
     fs.writeFileSync(
-      path,
+      partial,
       JSON.stringify({
         reason,
         sessionId: ctx.sessionManager.getSessionId(),
-        sessionFile: ctx.sessionManager.getSessionFile(),
+        sessionFile,
         cwd: ctx.cwd,
       }),
     );
+    fs.renameSync(partial, path);
   } catch {
     // Best effort: a capture failure must never take the session down.
   }
@@ -88,6 +130,10 @@ function write(ctx, reason) {
 export default function (pi) {
   pi.on("session_start", (_e, ctx) => write(ctx, "session_start"));
   pi.on("session_switch", (_e, ctx) => write(ctx, "session_switch"));
+  pi.on("session_branch", (_e, ctx) => write(ctx, "session_branch"));
+  // A lease move and the session file's creation raise no event of their
+  // own: report again after every turn.
+  pi.on("agent_end", (_e, ctx) => write(ctx, "agent_end"));
 }
 "#;
 
@@ -263,9 +309,51 @@ mod tests {
 
     use super::*;
     use crate::{
-        harness::{CAPTURE_ENV, Claude, Harness, NOTIFY_CHAIN_ENV, fixtures::ID},
+        harness::{
+            CAPTURE_ENV, Claude, Harness, NOTIFY_CHAIN_ENV, Omp,
+            fixtures::{ID, OTHER},
+        },
         testutil::{dead_pid, install_fake_notifier, temp, write_executable},
     };
+
+    /// The events the `omp` module registers, in registration order.
+    const OMP_EVENTS: [&str; 4] = [
+        "session_start",
+        "session_switch",
+        "session_branch",
+        "agent_end",
+    ];
+
+    /// Runtimes that can load the `omp` module, in preference order, with the
+    /// arguments that precede a script path. omp itself runs on Bun.
+    const JS_RUNTIMES: &[(&str, &[&str])] = &[
+        ("bun", &[]),
+        ("node", &[]),
+        ("deno", &["run", "--allow-all"]),
+    ];
+
+    /// Stand-in for omp's extension host. Load the module, collect its
+    /// registrations, and fire one event with a context built from the
+    /// arguments `<event> <agent kind> <session id> <session file>`. An empty
+    /// kind omits `ctx.agent`, as an omp older than 18.3.2 does; an empty file
+    /// makes `getSessionFile()` return `undefined`. Print the registered event
+    /// names in registration order.
+    const OMP_HOST_DRIVER: &str = r#"import register from "./omp-capture.mjs";
+
+const handlers = {};
+register({ on: (event, handler) => (handlers[event] = handler) });
+const [event, kind, sessionId, sessionFile] = process.argv.slice(2);
+const ctx = {
+  cwd: "/work/proj",
+  sessionManager: {
+    getSessionId: () => sessionId,
+    getSessionFile: () => sessionFile || undefined,
+  },
+};
+if (kind) ctx.agent = { kind };
+handlers[event]({ type: event }, ctx);
+console.log(Object.keys(handlers).join(" "));
+"#;
 
     fn mode(p: &Path) -> u32 {
         fs::metadata(p).unwrap().permissions().mode() & 0o777
@@ -664,6 +752,189 @@ mod tests {
             Some(ID)
         );
         assert_eq!(Claude.parse_capture(&written, Some(parent + 1), None), None);
+    }
+
+    /// The module's text carries each load-bearing point of the `omp`
+    /// contract, in order: both gates return before the one write, and the
+    /// rename follows it. No JavaScript runtime is needed to check this.
+    #[test]
+    fn omp_module_text_gates_then_writes_then_renames() {
+        let module = OMP_CAPTURE_MODULE;
+        let imports: Vec<&str> = module
+            .lines()
+            .filter(|line| line.starts_with("import "))
+            .collect();
+        assert_eq!(imports, [r#"import * as fs from "node:fs";"#]);
+
+        let mut at = 0;
+        for step in [
+            "try {",
+            "const path = process.env.FLEETCOM_CAPTURE_FILE;",
+            "if (!path) return;",
+            r#"if (ctx.agent?.kind !== "main") return;"#,
+            "const sessionFile = ctx.sessionManager.getSessionFile();",
+            "if (!sessionFile || !fs.existsSync(sessionFile)) return;",
+            "const partial = `${path}.${process.pid}.tmp`;",
+            "fs.writeFileSync(\n      partial,",
+            "reason,",
+            "sessionId: ctx.sessionManager.getSessionId(),",
+            "sessionFile,",
+            "cwd: ctx.cwd,",
+            "fs.renameSync(partial, path);",
+            "} catch {",
+        ] {
+            let found = module[at..]
+                .find(step)
+                .unwrap_or_else(|| panic!("missing or out of order: {step:?}"));
+            at += found + step.len();
+        }
+        // The temporary file takes the only write.
+        assert_eq!(module.matches("fs.writeFileSync(").count(), 1);
+
+        // Exactly these four registrations: a `tool_call`, `tool_result`, or
+        // `tool_approval_*` handler would disable omp's speculation.
+        assert_eq!(module.matches("pi.on(").count(), OMP_EVENTS.len());
+        for event in OMP_EVENTS {
+            let registration = format!(r#"pi.on("{event}", (_e, ctx) => write(ctx, "{event}"));"#);
+            assert!(module.contains(&registration), "{event}");
+        }
+    }
+
+    /// Fire the installed module's handlers under a JavaScript runtime. A
+    /// report is written only for the top-level session and only once its
+    /// session file exists; each write replaces the capture file whole.
+    #[test]
+    fn omp_module_reports_only_a_materialized_main_session() {
+        let Some((program, prefix)) = JS_RUNTIMES.iter().find(|(program, _)| {
+            Command::new(program)
+                .arg("--version")
+                .output()
+                .is_ok_and(|out| out.status.success())
+        }) else {
+            // The test harness captures `eprintln!`. A direct write shows the
+            // skip in a passing run.
+            writeln!(
+                io::stderr(),
+                "skipped omp_module_reports_only_a_materialized_main_session: \
+                 no bun, node, or deno on PATH"
+            )
+            .unwrap();
+            return;
+        };
+
+        let root = temp("assets_omp_module");
+        let assets = CaptureAssets::install(&root, std::process::id()).unwrap();
+        let ns = namespace(&assets, &root);
+        let cap = assets.paths_for(5, 0).capture_file;
+        // Node takes a `.js` file's module system from the nearest
+        // `package.json`; `.mjs` is an ES module under every runtime.
+        let host = root.join("host");
+        fs::create_dir(&host).unwrap();
+        fs::copy(&assets.omp_capture, host.join("omp-capture.mjs")).unwrap();
+        let driver = host.join("driver.mjs");
+        fs::write(&driver, OMP_HOST_DRIVER).unwrap();
+
+        let session_file = |id: &str| {
+            let file = host.join(format!("2026-08-15T22-13-39-854Z_{id}.jsonl"));
+            fs::write(&file, "").unwrap();
+            file.to_str().unwrap().to_string()
+        };
+        let session = session_file(ID);
+        let unwritten = host.join("unwritten.jsonl");
+        let unwritten = unwritten.to_str().unwrap();
+
+        let fire = |event: &str, kind: &str, id: &str, file: &str, capture: Option<&Path>| {
+            let mut cmd = Command::new(program);
+            cmd.args(*prefix).arg(&driver).args([event, kind, id, file]);
+            match capture {
+                Some(path) => cmd.env(CAPTURE_ENV, path),
+                None => cmd.env_remove(CAPTURE_ENV),
+            };
+            let out = cmd.output().unwrap();
+            assert!(
+                out.status.success(),
+                "{event} {kind:?} {file:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            assert_eq!(
+                String::from_utf8_lossy(&out.stdout).trim(),
+                OMP_EVENTS.join(" "),
+                "the module must register exactly the four events"
+            );
+        };
+        let captured = || {
+            let written = fs::read_to_string(&cap).unwrap();
+            Omp.parse_capture(&written, None, None)
+        };
+
+        // No capture path, an empty one, and one in a missing directory: the
+        // handler returns normally, and the last case swallows the write error.
+        let orphan = root.join("missing").join("task-5-0.json");
+        for capture in [None, Some(Path::new("")), Some(orphan.as_path())] {
+            fire("session_start", "main", ID, &session, capture);
+        }
+        assert!(!orphan.parent().unwrap().exists());
+
+        // The sub-agent and the omp without `ctx.agent` both name a session
+        // file that exists, so the agent gate alone refuses them. The two
+        // top-level cases have no file on disk.
+        for (kind, file) in [
+            ("sub", session.as_str()),
+            ("", session.as_str()),
+            ("main", unwritten),
+            ("main", ""),
+        ] {
+            for event in ["session_start", "agent_end"] {
+                fire(event, kind, ID, file, Some(&cap));
+                assert!(!cap.exists(), "{event} {kind:?} {file:?} must not report");
+            }
+        }
+
+        for event in OMP_EVENTS {
+            // An earlier, longer capture must not survive the next write.
+            fs::write(&cap, "9".repeat(4096)).unwrap();
+            fire(event, "main", ID, &session, Some(&cap));
+            let payload = jzon::parse(&fs::read_to_string(&cap).unwrap()).unwrap();
+            let fields: Vec<(&str, Option<&str>)> = payload
+                .entries()
+                .map(|(key, value)| (key, value.as_str()))
+                .collect();
+            assert_eq!(
+                fields,
+                [
+                    ("reason", Some(event)),
+                    ("sessionId", Some(ID)),
+                    ("sessionFile", Some(session.as_str())),
+                    ("cwd", Some("/work/proj")),
+                ],
+                "{event}"
+            );
+            assert_eq!(captured().as_deref(), Some(ID), "{event}");
+        }
+
+        // A sub-agent's turn leaves the top-level session's capture in place.
+        fire("agent_end", "sub", OTHER, &session, Some(&cap));
+        assert_eq!(captured().as_deref(), Some(ID));
+
+        // A lease move raises no event; the next turn reports the new ID.
+        fire("agent_end", "main", OTHER, &session_file(OTHER), Some(&cap));
+        assert_eq!(captured().as_deref(), Some(OTHER));
+
+        // Every temporary file was renamed into place.
+        let mut names: Vec<String> = fs::read_dir(&ns)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect();
+        names.sort();
+        assert_eq!(
+            names,
+            [
+                "claude-settings.json",
+                "codex-notify.sh",
+                "omp-capture.js",
+                "task-5-0.json"
+            ]
+        );
     }
 
     /// Drop removes only the owned namespace and its contents.

@@ -1,7 +1,14 @@
 //! omp cannot pin a session ID at launch: it has no `--session-id` flag, and
 //! `--resume` requires an existing session. Live capture therefore loads an
-//! extension whose `session_start` and `session_switch` handlers write the
-//! current ID.
+//! extension that reports the top-level session's ID on `session_start`,
+//! `session_switch`, `session_branch`, and `agent_end`.
+//!
+//! The extension reports only an ID that `omp --resume` can open. It skips
+//! sub-agent sessions: omp binds the same handlers to them, and their IDs are
+//! not resumable. It waits for the session file, which omp creates after the
+//! first assistant message. A bare `omp` task therefore has no ID until its
+//! first turn ends, and never has one on an omp older than 18.3.2, which does
+//! not tell the extension whether its session is a sub-agent's.
 //!
 //! omp's IDs are UUIDv7. [`is_uuid`](super::is_uuid) validates the 8-4-4-4-12
 //! lowercase-hex shape and not the version field, so they pass unchanged.
@@ -40,7 +47,9 @@ impl Harness for Omp {
         }
     }
 
-    /// Return `sessionId` from a valid extension payload.
+    /// Return `sessionId` from a valid extension payload. The extension
+    /// decides which sessions report: the payload does not carry the agent
+    /// kind, so that gate cannot be repeated here.
     fn parse_capture(
         &self,
         payload: &str,
@@ -106,7 +115,12 @@ mod tests {
     #[test]
     fn parse_capture_returns_only_strict_ids() {
         let parse = |payload: &str| Omp.parse_capture(payload, None, None);
-        for reason in ["session_start", "session_switch"] {
+        for reason in [
+            "session_start",
+            "session_switch",
+            "session_branch",
+            "agent_end",
+        ] {
             let payload = format!(
                 r#"{{"reason":"{reason}","sessionId":"{CAPTURED}","sessionFile":"/s/2026-08-15T22-13-39-854Z_{CAPTURED}.jsonl","cwd":"/work/proj"}}"#
             );
