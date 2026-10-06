@@ -132,7 +132,7 @@ Verify display and parser behavior against these fixtures:
 - `codex_resume`, `wide_emoji`, `dec_scrollregion`, and `topregion_scroll` for
   parser semantics: scrollback retention, intensity stacking, charset
   translation, and VS16 width.
-- Every raw capture listed above for comparison of the emulator's final styled
+- Every raw capture in the Fixtures table for comparison of the emulator's final styled
   cells, text, cursor, and alternate-screen state with the terminal backend,
   and for a serialize-and-replay round trip.
 

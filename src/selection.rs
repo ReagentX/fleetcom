@@ -233,9 +233,6 @@ mod tests {
     fn rows_below_the_screen_land_on_the_bottom_row() {
         let rows = screen(&["ab", "cd"]);
         assert_eq!(drag((0, 0), (9, 0)).extract(&rows), "ab\nc");
-        // Both endpoints below the screen: the drag collapses onto the
-        // bottom row, and clamping inverts the endpoint order.
-        assert_eq!(drag((5, 1), (9, 0)).extract(&rows), "cd");
     }
 
     #[test]

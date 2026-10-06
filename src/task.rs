@@ -598,15 +598,7 @@ impl Task {
 
     /// Move the scrollback viewport, clamped to retained history.
     pub fn scroll_view(&mut self, action: ScrollAction) {
-        let mut p = grid(&self.parser);
-        let cur = p.scrollback();
-        let target = match action {
-            ScrollAction::Up(n) => cur.saturating_add(n as usize),
-            ScrollAction::Down(n) => cur.saturating_sub(n as usize),
-            ScrollAction::Top => usize::MAX,
-            ScrollAction::Live => 0,
-        };
-        p.set_scrollback(target);
+        grid(&self.parser).scroll(action);
     }
 
     /// Rows the viewport is scrolled back from live output.

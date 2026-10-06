@@ -15,6 +15,13 @@ use std::{
     time::{Duration, Instant, SystemTime},
 };
 
+use alacritty_terminal::{
+    Term,
+    event::VoidListener,
+    term::{Config, test::TermSize},
+    vte::ansi::Processor,
+};
+
 use crate::{
     emulator::Emulator,
     task::{pid_is_dead, positive_pid},
@@ -246,6 +253,16 @@ pub(crate) fn install_codex_root(home: &Path, thread: &str) -> PathBuf {
 /// under a 40-row, 120-column PTY (tests/corpus/README.md).
 pub(crate) const CORPUS_LINES: usize = 40;
 pub(crate) const CORPUS_COLS: usize = 120;
+
+/// A raw backend `Term` of `lines`×`cols` with `bytes` parsed into it: the
+/// reference grid for tests that compare the wrapper or the serializer
+/// against the backend without going through `Emulator`.
+pub(crate) fn parse_term(bytes: &[u8], lines: usize, cols: usize) -> Term<VoidListener> {
+    let mut term = Term::new(Config::default(), &TermSize::new(cols, lines), VoidListener);
+    let mut parser: Processor = Processor::new();
+    parser.advance(&mut term, bytes);
+    term
+}
 
 /// An emulator sized for corpus replay: corpus geometry plus enough
 /// scrollback (2000 rows) to retain every fixture's history.

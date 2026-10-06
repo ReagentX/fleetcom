@@ -1161,17 +1161,13 @@ fn resize_clamps_hostile_dimensions() {
 fn worst_case_screen_frame_fits_max_frame() {
     use std::fmt::Write as _;
 
-    use alacritty_terminal::{
-        event::VoidListener,
-        index::{Column, Line},
-        term::{Config, test::TermSize},
-        vte::ansi::Processor,
-    };
+    use alacritty_terminal::index::{Column, Line};
 
     use crate::{
         ansi,
         frame::{KIND_SCREEN, MAX_FRAME},
         protocol::{ScreenView, encode_event},
+        testutil::parse_term,
     };
 
     // Alternate complete SGR states so every cell emits all style and
@@ -1199,10 +1195,7 @@ fn worst_case_screen_frame_fits_max_frame() {
         }
     }
 
-    let mut term =
-        alacritty_terminal::Term::new(Config::default(), &TermSize::new(cols, rows), VoidListener);
-    let mut parser: Processor = Processor::new();
-    parser.advance(&mut term, input.as_bytes());
+    let term = parse_term(input.as_bytes(), rows, cols);
 
     // Confirm the grid contains the features used by the density bound.
     let probe = &term.grid()[Line(0)][Column(0)];

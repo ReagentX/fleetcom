@@ -6,7 +6,8 @@ pub(crate) mod ansi;
 #[cfg(test)]
 mod codex_tests;
 pub(crate) mod emulator;
-// Differential emulator tests over recorded PTY output.
+// Absolute pins over the recorded PTY corpus, plus the wrapper-vs-backend
+// oracle.
 #[cfg(test)]
 mod golden;
 pub(crate) mod input;

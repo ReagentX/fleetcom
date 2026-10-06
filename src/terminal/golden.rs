@@ -4,7 +4,7 @@
 //!
 //! **Displayed state.** Verify every final plain-text row via [`ansi::contents`],
 //! cursor position and visibility via [`ansi::formatted`], and selected styled
-//! cells for each fixture (see `tests/corpus/README.md`).
+//! cells for the displayed-state fixtures (see `tests/corpus/README.md`).
 //!
 //! **Parser semantics.** Verify exact scrollback retention, bold-plus-dim intensity
 //! stacking, DEC charset translation, and VS16 width with targeted fixtures.
@@ -13,21 +13,18 @@ use alacritty_terminal::{
     Term,
     event::VoidListener,
     grid::Dimensions,
-    index::{Column, Line, Point},
-    term::{Config, TermMode, cell::Flags, test::TermSize},
-    vte::ansi::{Color, NamedColor, Processor, Rgb},
+    index::{Column, Line},
+    term::{TermMode, cell::Flags},
+    vte::ansi::{Color, NamedColor, Rgb},
 };
 
 use crate::{
     ansi,
-    testutil::{CORPUS_COLS as COLS, CORPUS_LINES as LINES},
+    testutil::{CORPUS_COLS as COLS, CORPUS_LINES as LINES, parse_term},
 };
 
 fn alacritty(bytes: &[u8]) -> Term<VoidListener> {
-    let mut term = Term::new(Config::default(), &TermSize::new(COLS, LINES), VoidListener);
-    let mut parser: Processor = Processor::new();
-    parser.advance(&mut term, bytes);
-    term
+    parse_term(bytes, LINES, COLS)
 }
 
 /// Pin every visible text row, cursor position and visibility, and the active
@@ -556,24 +553,20 @@ fn semantic_dec_scrollregion_charset_translation() {
 
     // Visible screen: box body translated, ASCII rows verbatim, the rest
     // blank.
-    let al_text = ansi::contents(&al);
-    let al_rows: Vec<&str> = al_text.split('\n').collect();
-    assert_eq!(al_rows[0], "│     │");
-    assert_eq!(al_rows[1], "└─────┘");
-    let shared = [
-        (2, "ascii after charset"),
-        (3, "inside region 1"),
-        (4, "inside region 2"),
-        (5, "inside region 3"),
-        (38, "bottom line after region reset"),
-    ];
-    for (row, text) in shared {
-        assert_eq!(al_rows[row], text, "row {row}");
-    }
-    for row in (6..38).chain([39]) {
-        assert_eq!(al_rows[row], "", "row {row} blank");
-    }
-    assert_eq!(al.grid().cursor.point, Point::new(Line(39), Column(0)));
+    assert_screen(
+        "dec_scrollregion.bin",
+        &al,
+        &[
+            (0, "│     │"),
+            (1, "└─────┘"),
+            (2, "ascii after charset"),
+            (3, "inside region 1"),
+            (4, "inside region 2"),
+            (5, "inside region 3"),
+            (38, "bottom line after region reset"),
+        ],
+        (39, 0),
+    );
 }
 
 /// Assert identical styled cells, screen text, cursor state, and alternate-screen mode
