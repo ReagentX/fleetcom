@@ -142,18 +142,16 @@ fn exited_leader_stays_a_zombie_until_drop() {
     assert!(kill(pid, None).is_err(), "Drop did not collect the zombie");
 }
 
-/// A managed launch makes the agent the task leader by construction: no
-/// shell sits between the PTY and the binary. The same agent launched as a
-/// literal through a resident shell (one that runs its `-c` text as a child
-/// instead of replacing itself, as tcsh and csh do) is not the leader. That
-/// gap is why managed launch exists: claude's capture gate and registry
-/// reader key on the leader pid.
+/// Verify the agent's PID is the task leader's under a managed launch. A literal launch
+/// through a resident shell, such as tcsh or csh, runs the agent as a child without
+/// replacing the shell. Direct execution is required because Claude capture and registry
+/// records are validated against the leader PID.
 #[test]
 fn managed_launch_makes_the_agent_the_task_leader_under_any_shell() {
     let dir = temp("task_identity");
     let shell = dir.join("resident-sh");
-    // `:` after the child keeps sh from exec'ing it as the script's last
-    // command, so the shell stays resident as the leader.
+    // Add `:` after the child command to prevent sh from execing that command. Retain the
+    // shell as task leader.
     write_executable(&shell, "[ \"$1\" = -c ] || exit 2\n/bin/sh -c \"$2\"\n:");
     let agent = dir.join("agent");
     let pid_file = dir.join("pid");

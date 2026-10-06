@@ -860,10 +860,9 @@ fn flagship_wire_form() {
     }
 }
 
-/// `SpawnAgent` names the agent by program word and encodes the cwd as
-/// base64, omitting `"group"` when unassigned, as `Spawn` does. The decoder
-/// requires a string word; refusing a path or an unknown word is the core's
-/// registry check, not the decoder's.
+/// Encode the `SpawnAgent` program word as a string and cwd as base64. Omit `"group"` when
+/// unassigned, as for `Spawn`. Require a string word during decoding; reject paths and
+/// unknown words in the core's registry check.
 #[test]
 fn spawn_agent_wire_form() {
     let (k, p) = encode_command(&Command::SpawnAgent {
@@ -913,10 +912,9 @@ fn spawn_agent_wire_form() {
     }
 }
 
-/// `Agents` round-trips empty and populated lists in order and pins its
-/// wire shape. A missing list, a non-array, or a non-string member rejects
-/// the event rather than reading as "no agents": the client indexes the
-/// list by position, and an empty menu is an explicit `[]`.
+/// Round-trip empty and populated `Agents` lists in order and check the wire format. Reject
+/// missing lists, non-arrays, and non-string members. Encode an empty menu as `[]`; do not
+/// treat malformed input as "no agents".
 #[test]
 fn agents_event_round_trips_and_pins_the_wire_shape() {
     for agents in [
@@ -953,7 +951,7 @@ fn agents_event_round_trips_and_pins_the_wire_shape() {
     }
 }
 
-/// Every task row carries `managed` as a required boolean, both ways.
+/// Require a boolean `managed` field on every task row during encoding and decoding.
 #[test]
 fn tasks_frame_managed_flag_round_trips_and_is_required() {
     for managed in [false, true] {

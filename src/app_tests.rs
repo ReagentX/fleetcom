@@ -3083,7 +3083,7 @@ fn state_and_dir_mode_spawns_stay_unassigned() {
 
 // --- `n` spawn prompt: Agent page --------------------------------------
 
-/// Hand the core's events to the app with no core behind them.
+/// Supply core events to the app without a running core.
 struct Scripted(Vec<Event>);
 
 impl Transport for Scripted {
@@ -3101,9 +3101,9 @@ impl Transport for Scripted {
 }
 
 impl App {
-    /// A detached app that lists `agents`: `new_local` never pumps here, so
-    /// the machine's real agents never replace the list, and Enter reaches
-    /// no core. Returns the send log.
+    /// Create a detached app with the supplied `agents` list and return the send log. Do
+    /// not pump `new_local`, so the host's installed agents are never read into the list.
+    /// Do not forward Enter to a core.
     fn with_agents(agents: &[&str]) -> (Self, Arc<std::sync::Mutex<Vec<Command>>>) {
         let mut app = Self::new_local(30, 100);
         app.agents = agents.iter().map(|a| a.to_string()).collect();
@@ -3112,7 +3112,7 @@ impl App {
         (app, sent)
     }
 
-    /// `n`, then Tab onto the Agent page.
+    /// Press `n`, then Tab to open the Agent page.
     fn open_agent_page(&mut self) {
         self.on_key_dashboard(key(KeyCode::Char('n')));
         self.on_key_spawn(key(KeyCode::Tab));
@@ -3127,9 +3127,8 @@ impl App {
     }
 }
 
-/// An app whose core's `PATH` holds a stub `claude` and nothing else, so
-/// discovery lists exactly that and a managed launch runs the stub rather
-/// than a real agent. Capture assets and the claude registry read stay in
+/// Create an app with only a stub `claude` on the core's `PATH`. Discover and launch that
+/// stub without running a real agent. Keep capture assets and Claude registry reads inside
 /// the scratch tree.
 fn stub_claude_fixture(tag: &str) -> (App, Scratch) {
     let dir = temp(&format!("agent_{tag}"));
@@ -3156,8 +3155,8 @@ fn stub_claude_fixture(tag: &str) -> (App, Scratch) {
     (app, dir)
 }
 
-/// Tab flips between the Command and Agent pages only while the core lists
-/// agents; without any, both Tab forms fall through and the page holds.
+/// Switch between Command and Agent with Tab only when agents are installed. With no
+/// agents, ignore Tab and BackTab and keep the current page.
 #[test]
 fn spawn_tab_toggles_pages_only_with_agents() {
     let (mut app, _) = App::with_agents(&[]);
@@ -3184,9 +3183,8 @@ fn spawn_tab_toggles_pages_only_with_agents() {
     assert_eq!(app.spawn_page, SpawnPage::Agent);
 }
 
-/// Typing filters by a lowercase substring of the program word. The rows
-/// keep registry order whatever the match position, and the first match is
-/// selected after every edit.
+/// Filter by a case-insensitive substring of the program word. Preserve registry order
+/// regardless of match position, and select the first match after every edit.
 #[test]
 fn agent_filter_matches_substrings_in_registry_order() {
     let (mut app, _) = App::with_agents(&["claude", "codex", "grok", "omp"]);
@@ -3213,8 +3211,8 @@ fn agent_filter_matches_substrings_in_registry_order() {
     assert_eq!(app.agent_candidates, ["grok"], "backspace re-widens");
 }
 
-/// Down and Up step through the matches and clamp at both ends; a filter
-/// edit returns the highlight to the first match.
+/// Move through matches with Down and Up, clamping at both ends. Select the first match
+/// after a filter edit.
 #[test]
 fn agent_arrows_step_within_the_matches() {
     let (mut app, _) = App::with_agents(&["claude", "codex", "grok", "omp"]);
@@ -3233,13 +3231,8 @@ fn agent_arrows_step_within_the_matches() {
     assert_eq!(app.agent_sel, 0, "a filter edit reselects the first match");
 }
 
-/// The common case, `n` → Tab → Enter: `SpawnAgent` for the first installed
-/// agent in the invocation directory, the prompt closed, and the core admits
-/// the task as managed with the program word as its row label.
-/// A session load reports every task's launch notice and every failure in
-/// the status the app actually displays. The core queues the per-task
-/// reasons and the summary in one batch, and `sync` keeps only the last
-/// status, so the summary itself must carry them.
+/// Include every launch notice and failure in the displayed session-load status. In `sync`,
+/// only the last status in a poll is retained, so include all reasons in the final summary.
 #[test]
 fn session_load_status_keeps_capture_notices_and_failures() {
     let dir = temp("load_status");
@@ -3248,7 +3241,7 @@ fn session_load_status_keeps_capture_notices_and_failures() {
         std::fs::create_dir_all(d).unwrap();
     }
     write_executable(&bin.join("codex"), "exit 0");
-    // A notify route fleetcom cannot chain: codex launches without capture.
+    // Use an unchainable notify route to launch codex without capture.
     std::fs::write(codex_home.join("config.toml"), "notify = [1]\n").unwrap();
     let ctx = crate::protocol::LaunchContext {
         env: vec![
@@ -3301,6 +3294,9 @@ fn session_load_status_keeps_capture_notices_and_failures() {
     }
 }
 
+/// Press `n`, Tab, then Enter to launch the first installed agent in the invocation
+/// directory. Close the prompt, admit a managed task, and label its row with the
+/// program word.
 #[test]
 fn agent_enter_launches_the_highlighted_agent_managed() {
     let (mut app, _dir) = stub_claude_fixture("enter");
@@ -3325,9 +3321,8 @@ fn agent_enter_launches_the_highlighted_agent_managed() {
     );
 }
 
-/// Enter on a stepped-to row names that row, with the directory `@` picked
-/// and the group custom mode inherits: the destination a Command-page Enter
-/// would use.
+/// Launch the selected row on Enter, using the directory selected through `@` and the group
+/// inherited in Custom mode. Use the same destination as for Command-page launches.
 #[test]
 fn agent_enter_uses_the_picked_directory_and_inherited_group() {
     let root = temp("agent_dest");
@@ -3336,8 +3331,8 @@ fn agent_enter_uses_the_picked_directory_and_inherited_group() {
     app.selected_id = Some(1);
     app.group_mode = GroupMode::Custom;
 
-    // The trailing slash leaves no fragment, so row 0 (the resolved path,
-    // DirKind::Use) stays selected and Enter hands off to Spawn.
+    // With a trailing slash, there is no path fragment. Keep row 0 selected (the resolved
+    // path, `DirKind::Use`) and open Spawn on Enter.
     type_pickdir(&mut app, &format!("{}/", root.display()));
     app.on_key_pickdir(key(KeyCode::Enter));
     assert_eq!(app.mode, Mode::Spawn);
@@ -3358,8 +3353,7 @@ fn agent_enter_uses_the_picked_directory_and_inherited_group() {
     assert_eq!(app.mode, Mode::Dashboard);
 }
 
-/// Enter with no match sends nothing and leaves the prompt open on the
-/// Agent page.
+/// With no match, send nothing on Enter and keep the prompt open on the Agent page.
 #[test]
 fn agent_enter_with_no_match_sends_nothing() {
     let (mut app, sent) = App::with_agents(&["claude"]);
@@ -3372,7 +3366,7 @@ fn agent_enter_with_no_match_sends_nothing() {
     assert!(sent.lock().unwrap().is_empty());
 }
 
-/// Esc closes the prompt from the Agent page without sending.
+/// Close the prompt on Esc without sending a command.
 #[test]
 fn agent_page_esc_closes_the_prompt_without_sending() {
     let (mut app, sent) = App::with_agents(&["claude"]);
@@ -3383,9 +3377,8 @@ fn agent_page_esc_closes_the_prompt_without_sending() {
     assert!(sent.lock().unwrap().is_empty());
 }
 
-/// Each page keeps its own buffer across Tab: typed command text is never a
-/// filter, and both survive the flip. Reopening the prompt clears both and
-/// lands on the Command page, so Tab shows the full list again.
+/// Preserve separate command and filter buffers across Tab. Clear both when reopening the
+/// prompt on the Command page, so the full agent list is available on Tab.
 #[test]
 fn spawn_pages_keep_separate_buffers_until_the_prompt_reopens() {
     let (mut app, _) = App::with_agents(&["claude", "codex"]);
@@ -3417,8 +3410,8 @@ fn spawn_pages_keep_separate_buffers_until_the_prompt_reopens() {
     );
 }
 
-/// With agents listed, the Command page still runs typed text literally:
-/// a typed `claude` is a `Spawn`, never a `SpawnAgent`.
+/// Run Command-page text literally even when agents are installed: submit a typed `claude`
+/// as `Spawn`, never `SpawnAgent`.
 #[test]
 fn command_page_enter_still_spawns_the_literal_text() {
     let (mut app, sent) = App::with_agents(&["claude"]);
@@ -3436,7 +3429,7 @@ fn command_page_enter_still_spawns_the_literal_text() {
     );
 }
 
-/// A paste on the Agent page lands in the filter, not the command buffer.
+/// Paste into the filter on the Agent page, without changing the command buffer.
 #[test]
 fn agent_page_paste_filters_the_rows() {
     let (mut app, _) = App::with_agents(&["claude", "codex"]);
@@ -3447,8 +3440,8 @@ fn agent_page_paste_filters_the_rows() {
     assert!(app.input.is_empty(), "the command buffer is untouched");
 }
 
-/// A reconnect's `Agents` event refilters an open Agent page, and an empty
-/// list returns it to the Command page, where Tab can no longer leave.
+/// Refilter an open Agent page after receiving `Agents` on reconnect. With an empty list,
+/// switch to Command and disable Tab.
 #[test]
 fn agents_event_refilters_and_an_empty_list_leaves_the_agent_page() {
     let (mut app, _) = App::with_agents(&["claude", "codex"]);
@@ -3472,9 +3465,9 @@ fn agents_event_refilters_and_an_empty_list_leaves_the_agent_page() {
     assert_eq!(app.spawn_page, SpawnPage::Command);
 }
 
-/// The Command page footer advertises the Agent page only when agents exist;
-/// the Agent page paints the `❯` destination, the filter, the matching rows
-/// with the first highlighted, and its own hint.
+/// Include the Agent-page hint in the Command footer only when agents are installed. On the
+/// Agent page, render the `❯` destination, filter, matching rows, first-row highlight, and
+/// page hint.
 #[test]
 fn agent_page_paints_the_rows_and_highlights_the_first_match() {
     let (mut app, _) = App::with_agents(&[]);
@@ -3508,8 +3501,8 @@ fn agent_page_paints_the_rows_and_highlights_the_first_match() {
     );
 }
 
-/// A filter that matches nothing names the registered agents this host
-/// lacks, in registry order.
+/// When nothing matches, list the registered agents missing from the host in registry
+/// order.
 #[test]
 fn agent_page_no_match_names_the_missing_agents() {
     let (mut app, _) = App::with_agents(&["claude", "codex"]);

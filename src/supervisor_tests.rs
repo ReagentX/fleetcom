@@ -2091,9 +2091,9 @@ fn agents_of(s: &mut Supervisor) -> Vec<String> {
         .expect("expected an Agents event")
 }
 
-/// `dir` spelled relative to this process's cwd, through `..` components.
-/// The spelling reaches `dir` from here, which is exactly why discovery
-/// must not use it: the task would resolve it from its own cwd.
+/// Spell `dir` relative to this process's cwd through `..` components. Although reachable
+/// from here, this path must be excluded from discovery: at exec, it would be resolved
+/// against the task's cwd.
 fn relative_spelling(dir: &Path) -> PathBuf {
     use std::path::Component;
     let ups = here()
@@ -2105,11 +2105,10 @@ fn relative_spelling(dir: &Path) -> PathBuf {
         .join(dir.strip_prefix("/").unwrap())
 }
 
-/// Installing a context queues the registered agents its `PATH` resolves, in
-/// registry order rather than `PATH` order. An unregistered executable and a
-/// relative component contribute nothing. Each install resends the whole
-/// list, and a context without `PATH` sends an empty one, so a reconnect
-/// never inherits a stale menu.
+/// On context install, queue the registered agents found on its `PATH` in registry order.
+/// Ignore unregistered executables and relative components. Send the whole list on every
+/// install, including an empty list without `PATH`, to clear stale menu entries on
+/// reconnect.
 #[test]
 fn launch_context_install_discovers_agents_in_registry_order() {
     let dir = scratch("discover");
@@ -2148,9 +2147,9 @@ fn launch_context_install_discovers_agents_in_registry_order() {
     assert_eq!(agents_of(&mut s), Vec::<String>::new());
 }
 
-/// `Command::SpawnAgent` admits a managed task for a registered word on the
-/// context's `PATH`, acking with `Spawned` and reporting `managed` in the
-/// snapshot. A literal spawn of the same word stays unmanaged.
+/// Admit a managed task for a registered word found on the context's `PATH` through
+/// `Command::SpawnAgent`. Acknowledge with `Spawned` and set `managed` in the snapshot.
+/// Keep literal spawns of the same word unmanaged.
 #[test]
 fn spawn_agent_admits_a_managed_task() {
     let dir = scratch("spawn_agent");

@@ -7,16 +7,15 @@ use crate::{
 
 // --- session-capture wiring -------------------------------------------
 
-/// Install an executable stub that records `FLEETCOM_CAPTURE_FILE`,
-/// `FLEETCOM_BINARY`, and its argv, one token per line, then exits.
+/// Install an executable stub to record `FLEETCOM_CAPTURE_FILE`, `FLEETCOM_BINARY`, and
+/// argv, one token per line, then exit.
 fn install_stub(bin: &Path, name: &str, out: &Path) {
     install_script(
         bin,
         name,
-        // Write each record to a per-process file beside its destination and
-        // rename it into place: `>` truncates first and `printf` may write
-        // one argument at a time, so a reader polling for a non-empty file
-        // could otherwise see a prefix of the argv.
+        // Write each record to a per-process file beside its destination and rename it into
+        // place. Redirection truncates before writing, and `printf` may write arguments
+        // separately; polling for a non-empty file could otherwise accept incomplete argv.
         &format!(
             "printf '%s' \"$FLEETCOM_CAPTURE_FILE\" > '{out}/capenv.'$$'.tmp' && mv '{out}/capenv.'$$'.tmp' '{out}/capenv'\n\
              printf '%s' \"$FLEETCOM_BINARY\" > '{out}/binenv.'$$'.tmp' && mv '{out}/binenv.'$$'.tmp' '{out}/binenv'\n\
@@ -121,9 +120,8 @@ fn notices(s: &mut Supervisor) -> Vec<String> {
         .collect()
 }
 
-/// Assert that `s` queued exactly one status line and that it names `needle`.
-/// Match on the distinctive token, not the full sentence, so rewording a
-/// message never breaks a test of the behavior behind it.
+/// Require exactly one queued status containing `needle`. Match the distinctive token so
+/// message wording can change without affecting the behavior check.
 fn assert_sole_notice(s: &mut Supervisor, needle: &str) {
     let got = notices(s);
     assert!(
@@ -132,7 +130,7 @@ fn assert_sole_notice(s: &mut Supervisor, needle: &str) {
     );
 }
 
-/// Whether a drained event batch acknowledges a spawn.
+/// Check for a spawn acknowledgement in drained events.
 fn acknowledged(events: &[Event]) -> bool {
     events.iter().any(|e| matches!(e, Event::Spawned { .. }))
 }
@@ -158,8 +156,8 @@ fn literal(cmd: &str) -> SessionEntry {
     }
 }
 
-/// Save `entries` for `dir` as the named recipe through the real serializer,
-/// then load it: the only way a task starts with a chosen resume target.
+/// Save `entries` for `dir` through the real serializer, then load the named recipe. Use
+/// this path to start a managed task with a specified resume target.
 fn load_recipe(
     s: &mut Supervisor,
     config: &Path,
@@ -182,7 +180,7 @@ fn saved_entries(s: &mut Supervisor, config: &Path, name: &str) -> Vec<SessionEn
         .collect()
 }
 
-/// The resume target the sole task saves under `name`, which must be managed.
+/// Resume target saved under `name` for the sole managed task.
 fn saved_resume(s: &mut Supervisor, config: &Path, name: &str) -> Option<String> {
     match saved_entries(s, config, name).as_slice() {
         [
@@ -205,8 +203,8 @@ fn fnv_discriminator_is_stable_and_distinguishes_roots() {
     assert_ne!(fnv1a_hex(b"/cfg/one"), fnv1a_hex(b"/cfg/two"));
 }
 
-/// A managed `claude` receives a pinned ID, settings overlay, and capture
-/// environment; its display text stays the program word.
+/// Launch managed `claude` with a pinned ID, settings overlay, and capture environment.
+/// Preserve the program word for display.
 #[test]
 fn spawn_claude_pins_an_id_and_layers_settings() {
     let dir = scratch("cap_claude");
@@ -297,16 +295,15 @@ fn spawn_non_agent_command_is_not_instrumented() {
     assert!(!runtime.exists());
 }
 
-/// A typed `claude` is a literal task: the shell gets exactly that text, no
-/// harness channel is attached, and the recipe stores the text. A
-/// capture-shaped file at the path a managed task of the same id would use
-/// and a matching registry record change nothing: nothing reads them.
+/// Run a typed `claude` literally, with no harness channel, and save the exact text. Ignore
+/// both a capture file at the path for a managed task with the same ID and a matching
+/// registry record.
 #[test]
 fn typed_agent_word_is_literal_runs_verbatim_and_saves_as_text() {
     let dir = scratch("literal_claude");
     let (bin, runtime, config) = (dir.join("bin"), dir.join("run"), dir.join("config"));
     let claude_home = dir.join("claude_home");
-    // The stub publishes its argument count and the capture env atomically.
+    // Publish the argument count and capture environment atomically from the stub.
     install_script(
         &bin,
         "claude",
@@ -348,9 +345,8 @@ fn typed_agent_word_is_literal_runs_verbatim_and_saves_as_text() {
     assert!(!runtime.exists());
     let pid = t.pid().expect("a spawned task has a pid");
 
-    // A managed sibling installs the namespace; a capture-shaped file for
-    // task 1 lands there, stamped with task 1's own leader pid, and a
-    // registry record is keyed to task 1 as well.
+    // Install a namespace by launching a managed sibling. Write a capture for task 1 there,
+    // stamped with task 1's leader PID, and create a registry record keyed to that PID.
     s.spawn_agent("claude", dir.to_path_buf(), None);
     let ns = s.tasks[1]
         .capture_file
@@ -549,9 +545,9 @@ fn remove_deletes_the_capture_file_under_the_spawn_root() {
     );
 }
 
-/// For a `codex` spawn, add `notify=[...]` with the executable capture script,
-/// then the override for embedded mode, and name this process's own
-/// executable in `FLEETCOM_BINARY` for the script's validation step.
+/// For a `codex` spawn, add `notify=[...]` with the executable capture script, then the
+/// embedded-mode override. Set `FLEETCOM_BINARY` to this process's executable for
+/// validation from the script.
 #[test]
 fn spawn_codex_installs_the_notify_and_embedded_overrides() {
     use std::os::unix::fs::PermissionsExt;
@@ -687,9 +683,9 @@ fn spawn_omp_loads_the_capture_extension() {
     assert!(t.resume_id.is_none(), "omp cannot pin an id at launch");
 }
 
-/// Printed hints are display content even after exit and reader EOF. Named
-/// saves, recovery snapshots, and reruns carry the capture or launch ID; a
-/// task with neither saves and reruns fresh.
+/// Treat printed hints as display content, even after exit and reader EOF. Use capture or
+/// launch IDs for named saves, recovery snapshots, and reruns; without either ID, save and
+/// rerun fresh.
 #[test]
 fn printed_resume_hints_do_not_change_saved_recovery_or_rerun_targets() {
     for (tool, hints) in [
@@ -799,10 +795,9 @@ fn printed_resume_hints_do_not_change_saved_recovery_or_rerun_targets() {
     }
 }
 
-/// Rerun latches a recent exit before checking eligibility and retains the
-/// explicit launch ID when terminal output names another conversation. The
-/// launch ID comes from a loaded recipe: the one way a managed task starts
-/// on a chosen conversation.
+/// Latch a recent exit before checking rerun eligibility. Retain the explicit launch ID
+/// even when another conversation is named in terminal output. Load a recipe to start the
+/// managed task on a specified conversation.
 #[test]
 fn rerun_latches_exit_without_reap_and_preserves_the_launch_id() {
     use rustix::process::{Pid, WaitId, WaitIdOptions, waitid};
@@ -934,12 +929,10 @@ fn capture_stamped_by_a_foreign_process_falls_back_to_the_next_source() {
     let json = |id: &str, source: &str| {
         format!(r#"{{"session_id":"{id}","hook_event_name":"SessionStart","source":"{source}"}}"#)
     };
-    // The test writes the task's own capture itself, with the leader's
-    // stamp. The stub then runs the installed hook under an intermediate
-    // shell with the same inherited environment, as in Claude's daemon.
-    // Append `:` to prevent an exec of the pipeline's last command: the
-    // hook's `$PPID` must be the intermediate shell, which is never the
-    // leader.
+    // Write a capture stamped with the task leader's PID. Then run the installed hook from
+    // the stub through an intermediate shell, with the same inherited environment as in
+    // Claude's daemon. Append `:` to prevent exec of the pipeline's last command: the
+    // hook's `$PPID` must be the intermediate shell, never the leader.
     install_script(
         &bin,
         "claude",
@@ -1023,9 +1016,8 @@ until [ -e '{d}/done' ]; do sleep 0.05; done"#,
     std::fs::write(dir.join("done"), b"").unwrap();
 }
 
-/// Two managed tasks sharing a directory do not own a nearby rollout. Named
-/// saves and recovery must write both without a resume ID when capture is
-/// silent.
+/// Do not infer ownership of a nearby rollout from a shared directory. With no capture,
+/// save both managed tasks without resume IDs in named sessions and recovery snapshots.
 #[test]
 fn silent_codex_tasks_save_and_recover_without_a_resume_id() {
     let dir = scratch("uncaptured_codex");
@@ -1119,9 +1111,8 @@ const CODEX_ROOT: &str = "019f5453-de22-7240-b2e5-0d32692aa6d9";
 const CODEX_CHILD: &str = "019f5454-0c11-7b33-9a4e-5f0e6d7c8b9a";
 const CODEX_TITLE: &str = "019f5453-de9f-7e61-8c0d-1a2b3c4d5e6f";
 
-/// Notification JSON for a completed turn of `thread`, as codex passes it
-/// to the injected notifier. `last` is the final assistant message, already
-/// escaped for a JSON string.
+/// Notification JSON passed to the injected notifier after a completed turn of `thread`.
+/// `last` is the final assistant message, already escaped for a JSON string.
 fn turn_complete(thread: &str, last: &str) -> String {
     format!(
         r#"{{"type":"agent-turn-complete","thread-id":"{thread}","turn-id":"t","cwd":"/w","input-messages":["ping"],"last-assistant-message":"{last}"}}"#
@@ -1133,9 +1124,9 @@ fn title_turn() -> String {
     turn_complete(CODEX_TITLE, r#"{\"title\":\"Ping the sub-agent\"}"#)
 }
 
-/// Run the `--codex-notify-v1` step in-process for the sole task, as the
-/// injected script's binary call would: the task's capture file and
-/// `codex_home` are its environment. Return the root it wrote.
+/// Run `--codex-notify-v1` in-process for the sole task, using its capture file and
+/// `codex_home` as the environment. Return the written root, as for a binary invocation
+/// from the injected script.
 fn arrive(s: &Supervisor, codex_home: &Path, payload: &str) -> Option<String> {
     let cap = s.tasks[0].capture_file.clone().expect("capture file set");
     crate::harness::record_arrival(payload, &|key| match key {
@@ -1145,10 +1136,10 @@ fn arrive(s: &Supervisor, codex_home: &Path, payload: &str) -> Option<String> {
     })
 }
 
-/// Install a stand-in for `fleetcom --codex-notify-v1` at `<bin>/fleetcom`
-/// that writes `CAP_ID` over the capture file. The real mode cannot run from
-/// the unit-test binary, whose `main` is the test harness, so stubs that
-/// invoke the injected script name this file in `FLEETCOM_BINARY`.
+/// Install a stand-in at `<bin>/fleetcom` to write `CAP_ID` over the capture file. The real
+/// notify mode cannot run from the unit-test executable because its `main` is the test
+/// harness. Set `FLEETCOM_BINARY` to this stand-in when invoking the injected script from a
+/// stub.
 fn install_fake_fleetcom(bin: &Path) -> PathBuf {
     install_script(
         bin,
@@ -1158,13 +1149,11 @@ fn install_fake_fleetcom(bin: &Path) -> PathBuf {
     bin.join("fleetcom")
 }
 
-/// Report three threads from one codex process through the arrival step in
-/// the order observed after the first prompt: the title thread, a sub-agent,
-/// then the conversation, and the title thread again, which lands after the
-/// root in most sessions. With no rollout for the title thread, nothing is
-/// written and the authored command is preserved. Resolve the sub-agent to
-/// its conversation and the conversation to itself, and keep that root
-/// across the later title notification.
+/// Report notifications from one codex process in the observed order: title thread,
+/// sub-agent, root conversation, then title again to cover its later arrival in most
+/// sessions. Without a title rollout, write nothing and preserve the authored command.
+/// Resolve the sub-agent to its root and the conversation to itself; preserve that root
+/// after the later title notification.
 #[test]
 fn codex_capture_resolves_each_notifying_thread_to_the_root() {
     let dir = scratch("codex_threads");
@@ -1303,9 +1292,9 @@ fn harness_home_prefers_the_tool_var_then_home() {
     assert_eq!(harness_home(&[], &Codex), None);
 }
 
-/// With only `HOME` in the launch environment, notify routing reads
-/// `<home>/.codex/config.toml`: an unchainable route there leaves the launch
-/// with the embedded override alone.
+/// With only `HOME` in the launch environment, read notify routing from
+/// `<home>/.codex/config.toml`. For an unchainable route, include only the embedded
+/// override.
 #[test]
 fn home_only_launch_env_targets_the_clients_dot_codex() {
     let dir = scratch("home_resolve");
@@ -1366,8 +1355,8 @@ fn stale_inherited_notify_chain_is_never_executed() {
     let record = dir.join("stale-record");
     write_executable(&stale, &format!("touch '{}'", record.display()));
 
-    // The stub invokes the injected notify script the way codex would,
-    // naming the fake binary for the script's validation step.
+    // Invoke the injected notifier from the stub as from codex, with the fake binary set
+    // for validation.
     let payload = format!(r#"{{"type":"agent-turn-complete","thread-id":"{CAP_ID}"}}"#);
     let fake = install_fake_fleetcom(&bin);
     // The notify script sits beside the capture file, in a namespace
@@ -1412,8 +1401,7 @@ fn stale_inherited_notify_chain_is_never_executed() {
     );
 }
 
-/// Without a known ID, a managed entry carries the agent word alone: no
-/// `resume` field at all.
+/// Without a known ID, save only the managed agent word; omit `resume`.
 #[test]
 fn managed_save_without_any_id_omits_resume() {
     let dir = scratch("no_id");
@@ -1446,8 +1434,8 @@ fn managed_save_without_any_id_omits_resume() {
     );
 }
 
-/// A representable `notify` assignment runs through the injected notifier
-/// after the validation step.
+/// For a representable `notify` assignment, run the configured notifier after validation
+/// through the injected script.
 #[test]
 fn config_toml_notify_chains_through_the_injected_script() {
     use crate::harness::NOTIFY_CHAIN_ENV;
@@ -1465,9 +1453,8 @@ fn config_toml_notify_chains_through_the_injected_script() {
     )
     .unwrap();
 
-    // The stub records argv and the chain env, then invokes the notify
-    // script with notification JSON as the final argument, naming the fake
-    // binary for the script's validation step.
+    // Record argv and the chain environment in the stub, then invoke the notify script with
+    // notification JSON as the final argument. Use the fake binary for validation.
     let payload = format!(r#"{{"type":"agent-turn-complete","thread-id":"{CAP_ID}"}}"#);
     let fake = install_fake_fleetcom(&bin);
     install_script(
@@ -1522,10 +1509,9 @@ fn config_toml_notify_chains_through_the_injected_script() {
     );
 }
 
-/// An unrepresentable `notify` value disables capture injection: the launch
-/// carries the embedded override alone and the status line says why. A
-/// commented assignment defines no route, so injection returns and no notice
-/// is sent.
+/// For an unrepresentable `notify` value, disable capture injection, include only the
+/// embedded override, and report the reason. With the assignment commented out, inject
+/// capture again without a notice.
 #[test]
 fn unrepresentable_config_notify_suppresses_injection() {
     let dir = scratch("cfg_guard");
@@ -1663,13 +1649,12 @@ fn recovery_cadence_rewrites_on_capture_drift_and_skips_when_static() {
 
 // --- managed launches --------------------------------------------------
 
-/// Install a resident shell at `<dir>/resident-sh`: it runs its `-c` text as
-/// a child and stays the leader, as tcsh and csh do. A launch context naming
-/// it as `SHELL` proves the shell plays no part in a managed launch.
+/// Install a resident shell at `<dir>/resident-sh`: run its `-c` text as a child and retain
+/// the shell as leader, as with tcsh and csh. Set it as `SHELL` to verify that managed
+/// launches bypass the shell.
 fn install_resident_shell(dir: &Path) -> PathBuf {
     let shell = dir.join("resident-sh");
-    // `:` after the child keeps sh from exec'ing it as the script's last
-    // command.
+    // Append `:` to prevent sh from execing the child as the last command.
     write_executable(&shell, "[ \"$1\" = -c ] || exit 2\n/bin/sh -c \"$2\"\n:");
     shell
 }
@@ -1695,15 +1680,15 @@ fn settings_beside(s: &Supervisor) -> String {
         .to_string()
 }
 
-/// A managed claude is the task leader whatever `SHELL` names, so a capture
-/// its own hook stamps with `$$` passes the gate; the same payload stamped
-/// by any other process is refused and the pinned ID stands.
+/// Run managed claude as the task leader regardless of `SHELL`. Accept its capture stamped
+/// with `$$`; reject the same payload stamped with another PID and fall back to the pinned
+/// ID.
 #[test]
 fn managed_claude_accepts_its_own_capture_and_refuses_a_foreign_stamp() {
     let dir = scratch("managed_capture");
     let (bin, runtime) = (dir.join("bin"), dir.join("run"));
-    // The stub plays claude running its SessionStart hook after `/clear`:
-    // the capture names a drifted ID under the stub's own pid.
+    // Simulate Claude's SessionStart hook after `/clear`: write the changed ID and stamp
+    // the capture with the stub's PID.
     install_script(
         &bin,
         "claude",
@@ -1738,7 +1723,7 @@ fn managed_claude_accepts_its_own_capture_and_refuses_a_foreign_stamp() {
         "the stub's `$$` is the leader pid: no shell sat between"
     );
 
-    // Any other process's stamp over the same payload is refused.
+    // Reject the same payload when stamped with another process's PID.
     let cap = s.tasks[0].capture_file.clone().unwrap();
     let text = std::fs::read_to_string(&cap).unwrap();
     let (_, json) = text.split_once('\n').unwrap();
@@ -1750,9 +1735,8 @@ fn managed_claude_accepts_its_own_capture_and_refuses_a_foreign_stamp() {
     );
 }
 
-/// An unknown word, a word with no binary on `PATH`, and a full fleet each
-/// produce one status line and no task; the task ceiling is the one `Spawn`
-/// uses.
+/// Refuse unknown words, missing binaries, and launches beyond the task ceiling. Report one
+/// status and create no task in each case. Apply the same ceiling as for `Spawn`.
 #[test]
 fn managed_spawn_refuses_an_unknown_word_a_missing_binary_and_a_full_fleet() {
     let dir = scratch("managed_refusals");
@@ -1782,17 +1766,17 @@ fn managed_spawn_refuses_an_unknown_word_a_missing_binary_and_a_full_fleet() {
     assert_eq!(s.tasks.len(), 1, "the ceiling holds for both launch kinds");
 }
 
-/// A supervisor holding only `events`, so `notices` can filter them.
+/// Build a supervisor with only the supplied `events` for filtering through `notices`.
 fn sup_with(events: Vec<Event>) -> Supervisor {
     let mut s = Supervisor::new(24, 80, 0);
     s.events = events;
     s
 }
 
-/// A managed rerun relaunches through the harness: it resumes the captured
-/// ID ahead of the overlay, keeps id, tag, group, name and the program word,
-/// bumps the run, and finds the binary on `PATH` again, so a binary removed
-/// since the launch refuses the rerun and leaves the finished task alone.
+/// Rerun a managed task through its harness: place the captured ID before the overlay;
+/// preserve id, tag, group, name, and program word; increment the run number. Resolve the
+/// binary on `PATH` again. If removed since launch, refuse the rerun and preserve the
+/// finished task.
 #[test]
 fn managed_rerun_resumes_the_captured_id_from_the_binary_path_finds_now() {
     let dir = scratch("managed_rerun");
@@ -1841,7 +1825,7 @@ fn managed_rerun_resumes_the_captured_id_from_the_binary_path_finds_now() {
         "rerun must delete the displaced run's capture file; the ID was read first"
     );
 
-    // The binary is resolved again at each rerun: a removed one refuses.
+    // Resolve the binary again on rerun; refuse if it has been removed.
     wait_for_lifecycle(&mut s, id, |l| l == Lifecycle::Ok);
     std::fs::remove_file(bin.join("claude")).unwrap();
     s.apply(Command::Restart { id });
@@ -1849,8 +1833,8 @@ fn managed_rerun_resumes_the_captured_id_from_the_binary_path_finds_now() {
     assert_eq!(s.tasks[0].run, 1, "the finished task is preserved");
 }
 
-/// Without any known ID, a managed rerun starts a fresh conversation: omp
-/// pins nothing, so both runs carry the overlay alone.
+/// Without a known ID, start a fresh conversation on rerun. With no pin support in omp, use
+/// only the overlay on both runs.
 #[test]
 fn managed_rerun_without_an_id_starts_fresh() {
     let dir = scratch("managed_rerun_fresh");
@@ -1873,23 +1857,21 @@ fn managed_rerun_without_an_id_starts_fresh() {
     assert_eq!(s.tasks[0].run, 1);
 }
 
-/// A managed task saves as a managed entry carrying its current session ID,
-/// and that entry reloads as a managed task that resumes it: the argv leads
-/// with the selector and ID, the binary runs as a direct child even under a
-/// resident shell, and the group carries over.
+/// Save a managed entry with its current session ID, then reload it as managed. Place the
+/// selector and ID first in argv, execute the binary directly even with a resident `SHELL`,
+/// and preserve the group.
 #[test]
 fn managed_task_saves_as_a_managed_entry_and_reloads_managed() {
     let dir = scratch("managed_save");
     let (bin, runtime, config) = (dir.join("bin"), dir.join("run"), dir.join("config"));
-    // One record directory per stub: the reloaded tasks launch together, and
-    // a shared argv file would be truncated by one while the test reads the
-    // other's.
+    // Use one record directory per stub. Reload tasks together without a shared argv file
+    // that could be truncated during a read.
     let (claude_out, omp_out) = (dir.join("claude-out"), dir.join("omp-out"));
     for out in [&claude_out, &omp_out] {
         std::fs::create_dir_all(out).unwrap();
     }
-    // The claude stub plays its SessionStart hook: a capture stamped with
-    // its own `$$`, which passes the gate only if the stub is the leader.
+    // Simulate Claude's SessionStart hook in the stub. Stamp the capture with `$$`, which
+    // is accepted only when the stub is the task leader.
     install_script(
         &bin,
         "claude",
@@ -1971,10 +1953,9 @@ fn managed_task_saves_as_a_managed_entry_and_reloads_managed() {
     );
 }
 
-/// A recipe naming an agent this host lacks loads the rest, and the one
-/// summary line carries the reason: the client shows only a poll's last
-/// status, so a separate line queued before the summary would be lost.
-/// Recovery loads report the same way.
+/// Continue loading a recipe after a missing agent, including the failure reason in the
+/// final summary. Only the last status in a client poll is displayed, so a separate earlier
+/// diagnostic would be lost. Report recovery loads the same way.
 #[test]
 fn load_reports_a_missing_agent_and_loads_the_rest() {
     let dir = scratch("load_missing_agent");
@@ -2033,8 +2014,8 @@ fn load_reports_a_missing_agent_and_loads_the_rest() {
     assert_sole_notice(&mut s, "grok not found on PATH");
 }
 
-/// A managed codex carries the embedded override even when capture is off,
-/// reports why, and leads a rerun with `resume <id>` ahead of the overrides.
+/// Include the embedded override on managed codex launches even with capture disabled, and
+/// report the reason. On rerun, place `resume <id>` before the overrides.
 #[test]
 fn managed_codex_reports_the_capture_notice_and_leads_a_rerun_with_resume() {
     let dir = scratch("managed_codex");
