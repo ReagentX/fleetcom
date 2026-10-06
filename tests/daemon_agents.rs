@@ -1,8 +1,6 @@
-//! Agent discovery and managed launches across the socket: the daemon reports
-//! which registered agents the hello's `PATH` resolves, launches one by program
-//! word as a managed task, refuses a word it does not know, and resends the
-//! list on reconnect. A stub `claude` on a scratch `PATH` keeps every path
-//! inside the test's tree.
+//! Verify discovery and managed launches over the socket: list registered agents found on
+//! the hello's `PATH`, launch by program word, refuse unknown words, and resend the list on
+//! reconnect. Use a stub `claude` and scratch `PATH` to isolate all test paths.
 
 mod common;
 
@@ -17,8 +15,8 @@ use common::{
     read_frame, shake_hands_env, spawn_agent_frame, start_daemon_raw, stop_daemon, wait_until,
 };
 
-/// Scratch tree: `bin` holds the stub, `nobin` holds nothing, and the rest
-/// keep the daemon's runtime, config, and registry reads off the host.
+/// Scratch tree: the stub in `bin`, an empty `nobin`, and isolated runtime, config, and
+/// registry paths.
 struct Scratch {
     root: PathBuf,
 }
@@ -45,8 +43,8 @@ impl Scratch {
         self.root.join("claude-argv")
     }
 
-    /// Handshake environment whose `PATH` is exactly `<root>/<bin>`: a
-    /// managed launch needs no shell, so nothing else must resolve.
+    /// Handshake environment with exactly `<root>/<bin>` as `PATH`. Managed launches
+    /// require no shell lookup, so no other PATH entries are needed.
     fn hello_env(&self, bin: &str) -> Vec<(String, String)> {
         vec![
             ("PATH".into(), self.root.join(bin).display().to_string()),
@@ -83,13 +81,13 @@ fn hello(stream: &mut UnixStream, s: &Scratch, bin: &str) {
         .map(|(k, v)| (k.as_bytes(), v.as_bytes()))
         .collect();
     shake_hands_env(stream, &s.work().display().to_string(), &env);
-    // A stalled daemon fails the test instead of hanging it.
+    // Time out if the daemon stalls instead of hanging the test.
     stream
         .set_read_timeout(Some(Duration::from_secs(10)))
         .unwrap();
 }
 
-/// Install a `claude` stub that records its argv and exits.
+/// Install a `claude` stub to record argv and exit.
 fn install_claude_stub(s: &Scratch) {
     let path = s.root.join("bin").join("claude");
     std::fs::write(
@@ -103,8 +101,8 @@ fn install_claude_stub(s: &Scratch) {
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
 }
 
-/// Read control frames until one tagged `tag` satisfies `pred`, within 10 s.
-/// The reply shares the stream with periodic `tasks` snapshots.
+/// Read control frames for up to 10 s until a frame tagged `tag` satisfies `pred`. Skip
+/// periodic `tasks` snapshots on the same stream.
 fn next_frame(stream: &mut UnixStream, tag: &str, pred: impl Fn(&str) -> bool) -> String {
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
@@ -124,13 +122,13 @@ fn hello_discovers_agents_and_spawn_agent_launches_a_managed_task() {
     let (dir, mut daemon, mut stream) = start_daemon_raw("agents", |_| {});
     hello(&mut stream, &s, "bin");
 
-    // Discovery follows the handshake: only the stub is on this PATH.
+    // Discover agents after the handshake; only the stub is on this PATH.
     assert_eq!(
         next_frame(&mut stream, "agents", |_| true),
         r#"{"t":"agents","agents":["claude"]}"#
     );
 
-    // A registered word launches a managed task, acked like a direct spawn.
+    // Launch a registered word as a managed task and acknowledge it as for a direct spawn.
     stream
         .write_all(&spawn_agent_frame("claude", &s.work()))
         .unwrap();
@@ -153,7 +151,7 @@ fn hello_discovers_agents_and_spawn_agent_launches_a_managed_task() {
         "the launch must carry the harness argv: {argv:?}"
     );
 
-    // An unregistered word is refused with a notice and adds no task.
+    // Refuse an unregistered word with a notice and no new task.
     stream
         .write_all(&spawn_agent_frame("vim", &s.work()))
         .unwrap();
@@ -166,8 +164,8 @@ fn hello_discovers_agents_and_spawn_agent_launches_a_managed_task() {
         "a refused word must add no task: {tasks}"
     );
 
-    // A reconnect from a PATH without the stub resends the list empty, so
-    // the new client never inherits the previous one's menu.
+    // Reconnect with a PATH without the stub. Resend an empty list to clear the previous
+    // client's menu.
     drop(stream);
     let sock = dir.join("default.sock");
     let mut again = None;

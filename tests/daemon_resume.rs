@@ -1,7 +1,6 @@
-//! Agent resume crosses the managed launch, daemon framing, child
-//! instrumentation, session persistence, and reload. These tests exercise that
-//! complete path with stub `claude` and `codex` executables. An explicit
-//! handshake keeps every path inside the test's scratch tree.
+//! Verify agent resume through managed launch, daemon framing, child instrumentation,
+//! persistence, and reload. Use stub `claude` and `codex` executables and an explicit
+//! handshake to keep all paths inside the scratch tree.
 
 mod common;
 
@@ -24,12 +23,12 @@ const RUN_MARKER: &str = "-- run --";
 /// Fixed v7-shaped thread ID reported by the `codex` stub as its root.
 const CODEX_ID: &str = "019f5453-de22-7240-b2e5-0d32692aa6d9";
 
-/// Hidden title thread the `codex` stub reports after the root. Like the
-/// real one, it never gets a rollout.
+/// Hidden title thread reported by the `codex` stub after the root. Omit its rollout, as
+/// for real title threads.
 const CODEX_TITLE: &str = "019f5453-de9f-7e61-8c0d-1a2b3c4d5e6f";
 
-/// Root rollout header the `codex` stub saves before notifying: `session_id`
-/// is the thread's own ID and `source` is a string.
+/// Root rollout header saved by the `codex` stub before notifying: `session_id` equals the
+/// thread's ID, and `source` is a string.
 const CODEX_HEADER: &str = r#"{"timestamp":"2026-10-04T17:49:56.012Z","ordinal":0,"type":"session_meta","payload":{"id":"019f5453-de22-7240-b2e5-0d32692aa6d9","session_id":"019f5453-de22-7240-b2e5-0d32692aa6d9","source":"cli"}}"#;
 
 /// Notification JSON for a completed turn of `thread`.
@@ -87,7 +86,7 @@ impl Scratch {
         self.root.join(format!("{tool}-argv"))
     }
 
-    /// Marker the `codex` stub touches after both of its notifications.
+    /// Marker touched by the `codex` stub after both notifications.
     fn notified(&self) -> PathBuf {
         self.root.join("codex-notified")
     }
@@ -177,12 +176,10 @@ printf 'Resume this session with:\nclaude --resume %s\n' "$id""#,
     install_stub(s, "claude", &body);
 }
 
-/// Install a `codex` stub to record argv and report through the injected
-/// notify program alone, as the real TUI does. It saves the root's rollout
-/// header under `$CODEX_HOME`, notifies for the root, then notifies for the
-/// title thread, which has no rollout, and finally touches the `notified`
-/// marker. The notify program is read back from the `notify=["<path>"]`
-/// override in its own argv.
+/// Install a `codex` stub to record argv and report only through the injected notifier, as
+/// in the real TUI. Save the root rollout header under `$CODEX_HOME`; notify for the root,
+/// then the title thread without a rollout; finally, touch `notified`. Read the notifier
+/// path from the `notify=["<path>"]` argv override.
 fn install_codex_stub(s: &Scratch) {
     let body = format!(
         r#"printf '%s\n' '{marker}' "$@" >> '{rec}'
@@ -269,9 +266,9 @@ fn assert_daemon_namespaced(asset: &Path, daemon_pid: u32, what: &str, argv: &[S
     );
 }
 
-/// Save once and return the persisted recipe. Each caller first waits for its
-/// ID channel, and the daemon scrapes finished tasks before reading IDs. As a
-/// result, one save must already carry the resume ID.
+/// Save once and return the persisted recipe. Wait for the ID channel at each call site;
+/// scrape finished tasks in the daemon before reading IDs. Require the resume ID in that
+/// first save.
 fn save_once(stream: &mut UnixStream, recipe: &Path, name: &str) -> String {
     stream
         .write_all(&control_frame(&format!(
@@ -285,9 +282,9 @@ fn save_once(stream: &mut UnixStream, recipe: &Path, name: &str) -> String {
     std::fs::read_to_string(recipe).unwrap()
 }
 
-/// Every file in the daemon namespaces under `runtime`, as
-/// `(name, contents)` sorted by name. Assets live under
-/// `<runtime>/<pid>-<nonce>/`, so the runtime root itself holds no task files.
+/// Read every file in daemon namespaces under `runtime` as `(name, contents)`, sorted by
+/// name. Look under `<runtime>/<pid>-<nonce>/`; no task files are stored directly in the
+/// runtime root.
 fn namespace_files(runtime: &Path) -> Vec<(String, String)> {
     let mut files: Vec<(String, String)> = std::fs::read_dir(runtime)
         .into_iter()
@@ -314,14 +311,13 @@ fn capture_slot(runtime: &Path) -> Option<String> {
         .map(|(_, contents)| contents)
 }
 
-/// The managed entry a recipe writes for `agent` resuming `id`, as `to_json`
-/// pretty-prints it.
+/// Managed entry for `agent` resuming `id`, in the pretty-printed `to_json` format.
 fn managed_entry(agent: &str, id: &str) -> String {
     format!("{{\n        \"agent\": \"{agent}\",\n        \"resume\": \"{id}\"\n      }}")
 }
 
-/// A managed claude captures an ID without leaking its injected flags into
-/// the recipe, then reloads the same conversation.
+/// Capture a managed Claude ID, save without injected flags in the recipe, and reload the
+/// same conversation.
 #[test]
 fn claude_spawn_save_load_resumes_the_conversation() {
     let s = Scratch::new("claude");
@@ -374,9 +370,9 @@ fn claude_spawn_save_load_resumes_the_conversation() {
     stop_daemon(&mut daemon);
 }
 
-/// A Codex notification validated by the daemon's own binary persists the
-/// resume ID, the title thread's later notification leaves it intact, and
-/// loading that entry reapplies the notifier instrumentation.
+/// Persist the resume ID after validating a Codex notification through the daemon's binary.
+/// Preserve it after a later title notification and reapply notifier instrumentation on
+/// reload.
 #[test]
 fn codex_capture_file_drives_save_and_load_resumes() {
     let s = Scratch::new("codex");
@@ -403,10 +399,9 @@ fn codex_capture_file_drives_save_and_load_resumes() {
         "a bare spawn must receive the two overrides and nothing else"
     );
 
-    // The stub exits silently, so the notify script is the only id channel.
-    // Wait for both notifications: the root's must have written the bare
-    // UUID and the title thread's must have left it alone, with no temporary
-    // file beside it. A single save must then persist the resuming form.
+    // Exit the stub silently so the notify script is the only ID channel. Wait for both
+    // notifications, then require a bare root UUID and no temporary file. Preserve the root
+    // after the title notification and persist the resume ID on the first save.
     let ok = wait_until(Duration::from_secs(10), || s.notified().exists());
     assert!(ok, "the codex stub never finished notifying");
     let files = namespace_files(&s.runtime());
@@ -452,10 +447,9 @@ fn codex_capture_file_drives_save_and_load_resumes() {
     stop_daemon(&mut daemon);
 }
 
-/// The notify mode runs headless, before the terminal check and daemon
-/// autostart: without a tty it writes the bare root and exits 0, prints
-/// nothing, refuses the title thread with exit 1 and no write, and is a
-/// no-op without a capture path.
+/// Run notify mode without terminal setup or daemon autostart. With no TTY, write the bare
+/// root and exit 0 without output. Refuse the title thread with exit 1 and no write.
+/// Without a capture path, write nothing.
 #[test]
 fn codex_notify_mode_runs_headless() {
     let s = Scratch::new("notify_mode");
@@ -500,8 +494,7 @@ fn codex_notify_mode_runs_headless() {
     assert_eq!(names, ["task-1-0.json"], "no temporary file may remain");
 }
 
-/// A persisted managed entry survives daemon replacement and targets the same
-/// ID afterward.
+/// Persist a managed entry, replace the daemon, and resume the same ID afterward.
 #[test]
 fn saved_recipe_resumes_across_a_daemon_restart() {
     let s = Scratch::new("restart");
