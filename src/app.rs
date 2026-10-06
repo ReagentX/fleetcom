@@ -27,7 +27,7 @@ use crossterm::{
 use crate::{
     editbuf::EditBuffer,
     format::collation_key,
-    path,
+    harness, path,
     protocol::{
         ClipboardKind, Command, Event, Key, Lifecycle, Mods, MouseBtn, MouseKind, RecoveryEntry,
         ScreenView, ScrollAction, TaskView, UNASSIGNED,
@@ -139,6 +139,14 @@ pub enum SessionPage {
     Recovery,
 }
 
+/// Active page of the spawn prompt. `Command` runs typed text literally;
+/// `Agent` launches a picked agent as a managed task.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum SpawnPage {
+    Command,
+    Agent,
+}
+
 /// What Enter does with a picker row.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum DirKind {
@@ -196,8 +204,8 @@ pub struct App {
     /// Task snapshot received from `Event::Tasks`.
     pub views: Vec<TaskView>,
     /// Agents installed on the core's launch `PATH`, from the latest
-    /// `Event::Agents`; program words in registry order. Nothing renders it
-    /// until the spawn prompt's Agent page lands.
+    /// `Event::Agents`; program words in registry order. The spawn prompt's
+    /// Agent page lists it and exists only while it is non-empty.
     pub agents: Vec<String>,
     /// The watched task's screen (attach/peek), from `Event::Screen`.
     focused_screen: Option<ScreenView>,
@@ -224,6 +232,18 @@ pub struct App {
     /// Group assigned to the next spawn. Custom mode snapshots the selected
     /// task's group; State and Dir modes leave the spawn unassigned.
     pub spawn_group: Option<String>,
+    /// The displayed spawn-prompt page; opening the prompt resets it to
+    /// `Command`. Tab toggles it only while `agents` is non-empty.
+    pub spawn_page: SpawnPage,
+    /// The Agent page's filter: its own buffer, so typed command text is
+    /// never consumed as a filter and both survive a page flip. Empty at
+    /// every open, so Tab always shows the full list first.
+    pub agent_input: EditBuffer,
+    /// Program words of `agents` matching `agent_input`, in registry order.
+    pub agent_candidates: Vec<String>,
+    /// Highlighted row of `agent_candidates`; reset to the first match on
+    /// every filter edit.
+    pub agent_sel: usize,
     /// Id of the attached task, if any: by id (not index) so it survives the
     /// task list changing underneath it.
     pub focused_id: Option<u64>,
@@ -465,6 +485,10 @@ impl App {
             input: EditBuffer::default(),
             spawn_cwd: invocation_dir.clone(),
             spawn_group: None,
+            spawn_page: SpawnPage::Command,
+            agent_input: EditBuffer::default(),
+            agent_candidates: Vec::new(),
+            agent_sel: 0,
             focused_id: None,
             return_to: None,
             terminal_focused: true,
@@ -756,7 +780,19 @@ impl App {
                 // The handshake is handled before the transport is created.
                 Event::HelloOk => {}
                 // Each context install resends the whole list; replace, never merge.
-                Event::Agents(a) => self.agents = a,
+                Event::Agents(a) => {
+                    self.agents = a;
+                    // A reconnect can replace the list under an open prompt.
+                    // Refilter so the rows match, and leave an Agent page that
+                    // Tab could no longer reach: the loader's emptied-recovery
+                    // rule.
+                    if self.mode == Mode::Spawn {
+                        self.refresh_agent_candidates();
+                        if self.agents.is_empty() {
+                            self.spawn_page = SpawnPage::Command;
+                        }
+                    }
+                }
                 Event::Tasks(v) => {
                     self.views = v;
                     // The acknowledgement precedes its row. Select only after
@@ -1039,13 +1075,40 @@ impl App {
             .collect()
     }
 
-    /// Lock in `dir` as the spawn target and move to command entry.
+    /// Lock in `dir` as the spawn target and move to command entry, with the
+    /// Agent page's filter cleared so Tab shows the full list.
     fn open_spawn_prompt(&mut self, dir: PathBuf) {
         self.spawn_cwd = dir;
         self.spawn_group = self.inherited_group();
         self.input.clear();
         self.dir_candidates.clear();
+        self.spawn_page = SpawnPage::Command;
+        self.agent_input.clear();
+        self.refresh_agent_candidates();
         self.mode = Mode::Spawn;
+    }
+
+    /// Rebuild the Agent page as the installed agents whose program word
+    /// contains the lowercased filter, in registry order, and select the
+    /// first. Order never follows match position: `o` lists codex, grok, omp
+    /// as the registry does.
+    fn refresh_agent_candidates(&mut self) {
+        let needle = self.agent_input.to_lowercase();
+        self.agent_candidates = self
+            .agents
+            .iter()
+            .filter(|a| a.to_lowercase().contains(&needle))
+            .cloned()
+            .collect();
+        self.agent_sel = 0;
+    }
+
+    /// Registered agents absent from `agents`: what the no-match text names
+    /// so a filter for an uninstalled agent explains itself.
+    pub fn missing_agents(&self) -> Vec<&'static str> {
+        harness::program_words()
+            .filter(|w| !self.agents.iter().any(|a| a == w))
+            .collect()
     }
 
     /// Navigate into `dir`: retype the input as its path (trailing slash) so
@@ -1478,11 +1541,53 @@ impl App {
     }
 
     fn on_key_spawn(&mut self, k: KeyEvent) {
-        self.on_key_textinput(k, |app, cmd| {
-            if !cmd.is_empty() {
-                app.spawn_task(cmd);
+        match k.code {
+            // Pure page toggle, gated as the loader gates its recovery page.
+            // Without agents Tab falls through to the editor, which ignores it.
+            KeyCode::Tab | KeyCode::BackTab if !self.agents.is_empty() => {
+                self.spawn_page = match self.spawn_page {
+                    SpawnPage::Command => SpawnPage::Agent,
+                    SpawnPage::Agent => SpawnPage::Command,
+                };
             }
-        });
+            _ => match self.spawn_page {
+                SpawnPage::Command => self.on_key_textinput(k, |app, cmd| {
+                    if !cmd.is_empty() {
+                        app.spawn_task(cmd);
+                    }
+                }),
+                SpawnPage::Agent => self.on_key_agent(k),
+            },
+        }
+    }
+
+    /// Agent-page keys: filter, pick, and launch the highlighted agent as a
+    /// managed task in the prompt's directory and group. Enter on no match
+    /// leaves the prompt open.
+    fn on_key_agent(&mut self, k: KeyEvent) {
+        match k.code {
+            KeyCode::Esc => self.close_prompt(),
+            KeyCode::Up => self.agent_sel = self.agent_sel.saturating_sub(1),
+            KeyCode::Down => {
+                self.agent_sel = step_down(self.agent_sel, self.agent_candidates.len())
+            }
+            KeyCode::Enter => {
+                if let Some(agent) = self.agent_candidates.get(self.agent_sel).cloned() {
+                    self.transport.send(Command::SpawnAgent {
+                        agent,
+                        cwd: self.spawn_cwd.clone(),
+                        group: self.spawn_group.clone(),
+                    });
+                    self.close_prompt();
+                }
+            }
+            // Caret motion does not affect the matches.
+            _ => {
+                if on_key_edit(&mut self.agent_input, k) {
+                    self.refresh_agent_candidates();
+                }
+            }
+        }
     }
 
     fn on_key_peek(&mut self, k: KeyEvent) {
@@ -1582,6 +1687,10 @@ impl App {
                         bytes: s.as_bytes().to_vec(),
                     });
                 }
+            }
+            Mode::Spawn if self.spawn_page == SpawnPage::Agent => {
+                paste_into(&mut self.agent_input, s);
+                self.refresh_agent_candidates();
             }
             Mode::Spawn | Mode::SaveSession | Mode::Rename(_) => {
                 paste_into(&mut self.input, s);

@@ -196,14 +196,18 @@ pub fn registered(program: &str) -> Option<&'static dyn Harness> {
         .find(|h| h.shape().0 == program)
 }
 
+/// Program words of every registered agent, in registry order. The launcher
+/// subtracts `installed` from this to name the agents a host lacks.
+pub fn program_words() -> impl Iterator<Item = &'static str> {
+    AGENTS.iter().map(|a| a.harness.shape().0)
+}
+
 /// Program words of the registered agents that [`find_on_path`] resolves on
 /// `path`, in registry order: the launcher's menu. Each word is searched
 /// independently, so the result never depends on `path` order. An empty
 /// `path` yields an empty list.
 pub fn installed(path: &OsStr) -> Vec<&'static str> {
-    AGENTS
-        .iter()
-        .map(|a| a.harness.shape().0)
+    program_words()
         .filter(|program| find_on_path(program, path).is_some())
         .collect()
 }

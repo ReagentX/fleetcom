@@ -17,7 +17,7 @@ use crossterm::{
 use unicode_width::UnicodeWidthStr;
 
 use crate::{
-    app::{App, DirKind, GroupMode, Mode, Row, SessionPage, Target},
+    app::{App, DirKind, GroupMode, Mode, Row, SessionPage, SpawnPage, Target},
     editbuf::EditBuffer,
     format::{pad, rel_time, truncate},
     path,
@@ -55,6 +55,10 @@ pub fn render(out: &mut impl Write, app: &mut App) -> io::Result<bool> {
         Mode::LoadSession => {
             render_dashboard(&mut buf, app)?;
             render_session_picker(&mut buf, app)?;
+        }
+        Mode::Spawn if app.spawn_page == SpawnPage::Agent => {
+            render_dashboard(&mut buf, app)?;
+            render_agent_page(&mut buf, app)?;
         }
         Mode::Disconnected => render_disconnected(&mut buf, app)?,
         Mode::Dashboard | Mode::Spawn | Mode::SaveSession | Mode::Rename(_) => {
@@ -209,12 +213,12 @@ fn render_dashboard(out: &mut impl Write, app: &App) -> io::Result<()> {
     }
 
     // Keep common actions visible and route the remaining bindings through `?`.
-    dim(
-        out,
-        rows.saturating_sub(1),
-        &dashboard_hint(app.chord_target()),
-        cols,
-    )?;
+    // The spawn prompt owns its footer: that is where it advertises Tab.
+    let footer = match app.mode {
+        Mode::Spawn => spawn_page_hint(app.agents.len()),
+        _ => dashboard_hint(app.chord_target()),
+    };
+    dim(out, rows.saturating_sub(1), &footer, cols)?;
 
     match &cmd {
         Some((_, cx)) => queue!(out, MoveTo(*cx, cmd_y), Show)?,
@@ -238,11 +242,23 @@ fn transient_line(notice: Option<&str>, status: Option<&str>) -> Option<String> 
     notice.or(status).map(|s| format!("  {s}"))
 }
 
+/// Build the spawn prompt's Command-page footer. Include the Agent page only
+/// when the core found agents, as the loader includes recovery.
+fn spawn_page_hint(agents: usize) -> String {
+    if agents > 0 {
+        format!("  enter run · tab agents ({agents}) · esc")
+    } else {
+        "  enter run · esc".to_string()
+    }
+}
+
 /// The editable bottom line for the text-input modes (the rendered line and
 /// the caret's display column), or `None` when the command line should show a
 /// hint/status instead.
 fn cmdline(app: &App) -> Option<(String, u16)> {
     let prefix = match app.mode {
+        // The Agent page paints its own field in its panel.
+        Mode::Spawn if app.spawn_page == SpawnPage::Agent => return None,
         Mode::Spawn => spawn_prefix(app),
         Mode::SaveSession => "  save session as: ".to_string(),
         Mode::Rename(_) => "  rename task: ".to_string(),
@@ -841,6 +857,42 @@ fn render_find(out: &mut impl Write, app: &App) -> io::Result<()> {
     )
 }
 
+/// The Agent page's placeholder when the filter matches nothing. Name the
+/// registered agents this host lacks, so a filter for one of them explains
+/// itself; `missing` is in registry order.
+fn agent_empty_text(missing: &[&str]) -> String {
+    if missing.is_empty() {
+        "    (no installed agent matches)".to_string()
+    } else {
+        format!(
+            "    (no installed agent matches · {} not found on this host)",
+            missing.join(", ")
+        )
+    }
+}
+
+/// The spawn prompt's Agent page: a bottom panel with the same `❯` destination
+/// prefix as the Command page, the filter field, and the matching installed
+/// agents in registry order with `agent_sel` highlighted.
+fn render_agent_page(out: &mut impl Write, app: &App) -> io::Result<()> {
+    let prefix = format!("{}agent: ", spawn_prefix(app));
+    let (line, cx) = caret_line(&prefix, &app.agent_input, app.cols as usize);
+    let empty = agent_empty_text(&app.missing_agents());
+    render_panel(
+        out,
+        app,
+        &Panel {
+            header: format!("{line}   "),
+            labels: &app.agent_candidates,
+            sel: app.agent_sel,
+            max_rows: 8,
+            hint: "↑↓ pick · enter launch · tab command · esc".to_string(),
+            empty: Some(&empty),
+            cursor: Some(cx),
+        },
+    )
+}
+
 /// Format a recovery row with its variable-length label last for clipping.
 fn recovery_row(e: &RecoveryEntry) -> String {
     let unit = if e.tasks == 1 { "task" } else { "tasks" };
@@ -1200,6 +1252,23 @@ mod tests {
         assert_eq!(
             saved_page_hint(3),
             "↑↓ pick · enter load · tab recovery (3) · esc"
+        );
+    }
+
+    /// Advertise the Agent page in the spawn footer only when agents exist.
+    #[test]
+    fn spawn_page_hint_shows_the_count_only_when_nonzero() {
+        assert_eq!(spawn_page_hint(0), "  enter run · esc");
+        assert_eq!(spawn_page_hint(3), "  enter run · tab agents (3) · esc");
+    }
+
+    /// Name the missing agents only when some are missing.
+    #[test]
+    fn agent_empty_text_names_the_missing_agents() {
+        assert_eq!(agent_empty_text(&[]), "    (no installed agent matches)");
+        assert_eq!(
+            agent_empty_text(&["grok", "omp"]),
+            "    (no installed agent matches · grok, omp not found on this host)"
         );
     }
 

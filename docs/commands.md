@@ -24,8 +24,8 @@ Choose the operating mode with launch arguments. Use keys to control the dashboa
 | `Tab` / `Shift-Tab` | Jump the selection to the next / previous section |
 | `Enter` | Attach to the selected task |
 | `Space` | Peek at the selected task |
-| `n` | New command in the invocation directory |
-| `@` | New command in a directory you pick |
+| `n` | New command or agent in the invocation directory (through the [spawn prompt](#the-n-spawn-prompt)) |
+| `@` | New command or agent in a directory you pick |
 | `/` | Jump the selection to a task by name, command, or group (through the [find palette](#the--find-palette)) |
 | `s` | Cycle grouping: by state / by directory / by custom group |
 | `m` | Tag the selected task "in use" (toggles) |
@@ -161,6 +161,12 @@ Press `R` to rename the selected task, starting with its current name. Press `En
 For a named task, the name is displayed in place of the command in the dashboard row and peek title. In the attached status bar, both are displayed as `name · command`.
 
 The daemon removes control characters and surrounding whitespace from display names, then limits them to 64 characters. An empty result means no name. Unlike groups, `Unassigned` is a legal display name; the label is reserved only in the [group picker](#the-g-group-picker).
+
+## The `n` spawn prompt
+
+Press `n` to run something in the invocation directory, or pick the directory first with `@`. The prompt has two pages. The Command page runs the typed text exactly as typed, through your shell. Press `Tab` (or `Shift-Tab`) for the Agent page: the supported agent CLIs found on the daemon's `PATH`, in a fixed order. `Enter` launches the highlighted one as a managed task: `fleetcom` builds the launch itself and owns the agent's session, see [agent session resume](agent-resume.md). Typing filters the list by a case-insensitive substring of the program name, so `x` finds `codex`; the first match is highlighted. Use `↑`/`↓` to move the highlight, `Enter` to launch in the prompt's directory and group, or `Esc` to cancel. When nothing matches, the prompt says so and names any supported agents not found on this host.
+
+Each page keeps its own text, and the filter is empty every time the prompt opens, so `Tab` always shows the full list first. With no agents found, `Tab` is unbound and omitted from the hint.
 
 ## The `@` directory picker
 
