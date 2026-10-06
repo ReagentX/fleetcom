@@ -96,16 +96,18 @@ pub struct Task {
     pub group: Option<String>,
     /// Custom display name; `None` means unnamed.
     pub name: Option<String>,
-    /// Agent harness selected for session capture.
+    /// Agent harness of a managed task: the channel its session ID and
+    /// blocked status are read through. `None` for every literal task, so no
+    /// harness channel is ever read for one.
     pub harness: Option<&'static dyn crate::harness::Harness>,
     /// Harness home resolved from this run's launch environment.
     pub harness_home: Option<PathBuf>,
-    /// Display-only summary adapter selected from the requested command,
-    /// independently of session-capture instrumentation.
+    /// Display-only summary adapter selected from the command's first word,
+    /// for literal and managed tasks alike.
     pub summary_adapter: Option<&'static dyn crate::preview::SummaryAdapter>,
     /// Run number used to give each rerun a distinct capture path.
     pub run: u32,
-    /// Session ID injected or recognized at spawn. Capture data or a live
+    /// Session ID pinned or resumed at spawn. Capture data or a live
     /// registry record can supersede it.
     pub resume_id: Option<String>,
     /// Capture path allocated for this task run.
@@ -213,8 +215,7 @@ fn wait_code(status: &rustix::process::WaitIdStatus) -> i32 {
 /// becomes a process.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Exec {
-    /// The text as typed (plus any detected-literal suffix), run as
-    /// `$SHELL -c <text>`.
+    /// The text as typed, run as `$SHELL -c <text>`.
     Literal(String),
     /// `binary` with `args`, no shell between. The task leader is the agent
     /// process in every login shell: claude's capture gate and registry

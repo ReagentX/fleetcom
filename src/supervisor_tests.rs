@@ -65,29 +65,16 @@ fn session_config_groups_by_dir_in_spawn_order() {
     spawn(&mut s, "c", here());
 
     let cfg = s.session_config();
+    let literal = |cmd: &str| SessionEntry {
+        kind: EntryKind::Literal(cmd.into()),
+        group: None,
+        name: None,
+    };
     assert_eq!(
         cfg[&path::abbreviate(&here())],
-        vec![
-            SessionEntry {
-                cmd: "a".into(),
-                group: None,
-                name: None,
-            },
-            SessionEntry {
-                cmd: "c".into(),
-                group: None,
-                name: None,
-            },
-        ]
+        vec![literal("a"), literal("c")]
     );
-    assert_eq!(
-        cfg["/tmp"],
-        vec![SessionEntry {
-            cmd: "b".into(),
-            group: None,
-            name: None,
-        }]
-    );
+    assert_eq!(cfg["/tmp"], vec![literal("b")]);
 }
 
 /// `tick` emits exactly a `Tasks` snapshot while nothing is watched, and
@@ -2398,7 +2385,7 @@ fn list_sessions_includes_recovery_snapshots_newest_first() {
 
     let rec = config.join("sessions").join("recovery");
     let entry = |cmd: &str| SessionEntry {
-        cmd: cmd.into(),
+        kind: EntryKind::Literal(cmd.into()),
         group: None,
         name: None,
     };
@@ -2457,12 +2444,12 @@ fn load_recovery_materializes_the_fleet_and_notices() {
         dir.to_string_lossy().into_owned(),
         vec![
             SessionEntry {
-                cmd: "sleep 30".into(),
+                kind: EntryKind::Literal("sleep 30".into()),
                 group: Some("api".into()),
                 name: None,
             },
             SessionEntry {
-                cmd: "sleep 31".into(),
+                kind: EntryKind::Literal("sleep 31".into()),
                 group: None,
                 name: Some("web".into()),
             },

@@ -167,9 +167,9 @@ Full command lines are persisted in recipes, including any embedded secrets. A t
 
 The client environment is not persisted. Each client's environment and working directory are sent during the connection handshake and retained in daemon memory. Only directories, commands, group assignments, and display names are stored in session and recovery files.
 
-### Captured IDs in shell commands
+### Captured IDs
 
-To resume an agent conversation, insert its captured ID into a command run through `$SHELL -c`. Before shell insertion, accept only lowercase hexadecimal in the `8-4-4-4-12` UUID format. Validate capture payloads, Codex rollout headers, live session records, and the final command construction. Never read session IDs from terminal output; instrument only a bare program word or its canonical resume form. See [Agent session resume](agent-resume.md#validation-boundary) for both boundaries.
+A captured ID enters an agent's argv as one element and a session file as its `resume` field; it is never inserted into a shell command. Before either, accept only lowercase hexadecimal in the `8-4-4-4-12` UUID format. Validate capture payloads, Codex rollout headers, live session records, and session files on load. Never read session IDs from terminal output, and capture only for agents launched from the Agent page: a typed command runs as typed and gets no channel. See [Agent session resume](agent-resume.md#validation-boundary).
 
 ### Copying text through the terminal
 

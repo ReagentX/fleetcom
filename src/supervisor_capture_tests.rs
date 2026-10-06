@@ -126,6 +126,64 @@ fn acknowledged(events: &[Event]) -> bool {
     events.iter().any(|e| matches!(e, Event::Spawned { .. }))
 }
 
+/// An unlabelled managed entry.
+fn managed(agent: &str, resume: Option<&str>) -> SessionEntry {
+    SessionEntry {
+        kind: EntryKind::Managed {
+            agent: agent.into(),
+            resume: resume.map(String::from),
+        },
+        group: None,
+        name: None,
+    }
+}
+
+/// An unlabelled literal entry.
+fn literal(cmd: &str) -> SessionEntry {
+    SessionEntry {
+        kind: EntryKind::Literal(cmd.into()),
+        group: None,
+        name: None,
+    }
+}
+
+/// Save `entries` for `dir` as the named recipe through the real serializer,
+/// then load it: the only way a task starts with a chosen resume target.
+fn load_recipe(
+    s: &mut Supervisor,
+    config: &Path,
+    name: &str,
+    dir: &Path,
+    entries: Vec<SessionEntry>,
+) {
+    let cfg = SessionConfig::from([(dir.to_string_lossy().into_owned(), entries)]);
+    session::save_in(&config.join("sessions"), name, &cfg).unwrap();
+    s.apply(Command::LoadSession { name: name.into() });
+}
+
+/// The entries of the sole directory in the saved recipe `name`.
+fn saved_entries(s: &mut Supervisor, config: &Path, name: &str) -> Vec<SessionEntry> {
+    save_and_read(s, config, name);
+    session::load_in(&config.join("sessions"), name)
+        .unwrap()
+        .into_values()
+        .flatten()
+        .collect()
+}
+
+/// The resume target the sole task saves under `name`, which must be managed.
+fn saved_resume(s: &mut Supervisor, config: &Path, name: &str) -> Option<String> {
+    match saved_entries(s, config, name).as_slice() {
+        [
+            SessionEntry {
+                kind: EntryKind::Managed { resume, .. },
+                ..
+            },
+        ] => resume.clone(),
+        other => panic!("expected one managed entry, got {other:?}"),
+    }
+}
+
 /// The FNV-1a discriminator is stable and separates distinct config roots.
 #[test]
 fn fnv_discriminator_is_stable_and_distinguishes_roots() {
@@ -136,15 +194,15 @@ fn fnv_discriminator_is_stable_and_distinguishes_roots() {
     assert_ne!(fnv1a_hex(b"/cfg/one"), fnv1a_hex(b"/cfg/two"));
 }
 
-/// A `claude` spawn receives a pinned ID, settings overlay, and capture
-/// environment without changing the stored command.
+/// A managed `claude` receives a pinned ID, settings overlay, and capture
+/// environment; its display text stays the program word.
 #[test]
 fn spawn_claude_pins_an_id_and_layers_settings() {
     let dir = scratch("cap_claude");
     let (bin, runtime) = (dir.join("bin"), dir.join("run"));
     install_stub(&bin, "claude", &dir);
     let mut s = sup_ctx(agent_ctx(&bin, &runtime, dir.to_path_buf()));
-    spawn(&mut s, "claude", dir.to_path_buf());
+    s.spawn_agent("claude", dir.to_path_buf(), None);
 
     let argv = wait_argv(&mut s, &dir.join("argv"));
     let si = argv
@@ -228,86 +286,89 @@ fn spawn_non_agent_command_is_not_instrumented() {
     assert!(!runtime.exists());
 }
 
-/// A resuming `claude` launch retains its target ID and adds only the
-/// capture overlay.
+/// A typed `claude` is a literal task: the shell gets exactly that text, no
+/// harness channel is attached, and the recipe stores the text. A
+/// capture-shaped file at the path a managed task of the same id would use
+/// and a matching registry record change nothing: nothing reads them.
 #[test]
-fn spawn_resuming_claude_injects_only_the_capture_channel() {
-    let dir = scratch("cap_resume");
-    let (bin, runtime) = (dir.join("bin"), dir.join("run"));
-    install_stub(&bin, "claude", &dir);
-    let mut s = sup_ctx(agent_ctx(&bin, &runtime, dir.to_path_buf()));
-    spawn(
-        &mut s,
-        format!("claude --resume {CAP_ID}"),
+fn typed_agent_word_is_literal_runs_verbatim_and_saves_as_text() {
+    let dir = scratch("literal_claude");
+    let (bin, runtime, config) = (dir.join("bin"), dir.join("run"), dir.join("config"));
+    let claude_home = dir.join("claude_home");
+    // The stub publishes its argument count and the capture env atomically.
+    install_script(
+        &bin,
+        "claude",
+        &format!(
+            "printf '%s\\n' \"$#\" \"$FLEETCOM_CAPTURE_FILE\" > '{out}/argv.'$$'.tmp' \
+             && mv '{out}/argv.'$$'.tmp' '{out}/argv'",
+            out = dir.display()
+        ),
+    );
+    let mut s = sup_ctx(agent_ctx_plus(
+        &bin,
+        &runtime,
         dir.to_path_buf(),
-    );
-
-    let argv = wait_argv(&mut s, &dir.join("argv"));
-    assert!(
-        !argv.iter().any(|a| a == "--session-id"),
-        "a resuming launch must never pin a second id; argv: {argv:?}"
-    );
-    assert!(
-        argv.iter().any(|a| a == "--settings"),
-        "the settings overlay must still ride along; argv: {argv:?}"
+        &[
+            ("FLEETCOM_CONFIG_DIR", &config),
+            ("CLAUDE_CONFIG_DIR", &claude_home),
+        ],
+    ));
+    spawn(&mut s, "claude", dir.to_path_buf());
+    assert_eq!(
+        wait_argv(&mut s, &dir.join("argv")),
+        ["0", ""],
+        "a literal launch adds no argument and names no capture file"
     );
     let t = &s.tasks[0];
-    assert_eq!(t.command, format!("claude --resume {CAP_ID}"));
-    assert_eq!(t.resume_id.as_deref(), Some(CAP_ID));
-}
+    assert!(!t.managed);
+    assert!(t.harness.is_none(), "a literal task has no harness channel");
+    assert!(t.capture_file.is_none());
+    assert!(t.resume_id.is_none());
+    assert_eq!(t.command, "claude");
+    assert!(
+        t.summary_adapter.is_some(),
+        "the screen-only summary adapter still applies"
+    );
+    assert!(
+        s.capture.is_empty(),
+        "no assets are installed for a literal"
+    );
+    assert!(!runtime.exists());
+    let pid = t.pid().expect("a spawned task has a pid");
 
-/// Rerun prefers the capture-file ID, stores the resulting resume command,
-/// and deletes the displaced run's capture after deriving the resume command.
-#[test]
-fn rerun_resumes_the_captured_conversation() {
-    use crate::protocol::Lifecycle;
-    let dir = scratch("cap_rerun");
-    let (bin, runtime) = (dir.join("bin"), dir.join("run"));
-    install_stub(&bin, "claude", &dir);
-    let mut s = sup_ctx(agent_ctx(&bin, &runtime, dir.to_path_buf()));
-    spawn(&mut s, "claude", dir.to_path_buf());
-    let _ = wait_argv(&mut s, &dir.join("argv"));
-    let id = s.tasks[0].id;
-    wait_for_lifecycle(&mut s, id, |l| l == Lifecycle::Ok);
-
-    // The capture payload reports a different ID from the pinned one.
-    let cap = s.tasks[0].capture_file.clone().expect("capture file set");
+    // A managed sibling installs the namespace; a capture-shaped file for
+    // task 1 lands there, stamped with task 1's own leader pid, and a
+    // registry record is keyed to task 1 as well.
+    s.spawn_agent("claude", dir.to_path_buf(), None);
+    let ns = s.tasks[1]
+        .capture_file
+        .as_deref()
+        .and_then(Path::parent)
+        .expect("a managed task has a namespaced capture file")
+        .to_path_buf();
     std::fs::write(
-        &cap,
-        stamped(
-            &s.tasks[0],
-            &format!(
-                r#"{{"session_id":"{CAP_OTHER}","hook_event_name":"SessionStart","source":"clear"}}"#
-            ),
-        ),
+        ns.join("task-1-0.json"),
+        stamped(&s.tasks[0], &format!(r#"{{"session_id":"{CAP_ID}"}}"#)),
     )
     .unwrap();
-    std::fs::remove_file(dir.join("argv")).unwrap();
-
-    s.apply(Command::Restart { id });
-    let argv = wait_argv(&mut s, &dir.join("argv"));
-    assert_eq!(
-        s.tasks[0].command,
-        format!("claude --resume '{CAP_OTHER}'"),
-        "the stored command must become the resuming one"
+    install_status_record(
+        &claude_home,
+        pid,
+        &dir,
+        r#""status":"waiting","waitingFor":"permission prompt""#,
     );
-    let ri = argv
-        .iter()
-        .position(|a| a == "--resume")
-        .expect("the respawn must resume");
-    assert_eq!(argv[ri + 1], CAP_OTHER);
+    assert_eq!(current_resume_id(&s.tasks[0]), None);
+    let entries = saved_entries(&mut s, &config, "typed");
+    assert_eq!(entries[0], literal("claude"));
+    assert!(matches!(
+        &entries[1].kind,
+        EntryKind::Managed { agent, resume: Some(_) } if agent == "claude"
+    ));
+    let text = std::fs::read_to_string(config.join("sessions/typed.json")).unwrap();
     assert!(
-        !argv.iter().any(|a| a == "--session-id"),
-        "re-detection classifies the respawn as resuming: no second id"
-    );
-    assert!(
-        reap_until(&mut s, Duration::from_secs(5), |s| s.graveyard.is_empty()),
-        "the displaced run was never collected"
-    );
-    // The resume command retains the ID after the source capture is deleted.
-    assert!(
-        !cap.exists(),
-        "rerun must delete the displaced run's capture file"
+        !text.contains(CAP_ID),
+        "the capture-shaped file must be unreachable: {text}"
     );
 }
 
@@ -324,7 +385,7 @@ fn rerun_cannot_read_the_old_runs_stale_capture() {
         dir.to_path_buf(),
         &[("FLEETCOM_CONFIG_DIR", &config)],
     ));
-    spawn(&mut s, "claude", dir.to_path_buf());
+    s.spawn_agent("claude", dir.to_path_buf(), None);
     let id = s.tasks[0].id;
     // The old run's final capture becomes the new run's launch ID.
     let old_cap = s.tasks[0].capture_file.clone().expect("capture file set");
@@ -340,7 +401,7 @@ fn rerun_cannot_read_the_old_runs_stale_capture() {
     s.apply(Command::Restart { id });
     let new_cap = s.tasks[0].capture_file.clone().expect("capture file set");
     assert_ne!(new_cap, old_cap, "the fresh run needs its own capture file");
-    assert_eq!(s.tasks[0].command, format!("claude --resume '{CAP_ID}'"));
+    assert_eq!(s.tasks[0].resume_id.as_deref(), Some(CAP_ID));
     assert!(
         !old_cap.exists(),
         "rerun must delete the displaced run's capture file"
@@ -355,14 +416,10 @@ fn rerun_cannot_read_the_old_runs_stale_capture() {
         ),
     );
     std::fs::write(&old_cap, &stale).unwrap();
-    let text = save_and_read(&mut s, &config, "stalecap");
-    assert!(
-        text.contains(&format!("claude --resume '{CAP_ID}'")),
-        "the fresh run must save the drifted session; got {text}"
-    );
-    assert!(
-        !text.contains(CAP_OTHER),
-        "the old run's stale capture must be unreachable; got {text}"
+    assert_eq!(
+        saved_resume(&mut s, &config, "stalecap").as_deref(),
+        Some(CAP_ID),
+        "the fresh run must save its launch target, never the old run's stale capture"
     );
 }
 
@@ -374,7 +431,7 @@ fn remove_deletes_the_capture_file() {
     let (bin, runtime) = (dir.join("bin"), dir.join("run"));
     install_stub(&bin, "claude", &dir);
     let mut s = sup_ctx(agent_ctx(&bin, &runtime, dir.to_path_buf()));
-    spawn(&mut s, "claude", dir.to_path_buf());
+    s.spawn_agent("claude", dir.to_path_buf(), None);
     let _ = wait_argv(&mut s, &dir.join("argv"));
     let id = s.tasks[0].id;
     wait_for_lifecycle(&mut s, id, |l| l == Lifecycle::Ok);
@@ -393,13 +450,13 @@ fn reconnect_with_unchanged_root_preserves_capture_files() {
     let (bin, runtime) = (dir.join("bin"), dir.join("run"));
     install_stub(&bin, "claude", &dir);
     let mut s = sup_ctx(agent_ctx(&bin, &runtime, dir.to_path_buf()));
-    spawn(&mut s, "claude", dir.to_path_buf());
+    s.spawn_agent("claude", dir.to_path_buf(), None);
     let cap = s.tasks[0].capture_file.clone().expect("capture file set");
     std::fs::write(&cap, "{}").unwrap();
 
     // The client reconnects with an identical env and spawns again.
     s.set_launch_context(agent_ctx(&bin, &runtime, dir.to_path_buf()));
-    spawn(&mut s, "claude", dir.to_path_buf());
+    s.spawn_agent("claude", dir.to_path_buf(), None);
     assert_eq!(s.tasks.len(), 2);
     assert!(
         cap.exists(),
@@ -414,16 +471,16 @@ fn returning_to_a_prior_root_preserves_its_live_captures() {
     let (bin, root_a, root_b) = (dir.join("bin"), dir.join("run-a"), dir.join("run-b"));
     install_stub(&bin, "claude", &dir);
     let mut s = sup_ctx(agent_ctx(&bin, &root_a, dir.to_path_buf()));
-    spawn(&mut s, "claude", dir.to_path_buf());
+    s.spawn_agent("claude", dir.to_path_buf(), None);
     let cap_a = s.tasks[0].capture_file.clone().expect("capture file set");
     std::fs::write(&cap_a, "{}").unwrap();
 
     // The client reconnects under root B, spawns, then returns to A and
     // spawns again.
     s.set_launch_context(agent_ctx(&bin, &root_b, dir.to_path_buf()));
-    spawn(&mut s, "claude", dir.to_path_buf());
+    s.spawn_agent("claude", dir.to_path_buf(), None);
     s.set_launch_context(agent_ctx(&bin, &root_a, dir.to_path_buf()));
-    spawn(&mut s, "claude", dir.to_path_buf());
+    s.spawn_agent("claude", dir.to_path_buf(), None);
 
     assert_eq!(s.tasks.len(), 3);
     assert!(
@@ -451,7 +508,7 @@ fn remove_deletes_the_capture_file_under_the_spawn_root() {
     let (bin, root_a, root_b) = (dir.join("bin"), dir.join("run-a"), dir.join("run-b"));
     install_stub(&bin, "claude", &dir);
     let mut s = sup_ctx(agent_ctx(&bin, &root_a, dir.to_path_buf()));
-    spawn(&mut s, "claude", dir.to_path_buf());
+    s.spawn_agent("claude", dir.to_path_buf(), None);
     let _ = wait_argv(&mut s, &dir.join("argv"));
     let id = s.tasks[0].id;
     wait_for_lifecycle(&mut s, id, |l| l == Lifecycle::Ok);
@@ -461,7 +518,7 @@ fn remove_deletes_the_capture_file_under_the_spawn_root() {
     // Root B is installed by a newer spawn; a same-id file under it must
     // survive the A task's removal.
     s.set_launch_context(agent_ctx(&bin, &root_b, dir.to_path_buf()));
-    spawn(&mut s, "claude", dir.to_path_buf());
+    s.spawn_agent("claude", dir.to_path_buf(), None);
     let decoy = s.tasks[1]
         .capture_file
         .as_deref()
@@ -497,7 +554,7 @@ fn spawn_codex_installs_the_notify_and_embedded_overrides() {
         dir.to_path_buf(),
         &[("CODEX_HOME", &dir.join("codex_home"))],
     ));
-    spawn(&mut s, "codex", dir.to_path_buf());
+    s.spawn_agent("codex", dir.to_path_buf(), None);
 
     let argv = wait_argv(&mut s, &dir.join("argv"));
     let ci = argv
@@ -543,7 +600,7 @@ fn spawn_grok_pins_an_id_and_injects_nothing_else() {
         dir.to_path_buf(),
         &[("FLEETCOM_CONFIG_DIR", &config)],
     ));
-    spawn(&mut s, "grok", dir.to_path_buf());
+    s.spawn_agent("grok", dir.to_path_buf(), None);
 
     let argv = wait_argv(&mut s, &dir.join("argv"));
     assert_eq!(
@@ -570,10 +627,10 @@ fn spawn_grok_pins_an_id_and_injects_nothing_else() {
     );
     assert_eq!(t.resume_id.as_deref(), Some(id.as_str()));
 
-    let text = save_and_read(&mut s, &config, "grokpin");
-    assert!(
-        text.contains(&format!("grok --resume '{id}'")),
-        "the recipe must resume the pinned session; got {text}"
+    assert_eq!(
+        saved_entries(&mut s, &config, "grokpin"),
+        [managed("grok", Some(&id))],
+        "the recipe must resume the pinned session"
     );
 }
 
@@ -585,7 +642,7 @@ fn spawn_omp_loads_the_capture_extension() {
     let (bin, runtime) = (dir.join("bin"), dir.join("run"));
     install_stub(&bin, "omp", &dir);
     let mut s = sup_ctx(agent_ctx(&bin, &runtime, dir.to_path_buf()));
-    spawn(&mut s, "omp", dir.to_path_buf());
+    s.spawn_agent("omp", dir.to_path_buf(), None);
 
     let argv = wait_argv(&mut s, &dir.join("argv"));
     let ei = argv
@@ -620,10 +677,10 @@ fn spawn_omp_loads_the_capture_extension() {
 }
 
 /// Printed hints are display content even after exit and reader EOF. Named
-/// saves, recovery snapshots, and reruns retain the capture or launch ID; an
-/// uncaptured task retains its exact authored command.
+/// saves, recovery snapshots, and reruns carry the capture or launch ID; a
+/// task with neither saves and reruns fresh.
 #[test]
-fn printed_resume_hints_do_not_change_saved_recovery_or_rerun_commands() {
+fn printed_resume_hints_do_not_change_saved_recovery_or_rerun_targets() {
     for (tool, hints) in [
         (
             "claude",
@@ -663,8 +720,7 @@ fn printed_resume_hints_do_not_change_saved_recovery_or_rerun_commands() {
             ],
         ));
         s.set_recovery_timing(Duration::from_millis(20), Duration::from_millis(100));
-        let authored = format!("  {}/{}\t", bin.display(), tool);
-        spawn(&mut s, &authored, dir.to_path_buf());
+        s.spawn_agent(tool, dir.to_path_buf(), None);
         s.tasks[0].group = Some("agents".into());
         s.tasks[0].name = Some(tool.into());
         let expected_id = match tool {
@@ -680,10 +736,6 @@ fn printed_resume_hints_do_not_change_saved_recovery_or_rerun_commands() {
             _ => None,
         };
         assert_ne!(expected_id.as_deref(), Some(CAP_ID));
-        let command = match expected_id.as_deref() {
-            Some(id) => format!("{}/{} --resume '{id}'", bin.display(), tool),
-            None => authored,
-        };
         assert!(
             reap_until(&mut s, Duration::from_secs(5), |s| {
                 s.tasks[0].finished.is_some() && s.tasks[0].reader_done()
@@ -702,9 +754,9 @@ fn printed_resume_hints_do_not_change_saved_recovery_or_rerun_commands() {
         let expected = SessionConfig::from([(
             path::abbreviate(&dir),
             vec![SessionEntry {
-                cmd: command.clone(),
                 group: Some("agents".into()),
                 name: Some(tool.into()),
+                ..managed(tool, expected_id.as_deref())
             }],
         )]);
         save_and_read(&mut s, &config, "hints");
@@ -731,18 +783,20 @@ fn printed_resume_hints_do_not_change_saved_recovery_or_rerun_commands() {
         let id = s.tasks[0].id;
         s.apply(Command::Restart { id });
         assert_eq!(s.tasks[0].run, 1, "{tool}: rerun must replace the task");
-        assert_eq!(s.tasks[0].command, command, "{tool}: rerun command");
+        assert_eq!(s.tasks[0].command, tool, "{tool}: rerun keeps the word");
         assert_eq!(s.tasks[0].resume_id, expected_id, "{tool}: rerun ID");
     }
 }
 
 /// Rerun latches a recent exit before checking eligibility and retains the
-/// explicit launch ID when terminal output names another conversation.
+/// explicit launch ID when terminal output names another conversation. The
+/// launch ID comes from a loaded recipe: the one way a managed task starts
+/// on a chosen conversation.
 #[test]
 fn rerun_latches_exit_without_reap_and_preserves_the_launch_id() {
     use rustix::process::{Pid, WaitId, WaitIdOptions, waitid};
     let dir = scratch("rerun_without_reap");
-    let (bin, runtime) = (dir.join("bin"), dir.join("run"));
+    let (bin, runtime, config) = (dir.join("bin"), dir.join("run"), dir.join("config"));
     install_script(
         &bin,
         "grok",
@@ -752,12 +806,22 @@ fn rerun_latches_exit_without_reap_and_preserves_the_launch_id() {
             dir.display()
         ),
     );
-    let mut s = sup_ctx(agent_ctx(&bin, &runtime, dir.to_path_buf()));
-    spawn(
-        &mut s,
-        format!("grok --resume {CAP_OTHER}"),
+    let mut s = sup_ctx(agent_ctx_plus(
+        &bin,
+        &runtime,
         dir.to_path_buf(),
+        &[("FLEETCOM_CONFIG_DIR", &config)],
+    ));
+    load_recipe(
+        &mut s,
+        &config,
+        "target",
+        &dir,
+        vec![managed("grok", Some(CAP_OTHER))],
     );
+    assert_eq!(s.tasks.len(), 1, "{:?}", notices(&mut s));
+    assert!(s.tasks[0].managed);
+    assert_eq!(s.tasks[0].resume_id.as_deref(), Some(CAP_OTHER));
     let id = s.tasks[0].id;
     let pid = Pid::from_raw(s.tasks[0].pid().unwrap() as i32).unwrap();
     assert!(
@@ -779,7 +843,7 @@ fn rerun_latches_exit_without_reap_and_preserves_the_launch_id() {
     std::fs::remove_file(dir.join("argv")).unwrap();
     s.apply(Command::Restart { id });
     assert_eq!(s.tasks[0].run, 1);
-    assert_eq!(s.tasks[0].command, format!("grok --resume '{CAP_OTHER}'"));
+    assert_eq!(s.tasks[0].resume_id.as_deref(), Some(CAP_OTHER));
     assert_eq!(
         wait_argv(&mut s, &dir.join("argv")),
         ["--resume", CAP_OTHER]
@@ -809,7 +873,7 @@ fn resume_id_precedence_registry_over_spawn_under_capture() {
             ("CLAUDE_CONFIG_DIR", &claude_home),
         ],
     ));
-    spawn(&mut s, "claude", dir.to_path_buf());
+    s.spawn_agent("claude", dir.to_path_buf(), None);
     let injected = s.tasks[0]
         .resume_id
         .clone()
@@ -819,14 +883,10 @@ fn resume_id_precedence_registry_over_spawn_under_capture() {
     let pid = s.tasks[0].pid().expect("a live task has a pid");
 
     install_status_record(&claude_home, pid, &dir, r#""status":"idle""#);
-    let text = save_and_read(&mut s, &config, "registry");
-    assert!(
-        text.contains(&format!("claude --resume '{CAP_ID}'")),
-        "the registry must beat the injected id; got {text}"
-    );
-    assert!(
-        !text.contains(&injected),
-        "the injected id must not survive the registry; got {text}"
+    assert_eq!(
+        saved_resume(&mut s, &config, "registry").as_deref(),
+        Some(CAP_ID),
+        "the registry must beat the injected id {injected}"
     );
 
     // A capture-file ID outranks the registry ID.
@@ -841,10 +901,10 @@ fn resume_id_precedence_registry_over_spawn_under_capture() {
         ),
     )
     .unwrap();
-    let text = save_and_read(&mut s, &config, "capture");
-    assert!(
-        text.contains(&format!("claude --resume '{CAP_OTHER}'")),
-        "the capture file must beat the registry; got {text}"
+    assert_eq!(
+        saved_resume(&mut s, &config, "capture").as_deref(),
+        Some(CAP_OTHER),
+        "the capture file must beat the registry"
     );
     std::fs::write(&done, b"").unwrap();
 }
@@ -863,13 +923,12 @@ fn capture_stamped_by_a_foreign_process_falls_back_to_the_next_source() {
     let json = |id: &str, source: &str| {
         format!(r#"{{"session_id":"{id}","hook_event_name":"SessionStart","source":"{source}"}}"#)
     };
-    // The stub is the task leader only when `/bin/sh -c` replaces itself with
-    // it, which Ubuntu's `/bin/sh` does not. The test therefore writes the
-    // task's own capture itself, with the leader's stamp. The stub runs the
-    // installed hook under an intermediate shell with the same inherited
-    // environment, as in Claude's daemon. Append `:` to prevent an exec of
-    // the pipeline's last command: the hook's `$PPID` must be the
-    // intermediate shell, which is never the leader.
+    // The test writes the task's own capture itself, with the leader's
+    // stamp. The stub then runs the installed hook under an intermediate
+    // shell with the same inherited environment, as in Claude's daemon.
+    // Append `:` to prevent an exec of the pipeline's last command: the
+    // hook's `$PPID` must be the intermediate shell, which is never the
+    // leader.
     install_script(
         &bin,
         "claude",
@@ -891,7 +950,7 @@ until [ -e '{d}/done' ]; do sleep 0.05; done"#,
             ("CLAUDE_CONFIG_DIR", &claude_home),
         ],
     ));
-    spawn(&mut s, "claude", dir.to_path_buf());
+    s.spawn_agent("claude", dir.to_path_buf(), None);
     let pinned = s.tasks[0]
         .resume_id
         .clone()
@@ -945,18 +1004,19 @@ until [ -e '{d}/done' ]; do sleep 0.05; done"#,
         Some(CAP_ID),
         "a foreign capture must fall through to the registry"
     );
-    let text = save_and_read(&mut s, &config, "foreign");
-    assert!(
-        text.contains(&format!("claude --resume '{CAP_ID}'")) && !text.contains(FOREIGN_ID),
-        "the recipe must never resume the foreign session; got {text}"
+    assert_eq!(
+        saved_resume(&mut s, &config, "foreign").as_deref(),
+        Some(CAP_ID),
+        "the recipe must never resume the foreign session {FOREIGN_ID}"
     );
     std::fs::write(dir.join("done"), b"").unwrap();
 }
 
-/// Two tasks sharing a directory do not own a nearby rollout. Named saves
-/// and recovery must preserve both authored commands when capture is silent.
+/// Two managed tasks sharing a directory do not own a nearby rollout. Named
+/// saves and recovery must write both without a resume ID when capture is
+/// silent.
 #[test]
-fn silent_codex_tasks_keep_authored_commands_in_saves_and_recovery() {
+fn silent_codex_tasks_save_and_recover_without_a_resume_id() {
     let dir = scratch("uncaptured_codex");
     let (bin, runtime, config) = (dir.join("bin"), dir.join("run"), dir.join("config"));
     let codex_home = dir.join("codex_home");
@@ -993,10 +1053,8 @@ fn silent_codex_tasks_keep_authored_commands_in_saves_and_recovery() {
         ],
     ));
     s.set_recovery_timing(Duration::from_millis(20), Duration::from_millis(100));
-    let commands = ["codex".to_string(), format!("  {}/codex\t", bin.display())];
-    for command in &commands {
-        spawn(&mut s, command, dir.to_path_buf());
-    }
+    s.spawn_agent("codex", dir.to_path_buf(), None);
+    s.spawn_agent("codex", dir.to_path_buf(), None);
     assert_eq!(s.tasks.len(), 2);
     assert!(reap_until(&mut s, Duration::from_secs(5), |s| s
         .tasks
@@ -1019,14 +1077,7 @@ fn silent_codex_tasks_keep_authored_commands_in_saves_and_recovery() {
     }
     let expected = SessionConfig::from([(
         path::abbreviate(&dir),
-        commands
-            .iter()
-            .map(|cmd| SessionEntry {
-                cmd: cmd.clone(),
-                group: None,
-                name: None,
-            })
-            .collect(),
+        vec![managed("codex", None), managed("codex", None)],
     )]);
     save_and_read(&mut s, &config, "silent");
     assert_eq!(
@@ -1083,18 +1134,6 @@ fn arrive(s: &Supervisor, codex_home: &Path, payload: &str) -> Option<String> {
     })
 }
 
-/// Save under `name` and return the persisted command of the sole task.
-fn saved_command(s: &mut Supervisor, config: &Path, name: &str) -> String {
-    save_and_read(s, config, name);
-    session::load_in(&config.join("sessions"), name)
-        .unwrap()
-        .into_values()
-        .flatten()
-        .next()
-        .expect("the recipe must hold the task")
-        .cmd
-}
-
 /// Install a stand-in for `fleetcom --codex-notify-v1` at `<bin>/fleetcom`
 /// that writes `CAP_ID` over the capture file. The real mode cannot run from
 /// the unit-test binary, whose `main` is the test harness, so stubs that
@@ -1138,23 +1177,22 @@ fn codex_capture_resolves_each_notifying_thread_to_the_root() {
             ("CODEX_HOME", &codex_home),
         ],
     ));
-    spawn(&mut s, "codex", dir.to_path_buf());
+    s.spawn_agent("codex", dir.to_path_buf(), None);
     assert!(s.tasks[0].resume_id.is_none(), "codex pins no id at launch");
 
     assert_eq!(arrive(&s, &codex_home, &title_turn()), None);
     assert_eq!(
-        saved_command(&mut s, &config, "title"),
-        "codex",
+        saved_resume(&mut s, &config, "title"),
+        None,
         "the title thread must not become the resume target"
     );
-    let resumes_root = format!("codex resume '{CODEX_ROOT}'");
     assert_eq!(
         arrive(&s, &codex_home, &turn_complete(CODEX_CHILD, "pong")).as_deref(),
         Some(CODEX_ROOT)
     );
     assert_eq!(
-        saved_command(&mut s, &config, "child"),
-        resumes_root,
+        saved_resume(&mut s, &config, "child").as_deref(),
+        Some(CODEX_ROOT),
         "a sub-agent's turn must resume the conversation that spawned it"
     );
     assert_eq!(
@@ -1162,21 +1200,22 @@ fn codex_capture_resolves_each_notifying_thread_to_the_root() {
         Some(CODEX_ROOT)
     );
     assert_eq!(
-        saved_command(&mut s, &config, "root"),
-        resumes_root,
+        saved_resume(&mut s, &config, "root").as_deref(),
+        Some(CODEX_ROOT),
         "the conversation's own turn must resume it"
     );
     assert_eq!(arrive(&s, &codex_home, &title_turn()), None);
     assert_eq!(
-        saved_command(&mut s, &config, "after_title"),
-        resumes_root,
+        saved_resume(&mut s, &config, "after_title").as_deref(),
+        Some(CODEX_ROOT),
         "a title notification after the root's must leave the root in place"
     );
 }
 
-/// For `codex resume`, preserve the launch ID after rejecting notifications
-/// for the title thread or a rollout outside the launch-time Codex home.
-/// Prefer a captured root thread in the task's own home over the launch ID.
+/// For a codex task loaded on a chosen conversation, preserve the launch ID
+/// after rejecting notifications for the title thread or a rollout outside
+/// the launch-time Codex home. Prefer a captured root thread in the task's
+/// own home over the launch ID.
 #[test]
 fn refused_codex_capture_keeps_the_launch_target() {
     /// A root thread saved under another Codex home.
@@ -1196,20 +1235,26 @@ fn refused_codex_capture_keeps_the_launch_target() {
             ("CODEX_HOME", &codex_home),
         ],
     ));
-    let authored = format!("codex resume '{CAP_ID}'");
-    spawn(&mut s, &authored, dir.to_path_buf());
+    load_recipe(
+        &mut s,
+        &config,
+        "target",
+        &dir,
+        vec![managed("codex", Some(CAP_ID))],
+    );
+    assert_eq!(s.tasks.len(), 1, "{:?}", notices(&mut s));
     assert_eq!(s.tasks[0].resume_id.as_deref(), Some(CAP_ID));
 
     assert_eq!(arrive(&s, &codex_home, &title_turn()), None);
     assert_eq!(
-        saved_command(&mut s, &config, "title"),
-        authored,
+        saved_resume(&mut s, &config, "title").as_deref(),
+        Some(CAP_ID),
         "the title thread must not displace the launch target"
     );
     assert_eq!(arrive(&s, &codex_home, &turn_complete(FOREIGN, "hi")), None);
     assert_eq!(
-        saved_command(&mut s, &config, "foreign"),
-        authored,
+        saved_resume(&mut s, &config, "foreign").as_deref(),
+        Some(CAP_ID),
         "a thread outside the task's Codex home must not displace the launch target"
     );
     assert_eq!(
@@ -1217,8 +1262,8 @@ fn refused_codex_capture_keeps_the_launch_target() {
         Some(CODEX_ROOT)
     );
     assert_eq!(
-        saved_command(&mut s, &config, "root"),
-        format!("codex resume '{CODEX_ROOT}'"),
+        saved_resume(&mut s, &config, "root").as_deref(),
+        Some(CODEX_ROOT),
         "the task's own root thread must still outrank the launch target"
     );
 }
@@ -1275,7 +1320,7 @@ fn home_only_launch_env_targets_the_clients_dot_codex() {
         dir.to_path_buf(),
         &[("FLEETCOM_CONFIG_DIR", &config), ("HOME", &home)],
     ));
-    spawn(&mut s, "codex", dir.to_path_buf());
+    s.spawn_agent("codex", dir.to_path_buf(), None);
     assert_eq!(
         s.tasks[0].harness_home.as_deref(),
         Some(codex_home.as_path()),
@@ -1291,15 +1336,9 @@ fn home_only_launch_env_targets_the_clients_dot_codex() {
         .finished
         .is_some()));
 
-    save_and_read(&mut s, &config, "homeonly");
-    let cfg = session::load_in(&config.join("sessions"), "homeonly").unwrap();
     assert_eq!(
-        cfg[&path::abbreviate(&dir)],
-        vec![SessionEntry {
-            cmd: "codex".into(),
-            group: None,
-            name: None,
-        }]
+        saved_entries(&mut s, &config, "homeonly"),
+        [managed("codex", None)]
     );
 }
 
@@ -1341,7 +1380,7 @@ fn stale_inherited_notify_chain_is_never_executed() {
         stale.as_os_str().to_os_string(),
     ));
     let mut s = sup_ctx(ctx);
-    spawn(&mut s, "codex", dir.to_path_buf());
+    s.spawn_agent("codex", dir.to_path_buf(), None);
     assert!(reap_until(&mut s, Duration::from_secs(5), |s| s.tasks[0]
         .finished
         .is_some()));
@@ -1362,9 +1401,10 @@ fn stale_inherited_notify_chain_is_never_executed() {
     );
 }
 
-/// Without a known ID, an agent recipe retains the original command.
+/// Without a known ID, a managed entry carries the agent word alone: no
+/// `resume` field at all.
 #[test]
-fn agent_save_without_any_id_keeps_the_plain_command() {
+fn managed_save_without_any_id_omits_resume() {
     let dir = scratch("no_id");
     let (bin, runtime, config) = (dir.join("bin"), dir.join("run"), dir.join("config"));
     // No config.toml exists, so notifier routing has nothing to read.
@@ -1379,19 +1419,19 @@ fn agent_save_without_any_id_keeps_the_plain_command() {
             ("CODEX_HOME", &codex_home),
         ],
     ));
-    spawn(&mut s, "codex", dir.to_path_buf());
+    s.spawn_agent("codex", dir.to_path_buf(), None);
     assert!(reap_until(&mut s, Duration::from_secs(5), |s| s.tasks[0]
         .finished
         .is_some()));
 
     let text = save_and_read(&mut s, &config, "plainagent");
     assert!(
-        text.contains("\"codex\""),
-        "the plain command must survive; got {text}"
+        text.contains("\"agent\": \"codex\""),
+        "the agent word must be written; got {text}"
     );
     assert!(
         !text.contains("resume"),
-        "no id exists, so nothing may be rewritten; got {text}"
+        "no id exists, so no resume field may be written; got {text}"
     );
 }
 
@@ -1437,7 +1477,7 @@ fn config_toml_notify_chains_through_the_injected_script() {
         dir.to_path_buf(),
         &[("CODEX_HOME", &codex_home)],
     ));
-    spawn(&mut s, "codex", dir.to_path_buf());
+    s.spawn_agent("codex", dir.to_path_buf(), None);
     let argv = wait_argv(&mut s, &dir.join("argv"));
     assert!(
         argv.iter().any(|a| a.starts_with("notify=[")),
@@ -1494,7 +1534,7 @@ fn unrepresentable_config_notify_suppresses_injection() {
         dir.to_path_buf(),
         &[("CODEX_HOME", &codex_home)],
     ));
-    spawn(&mut s, "codex", dir.to_path_buf());
+    s.spawn_agent("codex", dir.to_path_buf(), None);
     assert_eq!(
         notices(&mut s),
         ["task 1: codex capture unavailable: `notify` config can't be chained"]
@@ -1513,7 +1553,7 @@ fn unrepresentable_config_notify_suppresses_injection() {
     )
     .unwrap();
     std::fs::remove_file(dir.join("argv")).unwrap();
-    spawn(&mut s, "codex", dir.to_path_buf());
+    s.spawn_agent("codex", dir.to_path_buf(), None);
     assert_eq!(notices(&mut s), Vec::<String>::new());
     let argv = wait_argv(&mut s, &dir.join("argv"));
     assert!(
@@ -1543,14 +1583,7 @@ fn non_agent_entries_survive_save_as_plain_strings() {
         "no object form for an unadorned entry; got {text}"
     );
     let cfg = session::load_in(&config.join("sessions"), "plain").unwrap();
-    assert_eq!(
-        cfg[&path::abbreviate(&dir)],
-        vec![SessionEntry {
-            cmd: "sleep 30".into(),
-            group: None,
-            name: None,
-        }]
-    );
+    assert_eq!(cfg[&path::abbreviate(&dir)], vec![literal("sleep 30")]);
 }
 
 /// Cadence passes persist changed capture IDs without rewriting stable recipes.
@@ -1566,7 +1599,7 @@ fn recovery_cadence_rewrites_on_capture_drift_and_skips_when_static() {
         &[("FLEETCOM_CONFIG_DIR", &config)],
     ));
     s.set_recovery_timing(Duration::from_millis(20), Duration::from_millis(100));
-    spawn(&mut s, "claude", dir.to_path_buf());
+    s.spawn_agent("claude", dir.to_path_buf(), None);
     let _ = wait_argv(&mut s, &dir.join("argv"));
 
     let rec = config.join("sessions").join("recovery");
@@ -1782,6 +1815,7 @@ fn managed_rerun_resumes_the_captured_id_from_the_binary_path_finds_now() {
     .unwrap();
     std::fs::remove_file(dir.join("argv")).unwrap();
 
+    let old_cap = s.tasks[0].capture_file.clone().unwrap();
     s.apply(Command::Restart { id });
     let argv = wait_argv(&mut s, &dir.join("argv"));
     assert_eq!(
@@ -1796,6 +1830,14 @@ fn managed_rerun_resumes_the_captured_id_from_the_binary_path_finds_now() {
     assert!(t.tagged);
     assert_eq!(t.group.as_deref(), Some("agents"));
     assert_eq!(t.name.as_deref(), Some("pilot"));
+    assert!(
+        reap_until(&mut s, Duration::from_secs(5), |s| s.graveyard.is_empty()),
+        "the displaced run was never collected"
+    );
+    assert!(
+        !old_cap.exists(),
+        "rerun must delete the displaced run's capture file; the ID was read first"
+    );
 
     // The binary is resolved again at each rerun: a removed one refuses.
     wait_for_lifecycle(&mut s, id, |l| l == Lifecycle::Ok);
@@ -1829,11 +1871,12 @@ fn managed_rerun_without_an_id_starts_fresh() {
     assert_eq!(s.tasks[0].run, 1);
 }
 
-/// Session format v1 has no managed entry. A managed task saves as the bare
-/// program word or its resume form, and that string loads as a detected
-/// literal that resumes the same conversation.
+/// A managed task saves as a managed entry carrying its current session ID,
+/// and that entry reloads as a managed task that resumes it: the argv leads
+/// with the selector and ID, the binary runs as a direct child even under a
+/// resident shell, and the group carries over.
 #[test]
-fn managed_task_saves_in_the_v1_resume_form_and_reloads_as_a_detected_literal() {
+fn managed_task_saves_as_a_managed_entry_and_reloads_managed() {
     let dir = scratch("managed_save");
     let (bin, runtime, config) = (dir.join("bin"), dir.join("run"), dir.join("config"));
     // One record directory per stub: the reloaded tasks launch together, and
@@ -1843,17 +1886,32 @@ fn managed_task_saves_in_the_v1_resume_form_and_reloads_as_a_detected_literal() 
     for out in [&claude_out, &omp_out] {
         std::fs::create_dir_all(out).unwrap();
     }
-    install_stub(&bin, "claude", &claude_out);
-    install_stub(&bin, "omp", &omp_out);
-    let mut s = sup_ctx(agent_ctx_plus(
+    // The claude stub plays its SessionStart hook: a capture stamped with
+    // its own `$$`, which passes the gate only if the stub is the leader.
+    install_script(
         &bin,
-        &runtime,
-        dir.to_path_buf(),
-        &[("FLEETCOM_CONFIG_DIR", &config)],
+        "claude",
+        &format!(
+            "printf '%s\\n{{\"session_id\":\"{CAP_OTHER}\"}}\\n' \"$$\" > \"$FLEETCOM_CAPTURE_FILE\"\n\
+             printf '%s\\n' \"$@\" > '{out}/argv.'$$'.tmp' && mv '{out}/argv.'$$'.tmp' '{out}/argv'",
+            out = claude_out.display()
+        ),
+    );
+    install_stub(&bin, "omp", &omp_out);
+    let mut ctx = resident_shell_ctx(&bin, &runtime, &dir);
+    ctx.env.push((
+        "FLEETCOM_CONFIG_DIR".into(),
+        config.as_os_str().to_os_string(),
     ));
+    let mut s = sup_ctx(ctx);
     s.spawn_agent("claude", dir.to_path_buf(), Some("agents".into()));
     s.spawn_agent("omp", dir.to_path_buf(), None);
     assert!(s.tasks.iter().all(|t| t.managed));
+    // Wait for both first-run records before touching captures or clearing
+    // them, so a late write from the original launch cannot pass for the
+    // reloaded one.
+    wait_argv(&mut s, &claude_out.join("argv"));
+    wait_argv(&mut s, &omp_out.join("argv"));
     let claude = s.tasks[0].id;
     wait_for_lifecycle(&mut s, claude, |l| l == Lifecycle::Ok);
     std::fs::write(
@@ -1869,49 +1927,91 @@ fn managed_task_saves_in_the_v1_resume_form_and_reloads_as_a_detected_literal() 
             path::abbreviate(&dir),
             vec![
                 SessionEntry {
-                    cmd: format!("claude --resume '{CAP_ID}'"),
                     group: Some("agents".into()),
-                    name: None,
+                    ..managed("claude", Some(CAP_ID))
                 },
-                SessionEntry {
-                    cmd: "omp".into(),
-                    group: None,
-                    name: None,
-                },
+                managed("omp", None),
             ]
         )])
     );
 
-    // The saved strings load as literal tasks that detection instruments.
-    // Wait for both first-run records before clearing them, so a late write
-    // from the original launch cannot pass for the reloaded one.
-    wait_argv(&mut s, &claude_out.join("argv"));
-    wait_argv(&mut s, &omp_out.join("argv"));
     std::fs::remove_file(claude_out.join("argv")).unwrap();
     std::fs::remove_file(omp_out.join("argv")).unwrap();
     s.apply(Command::LoadSession {
         name: "managed".into(),
     });
-    assert_eq!(s.tasks.len(), 4);
+    assert_eq!(s.tasks.len(), 4, "{:?}", notices(&mut s));
     let reloaded = &s.tasks[2];
-    assert!(!reloaded.managed, "v1 has no managed entry");
-    assert_eq!(reloaded.command, format!("claude --resume '{CAP_ID}'"));
-    assert!(reloaded.harness.is_some(), "detection instruments the form");
+    assert!(reloaded.managed, "a managed entry reloads managed");
+    assert_eq!(reloaded.command, "claude");
+    assert!(reloaded.harness.is_some());
     assert_eq!(reloaded.resume_id.as_deref(), Some(CAP_ID));
     assert_eq!(reloaded.group.as_deref(), Some("agents"));
-    assert!(!s.tasks[3].managed);
+    assert!(s.tasks[3].managed);
     assert_eq!(s.tasks[3].command, "omp");
     assert!(s.tasks[3].harness.is_some());
+    assert!(s.tasks[3].resume_id.is_none());
     let claude_argv = wait_argv(&mut s, &claude_out.join("argv"));
     assert!(
         claude_argv.starts_with(&["--resume".into(), CAP_ID.into()]),
         "the reloaded claude entry must resume its captured ID: {claude_argv:?}"
+    );
+    assert_eq!(
+        current_resume_id(&s.tasks[2]).as_deref(),
+        Some(CAP_OTHER),
+        "the reloaded stub's `$$` stamp passes the gate: it ran as a direct child"
     );
     let omp_argv = wait_argv(&mut s, &omp_out.join("argv"));
     assert_eq!(
         omp_argv.first().map(String::as_str),
         Some("-e"),
         "the reloaded omp entry must load the capture extension: {omp_argv:?}"
+    );
+}
+
+/// A recipe naming an agent this host lacks reports it and loads the rest:
+/// the literal and the installed agent spawn, the missing one counts as
+/// failed.
+#[test]
+fn load_reports_a_missing_agent_and_loads_the_rest() {
+    let dir = scratch("load_missing_agent");
+    let (bin, runtime, config) = (dir.join("bin"), dir.join("run"), dir.join("config"));
+    install_stub(&bin, "claude", &dir);
+    let mut s = sup_ctx(agent_ctx_plus(
+        &bin,
+        &runtime,
+        dir.to_path_buf(),
+        &[("FLEETCOM_CONFIG_DIR", &config)],
+    ));
+    load_recipe(
+        &mut s,
+        &config,
+        "fleet",
+        &dir,
+        vec![
+            managed("grok", None),
+            literal("true"),
+            SessionEntry {
+                name: Some("pilot".into()),
+                ..managed("claude", Some(CAP_ID))
+            },
+        ],
+    );
+    assert_eq!(
+        notices(&mut s),
+        [
+            "grok not found on PATH, not spawning",
+            "loaded 'fleet': 2 task(s), 1 failed to spawn"
+        ]
+    );
+    assert_eq!(s.tasks.len(), 2);
+    assert!(!s.tasks[0].managed);
+    assert_eq!(s.tasks[0].command, "true");
+    assert!(s.tasks[1].managed);
+    assert_eq!(s.tasks[1].name.as_deref(), Some("pilot"));
+    assert_eq!(
+        wait_argv(&mut s, &dir.join("argv"))[..2],
+        ["--resume", CAP_ID]
     );
 }
 
@@ -2002,7 +2102,7 @@ fn registry_waiting_status_reaches_the_dashboard_preview() {
         dir.to_path_buf(),
         &[("CLAUDE_CONFIG_DIR", &claude_home)],
     ));
-    spawn(&mut s, "claude", dir.to_path_buf());
+    s.spawn_agent("claude", dir.to_path_buf(), None);
     // Key the record to the task's leader PID.
     let pid = s.tasks[0].pid().expect("a live task has a pid");
 

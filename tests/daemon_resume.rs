@@ -1,7 +1,7 @@
-//! Agent resume crosses command parsing, daemon framing, child instrumentation,
-//! session persistence, and reload. These tests exercise that complete path
-//! with stub `claude` and `codex` executables. An explicit handshake keeps every
-//! path inside the test's scratch tree.
+//! Agent resume crosses the managed launch, daemon framing, child
+//! instrumentation, session persistence, and reload. These tests exercise that
+//! complete path with stub `claude` and `codex` executables. An explicit
+//! handshake keeps every path inside the test's scratch tree.
 
 mod common;
 
@@ -14,8 +14,8 @@ use std::{
 };
 
 use common::{
-    control_frame, read_frame, shake_hands_env, spawn_frame, start_daemon_raw, stop_daemon,
-    wait_until,
+    control_frame, read_frame, shake_hands_env, spawn_agent_frame, spawn_frame, start_daemon_raw,
+    stop_daemon, wait_until,
 };
 
 /// Delimiter separating argv records in a stub's append-only output.
@@ -271,7 +271,7 @@ fn assert_daemon_namespaced(asset: &Path, daemon_pid: u32, what: &str, argv: &[S
 
 /// Save once and return the persisted recipe. Each caller first waits for its
 /// ID channel, and the daemon scrapes finished tasks before reading IDs. As a
-/// result, one save must already contain the resume form.
+/// result, one save must already carry the resume ID.
 fn save_once(stream: &mut UnixStream, recipe: &Path, name: &str) -> String {
     stream
         .write_all(&control_frame(&format!(
@@ -314,8 +314,14 @@ fn capture_slot(runtime: &Path) -> Option<String> {
         .map(|(_, contents)| contents)
 }
 
-/// Claude instrumentation captures an ID without leaking its injected flags
-/// into the recipe, then reloads the same conversation.
+/// The managed entry a recipe writes for `agent` resuming `id`, as `to_json`
+/// pretty-prints it.
+fn managed_entry(agent: &str, id: &str) -> String {
+    format!("{{\n        \"agent\": \"{agent}\",\n        \"resume\": \"{id}\"\n      }}")
+}
+
+/// A managed claude captures an ID without leaking its injected flags into
+/// the recipe, then reloads the same conversation.
 #[test]
 fn claude_spawn_save_load_resumes_the_conversation() {
     let s = Scratch::new("claude");
@@ -324,7 +330,9 @@ fn claude_spawn_save_load_resumes_the_conversation() {
     hello(&mut stream, &s);
     drain_events(&stream);
 
-    stream.write_all(&spawn_frame("claude", &s.work())).unwrap();
+    stream
+        .write_all(&spawn_agent_frame("claude", &s.work()))
+        .unwrap();
     let rec = s.record("claude");
     let argv = wait_run(&rec, 0, |a| {
         a.iter().any(|t| t == "--session-id") && a.iter().any(|t| t == "--settings")
@@ -337,7 +345,7 @@ fn claude_spawn_save_load_resumes_the_conversation() {
     // The pinned ID is stored in `resume_id` at spawn: save once to verify it.
     let recipe = save_once(&mut stream, &s.recipe("story"), "story");
     assert!(
-        recipe.contains(&format!("claude --resume '{id}'")),
+        recipe.contains(&managed_entry("claude", &id)),
         "the recipe must resume the pinned id: {recipe}"
     );
     assert!(
@@ -367,8 +375,8 @@ fn claude_spawn_save_load_resumes_the_conversation() {
 }
 
 /// A Codex notification validated by the daemon's own binary persists the
-/// resume command, the title thread's later notification leaves it intact,
-/// and loading that command reapplies the notifier instrumentation.
+/// resume ID, the title thread's later notification leaves it intact, and
+/// loading that entry reapplies the notifier instrumentation.
 #[test]
 fn codex_capture_file_drives_save_and_load_resumes() {
     let s = Scratch::new("codex");
@@ -377,7 +385,9 @@ fn codex_capture_file_drives_save_and_load_resumes() {
     hello(&mut stream, &s);
     drain_events(&stream);
 
-    stream.write_all(&spawn_frame("codex", &s.work())).unwrap();
+    stream
+        .write_all(&spawn_agent_frame("codex", &s.work()))
+        .unwrap();
     let rec = s.record("codex");
     let argv = wait_run(&rec, 0, |a| a.iter().any(|t| t.starts_with("notify=[")));
     let notify = value_after(&argv, "-c").to_string();
@@ -418,7 +428,7 @@ fn codex_capture_file_drives_save_and_load_resumes() {
     );
     let recipe = save_once(&mut stream, &s.recipe("story"), "story");
     assert!(
-        recipe.contains(&format!("codex resume '{CODEX_ID}'")),
+        recipe.contains(&managed_entry("codex", CODEX_ID)),
         "the recipe must resume the captured thread: {recipe}"
     );
 
@@ -490,7 +500,7 @@ fn codex_notify_mode_runs_headless() {
     assert_eq!(names, ["task-1-0.json"], "no temporary file may remain");
 }
 
-/// A persisted resume command survives daemon replacement and targets the same
+/// A persisted managed entry survives daemon replacement and targets the same
 /// ID afterward.
 #[test]
 fn saved_recipe_resumes_across_a_daemon_restart() {
@@ -502,13 +512,13 @@ fn saved_recipe_resumes_across_a_daemon_restart() {
     hello(&mut stream_a, &s);
     drain_events(&stream_a);
     stream_a
-        .write_all(&spawn_frame("claude", &s.work()))
+        .write_all(&spawn_agent_frame("claude", &s.work()))
         .unwrap();
     let argv = wait_run(&rec, 0, |a| a.iter().any(|t| t == "--session-id"));
     let id = value_after(&argv, "--session-id").to_string();
     let recipe = save_once(&mut stream_a, &s.recipe("overnight"), "overnight");
     assert!(
-        recipe.contains(&format!("claude --resume '{id}'")),
+        recipe.contains(&managed_entry("claude", &id)),
         "the recipe must resume the pinned id: {recipe}"
     );
     stop_daemon(&mut daemon_a);
@@ -529,8 +539,42 @@ fn saved_recipe_resumes_across_a_daemon_restart() {
     );
     assert!(
         !argv.iter().any(|t| t == "--session-id"),
-        "the loaded command is a resume; no second id: {argv:?}"
+        "the loaded entry is a resume; no second id: {argv:?}"
     );
 
     stop_daemon(&mut daemon_b);
+}
+
+/// A typed `claude` is a literal task on the wire too: the stub runs with no
+/// argument, the recipe stores the text as a bare string, and reloading runs
+/// the same text again.
+#[test]
+fn typed_claude_runs_verbatim_and_saves_as_text() {
+    let s = Scratch::new("literal");
+    install_claude_stub(&s);
+    let (_dir, mut daemon, mut stream) = start_daemon_raw("resume_literal", |_| {});
+    hello(&mut stream, &s);
+    drain_events(&stream);
+
+    stream.write_all(&spawn_frame("claude", &s.work())).unwrap();
+    let rec = s.record("claude");
+    let argv = wait_run(&rec, 0, |a| a.is_empty());
+    assert!(argv.is_empty(), "a literal launch adds nothing: {argv:?}");
+
+    let recipe = save_once(&mut stream, &s.recipe("typed"), "typed");
+    // The scratch path itself contains "resume", so match the JSON keys.
+    assert!(
+        recipe.contains("\"claude\"")
+            && !recipe.contains("\"agent\"")
+            && !recipe.contains("\"resume\""),
+        "the recipe must hold the typed text and no managed entry: {recipe}"
+    );
+
+    stream
+        .write_all(&control_frame(r#"{"t":"load","name":"typed"}"#))
+        .unwrap();
+    let argv = wait_run(&rec, 1, |a| a.is_empty());
+    assert!(argv.is_empty(), "the reloaded text runs verbatim: {argv:?}");
+
+    stop_daemon(&mut daemon);
 }

@@ -14,7 +14,7 @@ Choose the operating mode with launch arguments. Use keys to control the dashboa
 | `fleetcom --help` / `-h` | Print usage and exit |
 | `fleetcom --version` / `-V` | Print the version and exit |
 
-`--daemon` and `--codex-notify-v1` are internal. The daemon is started automatically when needed; the notify mode is run by the notifier injected into `codex` tasks, see [agent session resume](agent-resume.md#codex). The first non-`-` argument is treated as the session name; a second is rejected.
+`--daemon` and `--codex-notify-v1` are internal. The daemon is started automatically when needed; the notify mode is run by the notifier injected into managed `codex` tasks, see [agent session resume](agent-resume.md#codex). The first non-`-` argument is treated as the session name; a second is rejected.
 
 ## Dashboard
 
@@ -34,7 +34,7 @@ Choose the operating mode with launch arguments. Use keys to control the dashboa
 | `Ctrl-]` | Attach to the flagship |
 | `g` | Assign the selected task to a group (through the group picker) |
 | `R` | Rename the selected task: a display name shown in place of the command |
-| `r` | Rerun a finished task; use the captured resume command for supported agent tasks |
+| `r` | Rerun a finished task; a managed agent resumes its conversation |
 | `X` | Kill a running task (`TERM`, then `KILL` after 2 s), or remove a finished one |
 | `w` | Save the current tasks as a session |
 | `o` | Load a saved session or a recovery snapshot (through the [session picker](#the-o-session-picker)) |
@@ -111,7 +111,7 @@ Press uppercase `X` to kill a running task or remove a finished one. On removal,
 
 Press `r` to rerun a finished task. Running tasks cannot be rerun without first being killed and are left untouched.
 
-`fleetcom` starts the replacement in the same directory, using the requesting client's environment and the stored command. For a supported `claude`, `codex`, `grok`, or `omp` task with a valid captured conversation ID, it uses the resume command instead.
+`fleetcom` starts the replacement in the same directory, using the requesting client's environment. A literal task reruns its exact text. A managed agent is launched again from whatever `PATH` finds now and resumes its captured conversation when an ID is known; see [agent session resume](agent-resume.md).
 
 On rerun, the task's ID, `◆` tag, group, name, and spawn order are preserved; its clock and screen are reset. Under lifecycle sorting, the restarted task may be listed in another section. You can also rerun inside peek without closing the overlay.
 

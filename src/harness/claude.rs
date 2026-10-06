@@ -1,6 +1,6 @@
 //! Claude session capture uses a launch-time `--session-id`, a `SessionStart`
-//! hook, and the live session registry. Bare launches pin a v4 UUID; accepted
-//! launches install the hook through `--settings`.
+//! hook, and the live session registry. A fresh launch pins a v4 UUID; every
+//! launch installs the hook through `--settings`.
 //! Live lookup reads `<claude-home>/sessions/<pid>.json`.
 //!
 //! With agent view enabled, a conversation can be moved into Claude's own
@@ -61,11 +61,11 @@ impl Harness for Claude {
     /// cannot be determined from the JSON: `source: "fork"` is reported for
     /// both `/branch` in the task's process and a background fork.
     ///
-    /// The task leader is the Claude process only after an exec from
-    /// `$SHELL -c`, as required for [`record_for_pid`]. With a shell retained
-    /// as task leader, the stamped PID differs: reject the capture and fall
-    /// back to the registry, then the spawn-time ID. Without a task PID,
-    /// ownership cannot be checked.
+    /// A managed launch runs the Claude binary directly, so the task leader
+    /// is the Claude process, as [`record_for_pid`] also requires. A stamp
+    /// from any other PID (a background fork, a wrapper that stayed resident)
+    /// is rejected: fall back to the registry, then the spawn-time ID.
+    /// Without a task PID, ownership cannot be checked.
     fn parse_capture(
         &self,
         payload: &str,
@@ -179,8 +179,8 @@ mod tests {
     use crate::{
         harness::{
             Intent,
-            fixtures::{ID, OTHER, argv, assert_all_opaque, paths},
-            plan, shell_words,
+            fixtures::{ID, OTHER, argv, paths},
+            plan,
         },
         testutil::temp,
     };
@@ -222,29 +222,6 @@ mod tests {
         std::time::UNIX_EPOCH + std::time::Duration::from_millis(ms)
     }
 
-    /// Claude-specific opaque shapes: flags, `--continue`/`-c`, subcommands,
-    /// the short/`=` resume spellings, and `--session-id`. The syntax shared
-    /// by every harness is covered by the table test in `harness::tests`.
-    #[test]
-    fn everything_else_is_opaque_and_never_rewritten() {
-        let opaque: Vec<String> = [
-            "claude --model opus",
-            "claude --continue",
-            "claude -c",
-            "claude mcp list",
-            "claudius",
-        ]
-        .iter()
-        .map(|s| s.to_string())
-        .chain([
-            format!("claude -r {ID}"),
-            format!("claude --resume {ID} --model opus"),
-            format!("claude --session-id {ID}"),
-        ])
-        .collect();
-        assert_all_opaque(&Claude, ID, &opaque);
-    }
-
     /// Managed argv: a fresh launch pins the minted ID, a resume names its
     /// conversation, and the settings overlay follows either. Both carry the
     /// capture file in the environment and report the ID they target.
@@ -277,30 +254,6 @@ mod tests {
         let unpinned = plan(&Claude, &Intent::Fresh, None, &paths(), None);
         assert_eq!(unpinned.args, argv(&["--settings", SETTINGS]));
         assert_eq!(unpinned.resume_id, None);
-    }
-
-    /// The literal suffix for a bare `claude`: the fresh intent part, then
-    /// the overlay, as shell text.
-    #[test]
-    fn bare_literal_suffix_pins_an_id_and_layers_settings() {
-        let fresh = plan(&Claude, &Intent::Fresh, Some(ID), &paths(), None);
-        assert_eq!(
-            shell_words(&fresh.args),
-            format!(" --session-id '{ID}' --settings '/tmp/Application Support/fleetcom.json'")
-        );
-    }
-
-    /// The typed resume form already targets a conversation, so its suffix
-    /// is the settings overlay alone.
-    #[test]
-    fn resume_literal_suffix_adds_only_settings() {
-        let overlay = Claude.overlay(&paths(), None);
-        assert_eq!(overlay.resume_id, None);
-        assert_eq!(
-            shell_words(&overlay.args),
-            " --settings '/tmp/Application Support/fleetcom.json'"
-        );
-        assert_eq!(overlay.env.len(), 1, "env still names the capture file");
     }
 
     /// Task leader PID used by the capture-gate cases.

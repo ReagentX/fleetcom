@@ -15,12 +15,12 @@ use std::{
 
 use crate::{
     core::{Wake, Waker},
-    harness::{self, Harness, Intent, Invocation, assets},
+    harness::{self, Harness, Intent, assets},
     path,
     protocol::{
         Command, Event, LaunchContext, ScreenView, ScrollAction, TaskView, UNASSIGNED, env_get,
     },
-    session::{self, SessionConfig, SessionEntry},
+    session::{self, EntryKind, SessionConfig, SessionEntry},
     task::{Exec, Task, WriteRefused},
 };
 
@@ -48,9 +48,7 @@ const MAX_TASKS: usize = 256;
 /// text is never edited by managed code, and a managed task's argv never
 /// passes through a shell.
 enum Launch<'a> {
-    /// The text the user typed, run verbatim under `$SHELL -c`. In this
-    /// release a bare agent word or its resume form still gets detected and
-    /// instrumented; that path goes once managed launches carry it alone.
+    /// The text the user typed, run verbatim under `$SHELL -c`.
     Literal(&'a str),
     /// An agent fleetcom launches and owns.
     Managed(ManagedLaunch),
@@ -64,8 +62,9 @@ struct ManagedLaunch {
     intent: Intent,
 }
 
-/// Maximum command length in bytes. Direct spawns and session loads enforce
-/// this limit to bound shell arguments and serialized task snapshots.
+/// Maximum literal command length in bytes. Direct spawns and session loads
+/// enforce this limit to bound shell arguments and serialized task snapshots.
+/// A managed entry carries a program word and a UUID, so it needs no cap.
 const MAX_COMMAND_LEN: usize = 64 * 1024;
 
 /// Conditions counted as skipped by `materialize`.
@@ -151,10 +150,12 @@ fn fnv1a_hex(bytes: &[u8]) -> String {
     format!("{h:016x}")
 }
 
-/// Resolve the session ID in precedence order: capture file, live registry,
-/// then spawn-time ID. Prefer the first two sources because a session may have
-/// been selected after launch. Validate the capture with the task's leader PID
-/// and launch-time home through the harness. If rejected, try the next source.
+/// Resolve a managed task's session ID in precedence order: capture file,
+/// live registry, then spawn-time ID. Prefer the first two sources because a
+/// session may have been selected after launch. Validate the capture with the
+/// task's leader PID and launch-time home through the harness. If rejected,
+/// try the next source. A literal task has no harness, so every source is
+/// skipped and the result is `None`.
 fn current_resume_id(task: &Task) -> Option<String> {
     if let (Some(h), Some(path)) = (task.harness, &task.capture_file)
         && let Ok(payload) = std::fs::read_to_string(path)
@@ -173,15 +174,6 @@ fn current_resume_id(task: &Task) -> Option<String> {
         return Some(id);
     }
     task.resume_id.clone()
-}
-
-/// Build the saved or rerun command from the task's best-known ID.
-/// Without an ID, preserve the requested command exactly.
-fn recipe_command(t: &Task) -> String {
-    match (t.harness, current_resume_id(t)) {
-        (Some(h), Some(id)) => h.resume_command(&t.command, &id),
-        _ => t.command.clone(),
-    }
 }
 
 /// Resolve harness configuration from the task's launch environment.
@@ -778,8 +770,9 @@ impl Supervisor {
 
     /// Spawn a direct command, managed agent, rerun, or session entry. The
     /// task's `command` is display and recipe text: a literal's typed text, a
-    /// managed agent's program word. Only the exec form carries
-    /// instrumentation.
+    /// managed agent's program word. Only a managed launch carries
+    /// instrumentation: a literal's text reaches the shell untouched, whatever
+    /// it names.
     fn spawn_task(
         &mut self,
         id: u64,
@@ -792,38 +785,7 @@ impl Supervisor {
         let mut meta = None;
         let mut notice = None;
         let (command, exec) = match launch {
-            Launch::Literal(text) => {
-                // Detection, when it fires, contributes a shell suffix, extra
-                // env, and post-spawn metadata; a plain command contributes
-                // nothing. A detected harness without capture assets (install
-                // failure) spawns plain: instrumentation is disabled, not the
-                // task.
-                let mut exec = text.to_string();
-                if let Some((h, inv)) = harness::detect(text)
-                    && let Some(paths) = self.ensure_capture_assets().map(|a| a.paths_for(id, run))
-                {
-                    let home = harness_home(&env, h);
-                    let plan = match inv {
-                        Invocation::Bare => harness::plan(
-                            h,
-                            &Intent::Fresh,
-                            harness::uuid_v4().as_deref(),
-                            &paths,
-                            home.as_deref(),
-                        ),
-                        // The typed text already carries the selector and ID.
-                        Invocation::Resume(known) => harness::SpawnPlan {
-                            resume_id: Some(known),
-                            ..h.overlay(&paths, home.as_deref())
-                        },
-                    };
-                    exec.push_str(&harness::shell_words(&plan.args));
-                    env.to_mut().extend(plan.env);
-                    notice = plan.notice;
-                    meta = Some((h, home, paths.capture_file, plan.resume_id));
-                }
-                (*text, Exec::Literal(exec))
-            }
+            Launch::Literal(text) => (*text, Exec::Literal((*text).to_string())),
             Launch::Managed(m) => {
                 // Ownership needs the overlay: without the embedded override a
                 // managed codex would hand its conversation to the shared
@@ -944,28 +906,40 @@ impl Supervisor {
     /// fresh conversation. The binary is whatever the launch context's `PATH`
     /// finds now, never a path the client sent; no binary means no spawn.
     fn spawn_agent(&mut self, agent: &str, cwd: PathBuf, group: Option<String>) {
-        let Some(h) = harness::registered(agent) else {
-            self.status(format!("no agent named {agent:?}, not spawning"));
-            return;
-        };
         if !self.below_task_ceiling() {
             return;
         }
         let Some(launch) = self.launch_or_refuse() else {
             return;
         };
-        let Some(binary) = self.agent_binary(agent, &launch) else {
+        let Some(managed) = self.resolve_agent(agent, &launch, Intent::Fresh) else {
             return;
         };
-        let managed = Launch::Managed(ManagedLaunch {
-            agent: h,
-            binary,
-            intent: Intent::Fresh,
-        });
-        match self.admit(&managed, &cwd, &launch.env, group, None) {
+        match self.admit(&Launch::Managed(managed), &cwd, &launch.env, group, None) {
             Ok(id) => self.events.push(Event::Spawned { id }),
             Err(e) => self.status(format!("spawn failed: {e}")),
         }
+    }
+
+    /// Build the managed launch of `agent` with `intent`: the registered
+    /// harness and the binary `launch`'s `PATH` finds now. Either miss is a
+    /// status line and `None`.
+    fn resolve_agent(
+        &mut self,
+        agent: &str,
+        launch: &LaunchContext,
+        intent: Intent,
+    ) -> Option<ManagedLaunch> {
+        let Some(h) = harness::registered(agent) else {
+            self.status(format!("no agent named {agent:?}, not spawning"));
+            return None;
+        };
+        let binary = self.agent_binary(agent, launch)?;
+        Some(ManagedLaunch {
+            agent: h,
+            binary,
+            intent,
+        })
     }
 
     /// Resolve `agent` on `launch`'s `PATH`, reporting a miss.
@@ -981,7 +955,7 @@ impl Supervisor {
     /// Rerun a finished task in place while preserving its ID, tag, group, and name.
     /// A managed task resumes its best-known ID through the harness, or starts
     /// fresh without one, from whatever binary `PATH` finds now. A literal
-    /// task with a captured agent session reruns its resume form.
+    /// task reruns its exact text.
     fn rerun(&mut self, id: u64) {
         let Some(i) = self.index_of(id) else {
             self.status(format!("rerun failed: no task {id}"));
@@ -1003,11 +977,10 @@ impl Supervisor {
             return;
         };
         let cwd = self.tasks[i].cwd.clone();
+        // Only a managed task carries a harness: the match is the kind split.
         let command;
-        let relaunch = match (self.tasks[i].managed, self.tasks[i].harness) {
-            // A managed task always carries its harness; the tuple keeps the
-            // literal arm as the only other path rather than panicking.
-            (true, Some(agent)) => {
+        let relaunch = match self.tasks[i].harness {
+            Some(agent) => {
                 let Some(binary) = self.agent_binary(agent.shape().0, &launch) else {
                     return;
                 };
@@ -1019,10 +992,8 @@ impl Supervisor {
                     intent,
                 })
             }
-            // Store the resuming form so detection treats the replacement as
-            // a targeted conversation.
-            _ => {
-                command = recipe_command(&self.tasks[i]);
+            None => {
+                command = self.tasks[i].command.clone();
                 Launch::Literal(&command)
             }
         };
@@ -1034,8 +1005,8 @@ impl Supervisor {
                 fresh.tagged = self.tasks[i].tagged;
                 fresh.group = self.tasks[i].group.clone();
                 fresh.name = self.tasks[i].name.clone();
-                // Derive the resume command before removing the displaced run's capture
-                // file during retirement.
+                // The resume ID was read above, before retirement removes the
+                // displaced run's capture file.
                 let old = std::mem::replace(&mut self.tasks[i], fresh);
                 self.retire(old);
                 // Reset the fingerprint for the replacement task's screen.
@@ -1047,8 +1018,9 @@ impl Supervisor {
         }
     }
 
-    /// Build `{dir: [entries]}` in spawn order. Groups and names remain intact;
-    /// agent entries use the command returned by `recipe_command`.
+    /// Build `{dir: [entries]}` in spawn order. Groups and names remain intact.
+    /// A managed task is written as its agent word and best-known session ID;
+    /// a literal task as its exact text.
     fn session_config(&self) -> SessionConfig {
         // `admit` appends monotonic IDs; `rerun` preserves both index and ID;
         // removal preserves relative order.
@@ -1058,10 +1030,17 @@ impl Supervisor {
         );
         let mut cfg = SessionConfig::new();
         for t in &self.tasks {
+            let kind = match t.harness {
+                Some(h) => EntryKind::Managed {
+                    agent: h.shape().0.to_string(),
+                    resume: current_resume_id(t),
+                },
+                None => EntryKind::Literal(t.command.clone()),
+            };
             cfg.entry(path::abbreviate(&t.cwd))
                 .or_default()
                 .push(SessionEntry {
-                    cmd: recipe_command(t),
+                    kind,
                     group: t.group.clone(),
                     name: t.name.clone(),
                 });
@@ -1112,9 +1091,11 @@ impl Supervisor {
 
     /// Spawn every entry of a loaded recipe, each in its (existing) dir.
     /// Missing dirs are skipped rather than spawning tasks doomed to fail on
-    /// chdir. Returns `(spawned, skipped, failed)` for the caller's notice, or
-    /// `None` when no launch context is installed (already refused with its
-    /// own notice).
+    /// chdir. A managed entry goes through the same resolution as the Agent
+    /// page: an agent with no binary on this context's `PATH` is a status
+    /// line and a failed entry, the rest still load. Returns `(spawned,
+    /// skipped, failed)` for the caller's notice, or `None` when no launch
+    /// context is installed (already refused with its own notice).
     fn materialize(&mut self, cfg: &SessionConfig) -> Option<(usize, usize, usize)> {
         let launch = self.launch_or_refuse()?;
         let (mut spawned, mut skipped, mut failed) = (0usize, 0usize, 0usize);
@@ -1125,13 +1106,30 @@ impl Supervisor {
                 continue;
             }
             for entry in entries {
-                if self.tasks.len() >= self.max_tasks || entry.cmd.len() > MAX_COMMAND_LEN {
+                if self.tasks.len() >= self.max_tasks {
                     skipped += 1;
                     continue;
                 }
+                let kind = match &entry.kind {
+                    EntryKind::Literal(text) => {
+                        if text.len() > MAX_COMMAND_LEN {
+                            skipped += 1;
+                            continue;
+                        }
+                        Launch::Literal(text)
+                    }
+                    EntryKind::Managed { agent, resume } => {
+                        let intent = resume.clone().map_or(Intent::Fresh, Intent::Resume);
+                        let Some(m) = self.resolve_agent(agent, &launch, intent) else {
+                            failed += 1;
+                            continue;
+                        };
+                        Launch::Managed(m)
+                    }
+                };
                 // `admit` normalizes the persisted labels before assignment.
                 match self.admit(
-                    &Launch::Literal(&entry.cmd),
+                    &kind,
                     &resolved,
                     &launch.env,
                     entry.group.clone(),

@@ -12,9 +12,6 @@
 //!
 //! omp's IDs are UUIDv7. [`is_uuid`](super::is_uuid) validates the 8-4-4-4-12
 //! lowercase-hex shape and not the version field, so they pass unchanged.
-//!
-//! `-r`, `--session`, and `-c` resume as well, but detection stays on the
-//! canonical pair: a command fleetcom cannot rewrite exactly is left verbatim.
 
 use std::path::Path;
 
@@ -60,8 +57,8 @@ mod tests {
     use super::*;
     use crate::harness::{
         Intent,
-        fixtures::{ID, argv, assert_all_opaque, paths},
-        plan, shell_words,
+        fixtures::{ID, argv, paths},
+        plan,
     };
 
     /// Valid UUIDv7 used in capture payloads.
@@ -69,23 +66,6 @@ mod tests {
 
     /// The extension path from [`paths`].
     const EXTENSION: &str = "/tmp/Application Support/omp-capture.js";
-
-    /// omp-specific aliases, shortcuts, prompts, and malformed resume forms
-    /// remain opaque.
-    #[test]
-    fn everything_else_is_opaque_and_never_rewritten() {
-        let opaque: Vec<String> = ["omp -c", "omp --continue", "omp --resume", "ompx"]
-            .iter()
-            .map(|s| s.to_string())
-            .chain([
-                format!("omp -r {ID}"),
-                format!("omp --session {ID}"),
-                format!("omp --resume {}", &ID[..8]),
-                "omp -p 'fix the tests'".to_string(),
-            ])
-            .collect();
-        assert_all_opaque(&Omp, ID, &opaque);
-    }
 
     /// Managed argv: a fresh launch loads the extension alone, since omp has
     /// no `--session-id` and a minted ID would be unresumable; a resume names
@@ -107,22 +87,6 @@ mod tests {
         assert_eq!(resume.args, argv(&["--resume", CAPTURED, "-e", EXTENSION]));
         assert_eq!(resume.resume_id.as_deref(), Some(CAPTURED));
         assert_eq!(resume.env, fresh.env);
-    }
-
-    /// Both literal shapes get the extension as one quoted word (the
-    /// fixture path has a space) and no pin.
-    #[test]
-    fn literal_suffix_loads_the_extension_for_either_accepted_shape() {
-        let overlay = Omp.overlay(&paths(), None);
-        assert_eq!(overlay.resume_id, None);
-        assert_eq!(
-            shell_words(&overlay.args),
-            " -e '/tmp/Application Support/omp-capture.js'"
-        );
-        // The bare word's fresh intent part is empty, so its suffix is the
-        // overlay's.
-        let fresh = plan(&Omp, &Intent::Fresh, Some(ID), &paths(), None);
-        assert_eq!(fresh.args, overlay.args);
     }
 
     /// Extract only a validated ID from the extension payload.

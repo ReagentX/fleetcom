@@ -1,5 +1,5 @@
-//! Grok has no injectable live-capture channel. Bare launches instead pin a v4
-//! UUID; canonical resume commands retain their explicit ID.
+//! Grok has no injectable live-capture channel. A fresh launch instead pins a
+//! v4 UUID, and a resume names it.
 
 use std::path::Path;
 
@@ -27,33 +27,9 @@ mod tests {
     use super::*;
     use crate::harness::{
         Intent,
-        fixtures::{ID, OTHER, argv, assert_all_opaque, paths},
-        plan, shell_words,
+        fixtures::{ID, OTHER, argv, paths},
+        plan,
     };
-
-    /// Grok-specific opaque shapes: flags, the `-r`/`-s`/`=` spellings the
-    /// tool prints but detection refuses, and subcommands. The syntax shared
-    /// by every harness is covered by the table test in `harness::tests`.
-    #[test]
-    fn everything_else_is_opaque_and_never_rewritten() {
-        let opaque: Vec<String> = [
-            "grok --model grok-4",
-            "grok --continue",
-            "grok -r",
-            "grok -r my-session",
-            "grok sessions list",
-            "grokk",
-        ]
-        .iter()
-        .map(|s| s.to_string())
-        .chain([
-            format!("grok -r {ID}"),
-            format!("grok -s {ID}"),
-            format!("grok --resume {ID} --debug"),
-        ])
-        .collect();
-        assert_all_opaque(&Grok, ID, &opaque);
-    }
 
     /// Managed argv is the intent part alone: Grok exposes no live capture
     /// channel, so nothing rides along either way.
@@ -70,16 +46,9 @@ mod tests {
         assert!(resume.env.is_empty());
     }
 
-    /// A bare literal `grok` gains only the pinned ID.
+    /// The overlay is empty: no flag, no environment, no notice.
     #[test]
-    fn bare_literal_suffix_pins_an_id_and_nothing_else() {
-        let fresh = plan(&Grok, &Intent::Fresh, Some(ID), &paths(), None);
-        assert_eq!(shell_words(&fresh.args), format!(" --session-id '{ID}'"));
-    }
-
-    /// The typed resume form needs no pin, overlay, or environment change.
-    #[test]
-    fn overlay_leaves_the_resume_form_untouched() {
+    fn overlay_is_empty() {
         assert_eq!(Grok.overlay(&paths(), None), SpawnPlan::default());
     }
 
