@@ -17,7 +17,7 @@ use std::{
 
 /// Protocol version used by this test suite; must match
 /// `protocol::PROTOCOL_VERSION`.
-pub const PROTOCOL_VERSION: u32 = 13;
+pub const PROTOCOL_VERSION: u32 = 14;
 
 /// One frame of the given kind: `[u32 len][kind][payload]`.
 pub fn frame(kind: u8, payload: &[u8]) -> Vec<u8> {
@@ -128,6 +128,14 @@ pub fn spawn_frame(command: &str, cwd: &Path) -> Vec<u8> {
     let cmd = command.replace('\\', "\\\\").replace('"', "\\\"");
     control_frame(&format!(
         r#"{{"t":"spawn","command":"{cmd}","cwd":"{}"}}"#,
+        b64(cwd.as_os_str().as_bytes())
+    ))
+}
+
+/// Build a spawn-agent control frame naming `agent` by program word.
+pub fn spawn_agent_frame(agent: &str, cwd: &Path) -> Vec<u8> {
+    control_frame(&format!(
+        r#"{{"t":"spawn_agent","agent":"{agent}","cwd":"{}"}}"#,
         b64(cwd.as_os_str().as_bytes())
     ))
 }

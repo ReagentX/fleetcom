@@ -2081,8 +2081,168 @@ fn recovery_arms_on_structural_mutations_not_tag() {
     });
     assert!(take_dirty(&mut s), "LoadRecovery must arm");
 
+    s.apply(Command::SpawnAgent {
+        agent: "vim".into(),
+        cwd: here(),
+        group: None,
+    });
+    assert!(take_dirty(&mut s), "SpawnAgent must arm, even when refused");
+
     s.apply(Command::Remove { id });
     assert!(take_dirty(&mut s), "Remove must arm");
+}
+
+/// Drain and return the newest `Agents` list, without ticking.
+fn agents_of(s: &mut Supervisor) -> Vec<String> {
+    s.drain()
+        .into_iter()
+        .rev()
+        .find_map(|e| match e {
+            Event::Agents(a) => Some(a),
+            _ => None,
+        })
+        .expect("expected an Agents event")
+}
+
+/// `dir` spelled relative to this process's cwd, through `..` components.
+/// The spelling reaches `dir` from here, which is exactly why discovery
+/// must not use it: the task would resolve it from its own cwd.
+fn relative_spelling(dir: &Path) -> PathBuf {
+    use std::path::Component;
+    let ups = here()
+        .components()
+        .filter(|c| matches!(c, Component::Normal(_)))
+        .count();
+    std::iter::repeat_n("..", ups)
+        .collect::<PathBuf>()
+        .join(dir.strip_prefix("/").unwrap())
+}
+
+/// Installing a context queues the registered agents its `PATH` resolves, in
+/// registry order rather than `PATH` order. An unregistered executable and a
+/// relative component contribute nothing. Each install resends the whole
+/// list, and a context without `PATH` sends an empty one, so a reconnect
+/// never inherits a stale menu.
+#[test]
+fn launch_context_install_discovers_agents_in_registry_order() {
+    let dir = scratch("discover");
+    let (a, b, c) = (dir.join("a"), dir.join("b"), dir.join("c"));
+    for d in [&a, &b, &c] {
+        std::fs::create_dir_all(d).unwrap();
+    }
+    write_executable(&a.join("claude"), "");
+    write_executable(&a.join("vim"), "");
+    write_executable(&b.join("omp"), "");
+    write_executable(&b.join("codex"), "");
+    write_executable(&c.join("grok"), "");
+    let rel = relative_spelling(&c);
+    assert!(
+        std::fs::metadata(rel.join("grok")).is_ok(),
+        "premise: the relative spelling reaches grok from here"
+    );
+    let ctx = |dirs: &[&Path]| LaunchContext {
+        env: vec![("PATH".into(), std::env::join_paths(dirs).unwrap())],
+        cwd: dir.to_path_buf(),
+    };
+
+    let mut s = Supervisor::new(24, 80, 2000);
+    assert!(
+        s.drain().is_empty(),
+        "no discovery before a context is installed"
+    );
+    s.set_launch_context(ctx(&[&b, &rel, &a]));
+    assert_eq!(agents_of(&mut s), ["claude", "codex", "omp"]);
+    s.set_launch_context(ctx(&[&a]));
+    assert_eq!(agents_of(&mut s), ["claude"]);
+    s.set_launch_context(LaunchContext {
+        env: Vec::new(),
+        cwd: dir.to_path_buf(),
+    });
+    assert_eq!(agents_of(&mut s), Vec::<String>::new());
+}
+
+/// `Command::SpawnAgent` admits a managed task for a registered word on the
+/// context's `PATH`, acking with `Spawned` and reporting `managed` in the
+/// snapshot; an unregistered word or a missing binary gets a notice and no
+/// task. A literal spawn of the same word stays unmanaged.
+#[test]
+fn spawn_agent_admits_a_managed_task_and_refuses_the_rest() {
+    let dir = scratch("spawn_agent");
+    let bin = dir.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let rec = dir.join("argv");
+    write_executable(
+        &bin.join("claude"),
+        &format!("printf '%s\\n' \"$@\" > '{}'", rec.display()),
+    );
+    // Keep capture assets and the registry read inside the scratch tree.
+    let mut s = sup_ctx(LaunchContext {
+        env: vec![
+            ("PATH".into(), bin.as_os_str().to_os_string()),
+            (
+                path::FLEETCOM_RUNTIME_DIR.into(),
+                dir.join("run").into_os_string(),
+            ),
+            (
+                "CLAUDE_CONFIG_DIR".into(),
+                dir.join("claude-home").into_os_string(),
+            ),
+        ],
+        cwd: dir.to_path_buf(),
+    });
+    assert_eq!(agents_of(&mut s), ["claude"]);
+
+    s.apply(Command::SpawnAgent {
+        agent: "claude".into(),
+        cwd: dir.to_path_buf(),
+        group: Some("agents".into()),
+    });
+    let id = spawned_id(&mut s);
+    let v = view_of(&mut s, id);
+    assert!(v.managed, "a SpawnAgent task must report managed");
+    assert_eq!(v.command, "claude", "the row shows the program word");
+    assert_eq!(v.group.as_deref(), Some("agents"));
+    assert!(
+        wait_until(Duration::from_secs(5), || rec.exists()),
+        "the stub never ran"
+    );
+    let argv = std::fs::read_to_string(&rec).unwrap();
+    assert!(
+        argv.lines().any(|l| l == "--session-id"),
+        "the launch must carry the harness argv: {argv:?}"
+    );
+
+    for (agent, needle) in [("vim", "no agent named"), ("codex", "not found on PATH")] {
+        s.apply(Command::SpawnAgent {
+            agent: agent.into(),
+            cwd: dir.to_path_buf(),
+            group: None,
+        });
+        let evs = s.drain();
+        assert!(
+            evs.iter()
+                .any(|e| matches!(e, Event::Status(m) if m.contains(needle))),
+            "{agent}: expected a refusal; got {evs:?}"
+        );
+        assert!(
+            !evs.iter().any(|e| matches!(e, Event::Spawned { .. })),
+            "{agent}: a refusal must not ack; got {evs:?}"
+        );
+    }
+    s.tick();
+    assert!(
+        s.drain()
+            .iter()
+            .any(|e| matches!(e, Event::Tasks(v) if v.len() == 1)),
+        "refusals must add no task"
+    );
+
+    spawn(&mut s, "claude", dir.to_path_buf());
+    let literal = spawned_id(&mut s);
+    assert!(
+        !view_of(&mut s, literal).managed,
+        "a typed word is a literal task"
+    );
 }
 
 /// Tick once and return the flagship ids from the snapshot.

@@ -12,7 +12,7 @@ use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
 use crate::frame::{KIND_CONTROL, KIND_HELLO, KIND_SCREEN};
 
 /// Wire-protocol version; mismatched peers are rejected during the handshake.
-pub const PROTOCOL_VERSION: u32 = 13;
+pub const PROTOCOL_VERSION: u32 = 14;
 
 /// Reserved dashboard label for tasks without a custom group.
 pub const UNASSIGNED: &str = "Unassigned";
@@ -53,6 +53,15 @@ pub enum Command {
     /// dashboard assignment.
     Spawn {
         command: String,
+        cwd: PathBuf,
+        group: Option<String>,
+    },
+    /// Launch a registered agent as a managed task in `cwd`. `agent` is a
+    /// program word from `Event::Agents`, never a path: the core checks it
+    /// against its registry and resolves the binary on its own launch
+    /// context's `PATH` at spawn time.
+    SpawnAgent {
+        agent: String,
         cwd: PathBuf,
         group: Option<String>,
     },
@@ -178,6 +187,11 @@ pub struct Mods {
 pub enum Event {
     /// The daemon accepted a compatible hello frame and stored its launch context.
     HelloOk,
+    /// Program words of the registered agents found on the launch context's
+    /// `PATH`, in registry order. Sent whenever a context is installed, so a
+    /// reconnect replaces the list; empty when none resolve. Binary paths
+    /// stay in the core.
+    Agents(Vec<String>),
     /// Full task-set snapshot; replaces the client's mirror wholesale.
     Tasks(Vec<TaskView>),
     /// The watched task's current screen (attach/peek source).
@@ -325,6 +339,9 @@ pub struct TaskView {
     /// Whether this task is the flagship. True for at most one task per
     /// snapshot, and never for a finished task.
     pub flagship: bool,
+    /// Whether fleetcom launched this task as a managed agent: `command` is
+    /// then the agent's program word, and a rerun resumes through the harness.
+    pub managed: bool,
     /// Dashboard group; `None` means unassigned.
     pub group: Option<String>,
     /// Custom display name; `None` means unnamed.
@@ -564,6 +581,15 @@ pub fn encode_command(cmd: &Command) -> (u8, Vec<u8>) {
             insert_opt_str(&mut o, "group", group);
             o
         }
+        Command::SpawnAgent { agent, cwd, group } => {
+            let mut o = jzon::object! {
+                "t": "spawn_agent",
+                "agent": agent.as_str(),
+                "cwd": path_b64(cwd),
+            };
+            insert_opt_str(&mut o, "group", group);
+            o
+        }
         Command::Kill { id } => jzon::object! { "t": "kill", "id": *id },
         Command::Remove { id } => jzon::object! { "t": "remove", "id": *id },
         Command::Restart { id } => jzon::object! { "t": "restart", "id": *id },
@@ -692,6 +718,11 @@ pub fn decode_command(kind: u8, payload: &[u8]) -> Option<Command> {
             command: v["command"].as_str()?.to_string(),
             cwd: path_from_b64(&v["cwd"])?,
             // Missing and null group fields both decode as unassigned.
+            group: opt_str(&v["group"])?,
+        },
+        "spawn_agent" => Command::SpawnAgent {
+            agent: v["agent"].as_str()?.to_string(),
+            cwd: path_from_b64(&v["cwd"])?,
             group: opt_str(&v["group"])?,
         },
         "kill" => Command::Kill {
@@ -825,6 +856,10 @@ pub fn decode_command(kind: u8, payload: &[u8]) -> Option<Command> {
 pub fn encode_event(ev: &Event) -> (u8, Vec<u8>) {
     let o = match ev {
         Event::HelloOk => jzon::object! { "t": "hello_ok" },
+        Event::Agents(agents) => jzon::object! {
+            "t": "agents",
+            "agents": agents.iter().map(String::as_str).collect::<Vec<_>>(),
+        },
         Event::Tasks(views) => {
             let mut arr = jzon::JsonValue::new_array();
             for tv in views {
@@ -834,6 +869,7 @@ pub fn encode_event(ev: &Event) -> (u8, Vec<u8>) {
                 let _ = o.insert("cwd", path_b64(&tv.cwd));
                 let _ = o.insert("tagged", tv.tagged);
                 let _ = o.insert("flagship", tv.flagship);
+                let _ = o.insert("managed", tv.managed);
                 // Group and name fields are present only when set.
                 insert_opt_str(&mut o, "group", &tv.group);
                 insert_opt_str(&mut o, "name", &tv.name);
@@ -907,6 +943,9 @@ pub fn decode_event(kind: u8, payload: &[u8]) -> Option<Event> {
             let v = jzon::parse(std::str::from_utf8(payload).ok()?).ok()?;
             match v["t"].as_str()? {
                 "hello_ok" => Some(Event::HelloOk),
+                // `str_vec` reads a missing or non-array value as empty; an
+                // empty menu is an explicit `[]`, so anything else is malformed.
+                "agents" if v["agents"].is_array() => Some(Event::Agents(str_vec(&v["agents"])?)),
                 "tasks" => {
                     let mut views = Vec::new();
                     for tv in v["tasks"].members() {
@@ -916,6 +955,7 @@ pub fn decode_event(kind: u8, payload: &[u8]) -> Option<Event> {
                             cwd: path_from_b64(&tv["cwd"])?,
                             tagged: tv["tagged"].as_bool()?,
                             flagship: tv["flagship"].as_bool()?,
+                            managed: tv["managed"].as_bool()?,
                             // Missing and null both mean unassigned/unnamed.
                             group: opt_str(&tv["group"])?,
                             name: opt_str(&tv["name"])?,

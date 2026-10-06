@@ -25,6 +25,16 @@ fn command_round_trips() {
             cwd: PathBuf::from("/tmp"),
             group: Some("build".into()),
         },
+        Command::SpawnAgent {
+            agent: "claude".into(),
+            cwd: PathBuf::from("/tmp/with space"),
+            group: None,
+        },
+        Command::SpawnAgent {
+            agent: "codex".into(),
+            cwd: PathBuf::from(OsString::from_vec(b"/tmp/\xff\xfe dir".to_vec())),
+            group: Some("agents".into()),
+        },
         Command::Kill { id: 7 },
         Command::Remove { id: 3 },
         Command::Restart { id: 4 },
@@ -166,9 +176,10 @@ fn command_round_trips() {
             Command::ListSessions => 16,
             Command::Shutdown => 17,
             Command::Flagship { .. } => 18,
+            Command::SpawnAgent { .. } => 19,
         }
     }
-    let mut seen = [false; 19];
+    let mut seen = [false; 20];
     for c in cases {
         seen[variant_index(&c)] = true;
         let (k, p) = encode_command(&c);
@@ -191,6 +202,7 @@ fn event_round_trips() {
     let screen = r#"{"id":9,"cursor":[3,12],"hide":false,"mouse":true,"alt":false,"ascr":true,"sb":42,"lines":["row0"]}"#;
     let cases = [
         Event::HelloOk,
+        Event::Agents(vec!["claude".into(), "omp".into()]),
         Event::Tasks(vec![tv(1)]),
         decode_event(KIND_SCREEN, &screen_payload(screen)).expect("valid screen header"),
         Event::Status("saved 'x'".into()),
@@ -219,9 +231,10 @@ fn event_round_trips() {
             Event::Spawned { .. } => 4,
             Event::Sessions { .. } => 5,
             Event::ClipboardCopy { .. } => 6,
+            Event::Agents(_) => 7,
         }
     }
-    let mut seen = [false; 7];
+    let mut seen = [false; 8];
     for ev in cases {
         seen[variant_index(&ev)] = true;
         let (k, p) = encode_event(&ev);
@@ -356,6 +369,7 @@ fn tv(id: u64) -> TaskView {
         cwd: PathBuf::from("/"),
         tagged: false,
         flagship: false,
+        managed: false,
         group: None,
         name: None,
         lifecycle: Lifecycle::Ok,
@@ -385,11 +399,11 @@ fn mistyped_event_members_are_rejected() {
     for json in [
         r#"{"t":"tasks","tasks":[{"id":"nope"}]}"#,
         // The cwd must be a base64 string.
-        r#"{"t":"tasks","tasks":[{"id":1,"command":"x","cwd":"/x","tagged":true,"flagship":false,"life":"ok","preview":"","src":"floor","frozen":false,"started_ms":0}]}"#,
+        r#"{"t":"tasks","tasks":[{"id":1,"command":"x","cwd":"/x","tagged":true,"flagship":false,"managed":false,"life":"ok","preview":"","src":"floor","frozen":false,"started_ms":0}]}"#,
         // A present group must be a string; only missing/null means unassigned.
-        r#"{"t":"tasks","tasks":[{"id":1,"command":"x","cwd":"Lw==","tagged":true,"flagship":false,"life":"ok","preview":"","src":"floor","frozen":false,"started_ms":0,"group":5}]}"#,
+        r#"{"t":"tasks","tasks":[{"id":1,"command":"x","cwd":"Lw==","tagged":true,"flagship":false,"managed":false,"life":"ok","preview":"","src":"floor","frozen":false,"started_ms":0,"group":5}]}"#,
         // A present name must be a string.
-        r#"{"t":"tasks","tasks":[{"id":1,"command":"x","cwd":"Lw==","tagged":true,"flagship":false,"life":"ok","preview":"","src":"floor","frozen":false,"started_ms":0,"name":5}]}"#,
+        r#"{"t":"tasks","tasks":[{"id":1,"command":"x","cwd":"Lw==","tagged":true,"flagship":false,"managed":false,"life":"ok","preview":"","src":"floor","frozen":false,"started_ms":0,"name":5}]}"#,
         r#"{"t":"tasks","tasks":["flat"]}"#,
         // Numeric member in `names`.
         r#"{"t":"sessions","names":["ok",5]}"#,
@@ -419,6 +433,7 @@ fn tasks_and_status_round_trip() {
             cwd: PathBuf::from("/home/x"),
             tagged: true,
             flagship: true,
+            managed: true,
             group: Some("x".into()),
             name: Some("editor".into()),
             lifecycle: Lifecycle::Idle,
@@ -509,7 +524,7 @@ fn set_name_wire_form() {
 #[test]
 fn tasks_frame_group_key_is_optional() {
     // "Lw==" is the base64 encoding of "/".
-    let ungrouped = r#"{"t":"tasks","tasks":[{"id":1,"command":"x","cwd":"Lw==","tagged":false,"flagship":false,"life":"ok","preview":"","src":"floor","frozen":false,"started_ms":0}]}"#;
+    let ungrouped = r#"{"t":"tasks","tasks":[{"id":1,"command":"x","cwd":"Lw==","tagged":false,"flagship":false,"managed":false,"life":"ok","preview":"","src":"floor","frozen":false,"started_ms":0}]}"#;
     match decode_event(KIND_CONTROL, ungrouped.as_bytes()) {
         Some(Event::Tasks(v)) => assert_eq!(v[0].group, None),
         other => panic!("expected tasks event, got {other:?}"),
@@ -518,7 +533,7 @@ fn tasks_frame_group_key_is_optional() {
     let (_, p) = encode_event(&Event::Tasks(vec![tv(1)]));
     assert_eq!(std::str::from_utf8(&p).unwrap(), ungrouped);
 
-    let grouped = r#"{"t":"tasks","tasks":[{"id":1,"command":"x","cwd":"Lw==","tagged":false,"flagship":false,"group":"infra","life":"ok","preview":"","src":"floor","frozen":false,"started_ms":0}]}"#;
+    let grouped = r#"{"t":"tasks","tasks":[{"id":1,"command":"x","cwd":"Lw==","tagged":false,"flagship":false,"managed":false,"group":"infra","life":"ok","preview":"","src":"floor","frozen":false,"started_ms":0}]}"#;
     match decode_event(KIND_CONTROL, grouped.as_bytes()) {
         Some(Event::Tasks(v)) => assert_eq!(v[0].group.as_deref(), Some("infra")),
         other => panic!("expected tasks event, got {other:?}"),
@@ -530,7 +545,7 @@ fn tasks_frame_group_key_is_optional() {
 #[test]
 fn tasks_frame_name_key_is_optional() {
     // "Lw==" is the base64 encoding of "/".
-    let unnamed = r#"{"t":"tasks","tasks":[{"id":1,"command":"x","cwd":"Lw==","tagged":false,"flagship":false,"life":"ok","preview":"","src":"floor","frozen":false,"started_ms":0}]}"#;
+    let unnamed = r#"{"t":"tasks","tasks":[{"id":1,"command":"x","cwd":"Lw==","tagged":false,"flagship":false,"managed":false,"life":"ok","preview":"","src":"floor","frozen":false,"started_ms":0}]}"#;
     match decode_event(KIND_CONTROL, unnamed.as_bytes()) {
         Some(Event::Tasks(v)) => assert_eq!(v[0].name, None),
         other => panic!("expected tasks event, got {other:?}"),
@@ -539,7 +554,7 @@ fn tasks_frame_name_key_is_optional() {
     let (_, p) = encode_event(&Event::Tasks(vec![tv(1)]));
     assert_eq!(std::str::from_utf8(&p).unwrap(), unnamed);
 
-    let named = r#"{"t":"tasks","tasks":[{"id":1,"command":"x","cwd":"Lw==","tagged":false,"flagship":false,"name":"build","life":"ok","preview":"","src":"floor","frozen":false,"started_ms":0}]}"#;
+    let named = r#"{"t":"tasks","tasks":[{"id":1,"command":"x","cwd":"Lw==","tagged":false,"flagship":false,"managed":false,"name":"build","life":"ok","preview":"","src":"floor","frozen":false,"started_ms":0}]}"#;
     match decode_event(KIND_CONTROL, named.as_bytes()) {
         Some(Event::Tasks(v)) => assert_eq!(v[0].name.as_deref(), Some("build")),
         other => panic!("expected tasks event, got {other:?}"),
@@ -842,6 +857,123 @@ fn flagship_wire_form() {
             None,
             "should reject {json}"
         );
+    }
+}
+
+/// `SpawnAgent` names the agent by program word and encodes the cwd as
+/// base64, omitting `"group"` when unassigned, as `Spawn` does. The decoder
+/// requires a string word; refusing a path or an unknown word is the core's
+/// registry check, not the decoder's.
+#[test]
+fn spawn_agent_wire_form() {
+    let (k, p) = encode_command(&Command::SpawnAgent {
+        agent: "claude".into(),
+        cwd: PathBuf::from("/"),
+        group: None,
+    });
+    assert_eq!(k, KIND_CONTROL);
+    assert_eq!(
+        std::str::from_utf8(&p).unwrap(),
+        r#"{"t":"spawn_agent","agent":"claude","cwd":"Lw=="}"#
+    );
+    let (_, p) = encode_command(&Command::SpawnAgent {
+        agent: "claude".into(),
+        cwd: PathBuf::from("/"),
+        group: Some("agents".into()),
+    });
+    assert_eq!(
+        std::str::from_utf8(&p).unwrap(),
+        r#"{"t":"spawn_agent","agent":"claude","cwd":"Lw==","group":"agents"}"#
+    );
+    // An explicit null group is unassigned, same as an omitted key.
+    assert_eq!(
+        decode_command(
+            KIND_CONTROL,
+            br#"{"t":"spawn_agent","agent":"claude","cwd":"Lw==","group":null}"#
+        ),
+        Some(Command::SpawnAgent {
+            agent: "claude".into(),
+            cwd: PathBuf::from("/"),
+            group: None,
+        })
+    );
+    for json in [
+        r#"{"t":"spawn_agent","cwd":"Lw=="}"#, // missing agent
+        r#"{"t":"spawn_agent","agent":5,"cwd":"Lw=="}"#, // agent must be a string
+        r#"{"t":"spawn_agent","agent":null,"cwd":"Lw=="}"#, // null is not a word
+        r#"{"t":"spawn_agent","agent":"claude"}"#, // missing cwd
+        r#"{"t":"spawn_agent","agent":"claude","cwd":"/tmp/x"}"#, // plain path
+        r#"{"t":"spawn_agent","agent":"claude","cwd":"Lw==","group":5}"#, // group must be a string
+    ] {
+        assert_eq!(
+            decode_command(KIND_CONTROL, json.as_bytes()),
+            None,
+            "should reject {json}"
+        );
+    }
+}
+
+/// `Agents` round-trips empty and populated lists in order and pins its
+/// wire shape. A missing list, a non-array, or a non-string member rejects
+/// the event rather than reading as "no agents": the client indexes the
+/// list by position, and an empty menu is an explicit `[]`.
+#[test]
+fn agents_event_round_trips_and_pins_the_wire_shape() {
+    for agents in [
+        Vec::new(),
+        vec!["claude".to_string()],
+        vec!["claude".to_string(), "codex".to_string(), "omp".to_string()],
+    ] {
+        let ev = Event::Agents(agents);
+        let (k, p) = encode_event(&ev);
+        assert_eq!(k, KIND_CONTROL);
+        assert_eq!(decode_event(k, &p).as_ref(), Some(&ev), "round-trip {ev:?}");
+    }
+    let (_, p) = encode_event(&Event::Agents(vec!["claude".into(), "omp".into()]));
+    assert_eq!(
+        std::str::from_utf8(&p).unwrap(),
+        r#"{"t":"agents","agents":["claude","omp"]}"#
+    );
+    let (_, p) = encode_event(&Event::Agents(Vec::new()));
+    assert_eq!(
+        std::str::from_utf8(&p).unwrap(),
+        r#"{"t":"agents","agents":[]}"#
+    );
+    for json in [
+        r#"{"t":"agents"}"#,
+        r#"{"t":"agents","agents":null}"#,
+        r#"{"t":"agents","agents":"claude"}"#,
+        r#"{"t":"agents","agents":["claude",5]}"#,
+    ] {
+        assert_eq!(
+            decode_event(KIND_CONTROL, json.as_bytes()),
+            None,
+            "should reject {json}"
+        );
+    }
+}
+
+/// Every task row carries `managed` as a required boolean, both ways.
+#[test]
+fn tasks_frame_managed_flag_round_trips_and_is_required() {
+    for managed in [false, true] {
+        let tasks = Event::Tasks(vec![TaskView { managed, ..tv(1) }]);
+        let (k, p) = encode_event(&tasks);
+        let s = std::str::from_utf8(&p).unwrap();
+        assert!(
+            s.contains(&format!("\"managed\":{managed}")),
+            "frame was {s}"
+        );
+        assert_eq!(decode_event(k, &p), Some(tasks));
+    }
+    let (k, p) = encode_event(&Event::Tasks(vec![tv(1)]));
+    let valid = String::from_utf8(p).unwrap();
+    let missing = valid.replace("\"managed\":false,", "");
+    assert_ne!(missing, valid, "premise: the encoder writes the key");
+    assert_eq!(decode_event(k, missing.as_bytes()), None, "missing managed");
+    for bad in ["null", "0", "\"true\"", "[]"] {
+        let frame = valid.replace("\"managed\":false", &format!("\"managed\":{bad}"));
+        assert_eq!(decode_event(k, frame.as_bytes()), None, "frame was {frame}");
     }
 }
 

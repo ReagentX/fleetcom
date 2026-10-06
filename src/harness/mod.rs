@@ -196,6 +196,18 @@ pub fn registered(program: &str) -> Option<&'static dyn Harness> {
         .find(|h| h.shape().0 == program)
 }
 
+/// Program words of the registered agents that [`find_on_path`] resolves on
+/// `path`, in registry order: the launcher's menu. Each word is searched
+/// independently, so the result never depends on `path` order. An empty
+/// `path` yields an empty list.
+pub fn installed(path: &OsStr) -> Vec<&'static str> {
+    AGENTS
+        .iter()
+        .map(|a| a.harness.shape().0)
+        .filter(|program| find_on_path(program, path).is_some())
+        .collect()
+}
+
 /// The first executable regular file named `program` in `path`, returned as
 /// found. The path is never canonicalized: a self-updater that repoints
 /// `~/.local/bin/claude` is followed at the next launch. Components that are
@@ -832,6 +844,27 @@ mod tests {
             Some(b.join("claude")),
             "the absolute component behind them still resolves"
         );
+    }
+
+    /// The menu follows registry order whatever `PATH` order says, lists
+    /// only registered words, and is empty for an empty `PATH`.
+    #[test]
+    fn installed_follows_registry_order_not_path_order() {
+        use crate::testutil::{temp, write_executable};
+        let dir = temp("installed");
+        let (a, b) = (dir.join("a"), dir.join("b"));
+        for d in [&a, &b] {
+            fs::create_dir_all(d).unwrap();
+        }
+        for name in ["omp", "grok", "vim"] {
+            write_executable(&a.join(name), "");
+        }
+        write_executable(&b.join("claude"), "");
+        let join = |dirs: &[&Path]| std::env::join_paths(dirs).unwrap();
+
+        assert_eq!(installed(&join(&[&a, &b])), ["claude", "grok", "omp"]);
+        assert_eq!(installed(&join(&[&b])), ["claude"]);
+        assert_eq!(installed(OsStr::new("")), Vec::<&str>::new());
     }
 
     #[test]

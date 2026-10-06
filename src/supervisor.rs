@@ -194,6 +194,7 @@ fn harness_home(env: &[(OsString, OsString)], h: &dyn harness::Harness) -> Optio
 fn affects_recipe(cmd: &Command) -> bool {
     match cmd {
         Command::Spawn { .. }
+        | Command::SpawnAgent { .. }
         | Command::Remove { .. }
         | Command::Restart { .. }
         | Command::SetGroup { .. }
@@ -328,8 +329,18 @@ impl Supervisor {
         }
     }
 
-    /// Install the launch context used by subsequent spawns.
+    /// Install the launch context used by subsequent spawns, and queue the
+    /// agents found on its `PATH` as `Event::Agents`. Discovery runs here
+    /// rather than at daemon start because the daemon lives for weeks and the
+    /// context changes with every client; an empty list is still sent so a
+    /// reconnect from a poorer `PATH` clears the previous client's menu.
     pub fn set_launch_context(&mut self, ctx: LaunchContext) {
+        let path = env_get(&ctx.env, "PATH").unwrap_or_default();
+        let agents = harness::installed(path)
+            .into_iter()
+            .map(String::from)
+            .collect();
+        self.events.push(Event::Agents(agents));
         self.launch = Some(ctx);
     }
 
@@ -392,6 +403,7 @@ impl Supervisor {
                 cwd,
                 group,
             } => self.spawn(&command, cwd, group),
+            Command::SpawnAgent { agent, cwd, group } => self.spawn_agent(&agent, cwd, group),
             Command::Kill { id } => self.with_task(id, Task::terminate),
             Command::Remove { id } => {
                 if let Some(i) = self.index_of(id) {
@@ -542,6 +554,7 @@ impl Supervisor {
                     cwd: t.cwd.clone(),
                     tagged: t.tagged,
                     flagship: self.flagship == Some(t.id),
+                    managed: t.managed,
                     group: t.group.clone(),
                     name: t.name.clone(),
                     lifecycle: t.lifecycle(now, IDLE_AFTER),
@@ -930,10 +943,7 @@ impl Supervisor {
     /// Launch `agent`, a registered program word, as a managed task with a
     /// fresh conversation. The binary is whatever the launch context's `PATH`
     /// finds now, never a path the client sent; no binary means no spawn.
-    /// Nothing reaches this entry point yet: `Command::SpawnAgent` lands in
-    /// the next phase.
-    #[allow(dead_code)]
-    pub fn spawn_agent(&mut self, agent: &str, cwd: PathBuf, group: Option<String>) {
+    fn spawn_agent(&mut self, agent: &str, cwd: PathBuf, group: Option<String>) {
         let Some(h) = harness::registered(agent) else {
             self.status(format!("no agent named {agent:?}, not spawning"));
             return;

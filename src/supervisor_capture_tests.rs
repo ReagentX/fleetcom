@@ -1832,8 +1832,15 @@ fn managed_rerun_without_an_id_starts_fresh() {
 fn managed_task_saves_in_the_v1_resume_form_and_reloads_as_a_detected_literal() {
     let dir = scratch("managed_save");
     let (bin, runtime, config) = (dir.join("bin"), dir.join("run"), dir.join("config"));
-    install_stub(&bin, "claude", &dir);
-    install_stub(&bin, "omp", &dir);
+    // One record directory per stub: the reloaded tasks launch together, and
+    // a shared argv file would be truncated by one while the test reads the
+    // other's.
+    let (claude_out, omp_out) = (dir.join("claude-out"), dir.join("omp-out"));
+    for out in [&claude_out, &omp_out] {
+        std::fs::create_dir_all(out).unwrap();
+    }
+    install_stub(&bin, "claude", &claude_out);
+    install_stub(&bin, "omp", &omp_out);
     let mut s = sup_ctx(agent_ctx_plus(
         &bin,
         &runtime,
@@ -1872,7 +1879,12 @@ fn managed_task_saves_in_the_v1_resume_form_and_reloads_as_a_detected_literal() 
     );
 
     // The saved strings load as literal tasks that detection instruments.
-    std::fs::remove_file(dir.join("argv")).unwrap();
+    // Wait for both first-run records before clearing them, so a late write
+    // from the original launch cannot pass for the reloaded one.
+    wait_argv(&mut s, &claude_out.join("argv"));
+    wait_argv(&mut s, &omp_out.join("argv"));
+    std::fs::remove_file(claude_out.join("argv")).unwrap();
+    std::fs::remove_file(omp_out.join("argv")).unwrap();
     s.apply(Command::LoadSession {
         name: "managed".into(),
     });
@@ -1886,12 +1898,16 @@ fn managed_task_saves_in_the_v1_resume_form_and_reloads_as_a_detected_literal() 
     assert!(!s.tasks[3].managed);
     assert_eq!(s.tasks[3].command, "omp");
     assert!(s.tasks[3].harness.is_some());
-    // Two reloaded stubs race for one argv file; both lead with the resume
-    // or extension element, so either record proves the detected launch.
-    let argv = wait_argv(&mut s, &dir.join("argv"));
+    let claude_argv = wait_argv(&mut s, &claude_out.join("argv"));
     assert!(
-        argv.starts_with(&["--resume".into(), CAP_ID.into()]) || argv[0] == "-e",
-        "a reloaded entry must resume or load its extension: {argv:?}"
+        claude_argv.starts_with(&["--resume".into(), CAP_ID.into()]),
+        "the reloaded claude entry must resume its captured ID: {claude_argv:?}"
+    );
+    let omp_argv = wait_argv(&mut s, &omp_out.join("argv"));
+    assert_eq!(
+        omp_argv.first().map(String::as_str),
+        Some("-e"),
+        "the reloaded omp entry must load the capture extension: {omp_argv:?}"
     );
 }
 

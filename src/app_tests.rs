@@ -114,6 +114,7 @@ fn view(id: u64, cwd: PathBuf, tagged: bool, group: Option<&str>) -> TaskView {
         cwd,
         tagged,
         flagship: false,
+        managed: false,
         group: group.map(str::to_string),
         name: None,
         lifecycle: Lifecycle::Active,

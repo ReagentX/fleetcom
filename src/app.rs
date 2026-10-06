@@ -195,6 +195,10 @@ pub struct App {
     transport: Box<dyn Transport>,
     /// Task snapshot received from `Event::Tasks`.
     pub views: Vec<TaskView>,
+    /// Agents installed on the core's launch `PATH`, from the latest
+    /// `Event::Agents`; program words in registry order. Nothing renders it
+    /// until the spawn prompt's Agent page lands.
+    pub agents: Vec<String>,
     /// The watched task's screen (attach/peek), from `Event::Screen`.
     focused_screen: Option<ScreenView>,
     /// Last `(target, attached)` watch state sent to the core.
@@ -450,6 +454,7 @@ impl App {
         Self {
             transport,
             views: Vec::new(),
+            agents: Vec::new(),
             focused_screen: None,
             watched: None,
             daemon_backed: false,
@@ -750,6 +755,8 @@ impl App {
             match ev {
                 // The handshake is handled before the transport is created.
                 Event::HelloOk => {}
+                // Each context install resends the whole list; replace, never merge.
+                Event::Agents(a) => self.agents = a,
                 Event::Tasks(v) => {
                     self.views = v;
                     // The acknowledgement precedes its row. Select only after

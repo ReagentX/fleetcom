@@ -1229,6 +1229,7 @@ mod tests {
             cwd: std::path::PathBuf::from("/tmp"),
             tagged: false,
             flagship: false,
+            managed: false,
             group: None,
             name: name.map(str::to_string),
             lifecycle: Lifecycle::Active,
