@@ -9,6 +9,7 @@ use std::{
     io::Write,
     os::unix::{fs::PermissionsExt, net::UnixStream},
     path::{Path, PathBuf},
+    process::{Command, Stdio},
     time::Duration,
 };
 
@@ -20,8 +21,21 @@ use common::{
 /// Delimiter separating argv records in a stub's append-only output.
 const RUN_MARKER: &str = "-- run --";
 
-/// Fixed v7-shaped thread ID reported by the `codex` stub.
+/// Fixed v7-shaped thread ID reported by the `codex` stub as its root.
 const CODEX_ID: &str = "019f5453-de22-7240-b2e5-0d32692aa6d9";
+
+/// Hidden title thread the `codex` stub reports after the root. Like the
+/// real one, it never gets a rollout.
+const CODEX_TITLE: &str = "019f5453-de9f-7e61-8c0d-1a2b3c4d5e6f";
+
+/// Root rollout header the `codex` stub saves before notifying: `session_id`
+/// is the thread's own ID and `source` is a string.
+const CODEX_HEADER: &str = r#"{"timestamp":"2026-10-04T17:49:56.012Z","ordinal":0,"type":"session_meta","payload":{"id":"019f5453-de22-7240-b2e5-0d32692aa6d9","session_id":"019f5453-de22-7240-b2e5-0d32692aa6d9","source":"cli"}}"#;
+
+/// Notification JSON for a completed turn of `thread`.
+fn turn_complete(thread: &str) -> String {
+    format!(r#"{{"type":"agent-turn-complete","thread-id":"{thread}","turn-id":"t","cwd":"/w"}}"#)
+}
 
 /// Config override for embedded mode, placed after the notify override on
 /// every instrumented `codex` launch.
@@ -71,6 +85,11 @@ impl Scratch {
     /// The named stub's argv record.
     fn record(&self, tool: &str) -> PathBuf {
         self.root.join(format!("{tool}-argv"))
+    }
+
+    /// Marker the `codex` stub touches after both of its notifications.
+    fn notified(&self) -> PathBuf {
+        self.root.join("codex-notified")
     }
 
     /// Explicit handshake environment with every resolved path under `root`.
@@ -158,21 +177,38 @@ printf 'Resume this session with:\nclaude --resume %s\n' "$id""#,
     install_stub(s, "claude", &body);
 }
 
-/// Install a `codex` stub to record argv and report `CODEX_ID` only through
-/// the capture file. Before notifying, save a root rollout header under
-/// `$CODEX_HOME`: set `session_id` to `id` and use a string `source`.
+/// Install a `codex` stub to record argv and report through the injected
+/// notify program alone, as the real TUI does. It saves the root's rollout
+/// header under `$CODEX_HOME`, notifies for the root, then notifies for the
+/// title thread, which has no rollout, and finally touches the `notified`
+/// marker. The notify program is read back from the `notify=["<path>"]`
+/// override in its own argv.
 fn install_codex_stub(s: &Scratch) {
     let body = format!(
         r#"printf '%s\n' '{marker}' "$@" >> '{rec}'
 if [ -n "$FLEETCOM_CAPTURE_FILE" ]; then
   day="$CODEX_HOME/sessions/2026/10/04"
   mkdir -p "$day"
-  printf '%s\n' '{{"timestamp":"2026-10-04T17:49:56.012Z","ordinal":0,"type":"session_meta","payload":{{"id":"{id}","session_id":"{id}","source":"cli"}}}}' > "$day/rollout-2026-10-04T13-49-56-{id}.jsonl"
-  printf '{{"type":"agent-turn-complete","thread-id":"{id}"}}' > "$FLEETCOM_CAPTURE_FILE"
+  printf '%s\n' '{header}' > "$day/rollout-2026-10-04T13-49-56-{id}.jsonl"
+  script=''
+  prev=''
+  for a in "$@"; do
+    if [ "$prev" = -c ]; then
+      case "$a" in notify=*) script=${{a#notify=}}; script=${{script#'["'}}; script=${{script%'"]'}} ;; esac
+    fi
+    prev="$a"
+  done
+  "$script" '{root}'
+  "$script" '{title}'
+  : > '{notified}'
 fi"#,
         marker = RUN_MARKER,
         rec = s.record("codex").display(),
+        header = CODEX_HEADER,
         id = CODEX_ID,
+        root = turn_complete(CODEX_ID),
+        title = turn_complete(CODEX_TITLE),
+        notified = s.notified().display(),
     );
     install_stub(s, "codex", &body);
 }
@@ -249,28 +285,33 @@ fn save_once(stream: &mut UnixStream, recipe: &Path, name: &str) -> String {
     std::fs::read_to_string(recipe).unwrap()
 }
 
-/// Check whether a daemon namespace contains a non-empty task capture file.
-/// Assets live under `<runtime>/<pid>-<nonce>/`, so the runtime root itself
-/// contains no task files.
-fn has_capture(runtime: &Path) -> bool {
-    std::fs::read_dir(runtime).is_ok_and(|namespaces| {
-        namespaces
-            .flatten()
-            .filter(|ns| ns.path().is_dir())
-            .any(|ns| {
-                std::fs::read_dir(ns.path()).is_ok_and(|files| {
-                    files.flatten().any(|e| {
-                        let name = e.file_name();
-                        let Some(n) = name.to_str() else {
-                            return false;
-                        };
-                        n.starts_with("task-")
-                            && n.ends_with(".json")
-                            && e.metadata().is_ok_and(|m| m.len() > 0)
-                    })
-                })
-            })
-    })
+/// Every file in the daemon namespaces under `runtime`, as
+/// `(name, contents)` sorted by name. Assets live under
+/// `<runtime>/<pid>-<nonce>/`, so the runtime root itself holds no task files.
+fn namespace_files(runtime: &Path) -> Vec<(String, String)> {
+    let mut files: Vec<(String, String)> = std::fs::read_dir(runtime)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|ns| ns.path().is_dir())
+        .flat_map(|ns| std::fs::read_dir(ns.path()).into_iter().flatten().flatten())
+        .map(|e| {
+            (
+                e.file_name().to_string_lossy().into_owned(),
+                std::fs::read_to_string(e.path()).unwrap_or_default(),
+            )
+        })
+        .collect();
+    files.sort();
+    files
+}
+
+/// Contents of the single task capture file under `runtime`, when present.
+fn capture_slot(runtime: &Path) -> Option<String> {
+    namespace_files(runtime)
+        .into_iter()
+        .find(|(name, _)| name.starts_with("task-") && name.ends_with(".json"))
+        .map(|(_, contents)| contents)
 }
 
 /// Claude instrumentation captures an ID without leaking its injected flags
@@ -325,8 +366,9 @@ fn claude_spawn_save_load_resumes_the_conversation() {
     stop_daemon(&mut daemon);
 }
 
-/// A Codex capture payload persists the resume command, and loading that command
-/// reapplies the notifier instrumentation.
+/// A Codex notification validated by the daemon's own binary persists the
+/// resume command, the title thread's later notification leaves it intact,
+/// and loading that command reapplies the notifier instrumentation.
 #[test]
 fn codex_capture_file_drives_save_and_load_resumes() {
     let s = Scratch::new("codex");
@@ -351,10 +393,29 @@ fn codex_capture_file_drives_save_and_load_resumes() {
         "a bare spawn must receive the two overrides and nothing else"
     );
 
-    // The stub exits silently, so its capture write is the only id channel;
-    // wait for the file, then a single save must persist the resuming form.
-    let ok = wait_until(Duration::from_secs(10), || has_capture(&s.runtime()));
-    assert!(ok, "the codex stub never wrote its capture file");
+    // The stub exits silently, so the notify script is the only id channel.
+    // Wait for both notifications: the root's must have written the bare
+    // UUID and the title thread's must have left it alone, with no temporary
+    // file beside it. A single save must then persist the resuming form.
+    let ok = wait_until(Duration::from_secs(10), || s.notified().exists());
+    assert!(ok, "the codex stub never finished notifying");
+    let files = namespace_files(&s.runtime());
+    let names: Vec<&str> = files.iter().map(|(name, _)| name.as_str()).collect();
+    assert_eq!(
+        names,
+        [
+            "claude-settings.json",
+            "codex-notify.sh",
+            "omp-capture.js",
+            "task-1-0.json"
+        ],
+        "the slot must be renamed into place with nothing left behind"
+    );
+    assert_eq!(
+        capture_slot(&s.runtime()).as_deref(),
+        Some(CODEX_ID),
+        "the slot must hold the bare root after the title thread's notification"
+    );
     let recipe = save_once(&mut stream, &s.recipe("story"), "story");
     assert!(
         recipe.contains(&format!("codex resume '{CODEX_ID}'")),
@@ -379,6 +440,54 @@ fn codex_capture_file_drives_save_and_load_resumes() {
     );
 
     stop_daemon(&mut daemon);
+}
+
+/// The notify mode runs headless, before the terminal check and daemon
+/// autostart: without a tty it writes the bare root and exits 0, prints
+/// nothing, refuses the title thread with exit 1 and no write, and is a
+/// no-op without a capture path.
+#[test]
+fn codex_notify_mode_runs_headless() {
+    let s = Scratch::new("notify_mode");
+    let home = s.root.join("codex-home");
+    let day = home.join("sessions/2026/10/04");
+    std::fs::create_dir_all(&day).unwrap();
+    std::fs::write(
+        day.join(format!("rollout-2026-10-04T13-49-56-{CODEX_ID}.jsonl")),
+        format!("{CODEX_HEADER}\n"),
+    )
+    .unwrap();
+    let cap = s.runtime().join("task-1-0.json");
+    let notify = |payload: &str, capture: Option<&Path>| {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_fleetcom"));
+        cmd.arg("--codex-notify-v1")
+            .arg(payload)
+            .env("CODEX_HOME", &home)
+            .stdin(Stdio::null());
+        match capture {
+            Some(path) => cmd.env("FLEETCOM_CAPTURE_FILE", path),
+            None => cmd.env_remove("FLEETCOM_CAPTURE_FILE"),
+        };
+        let out = cmd.output().unwrap();
+        assert!(out.stdout.is_empty(), "the mode prints nothing: {out:?}");
+        assert!(out.stderr.is_empty(), "the mode prints nothing: {out:?}");
+        out.status.code()
+    };
+
+    assert_eq!(notify(&turn_complete(CODEX_ID), None), Some(1));
+    assert!(!cap.exists(), "no capture path, no write");
+    assert_eq!(notify(&turn_complete(CODEX_TITLE), Some(&cap)), Some(1));
+    assert!(!cap.exists(), "a refused thread writes nothing");
+    assert_eq!(notify(&turn_complete(CODEX_ID), Some(&cap)), Some(0));
+    assert_eq!(std::fs::read_to_string(&cap).unwrap(), CODEX_ID);
+    assert_eq!(notify(&turn_complete(CODEX_TITLE), Some(&cap)), Some(1));
+    assert_eq!(std::fs::read_to_string(&cap).unwrap(), CODEX_ID);
+    let mut names: Vec<String> = std::fs::read_dir(s.runtime())
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    assert_eq!(names, ["task-1-0.json"], "no temporary file may remain");
 }
 
 /// A persisted resume command survives daemon replacement and targets the same

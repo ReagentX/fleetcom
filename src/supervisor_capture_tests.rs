@@ -7,14 +7,15 @@ use crate::{
 
 // --- session-capture wiring -------------------------------------------
 
-/// Install an executable stub that records `FLEETCOM_CAPTURE_FILE` and
-/// its argv, one token per line, then exits.
+/// Install an executable stub that records `FLEETCOM_CAPTURE_FILE`,
+/// `FLEETCOM_BINARY`, and its argv, one token per line, then exits.
 fn install_stub(bin: &Path, name: &str, out: &Path) {
     install_script(
         bin,
         name,
         &format!(
             "printf '%s' \"$FLEETCOM_CAPTURE_FILE\" > '{out}/capenv'\n\
+             printf '%s' \"$FLEETCOM_BINARY\" > '{out}/binenv'\n\
              printf '%s\\n' \"$@\" > '{out}/argv'",
             out = out.display()
         ),
@@ -461,7 +462,8 @@ fn remove_deletes_the_capture_file_under_the_spawn_root() {
 }
 
 /// For a `codex` spawn, add `notify=[...]` with the executable capture script,
-/// then the override for embedded mode.
+/// then the override for embedded mode, and name this process's own
+/// executable in `FLEETCOM_BINARY` for the script's validation step.
 #[test]
 fn spawn_codex_installs_the_notify_and_embedded_overrides() {
     use std::os::unix::fs::PermissionsExt;
@@ -495,6 +497,11 @@ fn spawn_codex_installs_the_notify_and_embedded_overrides() {
     assert!(
         meta.permissions().mode() & 0o111 != 0,
         "codex execs the notify program directly; it must be executable"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.join("binenv")).unwrap(),
+        std::env::current_exe().unwrap().to_string_lossy(),
+        "the child env must name the supervisor's own executable"
     );
     let t = &s.tasks[0];
     assert_eq!(t.command, "codex");
@@ -1030,9 +1037,9 @@ const CODEX_ROOT: &str = "019f5453-de22-7240-b2e5-0d32692aa6d9";
 const CODEX_CHILD: &str = "019f5454-0c11-7b33-9a4e-5f0e6d7c8b9a";
 const CODEX_TITLE: &str = "019f5453-de9f-7e61-8c0d-1a2b3c4d5e6f";
 
-/// Capture contents for a completed turn of `thread`: the notification JSON
-/// written by the injected notifier. `last` is the final assistant message,
-/// already escaped for a JSON string.
+/// Notification JSON for a completed turn of `thread`, as codex passes it
+/// to the injected notifier. `last` is the final assistant message, already
+/// escaped for a JSON string.
 fn turn_complete(thread: &str, last: &str) -> String {
     format!(
         r#"{{"type":"agent-turn-complete","thread-id":"{thread}","turn-id":"t","cwd":"/w","input-messages":["ping"],"last-assistant-message":"{last}"}}"#
@@ -1044,11 +1051,20 @@ fn title_turn() -> String {
     turn_complete(CODEX_TITLE, r#"{\"title\":\"Ping the sub-agent\"}"#)
 }
 
-/// Replace the sole task's capture with `payload`, save under `name`, and
-/// return the persisted command.
-fn saved_command(s: &mut Supervisor, config: &Path, name: &str, payload: &str) -> String {
+/// Run the `--codex-notify-v1` step in-process for the sole task, as the
+/// injected script's binary call would: the task's capture file and
+/// `codex_home` are its environment. Return the root it wrote.
+fn arrive(s: &Supervisor, codex_home: &Path, payload: &str) -> Option<String> {
     let cap = s.tasks[0].capture_file.clone().expect("capture file set");
-    std::fs::write(&cap, payload).unwrap();
+    crate::harness::record_arrival(payload, &|key| match key {
+        crate::harness::CAPTURE_ENV => Some(cap.clone()),
+        "CODEX_HOME" => Some(codex_home.to_path_buf()),
+        _ => None,
+    })
+}
+
+/// Save under `name` and return the persisted command of the sole task.
+fn saved_command(s: &mut Supervisor, config: &Path, name: &str) -> String {
     save_and_read(s, config, name);
     session::load_in(&config.join("sessions"), name)
         .unwrap()
@@ -1059,11 +1075,26 @@ fn saved_command(s: &mut Supervisor, config: &Path, name: &str, payload: &str) -
         .cmd
 }
 
-/// Report three threads from one codex process in the order observed after
-/// the first prompt: the title thread, a sub-agent, then the conversation.
-/// Replace the capture on each write. With no rollout for the title thread,
-/// preserve the authored command. Resolve the sub-agent to its conversation
-/// and the conversation to itself.
+/// Install a stand-in for `fleetcom --codex-notify-v1` at `<bin>/fleetcom`
+/// that writes `CAP_ID` over the capture file. The real mode cannot run from
+/// the unit-test binary, whose `main` is the test harness, so stubs that
+/// invoke the injected script name this file in `FLEETCOM_BINARY`.
+fn install_fake_fleetcom(bin: &Path) -> PathBuf {
+    install_script(
+        bin,
+        "fleetcom",
+        &format!("printf '%s' '{CAP_ID}' > \"$FLEETCOM_CAPTURE_FILE\""),
+    );
+    bin.join("fleetcom")
+}
+
+/// Report three threads from one codex process through the arrival step in
+/// the order observed after the first prompt: the title thread, a sub-agent,
+/// then the conversation, and the title thread again, which lands after the
+/// root in most sessions. With no rollout for the title thread, nothing is
+/// written and the authored command is preserved. Resolve the sub-agent to
+/// its conversation and the conversation to itself, and keep that root
+/// across the later title notification.
 #[test]
 fn codex_capture_resolves_each_notifying_thread_to_the_root() {
     let dir = scratch("codex_threads");
@@ -1090,26 +1121,36 @@ fn codex_capture_resolves_each_notifying_thread_to_the_root() {
     spawn(&mut s, "codex", dir.to_path_buf());
     assert!(s.tasks[0].resume_id.is_none(), "codex pins no id at launch");
 
+    assert_eq!(arrive(&s, &codex_home, &title_turn()), None);
     assert_eq!(
-        saved_command(&mut s, &config, "title", &title_turn()),
+        saved_command(&mut s, &config, "title"),
         "codex",
         "the title thread must not become the resume target"
     );
     let resumes_root = format!("codex resume '{CODEX_ROOT}'");
     assert_eq!(
-        saved_command(
-            &mut s,
-            &config,
-            "child",
-            &turn_complete(CODEX_CHILD, "pong")
-        ),
+        arrive(&s, &codex_home, &turn_complete(CODEX_CHILD, "pong")).as_deref(),
+        Some(CODEX_ROOT)
+    );
+    assert_eq!(
+        saved_command(&mut s, &config, "child"),
         resumes_root,
         "a sub-agent's turn must resume the conversation that spawned it"
     );
     assert_eq!(
-        saved_command(&mut s, &config, "root", &turn_complete(CODEX_ROOT, "done")),
+        arrive(&s, &codex_home, &turn_complete(CODEX_ROOT, "done")).as_deref(),
+        Some(CODEX_ROOT)
+    );
+    assert_eq!(
+        saved_command(&mut s, &config, "root"),
         resumes_root,
         "the conversation's own turn must resume it"
+    );
+    assert_eq!(arrive(&s, &codex_home, &title_turn()), None);
+    assert_eq!(
+        saved_command(&mut s, &config, "after_title"),
+        resumes_root,
+        "a title notification after the root's must leave the root in place"
     );
 }
 
@@ -1139,18 +1180,24 @@ fn refused_codex_capture_keeps_the_launch_target() {
     spawn(&mut s, &authored, dir.to_path_buf());
     assert_eq!(s.tasks[0].resume_id.as_deref(), Some(CAP_ID));
 
+    assert_eq!(arrive(&s, &codex_home, &title_turn()), None);
     assert_eq!(
-        saved_command(&mut s, &config, "title", &title_turn()),
+        saved_command(&mut s, &config, "title"),
         authored,
         "the title thread must not displace the launch target"
     );
+    assert_eq!(arrive(&s, &codex_home, &turn_complete(FOREIGN, "hi")), None);
     assert_eq!(
-        saved_command(&mut s, &config, "foreign", &turn_complete(FOREIGN, "hi")),
+        saved_command(&mut s, &config, "foreign"),
         authored,
         "a thread outside the task's Codex home must not displace the launch target"
     );
     assert_eq!(
-        saved_command(&mut s, &config, "root", &turn_complete(CODEX_ROOT, "done")),
+        arrive(&s, &codex_home, &turn_complete(CODEX_ROOT, "done")).as_deref(),
+        Some(CODEX_ROOT)
+    );
+    assert_eq!(
+        saved_command(&mut s, &config, "root"),
         format!("codex resume '{CODEX_ROOT}'"),
         "the task's own root thread must still outrank the launch target"
     );
@@ -1181,7 +1228,8 @@ fn harness_home_prefers_the_tool_var_then_home() {
 }
 
 /// With only `HOME` in the launch environment, notify routing reads
-/// `<home>/.codex/config.toml`.
+/// `<home>/.codex/config.toml`: an unchainable route there leaves the launch
+/// with the embedded override alone.
 #[test]
 fn home_only_launch_env_targets_the_clients_dot_codex() {
     let dir = scratch("home_resolve");
@@ -1216,8 +1264,8 @@ fn home_only_launch_env_targets_the_clients_dot_codex() {
     let argv = wait_argv(&mut s, &dir.join("argv"));
     assert_eq!(
         argv,
-        [""],
-        "the guard must read <home>/.codex/config.toml and inject nothing"
+        ["-c", "features.daemon_auto_start=false"],
+        "the guard must read <home>/.codex/config.toml and inject only embedded mode"
     );
     assert!(reap_until(&mut s, Duration::from_secs(5), |s| s.tasks[0]
         .finished
@@ -1248,14 +1296,19 @@ fn stale_inherited_notify_chain_is_never_executed() {
     let record = dir.join("stale-record");
     write_executable(&stale, &format!("touch '{}'", record.display()));
 
-    // The stub invokes the injected notify script the way codex would.
+    // The stub invokes the injected notify script the way codex would,
+    // naming the fake binary for the script's validation step.
     let payload = format!(r#"{{"type":"agent-turn-complete","thread-id":"{CAP_ID}"}}"#);
+    let fake = install_fake_fleetcom(&bin);
     // The notify script sits beside the capture file, in a namespace
     // whose nonce is unknowable before spawn: derive it from the env.
     install_script(
         &bin,
         "codex",
-        &format!("\"${{FLEETCOM_CAPTURE_FILE%/*}}/codex-notify.sh\" '{payload}'"),
+        &format!(
+            "FLEETCOM_BINARY='{}' \"${{FLEETCOM_CAPTURE_FILE%/*}}/codex-notify.sh\" '{payload}'",
+            fake.display()
+        ),
     );
     let mut ctx = agent_ctx_plus(
         &bin,
@@ -1275,8 +1328,8 @@ fn stale_inherited_notify_chain_is_never_executed() {
     let cap = s.tasks[0].capture_file.clone().expect("capture file set");
     assert_eq!(
         std::fs::read_to_string(&cap).unwrap(),
-        payload,
-        "the capture write must land before the script exits"
+        CAP_ID,
+        "the validation step must land before the script exits"
     );
     assert!(
         !record.exists(),
@@ -1323,7 +1376,7 @@ fn agent_save_without_any_id_keeps_the_plain_command() {
 }
 
 /// A representable `notify` assignment runs through the injected notifier
-/// after the capture write.
+/// after the validation step.
 #[test]
 fn config_toml_notify_chains_through_the_injected_script() {
     use crate::harness::NOTIFY_CHAIN_ENV;
@@ -1342,17 +1395,20 @@ fn config_toml_notify_chains_through_the_injected_script() {
     .unwrap();
 
     // The stub records argv and the chain env, then invokes the notify
-    // script with notification JSON as the final argument.
+    // script with notification JSON as the final argument, naming the fake
+    // binary for the script's validation step.
     let payload = format!(r#"{{"type":"agent-turn-complete","thread-id":"{CAP_ID}"}}"#);
+    let fake = install_fake_fleetcom(&bin);
     install_script(
         &bin,
         "codex",
         &format!(
             "printf '%s\\n' \"$@\" > '{out}/argv'\n\
                  printf '%s' \"${chain}\" > '{out}/chainenv'\n\
-                 \"${{FLEETCOM_CAPTURE_FILE%/*}}/codex-notify.sh\" '{payload}'",
+                 FLEETCOM_BINARY='{fake}' \"${{FLEETCOM_CAPTURE_FILE%/*}}/codex-notify.sh\" '{payload}'",
             out = dir.display(),
             chain = NOTIFY_CHAIN_ENV,
+            fake = fake.display(),
         ),
     );
     let mut s = sup_ctx(agent_ctx_plus(
@@ -1385,8 +1441,8 @@ fn config_toml_notify_chains_through_the_injected_script() {
     let cap = s.tasks[0].capture_file.clone().unwrap();
     assert_eq!(
         std::fs::read_to_string(&cap).unwrap(),
-        payload,
-        "the capture write must precede the chain handoff"
+        CAP_ID,
+        "the validation step must precede the chain handoff"
     );
     assert_eq!(
         current_resume_id(&s.tasks[0]).as_deref(),
@@ -1395,8 +1451,10 @@ fn config_toml_notify_chains_through_the_injected_script() {
     );
 }
 
-/// An unrepresentable `notify` value disables injection, while a commented
-/// assignment defines no route and leaves injection enabled.
+/// An unrepresentable `notify` value disables capture injection: the launch
+/// carries the embedded override alone and the status line says why. A
+/// commented assignment defines no route, so injection returns and no notice
+/// is sent.
 #[test]
 fn unrepresentable_config_notify_suppresses_injection() {
     let dir = scratch("cfg_guard");
@@ -1416,12 +1474,25 @@ fn unrepresentable_config_notify_suppresses_injection() {
         dir.to_path_buf(),
         &[("CODEX_HOME", &codex_home)],
     ));
+    let notices = |s: &mut Supervisor| -> Vec<String> {
+        s.drain()
+            .into_iter()
+            .filter_map(|e| match e {
+                Event::Status(m) => Some(m),
+                _ => None,
+            })
+            .collect()
+    };
     spawn(&mut s, "codex", dir.to_path_buf());
+    assert_eq!(
+        notices(&mut s),
+        ["task 1: codex capture unavailable: `notify` config can't be chained"]
+    );
     let argv = wait_argv(&mut s, &dir.join("argv"));
     assert_eq!(
         argv,
-        [""],
-        "fleetcom must preserve an unrepresentable notify and inject nothing"
+        ["-c", "features.daemon_auto_start=false"],
+        "fleetcom must preserve an unrepresentable notify and inject only embedded mode"
     );
 
     // The same route commented out is inert: the injection returns.
@@ -1432,6 +1503,7 @@ fn unrepresentable_config_notify_suppresses_injection() {
     .unwrap();
     std::fs::remove_file(dir.join("argv")).unwrap();
     spawn(&mut s, "codex", dir.to_path_buf());
+    assert_eq!(notices(&mut s), Vec::<String>::new());
     let argv = wait_argv(&mut s, &dir.join("argv"));
     assert!(
         argv.iter().any(|a| a.starts_with("notify=[")),

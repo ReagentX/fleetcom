@@ -750,6 +750,7 @@ impl Supervisor {
         let mut exec = std::borrow::Cow::Borrowed(command);
         let mut env = std::borrow::Cow::Borrowed(env);
         let mut meta = None;
+        let mut notice = None;
         if let Some((h, inv)) = harness::detect(command)
             && let Some(paths) = self.ensure_capture_assets().map(|a| a.paths_for(id, run))
         {
@@ -758,6 +759,7 @@ impl Supervisor {
             exec = format!("{command}{}", plan.args_suffix).into();
             env.to_mut().extend(plan.env);
             let resume_id = plan.injected_id.or_else(|| inv.known_id());
+            notice = plan.notice;
             meta = Some((h, home, paths.capture_file, resume_id));
         }
         let mut task = Task::spawn(
@@ -779,6 +781,10 @@ impl Supervisor {
             task.resume_id = resume_id;
         }
         task.run = run;
+        // Report reduced instrumentation only for a task that exists.
+        if let Some(notice) = notice {
+            self.status(format!("task {id}: {notice}"));
+        }
         Ok(task)
     }
 

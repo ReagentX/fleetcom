@@ -14,7 +14,7 @@ Choose the operating mode with launch arguments. Use keys to control the dashboa
 | `fleetcom --help` / `-h` | Print usage and exit |
 | `fleetcom --version` / `-V` | Print the version and exit |
 
-`--daemon` is internal. The daemon is started automatically when needed. The first non-`-` argument is treated as the session name; a second is rejected.
+`--daemon` and `--codex-notify-v1` are internal. The daemon is started automatically when needed; the notify mode is run by the notifier injected into `codex` tasks, see [agent session resume](agent-resume.md#codex). The first non-`-` argument is treated as the session name; a second is rejected.
 
 ## Dashboard
 

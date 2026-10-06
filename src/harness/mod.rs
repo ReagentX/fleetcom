@@ -30,7 +30,7 @@ use std::{
 };
 
 pub use claude::Claude;
-pub use codex::Codex;
+pub use codex::{Codex, record_arrival};
 pub use grok::Grok;
 pub use omp::Omp;
 
@@ -41,6 +41,12 @@ pub const CAPTURE_ENV: &str = "FLEETCOM_CAPTURE_FILE";
 /// by newlines. Instrumentation sets an empty value when no notifier is
 /// configured so inherited values cannot reach the capture script.
 pub const NOTIFY_CHAIN_ENV: &str = "FLEETCOM_NOTIFY_CHAIN";
+
+/// Environment variable naming the fleetcom binary that the injected `codex`
+/// notify script runs as `--codex-notify-v1`. Set per launch from the
+/// daemon's own path so the script validates with the binary that built it;
+/// absent when that path is unusable, so the script skips the call.
+pub const BINARY_ENV: &str = "FLEETCOM_BINARY";
 
 /// Detection, capture, and resume behavior for one agent CLI.
 pub trait Harness: Sync {
@@ -215,6 +221,11 @@ pub struct CapturePaths {
     /// Extension module loaded by `omp -e`, which appends to the user's own
     /// extensions rather than replacing them.
     pub omp_capture: PathBuf,
+    /// This daemon's own executable, checked at allocation to be a regular
+    /// file with an execute bit. `None` when `current_exe` is unusable: on
+    /// Linux, `/proc/self/exe` reads `<path> (deleted)` once the binary is
+    /// replaced on disk under the running daemon.
+    pub fleetcom_binary: Option<PathBuf>,
 }
 
 /// Spawn-time additions for one instrumented launch.
@@ -227,6 +238,9 @@ pub struct SpawnPlan {
     pub env: Vec<(OsString, OsString)>,
     /// The session ID chosen at launch, when the harness can pin one.
     pub injected_id: Option<String>,
+    /// One-line reason the launch carries less instrumentation than usual.
+    /// The supervisor reports it on the status line once the task spawns.
+    pub notice: Option<String>,
 }
 
 /// Shell metacharacters that make the program token unsafe to instrument.
@@ -356,6 +370,7 @@ pub(crate) mod fixtures {
             claude_settings: PathBuf::from("/tmp/Application Support/fleetcom.json"),
             codex_notify: PathBuf::from("/tmp/Application Support/notify.sh"),
             omp_capture: PathBuf::from("/tmp/Application Support/omp-capture.js"),
+            fleetcom_binary: Some(PathBuf::from("/tmp/Application Support/fleetcom")),
         }
     }
 

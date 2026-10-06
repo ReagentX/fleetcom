@@ -44,6 +44,7 @@ impl Harness for Omp {
                 capture.capture_file.clone().into_os_string(),
             )],
             injected_id: None,
+            notice: None,
         }
     }
 

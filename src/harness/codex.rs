@@ -1,24 +1,29 @@
-//! A Codex ID cannot be selected at launch. Inject a `notify` override,
-//! chain compatible configured notifiers, and explicitly enable embedded mode
-//! with a second override.
+//! A Codex ID cannot be selected at launch. Explicitly enable embedded mode
+//! with one override on every launch, and when the configured notifier can
+//! be chained and this binary is usable, inject a `notify` override as well.
 //!
 //! Notifications are emitted for every thread in one Codex process: the
 //! conversation on screen, each spawned sub-agent, and the hidden thread used
 //! to title a new session. Only the first is the task's conversation. Resuming
 //! a sub-agent with an unloaded parent or the unsaved title thread exits 1.
-//! In `parse_capture`, use the notified thread's rollout header to resolve its
-//! session tree's root. Reject threads that cannot be classified.
+//! The injected script hands each notification to `fleetcom --codex-notify-v1`
+//! ([`record_arrival`]), which resolves the notified thread to its session
+//! tree's root through the rollout header and replaces the capture file with
+//! the bare root UUID. A thread that cannot be classified writes nothing, so
+//! the title thread, whose notification lands before or after the root's,
+//! never erases an accepted root. `parse_capture` then accepts the slot only
+//! as that one UUID.
 
 use std::{
     fmt::Write as _,
-    fs,
+    fs, io,
     io::{BufRead, BufReader, Read},
     path::{Path, PathBuf},
 };
 
 use super::{
-    CAPTURE_ENV, CapturePaths, Harness, Invocation, NOTIFY_CHAIN_ENV, SpawnPlan, capture_id,
-    home_root, resolve_home, shell_quote,
+    BINARY_ENV, CAPTURE_ENV, CapturePaths, Harness, Invocation, NOTIFY_CHAIN_ENV, SpawnPlan,
+    capture_id, home_root, is_uuid, resolve_home, shell_quote,
 };
 
 /// Config override for explicitly launching in embedded mode.
@@ -52,6 +57,11 @@ impl Harness for Codex {
         ("codex", "resume")
     }
 
+    /// Every launch carries the embedded override: without it, `codex`
+    /// attaches to its shared background server and killing the task kills
+    /// only the TUI client. The notify override and its environment ride
+    /// along only when the configured route can be chained and this binary
+    /// is usable; otherwise the plan explains why capture is off.
     fn instrument(
         &self,
         // Both accepted shapes take the same injection; codex cannot pin an
@@ -60,59 +70,119 @@ impl Harness for Codex {
         capture: &CapturePaths,
         home: Option<&Path>,
     ) -> SpawnPlan {
+        let mut plan = SpawnPlan {
+            args_suffix: format!(" -c {}", shell_quote(EMBEDDED_OVERRIDE)),
+            ..SpawnPlan::default()
+        };
         let chain = match config_notify_route(home) {
             // Set an explicit empty value to exclude an inherited chain from the
             // injected script.
             NotifyRoute::Vacant => String::new(),
-            // Chain the configured notifier after the capture write: exec this argv
-            // with the payload appended from the injected script.
+            // Chain the configured notifier after the validation step: exec this
+            // argv with the payload appended from the injected script.
             NotifyRoute::Chain(argv) => argv.join("\n"),
             // Skip injection when the configured route cannot be encoded.
-            NotifyRoute::Opaque => return SpawnPlan::default(),
+            NotifyRoute::Opaque => {
+                plan.notice = Some(format!("{CAPTURE_OFF}: `notify` config can't be chained"));
+                return plan;
+            }
+        };
+        // The script runs this binary to validate each notification. Without
+        // a usable path there is nothing to run, so inject nothing: an
+        // unvalidated slot would be worse than none.
+        let Some(binary) = &capture.fleetcom_binary else {
+            plan.notice = Some(format!(
+                "{CAPTURE_OFF}: fleetcom binary replaced; restart the daemon"
+            ));
+            return plan;
         };
         let toml = format!(
             "notify=[\"{}\"]",
             toml_escape(&capture.codex_notify.to_string_lossy())
         );
-        SpawnPlan {
-            args_suffix: format!(
-                " -c {} -c {}",
-                shell_quote(&toml),
-                shell_quote(EMBEDDED_OVERRIDE)
+        plan.args_suffix = format!(
+            " -c {} -c {}",
+            shell_quote(&toml),
+            shell_quote(EMBEDDED_OVERRIDE)
+        );
+        plan.env = vec![
+            (
+                CAPTURE_ENV.into(),
+                capture.capture_file.clone().into_os_string(),
             ),
-            env: vec![
-                (
-                    CAPTURE_ENV.into(),
-                    capture.capture_file.clone().into_os_string(),
-                ),
-                (NOTIFY_CHAIN_ENV.into(), chain.into()),
-            ],
-            injected_id: None,
-        }
+            (NOTIFY_CHAIN_ENV.into(), chain.into()),
+            (BINARY_ENV.into(), binary.clone().into_os_string()),
+        ];
+        plan
     }
 
-    /// Accept an `agent-turn-complete` notification and return the root
-    /// thread of the notified thread's session tree: the conversation the
-    /// task's TUI is on. For a sub-agent, return its root. If the thread cannot
-    /// be classified in [`root_thread`], return `None` to try the next ID source.
-    ///
-    /// Look up only the thread ID from the task's own notification and
-    /// classify it from its rollout header. Do not infer conversation
-    /// ownership from other sessions in the store.
+    /// Accept the slot only as exactly one bare root UUID: the v1 format
+    /// written by [`record_arrival`]. No trimming: the writer emits no
+    /// newline, so trailing whitespace marks a different writer. Validation
+    /// happened at arrival, when the rollout header was on disk; the payload
+    /// is not reparsed and no rollout is read here, so a root stays accepted
+    /// after codex compresses its rollout. An old-format JSON slot fails
+    /// [`is_uuid`] and is refused.
     fn parse_capture(
         &self,
         payload: &str,
         // Notifications for every thread originate in the task's own process.
         _pid: Option<u32>,
-        home: Option<&Path>,
+        // The home was consumed at arrival.
+        _home: Option<&Path>,
     ) -> Option<String> {
-        let v = jzon::parse(payload).ok()?;
-        if v["type"].as_str() != Some("agent-turn-complete") {
-            return None;
-        }
-        let thread = capture_id(&v, "thread-id")?;
-        root_thread(&home_root(home, ".codex")?, &thread)
+        is_uuid(payload).then(|| payload.to_string())
     }
+}
+
+/// Status-line prefix for a launch that carries the embedded override alone.
+const CAPTURE_OFF: &str = "codex capture unavailable";
+
+/// The `--codex-notify-v1` mode: validate one notification at arrival and
+/// replace the capture file with its root UUID. `env` is the process's own
+/// environment, inherited from the `codex` launch: [`CAPTURE_ENV`] names the
+/// slot, and the home resolves as in [`Codex::resolve_home`].
+///
+/// Return the root written, or `None` when nothing was written: no capture
+/// path, a payload that is not an `agent-turn-complete` for a strict thread
+/// ID, a thread [`root_thread`] cannot classify, or a failed write. The slot
+/// only ever moves from one accepted root to another.
+pub fn record_arrival(payload: &str, env: &dyn Fn(&str) -> Option<PathBuf>) -> Option<String> {
+    let capture = env(CAPTURE_ENV).filter(|p| !p.as_os_str().is_empty())?;
+    let root = arrival_root(payload, Codex.resolve_home(env).as_deref())?;
+    replace_slot(&capture, &root).ok()?;
+    Some(root)
+}
+
+/// Resolve an `agent-turn-complete` notification to the root thread of the
+/// notified thread's session tree: the conversation the task's TUI is on.
+/// For a sub-agent, that is its root. Return `None` for any other payload
+/// type, a non-strict thread ID, or a thread [`root_thread`] cannot classify.
+///
+/// Look up only the thread ID from the task's own notification and classify
+/// it from its rollout header. Do not infer conversation ownership from
+/// other sessions in the store.
+fn arrival_root(payload: &str, home: Option<&Path>) -> Option<String> {
+    let v = jzon::parse(payload).ok()?;
+    if v["type"].as_str() != Some("agent-turn-complete") {
+        return None;
+    }
+    let thread = capture_id(&v, "thread-id")?;
+    root_thread(&home_root(home, ".codex")?, &thread)
+}
+
+/// Write `root` to `<capture>.<pid>.tmp` beside the capture file and rename
+/// it over the destination, so a reader never sees a partial slot. Remove the
+/// temporary file when either step fails.
+fn replace_slot(capture: &Path, root: &str) -> io::Result<()> {
+    let mut tmp = capture.as_os_str().to_owned();
+    tmp.push(format!(".{}.tmp", std::process::id()));
+    let tmp = PathBuf::from(tmp);
+    let result = fs::write(&tmp, root).and_then(|()| fs::rename(&tmp, capture));
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    result
 }
 
 /// Resolve `thread` to the root thread of its session tree from the header of
@@ -195,7 +265,7 @@ fn read_header(path: &Path) -> Option<String> {
 enum NotifyRoute {
     /// No active route, so the capture notifier can run alone.
     Vacant,
-    /// One representable route, executed after the capture write.
+    /// One representable route, executed after the validation step.
     Chain(Vec<String>),
     /// A route that cannot be represented without changing its argv. Capture
     /// injection is disabled so the route remains untouched.
@@ -358,11 +428,11 @@ fn toml_escape(s: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
+    use std::{ffi::OsString, path::PathBuf};
 
     use super::*;
     use crate::{
-        harness::fixtures::{assert_all_opaque, paths},
+        harness::fixtures::{OTHER, assert_all_opaque, paths},
         testutil::{Scratch, codex_session_meta, install_codex_rollout, install_codex_root, temp},
     };
 
@@ -376,11 +446,39 @@ mod tests {
     /// Hidden title thread ID, reported through notify but never saved in a rollout.
     const TITLE: &str = "019f5453-de9f-7e61-8c0d-1a2b3c4d5e6f";
 
-    /// Suffix of every instrumented launch that uses [`paths`].
+    /// Suffix of every fully instrumented launch that uses [`paths`].
     const SUFFIX: &str = concat!(
         r#" -c 'notify=["/tmp/Application Support/notify.sh"]'"#,
         " -c 'features.daemon_auto_start=false'",
     );
+    /// Suffix of a launch whose capture is off: the embedded override alone.
+    const EMBEDDED_ONLY: &str = " -c 'features.daemon_auto_start=false'";
+
+    /// Environment of a fully instrumented launch that uses [`paths`] with
+    /// `chain` as the encoded notifier argv.
+    fn full_env(chain: &str) -> Vec<(OsString, OsString)> {
+        vec![
+            (
+                CAPTURE_ENV.into(),
+                PathBuf::from("/tmp/cap/session.json").into_os_string(),
+            ),
+            (NOTIFY_CHAIN_ENV.into(), chain.into()),
+            (
+                BINARY_ENV.into(),
+                PathBuf::from("/tmp/Application Support/fleetcom").into_os_string(),
+            ),
+        ]
+    }
+
+    /// The plan of a launch whose capture is off, explained by `why`.
+    fn embedded_only(why: &str) -> SpawnPlan {
+        SpawnPlan {
+            args_suffix: EMBEDDED_ONLY.into(),
+            env: Vec::new(),
+            injected_id: None,
+            notice: Some(format!("codex capture unavailable: {why}")),
+        }
+    }
 
     /// Codex-specific opaque shapes: subcommands (including `exec` and
     /// single-letter aliases), flags, `-c` overrides, `--resume` (the wrong
@@ -419,7 +517,9 @@ mod tests {
     }
 
     /// Apply the same two overrides to both accepted forms: the notifier,
-    /// then explicit embedded mode. No ID can be pinned at launch.
+    /// then explicit embedded mode. The environment names the capture file,
+    /// an explicitly empty chain so no inherited value reaches the script,
+    /// and the binary the script runs. No ID can be pinned at launch.
     #[test]
     fn instrument_installs_the_notify_and_embedded_overrides() {
         for cmd in ["codex".to_string(), format!("codex resume {ID}")] {
@@ -427,19 +527,35 @@ mod tests {
             let plan = Codex.instrument(&inv, &paths(), Some(&no_config_home()));
             assert_eq!(plan.args_suffix, SUFFIX, "{cmd}");
             assert_eq!(plan.injected_id, None, "{cmd}");
+            assert_eq!(plan.notice, None, "{cmd}");
+            assert_eq!(plan.env, full_env(""), "{cmd}");
+        }
+    }
+
+    /// Without a usable binary, the script would have nothing to run, so the
+    /// launch carries the embedded override alone and says why. The route
+    /// is still read first: an opaque route reports its own reason.
+    #[test]
+    fn instrument_without_a_usable_binary_keeps_only_the_embedded_override() {
+        let paths = CapturePaths {
+            fleetcom_binary: None,
+            ..paths()
+        };
+        for cmd in ["codex".to_string(), format!("codex resume {ID}")] {
+            let inv = Codex.detect(&cmd).unwrap();
             assert_eq!(
-                plan.env,
-                vec![
-                    (
-                        CAPTURE_ENV.into(),
-                        PathBuf::from("/tmp/cap/session.json").into_os_string()
-                    ),
-                    // Override any inherited chain with an explicit empty value.
-                    (NOTIFY_CHAIN_ENV.into(), "".into()),
-                ],
+                Codex.instrument(&inv, &paths, Some(&no_config_home())),
+                embedded_only("fleetcom binary replaced; restart the daemon"),
                 "{cmd}"
             );
         }
+        let home = temp("codex_no_binary_opaque");
+        fs::write(home.join("config.toml"), "notify = [1]\n").unwrap();
+        let inv = Codex.detect("codex").unwrap();
+        assert_eq!(
+            Codex.instrument(&inv, &paths, Some(&home)),
+            embedded_only("`notify` config can't be chained")
+        );
     }
 
     /// Pass a representable `notify` assignment through [`NOTIFY_CHAIN_ENV`]. Run
@@ -459,7 +575,7 @@ mod tests {
         // Missing config file: plain injection, and the chain is present but
         // empty.
         let plan = Codex.instrument(&inv, &paths(), Some(&home));
-        assert!(!plan.args_suffix.is_empty());
+        assert_eq!(plan.args_suffix, SUFFIX);
         assert_eq!(chained(&plan), Some("".into()));
 
         let cfg = home.join("config.toml");
@@ -471,10 +587,9 @@ mod tests {
         ] {
             fs::write(&cfg, active).unwrap();
             let plan = Codex.instrument(&inv, &paths(), Some(&home));
-            assert!(!plan.args_suffix.is_empty(), "{active:?}");
-            assert_eq!(chained(&plan), Some("/my/thing".into()), "{active:?}");
-            // Include the capture environment when chaining a notifier.
-            assert!(plan.env.iter().any(|(k, _)| k == CAPTURE_ENV), "{active:?}");
+            assert_eq!(plan.args_suffix, SUFFIX, "{active:?}");
+            assert_eq!(plan.env, full_env("/my/thing"), "{active:?}");
+            assert_eq!(plan.notice, None, "{active:?}");
         }
         for inert in [
             "# notify = [\"/my/thing\"]\n",
@@ -484,7 +599,7 @@ mod tests {
         ] {
             fs::write(&cfg, inert).unwrap();
             let plan = Codex.instrument(&inv, &paths(), Some(&home));
-            assert!(!plan.args_suffix.is_empty(), "{inert:?}");
+            assert_eq!(plan.args_suffix, SUFFIX, "{inert:?}");
             assert_eq!(chained(&plan), Some("".into()), "{inert:?}");
         }
     }
@@ -508,7 +623,8 @@ mod tests {
         )));
     }
 
-    /// For an unrepresentable route, inject neither override nor environment.
+    /// For an unrepresentable route, inject the embedded override alone, no
+    /// environment, and a notice: the task stays in embedded mode either way.
     #[test]
     fn instrument_skips_an_unrepresentable_config_notify() {
         let home = temp("codex_opaque_notify");
@@ -532,7 +648,7 @@ mod tests {
             fs::write(&cfg, opaque).unwrap();
             assert_eq!(
                 Codex.instrument(&inv, &paths(), Some(&home)),
-                SpawnPlan::default(),
+                embedded_only("`notify` config can't be chained"),
                 "{opaque:?}"
             );
         }
@@ -682,7 +798,7 @@ mod tests {
 
     /// Resolve a completed-turn notification for `thread` against `home`.
     fn resolve(home: &Path, thread: &str) -> Option<String> {
-        Codex.parse_capture(&turn_complete(thread), None, Some(home))
+        arrival_root(&turn_complete(thread), Some(home))
     }
 
     /// `session_meta` payload with raw JSON for `source`.
@@ -708,10 +824,10 @@ mod tests {
     /// Validate the payload before looking up its rollout. Even with a root
     /// rollout present, accept only a turn-complete payload with a strict ID.
     #[test]
-    fn parse_capture_accepts_only_turn_complete_payloads() {
+    fn arrival_root_accepts_only_turn_complete_payloads() {
         let home = temp("codex_capture_payload");
         install_codex_root(&home, ID);
-        let parse = |payload: &str| Codex.parse_capture(payload, None, Some(&home));
+        let parse = |payload: &str| arrival_root(payload, Some(&home));
         assert_eq!(parse(&turn_complete(ID)).as_deref(), Some(ID));
 
         let wrong_type = format!(r#"{{"type":"other","thread-id":"{ID}"}}"#);
@@ -725,10 +841,202 @@ mod tests {
         assert_eq!(parse(""), None);
     }
 
-    /// For a root thread, `session_id` is its own ID under every observed
-    /// string `source`. Accept the capture regardless of the task's PID.
+    /// The slot is exactly one bare UUID. Refuse the pre-v1 JSON payload, a
+    /// trailing newline (a different writer), and malformed or empty input,
+    /// whatever the PID and home: nothing is reparsed or looked up at read.
     #[test]
-    fn parse_capture_accepts_a_root_thread() {
+    fn parse_capture_accepts_only_a_bare_uuid_slot() {
+        let home = temp("codex_capture_slot");
+        install_codex_root(&home, ID);
+        for (pid, home) in [(None, None), (Some(4242), Some(&*home))] {
+            let parse = |slot: &str| Codex.parse_capture(slot, pid, home);
+            assert_eq!(parse(ID).as_deref(), Some(ID));
+            assert_eq!(parse(&turn_complete(ID)), None, "old JSON format");
+            assert_eq!(parse(&format!("{ID}\n")), None, "trailing newline");
+            assert_eq!(parse(&format!(" {ID}")), None, "leading space");
+            assert_eq!(parse(&ID.to_uppercase()), None, "uppercase");
+            assert_eq!(parse(&ID[..35]), None, "truncated");
+            assert_eq!(parse("not a uuid"), None);
+            assert_eq!(parse(""), None);
+        }
+    }
+
+    /// Environment of a `--codex-notify-v1` run: the capture slot, the
+    /// scratch `CODEX_HOME`, and `HOME` for the fallback case.
+    fn arrival_env<'a>(
+        capture: Option<&'a Path>,
+        codex_home: Option<&'a Path>,
+        home: Option<&'a Path>,
+    ) -> impl Fn(&str) -> Option<PathBuf> + 'a {
+        move |key| {
+            match key {
+                "FLEETCOM_CAPTURE_FILE" => capture,
+                "CODEX_HOME" => codex_home,
+                "HOME" => home,
+                _ => None,
+            }
+            .map(Path::to_path_buf)
+        }
+    }
+
+    /// Names in the directory holding `cap`, sorted.
+    fn siblings(cap: &Path) -> Vec<String> {
+        let mut names: Vec<String> = fs::read_dir(cap.parent().unwrap())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// The headline regression: the title thread's notification, which has
+    /// no rollout, lands before the root's in some sessions and after it in
+    /// others. Either way the slot ends up holding the root, because a
+    /// refusal writes nothing. No temporary file is left behind.
+    #[test]
+    fn record_arrival_keeps_the_root_across_a_title_thread_notification() {
+        let home = temp("codex_arrival_title");
+        install_codex_root(&home, ID);
+        let slot = temp("codex_arrival_title_slot");
+        let cap = slot.join("task-1-0.json");
+        let env = arrival_env(Some(&cap), Some(&home), None);
+
+        // Title first: nothing is written at all.
+        assert_eq!(record_arrival(&turn_complete(TITLE), &env), None);
+        assert!(!cap.exists(), "a refused thread must not create the slot");
+        assert_eq!(siblings(&cap), Vec::<String>::new());
+
+        assert_eq!(
+            record_arrival(&turn_complete(ID), &env).as_deref(),
+            Some(ID)
+        );
+        assert_eq!(fs::read_to_string(&cap).unwrap(), ID);
+
+        // Title after the root: the slot keeps the root.
+        assert_eq!(record_arrival(&turn_complete(TITLE), &env), None);
+        assert_eq!(fs::read_to_string(&cap).unwrap(), ID);
+        assert_eq!(siblings(&cap), ["task-1-0.json"]);
+        assert_eq!(
+            Codex.parse_capture(&fs::read_to_string(&cap).unwrap(), None, Some(&home)),
+            Some(ID.to_string())
+        );
+    }
+
+    /// A sub-agent's notification writes its root, not its own ID, replacing
+    /// an earlier, longer slot in full.
+    #[test]
+    fn record_arrival_writes_a_sub_agents_root() {
+        let home = temp("codex_arrival_child");
+        install_codex_rollout(
+            &home,
+            CHILD,
+            codex_session_meta(&child_meta(CHILD, ID, ID, &thread_spawn(ID, 1))),
+        );
+        let slot = temp("codex_arrival_child_slot");
+        let cap = slot.join("task-2-0.json");
+        fs::write(&cap, "9".repeat(4096)).unwrap();
+        let env = arrival_env(Some(&cap), Some(&home), None);
+        assert_eq!(
+            record_arrival(&turn_complete(CHILD), &env).as_deref(),
+            Some(ID)
+        );
+        assert_eq!(fs::read_to_string(&cap).unwrap(), ID);
+        assert_eq!(siblings(&cap), ["task-2-0.json"]);
+    }
+
+    /// Refuse before touching the slot: a non-turn-complete type, a non-UUID
+    /// thread, malformed JSON, and a thread without a rollout all leave an
+    /// existing slot as it was.
+    #[test]
+    fn record_arrival_refuses_without_writing() {
+        let home = temp("codex_arrival_refuse");
+        install_codex_root(&home, ID);
+        let slot = temp("codex_arrival_refuse_slot");
+        let cap = slot.join("task-3-0.json");
+        let env = arrival_env(Some(&cap), Some(&home), None);
+        for payload in [
+            format!(r#"{{"type":"agent-turn-start","thread-id":"{ID}"}}"#),
+            format!(
+                r#"{{"type":"agent-turn-complete","thread-id":"{}"}}"#,
+                ID.to_uppercase()
+            ),
+            r#"{"type":"agent-turn-complete","thread-id":"../../x"}"#.to_string(),
+            r#"{"type":"agent-turn-complete"}"#.to_string(),
+            "not json".to_string(),
+            String::new(),
+            turn_complete(TITLE),
+        ] {
+            assert_eq!(record_arrival(&payload, &env), None, "{payload:?}");
+            assert!(!cap.exists(), "{payload:?} must write nothing");
+        }
+        fs::write(&cap, OTHER).unwrap();
+        for payload in [turn_complete(TITLE), "not json".to_string()] {
+            assert_eq!(record_arrival(&payload, &env), None, "{payload:?}");
+            assert_eq!(fs::read_to_string(&cap).unwrap(), OTHER, "{payload:?}");
+        }
+        assert_eq!(siblings(&cap), ["task-3-0.json"]);
+    }
+
+    /// Without a capture path, the mode is a no-op even for an accepted root.
+    /// An empty value reads as unset, as in the script.
+    #[test]
+    fn record_arrival_is_a_no_op_without_a_capture_path() {
+        let home = temp("codex_arrival_nocap");
+        install_codex_root(&home, ID);
+        for capture in [None, Some(Path::new(""))] {
+            let env = arrival_env(capture, Some(&home), None);
+            assert_eq!(
+                record_arrival(&turn_complete(ID), &env),
+                None,
+                "{capture:?}"
+            );
+        }
+        // Nothing lands beside the store, where an empty path could resolve.
+        assert_eq!(siblings(&home.join("sessions")), ["sessions"]);
+    }
+
+    /// Resolve the home as `Codex::resolve_home` does: `CODEX_HOME` first,
+    /// then `$HOME/.codex`. A rollout under the wrong home is not found.
+    #[test]
+    fn record_arrival_resolves_the_home_from_its_environment() {
+        let user_home = temp("codex_arrival_home");
+        install_codex_root(&user_home.join(".codex"), ID);
+        let other = temp("codex_arrival_other_home");
+        let slot = temp("codex_arrival_home_slot");
+        let cap = slot.join("task-4-0.json");
+
+        let env = arrival_env(Some(&cap), Some(&other), Some(&user_home));
+        assert_eq!(
+            record_arrival(&turn_complete(ID), &env),
+            None,
+            "CODEX_HOME wins"
+        );
+        assert!(!cap.exists());
+
+        let env = arrival_env(Some(&cap), None, Some(&user_home));
+        assert_eq!(
+            record_arrival(&turn_complete(ID), &env).as_deref(),
+            Some(ID)
+        );
+        assert_eq!(fs::read_to_string(&cap).unwrap(), ID);
+    }
+
+    /// A slot whose directory is gone, as after the daemon's namespace is
+    /// dropped, is a refusal with no temporary file left anywhere.
+    #[test]
+    fn record_arrival_reports_a_failed_write() {
+        let home = temp("codex_arrival_badslot");
+        install_codex_root(&home, ID);
+        let cap = home.join("missing").join("task-5-0.json");
+        let env = arrival_env(Some(&cap), Some(&home), None);
+        assert_eq!(record_arrival(&turn_complete(ID), &env), None);
+        assert!(!cap.parent().unwrap().exists());
+    }
+
+    /// For a root thread, `session_id` is its own ID under every observed
+    /// string `source`.
+    #[test]
+    fn arrival_root_accepts_a_root_thread() {
         for source in ["cli", "vscode", "exec"] {
             let home = temp("codex_capture_root");
             install_codex_rollout(
@@ -737,13 +1045,6 @@ mod tests {
                 codex_session_meta(&meta(ID, ID, &format!("\"{source}\""))),
             );
             assert_eq!(resolve(&home, ID).as_deref(), Some(ID), "{source}");
-            assert_eq!(
-                Codex
-                    .parse_capture(&turn_complete(ID), Some(4242), Some(&home))
-                    .as_deref(),
-                Some(ID),
-                "{source}"
-            );
         }
     }
 
@@ -751,7 +1052,7 @@ mod tests {
     /// second-level thread, the parent is itself a sub-agent. Omit the root's
     /// rollout to verify that no lookup is needed for it.
     #[test]
-    fn parse_capture_maps_a_spawned_sub_agent_to_its_root() {
+    fn arrival_root_maps_a_spawned_sub_agent_to_its_root() {
         let home = temp("codex_capture_spawned");
         install_codex_rollout(
             &home,
@@ -771,7 +1072,7 @@ mod tests {
     /// No parent is specified in a guardian sub-agent's `source`; classify
     /// it by the `subagent` member alone.
     #[test]
-    fn parse_capture_maps_a_guardian_sub_agent_to_its_root() {
+    fn arrival_root_maps_a_guardian_sub_agent_to_its_root() {
         let home = temp("codex_capture_guardian");
         install_codex_rollout(
             &home,
@@ -790,7 +1091,7 @@ mod tests {
     /// `session_id`. Reject `id == session_id` with a `subagent` source:
     /// the root is unknown, and the sub-agent's ID is not resumable.
     #[test]
-    fn parse_capture_refuses_a_sub_agent_that_names_itself_as_root() {
+    fn arrival_root_refuses_a_sub_agent_that_names_itself_as_root() {
         let home = temp("codex_capture_self_rooted");
         for source in [
             thread_spawn(ID, 1),
@@ -809,7 +1110,7 @@ mod tests {
     /// No rollout is saved for the title thread. Reject its notification
     /// with an absent store, an empty store, or rollouts for other threads.
     #[test]
-    fn parse_capture_refuses_a_thread_without_a_rollout() {
+    fn arrival_root_refuses_a_thread_without_a_rollout() {
         let home = temp("codex_capture_title");
         assert_eq!(resolve(&home, TITLE), None, "no sessions directory");
         fs::create_dir_all(home.join("sessions/2026/10/04")).unwrap();
@@ -822,7 +1123,7 @@ mod tests {
     /// Look for rollouts exactly three directories below `sessions`.
     /// Ignore matching names at other depths and files among the directories.
     #[test]
-    fn parse_capture_finds_rollouts_only_in_day_directories() {
+    fn arrival_root_finds_rollouts_only_in_day_directories() {
         let home = temp("codex_capture_depth");
         let name = format!("rollout-2026-10-04T13-49-56-{ID}.jsonl");
         let header = codex_session_meta(&meta(ID, ID, r#""cli""#));
@@ -846,7 +1147,7 @@ mod tests {
     /// Reject duplicate rollouts for one thread, within or across day
     /// directories. Accept the capture after removing the extra rollout.
     #[test]
-    fn parse_capture_refuses_two_rollouts_for_one_thread() {
+    fn arrival_root_refuses_two_rollouts_for_one_thread() {
         let header = codex_session_meta(&meta(ID, ID, r#""cli""#));
         for day in ["2026/10/04", "2026/10/05", "2027/01/01"] {
             let home = temp("codex_capture_twins");
@@ -864,7 +1165,7 @@ mod tests {
     /// Reject the capture if a day directory cannot be listed: a second
     /// rollout may be present even when only one is visible.
     #[test]
-    fn parse_capture_refuses_a_store_it_cannot_list() {
+    fn arrival_root_refuses_a_store_it_cannot_list() {
         use std::os::unix::fs::PermissionsExt;
         let home = temp("codex_capture_unlistable");
         install_codex_root(&home, ID);
@@ -881,7 +1182,7 @@ mod tests {
     /// Require the notified thread's ID and its session tree in the header.
     /// Reject every other format as unclassified.
     #[test]
-    fn parse_capture_refuses_an_unclassified_header() {
+    fn arrival_root_refuses_an_unclassified_header() {
         let spawned = thread_spawn(ID, 1);
         for (what, header) in [
             (
@@ -953,7 +1254,7 @@ mod tests {
     /// only a terminated line; reject an empty file or a complete object
     /// without its newline.
     #[test]
-    fn parse_capture_refuses_empty_and_torn_headers() {
+    fn arrival_root_refuses_empty_and_torn_headers() {
         let home = temp("codex_capture_torn");
         let header = codex_session_meta(&meta(ID, ID, r#""cli""#));
         for cut in 0..header.len() {
@@ -967,7 +1268,7 @@ mod tests {
     /// Require a newline within the first [`HEADER_MAX`] bytes. Bound the
     /// line length, not the file size.
     #[test]
-    fn parse_capture_bounds_the_header_line() {
+    fn arrival_root_bounds_the_header_line() {
         let home = temp("codex_capture_bound");
         let header = |pad: usize| {
             codex_session_meta(&format!(
@@ -992,7 +1293,7 @@ mod tests {
     /// Accept a header alone or followed by bytes that are neither JSON nor
     /// UTF-8: nothing past the first line is examined.
     #[test]
-    fn parse_capture_reads_nothing_after_the_header() {
+    fn arrival_root_reads_nothing_after_the_header() {
         let home = temp("codex_capture_body");
         let header = codex_session_meta(&meta(ID, ID, r#""cli""#));
         install_codex_rollout(&home, ID, &header);
@@ -1007,7 +1308,7 @@ mod tests {
     /// Reject unreadable rollouts and non-UTF-8 first lines. Place the invalid
     /// byte in a field unused for classification to test strict decoding.
     #[test]
-    fn parse_capture_refuses_an_unreadable_header() {
+    fn arrival_root_refuses_an_unreadable_header() {
         let home = temp("codex_capture_unreadable");
         let path = install_codex_root(&home, ID);
         fs::remove_file(&path).unwrap();
