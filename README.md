@@ -30,7 +30,7 @@ Organize related tasks into named groups across working directories.
 
 ### Resume agent sessions
 
-Launch `claude`, `codex`, `grok`, or `omp` from the Agent page (`n`, then `Tab`). Rerun the task or reload a saved session and the conversation picks up where it left off.
+Launch `claude`, `codex`, `grok`, or `omp` from the Agent page (`n`, then `Tab`). Rerun the task or reload a saved session to resume the conversation.
 
 ## Operational model
 
@@ -40,7 +40,7 @@ Managing several long-lived commands across terminal panes is pesky, especially 
 - Keep tasks running under a daemon across client disconnects.
 - Save and reload task recipes: directories, commands, group assignments, and display names.
 - Rerun a completed task in place, keeping its identity, group, and name.
-- Launch `claude`, `codex`, `grok`, and `omp` as managed agents whose conversations survive rerun and reload.
+- Launch `claude`, `codex`, `grok`, and `omp` as managed agents and resume their conversations on rerun and reload.
 - Recover the current task set from automatic snapshots.
 
 ## Documentation
