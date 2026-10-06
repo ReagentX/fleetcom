@@ -139,8 +139,8 @@ pub enum SessionPage {
     Recovery,
 }
 
-/// Active page of the spawn prompt. `Command` runs typed text literally;
-/// `Agent` launches a picked agent as a managed task.
+/// Active page of the spawn prompt: `Command` for literal text, `Agent` for managed
+/// launches.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum SpawnPage {
     Command,
@@ -203,9 +203,8 @@ pub struct App {
     transport: Box<dyn Transport>,
     /// Task snapshot received from `Event::Tasks`.
     pub views: Vec<TaskView>,
-    /// Agents installed on the core's launch `PATH`, from the latest
-    /// `Event::Agents`; program words in registry order. The spawn prompt's
-    /// Agent page lists it and exists only while it is non-empty.
+    /// Installed agents from the latest `Event::Agents`, in registry order. Show the Agent
+    /// page only when this list is non-empty.
     pub agents: Vec<String>,
     /// The watched task's screen (attach/peek), from `Event::Screen`.
     focused_screen: Option<ScreenView>,
@@ -232,12 +231,12 @@ pub struct App {
     /// Group assigned to the next spawn. Custom mode snapshots the selected
     /// task's group; State and Dir modes leave the spawn unassigned.
     pub spawn_group: Option<String>,
-    /// The displayed spawn-prompt page; opening the prompt resets it to
-    /// `Command`. Tab toggles it only while `agents` is non-empty.
+    /// Displayed spawn-prompt page. Reset to `Command` when opening the prompt; allow Tab
+    /// to switch pages only when `agents` is non-empty.
     pub spawn_page: SpawnPage,
-    /// The Agent page's filter: its own buffer, so typed command text is
-    /// never consumed as a filter and both survive a page flip. Empty at
-    /// every open, so Tab always shows the full list first.
+    /// Agent filter buffer, separate from the command buffer. Preserve both across page
+    /// changes. Clear the filter when opening the prompt so the initial Agent list is
+    /// unfiltered.
     pub agent_input: EditBuffer,
     /// Program words of `agents` matching `agent_input`, in registry order.
     pub agent_candidates: Vec<String>,
@@ -779,13 +778,14 @@ impl App {
             match ev {
                 // The handshake is handled before the transport is created.
                 Event::HelloOk => {}
-                // Each context install resends the whole list; replace, never merge.
+                // Replace the whole list on each context install; do not merge it with the
+                // previous list.
                 Event::Agents(a) => {
                     self.agents = a;
-                    // A reconnect can replace the list under an open prompt.
-                    // Refilter so the rows match, and leave an Agent page that
-                    // Tab could no longer reach: the loader's emptied-recovery
-                    // rule.
+                    // After reconnecting, refilter an open prompt against the new list. If
+                    // no agents are installed, switch to Command: the Agent page is no
+                    // longer accessible through Tab. Apply the same rule as for an emptied
+                    // Recovery page.
                     if self.mode == Mode::Spawn {
                         self.refresh_agent_candidates();
                         if self.agents.is_empty() {
@@ -1075,8 +1075,8 @@ impl App {
             .collect()
     }
 
-    /// Lock in `dir` as the spawn target and move to command entry, with the
-    /// Agent page's filter cleared so Tab shows the full list.
+    /// Set `dir` as the spawn target and open command entry. Clear the Agent filter so the
+    /// full list is available on Tab.
     fn open_spawn_prompt(&mut self, dir: PathBuf) {
         self.spawn_cwd = dir;
         self.spawn_group = self.inherited_group();
@@ -1088,10 +1088,9 @@ impl App {
         self.mode = Mode::Spawn;
     }
 
-    /// Rebuild the Agent page as the installed agents whose program word
-    /// contains the lowercased filter, in registry order, and select the
-    /// first. Order never follows match position: `o` lists codex, grok, omp
-    /// as the registry does.
+    /// Filter installed agents by a case-insensitive substring of the program word and
+    /// select the first match. Preserve registry order rather than sorting by match
+    /// position: for `o`, list codex, grok, omp.
     fn refresh_agent_candidates(&mut self) {
         let needle = self.agent_input.to_lowercase();
         self.agent_candidates = self
@@ -1103,8 +1102,8 @@ impl App {
         self.agent_sel = 0;
     }
 
-    /// Registered agents absent from `agents`: what the no-match text names
-    /// so a filter for an uninstalled agent explains itself.
+    /// Registered agents absent from `agents`, for the no-match message. Identify missing
+    /// installations when the user filters for an unavailable agent.
     pub fn missing_agents(&self) -> Vec<&'static str> {
         harness::program_words()
             .filter(|w| !self.agents.iter().any(|a| a == w))
@@ -1542,8 +1541,8 @@ impl App {
 
     fn on_key_spawn(&mut self, k: KeyEvent) {
         match k.code {
-            // Pure page toggle, gated as the loader gates its recovery page.
-            // Without agents Tab falls through to the editor, which ignores it.
+            // Allow page changes only when agents are installed, as with the Recovery page.
+            // Otherwise, pass Tab to the editor, where it is ignored.
             KeyCode::Tab | KeyCode::BackTab if !self.agents.is_empty() => {
                 self.spawn_page = match self.spawn_page {
                     SpawnPage::Command => SpawnPage::Agent,
@@ -1561,9 +1560,8 @@ impl App {
         }
     }
 
-    /// Agent-page keys: filter, pick, and launch the highlighted agent as a
-    /// managed task in the prompt's directory and group. Enter on no match
-    /// leaves the prompt open.
+    /// Handle Agent-page filtering, selection, and launch in the prompt's directory and
+    /// group. Keep the prompt open on Enter when there is no match.
     fn on_key_agent(&mut self, k: KeyEvent) {
         match k.code {
             KeyCode::Esc => self.close_prompt(),
@@ -1581,7 +1579,7 @@ impl App {
                     self.close_prompt();
                 }
             }
-            // Caret motion does not affect the matches.
+            // Do not refilter on caret motion.
             _ => {
                 if on_key_edit(&mut self.agent_input, k) {
                     self.refresh_agent_candidates();

@@ -17,25 +17,22 @@ use crate::{
     task::{pid_is_dead, positive_pid},
 };
 
-/// What a recipe entry starts. The split mirrors the task it came from: a
-/// literal task's text is stored and rerun untouched, and a managed task is
-/// stored as the agent it names plus the conversation it last held, never as
-/// a command string.
+/// Launch specification for one recipe entry. Preserve a literal task's command text. For a
+/// managed task, store the agent word and last conversation ID instead of a command string.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EntryKind {
     /// Typed text, run under `$SHELL -c` exactly as stored.
     Literal(String),
-    /// An agent fleetcom launches and owns, named by its registered program
-    /// word. `resume` is the session to reopen; `None` starts a fresh one.
+    /// Managed agent identified by its registered program word. Use `resume` to reopen a
+    /// session, or `None` to start fresh.
     Managed {
         agent: String,
         resume: Option<String>,
     },
 }
 
-/// One recipe entry. A literal without a group or name serializes as a bare
-/// string; every other entry is an object, writing optional fields only when
-/// set.
+/// One recipe entry. Serialize a literal without group or name as a bare string. Use an
+/// object for every other entry, writing optional fields only when set.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionEntry {
     pub kind: EntryKind,
@@ -83,9 +80,9 @@ pub fn sessions_dir(root: Option<PathBuf>) -> Option<PathBuf> {
         .map(|base| base.join("sessions"))
 }
 
-/// Session format version written by `to_json` and accepted by `from_json`.
-/// Version 2 added managed entries. A missing version is version 1, whose
-/// literal entries pass through [`migrate_v1`]; newer versions fail.
+/// Session format version written by `to_json` and accepted by `from_json`. Managed entries
+/// were introduced in version 2. Treat a missing version as 1 and convert its literals
+/// through [`migrate_v1`]. Reject newer versions.
 const FORMAT_VERSION: u64 = 2;
 
 /// Build the recipe's `dirs` object.
@@ -116,18 +113,17 @@ fn dirs_json(cfg: &SessionConfig) -> jzon::JsonValue {
     dirs
 }
 
-/// Map a v1 literal onto the entry this build writes for the same task. Under
-/// v1 the bare program word and its resume form were instrumented and resumed,
-/// so loading either as literal would silently drop the conversation. Exactly
-/// those two shapes convert, with v1's whitespace tolerance between tokens and
-/// the single-quote pair v1 wrote around the ID. The first token must be the
-/// registered word itself: a path (`/usr/local/bin/claude`, `~/bin/claude`)
-/// names a binary the user chose, and a managed launch would run whatever
-/// `PATH` finds first, so it stays literal and loses resume. Everything else
-/// stays literal.
+/// Convert v1 literal entries to the corresponding managed form. In v1, bare program words
+/// and canonical resume commands were instrumented; preserving them as literals would
+/// silently disable conversation tracking. Convert exactly those two forms, accepting v1's
+/// whitespace between tokens and single-quoted IDs. Require an exact registered word as the
+/// first token. With a path (`/usr/local/bin/claude`, `~/bin/claude`), preserve the user's
+/// chosen binary as a literal rather than substitute the first binary found on `PATH`;
+/// managed resume tracking is then unavailable. Leave all other commands literal.
 ///
-/// Deleted one release after format v2 ships. From then on an unconverted v1
-/// file loads every entry as literal: no load fails, only resume is lost.
+/// Remove this conversion one release after format v2 ships. After removal, load
+/// unconverted v1 entries as literals: continue to accept the file, but without managed
+/// resume tracking.
 fn migrate_v1(cmd: &str) -> EntryKind {
     let literal = || EntryKind::Literal(cmd.to_string());
     let mut words = cmd.split([' ', '\t']).filter(|w| !w.is_empty());
@@ -172,15 +168,13 @@ pub fn fingerprint_json(cfg: &SessionConfig) -> String {
     dirs_json(cfg).dump()
 }
 
-/// Parse wrapped and flat schemas, returning the stored name when present.
-/// A wrapped file has an object-valued `dirs`; flat files have entry arrays at
-/// the top level, including when a directory is literally named `dirs`.
-/// A top-level `version` must be an integer from 1 through [`FORMAT_VERSION`];
-/// a missing version is interpreted as 1, and a version-1 file's literal
-/// entries pass through [`migrate_v1`]. Entry shapes are accepted by shape,
-/// whatever the version: a string or `{"cmd"}` object is literal, an
-/// `{"agent"}` object is managed. An object with both keys, an unregistered
-/// agent word, or a `resume` that is not a strict UUID rejects the whole file.
+/// Parse wrapped and flat schemas, returning the stored name when present. Identify a
+/// wrapped file by object-valued `dirs`; accept top-level entry arrays as a flat map,
+/// including an array under a directory named `dirs`. Require an integer `version` from 1
+/// through [`FORMAT_VERSION`]. Treat a missing version as 1 and convert its literal entries
+/// through [`migrate_v1`]. Accept entry forms regardless of version: strings and `{"cmd"}`
+/// objects for literals, `{"agent"}` objects for managed agents. Reject the whole file for
+/// objects with both keys, unregistered agents, or resume IDs that are not strict UUIDs.
 fn from_json(text: &str) -> io::Result<(Option<String>, SessionConfig)> {
     let invalid = |message| io::Error::new(io::ErrorKind::InvalidData, message);
     let parsed = jzon::parse(text).map_err(|e| invalid(e.to_string()))?;
@@ -226,7 +220,7 @@ fn from_json(text: &str) -> io::Result<(Option<String>, SessionConfig)> {
             return Err(invalid(format!("directory {dir:?}: expected an array")));
         }
         let mut entries = Vec::new();
-        // A v1 literal may be an agent launch v1 could only spell as text.
+        // In v1, managed launches could only be stored as command text.
         let literal = |cmd: &str| {
             if v1 {
                 migrate_v1(cmd)
@@ -721,8 +715,8 @@ mod tests {
         assert_eq!(load_in(&dir, "versioned").unwrap(), cfg);
     }
 
-    /// Managed entries round-trip in every label combination, with and
-    /// without a resume ID, beside literal ones.
+    /// Round-trip managed entries in every label combination, with and without resume IDs,
+    /// alongside literals.
     #[test]
     fn round_trips_managed_entries() {
         let dir = temp("session_managed_roundtrip");
@@ -754,8 +748,8 @@ mod tests {
         assert_eq!(load_in(&dir, "managed").unwrap(), cfg);
     }
 
-    /// The managed object carries `agent` first, then `resume`, `group` and
-    /// `name` only when set; a managed entry is never a bare string.
+    /// Serialize managed entries as objects with `agent` first. Include `resume`, `group`,
+    /// and `name` only when set; never use a bare string.
     #[test]
     fn managed_entries_serialize_as_agent_objects_with_optional_fields() {
         let mut cfg = SessionConfig::new();
@@ -778,8 +772,8 @@ mod tests {
         );
     }
 
-    /// The fingerprint changes with the resume ID, so a cadence pass notices
-    /// a captured session on an otherwise unchanged fleet.
+    /// Include the resume ID in the fingerprint so a cadence pass detects newly captured
+    /// sessions without other fleet changes.
     #[test]
     fn fingerprint_tracks_a_managed_entrys_resume_id() {
         let fp = |resume| {
@@ -792,8 +786,7 @@ mod tests {
         assert_eq!(fp(Some(ID)), fp(Some(ID)));
     }
 
-    /// A v2 file's literal agent word is literal by construction: only v1
-    /// files are migrated.
+    /// Preserve literal agent words in v2 files; migrate only v1 literals.
     #[test]
     fn v2_literal_agent_words_stay_literal() {
         let (_, cfg) = from_json(&format!(
@@ -811,9 +804,9 @@ mod tests {
         );
     }
 
-    /// The v1 → v2 mapping: the two shapes v1 instrumented become managed,
-    /// with v1's whitespace tolerance and its quoted ID; a path-qualified
-    /// word, extra arguments, shell syntax and malformed IDs stay literal.
+    /// Convert the two instrumented v1 forms to managed entries, accepting the original
+    /// whitespace and quoted IDs. Keep paths, extra arguments, shell syntax, and malformed
+    /// IDs literal.
     #[test]
     fn v1_literals_migrate_exactly_the_two_instrumented_shapes() {
         let cases: Vec<(String, SessionEntry)> = vec![
@@ -829,7 +822,8 @@ mod tests {
             // v1's token tolerance: tabs, repeated and surrounding whitespace.
             ("  claude\t".into(), m("claude", None)),
             (format!("claude\t--resume  '{ID}' "), m("claude", Some(ID))),
-            // A path names a binary the user chose: literal, resume lost.
+            // Preserve the user's chosen binary path as a literal, without managed resume
+            // tracking.
             ("/usr/local/bin/claude".into(), e("/usr/local/bin/claude")),
             ("~/bin/claude".into(), e("~/bin/claude")),
             (
@@ -903,8 +897,8 @@ mod tests {
         );
     }
 
-    /// A managed entry that is also a command, names no registered agent, or
-    /// carries a malformed resume ID rejects the whole file.
+    /// Reject the entire file for a managed entry with a `cmd` field, an unregistered
+    /// agent, or a malformed resume ID.
     #[test]
     fn rejects_malformed_managed_entries() {
         let cases = [
@@ -992,8 +986,8 @@ mod tests {
         assert_eq!(cfg["~/proj"], vec![e("vim")]);
     }
 
-    /// A newer format fails with an error naming both versions: the gate a
-    /// v1 build applies to this build's files, and this build to the next.
+    /// Reject newer formats and name both versions in the error. Apply the same version
+    /// check as v1 builds when reading v2 files.
     #[test]
     fn newer_version_refuses_naming_both_versions() {
         let err = from_json(r#"{"version": 3, "name": "v", "dirs": {}}"#).unwrap_err();
@@ -1361,8 +1355,8 @@ mod tests {
         assert_eq!(list_in(&dir), vec!["old".to_string()]);
     }
 
-    /// A v1 recovery snapshot with the strings v1 wrote for managed tasks
-    /// loads them as managed entries, so recovery survives the upgrade.
+    /// Load v1 recovery snapshots as managed entries when the stored strings match the old
+    /// instrumented forms. Preserve recovery across the upgrade.
     #[test]
     fn v1_recovery_snapshots_migrate_on_load() {
         let base = temp("session_recovery_migrate");

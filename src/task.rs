@@ -96,9 +96,8 @@ pub struct Task {
     pub group: Option<String>,
     /// Custom display name; `None` means unnamed.
     pub name: Option<String>,
-    /// Agent harness of a managed task: the channel its session ID and
-    /// blocked status are read through. `None` for every literal task, so no
-    /// harness channel is ever read for one.
+    /// Harness for a managed task's session ID and blocked-status reads. `None` for literal
+    /// tasks: never read a harness channel for those tasks.
     pub harness: Option<&'static dyn crate::harness::Harness>,
     /// Harness home resolved from this run's launch environment.
     pub harness_home: Option<PathBuf>,
@@ -107,15 +106,13 @@ pub struct Task {
     pub summary_adapter: Option<&'static dyn crate::preview::SummaryAdapter>,
     /// Run number used to give each rerun a distinct capture path.
     pub run: u32,
-    /// Session ID pinned or resumed at spawn. Capture data or a live
-    /// registry record can supersede it.
+    /// Session ID pinned or resumed at spawn. Prefer a captured ID or matching live
+    /// registry ID when available.
     pub resume_id: Option<String>,
     /// Capture path allocated for this task run.
     pub capture_file: Option<PathBuf>,
-    /// Whether fleetcom owns this task's launch: the argv came from the
-    /// harness and ran with no shell, and a rerun resumes through the
-    /// harness again. A literal task's text is never edited, whatever it
-    /// names.
+    /// Whether this task was launched directly with harness-built argv. If true, use the
+    /// harness again on rerun. Never edit literal command text.
     pub managed: bool,
     /// Dashboard-preview resolution state; resets with the task on rerun
     /// because a rerun replaces the whole `Task`.
@@ -211,16 +208,15 @@ fn wait_code(status: &rustix::process::WaitIdStatus) -> i32 {
         .unwrap_or(1)
 }
 
-/// How a task's child starts: the point where the literal/managed boundary
-/// becomes a process.
+/// Child execution mode: literal shell text or managed argv.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Exec {
     /// The text as typed, run as `$SHELL -c <text>`.
     Literal(String),
-    /// `binary` with `args`, no shell between. The task leader is the agent
-    /// process in every login shell: claude's capture gate and registry
-    /// reader key on the leader pid, and a resident shell (tcsh, csh, a
-    /// wrapper script) would otherwise hold it.
+    /// Run `binary` with `args` directly. Keep the agent as task leader regardless of the
+    /// login shell: validate Claude capture and registry records against that PID. With a
+    /// resident shell (tcsh, csh, or a wrapper script), the shell would be the leader
+    /// instead.
     Managed {
         binary: PathBuf,
         args: Vec<OsString>,
@@ -256,11 +252,9 @@ impl Task {
         let managed = matches!(exec, Exec::Managed { .. });
         let mut cmd = match exec {
             Exec::Literal(text) => {
-                // The daemon inherits the first client's environment, which may
-                // name a different shell from the connecting client's. Read SHELL
-                // from the launch context so a zsh client attached to a
-                // bash-started daemon still gets zsh word-splitting. Without
-                // SHELL, use the portable default.
+                // Read SHELL from the launch context, not the daemon's environment: a zsh
+                // client may connect to a daemon started from bash and still require zsh
+                // word-splitting. Without SHELL, use the portable default.
                 let shell = env_get(env, "SHELL")
                     .map(OsString::from)
                     .unwrap_or_else(|| "/bin/sh".into());

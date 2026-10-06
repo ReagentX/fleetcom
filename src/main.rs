@@ -98,8 +98,8 @@ enum Invocation {
     Version,
     Daemon,
     Kill,
-    /// `--codex-notify-v1 <payload>`: the injected codex notify script's
-    /// validation step, carrying one notification JSON.
+    /// `--codex-notify-v1 <payload>`: validate one notification JSON from the injected
+    /// codex notify script.
     CodexNotify(String),
     Client {
         foreground: bool,
@@ -125,8 +125,8 @@ fn parse_args(args: &[String]) -> Result<Invocation, String> {
             "--daemon" => daemon = true,
             "--kill" => kill = true,
             "--codex-notify-v1" => {
-                // The payload is taken verbatim: JSON never starts with `-`,
-                // and a flag-shaped value is refused later as non-JSON.
+                // Take the payload verbatim. JSON cannot begin with `-`; reject a
+                // flag-shaped value later as non-JSON.
                 let v = it
                     .next()
                     .ok_or_else(|| "--codex-notify-v1 requires a value".to_string())?;
@@ -205,9 +205,8 @@ fn run() -> io::Result<()> {
         Ok(Invocation::Daemon) => return daemon::run_daemon(),
         // `fleetcom --kill`: tell a running daemon to kill everything and exit.
         Ok(Invocation::Kill) => return daemon::run_kill(),
-        // The codex notify script's validation step: headless, silent, and
-        // exiting 1 on refusal. The status is informational only; the
-        // script ignores it.
+        // Validate the codex notification without terminal setup or output. Exit 1 on
+        // refusal; the calling script ignores this informational status.
         Ok(Invocation::CodexNotify(payload)) => {
             let env = |key: &str| std::env::var_os(key).map(std::path::PathBuf::from);
             if harness::record_arrival(&payload, &env).is_none() {
@@ -472,8 +471,8 @@ mod tests {
         assert!(parse(&["--kill", "work"]).is_err());
     }
 
-    /// The notify mode takes exactly its payload: no value, a second mode,
-    /// a session name, or a client flag is an error in either order.
+    /// Accept only the notify payload. Reject a missing value, another mode, a session
+    /// name, or a client flag, in either argument order.
     #[test]
     fn codex_notify_mode_takes_only_its_payload() {
         assert!(parse(&["--codex-notify-v1"]).is_err());

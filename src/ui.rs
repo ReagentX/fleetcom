@@ -212,8 +212,8 @@ fn render_dashboard(out: &mut impl Write, app: &App) -> io::Result<()> {
         },
     }
 
-    // Keep common actions visible and route the remaining bindings through `?`.
-    // The spawn prompt owns its footer: that is where it advertises Tab.
+    // Keep common actions visible and route the remaining bindings through `?`. In the
+    // spawn prompt, use the footer for the Tab hint.
     let footer = match app.mode {
         Mode::Spawn => spawn_page_hint(app.agents.len()),
         _ => dashboard_hint(app.chord_target()),
@@ -242,8 +242,8 @@ fn transient_line(notice: Option<&str>, status: Option<&str>) -> Option<String> 
     notice.or(status).map(|s| format!("  {s}"))
 }
 
-/// Build the spawn prompt's Command-page footer. Include the Agent page only
-/// when the core found agents, as the loader includes recovery.
+/// Build the Command-page footer. Include the Agent-page hint only when agents are
+/// installed, as with the Recovery-page hint in the session picker.
 fn spawn_page_hint(agents: usize) -> String {
     if agents > 0 {
         format!("  enter run · tab agents ({agents}) · esc")
@@ -257,7 +257,7 @@ fn spawn_page_hint(agents: usize) -> String {
 /// hint/status instead.
 fn cmdline(app: &App) -> Option<(String, u16)> {
     let prefix = match app.mode {
-        // The Agent page paints its own field in its panel.
+        // Render the Agent input field in its panel instead.
         Mode::Spawn if app.spawn_page == SpawnPage::Agent => return None,
         Mode::Spawn => spawn_prefix(app),
         Mode::SaveSession => "  save session as: ".to_string(),
@@ -857,9 +857,8 @@ fn render_find(out: &mut impl Write, app: &App) -> io::Result<()> {
     )
 }
 
-/// The Agent page's placeholder when the filter matches nothing. Name the
-/// registered agents this host lacks, so a filter for one of them explains
-/// itself; `missing` is in registry order.
+/// Build the Agent-page placeholder for an empty result. List missing registered agents to
+/// explain why an unavailable agent was not matched; `missing` is in registry order.
 fn agent_empty_text(missing: &[&str]) -> String {
     if missing.is_empty() {
         "    (no installed agent matches)".to_string()
@@ -871,9 +870,9 @@ fn agent_empty_text(missing: &[&str]) -> String {
     }
 }
 
-/// The spawn prompt's Agent page: a bottom panel with the same `❯` destination
-/// prefix as the Command page, the filter field, and the matching installed
-/// agents in registry order with `agent_sel` highlighted.
+/// Render the Agent page in a bottom panel: the same `❯` destination prefix as on Command,
+/// the filter field, and matching installed agents in registry order. Highlight
+/// `agent_sel`.
 fn render_agent_page(out: &mut impl Write, app: &App) -> io::Result<()> {
     let prefix = format!("{}agent: ", spawn_prefix(app));
     let (line, cx) = caret_line(&prefix, &app.agent_input, app.cols as usize);
@@ -1255,7 +1254,7 @@ mod tests {
         );
     }
 
-    /// Advertise the Agent page in the spawn footer only when agents exist.
+    /// Include the Agent-page hint in the spawn footer only when agents are installed.
     #[test]
     fn spawn_page_hint_shows_the_count_only_when_nonzero() {
         assert_eq!(spawn_page_hint(0), "  enter run · esc");

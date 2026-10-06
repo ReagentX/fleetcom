@@ -56,10 +56,9 @@ pub enum Command {
         cwd: PathBuf,
         group: Option<String>,
     },
-    /// Launch a registered agent as a managed task in `cwd`. `agent` is a
-    /// program word from `Event::Agents`, never a path: the core checks it
-    /// against its registry and resolves the binary on its own launch
-    /// context's `PATH` at spawn time.
+    /// Launch a registered agent as a managed task in `cwd`. Accept a program word from
+    /// `Event::Agents`, never a path. Check the core's registry and resolve the binary on
+    /// the launch context's `PATH` at spawn time.
     SpawnAgent {
         agent: String,
         cwd: PathBuf,
@@ -69,9 +68,9 @@ pub enum Command {
     Kill { id: u64 },
     /// Drop a task from the set entirely (used on already-finished tasks).
     Remove { id: u64 },
-    /// Re-run a finished task with the same id, cwd, tag, group, and name. A
-    /// literal task reruns its exact text; a managed task resumes its captured
-    /// session. Reject this request for running tasks.
+    /// Re-run a finished task with the same id, cwd, tag, group, and name. For a literal
+    /// task, rerun the exact text; for a managed task, resume the captured session. Reject
+    /// this request for running tasks.
     Restart { id: u64 },
     /// Set the manual "in use" tag.
     Tag { id: u64, on: bool },
@@ -187,10 +186,9 @@ pub struct Mods {
 pub enum Event {
     /// The daemon accepted a compatible hello frame and stored its launch context.
     HelloOk,
-    /// Program words of the registered agents found on the launch context's
-    /// `PATH`, in registry order. Sent whenever a context is installed, so a
-    /// reconnect replaces the list; empty when none resolve. Binary paths
-    /// stay in the core.
+    /// Registered program words found on the launch context's `PATH`, in registry order.
+    /// Send the complete list on every context install, including an empty list when none
+    /// are found, to replace the previous list on reconnect. Keep binary paths in the core.
     Agents(Vec<String>),
     /// Full task-set snapshot; replaces the client's mirror wholesale.
     Tasks(Vec<TaskView>),
@@ -339,8 +337,8 @@ pub struct TaskView {
     /// Whether this task is the flagship. True for at most one task per
     /// snapshot, and never for a finished task.
     pub flagship: bool,
-    /// Whether fleetcom launched this task as a managed agent: `command` is
-    /// then the agent's program word, and a rerun resumes through the harness.
+    /// Whether this task was launched as a managed agent. If true, `command` is the agent's
+    /// program word; use the harness to resume on rerun.
     pub managed: bool,
     /// Dashboard group; `None` means unassigned.
     pub group: Option<String>,
@@ -943,8 +941,9 @@ pub fn decode_event(kind: u8, payload: &[u8]) -> Option<Event> {
             let v = jzon::parse(std::str::from_utf8(payload).ok()?).ok()?;
             match v["t"].as_str()? {
                 "hello_ok" => Some(Event::HelloOk),
-                // `str_vec` reads a missing or non-array value as empty; an
-                // empty menu is an explicit `[]`, so anything else is malformed.
+                // Require an explicit array, including `[]` for an empty menu. Without this
+                // check, missing and non-array values would be accepted as empty by
+                // `str_vec`.
                 "agents" if v["agents"].is_array() => Some(Event::Agents(str_vec(&v["agents"])?)),
                 "tasks" => {
                     let mut views = Vec::new();
