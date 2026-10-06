@@ -1,8 +1,8 @@
 use super::*;
 use crate::{
     harness::fixtures::{ID as CAP_ID, OTHER as CAP_OTHER},
-    protocol::{Preview, PreviewSource},
-    testutil::{codex_session_meta, install_codex_rollout, install_codex_root},
+    protocol::{Lifecycle, Preview, PreviewSource},
+    testutil::{codex_session_meta, dead_pid, install_codex_rollout, install_codex_root},
 };
 
 // --- session-capture wiring -------------------------------------------
@@ -104,6 +104,22 @@ fn save_and_read(s: &mut Supervisor, config: &Path, name: &str) -> String {
     s.apply(Command::SaveSession { name: name.into() });
     let _ = s.drain();
     std::fs::read_to_string(config.join("sessions").join(format!("{name}.json"))).unwrap()
+}
+
+/// Drain the queued events and return the status lines among them.
+fn notices(s: &mut Supervisor) -> Vec<String> {
+    s.drain()
+        .into_iter()
+        .filter_map(|e| match e {
+            Event::Status(m) => Some(m),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Whether a drained event batch acknowledges a spawn.
+fn acknowledged(events: &[Event]) -> bool {
+    events.iter().any(|e| matches!(e, Event::Spawned { .. }))
 }
 
 /// The FNV-1a discriminator is stable and separates distinct config roots.
@@ -1474,15 +1490,6 @@ fn unrepresentable_config_notify_suppresses_injection() {
         dir.to_path_buf(),
         &[("CODEX_HOME", &codex_home)],
     ));
-    let notices = |s: &mut Supervisor| -> Vec<String> {
-        s.drain()
-            .into_iter()
-            .filter_map(|e| match e {
-                Event::Status(m) => Some(m),
-                _ => None,
-            })
-            .collect()
-    };
     spawn(&mut s, "codex", dir.to_path_buf());
     assert_eq!(
         notices(&mut s),
@@ -1607,6 +1614,327 @@ fn recovery_cadence_rewrites_on_capture_drift_and_skips_when_static() {
     );
     let names: Vec<_> = std::fs::read_dir(&rec).unwrap().flatten().collect();
     assert_eq!(names.len(), 1, "one incarnation owns one snapshot file");
+}
+
+// --- managed launches --------------------------------------------------
+
+/// Install a resident shell at `<dir>/resident-sh`: it runs its `-c` text as
+/// a child and stays the leader, as tcsh and csh do. A launch context naming
+/// it as `SHELL` proves the shell plays no part in a managed launch.
+fn install_resident_shell(dir: &Path) -> PathBuf {
+    let shell = dir.join("resident-sh");
+    // `:` after the child keeps sh from exec'ing it as the script's last
+    // command.
+    write_executable(&shell, "[ \"$1\" = -c ] || exit 2\n/bin/sh -c \"$2\"\n:");
+    shell
+}
+
+/// `agent_ctx` with `SHELL` pointing at the resident shell.
+fn resident_shell_ctx(bin: &Path, runtime: &Path, dir: &Path) -> LaunchContext {
+    let shell = install_resident_shell(dir);
+    let mut ctx = agent_ctx(bin, runtime, dir.to_path_buf());
+    ctx.env.retain(|(k, _)| k != "SHELL");
+    ctx.env.push(("SHELL".into(), shell.into_os_string()));
+    ctx
+}
+
+/// The settings overlay beside the sole task's capture file.
+fn settings_beside(s: &Supervisor) -> String {
+    s.tasks[0]
+        .capture_file
+        .as_deref()
+        .and_then(Path::parent)
+        .expect("a managed task has a namespaced capture file")
+        .join("claude-settings.json")
+        .display()
+        .to_string()
+}
+
+/// A managed claude is the task leader whatever `SHELL` names, so a capture
+/// its own hook stamps with `$$` passes the gate; the same payload stamped
+/// by any other process is refused and the pinned ID stands.
+#[test]
+fn managed_claude_accepts_its_own_capture_and_refuses_a_foreign_stamp() {
+    let dir = scratch("managed_capture");
+    let (bin, runtime) = (dir.join("bin"), dir.join("run"));
+    // The stub plays claude running its SessionStart hook after `/clear`:
+    // the capture names a drifted ID under the stub's own pid.
+    install_script(
+        &bin,
+        "claude",
+        &format!(
+            "printf '%s\\n' \"$@\" > '{out}/argv'\n\
+             printf '%s\\n{{\"session_id\":\"{CAP_OTHER}\",\"hook_event_name\":\"SessionStart\",\"source\":\"clear\"}}\\n' \"$$\" > \"$FLEETCOM_CAPTURE_FILE\"",
+            out = dir.display()
+        ),
+    );
+    let mut s = sup_ctx(resident_shell_ctx(&bin, &runtime, &dir));
+    s.spawn_agent("claude", dir.to_path_buf(), None);
+    assert!(acknowledged(&s.drain()), "a managed spawn is acknowledged");
+    let argv = wait_argv(&mut s, &dir.join("argv"));
+    let id = s.tasks[0].id;
+    wait_for_lifecycle(&mut s, id, |l| l == Lifecycle::Ok);
+
+    let t = &s.tasks[0];
+    assert!(t.managed);
+    assert_eq!(t.command, "claude", "the program word is the display text");
+    assert!(t.harness.is_some());
+    let pinned = t
+        .resume_id
+        .clone()
+        .expect("a fresh claude launch pins an id");
+    assert_eq!(
+        argv,
+        ["--session-id", &pinned, "--settings", &settings_beside(&s)]
+    );
+    assert_eq!(
+        current_resume_id(&s.tasks[0]).as_deref(),
+        Some(CAP_OTHER),
+        "the stub's `$$` is the leader pid: no shell sat between"
+    );
+
+    // Any other process's stamp over the same payload is refused.
+    let cap = s.tasks[0].capture_file.clone().unwrap();
+    let text = std::fs::read_to_string(&cap).unwrap();
+    let (_, json) = text.split_once('\n').unwrap();
+    std::fs::write(&cap, format!("{}\n{json}", dead_pid())).unwrap();
+    assert_eq!(
+        current_resume_id(&s.tasks[0]).as_deref(),
+        Some(pinned.as_str()),
+        "a foreign stamp must fall through to the pinned id"
+    );
+}
+
+/// An unknown word, a word with no binary on `PATH`, and a full fleet each
+/// produce one status line and no task; the task ceiling is the one `Spawn`
+/// uses.
+#[test]
+fn managed_spawn_refuses_an_unknown_word_a_missing_binary_and_a_full_fleet() {
+    let dir = scratch("managed_refusals");
+    let (bin, runtime) = (dir.join("bin"), dir.join("run"));
+    let mut s = sup_ctx(agent_ctx(&bin, &runtime, dir.to_path_buf()));
+
+    s.spawn_agent("vim", dir.to_path_buf(), None);
+    let events = s.drain();
+    assert!(!acknowledged(&events));
+    assert_eq!(
+        notices(&mut sup_with(events)),
+        ["no agent named \"vim\", not spawning"]
+    );
+    s.spawn_agent("claude", dir.to_path_buf(), None);
+    let events = s.drain();
+    assert!(!acknowledged(&events));
+    assert_eq!(
+        notices(&mut sup_with(events)),
+        ["claude not found on PATH, not spawning"]
+    );
+    assert!(s.tasks.is_empty(), "a refused launch creates nothing");
+    assert!(!runtime.exists(), "a refused launch installs nothing");
+
+    install_stub(&bin, "claude", &dir);
+    s.set_max_tasks(1);
+    s.spawn_agent("claude", dir.to_path_buf(), None);
+    assert!(acknowledged(&s.drain()));
+    assert_eq!(s.tasks.len(), 1);
+    s.spawn_agent("claude", dir.to_path_buf(), None);
+    assert_eq!(notices(&mut s), ["task limit reached (1), not spawning"]);
+    spawn(&mut s, "sleep 1", dir.to_path_buf());
+    assert_eq!(notices(&mut s), ["task limit reached (1), not spawning"]);
+    assert_eq!(s.tasks.len(), 1, "the ceiling holds for both launch kinds");
+}
+
+/// A supervisor holding only `events`, so `notices` can filter them.
+fn sup_with(events: Vec<Event>) -> Supervisor {
+    let mut s = Supervisor::new(24, 80, 0);
+    s.events = events;
+    s
+}
+
+/// A managed rerun relaunches through the harness: it resumes the captured
+/// ID ahead of the overlay, keeps id, tag, group, name and the program word,
+/// bumps the run, and finds the binary on `PATH` again, so a binary removed
+/// since the launch refuses the rerun and leaves the finished task alone.
+#[test]
+fn managed_rerun_resumes_the_captured_id_from_the_binary_path_finds_now() {
+    let dir = scratch("managed_rerun");
+    let (bin, runtime) = (dir.join("bin"), dir.join("run"));
+    install_stub(&bin, "claude", &dir);
+    let mut s = sup_ctx(agent_ctx(&bin, &runtime, dir.to_path_buf()));
+    s.spawn_agent("claude", dir.to_path_buf(), Some("agents".into()));
+    let _ = wait_argv(&mut s, &dir.join("argv"));
+    let id = s.tasks[0].id;
+    s.tasks[0].tagged = true;
+    s.tasks[0].name = Some("pilot".into());
+    wait_for_lifecycle(&mut s, id, |l| l == Lifecycle::Ok);
+    std::fs::write(
+        s.tasks[0].capture_file.as_ref().unwrap(),
+        stamped(
+            &s.tasks[0],
+            &format!(
+                r#"{{"session_id":"{CAP_OTHER}","hook_event_name":"SessionStart","source":"clear"}}"#
+            ),
+        ),
+    )
+    .unwrap();
+    std::fs::remove_file(dir.join("argv")).unwrap();
+
+    s.apply(Command::Restart { id });
+    let argv = wait_argv(&mut s, &dir.join("argv"));
+    assert_eq!(
+        argv,
+        ["--resume", CAP_OTHER, "--settings", &settings_beside(&s)],
+        "the intent part leads, the overlay follows, no second pin"
+    );
+    let t = &s.tasks[0];
+    assert!(t.managed, "a rerun keeps the task managed");
+    assert_eq!((t.id, t.run, t.command.as_str()), (id, 1, "claude"));
+    assert_eq!(t.resume_id.as_deref(), Some(CAP_OTHER));
+    assert!(t.tagged);
+    assert_eq!(t.group.as_deref(), Some("agents"));
+    assert_eq!(t.name.as_deref(), Some("pilot"));
+
+    // The binary is resolved again at each rerun: a removed one refuses.
+    wait_for_lifecycle(&mut s, id, |l| l == Lifecycle::Ok);
+    std::fs::remove_file(bin.join("claude")).unwrap();
+    s.apply(Command::Restart { id });
+    assert_eq!(notices(&mut s), ["claude not found on PATH, not spawning"]);
+    assert_eq!(s.tasks[0].run, 1, "the finished task is preserved");
+}
+
+/// Without any known ID, a managed rerun starts a fresh conversation: omp
+/// pins nothing, so both runs carry the overlay alone.
+#[test]
+fn managed_rerun_without_an_id_starts_fresh() {
+    let dir = scratch("managed_rerun_fresh");
+    let (bin, runtime) = (dir.join("bin"), dir.join("run"));
+    install_stub(&bin, "omp", &dir);
+    let mut s = sup_ctx(agent_ctx(&bin, &runtime, dir.to_path_buf()));
+    s.spawn_agent("omp", dir.to_path_buf(), None);
+    let first = wait_argv(&mut s, &dir.join("argv"));
+    let id = s.tasks[0].id;
+    assert_eq!(first[0], "-e");
+    assert_eq!(first.len(), 2);
+    assert!(s.tasks[0].resume_id.is_none(), "omp cannot pin an id");
+    wait_for_lifecycle(&mut s, id, |l| l == Lifecycle::Ok);
+    std::fs::remove_file(dir.join("argv")).unwrap();
+
+    s.apply(Command::Restart { id });
+    let again = wait_argv(&mut s, &dir.join("argv"));
+    assert_eq!(again, first, "no id known: the rerun is a fresh launch");
+    assert!(s.tasks[0].managed);
+    assert_eq!(s.tasks[0].run, 1);
+}
+
+/// Session format v1 has no managed entry. A managed task saves as the bare
+/// program word or its resume form, and that string loads as a detected
+/// literal that resumes the same conversation.
+#[test]
+fn managed_task_saves_in_the_v1_resume_form_and_reloads_as_a_detected_literal() {
+    let dir = scratch("managed_save");
+    let (bin, runtime, config) = (dir.join("bin"), dir.join("run"), dir.join("config"));
+    install_stub(&bin, "claude", &dir);
+    install_stub(&bin, "omp", &dir);
+    let mut s = sup_ctx(agent_ctx_plus(
+        &bin,
+        &runtime,
+        dir.to_path_buf(),
+        &[("FLEETCOM_CONFIG_DIR", &config)],
+    ));
+    s.spawn_agent("claude", dir.to_path_buf(), Some("agents".into()));
+    s.spawn_agent("omp", dir.to_path_buf(), None);
+    assert!(s.tasks.iter().all(|t| t.managed));
+    let claude = s.tasks[0].id;
+    wait_for_lifecycle(&mut s, claude, |l| l == Lifecycle::Ok);
+    std::fs::write(
+        s.tasks[0].capture_file.as_ref().unwrap(),
+        stamped(&s.tasks[0], &format!(r#"{{"session_id":"{CAP_ID}"}}"#)),
+    )
+    .unwrap();
+
+    save_and_read(&mut s, &config, "managed");
+    assert_eq!(
+        session::load_in(&config.join("sessions"), "managed").unwrap(),
+        SessionConfig::from([(
+            path::abbreviate(&dir),
+            vec![
+                SessionEntry {
+                    cmd: format!("claude --resume '{CAP_ID}'"),
+                    group: Some("agents".into()),
+                    name: None,
+                },
+                SessionEntry {
+                    cmd: "omp".into(),
+                    group: None,
+                    name: None,
+                },
+            ]
+        )])
+    );
+
+    // The saved strings load as literal tasks that detection instruments.
+    std::fs::remove_file(dir.join("argv")).unwrap();
+    s.apply(Command::LoadSession {
+        name: "managed".into(),
+    });
+    assert_eq!(s.tasks.len(), 4);
+    let reloaded = &s.tasks[2];
+    assert!(!reloaded.managed, "v1 has no managed entry");
+    assert_eq!(reloaded.command, format!("claude --resume '{CAP_ID}'"));
+    assert!(reloaded.harness.is_some(), "detection instruments the form");
+    assert_eq!(reloaded.resume_id.as_deref(), Some(CAP_ID));
+    assert_eq!(reloaded.group.as_deref(), Some("agents"));
+    assert!(!s.tasks[3].managed);
+    assert_eq!(s.tasks[3].command, "omp");
+    assert!(s.tasks[3].harness.is_some());
+    // Two reloaded stubs race for one argv file; both lead with the resume
+    // or extension element, so either record proves the detected launch.
+    let argv = wait_argv(&mut s, &dir.join("argv"));
+    assert!(
+        argv.starts_with(&["--resume".into(), CAP_ID.into()]) || argv[0] == "-e",
+        "a reloaded entry must resume or load its extension: {argv:?}"
+    );
+}
+
+/// A managed codex carries the embedded override even when capture is off,
+/// reports why, and leads a rerun with `resume <id>` ahead of the overrides.
+#[test]
+fn managed_codex_reports_the_capture_notice_and_leads_a_rerun_with_resume() {
+    let dir = scratch("managed_codex");
+    let (bin, runtime, codex_home) = (dir.join("bin"), dir.join("run"), dir.join("codex_home"));
+    std::fs::create_dir_all(&codex_home).unwrap();
+    std::fs::write(codex_home.join("config.toml"), "notify = [1]\n").unwrap();
+    install_stub(&bin, "codex", &dir);
+    let mut s = sup_ctx(agent_ctx_plus(
+        &bin,
+        &runtime,
+        dir.to_path_buf(),
+        &[("CODEX_HOME", &codex_home)],
+    ));
+    s.spawn_agent("codex", dir.to_path_buf(), None);
+    assert_eq!(
+        notices(&mut s),
+        ["task 1: codex capture unavailable: `notify` config can't be chained"]
+    );
+    let argv = wait_argv(&mut s, &dir.join("argv"));
+    assert_eq!(argv, ["-c", "features.daemon_auto_start=false"]);
+    let id = s.tasks[0].id;
+    assert!(s.tasks[0].managed);
+    assert!(s.tasks[0].resume_id.is_none(), "codex cannot pin an id");
+    wait_for_lifecycle(&mut s, id, |l| l == Lifecycle::Ok);
+
+    // The v1 slot holds one bare root UUID.
+    std::fs::write(s.tasks[0].capture_file.as_ref().unwrap(), CAP_ID).unwrap();
+    std::fs::remove_file(dir.join("argv")).unwrap();
+    s.apply(Command::Restart { id });
+    assert_eq!(
+        notices(&mut s),
+        ["task 1: codex capture unavailable: `notify` config can't be chained"]
+    );
+    assert_eq!(
+        wait_argv(&mut s, &dir.join("argv")),
+        ["resume", CAP_ID, "-c", "features.daemon_auto_start=false"]
+    );
+    assert_eq!(s.tasks[0].resume_id.as_deref(), Some(CAP_ID));
 }
 
 // --- live registry blocked status --------------------------------------

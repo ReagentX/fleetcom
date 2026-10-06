@@ -18,7 +18,7 @@
 
 use std::path::Path;
 
-use super::{CAPTURE_ENV, CapturePaths, Harness, Invocation, SpawnPlan, capture_id, shell_quote};
+use super::{CAPTURE_ENV, CapturePaths, Harness, SpawnPlan, capture_id};
 
 pub struct Omp;
 
@@ -27,24 +27,16 @@ impl Harness for Omp {
         ("omp", "--resume")
     }
 
-    /// Append the capture extension with `-e` for both accepted command shapes.
-    fn instrument(
-        &self,
-        _inv: &Invocation,
-        capture: &CapturePaths,
-        _home: Option<&Path>,
-    ) -> SpawnPlan {
+    /// Load the capture extension with `-e`. No session flag: omp has no
+    /// `--session-id`, so a pinned UUID could not be resumed.
+    fn overlay(&self, capture: &CapturePaths, _home: Option<&Path>) -> SpawnPlan {
         SpawnPlan {
-            args_suffix: format!(
-                " -e {}",
-                shell_quote(&capture.omp_capture.to_string_lossy())
-            ),
+            args: vec!["-e".into(), capture.omp_capture.clone().into_os_string()],
             env: vec![(
                 CAPTURE_ENV.into(),
                 capture.capture_file.clone().into_os_string(),
             )],
-            injected_id: None,
-            notice: None,
+            ..SpawnPlan::default()
         }
     }
 
@@ -66,10 +58,17 @@ mod tests {
     use std::path::PathBuf;
 
     use super::*;
-    use crate::harness::fixtures::{ID, assert_all_opaque, paths};
+    use crate::harness::{
+        Intent,
+        fixtures::{ID, argv, assert_all_opaque, paths},
+        plan, shell_words,
+    };
 
     /// Valid UUIDv7 used in capture payloads.
     const CAPTURED: &str = "01a0077c-e18e-7000-ae0b-016f4834b6e9";
+
+    /// The extension path from [`paths`].
+    const EXTENSION: &str = "/tmp/Application Support/omp-capture.js";
 
     /// omp-specific aliases, shortcuts, prompts, and malformed resume forms
     /// remain opaque.
@@ -88,28 +87,42 @@ mod tests {
         assert_all_opaque(&Omp, ID, &opaque);
     }
 
-    /// Load the extension and specify the capture file for both accepted shapes. Pin no
-    /// ID: omp has no `--session-id`, so a pinned UUID could not be resumed. Include a
-    /// space in the fixture's asset path to verify quoting as one word.
+    /// Managed argv: a fresh launch loads the extension alone, since omp has
+    /// no `--session-id` and a minted ID would be unresumable; a resume names
+    /// its conversation first. Both name the capture file in the environment.
     #[test]
-    fn instrument_loads_the_extension_for_either_accepted_shape() {
-        for cmd in ["omp".to_string(), format!("omp --resume {ID}")] {
-            let inv = Omp.detect(&cmd).unwrap();
-            let plan = Omp.instrument(&inv, &paths(), None);
-            assert_eq!(plan.injected_id, None, "{cmd}");
-            assert_eq!(
-                plan.args_suffix, " -e '/tmp/Application Support/omp-capture.js'",
-                "{cmd}"
-            );
-            assert_eq!(
-                plan.env,
-                vec![(
-                    CAPTURE_ENV.into(),
-                    PathBuf::from("/tmp/cap/session.json").into_os_string()
-                )],
-                "{cmd}"
-            );
-        }
+    fn managed_argv_loads_the_extension_and_pins_nothing() {
+        let fresh = plan(&Omp, &Intent::Fresh, Some(ID), &paths(), None);
+        assert_eq!(fresh.args, argv(&["-e", EXTENSION]));
+        assert_eq!(fresh.resume_id, None, "the minted id is ignored");
+        assert_eq!(
+            fresh.env,
+            vec![(
+                CAPTURE_ENV.into(),
+                PathBuf::from("/tmp/cap/session.json").into_os_string()
+            )]
+        );
+
+        let resume = plan(&Omp, &Intent::Resume(CAPTURED.into()), None, &paths(), None);
+        assert_eq!(resume.args, argv(&["--resume", CAPTURED, "-e", EXTENSION]));
+        assert_eq!(resume.resume_id.as_deref(), Some(CAPTURED));
+        assert_eq!(resume.env, fresh.env);
+    }
+
+    /// Both literal shapes get the extension as one quoted word (the
+    /// fixture path has a space) and no pin.
+    #[test]
+    fn literal_suffix_loads_the_extension_for_either_accepted_shape() {
+        let overlay = Omp.overlay(&paths(), None);
+        assert_eq!(overlay.resume_id, None);
+        assert_eq!(
+            shell_words(&overlay.args),
+            " -e '/tmp/Application Support/omp-capture.js'"
+        );
+        // The bare word's fresh intent part is empty, so its suffix is the
+        // overlay's.
+        let fresh = plan(&Omp, &Intent::Fresh, Some(ID), &paths(), None);
+        assert_eq!(fresh.args, overlay.args);
     }
 
     /// Extract only a validated ID from the extension payload.

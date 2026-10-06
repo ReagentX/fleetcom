@@ -175,7 +175,8 @@ Before inserting a captured ID into a shell command, accept only lowercase hexad
 Implement the `Harness` trait in [`src/harness/mod.rs`](../src/harness/mod.rs) for each tool. Register it in that file's `AGENTS` table, the sole registry for detection. Include a `SummaryAdapter` for the dashboard preview with each entry; see the implementations in [`src/harness/summary.rs`](../src/harness/summary.rs). Separate detection, evidence collection, and command construction through these methods:
 
 - `shape`: supply the program word and resume selector. Accepted and canonical forms are derived from that pair by the default `detect` and `resume_command` implementations.
-- `instrument`: return spawn-time arguments, environment entries, an optional pinned ID, and an optional notice explaining reduced instrumentation, which the supervisor reports on the status line once the task spawns.
+- `session_flag`: name the flag that pins a session ID on a fresh launch, or return `None` (the default) when the tool assigns its own. `harness::plan` builds the conversation-selecting argv from this flag and the resume selector.
+- `overlay`: return the argv elements, environment entries, and optional notice every launch of the tool carries after the conversation selection; the supervisor reports the notice on the status line once the task spawns. A managed launch passes the elements to the binary directly; a detected literal command gets them appended as shell text.
 - `parse_capture`: read an ID from the capture file's contents. The task leader's PID and the launch-time home are supplied; when other processes can reach the capture channel, use them to refuse a payload the task's own process did not write.
 - `live_session_id`: read the ID published on disk for a live session. Return `None` by default when no registry is available.
 - `live_blocked_status`: read that registry for blocked-on-user status. Return preview text, never an ID; return `None` by default.

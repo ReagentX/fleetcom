@@ -308,12 +308,7 @@ impl CaptureAssets {
 fn fleetcom_binary() -> Option<PathBuf> {
     std::env::current_exe()
         .ok()
-        .filter(|exe| executable_file(exe))
-}
-
-/// Whether `path` is a regular file with any execute bit, following symlinks.
-fn executable_file(path: &Path) -> bool {
-    fs::metadata(path).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+        .filter(|exe| super::executable_file(exe))
 }
 
 /// Remove this supervisor's capture namespace on drop.
@@ -335,7 +330,7 @@ mod tests {
     use super::*;
     use crate::{
         harness::{
-            BINARY_ENV, CAPTURE_ENV, Claude, Harness, NOTIFY_CHAIN_ENV, Omp,
+            BINARY_ENV, CAPTURE_ENV, Claude, Harness, NOTIFY_CHAIN_ENV, Omp, executable_file,
             fixtures::{ID, OTHER},
         },
         testutil::{dead_pid, install_fake_notifier, temp, write_executable},

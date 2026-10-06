@@ -22,8 +22,8 @@ use std::{
 };
 
 use super::{
-    BINARY_ENV, CAPTURE_ENV, CapturePaths, Harness, Invocation, NOTIFY_CHAIN_ENV, SpawnPlan,
-    capture_id, home_root, is_uuid, resolve_home, shell_quote,
+    BINARY_ENV, CAPTURE_ENV, CapturePaths, Harness, NOTIFY_CHAIN_ENV, SpawnPlan, capture_id,
+    home_root, is_uuid, resolve_home,
 };
 
 /// Config override for explicitly launching in embedded mode.
@@ -61,17 +61,11 @@ impl Harness for Codex {
     /// attaches to its shared background server and killing the task kills
     /// only the TUI client. The notify override and its environment ride
     /// along only when the configured route can be chained and this binary
-    /// is usable; otherwise the plan explains why capture is off.
-    fn instrument(
-        &self,
-        // Both accepted shapes take the same injection; codex cannot pin an
-        // ID at launch either way.
-        _inv: &Invocation,
-        capture: &CapturePaths,
-        home: Option<&Path>,
-    ) -> SpawnPlan {
+    /// is usable; otherwise the plan explains why capture is off. No session
+    /// flag: codex cannot pin an ID at launch.
+    fn overlay(&self, capture: &CapturePaths, home: Option<&Path>) -> SpawnPlan {
         let mut plan = SpawnPlan {
-            args_suffix: format!(" -c {}", shell_quote(EMBEDDED_OVERRIDE)),
+            args: vec!["-c".into(), EMBEDDED_OVERRIDE.into()],
             ..SpawnPlan::default()
         };
         let chain = match config_notify_route(home) {
@@ -100,11 +94,12 @@ impl Harness for Codex {
             "notify=[\"{}\"]",
             toml_escape(&capture.codex_notify.to_string_lossy())
         );
-        plan.args_suffix = format!(
-            " -c {} -c {}",
-            shell_quote(&toml),
-            shell_quote(EMBEDDED_OVERRIDE)
-        );
+        plan.args = vec![
+            "-c".into(),
+            toml.into(),
+            "-c".into(),
+            EMBEDDED_OVERRIDE.into(),
+        ];
         plan.env = vec![
             (
                 CAPTURE_ENV.into(),
@@ -432,7 +427,11 @@ mod tests {
 
     use super::*;
     use crate::{
-        harness::fixtures::{OTHER, assert_all_opaque, paths},
+        harness::{
+            Intent,
+            fixtures::{OTHER, argv, assert_all_opaque, paths},
+            plan, shell_words,
+        },
         testutil::{Scratch, codex_session_meta, install_codex_rollout, install_codex_root, temp},
     };
 
@@ -470,12 +469,15 @@ mod tests {
         ]
     }
 
-    /// The plan of a launch whose capture is off, explained by `why`.
+    /// The notify override that [`paths`] produces.
+    const NOTIFY: &str = r#"notify=["/tmp/Application Support/notify.sh"]"#;
+
+    /// The overlay of a launch whose capture is off, explained by `why`.
     fn embedded_only(why: &str) -> SpawnPlan {
         SpawnPlan {
-            args_suffix: EMBEDDED_ONLY.into(),
+            args: argv(&["-c", EMBEDDED_OVERRIDE]),
             env: Vec::new(),
-            injected_id: None,
+            resume_id: None,
             notice: Some(format!("codex capture unavailable: {why}")),
         }
     }
@@ -516,44 +518,90 @@ mod tests {
         temp("codex_no_config_home")
     }
 
-    /// Apply the same two overrides to both accepted forms: the notifier,
-    /// then explicit embedded mode. The environment names the capture file,
-    /// an explicitly empty chain so no inherited value reaches the script,
-    /// and the binary the script runs. No ID can be pinned at launch.
+    /// Managed argv: a fresh launch carries the two overrides alone (no ID
+    /// can be pinned, so the minted one is ignored); a resume leads with the
+    /// `resume` subcommand and the ID, then the same overrides. The
+    /// environment names the capture file, an explicitly empty chain so no
+    /// inherited value reaches the script, and the binary the script runs.
     #[test]
-    fn instrument_installs_the_notify_and_embedded_overrides() {
-        for cmd in ["codex".to_string(), format!("codex resume {ID}")] {
-            let inv = Codex.detect(&cmd).unwrap();
-            let plan = Codex.instrument(&inv, &paths(), Some(&no_config_home()));
-            assert_eq!(plan.args_suffix, SUFFIX, "{cmd}");
-            assert_eq!(plan.injected_id, None, "{cmd}");
-            assert_eq!(plan.notice, None, "{cmd}");
-            assert_eq!(plan.env, full_env(""), "{cmd}");
-        }
+    fn managed_argv_installs_the_notify_and_embedded_overrides() {
+        let home = no_config_home();
+        let fresh = plan(&Codex, &Intent::Fresh, Some(ID), &paths(), Some(&home));
+        assert_eq!(fresh.args, argv(&["-c", NOTIFY, "-c", EMBEDDED_OVERRIDE]));
+        assert_eq!(fresh.resume_id, None, "the minted id is ignored");
+        assert_eq!(fresh.notice, None);
+        assert_eq!(fresh.env, full_env(""));
+
+        let resume = plan(
+            &Codex,
+            &Intent::Resume(ID.into()),
+            None,
+            &paths(),
+            Some(&home),
+        );
+        assert_eq!(
+            resume.args,
+            argv(&["resume", ID, "-c", NOTIFY, "-c", EMBEDDED_OVERRIDE])
+        );
+        assert_eq!(resume.resume_id.as_deref(), Some(ID));
+        assert_eq!(resume.env, full_env(""));
+    }
+
+    /// Both literal shapes get the same suffix: the notifier, then explicit
+    /// embedded mode.
+    #[test]
+    fn literal_suffix_installs_the_notify_and_embedded_overrides() {
+        let overlay = Codex.overlay(&paths(), Some(&no_config_home()));
+        assert_eq!(shell_words(&overlay.args), SUFFIX);
+        assert_eq!(overlay.resume_id, None);
+        // The bare word's fresh intent part is empty, so its suffix is the
+        // overlay's.
+        let fresh = plan(
+            &Codex,
+            &Intent::Fresh,
+            Some(ID),
+            &paths(),
+            Some(&no_config_home()),
+        );
+        assert_eq!(shell_words(&fresh.args), SUFFIX);
     }
 
     /// Without a usable binary, the script would have nothing to run, so the
     /// launch carries the embedded override alone and says why. The route
-    /// is still read first: an opaque route reports its own reason.
+    /// is still read first: an opaque route reports its own reason. A
+    /// managed resume keeps its intent part ahead of the reduced overlay.
     #[test]
-    fn instrument_without_a_usable_binary_keeps_only_the_embedded_override() {
+    fn overlay_without_a_usable_binary_keeps_only_the_embedded_override() {
         let paths = CapturePaths {
             fleetcom_binary: None,
             ..paths()
         };
-        for cmd in ["codex".to_string(), format!("codex resume {ID}")] {
-            let inv = Codex.detect(&cmd).unwrap();
-            assert_eq!(
-                Codex.instrument(&inv, &paths, Some(&no_config_home())),
-                embedded_only("fleetcom binary replaced; restart the daemon"),
-                "{cmd}"
-            );
-        }
+        let why = "fleetcom binary replaced; restart the daemon";
+        assert_eq!(
+            Codex.overlay(&paths, Some(&no_config_home())),
+            embedded_only(why)
+        );
+        assert_eq!(
+            shell_words(&Codex.overlay(&paths, Some(&no_config_home())).args),
+            EMBEDDED_ONLY
+        );
+        let resume = plan(
+            &Codex,
+            &Intent::Resume(ID.into()),
+            None,
+            &paths,
+            Some(&no_config_home()),
+        );
+        assert_eq!(resume.args, argv(&["resume", ID, "-c", EMBEDDED_OVERRIDE]));
+        assert_eq!(
+            resume.notice.as_deref(),
+            Some(&*format!("{CAPTURE_OFF}: {why}"))
+        );
+
         let home = temp("codex_no_binary_opaque");
         fs::write(home.join("config.toml"), "notify = [1]\n").unwrap();
-        let inv = Codex.detect("codex").unwrap();
         assert_eq!(
-            Codex.instrument(&inv, &paths, Some(&home)),
+            Codex.overlay(&paths, Some(&home)),
             embedded_only("`notify` config can't be chained")
         );
     }
@@ -562,9 +610,8 @@ mod tests {
     /// capture alone for comments, longer keys, and missing files: no route is
     /// configured.
     #[test]
-    fn instrument_chains_a_config_toml_notify() {
+    fn overlay_chains_a_config_toml_notify() {
         let home = temp("codex_cfg_notify");
-        let inv = Codex.detect("codex").unwrap();
         let chained = |plan: &SpawnPlan| {
             plan.env
                 .iter()
@@ -574,8 +621,8 @@ mod tests {
 
         // Missing config file: plain injection, and the chain is present but
         // empty.
-        let plan = Codex.instrument(&inv, &paths(), Some(&home));
-        assert_eq!(plan.args_suffix, SUFFIX);
+        let plan = Codex.overlay(&paths(), Some(&home));
+        assert_eq!(shell_words(&plan.args), SUFFIX);
         assert_eq!(chained(&plan), Some("".into()));
 
         let cfg = home.join("config.toml");
@@ -586,8 +633,8 @@ mod tests {
             "model = \"gpt-5\"\nnotify = [\"/my/thing\"]\n",
         ] {
             fs::write(&cfg, active).unwrap();
-            let plan = Codex.instrument(&inv, &paths(), Some(&home));
-            assert_eq!(plan.args_suffix, SUFFIX, "{active:?}");
+            let plan = Codex.overlay(&paths(), Some(&home));
+            assert_eq!(shell_words(&plan.args), SUFFIX, "{active:?}");
             assert_eq!(plan.env, full_env("/my/thing"), "{active:?}");
             assert_eq!(plan.notice, None, "{active:?}");
         }
@@ -598,24 +645,23 @@ mod tests {
             "notify = []\n",
         ] {
             fs::write(&cfg, inert).unwrap();
-            let plan = Codex.instrument(&inv, &paths(), Some(&home));
-            assert_eq!(plan.args_suffix, SUFFIX, "{inert:?}");
+            let plan = Codex.overlay(&paths(), Some(&home));
+            assert_eq!(shell_words(&plan.args), SUFFIX, "{inert:?}");
             assert_eq!(chained(&plan), Some("".into()), "{inert:?}");
         }
     }
 
     /// Preserve spaces within argv elements in the newline-joined chain.
     #[test]
-    fn instrument_chains_the_vendor_desktop_entry() {
+    fn overlay_chains_the_vendor_desktop_entry() {
         let home = temp("codex_vendor_notify");
         fs::write(
             home.join("config.toml"),
             "notify = [\"/Applications/Codex Computer Use.app/Contents/MacOS/SkyComputerUseClient\", \"turn-ended\"]\n",
         )
         .unwrap();
-        let inv = Codex.detect("codex").unwrap();
-        let plan = Codex.instrument(&inv, &paths(), Some(&home));
-        assert_eq!(plan.args_suffix, SUFFIX);
+        let plan = Codex.overlay(&paths(), Some(&home));
+        assert_eq!(shell_words(&plan.args), SUFFIX);
         assert!(plan.env.contains(&(
             NOTIFY_CHAIN_ENV.into(),
             "/Applications/Codex Computer Use.app/Contents/MacOS/SkyComputerUseClient\nturn-ended"
@@ -626,10 +672,9 @@ mod tests {
     /// For an unrepresentable route, inject the embedded override alone, no
     /// environment, and a notice: the task stays in embedded mode either way.
     #[test]
-    fn instrument_skips_an_unrepresentable_config_notify() {
+    fn overlay_skips_an_unrepresentable_config_notify() {
         let home = temp("codex_opaque_notify");
         let cfg = home.join("config.toml");
-        let inv = Codex.detect("codex").unwrap();
         for opaque in [
             // Malformed TOML cannot identify an active route.
             "notify = [\n",
@@ -647,7 +692,7 @@ mod tests {
         ] {
             fs::write(&cfg, opaque).unwrap();
             assert_eq!(
-                Codex.instrument(&inv, &paths(), Some(&home)),
+                Codex.overlay(&paths(), Some(&home)),
                 embedded_only("`notify` config can't be chained"),
                 "{opaque:?}"
             );
@@ -667,11 +712,10 @@ mod tests {
             codex_notify: PathBuf::from(r#"/Odd Path/it's "here"\now"#),
             ..paths()
         };
-        let inv = Codex.detect("codex").unwrap();
-        let plan = Codex.instrument(&inv, &paths, Some(&no_config_home()));
+        let plan = Codex.overlay(&paths, Some(&no_config_home()));
         let out = std::process::Command::new("sh")
             .arg("-c")
-            .arg(format!("printf '%s\\n'{}", plan.args_suffix))
+            .arg(format!("printf '%s\\n'{}", shell_words(&plan.args)))
             .output()
             .expect("sh must run");
         assert_eq!(

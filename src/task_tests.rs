@@ -1,16 +1,21 @@
 use super::*;
-use crate::testutil::{env_here, here, read_pid, sh_env, temp, wait_until};
+use crate::testutil::{env_here, here, read_pid, sh_env, temp, wait_until, write_executable};
 
 /// Tests drive the reader directly, so there is no core loop to wake.
 fn no_waker() -> Waker {
     Arc::new(Mutex::new(None))
 }
 
+/// The exec form of a typed command.
+fn literal(command: &str) -> Exec {
+    Exec::Literal(command.to_string())
+}
+
 fn spawn(id: u64, command: &str) -> Task {
     Task::spawn(
         id,
         command,
-        command,
+        literal(command),
         &here(),
         24,
         80,
@@ -137,6 +142,65 @@ fn exited_leader_stays_a_zombie_until_drop() {
     assert!(kill(pid, None).is_err(), "Drop did not collect the zombie");
 }
 
+/// A managed launch makes the agent the task leader by construction: no
+/// shell sits between the PTY and the binary. The same agent launched as a
+/// literal through a resident shell (one that runs its `-c` text as a child
+/// instead of replacing itself, as tcsh and csh do) is not the leader. That
+/// gap is why managed launch exists: claude's capture gate and registry
+/// reader key on the leader pid.
+#[test]
+fn managed_launch_makes_the_agent_the_task_leader_under_any_shell() {
+    let dir = temp("task_identity");
+    let shell = dir.join("resident-sh");
+    // `:` after the child keeps sh from exec'ing it as the script's last
+    // command, so the shell stays resident as the leader.
+    write_executable(&shell, "[ \"$1\" = -c ] || exit 2\n/bin/sh -c \"$2\"\n:");
+    let agent = dir.join("agent");
+    let pid_file = dir.join("pid");
+    write_executable(
+        &agent,
+        &format!("printf '%s' \"$$\" > '{}'", pid_file.display()),
+    );
+    let mut env = sh_env();
+    env.retain(|(k, _)| k != "SHELL");
+    env.push(("SHELL".into(), shell.as_os_str().to_os_string()));
+
+    let managed = Exec::Managed {
+        binary: agent.clone(),
+        args: Vec::new(),
+    };
+    let mut t = Task::spawn(1, "agent", managed, &here(), 24, 80, 2000, &env, no_waker()).unwrap();
+    wait_finished(&mut t);
+    assert!(t.managed);
+    assert_eq!(
+        read_pid(&pid_file).as_raw() as u32,
+        t.pid().unwrap(),
+        "the agent must be the task leader with no shell in between"
+    );
+
+    std::fs::remove_file(&pid_file).unwrap();
+    let typed = format!("'{}'", agent.display());
+    let mut t = Task::spawn(
+        2,
+        &typed,
+        literal(&typed),
+        &here(),
+        24,
+        80,
+        2000,
+        &env,
+        no_waker(),
+    )
+    .unwrap();
+    wait_finished(&mut t);
+    assert!(!t.managed);
+    assert_ne!(
+        read_pid(&pid_file).as_raw() as u32,
+        t.pid().unwrap(),
+        "premise: under a resident shell the literal agent is a child, not the leader"
+    );
+}
+
 /// `terminate` reaches live group members after the leader exits.
 #[test]
 fn terminate_reaches_stragglers_after_leader_exit() {
@@ -147,7 +211,18 @@ fn terminate_reaches_stragglers_after_leader_exit() {
     // must survive its session leader's exit (leader death HUPs the
     // foreground group) to *be* a straggler.
     let cmd = format!("trap '' HUP; sleep 300 & echo $! > {}", spid.display());
-    let mut t = Task::spawn(5, &cmd, &cmd, &here(), 24, 80, 2000, &sh_env(), no_waker()).unwrap();
+    let mut t = Task::spawn(
+        5,
+        &cmd,
+        literal(&cmd),
+        &here(),
+        24,
+        80,
+        2000,
+        &sh_env(),
+        no_waker(),
+    )
+    .unwrap();
     wait_finished(&mut t); // leader exits as soon as the background job is up
     let straggler = read_pid(&spid);
     assert!(kill(straggler, None).is_ok(), "straggler should be alive");
@@ -329,7 +404,18 @@ fn input_hints_track_child_modes() {
 #[test]
 fn finalize_preview_waits_for_reader_eof() {
     let cmd = "printf 'test result: ok\\n'";
-    let mut t = Task::spawn(20, cmd, cmd, &here(), 24, 80, 2000, &sh_env(), no_waker()).unwrap();
+    let mut t = Task::spawn(
+        20,
+        cmd,
+        literal(cmd),
+        &here(),
+        24,
+        80,
+        2000,
+        &sh_env(),
+        no_waker(),
+    )
+    .unwrap();
     assert!(
         wait_until(Duration::from_secs(60), || {
             t.poll_exit().unwrap();
@@ -367,7 +453,18 @@ fn finalize_preview_waits_for_reader_eof() {
 #[test]
 fn finalize_preview_lands_an_open_sync_frame() {
     let cmd = "printf '\\033[?2026htest result: ok\\n'";
-    let mut t = Task::spawn(21, cmd, cmd, &here(), 24, 80, 2000, &sh_env(), no_waker()).unwrap();
+    let mut t = Task::spawn(
+        21,
+        cmd,
+        literal(cmd),
+        &here(),
+        24,
+        80,
+        2000,
+        &sh_env(),
+        no_waker(),
+    )
+    .unwrap();
     assert!(
         wait_until(Duration::from_secs(60), || {
             t.poll_exit().unwrap();
@@ -397,7 +494,18 @@ fn finalize_preview_freezes_the_final_primary_line() {
         "until [ -e '{}' ]; do sleep 0.05; done; printf 'test result: ok\\n'",
         flag.display()
     );
-    let mut t = Task::spawn(40, &cmd, &cmd, &here(), 24, 80, 2000, &sh_env(), no_waker()).unwrap();
+    let mut t = Task::spawn(
+        40,
+        &cmd,
+        literal(&cmd),
+        &here(),
+        24,
+        80,
+        2000,
+        &sh_env(),
+        no_waker(),
+    )
+    .unwrap();
     // The last live resolution predates every byte of output.
     let early = t.resolve_preview(Instant::now());
     assert!(!early.frozen);
@@ -433,7 +541,18 @@ fn finalize_preview_keeps_the_last_render_across_alt_teardown() {
         td = teardown.display(),
         ex = exit.display()
     );
-    let mut t = Task::spawn(41, &cmd, &cmd, &here(), 24, 80, 2000, &sh_env(), no_waker()).unwrap();
+    let mut t = Task::spawn(
+        41,
+        &cmd,
+        literal(&cmd),
+        &here(),
+        24,
+        80,
+        2000,
+        &sh_env(),
+        no_waker(),
+    )
+    .unwrap();
     assert!(
         wait_until(Duration::from_secs(5), || {
             t.resolve_preview(Instant::now()).source == PreviewSource::Title
@@ -490,7 +609,18 @@ fn finalize_preview_freezes_primary_output_after_alt_teardown() {
          printf '\\033[?1049ldone\\n'",
         flag.display()
     );
-    let mut t = Task::spawn(43, &cmd, &cmd, &here(), 24, 80, 2000, &sh_env(), no_waker()).unwrap();
+    let mut t = Task::spawn(
+        43,
+        &cmd,
+        literal(&cmd),
+        &here(),
+        24,
+        80,
+        2000,
+        &sh_env(),
+        no_waker(),
+    )
+    .unwrap();
     assert!(
         wait_until(Duration::from_secs(5), || {
             t.resolve_preview(Instant::now()).source == PreviewSource::Title
@@ -528,7 +658,18 @@ fn summary_adapter_anchors_live_and_freezes_completion_at_exit() {
          printf '\\033[H\\033[2J• Ran echo ok\\n\\n› \\n  synth-model high · 2 in · 3 out'",
         f = flag.display()
     );
-    let mut t = Task::spawn(42, &cmd, &cmd, &here(), 24, 80, 2000, &sh_env(), no_waker()).unwrap();
+    let mut t = Task::spawn(
+        42,
+        &cmd,
+        literal(&cmd),
+        &here(),
+        24,
+        80,
+        2000,
+        &sh_env(),
+        no_waker(),
+    )
+    .unwrap();
     assert!(t.summary_adapter.is_none(), "printf selects nothing");
     t.summary_adapter = crate::harness::select("codex");
     assert!(t.summary_adapter.is_some());
@@ -584,7 +725,18 @@ fn probe_replies_reach_the_child_through_the_allowlist() {
          head -c 11 > {}",
         out.display()
     );
-    let mut t = Task::spawn(11, &cmd, &cmd, &here(), 24, 80, 2000, &sh_env(), no_waker()).unwrap();
+    let mut t = Task::spawn(
+        11,
+        &cmd,
+        literal(&cmd),
+        &here(),
+        24,
+        80,
+        2000,
+        &sh_env(),
+        no_waker(),
+    )
+    .unwrap();
     let mut got = Vec::new();
     wait_until(Duration::from_secs(5), || {
         got = std::fs::read(&out).unwrap_or_default();

@@ -1,18 +1,23 @@
 //! A saved agent command is incomplete without its conversation ID. Relaunching
-//! the command can otherwise start a new conversation. Each harness detects a
-//! narrow set of commands, captures a validated ID, and builds the corresponding
-//! resume command.
+//! the command can otherwise start a new conversation. Each harness captures a
+//! validated ID and builds the argv that opens or resumes a conversation.
 //!
-//! Detection accepts only a bare program word or its canonical resume form:
-//! program word, fixed selector, one strict UUID, and end of line. Everything
-//! else remains opaque and runs and saves verbatim.
+//! A managed launch is built here from an [`Intent`]: the binary found on
+//! `PATH`, the conversation selection, then the harness's overlay (capture
+//! hook, config overrides, environment). No shell parses that argv.
+//!
+//! A literal command still goes through detection in this release: a bare
+//! program word or its canonical resume form (program word, fixed selector,
+//! one strict UUID, end of line) gets the same argv elements appended as
+//! shell text. Everything else remains opaque and runs and saves verbatim.
 //!
 //! # Security invariant
 //!
-//! Every ID returned by `parse_capture` or `live_session_id` eventually enters a shell
-//! command. These methods return only strings accepted by [`is_uuid`]; return `None`
-//! for free text, paths, and malformed IDs. Summary adapters and `live_blocked_status`
-//! are display-only.
+//! Every ID returned by `parse_capture` or `live_session_id` eventually enters a
+//! shell command (a literal task's resume form) or an agent's argv (a managed
+//! task's). These methods return only strings accepted by [`is_uuid`]; return
+//! `None` for free text, paths, and malformed IDs. Summary adapters and
+//! `live_blocked_status` are display-only.
 
 pub mod assets;
 mod claude;
@@ -22,9 +27,10 @@ mod omp;
 pub mod summary;
 
 use std::{
-    ffi::OsString,
-    fs::File,
+    ffi::{OsStr, OsString},
+    fs::{self, File},
     io::Read,
+    os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
     time::SystemTime,
 };
@@ -68,15 +74,20 @@ pub trait Harness: Sync {
         detect_shape(cmd, program, selector)
     }
 
-    /// Build spawn-time command and environment additions. `home` is resolved
-    /// from the launch environment; `None` uses the harness's platform-home
-    /// fallback.
-    fn instrument(
-        &self,
-        inv: &Invocation,
-        capture: &CapturePaths,
-        home: Option<&Path>,
-    ) -> SpawnPlan;
+    /// The flag that pins a session ID on a fresh launch, for tools that
+    /// accept one. `None` means a fresh conversation gets its ID from the
+    /// tool, and only capture or the registry can report it.
+    fn session_flag(&self) -> Option<&'static str> {
+        None
+    }
+
+    /// Spawn-time additions every launch of this tool carries, whichever
+    /// conversation it opens: argv elements after the conversation selection,
+    /// environment pairs, and a notice when the launch carries less than
+    /// usual. `home` is resolved from the launch environment; `None` uses the
+    /// harness's platform-home fallback. Leaves `resume_id` unset; [`plan`]
+    /// fills it from the intent.
+    fn overlay(&self, capture: &CapturePaths, home: Option<&Path>) -> SpawnPlan;
 
     /// Extract a session ID from the capture file's contents. `pid` is the
     /// task's session leader and `home` the launch-time harness home. When
@@ -176,6 +187,33 @@ pub fn detect(cmd: &str) -> Option<(&'static dyn Harness, Invocation)> {
         .find_map(|a| a.harness.detect(cmd).map(|inv| (a.harness, inv)))
 }
 
+/// The harness registered under exactly `program`: the word a managed
+/// launch names, never a path or a basename match.
+pub fn registered(program: &str) -> Option<&'static dyn Harness> {
+    AGENTS
+        .iter()
+        .map(|a| a.harness)
+        .find(|h| h.shape().0 == program)
+}
+
+/// The first executable regular file named `program` in `path`, returned as
+/// found. The path is never canonicalized: a self-updater that repoints
+/// `~/.local/bin/claude` is followed at the next launch. Components that are
+/// not absolute (empty, `.`, `bin`) are skipped: they would resolve against
+/// the daemon's cwd here and against the task's cwd at exec, so the two
+/// could name different files.
+pub fn find_on_path(program: &str, path: &OsStr) -> Option<PathBuf> {
+    std::env::split_paths(path)
+        .filter(|dir| dir.is_absolute())
+        .map(|dir| dir.join(program))
+        .find(|candidate| executable_file(candidate))
+}
+
+/// Whether `path` is a regular file with any execute bit, following symlinks.
+fn executable_file(path: &Path) -> bool {
+    fs::metadata(path).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+}
+
 /// Select a summary adapter by the basename of the command's first
 /// whitespace-separated word. Arguments are accepted; do not select an adapter
 /// for environment prefixes or compound shell commands. Selection is
@@ -192,21 +230,92 @@ pub fn select(command: &str) -> Option<&'static dyn crate::preview::SummaryAdapt
 /// Classification of an accepted agent-CLI command.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Invocation {
-    /// The bare program word: `instrument` may pin a fresh session ID.
+    /// The bare program word: the launch takes the `Fresh` intent part.
     Bare,
-    /// The canonical resume form: the command already targets this ID, so
-    /// launch-time pinning is off.
+    /// The canonical resume form: the command already carries the selector
+    /// and this ID, so the launch takes the overlay alone.
     Resume(String),
 }
 
-impl Invocation {
-    /// The session ID the command already targets.
-    pub fn known_id(self) -> Option<String> {
-        match self {
-            Self::Bare => None,
-            Self::Resume(id) => Some(id),
+/// Which conversation a managed launch opens.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Intent {
+    /// A new conversation. A tool with a [`Harness::session_flag`] gets an
+    /// ID minted by the supervisor.
+    Fresh,
+    /// The conversation with this ID, which passed [`is_uuid`] at its
+    /// source: a capture, a registry record, or a detected command.
+    Resume(String),
+}
+
+/// Argv that selects the conversation, and the ID the launch targets when
+/// one is known at launch. `Fresh` pins `fresh_id` through the tool's session
+/// flag where it has one; `None` (a mint failure) launches unpinned, as every
+/// release has. `Resume` names the ID after the tool's resume selector. The
+/// ID is one argv element and no shell parses it, so [`is_uuid`] is a second
+/// check here rather than the only one.
+pub fn intent_args(
+    h: &dyn Harness,
+    intent: &Intent,
+    fresh_id: Option<&str>,
+) -> (Vec<OsString>, Option<String>) {
+    match intent {
+        Intent::Fresh => match (h.session_flag(), fresh_id) {
+            (Some(flag), Some(id)) => (vec![flag.into(), id.into()], Some(id.to_string())),
+            _ => (Vec::new(), None),
+        },
+        Intent::Resume(id) => {
+            debug_assert!(is_uuid(id), "Intent::Resume carries a validated ID");
+            (
+                vec![h.shape().1.into(), id.as_str().into()],
+                Some(id.clone()),
+            )
         }
     }
+}
+
+/// The complete plan for one launch of `h`: the intent part first, then the
+/// overlay. Every tool takes its subcommand or session flag before config
+/// flags (`codex resume <id> -c …`), so the order is fixed here, once.
+pub fn plan(
+    h: &dyn Harness,
+    intent: &Intent,
+    fresh_id: Option<&str>,
+    capture: &CapturePaths,
+    home: Option<&Path>,
+) -> SpawnPlan {
+    let (mut args, resume_id) = intent_args(h, intent, fresh_id);
+    let overlay = h.overlay(capture, home);
+    args.extend(overlay.args);
+    SpawnPlan {
+        args,
+        resume_id,
+        ..overlay
+    }
+}
+
+/// Shell text for `args`, appended to a detected literal command before it
+/// is passed to `$SHELL -c`. Every element gets a leading space. Values are
+/// single-quoted. A bare flag (`-` followed by word characters, which no
+/// POSIX shell expands) stays unquoted, so the exec string is byte-identical
+/// to what instrumentation wrote before managed launches existed; the shell
+/// builds the same argv either way. Transitional: the literal path loses
+/// instrumentation once managed launches carry it alone.
+pub fn shell_words(args: &[OsString]) -> String {
+    args.iter()
+        .map(|a| {
+            let word = a.to_string_lossy();
+            let bare_flag = word.starts_with('-')
+                && word
+                    .bytes()
+                    .all(|b| b == b'-' || b == b'_' || b.is_ascii_alphanumeric());
+            if bare_flag {
+                format!(" {word}")
+            } else {
+                format!(" {}", shell_quote(&word))
+            }
+        })
+        .collect()
 }
 
 /// Capture paths allocated by [`assets::CaptureAssets::paths_for`].
@@ -228,16 +337,18 @@ pub struct CapturePaths {
     pub fleetcom_binary: Option<PathBuf>,
 }
 
-/// Spawn-time additions for one instrumented launch.
+/// Spawn-time additions for one launch: argv elements, never shell text. A
+/// managed launch passes `args` to the binary directly; a detected literal
+/// command gets them appended through [`shell_words`].
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SpawnPlan {
-    /// Appended verbatim to the user's command string before it is passed to
-    /// `$SHELL -c`. Starts with a space when non-empty.
-    pub args_suffix: String,
+    /// Argv elements after the binary.
+    pub args: Vec<OsString>,
     /// Environment pairs added to the child.
     pub env: Vec<(OsString, OsString)>,
-    /// The session ID chosen at launch, when the harness can pin one.
-    pub injected_id: Option<String>,
+    /// The session ID the launch targets, when known at launch: the pinned
+    /// fresh ID or the resumed one.
+    pub resume_id: Option<String>,
     /// One-line reason the launch carries less instrumentation than usual.
     /// The supervisor reports it on the status line once the task spawns.
     pub notice: Option<String>,
@@ -312,7 +423,7 @@ fn capture_id(v: &jzon::JsonValue, key: &str) -> Option<String> {
 
 /// Generate a v4 UUID from `/dev/urandom`. Return `None` on a read failure; launch
 /// without pinning an ID in that case.
-fn uuid_v4() -> Option<String> {
+pub(crate) fn uuid_v4() -> Option<String> {
     use std::fmt::Write;
     let mut bytes = [0u8; 16];
     File::open("/dev/urandom")
@@ -331,20 +442,6 @@ fn uuid_v4() -> Option<String> {
     Some(out)
 }
 
-/// Spawn plan for the launch-time ID pin: a bare launch pins a fresh v4 UUID
-/// through `--session-id`, the resume form already targets its conversation,
-/// and a `uuid_v4` failure launches without pinning.
-fn pin_plan(inv: &Invocation) -> SpawnPlan {
-    let mut plan = SpawnPlan::default();
-    if *inv == Invocation::Bare
-        && let Some(id) = uuid_v4()
-    {
-        plan.args_suffix = format!(" --session-id {}", shell_quote(&id));
-        plan.injected_id = Some(id);
-    }
-    plan
-}
-
 /// Single-quote `s` for `$SHELL -c`, encoding embedded `'` as `'\''`.
 fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
@@ -353,7 +450,7 @@ fn shell_quote(s: &str) -> String {
 /// Fixtures and assertions for harness detection and capture.
 #[cfg(test)]
 pub(crate) mod fixtures {
-    use std::path::PathBuf;
+    use std::{ffi::OsString, path::PathBuf};
 
     use super::{CapturePaths, Harness};
 
@@ -361,6 +458,11 @@ pub(crate) mod fixtures {
     pub(crate) const ID: &str = "c8c4a5cc-0b32-4ba0-a6b4-6ed08c218e0d";
     /// A second distinct ID for requote and precedence cases.
     pub(crate) const OTHER: &str = "11111111-2222-4333-8444-555555555555";
+
+    /// Argv elements from string literals, for snapshot assertions.
+    pub(super) fn argv(words: &[&str]) -> Vec<OsString> {
+        words.iter().map(OsString::from).collect()
+    }
 
     /// Capture-path fixture. Include spaces in asset paths to test shell and TOML
     /// quoting.
@@ -585,6 +687,151 @@ mod tests {
             .output()
             .expect("sh must run");
         assert_eq!(String::from_utf8(out.stdout).unwrap(), path);
+    }
+
+    /// The pin goes only where a session flag exists; a resume always names
+    /// the ID after the tool's selector; the reported ID follows the intent.
+    #[test]
+    fn intent_args_pin_only_behind_a_session_flag_and_always_resume() {
+        for a in AGENTS {
+            let h = a.harness;
+            let (prog, sel) = h.shape();
+            let expected = match h.session_flag() {
+                Some(flag) => (vec![OsString::from(flag), ID.into()], Some(ID.to_string())),
+                None => (Vec::new(), None),
+            };
+            assert_eq!(intent_args(h, &Intent::Fresh, Some(ID)), expected, "{prog}");
+            assert_eq!(
+                intent_args(h, &Intent::Fresh, None),
+                (Vec::new(), None),
+                "{prog}: a mint failure launches unpinned"
+            );
+            assert_eq!(
+                intent_args(h, &Intent::Resume(OTHER.into()), Some(ID)),
+                (
+                    vec![OsString::from(sel), OTHER.into()],
+                    Some(OTHER.to_string())
+                ),
+                "{prog}: a resume ignores the minted id"
+            );
+        }
+    }
+
+    /// Values are quoted; bare flags are not; the shell rebuilds the same
+    /// argv from the text.
+    #[test]
+    fn shell_words_quotes_values_and_leaves_bare_flags() {
+        let args: Vec<OsString> = [
+            "--session-id",
+            ID,
+            "-c",
+            "notify=[\"/App Support/n.sh\"]",
+            "-e",
+            "it's",
+            "resume",
+            "--x_y",
+            "-",
+            "",
+            "--not$bare",
+        ]
+        .iter()
+        .map(OsString::from)
+        .collect();
+        let text = shell_words(&args);
+        assert_eq!(
+            text,
+            format!(
+                " --session-id '{ID}' -c 'notify=[\"/App Support/n.sh\"]' -e 'it'\\''s' \
+                 'resume' --x_y - '' '--not$bare'"
+            )
+        );
+        assert_eq!(shell_words(&[]), "");
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(format!("printf '%s\\n'{text}"))
+            .output()
+            .expect("sh must run");
+        let words: Vec<&str> = std::str::from_utf8(&out.stdout)
+            .unwrap()
+            .split_terminator('\n')
+            .collect();
+        let expected: Vec<&str> = args.iter().map(|a| a.to_str().unwrap()).collect();
+        assert_eq!(words, expected, "the shell must rebuild every element");
+    }
+
+    /// Only the exact program word is a registered agent: no paths, no
+    /// prefixes, no basename matching.
+    #[test]
+    fn registered_matches_the_exact_program_word() {
+        for a in AGENTS {
+            let prog = a.harness.shape().0;
+            assert_eq!(registered(prog).map(|h| h.shape().0), Some(prog));
+            assert!(registered(&format!("{BIN}/{prog}")).is_none(), "{prog}");
+            assert!(registered(&format!("{prog}x")).is_none(), "{prog}");
+        }
+        assert!(registered("vim").is_none());
+        assert!(registered("").is_none());
+    }
+
+    /// Resolution walks absolute components only, skips files without an
+    /// execute bit and directories, takes the first hit, and returns a
+    /// symlink as found rather than its target.
+    #[test]
+    fn find_on_path_takes_the_first_executable_file_in_an_absolute_dir() {
+        use crate::testutil::{temp, write_executable};
+        use std::{os::unix::fs::symlink, path::Component};
+        let dir = temp("find_on_path");
+        let (a, b, c, l) = (dir.join("a"), dir.join("b"), dir.join("c"), dir.join("l"));
+        for d in [&a, &b, &c] {
+            fs::create_dir_all(d).unwrap();
+        }
+        fs::write(a.join("claude"), "#!/bin/sh\n").unwrap(); // no execute bit
+        fs::create_dir_all(a.join("codex")).unwrap(); // a directory
+        write_executable(&b.join("claude"), "");
+        write_executable(&c.join("claude"), "");
+        write_executable(&c.join("grok"), "");
+        symlink(&c, &l).unwrap();
+        let join = |dirs: &[&Path]| std::env::join_paths(dirs).unwrap();
+
+        assert_eq!(
+            find_on_path("claude", &join(&[&a, &b, &c])),
+            Some(b.join("claude")),
+            "the first executable regular file wins"
+        );
+        assert_eq!(find_on_path("codex", &join(&[&a, &b, &c])), None);
+        assert_eq!(find_on_path("omp", &join(&[&a, &b, &c])), None);
+        assert_eq!(
+            find_on_path("grok", &join(&[&l, &c])),
+            Some(l.join("grok")),
+            "a link is returned as found, never canonicalized"
+        );
+        assert_eq!(find_on_path("claude", OsStr::new("")), None);
+
+        // A relative spelling of `b` resolves from this process's cwd, and
+        // is still skipped: the task would resolve it from its own.
+        let cwd = std::env::current_dir().unwrap();
+        let ups = cwd
+            .components()
+            .filter(|c| matches!(c, Component::Normal(_)))
+            .count();
+        let rel: PathBuf = std::iter::repeat_n("..", ups)
+            .collect::<PathBuf>()
+            .join(b.strip_prefix("/").unwrap());
+        assert!(
+            executable_file(&rel.join("claude")),
+            "premise: the relative spelling reaches the binary from here"
+        );
+        let mut relative = vec![PathBuf::new(), ".".into(), "bin".into(), rel];
+        assert_eq!(
+            find_on_path("claude", &std::env::join_paths(&relative).unwrap()),
+            None
+        );
+        relative.push(b.clone());
+        assert_eq!(
+            find_on_path("claude", &std::env::join_paths(&relative).unwrap()),
+            Some(b.join("claude")),
+            "the absolute component behind them still resolves"
+        );
     }
 
     #[test]

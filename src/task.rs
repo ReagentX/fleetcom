@@ -110,6 +110,11 @@ pub struct Task {
     pub resume_id: Option<String>,
     /// Capture path allocated for this task run.
     pub capture_file: Option<PathBuf>,
+    /// Whether fleetcom owns this task's launch: the argv came from the
+    /// harness and ran with no shell, and a rerun resumes through the
+    /// harness again. A literal task's text is never edited, whatever it
+    /// names.
+    pub managed: bool,
     /// Dashboard-preview resolution state; resets with the task on rerun
     /// because a rerun replaces the whole `Task`.
     preview: PreviewState,
@@ -204,16 +209,33 @@ fn wait_code(status: &rustix::process::WaitIdStatus) -> i32 {
         .unwrap_or(1)
 }
 
+/// How a task's child starts: the point where the literal/managed boundary
+/// becomes a process.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Exec {
+    /// The text as typed (plus any detected-literal suffix), run as
+    /// `$SHELL -c <text>`.
+    Literal(String),
+    /// `binary` with `args`, no shell between. The task leader is the agent
+    /// process in every login shell: claude's capture gate and registry
+    /// reader key on the leader pid, and a resident shell (tcsh, csh, a
+    /// wrapper script) would otherwise hold it.
+    Managed {
+        binary: PathBuf,
+        args: Vec<OsString>,
+    },
+}
+
 impl Task {
-    /// Spawn `exec_command` under `$SHELL -c` in a fresh `rows`×`cols` PTY with
-    /// `scrollback` history rows. Retain `command` for the UI and recipes; instrument
-    /// only `exec_command`. Pass exactly `env` to the child and notify the core through
-    /// `waker` on terminal output.
+    /// Spawn `exec` in a fresh `rows`×`cols` PTY with `scrollback` history
+    /// rows. Retain `command` for the UI and recipes: a literal task's typed
+    /// text, a managed task's program word. Pass exactly `env` to the child
+    /// and notify the core through `waker` on terminal output.
     #[allow(clippy::too_many_arguments)] // All arguments define task launch state.
     pub fn spawn(
         id: u64,
         command: &str,
-        exec_command: &str,
+        exec: Exec,
         cwd: &Path,
         rows: u16,
         cols: u16,
@@ -230,18 +252,30 @@ impl Task {
             })
             .map_err(io_err)?;
 
-        // The daemon inherits the first client's environment, which may name a
-        // different shell from the connecting client's. Read SHELL from the launch
-        // context so a zsh client attached to a bash-started daemon still gets zsh
-        // word-splitting. Without SHELL, use the portable default.
-        let shell = env_get(env, "SHELL")
-            .map(OsString::from)
-            .unwrap_or_else(|| "/bin/sh".into());
-        let mut cmd = CommandBuilder::new(shell);
-        // Use a non-interactive shell. Interactive startup files, aliases, and
-        // shell functions are not loaded.
-        cmd.arg("-c");
-        cmd.arg(exec_command);
+        let managed = matches!(exec, Exec::Managed { .. });
+        let mut cmd = match exec {
+            Exec::Literal(text) => {
+                // The daemon inherits the first client's environment, which may
+                // name a different shell from the connecting client's. Read SHELL
+                // from the launch context so a zsh client attached to a
+                // bash-started daemon still gets zsh word-splitting. Without
+                // SHELL, use the portable default.
+                let shell = env_get(env, "SHELL")
+                    .map(OsString::from)
+                    .unwrap_or_else(|| "/bin/sh".into());
+                let mut cmd = CommandBuilder::new(shell);
+                // Use a non-interactive shell. Interactive startup files,
+                // aliases, and shell functions are not loaded.
+                cmd.arg("-c");
+                cmd.arg(text);
+                cmd
+            }
+            Exec::Managed { binary, args } => {
+                let mut cmd = CommandBuilder::new(binary);
+                cmd.args(args);
+                cmd
+            }
+        };
         // The builder inherits the daemon's environment. Clear it before applying
         // the client's environment so keys absent from the client cannot leak in
         // from the client that first autostarted the daemon.
@@ -339,6 +373,7 @@ impl Task {
             run: 0,
             resume_id: None,
             capture_file: None,
+            managed,
             preview: PreviewState::new(),
             blocked: None,
             blocked_probed: None,

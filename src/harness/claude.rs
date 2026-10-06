@@ -18,8 +18,7 @@ use std::{
 
 use super::summary::AWAITING_APPROVAL;
 use super::{
-    CAPTURE_ENV, CapturePaths, Harness, Invocation, SpawnPlan, capture_id, home_root, is_uuid,
-    pin_plan, resolve_home, shell_quote,
+    CAPTURE_ENV, CapturePaths, Harness, SpawnPlan, capture_id, home_root, is_uuid, resolve_home,
 };
 
 pub struct Claude;
@@ -33,22 +32,27 @@ impl Harness for Claude {
         ("claude", "--resume")
     }
 
-    fn instrument(
+    fn session_flag(&self) -> Option<&'static str> {
+        Some("--session-id")
+    }
+
+    fn overlay(
         &self,
-        inv: &Invocation,
         capture: &CapturePaths,
         // The settings overlay does not depend on the Claude home path.
         _home: Option<&Path>,
     ) -> SpawnPlan {
-        let mut plan = pin_plan(inv);
-        plan.args_suffix.push_str(" --settings ");
-        plan.args_suffix
-            .push_str(&shell_quote(&capture.claude_settings.to_string_lossy()));
-        plan.env = vec![(
-            CAPTURE_ENV.into(),
-            capture.capture_file.clone().into_os_string(),
-        )];
-        plan
+        SpawnPlan {
+            args: vec![
+                "--settings".into(),
+                capture.claude_settings.clone().into_os_string(),
+            ],
+            env: vec![(
+                CAPTURE_ENV.into(),
+                capture.capture_file.clone().into_os_string(),
+            )],
+            ..SpawnPlan::default()
+        }
     }
 
     /// Accept a hook payload only from the task's own process. The first line
@@ -173,9 +177,16 @@ mod tests {
 
     use super::*;
     use crate::{
-        harness::fixtures::{ID, OTHER, assert_all_opaque, paths},
+        harness::{
+            Intent,
+            fixtures::{ID, OTHER, argv, assert_all_opaque, paths},
+            plan, shell_words,
+        },
         testutil::temp,
     };
+
+    /// The overlay path from [`paths`].
+    const SETTINGS: &str = "/tmp/Application Support/fleetcom.json";
 
     /// Complete registry fixture with [`OTHER`] as its session ID.
     const LIVE_RECORD: &str = concat!(
@@ -234,37 +245,62 @@ mod tests {
         assert_all_opaque(&Claude, ID, &opaque);
     }
 
+    /// Managed argv: a fresh launch pins the minted ID, a resume names its
+    /// conversation, and the settings overlay follows either. Both carry the
+    /// capture file in the environment and report the ID they target.
     #[test]
-    fn instrument_pins_an_id_and_layers_settings_on_bare_launches() {
-        let inv = Claude.detect("claude").unwrap();
-        let plan = Claude.instrument(&inv, &paths(), None);
-        let id = plan.injected_id.expect("a bare launch pins an id");
-        assert!(is_uuid(&id));
+    fn managed_argv_pins_or_resumes_then_layers_settings() {
+        let fresh = plan(&Claude, &Intent::Fresh, Some(ID), &paths(), None);
         assert_eq!(
-            plan.args_suffix,
-            format!(" --session-id '{id}' --settings '/tmp/Application Support/fleetcom.json'")
+            fresh.args,
+            argv(&["--session-id", ID, "--settings", SETTINGS])
         );
+        assert_eq!(fresh.resume_id.as_deref(), Some(ID));
         assert_eq!(
-            plan.env,
+            fresh.env,
             vec![(
                 CAPTURE_ENV.into(),
                 PathBuf::from("/tmp/cap/session.json").into_os_string()
             )]
         );
+        assert_eq!(fresh.notice, None);
+
+        let resume = plan(&Claude, &Intent::Resume(OTHER.into()), None, &paths(), None);
+        assert_eq!(
+            resume.args,
+            argv(&["--resume", OTHER, "--settings", SETTINGS])
+        );
+        assert_eq!(resume.resume_id.as_deref(), Some(OTHER));
+        assert_eq!(resume.env, fresh.env);
+
+        // A mint failure launches unpinned: the overlay alone, no ID.
+        let unpinned = plan(&Claude, &Intent::Fresh, None, &paths(), None);
+        assert_eq!(unpinned.args, argv(&["--settings", SETTINGS]));
+        assert_eq!(unpinned.resume_id, None);
     }
 
-    /// A resume command already targets a conversation, so instrumentation adds
-    /// the settings overlay without pinning another ID.
+    /// The literal suffix for a bare `claude`: the fresh intent part, then
+    /// the overlay, as shell text.
     #[test]
-    fn instrument_adds_only_settings_to_the_resume_form() {
-        let inv = Claude.detect(&format!("claude --resume {ID}")).unwrap();
-        let plan = Claude.instrument(&inv, &paths(), None);
-        assert_eq!(plan.injected_id, None);
+    fn bare_literal_suffix_pins_an_id_and_layers_settings() {
+        let fresh = plan(&Claude, &Intent::Fresh, Some(ID), &paths(), None);
         assert_eq!(
-            plan.args_suffix,
+            shell_words(&fresh.args),
+            format!(" --session-id '{ID}' --settings '/tmp/Application Support/fleetcom.json'")
+        );
+    }
+
+    /// The typed resume form already targets a conversation, so its suffix
+    /// is the settings overlay alone.
+    #[test]
+    fn resume_literal_suffix_adds_only_settings() {
+        let overlay = Claude.overlay(&paths(), None);
+        assert_eq!(overlay.resume_id, None);
+        assert_eq!(
+            shell_words(&overlay.args),
             " --settings '/tmp/Application Support/fleetcom.json'"
         );
-        assert_eq!(plan.env.len(), 1, "env still names the capture file");
+        assert_eq!(overlay.env.len(), 1, "env still names the capture file");
     }
 
     /// Task leader PID used by the capture-gate cases.
