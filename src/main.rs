@@ -1,7 +1,7 @@
 #![forbid(unsafe_code)]
 
-//! `fleetcom`: a fleet-view supervisor for arbitrary shell commands. Each task is
-//! a command in its own PTY; the dashboard groups them by status, and you can
+//! `fleetcom`: a fleet-view supervisor for shell commands and managed agents. Each
+//! task runs in its own PTY; the dashboard groups them by status, and you can
 //! peek at, attach to, and background any of them.
 
 // fleetcom requires Unix PTYs, domain sockets, and process-group signaling.

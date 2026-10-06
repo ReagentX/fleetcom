@@ -107,7 +107,6 @@ impl Dirs {
 fn fixture_app(dirs: &Dirs, group_mode: GroupMode, views: Vec<TaskView>) -> App {
     let mut app = App::assemble(FIXTURE_ROWS, FIXTURE_COLS, |_, _, _| Box::new(NoTransport));
     app.daemon_backed = true;
-    app.invocation_label = path::abbreviate(&dirs.fleetcom);
     app.invocation_dir = dirs.fleetcom.clone();
     app.spawn_cwd = dirs.fleetcom.clone();
     app.group_mode = group_mode;
