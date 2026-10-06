@@ -186,6 +186,17 @@ pub(crate) fn write_executable(path: &Path, body: &str) {
     fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
 }
 
+/// Install a resident shell at `<dir>/resident-sh` and return its path: it runs its `-c`
+/// text in a child `sh` and stays the task leader, as tcsh and csh do. The trailing `:`
+/// keeps it resident: `sh` execs a script's last simple command in its own place, which
+/// would hand the child the leader PID. Set it as `SHELL` to verify that a managed launch
+/// bypasses the shell.
+pub(crate) fn install_resident_shell(dir: &Path) -> PathBuf {
+    let shell = dir.join("resident-sh");
+    write_executable(&shell, "[ \"$1\" = -c ] || exit 2\n/bin/sh -c \"$2\"\n:");
+    shell
+}
+
 /// Install a fake notifier at `path` that records its argv, one token
 /// per line, into `record`.
 pub(crate) fn install_fake_notifier(path: &Path, record: &Path) {

@@ -96,8 +96,10 @@ pub struct Task {
     pub group: Option<String>,
     /// Custom display name; `None` means unnamed.
     pub name: Option<String>,
-    /// Harness for a managed task's session ID and blocked-status reads. `None` for literal
-    /// tasks: never read a harness channel for those tasks.
+    /// Harness for a managed task's session ID and blocked-status reads: the harness built
+    /// the argv, no shell sits between, and a rerun goes through it again. `None` for
+    /// literal tasks: never read a harness channel for those tasks, and never edit their
+    /// command text.
     pub harness: Option<&'static dyn crate::harness::Harness>,
     /// Harness home resolved from this run's launch environment.
     pub harness_home: Option<PathBuf>,
@@ -111,9 +113,6 @@ pub struct Task {
     pub resume_id: Option<String>,
     /// Capture path allocated for this task run.
     pub capture_file: Option<PathBuf>,
-    /// Whether this task was launched directly with harness-built argv. If true, use the
-    /// harness again on rerun. Never edit literal command text.
-    pub managed: bool,
     /// Dashboard-preview resolution state; resets with the task on rerun
     /// because a rerun replaces the whole `Task`.
     preview: PreviewState,
@@ -209,10 +208,9 @@ fn wait_code(status: &rustix::process::WaitIdStatus) -> i32 {
 }
 
 /// Child execution mode: literal shell text or managed argv.
-#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Exec {
-    /// The text as typed, run as `$SHELL -c <text>`.
-    Literal(String),
+    /// Run the spawn's `command`, the text as typed, as `$SHELL -c <command>`.
+    Literal,
     /// Run `binary` with `args` directly. Keep the agent as task leader regardless of the
     /// login shell: validate Claude capture and registry records against that PID. With a
     /// resident shell (tcsh, csh, or a wrapper script), the shell would be the leader
@@ -226,8 +224,9 @@ pub enum Exec {
 impl Task {
     /// Spawn `exec` in a fresh `rows`×`cols` PTY with `scrollback` history
     /// rows. Retain `command` for the UI and recipes: a literal task's typed
-    /// text, a managed task's program word. Pass exactly `env` to the child
-    /// and notify the core through `waker` on terminal output.
+    /// text, which is also what its shell runs, or a managed task's program
+    /// word. Pass exactly `env` to the child and notify the core through
+    /// `waker` on terminal output.
     #[allow(clippy::too_many_arguments)] // All arguments define task launch state.
     pub fn spawn(
         id: u64,
@@ -249,9 +248,8 @@ impl Task {
             })
             .map_err(io_err)?;
 
-        let managed = matches!(exec, Exec::Managed { .. });
         let mut cmd = match exec {
-            Exec::Literal(text) => {
+            Exec::Literal => {
                 // Read SHELL from the launch context, not the daemon's environment: a zsh
                 // client may connect to a daemon started from bash and still require zsh
                 // word-splitting. Without SHELL, use the portable default.
@@ -262,7 +260,7 @@ impl Task {
                 // Use a non-interactive shell. Interactive startup files,
                 // aliases, and shell functions are not loaded.
                 cmd.arg("-c");
-                cmd.arg(text);
+                cmd.arg(command);
                 cmd
             }
             Exec::Managed { binary, args } => {
@@ -368,7 +366,6 @@ impl Task {
             run: 0,
             resume_id: None,
             capture_file: None,
-            managed,
             preview: PreviewState::new(),
             blocked: None,
             blocked_probed: None,

@@ -2,7 +2,10 @@ use super::*;
 use crate::{
     harness::fixtures::{ID as CAP_ID, OTHER as CAP_OTHER},
     protocol::{Lifecycle, Preview, PreviewSource},
-    testutil::{codex_session_meta, dead_pid, install_codex_rollout, install_codex_root},
+    testutil::{
+        codex_session_meta, dead_pid, install_codex_rollout, install_codex_root,
+        install_resident_shell,
+    },
 };
 
 // --- session-capture wiring -------------------------------------------
@@ -102,6 +105,11 @@ fn stamped(task: &Task, json: &str) -> String {
     )
 }
 
+/// The JSON Claude's `SessionStart` hook writes for session `id` started from `source`.
+fn hook_json(id: &str, source: &str) -> String {
+    format!(r#"{{"session_id":"{id}","hook_event_name":"SessionStart","source":"{source}"}}"#)
+}
+
 /// Save a recipe and return its persisted JSON.
 fn save_and_read(s: &mut Supervisor, config: &Path, name: &str) -> String {
     s.apply(Command::SaveSession { name: name.into() });
@@ -109,9 +117,9 @@ fn save_and_read(s: &mut Supervisor, config: &Path, name: &str) -> String {
     std::fs::read_to_string(config.join("sessions").join(format!("{name}.json"))).unwrap()
 }
 
-/// Drain the queued events and return the status lines among them.
-fn notices(s: &mut Supervisor) -> Vec<String> {
-    s.drain()
+/// The status lines among `events`.
+fn notices(events: Vec<Event>) -> Vec<String> {
+    events
         .into_iter()
         .filter_map(|e| match e {
             Event::Status(m) => Some(m),
@@ -120,10 +128,10 @@ fn notices(s: &mut Supervisor) -> Vec<String> {
         .collect()
 }
 
-/// Require exactly one queued status containing `needle`. Match the distinctive token so
-/// message wording can change without affecting the behavior check.
-fn assert_sole_notice(s: &mut Supervisor, needle: &str) {
-    let got = notices(s);
+/// Require exactly one status among `events`, containing `needle`. Match the distinctive
+/// token so message wording can change without affecting the behavior check.
+fn assert_sole_notice(events: Vec<Event>, needle: &str) {
+    let got = notices(events);
     assert!(
         got.len() == 1 && got[0].contains(needle),
         "expected one notice naming {needle:?}; got {got:?}"
@@ -133,27 +141,6 @@ fn assert_sole_notice(s: &mut Supervisor, needle: &str) {
 /// Check for a spawn acknowledgement in drained events.
 fn acknowledged(events: &[Event]) -> bool {
     events.iter().any(|e| matches!(e, Event::Spawned { .. }))
-}
-
-/// An unlabelled managed entry.
-fn managed(agent: &str, resume: Option<&str>) -> SessionEntry {
-    SessionEntry {
-        kind: EntryKind::Managed {
-            agent: agent.into(),
-            resume: resume.map(String::from),
-        },
-        group: None,
-        name: None,
-    }
-}
-
-/// An unlabelled literal entry.
-fn literal(cmd: &str) -> SessionEntry {
-    SessionEntry {
-        kind: EntryKind::Literal(cmd.into()),
-        group: None,
-        name: None,
-    }
 }
 
 /// Save `entries` for `dir` through the real serializer, then load the named recipe. Use
@@ -191,6 +178,22 @@ fn saved_resume(s: &mut Supervisor, config: &Path, name: &str) -> Option<String>
         ] => resume.clone(),
         other => panic!("expected one managed entry, got {other:?}"),
     }
+}
+
+/// Tick until the recovery snapshot lands under `config`'s session root, then load it. One
+/// incarnation owns one snapshot file, so the sole file is the one to read.
+fn recovered(s: &mut Supervisor, config: &Path) -> SessionConfig {
+    assert!(
+        wait_until(Duration::from_secs(5), || {
+            s.tick();
+            !recovery_files(config).is_empty()
+        }),
+        "the recovery snapshot never landed"
+    );
+    let files = recovery_files(config);
+    assert_eq!(files.len(), 1);
+    let stem = files[0].strip_suffix(".json").unwrap();
+    session::load_recovery_in(&config.join("sessions/recovery"), stem).unwrap()
 }
 
 /// The FNV-1a discriminator is stable and separates distinct config roots.
@@ -329,7 +332,6 @@ fn typed_agent_word_is_literal_runs_verbatim_and_saves_as_text() {
         "a literal launch adds no argument and names no capture file"
     );
     let t = &s.tasks[0];
-    assert!(!t.managed);
     assert!(t.harness.is_none(), "a literal task has no harness channel");
     assert!(t.capture_file.is_none());
     assert!(t.resume_id.is_none());
@@ -367,7 +369,7 @@ fn typed_agent_word_is_literal_runs_verbatim_and_saves_as_text() {
     );
     assert_eq!(current_resume_id(&s.tasks[0]), None);
     let entries = saved_entries(&mut s, &config, "typed");
-    assert_eq!(entries[0], literal("claude"));
+    assert_eq!(entries[0], SessionEntry::literal("claude"));
     assert!(matches!(
         &entries[1].kind,
         EntryKind::Managed { agent, resume: Some(_) } if agent == "claude"
@@ -416,12 +418,7 @@ fn rerun_cannot_read_the_old_runs_stale_capture() {
 
     // A late hook write can recreate the old path, but the new run cannot read it.
     // Stamp with the new leader's PID to test isolation by path alone.
-    let stale = stamped(
-        &s.tasks[0],
-        &format!(
-            r#"{{"session_id":"{CAP_OTHER}","hook_event_name":"SessionStart","source":"startup"}}"#
-        ),
-    );
+    let stale = stamped(&s.tasks[0], &hook_json(CAP_OTHER, "startup"));
     std::fs::write(&old_cap, &stale).unwrap();
     assert_eq!(
         saved_resume(&mut s, &config, "stalecap").as_deref(),
@@ -636,7 +633,7 @@ fn spawn_grok_pins_an_id_and_injects_nothing_else() {
 
     assert_eq!(
         saved_entries(&mut s, &config, "grokpin"),
-        [managed("grok", Some(&id))],
+        [SessionEntry::managed("grok", Some(&id))],
         "the recipe must resume the pinned session"
     );
 }
@@ -763,7 +760,7 @@ fn printed_resume_hints_do_not_change_saved_recovery_or_rerun_targets() {
             vec![SessionEntry {
                 group: Some("agents".into()),
                 name: Some(tool.into()),
-                ..managed(tool, expected_id.as_deref())
+                ..SessionEntry::managed(tool, expected_id.as_deref())
             }],
         )]);
         save_and_read(&mut s, &config, "hints");
@@ -772,21 +769,7 @@ fn printed_resume_hints_do_not_change_saved_recovery_or_rerun_targets() {
             expected,
             "{tool}: named save"
         );
-        assert!(
-            wait_until(Duration::from_secs(5), || {
-                s.tick();
-                !recovery_files(&config).is_empty()
-            }),
-            "{tool}: recovery snapshot never landed"
-        );
-        let files = recovery_files(&config);
-        assert_eq!(files.len(), 1);
-        let stem = files[0].strip_suffix(".json").unwrap();
-        assert_eq!(
-            session::load_recovery_in(&config.join("sessions/recovery"), stem).unwrap(),
-            expected,
-            "{tool}: recovery"
-        );
+        assert_eq!(recovered(&mut s, &config), expected, "{tool}: recovery");
         let id = s.tasks[0].id;
         s.apply(Command::Restart { id });
         assert_eq!(s.tasks[0].run, 1, "{tool}: rerun must replace the task");
@@ -823,10 +806,10 @@ fn rerun_latches_exit_without_reap_and_preserves_the_launch_id() {
         &config,
         "target",
         &dir,
-        vec![managed("grok", Some(CAP_OTHER))],
+        vec![SessionEntry::managed("grok", Some(CAP_OTHER))],
     );
-    assert_eq!(s.tasks.len(), 1, "{:?}", notices(&mut s));
-    assert!(s.tasks[0].managed);
+    assert_eq!(s.tasks.len(), 1, "{:?}", notices(s.drain()));
+    assert!(s.tasks[0].harness.is_some());
     assert_eq!(s.tasks[0].resume_id.as_deref(), Some(CAP_OTHER));
     let id = s.tasks[0].id;
     let pid = Pid::from_raw(s.tasks[0].pid().unwrap() as i32).unwrap();
@@ -897,16 +880,7 @@ fn resume_id_precedence_registry_over_spawn_under_capture() {
 
     // A capture-file ID outranks the registry ID.
     let cap = s.tasks[0].capture_file.clone().expect("capture file set");
-    std::fs::write(
-        &cap,
-        stamped(
-            &s.tasks[0],
-            &format!(
-                r#"{{"session_id":"{CAP_OTHER}","hook_event_name":"SessionStart","source":"clear"}}"#
-            ),
-        ),
-    )
-    .unwrap();
+    std::fs::write(&cap, stamped(&s.tasks[0], &hook_json(CAP_OTHER, "clear"))).unwrap();
     assert_eq!(
         saved_resume(&mut s, &config, "capture").as_deref(),
         Some(CAP_OTHER),
@@ -926,9 +900,6 @@ fn capture_stamped_by_a_foreign_process_falls_back_to_the_next_source() {
     let dir = scratch("cap_foreign");
     let (bin, runtime, config) = (dir.join("bin"), dir.join("run"), dir.join("config"));
     let claude_home = dir.join("claude_home");
-    let json = |id: &str, source: &str| {
-        format!(r#"{{"session_id":"{id}","hook_event_name":"SessionStart","source":"{source}"}}"#)
-    };
     // Write a capture stamped with the task leader's PID. Then run the installed hook from
     // the stub through an intermediate shell, with the same inherited environment as in
     // Claude's daemon. Append `:` to prevent exec of the pipeline's last command: the
@@ -942,7 +913,7 @@ sh -c 'printf "%s\n" "$1" | sh "$0"; :' '{d}/hook' '{foreign}'
 : > '{d}/foreign-done'
 until [ -e '{d}/done' ]; do sleep 0.05; done"#,
             d = dir.display(),
-            foreign = json(FOREIGN_ID, "startup"),
+            foreign = hook_json(FOREIGN_ID, "startup"),
         ),
     );
     let mut s = sup_ctx(agent_ctx_plus(
@@ -970,7 +941,7 @@ until [ -e '{d}/done' ]; do sleep 0.05; done"#,
         .to_string();
     std::fs::write(dir.join("hook"), hook).unwrap();
 
-    std::fs::write(&cap, stamped(&s.tasks[0], &json(CAP_OTHER, "clear"))).unwrap();
+    std::fs::write(&cap, stamped(&s.tasks[0], &hook_json(CAP_OTHER, "clear"))).unwrap();
     assert_eq!(
         current_resume_id(&s.tasks[0]).as_deref(),
         Some(CAP_OTHER),
@@ -988,7 +959,7 @@ until [ -e '{d}/done' ]; do sleep 0.05; done"#,
         .expect("the hook must write a stamp line");
     assert_eq!(
         rest,
-        format!("{}\n", json(FOREIGN_ID, "startup")),
+        format!("{}\n", hook_json(FOREIGN_ID, "startup")),
         "the foreign session must have replaced the task's capture"
     );
     assert!(
@@ -1080,7 +1051,10 @@ fn silent_codex_tasks_save_and_recover_without_a_resume_id() {
     }
     let expected = SessionConfig::from([(
         path::abbreviate(&dir),
-        vec![managed("codex", None), managed("codex", None)],
+        vec![
+            SessionEntry::managed("codex", None),
+            SessionEntry::managed("codex", None),
+        ],
     )]);
     save_and_read(&mut s, &config, "silent");
     assert_eq!(
@@ -1088,21 +1062,7 @@ fn silent_codex_tasks_save_and_recover_without_a_resume_id() {
         expected
     );
 
-    assert!(
-        wait_until(Duration::from_secs(5), || {
-            s.tick();
-            !recovery_files(&config).is_empty()
-        }),
-        "the recovery snapshot never landed"
-    );
-    let files = recovery_files(&config);
-    assert_eq!(files.len(), 1);
-    let stem = files[0].strip_suffix(".json").unwrap();
-    let recovery = config.join("sessions").join("recovery");
-    assert_eq!(
-        session::load_recovery_in(&recovery, stem).unwrap(),
-        expected
-    );
+    assert_eq!(recovered(&mut s, &config), expected);
 }
 
 /// Thread IDs reported through one codex process's notifier: the
@@ -1240,9 +1200,9 @@ fn refused_codex_capture_keeps_the_launch_target() {
         &config,
         "target",
         &dir,
-        vec![managed("codex", Some(CAP_ID))],
+        vec![SessionEntry::managed("codex", Some(CAP_ID))],
     );
-    assert_eq!(s.tasks.len(), 1, "{:?}", notices(&mut s));
+    assert_eq!(s.tasks.len(), 1, "{:?}", notices(s.drain()));
     assert_eq!(s.tasks[0].resume_id.as_deref(), Some(CAP_ID));
 
     assert_eq!(arrive(&s, &codex_home, &title_turn()), None);
@@ -1338,7 +1298,7 @@ fn home_only_launch_env_targets_the_clients_dot_codex() {
 
     assert_eq!(
         saved_entries(&mut s, &config, "homeonly"),
-        [managed("codex", None)]
+        [SessionEntry::managed("codex", None)]
     );
 }
 
@@ -1532,7 +1492,7 @@ fn unrepresentable_config_notify_suppresses_injection() {
         &[("CODEX_HOME", &codex_home)],
     ));
     s.spawn_agent("codex", dir.to_path_buf(), None);
-    assert_sole_notice(&mut s, "capture unavailable");
+    assert_sole_notice(s.drain(), "capture unavailable");
     let argv = wait_argv(&mut s, &dir.join("argv"));
     assert_eq!(
         argv,
@@ -1548,7 +1508,7 @@ fn unrepresentable_config_notify_suppresses_injection() {
     .unwrap();
     std::fs::remove_file(dir.join("argv")).unwrap();
     s.spawn_agent("codex", dir.to_path_buf(), None);
-    assert_eq!(notices(&mut s), Vec::<String>::new());
+    assert_eq!(notices(s.drain()), Vec::<String>::new());
     let argv = wait_argv(&mut s, &dir.join("argv"));
     assert!(
         argv.iter().any(|a| a.starts_with("notify=[")),
@@ -1577,7 +1537,10 @@ fn non_agent_entries_survive_save_as_plain_strings() {
         "no object form for an unadorned entry; got {text}"
     );
     let cfg = session::load_in(&config.join("sessions"), "plain").unwrap();
-    assert_eq!(cfg[&path::abbreviate(&dir)], vec![literal("sleep 30")]);
+    assert_eq!(
+        cfg[&path::abbreviate(&dir)],
+        vec![SessionEntry::literal("sleep 30")]
+    );
 }
 
 /// Cadence passes persist changed capture IDs without rewriting stable recipes.
@@ -1614,16 +1577,7 @@ fn recovery_cadence_rewrites_on_capture_drift_and_skips_when_static() {
 
     // Change the capture ID without a recipe mutation.
     let cap = s.tasks[0].capture_file.clone().expect("capture file set");
-    std::fs::write(
-        &cap,
-        stamped(
-            &s.tasks[0],
-            &format!(
-                r#"{{"session_id":"{CAP_OTHER}","hook_event_name":"SessionStart","source":"clear"}}"#
-            ),
-        ),
-    )
-    .unwrap();
+    std::fs::write(&cap, stamped(&s.tasks[0], &hook_json(CAP_OTHER, "clear"))).unwrap();
     assert!(
         wait_until(Duration::from_secs(5), || {
             s.tick();
@@ -1648,25 +1602,6 @@ fn recovery_cadence_rewrites_on_capture_drift_and_skips_when_static() {
 }
 
 // --- managed launches --------------------------------------------------
-
-/// Install a resident shell at `<dir>/resident-sh`: run its `-c` text as a child and retain
-/// the shell as leader, as with tcsh and csh. Set it as `SHELL` to verify that managed
-/// launches bypass the shell.
-fn install_resident_shell(dir: &Path) -> PathBuf {
-    let shell = dir.join("resident-sh");
-    // Append `:` to prevent sh from execing the child as the last command.
-    write_executable(&shell, "[ \"$1\" = -c ] || exit 2\n/bin/sh -c \"$2\"\n:");
-    shell
-}
-
-/// `agent_ctx` with `SHELL` pointing at the resident shell.
-fn resident_shell_ctx(bin: &Path, runtime: &Path, dir: &Path) -> LaunchContext {
-    let shell = install_resident_shell(dir);
-    let mut ctx = agent_ctx(bin, runtime, dir.to_path_buf());
-    ctx.env.retain(|(k, _)| k != "SHELL");
-    ctx.env.push(("SHELL".into(), shell.into_os_string()));
-    ctx
-}
 
 /// The settings overlay beside the sole task's capture file.
 fn settings_beside(s: &Supervisor) -> String {
@@ -1698,7 +1633,13 @@ fn managed_claude_accepts_its_own_capture_and_refuses_a_foreign_stamp() {
             out = dir.display()
         ),
     );
-    let mut s = sup_ctx(resident_shell_ctx(&bin, &runtime, &dir));
+    let mut ctx = agent_ctx(&bin, &runtime, dir.to_path_buf());
+    ctx.env.retain(|(k, _)| k != "SHELL");
+    ctx.env.push((
+        "SHELL".into(),
+        install_resident_shell(&dir).into_os_string(),
+    ));
+    let mut s = sup_ctx(ctx);
     s.spawn_agent("claude", dir.to_path_buf(), None);
     assert!(acknowledged(&s.drain()), "a managed spawn is acknowledged");
     let argv = wait_argv(&mut s, &dir.join("argv"));
@@ -1706,7 +1647,6 @@ fn managed_claude_accepts_its_own_capture_and_refuses_a_foreign_stamp() {
     wait_for_lifecycle(&mut s, id, |l| l == Lifecycle::Ok);
 
     let t = &s.tasks[0];
-    assert!(t.managed);
     assert_eq!(t.command, "claude", "the program word is the display text");
     assert!(t.harness.is_some());
     let pinned = t
@@ -1746,11 +1686,11 @@ fn managed_spawn_refuses_an_unknown_word_a_missing_binary_and_a_full_fleet() {
     s.spawn_agent("vim", dir.to_path_buf(), None);
     let events = s.drain();
     assert!(!acknowledged(&events));
-    assert_sole_notice(&mut sup_with(events), "no agent named");
+    assert_sole_notice(events, "no agent named");
     s.spawn_agent("claude", dir.to_path_buf(), None);
     let events = s.drain();
     assert!(!acknowledged(&events));
-    assert_sole_notice(&mut sup_with(events), "not found on PATH");
+    assert_sole_notice(events, "not found on PATH");
     assert!(s.tasks.is_empty(), "a refused launch creates nothing");
     assert!(!runtime.exists(), "a refused launch installs nothing");
 
@@ -1760,17 +1700,10 @@ fn managed_spawn_refuses_an_unknown_word_a_missing_binary_and_a_full_fleet() {
     assert!(acknowledged(&s.drain()));
     assert_eq!(s.tasks.len(), 1);
     s.spawn_agent("claude", dir.to_path_buf(), None);
-    assert_sole_notice(&mut s, "task limit");
+    assert_sole_notice(s.drain(), "task limit");
     spawn(&mut s, "sleep 1", dir.to_path_buf());
-    assert_sole_notice(&mut s, "task limit");
+    assert_sole_notice(s.drain(), "task limit");
     assert_eq!(s.tasks.len(), 1, "the ceiling holds for both launch kinds");
-}
-
-/// Build a supervisor with only the supplied `events` for filtering through `notices`.
-fn sup_with(events: Vec<Event>) -> Supervisor {
-    let mut s = Supervisor::new(24, 80, 0);
-    s.events = events;
-    s
 }
 
 /// Rerun a managed task through its harness: place the captured ID before the overlay;
@@ -1791,12 +1724,7 @@ fn managed_rerun_resumes_the_captured_id_from_the_binary_path_finds_now() {
     wait_for_lifecycle(&mut s, id, |l| l == Lifecycle::Ok);
     std::fs::write(
         s.tasks[0].capture_file.as_ref().unwrap(),
-        stamped(
-            &s.tasks[0],
-            &format!(
-                r#"{{"session_id":"{CAP_OTHER}","hook_event_name":"SessionStart","source":"clear"}}"#
-            ),
-        ),
+        stamped(&s.tasks[0], &hook_json(CAP_OTHER, "clear")),
     )
     .unwrap();
     std::fs::remove_file(dir.join("argv")).unwrap();
@@ -1810,7 +1738,7 @@ fn managed_rerun_resumes_the_captured_id_from_the_binary_path_finds_now() {
         "the intent part leads, the overlay follows, no second pin"
     );
     let t = &s.tasks[0];
-    assert!(t.managed, "a rerun keeps the task managed");
+    assert!(t.harness.is_some(), "a rerun keeps the task managed");
     assert_eq!((t.id, t.run, t.command.as_str()), (id, 1, "claude"));
     assert_eq!(t.resume_id.as_deref(), Some(CAP_OTHER));
     assert!(t.tagged);
@@ -1829,7 +1757,7 @@ fn managed_rerun_resumes_the_captured_id_from_the_binary_path_finds_now() {
     wait_for_lifecycle(&mut s, id, |l| l == Lifecycle::Ok);
     std::fs::remove_file(bin.join("claude")).unwrap();
     s.apply(Command::Restart { id });
-    assert_sole_notice(&mut s, "not found on PATH");
+    assert_sole_notice(s.drain(), "not found on PATH");
     assert_eq!(s.tasks[0].run, 1, "the finished task is preserved");
 }
 
@@ -1853,13 +1781,13 @@ fn managed_rerun_without_an_id_starts_fresh() {
     s.apply(Command::Restart { id });
     let again = wait_argv(&mut s, &dir.join("argv"));
     assert_eq!(again, first, "no id known: the rerun is a fresh launch");
-    assert!(s.tasks[0].managed);
+    assert!(s.tasks[0].harness.is_some());
     assert_eq!(s.tasks[0].run, 1);
 }
 
-/// Save a managed entry with its current session ID, then reload it as managed. Place the
-/// selector and ID first in argv, execute the binary directly even with a resident `SHELL`,
-/// and preserve the group.
+/// Save a managed entry with its current session ID, then reload it as managed: the
+/// selector and ID lead argv, the reloaded run's own capture is accepted, and the group
+/// survives.
 #[test]
 fn managed_task_saves_as_a_managed_entry_and_reloads_managed() {
     let dir = scratch("managed_save");
@@ -1882,15 +1810,15 @@ fn managed_task_saves_as_a_managed_entry_and_reloads_managed() {
         ),
     );
     install_stub(&bin, "omp", &omp_out);
-    let mut ctx = resident_shell_ctx(&bin, &runtime, &dir);
-    ctx.env.push((
-        "FLEETCOM_CONFIG_DIR".into(),
-        config.as_os_str().to_os_string(),
+    let mut s = sup_ctx(agent_ctx_plus(
+        &bin,
+        &runtime,
+        dir.to_path_buf(),
+        &[("FLEETCOM_CONFIG_DIR", &config)],
     ));
-    let mut s = sup_ctx(ctx);
     s.spawn_agent("claude", dir.to_path_buf(), Some("agents".into()));
     s.spawn_agent("omp", dir.to_path_buf(), None);
-    assert!(s.tasks.iter().all(|t| t.managed));
+    assert!(s.tasks.iter().all(|t| t.harness.is_some()));
     // Wait for both first-run records before touching captures or clearing
     // them, so a late write from the original launch cannot pass for the
     // reloaded one.
@@ -1912,9 +1840,9 @@ fn managed_task_saves_as_a_managed_entry_and_reloads_managed() {
             vec![
                 SessionEntry {
                     group: Some("agents".into()),
-                    ..managed("claude", Some(CAP_ID))
+                    ..SessionEntry::managed("claude", Some(CAP_ID))
                 },
-                managed("omp", None),
+                SessionEntry::managed("omp", None),
             ]
         )])
     );
@@ -1924,14 +1852,15 @@ fn managed_task_saves_as_a_managed_entry_and_reloads_managed() {
     s.apply(Command::LoadSession {
         name: "managed".into(),
     });
-    assert_eq!(s.tasks.len(), 4, "{:?}", notices(&mut s));
+    assert_eq!(s.tasks.len(), 4, "{:?}", notices(s.drain()));
     let reloaded = &s.tasks[2];
-    assert!(reloaded.managed, "a managed entry reloads managed");
+    assert!(
+        reloaded.harness.is_some(),
+        "a managed entry reloads managed"
+    );
     assert_eq!(reloaded.command, "claude");
-    assert!(reloaded.harness.is_some());
     assert_eq!(reloaded.resume_id.as_deref(), Some(CAP_ID));
     assert_eq!(reloaded.group.as_deref(), Some("agents"));
-    assert!(s.tasks[3].managed);
     assert_eq!(s.tasks[3].command, "omp");
     assert!(s.tasks[3].harness.is_some());
     assert!(s.tasks[3].resume_id.is_none());
@@ -1943,7 +1872,7 @@ fn managed_task_saves_as_a_managed_entry_and_reloads_managed() {
     assert_eq!(
         current_resume_id(&s.tasks[2]).as_deref(),
         Some(CAP_OTHER),
-        "the reloaded stub's `$$` stamp passes the gate: it ran as a direct child"
+        "the reloaded run's own capture outranks the recipe's resume ID"
     );
     let omp_argv = wait_argv(&mut s, &omp_out.join("argv"));
     assert_eq!(
@@ -1973,15 +1902,15 @@ fn load_reports_a_missing_agent_and_loads_the_rest() {
         "fleet",
         &dir,
         vec![
-            managed("grok", None),
-            literal("true"),
+            SessionEntry::managed("grok", None),
+            SessionEntry::literal("true"),
             SessionEntry {
                 name: Some("pilot".into()),
-                ..managed("claude", Some(CAP_ID))
+                ..SessionEntry::managed("claude", Some(CAP_ID))
             },
         ],
     );
-    let got = notices(&mut s);
+    let got = notices(s.drain());
     assert!(
         got.len() == 1
             && got[0].contains("1 failed to spawn")
@@ -1989,9 +1918,9 @@ fn load_reports_a_missing_agent_and_loads_the_rest() {
         "one summary naming the missing agent; got {got:?}"
     );
     assert_eq!(s.tasks.len(), 2);
-    assert!(!s.tasks[0].managed);
+    assert!(s.tasks[0].harness.is_none());
     assert_eq!(s.tasks[0].command, "true");
-    assert!(s.tasks[1].managed);
+    assert!(s.tasks[1].harness.is_some());
     assert_eq!(s.tasks[1].name.as_deref(), Some("pilot"));
     assert_eq!(
         wait_argv(&mut s, &dir.join("argv"))[..2],
@@ -2001,7 +1930,7 @@ fn load_reports_a_missing_agent_and_loads_the_rest() {
     let stem = "20990101-000000-1";
     let cfg = SessionConfig::from([(
         dir.to_string_lossy().into_owned(),
-        vec![managed("grok", None)],
+        vec![SessionEntry::managed("grok", None)],
     )]);
     session::save_recovery_in(
         &session::recovery_dir(&config.join("sessions")),
@@ -2011,11 +1940,12 @@ fn load_reports_a_missing_agent_and_loads_the_rest() {
     )
     .unwrap();
     s.apply(Command::LoadRecovery { stem: stem.into() });
-    assert_sole_notice(&mut s, "grok not found on PATH");
+    assert_sole_notice(s.drain(), "grok not found on PATH");
 }
 
-/// Include the embedded override on managed codex launches even with capture disabled, and
-/// report the reason. On rerun, place `resume <id>` before the overrides.
+/// With capture disabled, a rerun places `resume <id>` before the embedded override and
+/// repeats the capture notice. The launch's own notice and embedded-only argv are pinned by
+/// `unrepresentable_config_notify_suppresses_injection`.
 #[test]
 fn managed_codex_reports_the_capture_notice_and_leads_a_rerun_with_resume() {
     let dir = scratch("managed_codex");
@@ -2030,11 +1960,10 @@ fn managed_codex_reports_the_capture_notice_and_leads_a_rerun_with_resume() {
         &[("CODEX_HOME", &codex_home)],
     ));
     s.spawn_agent("codex", dir.to_path_buf(), None);
-    assert_sole_notice(&mut s, "capture unavailable");
-    let argv = wait_argv(&mut s, &dir.join("argv"));
-    assert_eq!(argv, ["-c", "features.daemon_auto_start=false"]);
+    // Drain the launch notice so the rerun's is the sole one.
+    let _ = s.drain();
+    let _ = wait_argv(&mut s, &dir.join("argv"));
     let id = s.tasks[0].id;
-    assert!(s.tasks[0].managed);
     assert!(s.tasks[0].resume_id.is_none(), "codex cannot pin an id");
     wait_for_lifecycle(&mut s, id, |l| l == Lifecycle::Ok);
 
@@ -2042,7 +1971,7 @@ fn managed_codex_reports_the_capture_notice_and_leads_a_rerun_with_resume() {
     std::fs::write(s.tasks[0].capture_file.as_ref().unwrap(), CAP_ID).unwrap();
     std::fs::remove_file(dir.join("argv")).unwrap();
     s.apply(Command::Restart { id });
-    assert_sole_notice(&mut s, "capture unavailable");
+    assert_sole_notice(s.drain(), "capture unavailable");
     assert_eq!(
         wait_argv(&mut s, &dir.join("argv")),
         ["resume", CAP_ID, "-c", "features.daemon_auto_start=false"]
