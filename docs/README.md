@@ -169,7 +169,7 @@ The client environment is not persisted. Each client's environment and working d
 
 ### Captured IDs
 
-A captured ID enters an agent's argv as one element and a session file as its `resume` field; it is never inserted into a shell command. Before either, accept only lowercase hexadecimal in the `8-4-4-4-12` UUID format. Validate capture payloads, Codex rollout headers, live session records, and session files on load. Never read session IDs from terminal output, and capture only for agents launched from the Agent page: a typed command runs as typed and gets no channel. See [Agent session resume](agent-resume.md#validation-boundary).
+Pass a captured ID as one agent argv element and store it as the session file's `resume` field; never insert it into a shell command. Before either use, validate it as lowercase hexadecimal in the `8-4-4-4-12` UUID format. Validate capture payloads, Codex rollout headers, live session records, and session files on load. Never read session IDs from terminal output. Enable capture only for managed agents launched from the Agent page or loaded from managed session entries; run typed commands unchanged without a capture channel. See [Agent session resume](agent-resume.md#validation-boundary).
 
 ### Copying text through the terminal
 

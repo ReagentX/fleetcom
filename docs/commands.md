@@ -34,7 +34,7 @@ Choose the operating mode with launch arguments. Use keys to control the dashboa
 | `Ctrl-]` | Attach to the flagship |
 | `g` | Assign the selected task to a group (through the group picker) |
 | `R` | Rename the selected task: a display name shown in place of the command |
-| `r` | Rerun a finished task; a managed agent resumes its conversation |
+| `r` | Rerun a finished task; resume the conversation for a managed agent |
 | `X` | Kill a running task (`TERM`, then `KILL` after 2 s), or remove a finished one |
 | `w` | Save the current tasks as a session |
 | `o` | Load a saved session or a recovery snapshot (through the [session picker](#the-o-session-picker)) |
@@ -111,7 +111,7 @@ Press uppercase `X` to kill a running task or remove a finished one. On removal,
 
 Press `r` to rerun a finished task. Running tasks cannot be rerun without first being killed and are left untouched.
 
-`fleetcom` starts the replacement in the same directory, using the requesting client's environment. A literal task reruns its exact text. A managed agent is launched again from whatever `PATH` finds now and resumes its captured conversation when an ID is known; see [agent session resume](agent-resume.md).
+On rerun, the replacement is started in the same directory with the requesting client's environment. For a literal task, the exact command text is run again. For a managed agent, the binary is resolved on the current `PATH`, and the captured conversation is resumed when an ID is known; see [agent session resume](agent-resume.md).
 
 On rerun, the task's ID, `◆` tag, group, name, and spawn order are preserved; its clock and screen are reset. Under lifecycle sorting, the restarted task may be listed in another section. You can also rerun inside peek without closing the overlay.
 
@@ -164,9 +164,11 @@ The daemon removes control characters and surrounding whitespace from display na
 
 ## The `n` spawn prompt
 
-Press `n` to run something in the invocation directory, or pick the directory first with `@`. The prompt has two pages. The Command page runs the typed text exactly as typed, through your shell. Press `Tab` (or `Shift-Tab`) for the Agent page: the supported agent CLIs found on the daemon's `PATH`, in a fixed order. `Enter` launches the highlighted one as a managed task: `fleetcom` builds the launch itself and owns the agent's session, see [agent session resume](agent-resume.md). Typing filters the list by a case-insensitive substring of the program name, so `x` finds `codex`; the first match is highlighted. Use `↑`/`↓` to move the highlight, `Enter` to launch in the prompt's directory and group, or `Esc` to cancel. When nothing matches, the prompt says so and names any supported agents not found on this host.
+Press `n` to open the spawn prompt in the invocation directory, or pick a directory first with `@`. On the Command page, enter text to run unchanged through your shell. Press `Tab` or `Shift-Tab` for the Agent page, where the supported CLIs found on the launch `PATH` are listed in a fixed order. Select an agent and press `Enter` to start a managed task, with argv and capture configured by `fleetcom`; see [agent session resume](agent-resume.md).
 
-Each page keeps its own text, and the filter is empty every time the prompt opens, so `Tab` always shows the full list first. With no agents found, `Tab` is unbound and omitted from the hint.
+Type a case-insensitive substring of a program name to filter the list: for example, `x` to find `codex`. The first match is highlighted. Use `↑`/`↓` to select, `Enter` to launch in the prompt's directory and group, or `Esc` to cancel. If nothing matches, the missing supported agents are listed in the prompt.
+
+Your command and filter text are preserved separately across page changes. Each time you open the prompt, the filter is cleared, so you can press `Tab` to view the full agent list. With no agents found, `Tab` is unbound and omitted from the hint.
 
 ## The `@` directory picker
 
