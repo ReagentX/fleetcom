@@ -6,15 +6,15 @@ mod common;
 
 use std::{
     io::Write,
-    os::unix::{fs::PermissionsExt, net::UnixStream},
+    os::unix::net::UnixStream,
     path::{Path, PathBuf},
     process::{Command, Stdio},
     time::Duration,
 };
 
 use common::{
-    control_frame, read_frame, shake_hands_env, spawn_agent_frame, start_daemon_raw, stop_daemon,
-    wait_until,
+    RuntimeDir, control_frame, read_frame, scratch, shake_hands_env, spawn_agent_frame,
+    start_daemon_raw, stop_daemon, wait_until, write_executable,
 };
 
 /// Delimiter separating argv records in a stub's append-only output.
@@ -43,18 +43,14 @@ const CODEX_EMBEDDED: &str = "features.daemon_auto_start=false";
 /// Scratch tree containing every executable, store, working directory, and argv
 /// record used by one test.
 struct Scratch {
-    root: PathBuf,
+    root: RuntimeDir,
 }
 
 impl Scratch {
     fn new(tag: &str) -> Self {
         // Keep the scratch tree separate from start_daemon_raw's directory,
         // which is cleared during daemon setup.
-        let root = std::env::temp_dir().join(format!(
-            "fleetcom_it_resume_scratch_{tag}_{}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&root);
+        let root = scratch(&format!("{tag}_scratch"));
         for sub in ["bin", "run", "config", "claude-home", "codex-home", "work"] {
             std::fs::create_dir_all(root.join(sub)).unwrap();
         }
@@ -119,23 +115,9 @@ impl Scratch {
     }
 }
 
-impl Drop for Scratch {
-    fn drop(&mut self) {
-        // Preserve stubs, stores, and argv records for inspection after failure.
-        if !std::thread::panicking() {
-            let _ = std::fs::remove_dir_all(&self.root);
-        }
-    }
-}
-
 /// Send a handshake scoped to the scratch tree.
 fn hello(stream: &mut UnixStream, s: &Scratch) {
-    let owned = s.hello_env();
-    let env: Vec<(&[u8], &[u8])> = owned
-        .iter()
-        .map(|(k, v)| (k.as_bytes(), v.as_bytes()))
-        .collect();
-    shake_hands_env(stream, &s.work().display().to_string(), &env);
+    shake_hands_env(stream, &s.work().display().to_string(), &s.hello_env());
 }
 
 /// Drain daemon events while a test polls files. Without this reader, snapshot
@@ -144,13 +126,6 @@ fn hello(stream: &mut UnixStream, s: &Scratch) {
 fn drain_events(stream: &UnixStream) {
     let mut rx = stream.try_clone().unwrap();
     std::thread::spawn(move || while read_frame(&mut rx).is_ok() {});
-}
-
-/// Install an executable stub named `name` under the scratch bin dir.
-fn install_stub(s: &Scratch, name: &str, body: &str) {
-    let path = s.bin().join(name);
-    std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
 }
 
 /// Install a `claude` stub to record argv, write a `SessionStart` payload,
@@ -173,7 +148,7 @@ printf 'Resume this session with:\nclaude --resume %s\n' "$id""#,
         marker = RUN_MARKER,
         rec = s.record("claude").display(),
     );
-    install_stub(s, "claude", &body);
+    write_executable(&s.bin().join("claude"), &body);
 }
 
 /// Install a `codex` stub to record argv and report only through the injected notifier, as
@@ -207,7 +182,7 @@ fi"#,
         title = turn_complete(CODEX_TITLE),
         notified = s.notified().display(),
     );
-    install_stub(s, "codex", &body);
+    write_executable(&s.bin().join("codex"), &body);
 }
 
 /// Parse a stub record into one argv vector per run.

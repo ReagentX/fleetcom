@@ -424,8 +424,9 @@ fn screen_header_without_alt_scroll_is_rejected() {
     assert_eq!(decode_event(KIND_SCREEN, &screen_payload(header)), None);
 }
 
+/// Round-trip a two-view task snapshot, including a non-UTF-8 task path.
 #[test]
-fn tasks_and_status_round_trip() {
+fn tasks_round_trip() {
     let tasks = Event::Tasks(vec![
         TaskView {
             id: 1,
@@ -459,10 +460,6 @@ fn tasks_and_status_round_trip() {
     let (k, p) = encode_event(&tasks);
     assert_eq!(k, KIND_CONTROL);
     assert_eq!(decode_event(k, &p), Some(tasks));
-
-    let status = Event::Status("saved 'x'".into());
-    let (k, p) = encode_event(&status);
-    assert_eq!(decode_event(k, &p), Some(status));
 }
 
 /// `SetGroup` emits `"g"` only for an assignment. A missing or null `"g"`

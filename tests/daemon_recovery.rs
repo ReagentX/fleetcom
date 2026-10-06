@@ -6,10 +6,10 @@ mod common;
 use std::{
     os::unix::net::UnixStream,
     path::{Path, PathBuf},
-    time::{Duration, Instant},
+    time::Duration,
 };
 
-use common::{read_frame, shake_hands, spawn_task, start_daemon, stop_daemon, wait_until};
+use common::{next_frame, shake_hands, spawn_task, start_daemon, stop_daemon, wait_until};
 
 /// Recovery-snapshot paths under the test daemon's config root.
 fn snapshots(dir: &Path) -> Vec<PathBuf> {
@@ -50,18 +50,7 @@ fn detached_daemon_writes_the_pending_snapshot() {
     // The daemon remains available and retains the task after the write.
     let mut stream = UnixStream::connect(dir.join("default.sock")).expect("reconnect failed");
     shake_hands(&mut stream, &dir.display().to_string());
-    stream
-        .set_read_timeout(Some(Duration::from_secs(10)))
-        .unwrap();
-    let deadline = Instant::now() + Duration::from_secs(10);
-    loop {
-        assert!(Instant::now() < deadline, "no tasks event after reconnect");
-        let (kind, payload) = read_frame(&mut stream).expect("stream closed after reconnect");
-        let text = String::from_utf8_lossy(&payload);
-        if kind == 1 && text.contains(r#""t":"tasks""#) && text.contains("sleep 30") {
-            break;
-        }
-    }
+    next_frame(&mut stream, "tasks", |t| t.contains("sleep 30"));
 
     stop_daemon(&mut daemon);
 }

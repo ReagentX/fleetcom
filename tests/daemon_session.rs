@@ -4,26 +4,22 @@
 
 mod common;
 
-use std::{
-    io::Write,
-    time::{Duration, Instant},
-};
+use std::{io::Write, time::Duration};
 
 use common::{
-    control_frame, read_frame, shake_hands_env, start_daemon, start_daemon_raw, stop_daemon,
-    wait_until,
+    control_frame, next_frame, scratch, shake_hands_env, start_daemon, start_daemon_raw,
+    stop_daemon, wait_until,
 };
 
 #[test]
 fn load_session_resolves_relative_dirs_against_the_client_cwd() {
-    let config = std::env::temp_dir().join(format!("fleetcom_it_sess_cfg_{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&config);
+    let config = scratch("sess_cfg");
     std::fs::create_dir_all(config.join("sessions")).unwrap();
 
     // start_daemon's hello carries `dir` as the client cwd; the daemon process
     // itself runs in this test's cwd (the repo root), which has no `sub`.
     let (dir, mut daemon, mut stream) = start_daemon("sess", |cmd| {
-        cmd.env("FLEETCOM_CONFIG_DIR", &config);
+        cmd.env("FLEETCOM_CONFIG_DIR", &*config);
     });
     std::fs::create_dir_all(dir.join("sub")).unwrap();
     let out = dir.join("sub").join("out");
@@ -43,7 +39,6 @@ fn load_session_resolves_relative_dirs_against_the_client_cwd() {
     );
 
     stop_daemon(&mut daemon);
-    let _ = std::fs::remove_dir_all(&config);
 }
 
 /// The session root follows the *hello's* env, not the daemon's: with the
@@ -52,17 +47,15 @@ fn load_session_resolves_relative_dirs_against_the_client_cwd() {
 /// recipe only the daemon's env can see must never surface.
 #[test]
 fn session_commands_follow_the_hello_config_dir() {
-    let pid = std::process::id();
-    let daemon_cfg = std::env::temp_dir().join(format!("fleetcom_it_sess_dcfg_{pid}"));
-    let client_cfg = std::env::temp_dir().join(format!("fleetcom_it_sess_ccfg_{pid}"));
+    let daemon_cfg = scratch("sess_dcfg");
+    let client_cfg = scratch("sess_ccfg");
     for d in [&daemon_cfg, &client_cfg] {
-        let _ = std::fs::remove_dir_all(d);
         std::fs::create_dir_all(d.join("sessions")).unwrap();
     }
     std::fs::write(daemon_cfg.join("sessions").join("daemononly.json"), "{}").unwrap();
 
     let (dir, mut daemon, mut stream) = start_daemon_raw("sesscfg", |cmd| {
-        cmd.env("FLEETCOM_CONFIG_DIR", &daemon_cfg);
+        cmd.env("FLEETCOM_CONFIG_DIR", &*daemon_cfg);
     });
     // Hand-rolled hello whose env carries the client-side config override.
     let cwd = dir.display().to_string();
@@ -87,20 +80,7 @@ fn session_commands_follow_the_hello_config_dir() {
     );
 
     stream.write_all(&control_frame(r#"{"t":"list"}"#)).unwrap();
-    // The reply shares the stream with periodic Tasks snapshots; skip to it.
-    stream
-        .set_read_timeout(Some(Duration::from_secs(10)))
-        .unwrap();
-    let deadline = Instant::now() + Duration::from_secs(10);
-    let sessions = loop {
-        assert!(Instant::now() < deadline, "no sessions event arrived");
-        let (kind, payload) =
-            read_frame(&mut stream).expect("stream closed before the sessions event");
-        let text = String::from_utf8_lossy(&payload).into_owned();
-        if kind == 1 && text.contains(r#""t":"sessions""#) {
-            break text;
-        }
-    };
+    let sessions = next_frame(&mut stream, "sessions", |_| true);
     assert!(
         sessions.contains(r#""where""#),
         "list must see the hello dir's recipe: {sessions}"
@@ -111,6 +91,4 @@ fn session_commands_follow_the_hello_config_dir() {
     );
 
     stop_daemon(&mut daemon);
-    let _ = std::fs::remove_dir_all(&daemon_cfg);
-    let _ = std::fs::remove_dir_all(&client_cfg);
 }

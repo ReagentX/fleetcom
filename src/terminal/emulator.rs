@@ -41,11 +41,9 @@ pub enum MouseProtocolEncoding {
 /// Maximum decoded size of one buffered OSC 52 clipboard payload.
 pub(crate) const CLIPBOARD_STORE_MAX_BYTES: usize = 1024 * 1024;
 
-// A maximum-size store expands to this base64 bound when re-encoded for
-// forwarding. Reserve 64 KiB for the command envelope and keep the result
-// within one frame.
+// A maximum-size store leaves the daemon base64-encoded in one `Event::ClipboardCopy` frame.
 const _: () = assert!(
-    CLIPBOARD_STORE_MAX_BYTES.div_ceil(3) * 4 + 64 * 1024 <= crate::frame::MAX_FRAME as usize,
+    crate::frame::fits_base64(CLIPBOARD_STORE_MAX_BYTES),
     "CLIPBOARD_STORE_MAX_BYTES must base64-encode to under frame::MAX_FRAME"
 );
 
