@@ -13,10 +13,14 @@ fn install_stub(bin: &Path, name: &str, out: &Path) {
     install_script(
         bin,
         name,
+        // Write each record to a per-process file beside its destination and
+        // rename it into place: `>` truncates first and `printf` may write
+        // one argument at a time, so a reader polling for a non-empty file
+        // could otherwise see a prefix of the argv.
         &format!(
-            "printf '%s' \"$FLEETCOM_CAPTURE_FILE\" > '{out}/capenv'\n\
-             printf '%s' \"$FLEETCOM_BINARY\" > '{out}/binenv'\n\
-             printf '%s\\n' \"$@\" > '{out}/argv'",
+            "printf '%s' \"$FLEETCOM_CAPTURE_FILE\" > '{out}/capenv.'$$'.tmp' && mv '{out}/capenv.'$$'.tmp' '{out}/capenv'\n\
+             printf '%s' \"$FLEETCOM_BINARY\" > '{out}/binenv.'$$'.tmp' && mv '{out}/binenv.'$$'.tmp' '{out}/binenv'\n\
+             printf '%s\\n' \"$@\" > '{out}/argv.'$$'.tmp' && mv '{out}/argv.'$$'.tmp' '{out}/argv'",
             out = out.display()
         ),
     );
