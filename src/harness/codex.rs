@@ -1,18 +1,17 @@
-//! A Codex ID cannot be selected at launch. Explicitly enable embedded mode
-//! with one override on every launch, and when the configured notifier can
-//! be chained and this binary is usable, inject a `notify` override as well.
+//! A Codex ID cannot be selected at launch. Explicitly enable embedded mode on every
+//! launch. Also inject a `notify` override when the configured notifier can be chained and
+//! this binary is usable.
 //!
-//! Notifications are emitted for every thread in one Codex process: the
-//! conversation on screen, each spawned sub-agent, and the hidden thread used
-//! to title a new session. Only the first is the task's conversation. Resuming
-//! a sub-agent with an unloaded parent or the unsaved title thread exits 1.
-//! The injected script hands each notification to `fleetcom --codex-notify-v1`
-//! ([`record_arrival`]), which resolves the notified thread to its session
-//! tree's root through the rollout header and replaces the capture file with
-//! the bare root UUID. A thread that cannot be classified writes nothing, so
-//! the title thread, whose notification lands before or after the root's,
-//! never erases an accepted root. `parse_capture` then accepts the slot only
-//! as that one UUID.
+//! Notifications are emitted for every thread in one Codex process: the conversation on
+//! screen, each spawned sub-agent, and the hidden title thread. Only the first is the
+//! task's conversation. Attempting to resume a sub-agent with an unloaded parent or the
+//! unsaved title thread exits 1.
+//!
+//! Pass each notification to `fleetcom --codex-notify-v1` ([`record_arrival`]). Resolve the
+//! notified thread to its session tree's root through the rollout header, then replace the
+//! capture file with the bare root UUID. Write nothing for an unclassified thread. Preserve
+//! an accepted root regardless of whether the title notification arrives before or after
+//! the root notification. In `parse_capture`, accept only that one bare UUID.
 
 use std::{
     fmt::Write as _,
@@ -57,12 +56,11 @@ impl Harness for Codex {
         ("codex", "resume")
     }
 
-    /// Every launch carries the embedded override: without it, `codex`
-    /// attaches to its shared background server and killing the task kills
-    /// only the TUI client. The notify override and its environment ride
-    /// along only when the configured route can be chained and this binary
-    /// is usable; otherwise the plan explains why capture is off. No session
-    /// flag: codex cannot pin an ID at launch.
+    /// Include the embedded override on every launch. Otherwise, `codex` attaches to its
+    /// shared background server, and killing the task terminates only the TUI client.
+    /// Inject the notify override and environment only when the configured route can be
+    /// chained and this binary is usable; otherwise, include a notice explaining why
+    /// capture is disabled. Omit the session flag: codex cannot pin an ID at launch.
     fn overlay(&self, capture: &CapturePaths, home: Option<&Path>) -> SpawnPlan {
         let mut plan = SpawnPlan {
             args: vec!["-c".into(), EMBEDDED_OVERRIDE.into()],
@@ -81,9 +79,8 @@ impl Harness for Codex {
                 return plan;
             }
         };
-        // The script runs this binary to validate each notification. Without
-        // a usable path there is nothing to run, so inject nothing: an
-        // unvalidated slot would be worse than none.
+        // Validate each notification with this binary. Without a usable executable path,
+        // skip injection so no unvalidated slot is written.
         let Some(binary) = &capture.fleetcom_binary else {
             plan.notice = Some(format!(
                 "{CAPTURE_OFF}: fleetcom binary replaced; restart the daemon"
@@ -111,37 +108,34 @@ impl Harness for Codex {
         plan
     }
 
-    /// Accept the slot only as exactly one bare root UUID: the v1 format
-    /// written by [`record_arrival`]. No trimming: the writer emits no
-    /// newline, so trailing whitespace marks a different writer. Validation
-    /// happened at arrival, when the rollout header was on disk; the payload
-    /// is not reparsed and no rollout is read here, so a root stays accepted
-    /// after codex compresses its rollout. An old-format JSON slot fails
-    /// [`is_uuid`] and is refused.
+    /// Accept exactly one bare root UUID: the v1 format written by [`record_arrival`]. Do
+    /// not trim whitespace; no newline is written in that format. Validation was completed
+    /// at arrival while the rollout header was on disk. Do not reparse the payload or read
+    /// the rollout here, so the ID remains accepted after rollout compression. Reject
+    /// old-format JSON with [`is_uuid`].
     fn parse_capture(
         &self,
         payload: &str,
         // Notifications for every thread originate in the task's own process.
         _pid: Option<u32>,
-        // The home was consumed at arrival.
+        // Home resolution was completed at arrival.
         _home: Option<&Path>,
     ) -> Option<String> {
         is_uuid(payload).then(|| payload.to_string())
     }
 }
 
-/// Status-line prefix for a launch that carries the embedded override alone.
+/// Status-line prefix for a launch with only the embedded override.
 const CAPTURE_OFF: &str = "codex capture unavailable";
 
-/// The `--codex-notify-v1` mode: validate one notification at arrival and
-/// replace the capture file with its root UUID. `env` is the process's own
-/// environment, inherited from the `codex` launch: [`CAPTURE_ENV`] names the
-/// slot, and the home resolves as in [`Codex::resolve_home`].
+/// Validate one notification at arrival through `--codex-notify-v1` and replace the capture
+/// file with its root UUID. Read `env` from the process environment inherited at the
+/// `codex` launch: use [`CAPTURE_ENV`] for the slot and resolve the home as in
+/// [`Codex::resolve_home`].
 ///
-/// Return the root written, or `None` when nothing was written: no capture
-/// path, a payload that is not an `agent-turn-complete` for a strict thread
-/// ID, a thread [`root_thread`] cannot classify, or a failed write. The slot
-/// only ever moves from one accepted root to another.
+/// Return the root written. Return `None` without writing if no capture path is set, the
+/// payload is not an `agent-turn-complete` for a strict thread ID, classification in
+/// [`root_thread`] fails, or the write fails. Replace the slot only with an accepted root.
 pub fn record_arrival(payload: &str, env: &dyn Fn(&str) -> Option<PathBuf>) -> Option<String> {
     let capture = env(CAPTURE_ENV).filter(|p| !p.as_os_str().is_empty())?;
     let root = arrival_root(payload, Codex.resolve_home(env).as_deref())?;
@@ -149,14 +143,13 @@ pub fn record_arrival(payload: &str, env: &dyn Fn(&str) -> Option<PathBuf>) -> O
     Some(root)
 }
 
-/// Resolve an `agent-turn-complete` notification to the root thread of the
-/// notified thread's session tree: the conversation the task's TUI is on.
-/// For a sub-agent, that is its root. Return `None` for any other payload
-/// type, a non-strict thread ID, or a thread [`root_thread`] cannot classify.
+/// Resolve an `agent-turn-complete` notification to the root of the notified thread's
+/// session tree: the conversation displayed in the task's TUI. For a sub-agent, use its
+/// root. Return `None` for any other payload type, a non-strict thread ID, or failed
+/// classification in [`root_thread`].
 ///
-/// Look up only the thread ID from the task's own notification and classify
-/// it from its rollout header. Do not infer conversation ownership from
-/// other sessions in the store.
+/// Look up only the thread ID from the task's own notification and classify it from its
+/// rollout header. Do not infer conversation ownership from other sessions in the store.
 fn arrival_root(payload: &str, home: Option<&Path>) -> Option<String> {
     let v = jzon::parse(payload).ok()?;
     if v["type"].as_str() != Some("agent-turn-complete") {
@@ -166,9 +159,9 @@ fn arrival_root(payload: &str, home: Option<&Path>) -> Option<String> {
     root_thread(&home_root(home, ".codex")?, &thread)
 }
 
-/// Write `root` to `<capture>.<pid>.tmp` beside the capture file and rename
-/// it over the destination, so a reader never sees a partial slot. Remove the
-/// temporary file when either step fails.
+/// Write `root` to `<capture>.<pid>.tmp` beside the capture file and rename it over the
+/// destination to prevent reads of a partial slot. Remove the temporary file if either step
+/// fails.
 fn replace_slot(capture: &Path, root: &str) -> io::Result<()> {
     let mut tmp = capture.as_os_str().to_owned();
     tmp.push(format!(".{}.tmp", std::process::id()));
@@ -182,7 +175,7 @@ fn replace_slot(capture: &Path, root: &str) -> io::Result<()> {
 
 /// Resolve `thread` to the root thread of its session tree from the header of
 /// its rollout under the Codex `home`. `thread` must already satisfy
-/// [`is_uuid`](super::is_uuid): it is matched against file names.
+/// [`is_uuid`]: it is matched against file names.
 ///
 /// Each thread is saved as
 /// `sessions/<YYYY>/<MM>/<DD>/rollout-<local time>-<thread>.jsonl`. The first
@@ -435,8 +428,8 @@ mod tests {
         testutil::{Scratch, codex_session_meta, install_codex_rollout, install_codex_root, temp},
     };
 
-    /// Codex's own launch and resume commands carry v7 IDs; the shared v4
-    /// fixture stays valid because `is_uuid` is version-agnostic.
+    /// Use v7 IDs in Codex launch and resume commands. Also accept the shared v4 fixture:
+    /// UUID version is not checked by `is_uuid`.
     const ID: &str = "019f5453-de22-7240-b2e5-0d32692aa6d9";
     /// A sub-agent thread and a second-level sub-agent thread in the session
     /// rooted at [`ID`].
@@ -467,7 +460,7 @@ mod tests {
         ]
     }
 
-    /// The notify override that [`paths`] produces.
+    /// The notify override built from [`paths`].
     const NOTIFY: &str = r#"notify=["/tmp/Application Support/notify.sh"]"#;
 
     /// The overlay of a launch whose capture is off, explained by `why`.
@@ -485,11 +478,10 @@ mod tests {
         temp("codex_no_config_home")
     }
 
-    /// Managed argv: a fresh launch carries the two overrides alone (no ID
-    /// can be pinned, so the minted one is ignored); a resume leads with the
-    /// `resume` subcommand and the ID, then the same overrides. The
-    /// environment names the capture file, an explicitly empty chain so no
-    /// inherited value reaches the script, and the binary the script runs.
+    /// For fresh managed launches, include only the two overrides; ignore the minted ID
+    /// because pinning is unsupported. For resumes, place `resume` and the ID before those
+    /// overrides. Set the capture file, an explicitly empty chain to exclude inherited
+    /// values, and the validation binary in the environment.
     #[test]
     fn managed_argv_installs_the_notify_and_embedded_overrides() {
         let home = no_config_home();
@@ -514,10 +506,9 @@ mod tests {
         assert_eq!(resume.env, full_env(""));
     }
 
-    /// Without a usable binary, the script would have nothing to run, so the
-    /// launch carries the embedded override alone and says why. The route
-    /// is still read first: an opaque route reports its own reason. A
-    /// managed resume keeps its intent part ahead of the reduced overlay.
+    /// Without a usable binary, include only the embedded override and a notice. Read the
+    /// route first and report an opaque route before checking the binary. On managed
+    /// resumes, preserve the conversation selection before the reduced overlay.
     #[test]
     fn overlay_without_a_usable_binary_keeps_only_the_embedded_override() {
         let paths = CapturePaths {
@@ -613,8 +604,8 @@ mod tests {
         )));
     }
 
-    /// For an unrepresentable route, inject the embedded override alone, no
-    /// environment, and a notice: the task stays in embedded mode either way.
+    /// For an unrepresentable route, inject only the embedded override, no environment, and
+    /// a notice. Keep the task in embedded mode even without capture.
     #[test]
     fn overlay_skips_an_unrepresentable_config_notify() {
         let home = temp("codex_opaque_notify");
@@ -651,8 +642,8 @@ mod tests {
             r#"/with space/and\"quote\\slash"#
         );
         assert_eq!(toml_escape("a\tb"), "a\\u0009b");
-        // The override is one argv element: the escaping is TOML's alone, with
-        // no shell layer to double it.
+        // Pass the override as one argv element. Escape TOML only; no shell escaping is
+        // needed.
         let paths = CapturePaths {
             codex_notify: PathBuf::from(r#"/Odd Path/it's "here"\now"#),
             ..paths()
@@ -827,9 +818,9 @@ mod tests {
         assert_eq!(parse(""), None);
     }
 
-    /// The slot is exactly one bare UUID. Refuse the pre-v1 JSON payload, a
-    /// trailing newline (a different writer), and malformed or empty input,
-    /// whatever the PID and home: nothing is reparsed or looked up at read.
+    /// Accept exactly one bare UUID. Refuse pre-v1 JSON, trailing newlines from other
+    /// writers, and malformed or empty input regardless of PID or home. Do not reparse or
+    /// look up the ID at read time.
     #[test]
     fn parse_capture_accepts_only_a_bare_uuid_slot() {
         let home = temp("codex_capture_slot");
@@ -875,10 +866,9 @@ mod tests {
         names
     }
 
-    /// The headline regression: the title thread's notification, which has
-    /// no rollout, lands before the root's in some sessions and after it in
-    /// others. Either way the slot ends up holding the root, because a
-    /// refusal writes nothing. No temporary file is left behind.
+    /// Preserve the root when the title notification arrives before or after it. No rollout
+    /// exists for the title thread, so refuse its notification without writing. Leave no
+    /// temporary file behind.
     #[test]
     fn record_arrival_keeps_the_root_across_a_title_thread_notification() {
         let home = temp("codex_arrival_title");
@@ -898,7 +888,7 @@ mod tests {
         );
         assert_eq!(fs::read_to_string(&cap).unwrap(), ID);
 
-        // Title after the root: the slot keeps the root.
+        // Title after the root: preserve the accepted root.
         assert_eq!(record_arrival(&turn_complete(TITLE), &env), None);
         assert_eq!(fs::read_to_string(&cap).unwrap(), ID);
         assert_eq!(siblings(&cap), ["task-1-0.json"]);
@@ -908,8 +898,8 @@ mod tests {
         );
     }
 
-    /// A sub-agent's notification writes its root, not its own ID, replacing
-    /// an earlier, longer slot in full.
+    /// On a sub-agent notification, write the root ID instead of the sub-agent's ID.
+    /// Replace the entire previous slot, including any excess bytes.
     #[test]
     fn record_arrival_writes_a_sub_agents_root() {
         let home = temp("codex_arrival_child");
@@ -930,9 +920,8 @@ mod tests {
         assert_eq!(siblings(&cap), ["task-2-0.json"]);
     }
 
-    /// Refuse before touching the slot: a non-turn-complete type, a non-UUID
-    /// thread, malformed JSON, and a thread without a rollout all leave an
-    /// existing slot as it was.
+    /// Refuse before touching the slot: preserve existing contents for a non-turn-complete
+    /// type, a non-UUID thread, malformed JSON, or a thread without a rollout.
     #[test]
     fn record_arrival_refuses_without_writing() {
         let home = temp("codex_arrival_refuse");
@@ -963,8 +952,8 @@ mod tests {
         assert_eq!(siblings(&cap), ["task-3-0.json"]);
     }
 
-    /// Without a capture path, the mode is a no-op even for an accepted root.
-    /// An empty value reads as unset, as in the script.
+    /// Without a capture path, write nothing even for an accepted root. Treat an empty path
+    /// as unset, as in the script.
     #[test]
     fn record_arrival_is_a_no_op_without_a_capture_path() {
         let home = temp("codex_arrival_nocap");
@@ -977,7 +966,7 @@ mod tests {
                 "{capture:?}"
             );
         }
-        // Nothing lands beside the store, where an empty path could resolve.
+        // Do not write beside the store, where an empty path could resolve.
         assert_eq!(siblings(&home.join("sessions")), ["sessions"]);
     }
 
@@ -1007,8 +996,8 @@ mod tests {
         assert_eq!(fs::read_to_string(&cap).unwrap(), ID);
     }
 
-    /// A slot whose directory is gone, as after the daemon's namespace is
-    /// dropped, is a refusal with no temporary file left anywhere.
+    /// Refuse a write when the slot's directory is gone, as after dropping the daemon's
+    /// namespace. Leave no temporary file behind.
     #[test]
     fn record_arrival_reports_a_failed_write() {
         let home = temp("codex_arrival_badslot");

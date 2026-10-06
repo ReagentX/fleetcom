@@ -16,21 +16,19 @@
 //!   the file at [`CAPTURE_ENV`](super::CAPTURE_ENV), set in the task's launch
 //!   environment. Write the parent Claude process's PID on the first line,
 //!   followed by the JSON payload from stdin, unmodified.
-//! - `codex`: `-c notify=["<codex-notify.sh>"]` names an executable that
-//!   `codex` invokes with notification JSON once per completed turn of any
-//!   thread: the conversation on screen, each sub-agent, and the hidden
-//!   title thread. When `$FLEETCOM_CAPTURE_FILE` and `$FLEETCOM_BINARY` are
-//!   both non-empty, the script runs
-//!   `"$FLEETCOM_BINARY" --codex-notify-v1 "$1"` and ignores its status.
-//!   That mode validates at arrival: it resolves the notified thread to its
-//!   root through the rollout header and replaces the capture file with the
-//!   bare root UUID, atomically, only for an accepted root. A refused thread
-//!   writes nothing, so the title thread cannot erase the root. The slot
-//!   format is frozen as v1: exactly one UUID, no newline. When
-//!   `$FLEETCOM_NOTIFY_CHAIN` is non-empty the script then execs that
-//!   newline-joined argv with the payload appended, so the displaced notifier
-//!   receives the same final argument `codex` would have passed; otherwise
-//!   exit 0. The chain runs whatever happens to fleetcom's part.
+//! - `codex`: register the notify executable with
+//!   `-c notify=["<codex-notify.sh>"]`. Receive notification JSON after each
+//!   completed turn: the conversation on screen, each sub-agent, and the
+//!   hidden title thread. With non-empty `$FLEETCOM_CAPTURE_FILE` and
+//!   `$FLEETCOM_BINARY`, run `"$FLEETCOM_BINARY" --codex-notify-v1 "$1"` and
+//!   ignore its status. Validate at arrival: resolve the notified thread to
+//!   its root through the rollout header, then atomically replace the capture
+//!   file with the bare root UUID. Write nothing for a refused thread, so a
+//!   title notification cannot overwrite an accepted root. Keep the v1 slot
+//!   format fixed: exactly one UUID, no newline. With a non-empty
+//!   `$FLEETCOM_NOTIFY_CHAIN`, exec the newline-joined argv with the payload
+//!   appended, preserving the notifier's original arguments and final payload
+//!   argument; otherwise, exit 0. Run the chain regardless of validation failure.
 //! - `omp`: load an extension module inside the agent's own process through
 //!   `-e <omp-capture.js>`, appending to the user's extensions. On
 //!   `session_start`, `session_switch`, `session_branch`, and `agent_end`,
@@ -51,9 +49,8 @@ use std::{
 use super::CapturePaths;
 use crate::task::{pid_is_dead, positive_pid};
 
-/// Notify program injected into `codex`. It hands the payload to fleetcom's
-/// `--codex-notify-v1` mode when a capture path and binary are both set, then
-/// replaces itself with the configured notifier when present.
+/// Codex notify program: pass the payload to `fleetcom --codex-notify-v1` when both a
+/// capture path and binary are set. Then exec the configured notifier, if present.
 const CODEX_NOTIFY_SCRIPT: &str = r#"#!/bin/sh
 # Validate the notification in fleetcom before replacing this process with
 # the chained notifier. The binary rewrites the capture file only for an
@@ -285,9 +282,9 @@ impl CaptureAssets {
         })
     }
 
-    /// Return the installed asset paths plus the capture path for one task run.
-    /// Including the run number prevents reruns from sharing payloads. The
-    /// binary is probed on every call: it can disappear between launches.
+    /// Return the installed asset paths and capture path for one task run. Include the run
+    /// number to isolate reruns. Probe the binary on every call in case it was removed
+    /// between launches.
     pub fn paths_for(&self, task_id: u64, run: u32) -> CapturePaths {
         CapturePaths {
             capture_file: self.dir.join(format!("task-{task_id}-{run}.json")),
@@ -299,12 +296,11 @@ impl CaptureAssets {
     }
 }
 
-/// This process's executable when it is still a regular file with an
-/// execute bit. On Linux, `current_exe` reads `/proc/self/exe`, which becomes
-/// `<path> (deleted)` once the binary is replaced on disk; that path fails
-/// the metadata check. On macOS the path survives a reinstall and names the
-/// new binary, so an older release there degrades to an unrecognized flag
-/// and no capture write.
+/// Look up this process's executable and require a regular file with an execute bit. On
+/// Linux, the path read through `/proc/self/exe` ends in ` (deleted)` after the binary is
+/// replaced on disk; reject that nonexistent path. On macOS, the same path refers to the
+/// newly installed binary. If replaced with an older release, validation fails with an
+/// unrecognized flag and no capture write.
 fn fleetcom_binary() -> Option<PathBuf> {
     std::env::current_exe()
         .ok()
@@ -592,9 +588,9 @@ console.log(Object.keys(handlers).join(" "));
         }
     }
 
-    /// Stand-in for `fleetcom --codex-notify-v1` at `path`: record argv into
-    /// `record`, write [`ID`] over the inherited capture file, and exit 3.
-    /// The nonzero status proves the script ignores it.
+    /// Install a stand-in for `fleetcom --codex-notify-v1` at `path`: record argv into
+    /// `record`, write [`ID`] over the inherited capture file, and exit 3. Verify that this
+    /// nonzero status is ignored by the calling script.
     fn install_fake_binary(path: &Path, record: &Path) {
         write_executable(
             path,
@@ -605,9 +601,8 @@ console.log(Object.keys(handlers).join(" "));
         );
     }
 
-    /// The script runs the binary only when both the capture path and the
-    /// binary are set, passing the payload as the mode's sole argument. With
-    /// neither chain nor binary, it exits 0 without output.
+    /// Run the binary only with both capture path and binary set, passing the payload as
+    /// the sole mode argument. With neither a chain nor a binary, exit 0 without output.
     #[test]
     fn notify_script_runs_the_binary_only_with_a_capture_path_and_binary() {
         let root = temp("assets_notify");
@@ -647,9 +642,8 @@ console.log(Object.keys(handlers).join(" "));
             assert!(!cap.exists(), "{capture:?} {bin:?}");
         }
 
-        // Both set and an empty chain, which reads as absent: the binary runs
-        // with the mode flag and the payload, its status is dropped, and the
-        // script exits 0 without exec.
+        // With both variables set and an empty chain, run the binary with the mode flag and
+        // payload, ignore its status, and exit 0 without exec.
         let out = Command::new(&assets.codex_notify)
             .arg(payload)
             .env(CAPTURE_ENV, &cap)
@@ -666,8 +660,8 @@ console.log(Object.keys(handlers).join(" "));
         assert_eq!(fs::read_to_string(&cap).unwrap(), ID);
     }
 
-    /// A configured chain runs after the binary and receives its original
-    /// argv followed by the payload. Spaces within an argument remain intact.
+    /// Run the configured notifier after the binary with its original argv followed by the
+    /// payload. Preserve spaces within arguments.
     #[test]
     fn notify_script_chains_the_displaced_notifier() {
         let root = temp("assets_chain");
@@ -699,8 +693,7 @@ console.log(Object.keys(handlers).join(" "));
         );
     }
 
-    /// The binary runs before the chained notifier, whose exit status passes
-    /// through.
+    /// Run the binary before the chained notifier and forward the notifier's exit status.
     #[test]
     fn notify_script_capture_survives_a_failing_chain() {
         let root = temp("assets_chain_fail");
@@ -723,8 +716,7 @@ console.log(Object.keys(handlers).join(" "));
         assert_eq!(fs::read_to_string(&cap).unwrap(), ID);
     }
 
-    /// Without a capture path, the script still execs the configured chain
-    /// and leaves the binary alone.
+    /// Without a capture path, exec the configured notifier without running the binary.
     #[test]
     fn notify_script_chains_without_a_capture_path() {
         let root = temp("assets_chain_nocap");
@@ -748,8 +740,8 @@ console.log(Object.keys(handlers).join(" "));
         assert!(!binary_record.exists(), "no capture path, no binary run");
     }
 
-    /// A binary that no longer exists, as after a Linux reinstall under a
-    /// running daemon, must not keep the chain from running.
+    /// Run the configured notifier even when the binary no longer exists, as after a Linux
+    /// reinstall under a running daemon.
     #[test]
     fn notify_script_chains_past_a_missing_binary() {
         let root = temp("assets_chain_nobin");

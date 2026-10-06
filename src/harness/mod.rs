@@ -1,20 +1,18 @@
-//! A saved agent is incomplete without its conversation ID. Relaunching the
-//! agent can otherwise start a new conversation. Each harness captures a
-//! validated ID and builds the argv that opens or resumes a conversation.
+//! Save an agent's conversation ID to resume it later; without the ID, relaunching may
+//! start a new conversation. Capture and validate the ID through the harness, then build
+//! the argv to open or resume it.
 //!
-//! A managed launch is built here from an [`Intent`]: the binary found on
-//! `PATH`, the conversation selection, then the harness's overlay (capture
-//! hook, config overrides, environment). No shell parses that argv. A literal
-//! command never comes here: it runs and saves verbatim, whatever it names,
-//! and only the display-only summary adapter ([`select`]) reads its text.
+//! Build managed launches from an [`Intent`]: the binary found on `PATH`, the conversation
+//! selection, then the harness overlay (capture hook, config overrides, environment).
+//! Execute that argv directly, without shell parsing. Run and save literal commands
+//! verbatim; inspect their text only to select a display adapter ([`select`]).
 //!
 //! # Security invariant
 //!
-//! Every ID returned by `parse_capture` or `live_session_id` enters an agent's
-//! argv as one element and a session file as its `resume` field. These
-//! methods return only strings accepted by [`is_uuid`]; return `None` for free
-//! text, paths, and malformed IDs. Summary adapters and `live_blocked_status`
-//! are display-only.
+//! Use each ID from `parse_capture` or `live_session_id` as one argv element and as the
+//! `resume` field in a session file. Return only IDs accepted by [`is_uuid`]; return `None`
+//! for free text, paths, and malformed IDs. Use summary adapters and `live_blocked_status`
+//! only for display.
 
 pub mod assets;
 mod claude;
@@ -45,10 +43,10 @@ pub const CAPTURE_ENV: &str = "FLEETCOM_CAPTURE_FILE";
 /// configured so inherited values cannot reach the capture script.
 pub const NOTIFY_CHAIN_ENV: &str = "FLEETCOM_NOTIFY_CHAIN";
 
-/// Environment variable naming the fleetcom binary that the injected `codex`
-/// notify script runs as `--codex-notify-v1`. Set per launch from the
-/// daemon's own path so the script validates with the binary that built it;
-/// absent when that path is unusable, so the script skips the call.
+/// Environment variable for the fleetcom executable used by the injected `codex` notifier.
+/// Set it from the daemon's path on each launch so notifications are validated through
+/// `--codex-notify-v1` with the same binary used to install the script. When the path is
+/// unusable, omit the variable and skip validation.
 pub const BINARY_ENV: &str = "FLEETCOM_BINARY";
 
 /// Launch, capture, and resume behavior for one agent CLI.
@@ -60,25 +58,21 @@ pub trait Harness: Sync {
         None
     }
 
-    /// Program word and resume selector. The word is how the registry, the
-    /// launcher, and session files name the tool; the selector is the flag or
-    /// subcommand that takes a conversation ID, which [`intent_args`] places
-    /// first in a resuming argv.
+    /// Program word and resume selector. Identify the tool by its word in the registry,
+    /// launcher, and session files. Use the selector flag or subcommand before the
+    /// conversation ID in [`intent_args`].
     fn shape(&self) -> (&'static str, &'static str);
 
-    /// The flag that pins a session ID on a fresh launch, for tools that
-    /// accept one. `None` means a fresh conversation gets its ID from the
-    /// tool, and only capture or the registry can report it.
+    /// Flag for pinning a session ID at launch, if supported. With `None`, use the ID
+    /// assigned by the tool and read it from capture or the registry.
     fn session_flag(&self) -> Option<&'static str> {
         None
     }
 
-    /// Spawn-time additions every launch of this tool carries, whichever
-    /// conversation it opens: argv elements after the conversation selection,
-    /// environment pairs, and a notice when the launch carries less than
-    /// usual. `home` is resolved from the launch environment; `None` uses the
-    /// harness's platform-home fallback. Leaves `resume_id` unset; [`plan`]
-    /// fills it from the intent.
+    /// Instrumentation for every launch of this tool: argv elements after the conversation
+    /// selection, environment pairs, and a notice for reduced instrumentation. Resolve
+    /// `home` from the launch environment; with `None`, use the platform-home fallback.
+    /// Leave `resume_id` unset here and assign it from the intent in [`plan`].
     fn overlay(&self, capture: &CapturePaths, home: Option<&Path>) -> SpawnPlan;
 
     /// Extract a session ID from the capture file's contents. `pid` is the
@@ -145,7 +139,7 @@ struct Agent {
     summary: &'static dyn crate::preview::SummaryAdapter,
 }
 
-/// Registered CLIs in registry order: the order the launcher lists them.
+/// Registered CLIs, in launcher order.
 static AGENTS: &[Agent] = &[
     Agent {
         harness: &Claude,
@@ -165,8 +159,8 @@ static AGENTS: &[Agent] = &[
     },
 ];
 
-/// The harness registered under exactly `program`: the word a managed
-/// launch or a session entry names, never a path or a basename match.
+/// Look up a harness by its exact registered `program` word, as used for managed launches
+/// and session entries. Do not match paths or basenames.
 pub fn registered(program: &str) -> Option<&'static dyn Harness> {
     AGENTS
         .iter()
@@ -174,28 +168,25 @@ pub fn registered(program: &str) -> Option<&'static dyn Harness> {
         .find(|h| h.shape().0 == program)
 }
 
-/// Program words of every registered agent, in registry order. The launcher
-/// subtracts `installed` from this to name the agents a host lacks.
+/// List every registered program word in registry order. Subtract `installed` to identify
+/// agents missing from the host.
 pub fn program_words() -> impl Iterator<Item = &'static str> {
     AGENTS.iter().map(|a| a.harness.shape().0)
 }
 
-/// Program words of the registered agents that [`find_on_path`] resolves on
-/// `path`, in registry order: the launcher's menu. Each word is searched
-/// independently, so the result never depends on `path` order. An empty
-/// `path` yields an empty list.
+/// List registered program words found on `path`, in registry order, for the launcher menu.
+/// Search for each word independently. Keep menu order independent of `path` order; return
+/// an empty list for an empty `path`.
 pub fn installed(path: &OsStr) -> Vec<&'static str> {
     program_words()
         .filter(|program| find_on_path(program, path).is_some())
         .collect()
 }
 
-/// The first executable regular file named `program` in `path`, returned as
-/// found. The path is never canonicalized: a self-updater that repoints
-/// `~/.local/bin/claude` is followed at the next launch. Components that are
-/// not absolute (empty, `.`, `bin`) are skipped: they would resolve against
-/// the daemon's cwd here and against the task's cwd at exec, so the two
-/// could name different files.
+/// Find the first executable regular file named `program` in `path`. Preserve the path as
+/// found: after a self-update of `~/.local/bin/claude`, follow the new symlink target on
+/// the next launch. Skip relative components (empty, `.`, `bin`): resolving them against
+/// the daemon's cwd during lookup and the task's cwd at exec could select different files.
 pub fn find_on_path(program: &str, path: &OsStr) -> Option<PathBuf> {
     std::env::split_paths(path)
         .filter(|dir| dir.is_absolute())
@@ -208,11 +199,10 @@ fn executable_file(path: &Path) -> bool {
     fs::metadata(path).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
 }
 
-/// Select a summary adapter by the basename of the command's first
-/// whitespace-separated word. Arguments are accepted; do not select an adapter
-/// for environment prefixes or compound shell commands. Selection is display
-/// only and applies to literal and managed tasks alike: it never grants a
-/// literal task a harness channel.
+/// Select a display-only summary adapter by the basename of the command's first
+/// whitespace-separated word. Accept arguments; do not select an adapter for environment
+/// prefixes or compound shell commands. Apply this selection to literal and managed tasks
+/// without enabling harness reads for literal tasks.
 pub fn select(command: &str) -> Option<&'static dyn crate::preview::SummaryAdapter> {
     let first = command.split_whitespace().next()?;
     let name = Path::new(first).file_name()?.to_str()?;
@@ -222,23 +212,22 @@ pub fn select(command: &str) -> Option<&'static dyn crate::preview::SummaryAdapt
         .map(|a| a.summary)
 }
 
-/// Which conversation a managed launch opens.
+/// Conversation selection for a managed launch.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Intent {
-    /// A new conversation. A tool with a [`Harness::session_flag`] gets an
-    /// ID minted by the supervisor.
+    /// Start a new conversation. When a [`Harness::session_flag`] is available, mint an ID
+    /// in the supervisor.
     Fresh,
-    /// The conversation with this ID, which passed [`is_uuid`] at its
-    /// source: a capture, a registry record, or a session file.
+    /// Resume the conversation with this ID, validated by [`is_uuid`] at its source:
+    /// capture, a registry record, or a session file.
     Resume(String),
 }
 
-/// Argv that selects the conversation, and the ID the launch targets when
-/// one is known at launch. `Fresh` pins `fresh_id` through the tool's session
-/// flag where it has one; `None` (a mint failure) launches unpinned, as every
-/// release has. `Resume` names the ID after the tool's resume selector. The
-/// ID is one argv element and no shell parses it, so [`is_uuid`] is a second
-/// check here rather than the only one.
+/// Build conversation-selection argv and report the target ID when known. For `Fresh`, pin
+/// `fresh_id` through the tool's session flag, if supported. With `None` (a mint failure),
+/// launch unpinned, as in prior releases. For `Resume`, place the ID after the resume
+/// selector. Pass the ID as one argv element without shell parsing; also validate it with
+/// [`is_uuid`].
 pub fn intent_args(
     h: &dyn Harness,
     intent: &Intent,
@@ -259,9 +248,9 @@ pub fn intent_args(
     }
 }
 
-/// The complete plan for one launch of `h`: the intent part first, then the
-/// overlay. Every tool takes its subcommand or session flag before config
-/// flags (`codex resume <id> -c …`), so the order is fixed here, once.
+/// Build the complete launch plan for `h`: conversation selection first, then the overlay.
+/// Use this order for every tool because each accepts its subcommand or session flag before
+/// config flags (`codex resume <id> -c …`).
 pub fn plan(
     h: &dyn Harness,
     intent: &Intent,
@@ -291,10 +280,10 @@ pub struct CapturePaths {
     /// Extension module loaded by `omp -e`, which appends to the user's own
     /// extensions rather than replacing them.
     pub omp_capture: PathBuf,
-    /// This daemon's own executable, checked at allocation to be a regular
-    /// file with an execute bit. `None` when `current_exe` is unusable: on
-    /// Linux, `/proc/self/exe` reads `<path> (deleted)` once the binary is
-    /// replaced on disk under the running daemon.
+    /// The daemon's executable, checked at allocation for a regular file with an execute
+    /// bit. Use `None` when `current_exe` is unusable. On Linux, the path read through
+    /// `/proc/self/exe` ends in ` (deleted)` after the binary is replaced on disk under the
+    /// running daemon.
     pub fleetcom_binary: Option<PathBuf>,
 }
 
@@ -306,11 +295,10 @@ pub struct SpawnPlan {
     pub args: Vec<OsString>,
     /// Environment pairs added to the child.
     pub env: Vec<(OsString, OsString)>,
-    /// The session ID the launch targets, when known at launch: the pinned
-    /// fresh ID or the resumed one.
+    /// Session ID known at launch: the pinned fresh ID or the resumed ID.
     pub resume_id: Option<String>,
-    /// One-line reason the launch carries less instrumentation than usual.
-    /// The supervisor reports it on the status line once the task spawns.
+    /// One-line explanation of reduced instrumentation, for the status line after a
+    /// successful spawn.
     pub notice: Option<String>,
 }
 
@@ -325,8 +313,8 @@ pub fn is_uuid(s: &str) -> bool {
         })
 }
 
-/// Validated session ID at `key` in a capture payload or a Codex rollout
-/// header; [`is_uuid`] is the boundary.
+/// Read a validated session ID at `key` in a capture payload or Codex rollout header.
+/// Validate with [`is_uuid`].
 fn capture_id(v: &jzon::JsonValue, key: &str) -> Option<String> {
     let id = v[key].as_str()?;
     is_uuid(id).then(|| id.to_string())
@@ -422,8 +410,8 @@ mod tests {
         assert_ne!(a, b);
     }
 
-    /// The pin goes only where a session flag exists; a resume always names
-    /// the ID after the tool's selector; the reported ID follows the intent.
+    /// Pin an ID only when a session flag is supported. On resume, place the ID after the
+    /// tool's selector. Report the ID selected by the intent.
     #[test]
     fn intent_args_pin_only_behind_a_session_flag_and_always_resume() {
         for a in AGENTS {
@@ -464,9 +452,9 @@ mod tests {
         assert!(registered("").is_none());
     }
 
-    /// Resolution walks absolute components only, skips files without an
-    /// execute bit and directories, takes the first hit, and returns a
-    /// symlink as found rather than its target.
+    /// Search absolute PATH components only. Skip directories and files without an execute
+    /// bit; stop at the first match. Preserve symlinks as found without canonicalizing the
+    /// target.
     #[test]
     fn find_on_path_takes_the_first_executable_file_in_an_absolute_dir() {
         use crate::testutil::{temp, write_executable};
@@ -498,8 +486,8 @@ mod tests {
         );
         assert_eq!(find_on_path("claude", OsStr::new("")), None);
 
-        // A relative spelling of `b` resolves from this process's cwd, and
-        // is still skipped: the task would resolve it from its own.
+        // Skip this relative spelling of `b` even though it is reachable from this
+        // process's cwd: at exec, it would be resolved against the task's cwd.
         let cwd = std::env::current_dir().unwrap();
         let ups = cwd
             .components()
@@ -525,8 +513,8 @@ mod tests {
         );
     }
 
-    /// The menu follows registry order whatever `PATH` order says, lists
-    /// only registered words, and is empty for an empty `PATH`.
+    /// List only registered words, in registry order, regardless of `PATH` order. Return an
+    /// empty menu for an empty `PATH`.
     #[test]
     fn installed_follows_registry_order_not_path_order() {
         use crate::testutil::{temp, write_executable};

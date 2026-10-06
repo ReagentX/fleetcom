@@ -1,5 +1,5 @@
-//! Grok has no injectable live-capture channel. A fresh launch instead pins a
-//! v4 UUID, and a resume names it.
+//! Grok has no injectable live-capture channel. Pin a v4 UUID on fresh launches and specify
+//! it on resume.
 
 use std::path::Path;
 
@@ -16,7 +16,7 @@ impl Harness for Grok {
         Some("--session-id")
     }
 
-    /// Nothing rides along: grok has no capture channel to install.
+    /// No overlay: grok has no capture channel to install.
     fn overlay(&self, _capture: &CapturePaths, _home: Option<&Path>) -> SpawnPlan {
         SpawnPlan::default()
     }
@@ -31,8 +31,8 @@ mod tests {
         plan,
     };
 
-    /// Managed argv is the intent part alone: Grok exposes no live capture
-    /// channel, so nothing rides along either way.
+    /// Build argv from the intent alone: Grok has no live-capture channel, so add no
+    /// overlay for fresh launches or resumes.
     #[test]
     fn managed_argv_is_the_pin_or_the_resume_and_nothing_else() {
         let fresh = plan(&Grok, &Intent::Fresh, Some(ID), &paths(), None);

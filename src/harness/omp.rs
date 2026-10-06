@@ -67,9 +67,9 @@ mod tests {
     /// The extension path from [`paths`].
     const EXTENSION: &str = "/tmp/Application Support/omp-capture.js";
 
-    /// Managed argv: a fresh launch loads the extension alone, since omp has
-    /// no `--session-id` and a minted ID would be unresumable; a resume names
-    /// its conversation first. Both name the capture file in the environment.
+    /// For fresh launches, load only the extension: omp has no `--session-id`, so a minted
+    /// ID would not be resumable. For resumes, specify the conversation first. Set the
+    /// capture file in the environment in both cases.
     #[test]
     fn managed_argv_loads_the_extension_and_pins_nothing() {
         let fresh = plan(&Omp, &Intent::Fresh, Some(ID), &paths(), None);
