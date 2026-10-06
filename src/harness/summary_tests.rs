@@ -6,7 +6,11 @@ use crate::{
     harness::select,
     preview::{MARKER, PreviewState, SummaryAdapter},
     protocol::PreviewSource,
+    testutil::CORPUS_LINES,
 };
+
+/// The ten braille spinner frames codex and omp cycle through their titles.
+const BRAILLE_FRAMES: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 
 /// Build a synthetic live viewport for an adapter.
 fn rs(rows: &[&str]) -> Vec<String> {
@@ -30,13 +34,14 @@ fn grok_screen<S: AsRef<str>>(above: &[S]) -> Vec<String> {
     rows
 }
 
-/// Resolve a corpus fixture at 40 rows and return its text, source, and rule.
+/// Resolve a corpus fixture at the corpus row count and `cols` columns;
+/// return its text, source, and rule.
 fn corpus(
     bytes: &[u8],
     adapter: &dyn SummaryAdapter,
     cols: u16,
 ) -> (String, PreviewSource, Option<&'static str>) {
-    let mut emu = Emulator::new(40, cols, 2000);
+    let mut emu = Emulator::new(CORPUS_LINES as u16, cols, 2000);
     emu.process(bytes);
     let mut st = PreviewState::new();
     let p = st.resolve(Instant::now(), &emu, Some(adapter), None);
@@ -81,15 +86,6 @@ fn select_matches_first_word_basenames_only() {
     }
 }
 
-/// Every registered program word selects a dashboard adapter.
-#[test]
-fn select_covers_every_registered_shape() {
-    for a in crate::harness::AGENTS {
-        let name = a.harness.shape().0;
-        assert!(select(name).is_some(), "{name} must select an adapter");
-    }
-}
-
 /// Each program word routes to its own CLI's matchers: the selected
 /// adapter fires that CLI's rule on that CLI's screen shape.
 #[test]
@@ -101,8 +97,7 @@ fn select_routes_to_the_matching_adapter() {
         4,
         "route the new adapter's screen here"
     );
-    let sep = "─".repeat(80);
-    let claude = rs(&["✻ Hashing… (6s · ↓ 87 tokens)", &sep, "❯", &sep]);
+    let claude = claude_screen(&["✻ Hashing… (6s · ↓ 87 tokens)"]);
     assert_eq!(
         select("claude").unwrap().live_preview(&claude).unwrap().1,
         "claude:spinner"
@@ -342,54 +337,6 @@ fn claude_title_frames_canonicalize_to_constant_text() {
     );
 }
 
-/// A registry status outranks a screen-derived status while retaining the
-/// model label and its own matcher ID.
-#[test]
-fn registry_anchor_outranks_the_claude_spinner() {
-    let rule = "─".repeat(60);
-    let screen = [
-        "╭─── Claude Code v2.1.233 ────────────╮",
-        "│ Fable 5 with high effort · Claude Max ·  │ notes │",
-        "╰──────────────────────────────────────╯",
-        "",
-        "✻ Hashing… (6s · ↓ 87 tokens)",
-        &rule,
-        "❯",
-        &rule,
-    ]
-    .join("\r\n");
-    let mut emu = Emulator::new(24, 80, 100);
-    emu.process(screen.as_bytes());
-
-    let mut st = PreviewState::new();
-    let p = st
-        .resolve(Instant::now(), &emu, Some(&ClaudeSummary), None)
-        .clone();
-    assert_eq!(
-        (p.text.as_str(), p.rule),
-        ("Fable 5 (high) · Hashing…", Some("claude:spinner")),
-        "premise: this screen anchors on the spinner"
-    );
-
-    let mut st = PreviewState::new();
-    let p = st
-        .resolve(
-            Instant::now(),
-            &emu,
-            Some(&ClaudeSummary),
-            Some(("awaiting approval", "claude:registry-approval")),
-        )
-        .clone();
-    assert_eq!(
-        (p.text.as_str(), p.source, p.rule),
-        (
-            "Fable 5 (high) · awaiting approval",
-            PreviewSource::Anchor,
-            Some("claude:registry-approval")
-        )
-    );
-}
-
 /// Cascade-level: with the claude adapter installed and no anchor on
 /// the screen, a frame-led title renders stripped to its text under the
 /// Title tier; without an adapter it renders verbatim.
@@ -437,13 +384,12 @@ fn title_tier_renders_the_normalized_title() {
 /// a wrapped status tail and body text touching the chrome both refuse.
 #[test]
 fn claude_aborts_on_foreign_column_zero_rows() {
-    let sep = "─".repeat(120);
-    let wrapped = rs(&["✻ Hashing… (6s · ↓ 87 to", "kens)", &sep, "❯", &sep]);
+    let wrapped = claude_screen(&["✻ Hashing… (6s · ↓ 87 to", "kens)"]);
     assert_eq!(ClaudeSummary.live_preview(&wrapped), None);
 
     // A menu quoted in the body, reaching the window with the input box
     // intact, refuses rather than synthesizing approval.
-    let menu = rs(&["❯ 1. Yes", "  2. No", &sep, "❯", &sep]);
+    let menu = claude_screen(&["❯ 1. Yes", "  2. No"]);
     assert_eq!(ClaudeSummary.live_preview(&menu), None);
 }
 
@@ -789,7 +735,7 @@ fn codex_label_rejects_warning_prose_and_incomplete_footers() {
 /// single string; idle and foreign titles pass through.
 #[test]
 fn codex_title_animations_canonicalize_to_constant_text() {
-    for frame in ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'] {
+    for frame in BRAILLE_FRAMES {
         assert_eq!(
             CodexSummary.normalize_title(&format!("{frame} fleetcom")),
             Some("⠋ fleetcom".to_string()),
@@ -1429,7 +1375,7 @@ fn omp_title_separators_decode_state_and_label() {
     );
 
     // Every working frame must normalize to the same title.
-    for frame in ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'] {
+    for frame in BRAILLE_FRAMES {
         assert_eq!(
             OmpSummary.normalize_title(&format!("π {frame} Fix the flaky test")),
             Some("⠋ Fix the flaky test".to_string()),

@@ -476,7 +476,10 @@ impl Emulator {
         self.revision
     }
 
-    /// Count of alt-screen entries observed so far.
+    /// Count of alt-screen entries observed so far. Production consults the
+    /// epoch only inside this module (title stamping and `title`'s currency
+    /// filter); the accessor exists for tests.
+    #[cfg(test)]
     pub fn alt_epoch(&self) -> u64 {
         self.alt.epoch
     }

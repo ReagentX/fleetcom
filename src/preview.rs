@@ -23,8 +23,11 @@ pub const MARKER: &str = "full-screen";
 
 /// Read-only emulator state consumed by one preview-resolution step.
 pub trait ScreenFacts {
+    /// Change counter for every other fact this trait exposes: it advances
+    /// whenever any of them can change (each `process` call, each
+    /// sync-frame landing, `resize`). The resolution key relies on this: an
+    /// unchanged revision means an unchanged screen.
     fn revision(&self) -> u64;
-    fn alt_epoch(&self) -> u64;
     fn alternate_screen(&self) -> bool;
     fn title(&self) -> Option<&str>;
     /// Last sanitized primary-screen title. Retain across printable output and
@@ -42,10 +45,6 @@ pub trait ScreenFacts {
 impl ScreenFacts for Emulator {
     fn revision(&self) -> u64 {
         Self::revision(self)
-    }
-
-    fn alt_epoch(&self) -> u64 {
-        Self::alt_epoch(self)
     }
 
     fn alternate_screen(&self) -> bool {
@@ -170,15 +169,10 @@ fn cascade(
     Preview::floor(screen.live_floor().trim_start().to_string())
 }
 
-/// Screen and registry state that invalidates the cached preview candidate.
-type ResolveKey = (
-    u64,
-    u64,
-    bool,
-    Option<String>,
-    Option<String>,
-    Option<(String, &'static str)>,
-);
+/// Screen revision and registry state that invalidate the cached preview
+/// candidate. The revision alone covers the screen: see
+/// [`ScreenFacts::revision`].
+type ResolveKey = (u64, Option<(String, &'static str)>);
 
 /// Per-task preview resolution state. Reset this state when replacing the `Task` on
 /// rerun.
@@ -236,10 +230,6 @@ impl PreviewState {
         }
         let key = (
             screen.revision(),
-            screen.alt_epoch(),
-            screen.alternate_screen(),
-            screen.title().map(str::to_owned),
-            screen.primary_title().map(str::to_owned),
             blocked.map(|(text, rule)| (text.to_string(), rule)),
         );
         if self.last_key.as_ref() != Some(&key) {
@@ -319,7 +309,6 @@ impl PreviewState {
         if self.rendered.frozen {
             return;
         }
-        self.downgrade_pending_since = None;
         let alt_torn_down_at_exit = self.rendered_under_alt
             && !screen.alternate_screen()
             && screen
@@ -349,10 +338,10 @@ mod tests {
     use crate::harness::summary::{CodexSummary, OmpSummary};
 
     /// Synthetic screen facts with a floor-read counter for the
-    /// revision-gate test.
+    /// revision-gate test. Every mutator bumps `revision`, matching the
+    /// emulator's contract that no fact changes without a grid advance.
     struct FakeScreen {
         revision: u64,
-        alt_epoch: u64,
         alt: bool,
         title: Option<String>,
         /// Last primary-screen title, mirroring `Emulator::primary_title`.
@@ -368,7 +357,6 @@ mod tests {
         fn primary(floor: &str) -> Self {
             Self {
                 revision: 1,
-                alt_epoch: 0,
                 alt: false,
                 title: None,
                 primary_title: None,
@@ -385,7 +373,6 @@ mod tests {
 
         fn enter_alt(&mut self) {
             self.alt = true;
-            self.alt_epoch += 1;
             self.advance();
         }
 
@@ -420,10 +407,6 @@ mod tests {
     impl ScreenFacts for FakeScreen {
         fn revision(&self) -> u64 {
             self.revision
-        }
-
-        fn alt_epoch(&self) -> u64 {
-            self.alt_epoch
         }
 
         fn alternate_screen(&self) -> bool {
@@ -711,18 +694,18 @@ mod tests {
         );
     }
 
-    /// Invalidate the resolve key on a primary-title change alone.
+    /// A primary-title change arrives with the grid advance that parsed it;
+    /// the revision bump recomputes the candidate and the min-hold governs
+    /// the re-render.
     #[test]
-    fn a_primary_title_change_invalidates_the_key() {
+    fn a_primary_title_change_recomputes_the_candidate() {
         let t0 = Instant::now();
         let mut st = PreviewState::new();
         let mut s = FakeScreen::primary("shell");
         s.set_primary_title("π > one");
         assert_eq!(st.resolve(t0, &s, Some(&OmpSummary), None).text, "one");
 
-        // The slot changes with no revision bump: only the key's
-        // primary-title entry can trigger the recompute.
-        s.primary_title = Some("π > two".into());
+        s.set_primary_title("π > two");
         let p = st
             .resolve(t0 + TITLE_MIN_HOLD, &s, Some(&OmpSummary), None)
             .clone();
