@@ -15,8 +15,8 @@
 
 use std::{
     fmt::Write as _,
-    fs, io,
-    io::{BufRead, BufReader, Read},
+    fs,
+    io::{self, BufRead, BufReader, Read},
     path::{Path, PathBuf},
 };
 
@@ -91,17 +91,10 @@ impl Harness for Codex {
             "notify=[\"{}\"]",
             toml_escape(&capture.codex_notify.to_string_lossy())
         );
-        plan.args = vec![
-            "-c".into(),
-            toml.into(),
-            "-c".into(),
-            EMBEDDED_OVERRIDE.into(),
-        ];
+        // The notify override precedes the embedded one; a test pins that order.
+        plan.args.splice(..0, ["-c".into(), toml.into()]);
         plan.env = vec![
-            (
-                CAPTURE_ENV.into(),
-                capture.capture_file.clone().into_os_string(),
-            ),
+            capture.capture_env(),
             (NOTIFY_CHAIN_ENV.into(), chain.into()),
             (BINARY_ENV.into(), binary.clone().into_os_string()),
         ];
@@ -118,8 +111,6 @@ impl Harness for Codex {
         payload: &str,
         // Notifications for every thread originate in the task's own process.
         _pid: Option<u32>,
-        // Home resolution was completed at arrival.
-        _home: Option<&Path>,
     ) -> Option<String> {
         is_uuid(payload).then(|| payload.to_string())
     }
@@ -268,7 +259,7 @@ fn config_notify_route(home: Option<&Path>) -> NotifyRoute {
     };
     let text = match fs::read_to_string(root.join("config.toml")) {
         Ok(text) => text,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return NotifyRoute::Vacant,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return NotifyRoute::Vacant,
         Err(_) => return NotifyRoute::Opaque,
     };
     let mut route = None;
@@ -422,21 +413,16 @@ mod tests {
     use crate::{
         harness::{
             Intent,
-            fixtures::{OTHER, argv, paths},
+            fixtures::{
+                CODEX_CHILD as CHILD, CODEX_ROOT as ID, CODEX_TITLE as TITLE, OTHER, argv, paths,
+            },
             plan,
         },
         testutil::{Scratch, codex_session_meta, install_codex_rollout, install_codex_root, temp},
     };
 
-    /// Use v7 IDs in Codex launch and resume commands. Also accept the shared v4 fixture:
-    /// UUID version is not checked by `is_uuid`.
-    const ID: &str = "019f5453-de22-7240-b2e5-0d32692aa6d9";
-    /// A sub-agent thread and a second-level sub-agent thread in the session
-    /// rooted at [`ID`].
-    const CHILD: &str = "019f5454-0c11-7b33-9a4e-5f0e6d7c8b9a";
+    /// A second-level sub-agent thread under [`CHILD`], in the session rooted at [`ID`].
     const GRANDCHILD: &str = "019f5454-3d70-7e02-b1c8-2a4b6c8d0e1f";
-    /// Hidden title thread ID, reported through notify but never saved in a rollout.
-    const TITLE: &str = "019f5453-de9f-7e61-8c0d-1a2b3c4d5e6f";
 
     /// Overlay argv of every fully instrumented launch that uses [`paths`]:
     /// the notifier, then explicit embedded mode.
@@ -448,10 +434,7 @@ mod tests {
     /// `chain` as the encoded notifier argv.
     fn full_env(chain: &str) -> Vec<(OsString, OsString)> {
         vec![
-            (
-                CAPTURE_ENV.into(),
-                PathBuf::from("/tmp/cap/session.json").into_os_string(),
-            ),
+            paths().capture_env(),
             (NOTIFY_CHAIN_ENV.into(), chain.into()),
             (
                 BINARY_ENV.into(),
@@ -469,7 +452,7 @@ mod tests {
             args: argv(&["-c", EMBEDDED_OVERRIDE]),
             env: Vec::new(),
             resume_id: None,
-            notice: Some(format!("codex capture unavailable: {why}")),
+            notice: Some(format!("{CAPTURE_OFF}: {why}")),
         }
     }
 
@@ -798,35 +781,13 @@ mod tests {
         )
     }
 
-    /// Validate the payload before looking up its rollout. Even with a root
-    /// rollout present, accept only a turn-complete payload with a strict ID.
-    #[test]
-    fn arrival_root_accepts_only_turn_complete_payloads() {
-        let home = temp("codex_capture_payload");
-        install_codex_root(&home, ID);
-        let parse = |payload: &str| arrival_root(payload, Some(&home));
-        assert_eq!(parse(&turn_complete(ID)).as_deref(), Some(ID));
-
-        let wrong_type = format!(r#"{{"type":"other","thread-id":"{ID}"}}"#);
-        assert_eq!(parse(&wrong_type), None);
-        for thread in ["my session", "../../../config", "*", ""] {
-            let payload = format!(r#"{{"type":"agent-turn-complete","thread-id":"{thread}"}}"#);
-            assert_eq!(parse(&payload), None, "{thread:?}");
-        }
-        assert_eq!(parse(r#"{"type":"agent-turn-complete"}"#), None);
-        assert_eq!(parse("not json"), None);
-        assert_eq!(parse(""), None);
-    }
-
     /// Accept exactly one bare UUID. Refuse pre-v1 JSON, trailing newlines from other
-    /// writers, and malformed or empty input regardless of PID or home. Do not reparse or
-    /// look up the ID at read time.
+    /// writers, and malformed or empty input regardless of PID. Do not reparse the ID at
+    /// read time.
     #[test]
     fn parse_capture_accepts_only_a_bare_uuid_slot() {
-        let home = temp("codex_capture_slot");
-        install_codex_root(&home, ID);
-        for (pid, home) in [(None, None), (Some(4242), Some(&*home))] {
-            let parse = |slot: &str| Codex.parse_capture(slot, pid, home);
+        for pid in [None, Some(4242)] {
+            let parse = |slot: &str| Codex.parse_capture(slot, pid);
             assert_eq!(parse(ID).as_deref(), Some(ID));
             assert_eq!(parse(&turn_complete(ID)), None, "old JSON format");
             assert_eq!(parse(&format!("{ID}\n")), None, "trailing newline");
@@ -847,7 +808,7 @@ mod tests {
     ) -> impl Fn(&str) -> Option<PathBuf> + 'a {
         move |key| {
             match key {
-                "FLEETCOM_CAPTURE_FILE" => capture,
+                CAPTURE_ENV => capture,
                 "CODEX_HOME" => codex_home,
                 "HOME" => home,
                 _ => None,
@@ -893,7 +854,7 @@ mod tests {
         assert_eq!(fs::read_to_string(&cap).unwrap(), ID);
         assert_eq!(siblings(&cap), ["task-1-0.json"]);
         assert_eq!(
-            Codex.parse_capture(&fs::read_to_string(&cap).unwrap(), None, Some(&home)),
+            Codex.parse_capture(&fs::read_to_string(&cap).unwrap(), None),
             Some(ID.to_string())
         );
     }
@@ -920,8 +881,9 @@ mod tests {
         assert_eq!(siblings(&cap), ["task-2-0.json"]);
     }
 
-    /// Refuse before touching the slot: preserve existing contents for a non-turn-complete
-    /// type, a non-UUID thread, malformed JSON, or a thread without a rollout.
+    /// Refuse before touching the slot, even with the root's rollout present: preserve
+    /// existing contents for a non-turn-complete type, a non-UUID thread, malformed JSON,
+    /// or a thread without a rollout.
     #[test]
     fn record_arrival_refuses_without_writing() {
         let home = temp("codex_arrival_refuse");
@@ -935,7 +897,10 @@ mod tests {
                 r#"{{"type":"agent-turn-complete","thread-id":"{}"}}"#,
                 ID.to_uppercase()
             ),
+            r#"{"type":"agent-turn-complete","thread-id":"my session"}"#.to_string(),
             r#"{"type":"agent-turn-complete","thread-id":"../../x"}"#.to_string(),
+            r#"{"type":"agent-turn-complete","thread-id":"*"}"#.to_string(),
+            r#"{"type":"agent-turn-complete","thread-id":""}"#.to_string(),
             r#"{"type":"agent-turn-complete"}"#.to_string(),
             "not json".to_string(),
             String::new(),

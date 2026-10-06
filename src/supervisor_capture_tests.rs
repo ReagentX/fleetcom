@@ -1,6 +1,6 @@
 use super::*;
 use crate::{
-    harness::fixtures::{ID as CAP_ID, OTHER as CAP_OTHER},
+    harness::fixtures::{CODEX_CHILD, CODEX_ROOT, CODEX_TITLE, ID as CAP_ID, OTHER as CAP_OTHER},
     protocol::{Lifecycle, Preview, PreviewSource},
     testutil::{
         codex_session_meta, dead_pid, install_codex_rollout, install_codex_root,
@@ -1064,12 +1064,6 @@ fn silent_codex_tasks_save_and_recover_without_a_resume_id() {
 
     assert_eq!(recovered(&mut s, &config), expected);
 }
-
-/// Thread IDs reported through one codex process's notifier: the
-/// conversation, a spawned sub-agent, and the hidden title thread.
-const CODEX_ROOT: &str = "019f5453-de22-7240-b2e5-0d32692aa6d9";
-const CODEX_CHILD: &str = "019f5454-0c11-7b33-9a4e-5f0e6d7c8b9a";
-const CODEX_TITLE: &str = "019f5453-de9f-7e61-8c0d-1a2b3c4d5e6f";
 
 /// Notification JSON passed to the injected notifier after a completed turn of `thread`.
 /// `last` is the final assistant message, already escaped for a JSON string.

@@ -6,7 +6,7 @@
 //! Report only IDs usable with `omp --resume`. Skip sub-agent sessions:
 //! the same handlers are registered for them, but their IDs are not resumable.
 //! Wait until the session file is created after the first assistant message.
-//! For a bare `omp` task, no ID is captured until the end of the first turn.
+//! For a fresh launch, no ID is captured until the end of the first turn.
 //! Capture is unavailable before omp 18.3.2: without the agent kind in the
 //! extension context, top-level sessions cannot be distinguished from sub-agents.
 //!
@@ -15,7 +15,7 @@
 
 use std::path::Path;
 
-use super::{CAPTURE_ENV, CapturePaths, Harness, SpawnPlan, capture_id};
+use super::{CapturePaths, Harness, SpawnPlan, capture_id};
 
 pub struct Omp;
 
@@ -29,10 +29,7 @@ impl Harness for Omp {
     fn overlay(&self, capture: &CapturePaths, _home: Option<&Path>) -> SpawnPlan {
         SpawnPlan {
             args: vec!["-e".into(), capture.omp_capture.clone().into_os_string()],
-            env: vec![(
-                CAPTURE_ENV.into(),
-                capture.capture_file.clone().into_os_string(),
-            )],
+            env: vec![capture.capture_env()],
             ..SpawnPlan::default()
         }
     }
@@ -40,20 +37,13 @@ impl Harness for Omp {
     /// Return `sessionId` from a valid extension payload. Check the agent
     /// kind in the extension: without that field in the payload, the check
     /// cannot be repeated here.
-    fn parse_capture(
-        &self,
-        payload: &str,
-        _pid: Option<u32>,
-        _home: Option<&Path>,
-    ) -> Option<String> {
+    fn parse_capture(&self, payload: &str, _pid: Option<u32>) -> Option<String> {
         capture_id(&jzon::parse(payload).ok()?, "sessionId")
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
-
     use super::*;
     use crate::harness::{
         Intent,
@@ -75,13 +65,7 @@ mod tests {
         let fresh = plan(&Omp, &Intent::Fresh, Some(ID), &paths(), None);
         assert_eq!(fresh.args, argv(&["-e", EXTENSION]));
         assert_eq!(fresh.resume_id, None, "the minted id is ignored");
-        assert_eq!(
-            fresh.env,
-            vec![(
-                CAPTURE_ENV.into(),
-                PathBuf::from("/tmp/cap/session.json").into_os_string()
-            )]
-        );
+        assert_eq!(fresh.env, vec![paths().capture_env()]);
 
         let resume = plan(&Omp, &Intent::Resume(CAPTURED.into()), None, &paths(), None);
         assert_eq!(resume.args, argv(&["--resume", CAPTURED, "-e", EXTENSION]));
@@ -92,7 +76,7 @@ mod tests {
     /// Extract only a validated ID from the extension payload.
     #[test]
     fn parse_capture_returns_only_strict_ids() {
-        let parse = |payload: &str| Omp.parse_capture(payload, None, None);
+        let parse = |payload: &str| Omp.parse_capture(payload, None);
         for reason in [
             "session_start",
             "session_switch",

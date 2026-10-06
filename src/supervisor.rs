@@ -205,13 +205,13 @@ fn fnv1a_hex(bytes: &[u8]) -> String {
 
 /// Resolve a managed task's session ID in precedence order: capture file, live registry,
 /// then spawn-time ID. Prefer the first two sources because a session may have been
-/// selected after launch. Validate capture through the harness using the task's leader PID
-/// and launch-time home. On rejection, try the next source. For literal tasks, skip all
-/// sources and return `None`.
+/// selected after launch. Validate capture through the harness using the task's leader PID.
+/// On rejection, try the next source. For literal tasks, skip all sources and return
+/// `None`.
 fn current_resume_id(task: &Task) -> Option<String> {
     if let (Some(h), Some(path)) = (task.harness, &task.capture_file)
         && let Ok(payload) = std::fs::read_to_string(path)
-        && let Some(id) = h.parse_capture(&payload, task.pid(), task.harness_home.as_deref())
+        && let Some(id) = h.parse_capture(&payload, task.pid())
     {
         return Some(id);
     }
