@@ -1,21 +1,18 @@
 use super::*;
-use crate::testutil::{env_here, here, read_pid, sh_env, temp, wait_until, write_executable};
+use crate::testutil::{
+    env_here, here, install_resident_shell, read_pid, sh_env, temp, wait_until, write_executable,
+};
 
 /// Tests drive the reader directly, so there is no core loop to wake.
 fn no_waker() -> Waker {
     Arc::new(Mutex::new(None))
 }
 
-/// The exec form of a typed command.
-fn literal(command: &str) -> Exec {
-    Exec::Literal(command.to_string())
-}
-
 fn spawn(id: u64, command: &str) -> Task {
     Task::spawn(
         id,
         command,
-        literal(command),
+        Exec::Literal,
         &here(),
         24,
         80,
@@ -149,19 +146,16 @@ fn exited_leader_stays_a_zombie_until_drop() {
 #[test]
 fn managed_launch_makes_the_agent_the_task_leader_under_any_shell() {
     let dir = temp("task_identity");
-    let shell = dir.join("resident-sh");
-    // Add `:` after the child command to prevent sh from execing that command. Retain the
-    // shell as task leader.
-    write_executable(&shell, "[ \"$1\" = -c ] || exit 2\n/bin/sh -c \"$2\"\n:");
+    let shell = install_resident_shell(&dir);
     let agent = dir.join("agent");
     let pid_file = dir.join("pid");
     write_executable(
         &agent,
         &format!("printf '%s' \"$$\" > '{}'", pid_file.display()),
     );
-    let mut env = sh_env();
+    let mut env = env_here();
     env.retain(|(k, _)| k != "SHELL");
-    env.push(("SHELL".into(), shell.as_os_str().to_os_string()));
+    env.push(("SHELL".into(), shell.into_os_string()));
 
     let managed = Exec::Managed {
         binary: agent.clone(),
@@ -169,7 +163,6 @@ fn managed_launch_makes_the_agent_the_task_leader_under_any_shell() {
     };
     let mut t = Task::spawn(1, "agent", managed, &here(), 24, 80, 2000, &env, no_waker()).unwrap();
     wait_finished(&mut t);
-    assert!(t.managed);
     assert_eq!(
         read_pid(&pid_file).as_raw() as u32,
         t.pid().unwrap(),
@@ -181,7 +174,7 @@ fn managed_launch_makes_the_agent_the_task_leader_under_any_shell() {
     let mut t = Task::spawn(
         2,
         &typed,
-        literal(&typed),
+        Exec::Literal,
         &here(),
         24,
         80,
@@ -191,7 +184,6 @@ fn managed_launch_makes_the_agent_the_task_leader_under_any_shell() {
     )
     .unwrap();
     wait_finished(&mut t);
-    assert!(!t.managed);
     assert_ne!(
         read_pid(&pid_file).as_raw() as u32,
         t.pid().unwrap(),
@@ -212,7 +204,7 @@ fn terminate_reaches_stragglers_after_leader_exit() {
     let mut t = Task::spawn(
         5,
         &cmd,
-        literal(&cmd),
+        Exec::Literal,
         &here(),
         24,
         80,
@@ -405,7 +397,7 @@ fn finalize_preview_waits_for_reader_eof() {
     let mut t = Task::spawn(
         20,
         cmd,
-        literal(cmd),
+        Exec::Literal,
         &here(),
         24,
         80,
@@ -454,7 +446,7 @@ fn finalize_preview_lands_an_open_sync_frame() {
     let mut t = Task::spawn(
         21,
         cmd,
-        literal(cmd),
+        Exec::Literal,
         &here(),
         24,
         80,
@@ -495,7 +487,7 @@ fn finalize_preview_freezes_the_final_primary_line() {
     let mut t = Task::spawn(
         40,
         &cmd,
-        literal(&cmd),
+        Exec::Literal,
         &here(),
         24,
         80,
@@ -542,7 +534,7 @@ fn finalize_preview_keeps_the_last_render_across_alt_teardown() {
     let mut t = Task::spawn(
         41,
         &cmd,
-        literal(&cmd),
+        Exec::Literal,
         &here(),
         24,
         80,
@@ -610,7 +602,7 @@ fn finalize_preview_freezes_primary_output_after_alt_teardown() {
     let mut t = Task::spawn(
         43,
         &cmd,
-        literal(&cmd),
+        Exec::Literal,
         &here(),
         24,
         80,
@@ -659,7 +651,7 @@ fn summary_adapter_anchors_live_and_freezes_completion_at_exit() {
     let mut t = Task::spawn(
         42,
         &cmd,
-        literal(&cmd),
+        Exec::Literal,
         &here(),
         24,
         80,
@@ -726,7 +718,7 @@ fn probe_replies_reach_the_child_through_the_allowlist() {
     let mut t = Task::spawn(
         11,
         &cmd,
-        literal(&cmd),
+        Exec::Literal,
         &here(),
         24,
         80,

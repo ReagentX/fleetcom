@@ -196,7 +196,7 @@ pub enum Event {
     Screen(ScreenView),
     /// A one-line notice for the status line (save/load result, spawn error).
     Status(String),
-    /// The id assigned to a direct `Spawn`. This event precedes the next task
+    /// The id assigned to a direct `Spawn` or `SpawnAgent`. This event precedes the next task
     /// snapshot containing that id. Session and recovery loads do not emit it.
     Spawned { id: u64 },
     /// The reply to `ListSessions`: saved session-recipe names (sorted) and
@@ -274,8 +274,8 @@ pub enum Lifecycle {
 /// Floor`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum PreviewSource {
-    /// The last non-blank row of the live screen: the cascade's fallback when
-    /// no higher-ranked preview qualifies.
+    /// The last non-blank row of the live screen, leading whitespace trimmed: the
+    /// cascade's fallback when no higher-ranked preview qualifies.
     Floor,
     /// The alternate screen is active with no usable title.
     Marker,
@@ -458,7 +458,8 @@ fn insert_opt_ms(o: &mut jzon::JsonValue, key: &str, val: Option<Duration>) {
 }
 
 /// Decode a JSON array of strings one-to-one. Reject the whole array on any non-string
-/// member to preserve encoded and decoded positions.
+/// member to preserve encoded and decoded positions. A missing or non-array value reads
+/// as empty.
 fn str_vec(v: &jzon::JsonValue) -> Option<Vec<String>> {
     let mut out = Vec::with_capacity(v.len());
     for m in v.members() {
@@ -941,9 +942,7 @@ pub fn decode_event(kind: u8, payload: &[u8]) -> Option<Event> {
             let v = jzon::parse(std::str::from_utf8(payload).ok()?).ok()?;
             match v["t"].as_str()? {
                 "hello_ok" => Some(Event::HelloOk),
-                // Require an explicit array, including `[]` for an empty menu. Without this
-                // check, missing and non-array values would be accepted as empty by
-                // `str_vec`.
+                // Require an explicit array: an empty menu is an explicit `[]`.
                 "agents" if v["agents"].is_array() => Some(Event::Agents(str_vec(&v["agents"])?)),
                 "tasks" => {
                     let mut views = Vec::new();

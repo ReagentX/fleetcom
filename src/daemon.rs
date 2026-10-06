@@ -8,8 +8,9 @@
 //!
 //! Every task's PTY master is held by the daemon. On daemon termination, the PTYs
 //! are closed and SIGHUP is sent by the kernel to each terminal's foreground
-//! process group: the whole task, with job control off under `$SHELL -c`. On
-//! normal shutdown, send SIGTERM to each task group, then SIGKILL after a grace
+//! process group: the whole task, because a literal task runs with job control off
+//! under `$SHELL -c` and a managed task execs the agent binary with no shell at all.
+//! On normal shutdown, send SIGTERM to each task group, then SIGKILL after a grace
 //! period, and remove the socket and lock. After a crash or SIGKILL, only the PTYs
 //! are closed; HUP-immune tasks may be left running without a supervisor.
 

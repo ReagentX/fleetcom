@@ -65,16 +65,11 @@ fn session_config_groups_by_dir_in_spawn_order() {
     spawn(&mut s, "c", here());
 
     let cfg = s.session_config();
-    let literal = |cmd: &str| SessionEntry {
-        kind: EntryKind::Literal(cmd.into()),
-        group: None,
-        name: None,
-    };
     assert_eq!(
         cfg[&path::abbreviate(&here())],
-        vec![literal("a"), literal("c")]
+        vec![SessionEntry::literal("a"), SessionEntry::literal("c")]
     );
-    assert_eq!(cfg["/tmp"], vec![literal("b")]);
+    assert_eq!(cfg["/tmp"], vec![SessionEntry::literal("b")]);
 }
 
 /// `tick` emits exactly a `Tasks` snapshot while nothing is watched, and
@@ -1166,17 +1161,13 @@ fn resize_clamps_hostile_dimensions() {
 fn worst_case_screen_frame_fits_max_frame() {
     use std::fmt::Write as _;
 
-    use alacritty_terminal::{
-        event::VoidListener,
-        index::{Column, Line},
-        term::{Config, test::TermSize},
-        vte::ansi::Processor,
-    };
+    use alacritty_terminal::index::{Column, Line};
 
     use crate::{
         ansi,
         frame::{KIND_SCREEN, MAX_FRAME},
         protocol::{ScreenView, encode_event},
+        testutil::parse_term,
     };
 
     // Alternate complete SGR states so every cell emits all style and
@@ -1204,10 +1195,7 @@ fn worst_case_screen_frame_fits_max_frame() {
         }
     }
 
-    let mut term =
-        alacritty_terminal::Term::new(Config::default(), &TermSize::new(cols, rows), VoidListener);
-    let mut parser: Processor = Processor::new();
-    parser.advance(&mut term, input.as_bytes());
+    let term = parse_term(input.as_bytes(), rows, cols);
 
     // Confirm the grid contains the features used by the density bound.
     let probe = &term.grid()[Line(0)][Column(0)];
@@ -2357,15 +2345,13 @@ fn list_sessions_includes_recovery_snapshots_newest_first() {
     let mut s = sup_ctx(config_ctx(&config, dir.to_path_buf(), &[]));
 
     let rec = config.join("sessions").join("recovery");
-    let entry = |cmd: &str| SessionEntry {
-        kind: EntryKind::Literal(cmd.into()),
-        group: None,
-        name: None,
-    };
     let mut one = SessionConfig::new();
-    one.insert("~/a".into(), vec![entry("vim")]);
+    one.insert("~/a".into(), vec![SessionEntry::literal("vim")]);
     let mut two = SessionConfig::new();
-    two.insert("~/a".into(), vec![entry("vim"), entry("top")]);
+    two.insert(
+        "~/a".into(),
+        vec![SessionEntry::literal("vim"), SessionEntry::literal("top")],
+    );
     session::save_recovery_in(
         &rec,
         "20260714-093015-11",
@@ -2417,14 +2403,12 @@ fn load_recovery_materializes_the_fleet_and_notices() {
         dir.to_string_lossy().into_owned(),
         vec![
             SessionEntry {
-                kind: EntryKind::Literal("sleep 30".into()),
                 group: Some("api".into()),
-                name: None,
+                ..SessionEntry::literal("sleep 30")
             },
             SessionEntry {
-                kind: EntryKind::Literal("sleep 31".into()),
-                group: None,
                 name: Some("web".into()),
+                ..SessionEntry::literal("sleep 31")
             },
         ],
     );

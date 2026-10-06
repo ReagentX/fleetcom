@@ -11,7 +11,7 @@ use std::{
 
 /// jzon-encoded control data (a `Command`, or any event but `Screen`).
 pub const KIND_CONTROL: u8 = 1;
-/// A `Screen` event: a jzon header (id, cursor, lines) followed by the raw
+/// A `Screen` event: a jzon metadata header followed by the raw
 /// `contents_formatted` bytes, spliced by [`crate::protocol`].
 pub const KIND_SCREEN: u8 = 2;
 /// Connection-opening handshake containing the protocol version and launch
@@ -22,6 +22,12 @@ pub const KIND_HELLO: u8 = 3;
 /// allocations from untrusted length prefixes and check maximum encoded payloads
 /// against this limit.
 pub const MAX_FRAME: u32 = 64 * 1024 * 1024;
+
+/// Whether `n` raw bytes, base64-encoded, fit in one frame beside a 64 KiB reserve
+/// for the jzon envelope that carries them (`Command::Paste`, `Event::ClipboardCopy`).
+pub const fn fits_base64(n: usize) -> bool {
+    n.div_ceil(3) * 4 + 64 * 1024 <= MAX_FRAME as usize
+}
 
 /// Maximum time one frame write to a socket peer may block. A peer that
 /// stops draining its socket (crashed, SIGSTOPped, hostile) must not wedge

@@ -16,9 +16,7 @@ use std::{
 };
 
 use super::summary::AWAITING_APPROVAL;
-use super::{
-    CAPTURE_ENV, CapturePaths, Harness, SpawnPlan, capture_id, home_root, is_uuid, resolve_home,
-};
+use super::{CapturePaths, Harness, SpawnPlan, capture_id, home_root, is_uuid, resolve_home};
 
 pub struct Claude;
 
@@ -46,10 +44,7 @@ impl Harness for Claude {
                 "--settings".into(),
                 capture.claude_settings.clone().into_os_string(),
             ],
-            env: vec![(
-                CAPTURE_ENV.into(),
-                capture.capture_file.clone().into_os_string(),
-            )],
+            env: vec![capture.capture_env()],
             ..SpawnPlan::default()
         }
     }
@@ -63,13 +58,7 @@ impl Harness for Claude {
     /// leader, as required by [`record_for_pid`]. Reject stamps from other PIDs (a
     /// background fork or a resident wrapper) and fall back to the registry, then the
     /// spawn-time ID. Without a task PID, ownership cannot be checked.
-    fn parse_capture(
-        &self,
-        payload: &str,
-        pid: Option<u32>,
-        // Ownership is decided by the stamp alone.
-        _home: Option<&Path>,
-    ) -> Option<String> {
+    fn parse_capture(&self, payload: &str, pid: Option<u32>) -> Option<String> {
         let json = payload.strip_prefix(&format!("{}\n", pid?))?;
         capture_id(&jzon::parse(json).ok()?, "session_id")
     }
@@ -147,7 +136,7 @@ fn parse_record(text: &str) -> Option<SessionRecord> {
 /// process start to match the task. The unreaped task leader reserves its PID;
 /// the directory and start-time checks reject stale records already present at
 /// that path. The start time may differ by at most 30 seconds. A mismatch
-/// returns `None` because the ID may enter a shell command.
+/// returns `None`: the ID becomes a resume argv element and a session-file field.
 fn record_for_pid(
     pid: u32,
     cwd: &Path,
@@ -170,7 +159,7 @@ fn record_for_pid(
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, path::PathBuf};
+    use std::fs;
 
     use super::*;
     use crate::{
@@ -230,13 +219,7 @@ mod tests {
             argv(&["--session-id", ID, "--settings", SETTINGS])
         );
         assert_eq!(fresh.resume_id.as_deref(), Some(ID));
-        assert_eq!(
-            fresh.env,
-            vec![(
-                CAPTURE_ENV.into(),
-                PathBuf::from("/tmp/cap/session.json").into_os_string()
-            )]
-        );
+        assert_eq!(fresh.env, vec![paths().capture_env()]);
         assert_eq!(fresh.notice, None);
 
         let resume = plan(&Claude, &Intent::Resume(OTHER.into()), None, &paths(), None);
@@ -266,7 +249,7 @@ mod tests {
 
     /// Parse `payload` as the capture file of a task led by [`OWNER`].
     fn parse_owned(payload: &str) -> Option<String> {
-        Claude.parse_capture(payload, Some(OWNER), None)
+        Claude.parse_capture(payload, Some(OWNER))
     }
 
     /// Accept the leader's stamp for every `source`, including `fork` after
@@ -292,9 +275,9 @@ mod tests {
             );
         }
         let owned = format!("{OWNER}\n{json}");
-        assert_eq!(Claude.parse_capture(&owned, Some(424), None), None);
-        assert_eq!(Claude.parse_capture(&owned, Some(42420), None), None);
-        assert_eq!(Claude.parse_capture(&owned, None, None), None);
+        assert_eq!(Claude.parse_capture(&owned, Some(424)), None);
+        assert_eq!(Claude.parse_capture(&owned, Some(42420)), None);
+        assert_eq!(Claude.parse_capture(&owned, None), None);
     }
 
     /// Require the leader's exact decimal PID on the first line. Reject the
@@ -331,7 +314,8 @@ mod tests {
         assert_eq!(parse_owned(&complete[..whole]).as_deref(), Some(ID));
     }
 
-    /// Require a strict ID even with a valid stamp before shell insertion.
+    /// Require a strict ID even under a valid stamp: the ID becomes a resume argv element
+    /// and a session-file field.
     #[test]
     fn parse_capture_returns_only_strict_ids_under_a_valid_stamp() {
         for json in [

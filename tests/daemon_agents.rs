@@ -4,30 +4,22 @@
 
 mod common;
 
-use std::{
-    io::Write,
-    os::unix::{fs::PermissionsExt, net::UnixStream},
-    path::PathBuf,
-    time::{Duration, Instant},
-};
+use std::{io::Write, os::unix::net::UnixStream, path::PathBuf, time::Duration};
 
 use common::{
-    read_frame, shake_hands_env, spawn_agent_frame, start_daemon_raw, stop_daemon, wait_until,
+    RuntimeDir, next_frame, scratch, shake_hands_env, spawn_agent_frame, start_daemon_raw,
+    stop_daemon, wait_until, write_executable,
 };
 
 /// Scratch tree: the stub in `bin`, an empty `nobin`, and isolated runtime, config, and
 /// registry paths.
 struct Scratch {
-    root: PathBuf,
+    root: RuntimeDir,
 }
 
 impl Scratch {
     fn new(tag: &str) -> Self {
-        let root = std::env::temp_dir().join(format!(
-            "fleetcom_it_agents_scratch_{tag}_{}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&root);
+        let root = scratch(&format!("{tag}_scratch"));
         for sub in ["bin", "nobin", "run", "config", "claude-home", "work"] {
             std::fs::create_dir_all(root.join(sub)).unwrap();
         }
@@ -65,54 +57,17 @@ impl Scratch {
     }
 }
 
-impl Drop for Scratch {
-    fn drop(&mut self) {
-        if !std::thread::panicking() {
-            let _ = std::fs::remove_dir_all(&self.root);
-        }
-    }
-}
-
 /// Send a handshake whose `PATH` is the scratch tree's `bin` subdirectory.
 fn hello(stream: &mut UnixStream, s: &Scratch, bin: &str) {
-    let owned = s.hello_env(bin);
-    let env: Vec<(&[u8], &[u8])> = owned
-        .iter()
-        .map(|(k, v)| (k.as_bytes(), v.as_bytes()))
-        .collect();
-    shake_hands_env(stream, &s.work().display().to_string(), &env);
-    // Time out if the daemon stalls instead of hanging the test.
-    stream
-        .set_read_timeout(Some(Duration::from_secs(10)))
-        .unwrap();
+    shake_hands_env(stream, &s.work().display().to_string(), &s.hello_env(bin));
 }
 
 /// Install a `claude` stub to record argv and exit.
 fn install_claude_stub(s: &Scratch) {
-    let path = s.root.join("bin").join("claude");
-    std::fs::write(
-        &path,
-        format!(
-            "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\n",
-            s.record().display()
-        ),
-    )
-    .unwrap();
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
-}
-
-/// Read control frames for up to 10 s until a frame tagged `tag` satisfies `pred`. Skip
-/// periodic `tasks` snapshots on the same stream.
-fn next_frame(stream: &mut UnixStream, tag: &str, pred: impl Fn(&str) -> bool) -> String {
-    let deadline = Instant::now() + Duration::from_secs(10);
-    loop {
-        assert!(Instant::now() < deadline, "no {tag} frame arrived");
-        let (kind, payload) = read_frame(stream).expect("stream closed");
-        let text = String::from_utf8_lossy(&payload).into_owned();
-        if kind == 1 && text.contains(&format!(r#""t":"{tag}""#)) && pred(&text) {
-            return text;
-        }
-    }
+    write_executable(
+        &s.root.join("bin").join("claude"),
+        &format!("printf '%s\\n' \"$@\" > '{}'", s.record().display()),
+    );
 }
 
 #[test]
@@ -167,13 +122,7 @@ fn hello_discovers_agents_and_spawn_agent_launches_a_managed_task() {
     // Reconnect with a PATH without the stub. Resend an empty list to clear the previous
     // client's menu.
     drop(stream);
-    let sock = dir.join("default.sock");
-    let mut again = None;
-    wait_until(Duration::from_secs(5), || {
-        again = UnixStream::connect(&sock).ok();
-        again.is_some()
-    });
-    let mut again = again.expect("reconnect failed");
+    let mut again = UnixStream::connect(dir.join("default.sock")).expect("reconnect failed");
     hello(&mut again, &s, "nobin");
     assert_eq!(
         next_frame(&mut again, "agents", |_| true),

@@ -9,7 +9,7 @@
 
 use std::{
     io::{Read, Write},
-    os::unix::{ffi::OsStrExt, net::UnixStream},
+    os::unix::{ffi::OsStrExt, fs::PermissionsExt, net::UnixStream},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     time::{Duration, Instant},
@@ -90,17 +90,22 @@ pub fn hello_frame(version: u32, env: &[(&[u8], &[u8])], cwd: &str) -> Vec<u8> {
 /// under a predictable shell) and require the `hello_ok` ack.
 pub fn shake_hands(stream: &mut UnixStream, cwd: &str) {
     let path = std::env::var("PATH").unwrap_or_default();
-    let env: Vec<(&[u8], &[u8])> = vec![
-        (b"PATH".as_slice(), path.as_bytes()),
-        (b"SHELL".as_slice(), b"/bin/sh".as_slice()),
-    ];
-    shake_hands_env(stream, cwd, &env);
+    shake_hands_env(
+        stream,
+        cwd,
+        &[("PATH", path.as_str()), ("SHELL", "/bin/sh")],
+    );
 }
 
 /// Complete [`shake_hands`] with a caller-supplied hello environment.
-pub fn shake_hands_env(stream: &mut UnixStream, cwd: &str, env: &[(&[u8], &[u8])]) {
+pub fn shake_hands_env(
+    stream: &mut UnixStream,
+    cwd: &str,
+    env: &[(impl AsRef<[u8]>, impl AsRef<[u8]>)],
+) {
+    let env: Vec<(&[u8], &[u8])> = env.iter().map(|(k, v)| (k.as_ref(), v.as_ref())).collect();
     stream
-        .write_all(&hello_frame(PROTOCOL_VERSION, env, cwd))
+        .write_all(&hello_frame(PROTOCOL_VERSION, &env, cwd))
         .unwrap();
     let (kind, payload) = read_frame(stream).expect("no reply to hello");
     let text = String::from_utf8_lossy(&payload);
@@ -108,6 +113,31 @@ pub fn shake_hands_env(stream: &mut UnixStream, cwd: &str, env: &[(&[u8], &[u8])
         kind == 1 && text.contains(r#""t":"hello_ok""#),
         "expected hello_ok, got kind={kind} payload={text}"
     );
+}
+
+/// Read control frames for up to 10 s until one tagged `tag` satisfies `pred`; return
+/// its text. Periodic `tasks` snapshots share the stream, so unrelated frames are
+/// skipped. Sets the stream's read timeout so a stalled daemon fails the test instead
+/// of hanging it.
+pub fn next_frame(stream: &mut UnixStream, tag: &str, pred: impl Fn(&str) -> bool) -> String {
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        assert!(Instant::now() < deadline, "no {tag} frame arrived");
+        let (kind, payload) = read_frame(stream).expect("stream closed");
+        let text = String::from_utf8_lossy(&payload).into_owned();
+        if kind == 1 && text.contains(&format!(r#""t":"{tag}""#)) && pred(&text) {
+            return text;
+        }
+    }
+}
+
+/// Write an executable `#!/bin/sh` script at `path`. The parent must exist.
+pub fn write_executable(path: &Path, body: &str) {
+    std::fs::write(path, format!("#!/bin/sh\n{body}\n")).unwrap();
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
 }
 
 /// Poll `ok` until it holds or `budget` elapses; returns the final answer.
@@ -189,8 +219,9 @@ impl Drop for KillOnDrop {
     }
 }
 
-/// A test daemon's runtime directory. Remove the tree on drop, except during
-/// unwinding: preserve the socket, config, and snapshots to inspect after failure.
+/// A test-owned temp directory: a daemon's runtime dir or a test's scratch tree. Remove
+/// the tree on drop, except during unwinding: preserve the socket, config, snapshots,
+/// stubs, and argv records to inspect after failure.
 pub struct RuntimeDir(PathBuf);
 impl std::ops::Deref for RuntimeDir {
     type Target = Path;
@@ -206,6 +237,16 @@ impl Drop for RuntimeDir {
     }
 }
 
+/// A fresh `fleetcom_it_{tag}_{pid}` directory under the system temp dir, cleared of any
+/// leftover from an earlier run. Tags must be distinct within one test: a daemon's
+/// runtime dir and a scratch tree sharing a tag would clear each other.
+pub fn scratch(tag: &str) -> RuntimeDir {
+    let dir = std::env::temp_dir().join(format!("fleetcom_it_{tag}_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    RuntimeDir(dir)
+}
+
 /// Start a `fleetcom --daemon` against an isolated runtime dir and connect a
 /// raw socket to it with no handshake, for tests that exercise the handshake
 /// itself. `configure` tweaks the daemon's `Command` (extra env vars) before
@@ -219,13 +260,11 @@ pub fn start_daemon_raw(
     tag: &str,
     configure: impl FnOnce(&mut Command),
 ) -> (RuntimeDir, KillOnDrop, UnixStream) {
-    let dir = std::env::temp_dir().join(format!("fleetcom_it_{tag}_{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = scratch(tag);
 
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_fleetcom"));
     cmd.arg("--daemon")
-        .env("FLEETCOM_RUNTIME_DIR", &dir)
+        .env("FLEETCOM_RUNTIME_DIR", &*dir)
         // Isolate recovery snapshots with the daemon's runtime files.
         .env("FLEETCOM_CONFIG_DIR", dir.join("config"))
         .stdin(Stdio::null())
@@ -241,7 +280,7 @@ pub fn start_daemon_raw(
         stream.is_some()
     });
     let stream = stream.expect("daemon never bound its socket");
-    (RuntimeDir(dir), daemon, stream)
+    (dir, daemon, stream)
 }
 
 /// `start_daemon_raw` plus the standard handshake: the connection is ready for

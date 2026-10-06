@@ -19,7 +19,10 @@ use alacritty_terminal::{
 };
 use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
 
-use crate::{format::prefix_bytes, protocol::ClipboardKind};
+use crate::{
+    format::prefix_bytes,
+    protocol::{ClipboardKind, ScrollAction},
+};
 
 /// Mouse event classes requested by the child through DECSET 1000/1002/1003.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -41,11 +44,9 @@ pub enum MouseProtocolEncoding {
 /// Maximum decoded size of one buffered OSC 52 clipboard payload.
 pub(crate) const CLIPBOARD_STORE_MAX_BYTES: usize = 1024 * 1024;
 
-// A maximum-size store expands to this base64 bound when re-encoded for
-// forwarding. Reserve 64 KiB for the command envelope and keep the result
-// within one frame.
+// A maximum-size store leaves the daemon base64-encoded in one `Event::ClipboardCopy` frame.
 const _: () = assert!(
-    CLIPBOARD_STORE_MAX_BYTES.div_ceil(3) * 4 + 64 * 1024 <= crate::frame::MAX_FRAME as usize,
+    crate::frame::fits_base64(CLIPBOARD_STORE_MAX_BYTES),
     "CLIPBOARD_STORE_MAX_BYTES must base64-encode to under frame::MAX_FRAME"
 );
 
@@ -188,8 +189,10 @@ const MAX_ZEROWIDTH: usize = 16;
 /// Counting bytes lets repeated marks trigger a scan without a separate timer.
 const SWEEP_INTERVAL_BYTES: usize = 256 * 1024;
 
-/// One task's parser, terminal grid, and buffered probe responses. The parser
-/// and grid advance together under the same caller-held lock.
+/// One task's parser, terminal grid, and buffered probe responses, plus the
+/// facts observed while parsing: OSC 52 stores, alternate-screen and title
+/// transitions, a grid revision counter, and the zero-width sweep budget.
+/// The parser and grid advance together under the same caller-held lock.
 pub struct Emulator {
     term: Term<ProbeSink>,
     parser: Processor,
@@ -423,16 +426,16 @@ impl Emulator {
         self.term.grid().display_offset()
     }
 
-    /// Move the viewport `rows` back from live output; the backend clamps to
-    /// retained history, so `usize::MAX` means the oldest stored row.
-    pub fn set_scrollback(&mut self, rows: usize) {
-        // Clamp contract: absolute target, capped at retained history. The
-        // grid API is relative; both offsets are bounded by the history cap,
-        // so the delta fits i32.
-        let grid = self.term.grid();
-        let target = rows.min(grid.history_size());
-        let delta = target as i32 - grid.display_offset() as i32;
-        self.term.scroll_display(Scroll::Delta(delta));
+    /// Move the viewport by `action`. The backend clamps every variant to
+    /// retained history: a delta lands in `0..=history_size`, `Top` is the
+    /// oldest stored row, `Live` is the live screen (offset 0).
+    pub fn scroll(&mut self, action: ScrollAction) {
+        self.term.scroll_display(match action {
+            ScrollAction::Up(n) => Scroll::Delta(n as i32),
+            ScrollAction::Down(n) => Scroll::Delta(-(n as i32)),
+            ScrollAction::Top => Scroll::Top,
+            ScrollAction::Live => Scroll::Bottom,
+        });
     }
 
     /// Resize the grid to `rows`×`cols`.
@@ -476,7 +479,10 @@ impl Emulator {
         self.revision
     }
 
-    /// Count of alt-screen entries observed so far.
+    /// Count of alt-screen entries observed so far. Production consults the
+    /// epoch only inside this module (title stamping and `title`'s currency
+    /// filter); the accessor exists for tests.
+    #[cfg(test)]
     pub fn alt_epoch(&self) -> u64 {
         self.alt.epoch
     }
@@ -550,7 +556,9 @@ fn live_floor_of(term: &Term<ProbeSink>) -> String {
 /// offset; apply the offset only when iterating for display.
 ///
 /// Unlike [`crate::ansi::contents`], preserve glyphs in concealed (SGR 8) cells
-/// and orphaned wide halves: match harness output against stored grid text,
+/// and orphaned wide halves, and omit `LEADING_WIDE_CHAR_SPACER` cells (the
+/// end-of-row spacer left when a wide glyph spills to the next row) instead
+/// of emitting their blank: match harness output against stored grid text,
 /// not replay-equivalent display text.
 fn live_row_text_of(term: &Term<ProbeSink>, row: i32) -> String {
     let mut text = String::new();
@@ -578,10 +586,6 @@ struct AltScreen {
     /// Count of alt-screen entries. Compared against
     /// `CapturedTitle::alt_epoch` to expire titles at app boundaries.
     epoch: u64,
-    /// Alt bit after the last observed mode event: transition detection
-    /// needs the previous value, and the mode register only holds the
-    /// current one.
-    last_alt: bool,
     /// The live floor captured at each alt-screen exit, at the mode event
     /// itself: successor bytes in the same read have not parsed yet, so
     /// this is exactly what the restore left visible. Preview finalization
@@ -631,11 +635,13 @@ struct ObservedTerm<'a> {
 }
 
 impl ObservedTerm<'_> {
-    /// Update alternate-screen state after a delegated mode change by
-    /// comparing the backend's current and previously observed mode bits.
-    fn observe_alt(&mut self) {
+    /// Update alternate-screen state after a delegated mode change. `was` is
+    /// the backend's alt bit read before the delegation: transition detection
+    /// needs the previous value, and the mode register only holds the
+    /// current one.
+    fn observe_alt(&mut self, was: bool) {
         let alt = self.term.mode().contains(TermMode::ALT_SCREEN);
-        if alt && !self.alt.last_alt {
+        if alt && !was {
             self.alt.epoch += 1;
             // Promote a staged primary-screen announce into the new epoch: consume the
             // staged copy so it cannot be reused for another entry.
@@ -646,10 +652,9 @@ impl ObservedTerm<'_> {
                 });
             }
         }
-        if !alt && self.alt.last_alt {
+        if !alt && was {
             self.alt.leave_floor = Some(live_floor_of(self.term));
         }
-        self.alt.last_alt = alt;
     }
 
     /// Assign a sanitized title to the current alternate-screen epoch, or stage and
@@ -747,8 +752,9 @@ impl Handler for ObservedTerm<'_> {
         set_tabs(a0: u16);
     }
     fn reset_state(&mut self) {
+        let was = self.term.mode().contains(TermMode::ALT_SCREEN);
         self.term.reset_state();
-        self.observe_alt();
+        self.observe_alt(was);
         // RIS clears the backend title and title stack without separate
         // handler events. The captured title remains epoch-gated.
         self.alt.raw_title = None;
@@ -764,12 +770,14 @@ impl Handler for ObservedTerm<'_> {
         report_mode(a0: vt::Mode);
     }
     fn set_private_mode(&mut self, a0: vt::PrivateMode) {
+        let was = self.term.mode().contains(TermMode::ALT_SCREEN);
         self.term.set_private_mode(a0);
-        self.observe_alt();
+        self.observe_alt(was);
     }
     fn unset_private_mode(&mut self, a0: vt::PrivateMode) {
+        let was = self.term.mode().contains(TermMode::ALT_SCREEN);
         self.term.unset_private_mode(a0);
-        self.observe_alt();
+        self.observe_alt(was);
     }
     delegate! {
         report_private_mode(a0: vt::PrivateMode);
@@ -1168,8 +1176,9 @@ mod tests {
         assert!(!emu.alternate_scroll(), "leaving the alt screen closes it");
     }
 
-    /// The clamp contract `scroll_view` relies on: absolute target capped at
-    /// retained history, `usize::MAX` → oldest stored row, 0 → live.
+    /// The clamp contract `scroll_view` relies on: deltas are capped at
+    /// retained history in both directions, `Top` is the oldest stored row,
+    /// `Live` is offset 0.
     #[test]
     fn scrollback_clamps_to_retained_history() {
         let mut emu = Emulator::new(4, 10, 100);
@@ -1178,17 +1187,21 @@ mod tests {
         }
         // 12 newlines on a 4-row screen, cursor starting at the top: the
         // first 3 move the cursor, the remaining 9 scroll rows into history.
-        emu.set_scrollback(usize::MAX);
+        emu.scroll(ScrollAction::Top);
         assert_eq!(emu.scrollback(), 9);
         assert!(
             emu.contents().starts_with("l0"),
             "the oldest stored row must be displayed"
         );
-        emu.set_scrollback(3);
+        emu.scroll(ScrollAction::Down(6));
         assert_eq!(emu.scrollback(), 3);
-        emu.set_scrollback(10_000);
+        emu.scroll(ScrollAction::Up(10_000));
         assert_eq!(emu.scrollback(), 9, "over-scroll clamps at history");
-        emu.set_scrollback(0);
+        emu.scroll(ScrollAction::Down(10_000));
+        assert_eq!(emu.scrollback(), 0, "under-scroll clamps at live");
+        emu.scroll(ScrollAction::Up(2));
+        assert_eq!(emu.scrollback(), 2);
+        emu.scroll(ScrollAction::Live);
         assert_eq!(emu.scrollback(), 0);
     }
 
@@ -1206,13 +1219,13 @@ mod tests {
             emu.process(format!("\r\nhist {i:02}").as_bytes());
         }
         emu.process(b"\x1b[r");
-        emu.set_scrollback(usize::MAX);
+        emu.scroll(ScrollAction::Top);
         assert_eq!(emu.scrollback(), 30);
         assert!(
             emu.contents().starts_with("seed 01"),
             "oldest region-scrolled row heads the history"
         );
-        emu.set_scrollback(0);
+        emu.scroll(ScrollAction::Live);
 
         // Shrink, then keep inserting at the new geometry. Row counts shift
         // with reflow (shrinking parks the excess viewport rows in history),
@@ -1223,7 +1236,7 @@ mod tests {
             emu.process(format!("\r\nmore {i:02}").as_bytes());
         }
         emu.process(b"\x1b[r");
-        emu.set_scrollback(usize::MAX);
+        emu.scroll(ScrollAction::Top);
         let after_shrink = emu.scrollback();
         assert!(
             after_shrink >= 50,
@@ -1235,15 +1248,15 @@ mod tests {
         );
 
         // Growing back must not orphan anything either.
-        emu.set_scrollback(0);
+        emu.scroll(ScrollAction::Live);
         emu.resize(40, 120);
-        emu.set_scrollback(usize::MAX);
+        emu.scroll(ScrollAction::Top);
         assert!(
             emu.contents().contains("seed 01"),
             "history survives the round trip"
         );
         let live = {
-            emu.set_scrollback(0);
+            emu.scroll(ScrollAction::Live);
             emu.contents()
         };
         assert!(
@@ -1749,7 +1762,7 @@ mod tests {
         }
         emu.process(b"latest");
         assert_eq!(emu.live_floor(), "latest");
-        emu.set_scrollback(usize::MAX);
+        emu.scroll(ScrollAction::Top);
         assert!(
             emu.contents().starts_with("l0"),
             "premise: the view shows history"

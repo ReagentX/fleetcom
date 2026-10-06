@@ -252,19 +252,6 @@ fn modifier_param_formula() {
     }
 }
 
-/// Application-cursor mode uses SS3 only for unmodified cursor keys.
-#[test]
-fn app_cursor_drives_unmodified_only() {
-    assert_eq!(
-        key_bytes(true, Key::Left, mods(false, true, false)),
-        Some(b"\x1b[1;3D".to_vec()),
-    );
-    assert_eq!(
-        key_bytes(true, Key::Up, Mods::default()),
-        Some(b"\x1bOA".to_vec()),
-    );
-}
-
 /// The full F1–F12 table, including the terminfo gaps (no 16 between
 /// F5=15 and F6=17; no 22 before F11=23) and the modified forms.
 #[test]

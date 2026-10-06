@@ -3,6 +3,7 @@
 //! differ from the previous frame.
 
 use std::{
+    borrow::Cow,
     io::{self, Write},
     time::Duration,
 };
@@ -279,17 +280,16 @@ fn caret_line(prefix: &str, buf: &EditBuffer, cols: usize) -> (String, u16) {
 /// The `❯` prompt prefix with optional directory and group destinations.
 fn spawn_prefix(app: &App) -> String {
     let dir = (app.spawn_cwd != app.invocation_dir).then(|| path::abbreviate(&app.spawn_cwd));
-    prompt_line(dir.as_deref(), app.spawn_group.as_deref(), "")
+    prompt_line(dir.as_deref(), app.spawn_group.as_deref())
 }
 
 /// Assemble the spawn prompt from its optional `▸` destination segments.
-fn prompt_line(dir: Option<&str>, group: Option<&str>, input: &str) -> String {
+fn prompt_line(dir: Option<&str>, group: Option<&str>) -> String {
     let mut line = String::from("  ❯ ");
     for seg in [dir, group].into_iter().flatten() {
         line.push_str(seg);
         line.push_str(" ▸ ");
     }
-    line.push_str(input);
     line
 }
 
@@ -680,8 +680,9 @@ fn render_controls(out: &mut impl Write, app: &App) -> io::Result<()> {
 /// The varying content of a bottom-panel picker; rendered within the shared skeleton in
 /// `render_panel`.
 struct Panel<'a> {
-    /// Header line, painted by `highlight` as the focused field.
-    header: String,
+    /// Header line, painted by `highlight` as the focused field. With `input`,
+    /// the prompt prefix the buffer is appended to.
+    header: &'a str,
     /// Preformatted row labels; indented and marked with `▸` in the skeleton.
     labels: &'a [String],
     /// Index of the highlighted row.
@@ -692,12 +693,14 @@ struct Panel<'a> {
     hint: String,
     /// Dim placeholder shown instead of rows when `labels` is empty.
     empty: Option<&'a str>,
-    /// Cursor column on the header line; hidden for `None`.
-    cursor: Option<u16>,
+    /// Edit buffer rendered after `header` with the caret shown at its
+    /// position; `None` paints the header verbatim with the cursor hidden.
+    input: Option<&'a EditBuffer>,
 }
 
-/// Bottom-panel skeleton shared by the dir, group, and session pickers,
-/// anchored above the footer and sized so the selected row stays visible.
+/// Bottom-panel skeleton shared by the `@`, `g`, `/`, session, and Agent
+/// panels, anchored to the bottom of the screen with the hint on the footer
+/// row, and sized so the selected row stays visible.
 fn render_panel(out: &mut impl Write, app: &App, p: &Panel) -> io::Result<()> {
     let cols = app.cols as usize;
     let rows = app.rows;
@@ -710,7 +713,14 @@ fn render_panel(out: &mut impl Write, app: &App, p: &Panel) -> io::Result<()> {
     let panel_h = (body + 2) as u16;
     let top = rows.saturating_sub(panel_h).max(2);
 
-    highlight(out, top, &p.header, cols, app.terminal_focused)?;
+    let (header, cursor) = match p.input {
+        Some(buf) => {
+            let (line, cx) = caret_line(p.header, buf, cols);
+            (Cow::Owned(line), Some(cx))
+        }
+        None => (Cow::Borrowed(p.header), None),
+    };
+    highlight(out, top, &header, cols, app.terminal_focused)?;
 
     if total == 0 {
         if let Some(msg) = p.empty {
@@ -742,7 +752,7 @@ fn render_panel(out: &mut impl Write, app: &App, p: &Panel) -> io::Result<()> {
         cols,
     )?;
 
-    match p.cursor {
+    match cursor {
         Some(cx) => queue!(out, MoveTo(cx, top), Show),
         None => queue!(out, Hide),
     }
@@ -767,19 +777,17 @@ fn render_pickdir(out: &mut impl Write, app: &App) -> io::Result<()> {
         Some(DirKind::Into) => "enter/tab open",
         None => "",
     };
-    // Add three styled columns after the text without moving the caret.
-    let (line, cx) = caret_line("  @ ", &app.dir_input, app.cols as usize);
     render_panel(
         out,
         app,
         &Panel {
-            header: format!("{line}   "),
+            header: "  @ ",
             labels: &labels,
             sel: app.dir_sel,
             max_rows: 8,
             hint: format!("{action} · ↑↓ pick · esc"),
             empty: None,
-            cursor: Some(cx),
+            input: Some(&app.dir_input),
         },
     )
 }
@@ -802,18 +810,17 @@ fn render_pickgroup(out: &mut impl Write, app: &App) -> io::Result<()> {
             None => "",
         }
     };
-    let (line, cx) = caret_line("  g ", &app.group_input, app.cols as usize);
     render_panel(
         out,
         app,
         &Panel {
-            header: format!("{line}   "),
+            header: "  g ",
             labels: &labels,
             sel: app.group_sel,
             max_rows: 8,
             hint: format!("{action} · ↑↓ pick · esc"),
             empty: None,
-            cursor: Some(cx),
+            input: Some(&app.group_input),
         },
     )
 }
@@ -841,18 +848,17 @@ fn render_find(out: &mut impl Write, app: &App) -> io::Result<()> {
             None => String::new(),
         })
         .collect();
-    let (line, cx) = caret_line("  / ", &app.find_input, app.cols as usize);
     render_panel(
         out,
         app,
         &Panel {
-            header: format!("{line}   "),
+            header: "  / ",
             labels: &labels,
             sel: app.find_sel,
             max_rows: 8,
             hint: "enter jump · ↑↓ pick · esc".to_string(),
             empty: Some("    (no matching tasks)"),
-            cursor: Some(cx),
+            input: Some(&app.find_input),
         },
     )
 }
@@ -875,19 +881,18 @@ fn agent_empty_text(missing: &[&str]) -> String {
 /// `agent_sel`.
 fn render_agent_page(out: &mut impl Write, app: &App) -> io::Result<()> {
     let prefix = format!("{}agent: ", spawn_prefix(app));
-    let (line, cx) = caret_line(&prefix, &app.agent_input, app.cols as usize);
     let empty = agent_empty_text(&app.missing_agents());
     render_panel(
         out,
         app,
         &Panel {
-            header: format!("{line}   "),
+            header: &prefix,
             labels: &app.agent_candidates,
             sel: app.agent_sel,
             max_rows: 8,
             hint: "↑↓ pick · enter launch · tab command · esc".to_string(),
             empty: Some(&empty),
-            cursor: Some(cx),
+            input: Some(&app.agent_input),
         },
     )
 }
@@ -936,13 +941,13 @@ fn render_session_picker(out: &mut impl Write, app: &App) -> io::Result<()> {
         out,
         app,
         &Panel {
-            header: header.to_string(),
+            header,
             labels,
             sel,
             max_rows: 10,
             hint,
             empty,
-            cursor: None,
+            input: None,
         },
     )
 }
@@ -1254,28 +1259,15 @@ mod tests {
         );
     }
 
-    /// Include the Agent-page hint in the spawn footer only when agents are installed.
-    #[test]
-    fn spawn_page_hint_shows_the_count_only_when_nonzero() {
-        assert_eq!(spawn_page_hint(0), "  enter run · esc");
-        assert_eq!(spawn_page_hint(3), "  enter run · tab agents (3) · esc");
-    }
-
     /// Directory and group destinations appear only when present.
     #[test]
     fn spawn_prompt_decoration_shapes() {
-        assert_eq!(prompt_line(None, None, "cargo test"), "  ❯ cargo test");
+        assert_eq!(prompt_line(None, None), "  ❯ ");
+        assert_eq!(prompt_line(Some("~/x"), None), "  ❯ ~/x ▸ ");
+        assert_eq!(prompt_line(None, Some("alpha")), "  ❯ alpha ▸ ");
         assert_eq!(
-            prompt_line(Some("~/x"), None, "cargo test"),
-            "  ❯ ~/x ▸ cargo test"
-        );
-        assert_eq!(
-            prompt_line(None, Some("alpha"), "cargo test"),
-            "  ❯ alpha ▸ cargo test"
-        );
-        assert_eq!(
-            prompt_line(Some("~/x"), Some("alpha"), "cargo test"),
-            "  ❯ ~/x ▸ alpha ▸ cargo test"
+            prompt_line(Some("~/x"), Some("alpha")),
+            "  ❯ ~/x ▸ alpha ▸ "
         );
     }
 

@@ -164,6 +164,7 @@ pub fn formatted<T>(term: &Term<T>) -> (Vec<u8>, (u16, u16), bool) {
 
     let cursor = &grid.cursor;
     let point = cursor.point;
+    let row = point.line.0.max(0) as usize;
     if offset == 0 && cursor.input_needs_wrap {
         // Pending wrap (phantom column): only a write into the last column
         // sets it and any CUP clears it, so it must be recreated by rewriting
@@ -178,7 +179,7 @@ pub fn formatted<T>(term: &Term<T>) -> (Vec<u8>, (u16, u16), bool) {
         } else {
             (last, &line[Column(last)])
         };
-        cup(&mut buf, point.line.0.max(0) as usize, base_col);
+        cup(&mut buf, row, base_col);
         sync_sgr(&mut buf, &mut state, base);
         // A '\t' goes through `put_tab` (which never sets pending wrap) and a
         // lone wide half would wrap; both are unrepresentable under a pending
@@ -194,7 +195,7 @@ pub fn formatted<T>(term: &Term<T>) -> (Vec<u8>, (u16, u16), bool) {
         // cell.
         push_zerowidth(&mut buf, base);
     } else {
-        cup(&mut buf, point.line.0.max(0) as usize, point.column.0);
+        cup(&mut buf, row, point.column.0);
     }
 
     // Leave the replay target in a known attribute state; the source's
@@ -208,7 +209,7 @@ pub fn formatted<T>(term: &Term<T>) -> (Vec<u8>, (u16, u16), bool) {
 
     (
         buf.into_bytes(),
-        (point.line.0.max(0) as u16, point.column.0 as u16),
+        (row as u16, point.column.0 as u16),
         !term.mode().contains(TermMode::SHOW_CURSOR),
     )
 }
@@ -345,15 +346,18 @@ fn sync_sgr(buf: &mut String, state: &mut Sgr, cell: &Cell) {
     push_color(buf, want.fg, 30);
     push_color(buf, want.bg, 40);
     if let Some(color) = want.underline {
-        push_underline_color(buf, color);
+        push_color(buf, color, 50);
     }
     buf.push('m');
     *state = want;
 }
 
-/// Foreground and background SGR parameters share one shape at different
-/// bases (30/40): named colors at `base+i`, bright at `base+60`, and the
-/// indexed (`;5;`) and RGB (`;2;`) forms introduced by `base+8` (38/48).
+/// Foreground, background, and underline SGR parameters share one shape at
+/// different bases (30/40/50): named colors at `base+i`, bright at `base+60`,
+/// and the indexed (`;5;`) and RGB (`;2;`) forms introduced by `base+8`
+/// (38/48/58). Base 50 is SGR 58 (underline color), for which the parser
+/// stores only the indexed and RGB forms: a named underline color cannot
+/// occur in a parsed grid, so the named arms are unreachable at that base.
 fn push_color(buf: &mut String, color: Color, base: u16) {
     let base = base as usize;
     match color {
@@ -384,51 +388,21 @@ fn push_color(buf: &mut String, color: Color, base: u16) {
     }
 }
 
-fn push_underline_color(buf: &mut String, color: Color) {
-    match color {
-        Color::Indexed(i) => {
-            let _ = write!(buf, ";58;5;{i}");
-        }
-        Color::Spec(rgb) => {
-            let _ = write!(buf, ";58;2;{};{};{}", rgb.r, rgb.g, rgb.b);
-        }
-        // SGR 58 only parses indexed and RGB forms, so a named underline
-        // color cannot occur in a parsed grid.
-        Color::Named(_) => {}
-    }
-}
-
 /// Round-trip tests parse bytes, serialize the resulting grid, replay the
 /// serialization, and compare every displayed cell and the cursor. Comparison
 /// exclusions are documented by [`tests::assert_same_screen`].
 #[cfg(test)]
 mod tests {
-    use alacritty_terminal::{
-        event::VoidListener,
-        grid::Scroll,
-        term::{Config, test::TermSize},
-        vte::ansi::Processor,
-    };
+    use alacritty_terminal::{event::VoidListener, grid::Scroll};
 
     use super::*;
-    use crate::testutil::{CORPUS_COLS, CORPUS_LINES};
+    use crate::testutil::{CORPUS_COLS, CORPUS_LINES, parse_term};
 
     /// Flags replay can never set: CUP-per-row emission performs no soft
     /// wraps, so wrap bookkeeping (soft-wrap marker and the spacer left when a
     /// wide glyph spills to the next row) is excluded from comparison. See the
     /// module docs for the copy/paste consequence.
     const WRAP_ARTIFACTS: Flags = Flags::WRAPLINE.union(Flags::LEADING_WIDE_CHAR_SPACER);
-
-    fn new_term(lines: usize, cols: usize) -> Term<VoidListener> {
-        Term::new(Config::default(), &TermSize::new(cols, lines), VoidListener)
-    }
-
-    fn parse(bytes: &[u8], lines: usize, cols: usize) -> Term<VoidListener> {
-        let mut term = new_term(lines, cols);
-        let mut parser: Processor = Processor::new();
-        parser.advance(&mut term, bytes);
-        term
-    }
 
     /// Compare every displayed cell of `source` (offset-adjusted) against the
     /// replayed term's screen: character, zero-width extras, fg, bg,
@@ -518,9 +492,11 @@ mod tests {
     /// it (see [`formatted`]).
     fn round_trip(source: &Term<VoidListener>, case: &str) -> Term<VoidListener> {
         let (bytes, pos, hidden) = formatted(source);
-        let mut replay = new_term(source.grid().screen_lines(), source.grid().columns());
-        let mut parser: Processor = Processor::new();
-        parser.advance(&mut replay, &bytes);
+        let replay = parse_term(
+            &bytes,
+            source.grid().screen_lines(),
+            source.grid().columns(),
+        );
 
         assert_same_screen(source, &replay, case);
 
@@ -566,7 +542,7 @@ mod tests {
         ($name:ident, $file:literal) => {
             #[test]
             fn $name() {
-                let source = parse(
+                let source = parse_term(
                     include_bytes!(concat!("../../tests/corpus/", $file)),
                     CORPUS_LINES,
                     CORPUS_COLS,
@@ -593,7 +569,7 @@ mod tests {
     /// displayed (offset) content, not the live screen.
     #[test]
     fn corpus_scrolled_viewport() {
-        let mut source = parse(
+        let mut source = parse_term(
             include_bytes!("../../tests/corpus/codex_resume.bin"),
             CORPUS_LINES,
             CORPUS_COLS,
@@ -615,7 +591,7 @@ mod tests {
     fn sgr_reset_boundaries() {
         // Attributes active at a row's right edge must not leak into the next
         // row's default cells, and SGR 0 mid-row must restore defaults.
-        let source = parse(
+        let source = parse_term(
             b"\x1b[1;31;44mred on blue\x1b[0m plain\r\n\x1b[7mreverse to eol",
             4,
             20,
@@ -631,7 +607,7 @@ mod tests {
     #[test]
     fn default_color_restoration() {
         // SGR 39/49 restore one default while the other stays set.
-        let source = parse(b"\x1b[31;44mA\x1b[39mB\x1b[49mC", 2, 10);
+        let source = parse_term(b"\x1b[31;44mA\x1b[39mB\x1b[49mC", 2, 10);
         let cell = &source.grid()[Line(0)][Column(1)];
         assert_eq!(
             cell.fg,
@@ -648,7 +624,7 @@ mod tests {
 
     #[test]
     fn wide_char_spacers_not_double_emitted() {
-        let source = parse("ab漢字c🙂d".as_bytes(), 2, 20);
+        let source = parse_term("ab漢字c🙂d".as_bytes(), 2, 20);
         assert!(
             source.grid()[Line(0)][Column(3)]
                 .flags
@@ -664,7 +640,7 @@ mod tests {
         // column and the write leaves the cursor in pending-wrap state.
         let mut bytes = b"\x1b[1;9H".to_vec();
         bytes.extend("漢".as_bytes());
-        let source = parse(&bytes, 3, 10);
+        let source = parse_term(&bytes, 3, 10);
         assert!(
             source.grid()[Line(0)][Column(9)]
                 .flags
@@ -686,7 +662,7 @@ mod tests {
         // land on the next row.
         let mut bytes = b"\x1b[1;10H".to_vec();
         bytes.extend("漢".as_bytes());
-        let source = parse(&bytes, 3, 10);
+        let source = parse_term(&bytes, 3, 10);
         assert!(
             source.grid()[Line(0)][Column(9)]
                 .flags
@@ -705,7 +681,7 @@ mod tests {
     fn zerowidth_combining_marks() {
         // Combining marks attach to narrow cells, wide cells (through the
         // spacer), and stack when repeated.
-        let source = parse(
+        let source = parse_term(
             "e\u{301}x 漢\u{20d7} a\u{300}\u{301}\u{308}".as_bytes(),
             2,
             20,
@@ -727,7 +703,7 @@ mod tests {
     fn erased_with_attrs_styled_blanks() {
         // BCE: ED/EL fill cells with the template background. Those blanks
         // carry attributes and must be re-emitted, never skipped as empty.
-        let source = parse(b"\x1b[44m\x1b[2J\x1b[3;3Hx\x1b[45m\x1b[K", 6, 12);
+        let source = parse_term(b"\x1b[44m\x1b[2J\x1b[3;3Hx\x1b[45m\x1b[K", 6, 12);
         assert_eq!(
             source.grid()[Line(5)][Column(11)].bg,
             Color::Named(NamedColor::Blue),
@@ -745,7 +721,7 @@ mod tests {
     fn cursor_phantom_column() {
         // Writing through the last column leaves pending wrap; replay must
         // recreate it without actually wrapping (write-then-reposition).
-        let source = parse(b"0123456789", 3, 10);
+        let source = parse_term(b"0123456789", 3, 10);
         assert!(
             source.grid().cursor.input_needs_wrap,
             "premise: pending wrap set"
@@ -761,13 +737,13 @@ mod tests {
 
     #[test]
     fn cursor_position_and_visibility() {
-        let hidden = parse(b"hello\x1b[?25l\x1b[2;4H", 4, 10);
+        let hidden = parse_term(b"hello\x1b[?25l\x1b[2;4H", 4, 10);
         let (_, pos, hide) = formatted(&hidden);
         assert_eq!(pos, (1, 3));
         assert!(hide);
         round_trip(&hidden, "cursor_hidden");
 
-        let visible = parse(b"hello\x1b[3;2H", 4, 10);
+        let visible = parse_term(b"hello\x1b[3;2H", 4, 10);
         let (_, _, hide) = formatted(&visible);
         assert!(!hide);
         round_trip(&visible, "cursor_visible");
@@ -789,7 +765,7 @@ mod tests {
         for i in 100..=107 {
             bytes.extend(format!("\x1b[{i}mD").into_bytes());
         }
-        let source = parse(&bytes, 3, 20);
+        let source = parse_term(&bytes, 3, 20);
         round_trip(&source, "colors_named_and_bright");
     }
 
@@ -799,13 +775,13 @@ mod tests {
         for i in [0u8, 7, 15, 16, 123, 231, 232, 255] {
             bytes.extend(format!("\x1b[38;5;{i}mx\x1b[48;5;{i}my").into_bytes());
         }
-        let source = parse(&bytes, 2, 20);
+        let source = parse_term(&bytes, 2, 20);
         round_trip(&source, "colors_indexed_256");
     }
 
     #[test]
     fn colors_rgb() {
-        let source = parse(
+        let source = parse_term(
             b"\x1b[38;2;1;2;3mA\x1b[48;2;250;128;0mB\x1b[38;2;255;255;255;48;2;0;0;0mC",
             2,
             10,
@@ -833,7 +809,7 @@ mod tests {
         for (sgr, _) in cases {
             bytes.extend(format!("\x1b[{sgr}mA\x1b[0m").into_bytes());
         }
-        let source = parse(&bytes, 2, 20);
+        let source = parse_term(&bytes, 2, 20);
         for (col, (sgr, flag)) in cases.iter().enumerate() {
             assert!(
                 source.grid()[Line(0)][Column(col)].flags.contains(*flag),
@@ -847,7 +823,7 @@ mod tests {
     fn attr_blink_not_modeled() {
         // alacritty stores no blink flag: SGR 5/6 must not perturb the round
         // trip, and the drop is symmetric (documented in the module docs).
-        let source = parse(b"\x1b[5mslow\x1b[6mfast\x1b[25m off", 2, 20);
+        let source = parse_term(b"\x1b[5mslow\x1b[6mfast\x1b[25m off", 2, 20);
         assert_eq!(
             source.grid()[Line(0)][Column(0)].flags,
             Flags::empty(),
@@ -858,7 +834,7 @@ mod tests {
 
     #[test]
     fn underline_color_extras() {
-        let source = parse(b"\x1b[4;58;5;99mA\x1b[4;58;2;10;20;30mB\x1b[59mC", 2, 10);
+        let source = parse_term(b"\x1b[4;58;5;99mA\x1b[4;58;2;10;20;30mB\x1b[59mC", 2, 10);
         assert_eq!(
             source.grid()[Line(0)][Column(0)].underline_color(),
             Some(Color::Indexed(99)),
@@ -871,7 +847,7 @@ mod tests {
     fn tab_cells_keep_erased_attrs() {
         // put_tab stores a literal '\t' in the cell it lands on, preserving
         // whatever attributes the cell already had (here: a BCE fill).
-        let source = parse(b"\x1b[44m\x1b[2J\x1b[Ha\tb", 3, 20);
+        let source = parse_term(b"\x1b[44m\x1b[2J\x1b[Ha\tb", 3, 20);
         assert_eq!(
             source.grid()[Line(0)][Column(1)].c,
             '\t',
@@ -890,7 +866,7 @@ mod tests {
         // The backend translates the DEC special graphics charset at write
         // time, so serialized cells are already Unicode; replay needs no
         // charset shifts.
-        let source = parse(b"\x1b(0lqk\x1b(B done", 2, 12);
+        let source = parse_term(b"\x1b(0lqk\x1b(B done", 2, 12);
         assert_eq!(
             source.grid()[Line(0)][Column(0)].c,
             '┌',
@@ -903,7 +879,7 @@ mod tests {
     fn alt_screen_visible_grid() {
         // The serializer reads the active grid; an alt-screen source must
         // reproduce the alt content on the replay's (primary) screen.
-        let source = parse(b"primary\x1b[?1049h\x1b[2;2Halt content\x1b[31mred", 4, 20);
+        let source = parse_term(b"primary\x1b[?1049h\x1b[2;2Halt content\x1b[31mred", 4, 20);
         assert!(
             source.mode().contains(TermMode::ALT_SCREEN),
             "premise: on alt screen"
@@ -918,7 +894,7 @@ mod tests {
         // excluded from comparison (unrepresentable).
         let mut bytes = "漢".as_bytes().to_vec();
         bytes.extend(b"\x1b[1;1H\x1b[1X");
-        let source = parse(&bytes, 2, 10);
+        let source = parse_term(&bytes, 2, 10);
         let line = &source.grid()[Line(0)];
         assert!(
             line[Column(1)].flags.contains(Flags::WIDE_CHAR_SPACER)
@@ -934,7 +910,7 @@ mod tests {
         // styled blank (see module docs).
         let mut bytes = "漢".as_bytes().to_vec();
         bytes.extend(b"\x1b[1;2H\x1b[1X");
-        let source = parse(&bytes, 2, 10);
+        let source = parse_term(&bytes, 2, 10);
         let line = &source.grid()[Line(0)];
         assert!(
             line[Column(0)].flags.contains(Flags::WIDE_CHAR)
@@ -948,7 +924,7 @@ mod tests {
     fn contents_plain_text() {
         // The '\t' cell reads as a blank; 'x' lands at the tab stop (col 8);
         // trailing spaces trim per row; the empty last row stays a line.
-        let source = parse("one\r\ntwo 漢\u{301}字\r\n\tx".as_bytes(), 4, 12);
+        let source = parse_term("one\r\ntwo 漢\u{301}字\r\n\tx".as_bytes(), 4, 12);
         assert_eq!(contents(&source), "one\ntwo 漢\u{301}字\n        x\n");
     }
 
@@ -958,7 +934,7 @@ mod tests {
         // spaces (`formatted` re-emits SGR 8 and both views must agree). The
         // combining mark on the hidden 'S' must not leak, and the trailing
         // hidden run trims away like padding.
-        let source = parse(
+        let source = parse_term(
             "ab\x1b[8mS\u{301}ECRET\x1b[28mcd \x1b[8mtail".as_bytes(),
             2,
             20,
@@ -970,7 +946,7 @@ mod tests {
     fn hidden_wide_glyphs_keep_both_columns() {
         // A concealed wide glyph occupies two cells; both read as spaces so
         // later glyphs keep their columns.
-        let source = parse("\x1b[8m日\x1b[28mx".as_bytes(), 1, 10);
+        let source = parse_term("\x1b[8m日\x1b[28mx".as_bytes(), 1, 10);
         assert_eq!(contents(&source), "  x");
     }
 
@@ -1133,7 +1109,7 @@ mod tests {
             0x0123456789abcdef,
         ] {
             let bytes = escape_soup(seed, 4000, 24, 80);
-            let source = parse(&bytes, 24, 80);
+            let source = parse_term(&bytes, 24, 80);
             for row in 0..24 {
                 let line = &source.grid()[Line(row)];
                 for col in 0..80 {

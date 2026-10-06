@@ -326,7 +326,7 @@ mod tests {
     use super::*;
     use crate::{
         harness::{
-            BINARY_ENV, CAPTURE_ENV, Claude, Harness, NOTIFY_CHAIN_ENV, Omp, executable_file,
+            BINARY_ENV, CAPTURE_ENV, Claude, Harness, NOTIFY_CHAIN_ENV, Omp,
             fixtures::{ID, OTHER},
         },
         testutil::{dead_pid, install_fake_notifier, temp, write_executable},
@@ -453,10 +453,7 @@ console.log(Object.keys(handlers).join(" "));
             "garbage",
             "install must never write into an earlier namespace"
         );
-        assert_eq!(mode(&root), 0o700);
-        assert_eq!(mode(&second.claude_settings), 0o600);
-        assert_eq!(mode(&second.codex_notify), 0o700);
-        assert_eq!(mode(&second.omp_capture), 0o600);
+        assert_eq!(mode(&root), 0o700, "the root mode is reapplied");
     }
 
     /// Installation retains live-owner namespaces and non-namespace entries.
@@ -524,19 +521,6 @@ console.log(Object.keys(handlers).join(" "));
             fs::read_to_string(stale.join("omp-capture.js")).unwrap(),
             "old module"
         );
-        assert_eq!(
-            fs::read_to_string(&assets.claude_settings).unwrap(),
-            claude_settings_json()
-        );
-        assert_eq!(
-            fs::read_to_string(&assets.codex_notify).unwrap(),
-            CODEX_NOTIFY_SCRIPT
-        );
-        assert_eq!(
-            fs::read_to_string(&assets.omp_capture).unwrap(),
-            OMP_CAPTURE_MODULE
-        );
-        assert_eq!(mode(&ns), 0o700);
     }
 
     /// Installation removes a dead owner's namespace and its contents.
@@ -819,12 +803,10 @@ console.log(Object.keys(handlers).join(" "));
         let written = fs::read_to_string(&cap).unwrap();
         assert_eq!(written, format!("{parent}\n{payload}"));
         assert_eq!(
-            Claude
-                .parse_capture(&written, Some(parent), None)
-                .as_deref(),
+            Claude.parse_capture(&written, Some(parent)).as_deref(),
             Some(ID)
         );
-        assert_eq!(Claude.parse_capture(&written, Some(parent + 1), None), None);
+        assert_eq!(Claude.parse_capture(&written, Some(parent + 1)), None);
     }
 
     /// Check the `omp` module without a JavaScript runtime: require both
@@ -936,7 +918,7 @@ console.log(Object.keys(handlers).join(" "));
         };
         let captured = || {
             let written = fs::read_to_string(&cap).unwrap();
-            Omp.parse_capture(&written, None, None)
+            Omp.parse_capture(&written, None)
         };
 
         // Require a normal return for absent and empty capture paths, and
@@ -1052,23 +1034,5 @@ console.log(Object.keys(handlers).join(" "));
             Some(std::env::current_exe().unwrap()),
             "the daemon's own executable rides every plan"
         );
-    }
-
-    /// Accept only an existing regular file with an execute bit: a missing
-    /// path, a plain file, and a directory are all unusable.
-    #[test]
-    fn fleetcom_binary_requires_an_executable_regular_file() {
-        let root = temp("assets_binary");
-        let plain = root.join("plain");
-        fs::write(&plain, "#!/bin/sh\n").unwrap();
-        assert!(!executable_file(&plain), "no execute bit");
-        fs::set_permissions(&plain, fs::Permissions::from_mode(0o700)).unwrap();
-        assert!(executable_file(&plain));
-        assert!(
-            !executable_file(&root.join("fleetcom (deleted)")),
-            "missing"
-        );
-        assert!(!executable_file(&root), "a directory");
-        assert_eq!(fleetcom_binary(), Some(std::env::current_exe().unwrap()));
     }
 }

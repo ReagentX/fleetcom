@@ -7,6 +7,7 @@
 use std::{
     collections::BTreeMap,
     ffi::OsString,
+    fmt::Write,
     io,
     path::{Path, PathBuf},
     sync::{Arc, Mutex, OnceLock, mpsc::Sender},
@@ -96,7 +97,7 @@ impl LoadOutcome {
             summary.push_str("; ");
             summary.push_str(note);
             if count > 1 {
-                summary.push_str(&format!(" ({count} tasks)"));
+                let _ = write!(summary, " ({count} tasks)");
             }
         }
         summary
@@ -104,24 +105,22 @@ impl LoadOutcome {
 }
 
 /// Resolve the registered harness and current binary on `launch`'s `PATH`, then build a
-/// managed launch with `intent`. Return a diagnostic for the caller if either lookup fails.
+/// managed launch that resumes `resume`, or starts fresh without one. Return a diagnostic
+/// for the caller if either lookup fails.
 fn resolve_agent(
     agent: &str,
     launch: &LaunchContext,
-    intent: Intent,
+    resume: Option<String>,
 ) -> Result<ManagedLaunch, String> {
     let h = harness::registered(agent).ok_or_else(|| format!("no agent named {agent:?}"))?;
+    let path = env_get(&launch.env, "PATH").unwrap_or_default();
+    let binary =
+        harness::find_on_path(agent, path).ok_or_else(|| format!("{agent} not found on PATH"))?;
     Ok(ManagedLaunch {
         agent: h,
-        binary: agent_binary(agent, launch)?,
-        intent,
+        binary,
+        intent: resume.map_or(Intent::Fresh, Intent::Resume),
     })
-}
-
-/// Resolve `agent` on `launch`'s `PATH`, or return a diagnostic for the caller.
-fn agent_binary(agent: &str, launch: &LaunchContext) -> Result<PathBuf, String> {
-    let path = env_get(&launch.env, "PATH").unwrap_or_default();
-    harness::find_on_path(agent, path).ok_or_else(|| format!("{agent} not found on PATH"))
 }
 
 /// Environment variable overriding per-task terminal history depth.
@@ -206,13 +205,13 @@ fn fnv1a_hex(bytes: &[u8]) -> String {
 
 /// Resolve a managed task's session ID in precedence order: capture file, live registry,
 /// then spawn-time ID. Prefer the first two sources because a session may have been
-/// selected after launch. Validate capture through the harness using the task's leader PID
-/// and launch-time home. On rejection, try the next source. For literal tasks, skip all
-/// sources and return `None`.
+/// selected after launch. Validate capture through the harness using the task's leader PID.
+/// On rejection, try the next source. For literal tasks, skip all sources and return
+/// `None`.
 fn current_resume_id(task: &Task) -> Option<String> {
     if let (Some(h), Some(path)) = (task.harness, &task.capture_file)
         && let Ok(payload) = std::fs::read_to_string(path)
-        && let Some(id) = h.parse_capture(&payload, task.pid(), task.harness_home.as_deref())
+        && let Some(id) = h.parse_capture(&payload, task.pid())
     {
         return Some(id);
     }
@@ -230,7 +229,7 @@ fn current_resume_id(task: &Task) -> Option<String> {
 }
 
 /// Resolve harness configuration from the task's launch environment.
-fn harness_home(env: &[(OsString, OsString)], h: &dyn harness::Harness) -> Option<PathBuf> {
+fn harness_home(env: &[(OsString, OsString)], h: &dyn Harness) -> Option<PathBuf> {
     h.resolve_home(&|key| env_get(env, key).map(PathBuf::from))
 }
 
@@ -599,7 +598,7 @@ impl Supervisor {
                     cwd: t.cwd.clone(),
                     tagged: t.tagged,
                     flagship: self.flagship == Some(t.id),
-                    managed: t.managed,
+                    managed: t.harness.is_some(),
                     group: t.group.clone(),
                     name: t.name.clone(),
                     lifecycle: t.lifecycle(now, IDLE_AFTER),
@@ -837,7 +836,7 @@ impl Supervisor {
         let mut meta = None;
         let mut notice = None;
         let (command, exec) = match launch {
-            Launch::Literal(text) => (*text, Exec::Literal((*text).to_string())),
+            Launch::Literal(text) => (*text, Exec::Literal),
             Launch::Managed(m) => {
                 // Require the overlay to retain process ownership. Without the embedded
                 // override, codex would use its shared server outside fleetcom supervision.
@@ -974,7 +973,7 @@ impl Supervisor {
         let Some(launch) = self.launch_or_refuse() else {
             return;
         };
-        let managed = match resolve_agent(agent, &launch, Intent::Fresh) {
+        let managed = match resolve_agent(agent, &launch, None) {
             Ok(m) => m,
             Err(why) => return self.status(format!("{why}, not spawning")),
         };
@@ -1010,17 +1009,11 @@ impl Supervisor {
         let command;
         let relaunch = match self.tasks[i].harness {
             Some(agent) => {
-                let binary = match agent_binary(agent.shape().0, &launch) {
-                    Ok(b) => b,
+                let resume = current_resume_id(&self.tasks[i]);
+                match resolve_agent(agent.shape().0, &launch, resume) {
+                    Ok(m) => Launch::Managed(m),
                     Err(why) => return self.status(format!("{why}, not spawning")),
-                };
-                let intent =
-                    current_resume_id(&self.tasks[i]).map_or(Intent::Fresh, Intent::Resume);
-                Launch::Managed(ManagedLaunch {
-                    agent,
-                    binary,
-                    intent,
-                })
+                }
             }
             None => {
                 command = self.tasks[i].command.clone();
@@ -1149,8 +1142,7 @@ impl Supervisor {
                         Launch::Literal(text)
                     }
                     EntryKind::Managed { agent, resume } => {
-                        let intent = resume.clone().map_or(Intent::Fresh, Intent::Resume);
-                        match resolve_agent(agent, &launch, intent) {
+                        match resolve_agent(agent, &launch, resume.clone()) {
                             Ok(m) => Launch::Managed(m),
                             Err(why) => {
                                 out.failed += 1;
@@ -1246,10 +1238,10 @@ impl Supervisor {
         // Append optional clauses to the fixed message prefix.
         let mut msg = String::from("loaded recovery snapshot; save to name it");
         if out.skipped > 0 {
-            msg.push_str(&format!(", {} skipped ({SKIP_REASONS})", out.skipped));
+            let _ = write!(msg, ", {} skipped ({SKIP_REASONS})", out.skipped);
         }
         if out.failed > 0 {
-            msg.push_str(&format!(", {} failed to spawn", out.failed));
+            let _ = write!(msg, ", {} failed to spawn", out.failed);
         }
         self.status(out.annotate(msg));
     }

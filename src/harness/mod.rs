@@ -51,9 +51,10 @@ pub const BINARY_ENV: &str = "FLEETCOM_BINARY";
 
 /// Launch, capture, and resume behavior for one agent CLI.
 pub trait Harness: Sync {
-    /// Resolve configuration needed by instrumentation, capture parsing, or
-    /// the live registry from the launch environment. Return `None` when no
-    /// configuration is needed.
+    /// Resolve the tool's configuration root from the launch environment. It serves the
+    /// overlay (codex's `config.toml` notify route), arrival validation (codex rollouts),
+    /// and the live registry (claude's `sessions/`). Return `None` when the tool reads no
+    /// configuration.
     fn resolve_home(&self, _env: &dyn Fn(&str) -> Option<PathBuf>) -> Option<PathBuf> {
         None
     }
@@ -75,17 +76,11 @@ pub trait Harness: Sync {
     /// Leave `resume_id` unset here and assign it from the intent in [`plan`].
     fn overlay(&self, capture: &CapturePaths, home: Option<&Path>) -> SpawnPlan;
 
-    /// Extract a session ID from the capture file's contents. `pid` is the
-    /// task's session leader and `home` the launch-time harness home. When
-    /// other processes can write to the capture channel, use these arguments
-    /// to reject payloads written outside the task's own process.
-    /// Return `None` by default for tools without an injected capture channel.
-    fn parse_capture(
-        &self,
-        _payload: &str,
-        _pid: Option<u32>,
-        _home: Option<&Path>,
-    ) -> Option<String> {
+    /// Extract a session ID from the capture file's contents. `pid` is the task's session
+    /// leader: when other processes can write to the capture channel, use it to reject
+    /// payloads written outside the task's own process. Return `None` by default for tools
+    /// without an injected capture channel.
+    fn parse_capture(&self, _payload: &str, _pid: Option<u32>) -> Option<String> {
         None
     }
 
@@ -200,9 +195,10 @@ fn executable_file(path: &Path) -> bool {
 }
 
 /// Select a display-only summary adapter by the basename of the command's first
-/// whitespace-separated word. Accept arguments; do not select an adapter for environment
-/// prefixes or compound shell commands. Apply this selection to literal and managed tasks
-/// without enabling harness reads for literal tasks.
+/// whitespace-separated word. Arguments and a space-separated compound (`claude && vim`)
+/// still select; an environment prefix or shell syntax glued to the word (`claude;`) does
+/// not. Apply this selection to literal and managed tasks without enabling harness reads
+/// for literal tasks.
 pub fn select(command: &str) -> Option<&'static dyn crate::preview::SummaryAdapter> {
     let first = command.split_whitespace().next()?;
     let name = Path::new(first).file_name()?.to_str()?;
@@ -287,6 +283,16 @@ pub struct CapturePaths {
     pub fleetcom_binary: Option<PathBuf>,
 }
 
+impl CapturePaths {
+    /// The capture-file pair every capturing overlay exports.
+    pub fn capture_env(&self) -> (OsString, OsString) {
+        (
+            CAPTURE_ENV.into(),
+            self.capture_file.clone().into_os_string(),
+        )
+    }
+}
+
 /// Spawn-time additions for one managed launch: argv elements passed to the
 /// binary directly, never shell text.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -297,8 +303,8 @@ pub struct SpawnPlan {
     pub env: Vec<(OsString, OsString)>,
     /// Session ID known at launch: the pinned fresh ID or the resumed ID.
     pub resume_id: Option<String>,
-    /// One-line explanation of reduced instrumentation, for the status line after a
-    /// successful spawn.
+    /// One-line explanation of reduced instrumentation, shown on the status line after a
+    /// successful spawn interactively, or folded into a load's summary line.
     pub notice: Option<String>,
 }
 
@@ -350,16 +356,22 @@ pub(crate) mod fixtures {
 
     /// Strict v4 UUID used wherever a valid session ID is needed.
     pub(crate) const ID: &str = "c8c4a5cc-0b32-4ba0-a6b4-6ed08c218e0d";
-    /// A second distinct ID for requote and precedence cases.
+    /// A second distinct ID for precedence cases.
     pub(crate) const OTHER: &str = "11111111-2222-4333-8444-555555555555";
+
+    /// Thread IDs reported through one codex process's notifier: the conversation on
+    /// screen, a sub-agent it spawned, and the hidden title thread. Codex thread IDs are
+    /// v7; use these so fixtures match real rollouts (`is_uuid` checks no version field).
+    pub(crate) const CODEX_ROOT: &str = "019f5453-de22-7240-b2e5-0d32692aa6d9";
+    pub(crate) const CODEX_CHILD: &str = "019f5454-0c11-7b33-9a4e-5f0e6d7c8b9a";
+    pub(crate) const CODEX_TITLE: &str = "019f5453-de9f-7e61-8c0d-1a2b3c4d5e6f";
 
     /// Argv elements from string literals, for snapshot assertions.
     pub(super) fn argv(words: &[&str]) -> Vec<OsString> {
         words.iter().map(OsString::from).collect()
     }
 
-    /// Capture-path fixture. Include spaces in asset paths to test shell and TOML
-    /// quoting.
+    /// Capture-path fixture. Include spaces in asset paths to test TOML quoting.
     pub(super) fn paths() -> CapturePaths {
         CapturePaths {
             capture_file: PathBuf::from("/tmp/cap/session.json"),

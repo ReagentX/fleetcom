@@ -40,10 +40,9 @@ use crate::{
 /// Maximum attached paste size, leaving headroom below the frame limit.
 const MAX_PASTE: usize = 8 * 1024 * 1024;
 
-// A maximum-size paste expands to this base64 bound in `encode_command`.
-// Reserve 64 KiB for the command envelope and keep the result within one frame.
+// A maximum-size paste leaves the client base64-encoded in one `Command::Paste` frame.
 const _: () = assert!(
-    MAX_PASTE.div_ceil(3) * 4 + 64 * 1024 <= crate::frame::MAX_FRAME as usize,
+    crate::frame::fits_base64(MAX_PASTE),
     "MAX_PASTE must base64-encode to under frame::MAX_FRAME"
 );
 
@@ -80,7 +79,8 @@ enum NoticeLevel {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Mode {
     Dashboard,
-    /// Typing a command to spawn in `spawn_cwd` (bottom command line focused).
+    /// The spawn prompt for `spawn_cwd`: a typed command or a picked agent,
+    /// selected by `spawn_page`.
     Spawn,
     /// Live directory picker (the `@` flow) that sets `spawn_cwd`.
     PickDir,
@@ -150,9 +150,10 @@ pub enum SpawnPage {
 /// What Enter does with a picker row.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum DirKind {
-    /// The resolved path (row 0): Enter runs the command there.
+    /// The resolved path (row 0): Enter opens the spawn prompt there.
     Use,
-    /// A current task's directory: Enter runs there; Tab descends into it.
+    /// A current task's directory: Enter opens the spawn prompt there; Tab
+    /// descends into it.
     Jump,
     /// A subdirectory: Enter and Tab descend into it.
     Into,
@@ -225,8 +226,9 @@ pub struct App {
     pub mode: Mode,
     pub group_mode: GroupMode,
     pub input: EditBuffer,
-    /// Directory a spawned command runs in. Set to `invocation_dir` for the `n`
-    /// flow, or to the picked directory for the `@` flow.
+    /// Directory a typed command or a picked agent launches in. Set to
+    /// `invocation_dir` for the `n` flow, or to the picked directory for the
+    /// `@` flow.
     pub spawn_cwd: PathBuf,
     /// Group assigned to the next spawn. Custom mode snapshots the selected
     /// task's group; State and Dir modes leave the spawn unassigned.
@@ -266,7 +268,6 @@ pub struct App {
     /// Directory `fleetcom` was launched from: base for relative `@` paths and
     /// the "default" section that sorts first in "by dir" mode.
     pub invocation_dir: PathBuf,
-    pub invocation_label: String,
     // `@` directory-picker state (only meaningful in `Mode::PickDir`).
     pub dir_input: EditBuffer,
     pub dir_candidates: Vec<DirCand>,
@@ -457,7 +458,6 @@ impl App {
         make: impl FnOnce(u16, u16, Sender<()>) -> Box<dyn Transport>,
     ) -> Self {
         let invocation_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-        let invocation_label = path::abbreviate(&invocation_dir);
         // The core runs every PTY at the *content* size: full height minus the
         // one row attached mode reserves for its status bar.
         let pane_rows = rows.saturating_sub(1).max(1);
@@ -497,7 +497,6 @@ impl App {
             last_paint: None,
             force_paint: false,
             invocation_dir,
-            invocation_label,
             dir_input: EditBuffer::default(),
             dir_candidates: Vec::new(),
             dir_sel: 0,
@@ -588,6 +587,7 @@ impl App {
 
     /// Task sections in render order. Navigation uses their flattened order.
     pub fn sections(&self) -> Vec<(String, Vec<usize>)> {
+        let home = path::abbreviate(&self.invocation_dir);
         let mut labeled: Vec<(u8, String, u8, String, u64, usize)> = self
             .views
             .iter()
@@ -601,7 +601,7 @@ impl App {
                     GroupMode::Dir => {
                         let label = path::abbreviate(&v.cwd);
                         // Keep the invocation directory first.
-                        let rank = if label == self.invocation_label { 0 } else { 1 };
+                        let rank = if label == home { 0 } else { 1 };
                         (rank, label)
                     }
                     GroupMode::Custom => match &v.group {
@@ -999,14 +999,6 @@ impl App {
         });
     }
 
-    fn spawn_task(&mut self, command: &str) {
-        self.transport.send(Command::Spawn {
-            command: command.to_string(),
-            cwd: self.spawn_cwd.clone(),
-            group: self.spawn_group.clone(),
-        });
-    }
-
     // --- `@` directory picker -------------------------------------------------
 
     /// Rebuild directory-picker rows with the resolved path first. When the
@@ -1044,7 +1036,7 @@ impl App {
         for name in list_dirs(&base, partial) {
             let path = base.join(&name);
             // A current-task directory that is also a subdirectory already has
-            // a row: Enter runs there, and Tab descends.
+            // a row: Enter opens the spawn prompt there, and Tab descends.
             if cands
                 .iter()
                 .any(|c| c.kind == DirKind::Jump && c.path == path)
@@ -1237,7 +1229,8 @@ impl App {
         }
     }
 
-    /// Clear the text-prompt state and return to the dashboard.
+    /// Clear the command buffer and return to the dashboard. The Agent page's
+    /// own state is reset when the prompt opens, not here.
     fn close_prompt(&mut self) {
         self.input.clear();
         self.mode = Mode::Dashboard;
@@ -1552,7 +1545,11 @@ impl App {
             _ => match self.spawn_page {
                 SpawnPage::Command => self.on_key_textinput(k, |app, cmd| {
                     if !cmd.is_empty() {
-                        app.spawn_task(cmd);
+                        app.transport.send(Command::Spawn {
+                            command: cmd.to_string(),
+                            cwd: app.spawn_cwd.clone(),
+                            group: app.spawn_group.clone(),
+                        });
                     }
                 }),
                 SpawnPage::Agent => self.on_key_agent(k),

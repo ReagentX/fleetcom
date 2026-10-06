@@ -15,6 +15,13 @@ use std::{
     time::{Duration, Instant, SystemTime},
 };
 
+use alacritty_terminal::{
+    Term,
+    event::VoidListener,
+    term::{Config, test::TermSize},
+    vte::ansi::Processor,
+};
+
 use crate::{
     emulator::Emulator,
     task::{pid_is_dead, positive_pid},
@@ -186,6 +193,17 @@ pub(crate) fn write_executable(path: &Path, body: &str) {
     fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
 }
 
+/// Install a resident shell at `<dir>/resident-sh` and return its path: it runs its `-c`
+/// text in a child `sh` and stays the task leader, as tcsh and csh do. The trailing `:`
+/// keeps it resident: `sh` execs a script's last simple command in its own place, which
+/// would hand the child the leader PID. Set it as `SHELL` to verify that a managed launch
+/// bypasses the shell.
+pub(crate) fn install_resident_shell(dir: &Path) -> PathBuf {
+    let shell = dir.join("resident-sh");
+    write_executable(&shell, "[ \"$1\" = -c ] || exit 2\n/bin/sh -c \"$2\"\n:");
+    shell
+}
+
 /// Install a fake notifier at `path` that records its argv, one token
 /// per line, into `record`.
 pub(crate) fn install_fake_notifier(path: &Path, record: &Path) {
@@ -235,6 +253,16 @@ pub(crate) fn install_codex_root(home: &Path, thread: &str) -> PathBuf {
 /// under a 40-row, 120-column PTY (tests/corpus/README.md).
 pub(crate) const CORPUS_LINES: usize = 40;
 pub(crate) const CORPUS_COLS: usize = 120;
+
+/// A raw backend `Term` of `lines`×`cols` with `bytes` parsed into it: the
+/// reference grid for tests that compare the wrapper or the serializer
+/// against the backend without going through `Emulator`.
+pub(crate) fn parse_term(bytes: &[u8], lines: usize, cols: usize) -> Term<VoidListener> {
+    let mut term = Term::new(Config::default(), &TermSize::new(cols, lines), VoidListener);
+    let mut parser: Processor = Processor::new();
+    parser.advance(&mut term, bytes);
+    term
+}
 
 /// An emulator sized for corpus replay: corpus geometry plus enough
 /// scrollback (2000 rows) to retain every fixture's history.

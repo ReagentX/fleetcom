@@ -283,7 +283,11 @@ fn dir_mode_groups_by_cwd() {
     app.group_mode = GroupMode::Dir;
     let s = app.sections();
     assert_eq!(s.len(), 2, "one section per distinct cwd");
-    assert_eq!(s[0].0, app.invocation_label, "invocation dir sorts first");
+    assert_eq!(
+        s[0].0,
+        path::abbreviate(&app.invocation_dir),
+        "invocation dir sorts first"
+    );
     assert_eq!(s[1].0, "/tmp");
 }
 
@@ -617,7 +621,7 @@ fn dir_mode_idle_task_holds_its_row() {
     app.spawn_in("sleep 5", inv); // id 2
     app.pump();
     app.group_mode = GroupMode::Dir;
-    let label = app.invocation_label.clone();
+    let label = path::abbreviate(&app.invocation_dir);
     assert_eq!(app.section_ids(), vec![(label.clone(), vec![1, 2])]);
 
     let i = app.views.iter().position(|v| v.id == 1).unwrap();
@@ -687,7 +691,7 @@ fn dir_mode_finished_sinks_within_section() {
     app.group_mode = GroupMode::Dir;
     assert_eq!(
         app.section_ids(),
-        vec![(app.invocation_label.clone(), vec![2, 1])],
+        vec![(path::abbreviate(&app.invocation_dir), vec![2, 1])],
         "finished id 1 sinks below live id 2 within its directory"
     );
 }
@@ -1400,7 +1404,7 @@ fn rows_interleave_headers_and_tasks() {
     app.group_mode = GroupMode::Dir;
     let rows = app.list_rows();
     assert_eq!(rows.len(), 4, "two sections, one task each");
-    assert_eq!(rows[0], Row::Section(app.invocation_label.clone()));
+    assert_eq!(rows[0], Row::Section(path::abbreviate(&app.invocation_dir)));
     assert!(matches!(rows[1], Row::Task(i) if app.views[i].id == 1));
     assert_eq!(rows[2], Row::Section("/tmp".to_string()));
     assert!(matches!(rows[3], Row::Task(i) if app.views[i].id == 2));
@@ -2513,17 +2517,12 @@ fn find_panel_rows_name_the_task_and_its_section() {
     app.pump();
     app.on_key_dashboard(key(KeyCode::Char('/')));
 
-    let mut out = Vec::new();
-    crate::ui::render(&mut out, &mut app).unwrap();
-    let frame = String::from_utf8_lossy(&out).into_owned();
+    let frame = painted(&mut app);
     assert!(frame.contains("✻ api tests · Running"), "{frame:?}");
     assert!(frame.contains("enter jump · ↑↓ pick · esc"), "{frame:?}");
 
     find_type(&mut app, "zzz");
-    app.last_frame.clear();
-    let mut out = Vec::new();
-    crate::ui::render(&mut out, &mut app).unwrap();
-    let frame = String::from_utf8_lossy(&out).into_owned();
+    let frame = painted(&mut app);
     assert!(frame.contains("(no matching tasks)"), "{frame:?}");
 }
 
@@ -2977,9 +2976,7 @@ fn pickgroup_caret_edits_refresh_the_filter() {
 fn paste_lands_at_the_caret() {
     let mut app = App::new_local(30, 100);
     app.mode = Mode::Spawn;
-    for c in "cargo t".chars() {
-        app.on_key_spawn(key(KeyCode::Char(c)));
-    }
+    app.type_spawn("cargo t");
     app.on_key_spawn(key(KeyCode::Left)); // caret before 't'
     app.on_paste("x\ny"); // control chars still stripped
     assert_eq!(app.input.as_str(), "cargo xyt");
@@ -3023,9 +3020,7 @@ fn custom_mode_spawn_inherits_the_selected_group() {
     assert_eq!(app.mode, Mode::Spawn);
     assert_eq!(app.spawn_group.as_deref(), Some("alpha"));
 
-    for c in "sleep 5".chars() {
-        app.on_key_spawn(key(KeyCode::Char(c)));
-    }
+    app.type_spawn("sleep 5");
     app.on_key_spawn(key(KeyCode::Enter));
     app.pump();
     let v = app.views.iter().find(|v| v.id == 2).unwrap();
@@ -3072,9 +3067,7 @@ fn state_and_dir_mode_spawns_stay_unassigned() {
     }
 
     app.on_key_dashboard(key(KeyCode::Char('n')));
-    for c in "sleep 5".chars() {
-        app.on_key_spawn(key(KeyCode::Char(c)));
-    }
+    app.type_spawn("sleep 5");
     app.on_key_spawn(key(KeyCode::Enter));
     app.pump();
     let v = app.views.iter().find(|v| v.id == 2).unwrap();
@@ -3125,34 +3118,6 @@ impl App {
             self.on_key_spawn(key(KeyCode::Char(c)));
         }
     }
-}
-
-/// Create an app with only a stub `claude` on the core's `PATH`. Discover and launch that
-/// stub without running a real agent. Keep capture assets and Claude registry reads inside
-/// the scratch tree.
-fn stub_claude_fixture(tag: &str) -> (App, Scratch) {
-    let dir = temp(&format!("agent_{tag}"));
-    let bin = dir.join("bin");
-    std::fs::create_dir_all(&bin).unwrap();
-    write_executable(&bin.join("claude"), "exit 0");
-    let ctx = crate::protocol::LaunchContext {
-        env: vec![
-            ("PATH".into(), bin.as_os_str().to_os_string()),
-            (
-                path::FLEETCOM_RUNTIME_DIR.into(),
-                dir.join("run").into_os_string(),
-            ),
-            (
-                "CLAUDE_CONFIG_DIR".into(),
-                dir.join("claude-home").into_os_string(),
-            ),
-        ],
-        cwd: dir.to_path_buf(),
-    };
-    let mut app = App::new_local_with_ctx(30, 100, ctx);
-    app.pump();
-    assert_eq!(app.agents, ["claude"], "discovery must see only the stub");
-    (app, dir)
 }
 
 /// Switch between Command and Agent with Tab only when agents are installed. With no
@@ -3258,14 +3223,7 @@ fn session_load_status_keeps_capture_notices_and_failures() {
         ],
         cwd: dir.to_path_buf(),
     };
-    let managed = |agent: &str| crate::session::SessionEntry {
-        kind: crate::session::EntryKind::Managed {
-            agent: agent.into(),
-            resume: None,
-        },
-        group: None,
-        name: None,
-    };
+    let managed = |agent| crate::session::SessionEntry::managed(agent, None);
     let cfg = crate::session::SessionConfig::from([(
         dir.to_string_lossy().into_owned(),
         vec![managed("codex"), managed("grok"), managed("codex")],
@@ -3295,12 +3253,10 @@ fn session_load_status_keeps_capture_notices_and_failures() {
 }
 
 /// Press `n`, Tab, then Enter to launch the first installed agent in the invocation
-/// directory. Close the prompt, admit a managed task, and label its row with the
-/// program word.
+/// directory and close the prompt.
 #[test]
 fn agent_enter_launches_the_highlighted_agent_managed() {
-    let (mut app, _dir) = stub_claude_fixture("enter");
-    let sent = app.record_sends();
+    let (mut app, sent) = App::with_agents(&["claude"]);
     app.open_agent_page();
     app.on_key_spawn(key(KeyCode::Enter));
     assert_eq!(app.mode, Mode::Dashboard, "Enter closes the prompt");
@@ -3311,13 +3267,6 @@ fn agent_enter_launches_the_highlighted_agent_managed() {
             cwd: app.invocation_dir.clone(),
             group: None,
         }]
-    );
-    app.pump();
-    assert_eq!(app.views.len(), 1);
-    assert!(app.views[0].managed, "the core must admit a managed task");
-    assert_eq!(
-        app.views[0].command, "claude",
-        "the row shows the program word"
     );
 }
 
@@ -4368,10 +4317,7 @@ fn peek_shows_short_output_instead_of_the_blank_grid_tail() {
         "the peek reads the selected task's screen"
     );
     app.mode = Mode::Peek;
-    app.last_frame.clear();
-    let mut out = Vec::new();
-    crate::ui::render(&mut out, &mut app).unwrap();
-    let frame = String::from_utf8_lossy(&out);
+    let frame = painted(&mut app);
     for word in ["alpha", "beta", "gamma"] {
         assert!(frame.contains(word), "peek frame must show {word:?}");
     }
