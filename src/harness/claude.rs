@@ -1,14 +1,13 @@
-//! Claude session capture uses a launch-time `--session-id`, a `SessionStart`
-//! hook, and the live session registry. Bare launches pin a v4 UUID; accepted
-//! launches install the hook through `--settings`.
-//! Live lookup reads `<claude-home>/sessions/<pid>.json`.
+//! Capture Claude sessions through a launch-time `--session-id`, a `SessionStart` hook, and
+//! the live registry. Pin a v4 UUID on fresh launches and install the hook through
+//! `--settings` on every launch. Read live records from
+//! `<claude-home>/sessions/<pid>.json`.
 //!
-//! With agent view enabled, a conversation can be moved into Claude's own
-//! background daemon. In that daemon's processes, the inherited capture
-//! environment and `--settings` flag are used to run the same hook with IDs
-//! from other conversations. Disable agent view in the overlay to prevent
-//! those handoffs. Stamp each payload with the parent Claude process's PID
-//! and accept only captures from the task's own process.
+//! With agent view enabled, a conversation can be moved into Claude's background daemon. In
+//! that daemon's processes, the inherited capture environment and `--settings` flag are
+//! used to run the same hook with IDs from other conversations. Disable agent view in the
+//! overlay to prevent those handoffs. Stamp each payload with the parent Claude process's
+//! PID and accept only captures from the task's own process.
 
 use std::{
     fs,
@@ -18,8 +17,7 @@ use std::{
 
 use super::summary::AWAITING_APPROVAL;
 use super::{
-    CAPTURE_ENV, CapturePaths, Harness, Invocation, SpawnPlan, capture_id, home_root, is_uuid,
-    pin_plan, resolve_home, shell_quote,
+    CAPTURE_ENV, CapturePaths, Harness, SpawnPlan, capture_id, home_root, is_uuid, resolve_home,
 };
 
 pub struct Claude;
@@ -33,35 +31,38 @@ impl Harness for Claude {
         ("claude", "--resume")
     }
 
-    fn instrument(
+    fn session_flag(&self) -> Option<&'static str> {
+        Some("--session-id")
+    }
+
+    fn overlay(
         &self,
-        inv: &Invocation,
         capture: &CapturePaths,
         // The settings overlay does not depend on the Claude home path.
         _home: Option<&Path>,
     ) -> SpawnPlan {
-        let mut plan = pin_plan(inv);
-        plan.args_suffix.push_str(" --settings ");
-        plan.args_suffix
-            .push_str(&shell_quote(&capture.claude_settings.to_string_lossy()));
-        plan.env = vec![(
-            CAPTURE_ENV.into(),
-            capture.capture_file.clone().into_os_string(),
-        )];
-        plan
+        SpawnPlan {
+            args: vec![
+                "--settings".into(),
+                capture.claude_settings.clone().into_os_string(),
+            ],
+            env: vec![(
+                CAPTURE_ENV.into(),
+                capture.capture_file.clone().into_os_string(),
+            )],
+            ..SpawnPlan::default()
+        }
     }
 
-    /// Accept a hook payload only from the task's own process. The first line
-    /// is the PID of the Claude process that ran the hook and must be exactly
-    /// the decimal form of `pid`; the remainder is the hook's JSON. Ownership
-    /// cannot be determined from the JSON: `source: "fork"` is reported for
-    /// both `/branch` in the task's process and a background fork.
+    /// Accept a hook payload only from the task's own process. Require the first line to
+    /// equal the decimal `pid` of the Claude process that ran the hook; parse the remainder
+    /// as the hook's JSON. Ownership cannot be determined from JSON: `source: "fork"` is
+    /// reported for both `/branch` in the task's process and a background fork.
     ///
-    /// The task leader is the Claude process only after an exec from
-    /// `$SHELL -c`, as required for [`record_for_pid`]. With a shell retained
-    /// as task leader, the stamped PID differs: reject the capture and fall
-    /// back to the registry, then the spawn-time ID. Without a task PID,
-    /// ownership cannot be checked.
+    /// Run the Claude binary directly for managed tasks so the Claude process is the task
+    /// leader, as required by [`record_for_pid`]. Reject stamps from other PIDs (a
+    /// background fork or a resident wrapper) and fall back to the registry, then the
+    /// spawn-time ID. Without a task PID, ownership cannot be checked.
     fn parse_capture(
         &self,
         payload: &str,
@@ -173,9 +174,16 @@ mod tests {
 
     use super::*;
     use crate::{
-        harness::fixtures::{ID, OTHER, assert_all_opaque, paths},
+        harness::{
+            Intent,
+            fixtures::{ID, OTHER, argv, paths},
+            plan,
+        },
         testutil::temp,
     };
+
+    /// The overlay path from [`paths`].
+    const SETTINGS: &str = "/tmp/Application Support/fleetcom.json";
 
     /// Complete registry fixture with [`OTHER`] as its session ID.
     const LIVE_RECORD: &str = concat!(
@@ -211,60 +219,38 @@ mod tests {
         std::time::UNIX_EPOCH + std::time::Duration::from_millis(ms)
     }
 
-    /// Claude-specific opaque shapes: flags, `--continue`/`-c`, subcommands,
-    /// the short/`=` resume spellings, and `--session-id`. The syntax shared
-    /// by every harness is covered by the table test in `harness::tests`.
+    /// For fresh launches, pin the minted ID; for resumes, specify the conversation ID.
+    /// Append the settings overlay in both cases, set the capture file in the environment,
+    /// and report the target ID.
     #[test]
-    fn everything_else_is_opaque_and_never_rewritten() {
-        let opaque: Vec<String> = [
-            "claude --model opus",
-            "claude --continue",
-            "claude -c",
-            "claude mcp list",
-            "claudius",
-        ]
-        .iter()
-        .map(|s| s.to_string())
-        .chain([
-            format!("claude -r {ID}"),
-            format!("claude --resume {ID} --model opus"),
-            format!("claude --session-id {ID}"),
-        ])
-        .collect();
-        assert_all_opaque(&Claude, ID, &opaque);
-    }
-
-    #[test]
-    fn instrument_pins_an_id_and_layers_settings_on_bare_launches() {
-        let inv = Claude.detect("claude").unwrap();
-        let plan = Claude.instrument(&inv, &paths(), None);
-        let id = plan.injected_id.expect("a bare launch pins an id");
-        assert!(is_uuid(&id));
+    fn managed_argv_pins_or_resumes_then_layers_settings() {
+        let fresh = plan(&Claude, &Intent::Fresh, Some(ID), &paths(), None);
         assert_eq!(
-            plan.args_suffix,
-            format!(" --session-id '{id}' --settings '/tmp/Application Support/fleetcom.json'")
+            fresh.args,
+            argv(&["--session-id", ID, "--settings", SETTINGS])
         );
+        assert_eq!(fresh.resume_id.as_deref(), Some(ID));
         assert_eq!(
-            plan.env,
+            fresh.env,
             vec![(
                 CAPTURE_ENV.into(),
                 PathBuf::from("/tmp/cap/session.json").into_os_string()
             )]
         );
-    }
+        assert_eq!(fresh.notice, None);
 
-    /// A resume command already targets a conversation, so instrumentation adds
-    /// the settings overlay without pinning another ID.
-    #[test]
-    fn instrument_adds_only_settings_to_the_resume_form() {
-        let inv = Claude.detect(&format!("claude --resume {ID}")).unwrap();
-        let plan = Claude.instrument(&inv, &paths(), None);
-        assert_eq!(plan.injected_id, None);
+        let resume = plan(&Claude, &Intent::Resume(OTHER.into()), None, &paths(), None);
         assert_eq!(
-            plan.args_suffix,
-            " --settings '/tmp/Application Support/fleetcom.json'"
+            resume.args,
+            argv(&["--resume", OTHER, "--settings", SETTINGS])
         );
-        assert_eq!(plan.env.len(), 1, "env still names the capture file");
+        assert_eq!(resume.resume_id.as_deref(), Some(OTHER));
+        assert_eq!(resume.env, fresh.env);
+
+        // If minting fails, launch with only the overlay and no pinned ID.
+        let unpinned = plan(&Claude, &Intent::Fresh, None, &paths(), None);
+        assert_eq!(unpinned.args, argv(&["--settings", SETTINGS]));
+        assert_eq!(unpinned.resume_id, None);
     }
 
     /// Task leader PID used by the capture-gate cases.

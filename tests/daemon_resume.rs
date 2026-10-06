@@ -1,7 +1,6 @@
-//! Agent resume crosses command parsing, daemon framing, child instrumentation,
-//! session persistence, and reload. These tests exercise that complete path
-//! with stub `claude` and `codex` executables. An explicit handshake keeps every
-//! path inside the test's scratch tree.
+//! Verify agent resume through managed launch, daemon framing, child instrumentation,
+//! persistence, and reload. Use stub `claude` and `codex` executables and an explicit
+//! handshake to keep all paths inside the scratch tree.
 
 mod common;
 
@@ -9,19 +8,33 @@ use std::{
     io::Write,
     os::unix::{fs::PermissionsExt, net::UnixStream},
     path::{Path, PathBuf},
+    process::{Command, Stdio},
     time::Duration,
 };
 
 use common::{
-    control_frame, read_frame, shake_hands_env, spawn_frame, start_daemon_raw, stop_daemon,
+    control_frame, read_frame, shake_hands_env, spawn_agent_frame, start_daemon_raw, stop_daemon,
     wait_until,
 };
 
 /// Delimiter separating argv records in a stub's append-only output.
 const RUN_MARKER: &str = "-- run --";
 
-/// Fixed v7-shaped thread ID reported by the `codex` stub.
+/// Fixed v7-shaped thread ID reported by the `codex` stub as its root.
 const CODEX_ID: &str = "019f5453-de22-7240-b2e5-0d32692aa6d9";
+
+/// Hidden title thread reported by the `codex` stub after the root. Omit its rollout, as
+/// for real title threads.
+const CODEX_TITLE: &str = "019f5453-de9f-7e61-8c0d-1a2b3c4d5e6f";
+
+/// Root rollout header saved by the `codex` stub before notifying: `session_id` equals the
+/// thread's ID, and `source` is a string.
+const CODEX_HEADER: &str = r#"{"timestamp":"2026-10-04T17:49:56.012Z","ordinal":0,"type":"session_meta","payload":{"id":"019f5453-de22-7240-b2e5-0d32692aa6d9","session_id":"019f5453-de22-7240-b2e5-0d32692aa6d9","source":"cli"}}"#;
+
+/// Notification JSON for a completed turn of `thread`.
+fn turn_complete(thread: &str) -> String {
+    format!(r#"{{"type":"agent-turn-complete","thread-id":"{thread}","turn-id":"t","cwd":"/w"}}"#)
+}
 
 /// Config override for embedded mode, placed after the notify override on
 /// every instrumented `codex` launch.
@@ -71,6 +84,11 @@ impl Scratch {
     /// The named stub's argv record.
     fn record(&self, tool: &str) -> PathBuf {
         self.root.join(format!("{tool}-argv"))
+    }
+
+    /// Marker touched by the `codex` stub after both notifications.
+    fn notified(&self) -> PathBuf {
+        self.root.join("codex-notified")
     }
 
     /// Explicit handshake environment with every resolved path under `root`.
@@ -158,21 +176,36 @@ printf 'Resume this session with:\nclaude --resume %s\n' "$id""#,
     install_stub(s, "claude", &body);
 }
 
-/// Install a `codex` stub to record argv and report `CODEX_ID` only through
-/// the capture file. Before notifying, save a root rollout header under
-/// `$CODEX_HOME`: set `session_id` to `id` and use a string `source`.
+/// Install a `codex` stub to record argv and report only through the injected notifier, as
+/// in the real TUI. Save the root rollout header under `$CODEX_HOME`; notify for the root,
+/// then the title thread without a rollout; finally, touch `notified`. Read the notifier
+/// path from the `notify=["<path>"]` argv override.
 fn install_codex_stub(s: &Scratch) {
     let body = format!(
         r#"printf '%s\n' '{marker}' "$@" >> '{rec}'
 if [ -n "$FLEETCOM_CAPTURE_FILE" ]; then
   day="$CODEX_HOME/sessions/2026/10/04"
   mkdir -p "$day"
-  printf '%s\n' '{{"timestamp":"2026-10-04T17:49:56.012Z","ordinal":0,"type":"session_meta","payload":{{"id":"{id}","session_id":"{id}","source":"cli"}}}}' > "$day/rollout-2026-10-04T13-49-56-{id}.jsonl"
-  printf '{{"type":"agent-turn-complete","thread-id":"{id}"}}' > "$FLEETCOM_CAPTURE_FILE"
+  printf '%s\n' '{header}' > "$day/rollout-2026-10-04T13-49-56-{id}.jsonl"
+  script=''
+  prev=''
+  for a in "$@"; do
+    if [ "$prev" = -c ]; then
+      case "$a" in notify=*) script=${{a#notify=}}; script=${{script#'["'}}; script=${{script%'"]'}} ;; esac
+    fi
+    prev="$a"
+  done
+  "$script" '{root}'
+  "$script" '{title}'
+  : > '{notified}'
 fi"#,
         marker = RUN_MARKER,
         rec = s.record("codex").display(),
+        header = CODEX_HEADER,
         id = CODEX_ID,
+        root = turn_complete(CODEX_ID),
+        title = turn_complete(CODEX_TITLE),
+        notified = s.notified().display(),
     );
     install_stub(s, "codex", &body);
 }
@@ -233,9 +266,9 @@ fn assert_daemon_namespaced(asset: &Path, daemon_pid: u32, what: &str, argv: &[S
     );
 }
 
-/// Save once and return the persisted recipe. Each caller first waits for its
-/// ID channel, and the daemon scrapes finished tasks before reading IDs. As a
-/// result, one save must already contain the resume form.
+/// Save once and return the persisted recipe. Wait for the ID channel at each call site;
+/// scrape finished tasks in the daemon before reading IDs. Require the resume ID in that
+/// first save.
 fn save_once(stream: &mut UnixStream, recipe: &Path, name: &str) -> String {
     stream
         .write_all(&control_frame(&format!(
@@ -249,32 +282,42 @@ fn save_once(stream: &mut UnixStream, recipe: &Path, name: &str) -> String {
     std::fs::read_to_string(recipe).unwrap()
 }
 
-/// Check whether a daemon namespace contains a non-empty task capture file.
-/// Assets live under `<runtime>/<pid>-<nonce>/`, so the runtime root itself
-/// contains no task files.
-fn has_capture(runtime: &Path) -> bool {
-    std::fs::read_dir(runtime).is_ok_and(|namespaces| {
-        namespaces
-            .flatten()
-            .filter(|ns| ns.path().is_dir())
-            .any(|ns| {
-                std::fs::read_dir(ns.path()).is_ok_and(|files| {
-                    files.flatten().any(|e| {
-                        let name = e.file_name();
-                        let Some(n) = name.to_str() else {
-                            return false;
-                        };
-                        n.starts_with("task-")
-                            && n.ends_with(".json")
-                            && e.metadata().is_ok_and(|m| m.len() > 0)
-                    })
-                })
-            })
-    })
+/// Read every file in daemon namespaces under `runtime` as `(name, contents)`, sorted by
+/// name. Look under `<runtime>/<pid>-<nonce>/`; no task files are stored directly in the
+/// runtime root.
+fn namespace_files(runtime: &Path) -> Vec<(String, String)> {
+    let mut files: Vec<(String, String)> = std::fs::read_dir(runtime)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|ns| ns.path().is_dir())
+        .flat_map(|ns| std::fs::read_dir(ns.path()).into_iter().flatten().flatten())
+        .map(|e| {
+            (
+                e.file_name().to_string_lossy().into_owned(),
+                std::fs::read_to_string(e.path()).unwrap_or_default(),
+            )
+        })
+        .collect();
+    files.sort();
+    files
 }
 
-/// Claude instrumentation captures an ID without leaking its injected flags
-/// into the recipe, then reloads the same conversation.
+/// Contents of the single task capture file under `runtime`, when present.
+fn capture_slot(runtime: &Path) -> Option<String> {
+    namespace_files(runtime)
+        .into_iter()
+        .find(|(name, _)| name.starts_with("task-") && name.ends_with(".json"))
+        .map(|(_, contents)| contents)
+}
+
+/// Managed entry for `agent` resuming `id`, in the pretty-printed `to_json` format.
+fn managed_entry(agent: &str, id: &str) -> String {
+    format!("{{\n        \"agent\": \"{agent}\",\n        \"resume\": \"{id}\"\n      }}")
+}
+
+/// Capture a managed Claude ID, save without injected flags in the recipe, and reload the
+/// same conversation.
 #[test]
 fn claude_spawn_save_load_resumes_the_conversation() {
     let s = Scratch::new("claude");
@@ -283,7 +326,9 @@ fn claude_spawn_save_load_resumes_the_conversation() {
     hello(&mut stream, &s);
     drain_events(&stream);
 
-    stream.write_all(&spawn_frame("claude", &s.work())).unwrap();
+    stream
+        .write_all(&spawn_agent_frame("claude", &s.work()))
+        .unwrap();
     let rec = s.record("claude");
     let argv = wait_run(&rec, 0, |a| {
         a.iter().any(|t| t == "--session-id") && a.iter().any(|t| t == "--settings")
@@ -296,7 +341,7 @@ fn claude_spawn_save_load_resumes_the_conversation() {
     // The pinned ID is stored in `resume_id` at spawn: save once to verify it.
     let recipe = save_once(&mut stream, &s.recipe("story"), "story");
     assert!(
-        recipe.contains(&format!("claude --resume '{id}'")),
+        recipe.contains(&managed_entry("claude", &id)),
         "the recipe must resume the pinned id: {recipe}"
     );
     assert!(
@@ -325,8 +370,9 @@ fn claude_spawn_save_load_resumes_the_conversation() {
     stop_daemon(&mut daemon);
 }
 
-/// A Codex capture payload persists the resume command, and loading that command
-/// reapplies the notifier instrumentation.
+/// Persist the resume ID after validating a Codex notification through the daemon's binary.
+/// Preserve it after a later title notification and reapply notifier instrumentation on
+/// reload.
 #[test]
 fn codex_capture_file_drives_save_and_load_resumes() {
     let s = Scratch::new("codex");
@@ -335,7 +381,9 @@ fn codex_capture_file_drives_save_and_load_resumes() {
     hello(&mut stream, &s);
     drain_events(&stream);
 
-    stream.write_all(&spawn_frame("codex", &s.work())).unwrap();
+    stream
+        .write_all(&spawn_agent_frame("codex", &s.work()))
+        .unwrap();
     let rec = s.record("codex");
     let argv = wait_run(&rec, 0, |a| a.iter().any(|t| t.starts_with("notify=[")));
     let notify = value_after(&argv, "-c").to_string();
@@ -351,13 +399,31 @@ fn codex_capture_file_drives_save_and_load_resumes() {
         "a bare spawn must receive the two overrides and nothing else"
     );
 
-    // The stub exits silently, so its capture write is the only id channel;
-    // wait for the file, then a single save must persist the resuming form.
-    let ok = wait_until(Duration::from_secs(10), || has_capture(&s.runtime()));
-    assert!(ok, "the codex stub never wrote its capture file");
+    // Exit the stub silently so the notify script is the only ID channel. Wait for both
+    // notifications, then require a bare root UUID and no temporary file. Preserve the root
+    // after the title notification and persist the resume ID on the first save.
+    let ok = wait_until(Duration::from_secs(10), || s.notified().exists());
+    assert!(ok, "the codex stub never finished notifying");
+    let files = namespace_files(&s.runtime());
+    let names: Vec<&str> = files.iter().map(|(name, _)| name.as_str()).collect();
+    assert_eq!(
+        names,
+        [
+            "claude-settings.json",
+            "codex-notify.sh",
+            "omp-capture.js",
+            "task-1-0.json"
+        ],
+        "the slot must be renamed into place with nothing left behind"
+    );
+    assert_eq!(
+        capture_slot(&s.runtime()).as_deref(),
+        Some(CODEX_ID),
+        "the slot must hold the bare root after the title thread's notification"
+    );
     let recipe = save_once(&mut stream, &s.recipe("story"), "story");
     assert!(
-        recipe.contains(&format!("codex resume '{CODEX_ID}'")),
+        recipe.contains(&managed_entry("codex", CODEX_ID)),
         "the recipe must resume the captured thread: {recipe}"
     );
 
@@ -381,8 +447,54 @@ fn codex_capture_file_drives_save_and_load_resumes() {
     stop_daemon(&mut daemon);
 }
 
-/// A persisted resume command survives daemon replacement and targets the same
-/// ID afterward.
+/// Run notify mode without terminal setup or daemon autostart. With no TTY, write the bare
+/// root and exit 0 without output. Refuse the title thread with exit 1 and no write.
+/// Without a capture path, write nothing.
+#[test]
+fn codex_notify_mode_runs_headless() {
+    let s = Scratch::new("notify_mode");
+    let home = s.root.join("codex-home");
+    let day = home.join("sessions/2026/10/04");
+    std::fs::create_dir_all(&day).unwrap();
+    std::fs::write(
+        day.join(format!("rollout-2026-10-04T13-49-56-{CODEX_ID}.jsonl")),
+        format!("{CODEX_HEADER}\n"),
+    )
+    .unwrap();
+    let cap = s.runtime().join("task-1-0.json");
+    let notify = |payload: &str, capture: Option<&Path>| {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_fleetcom"));
+        cmd.arg("--codex-notify-v1")
+            .arg(payload)
+            .env("CODEX_HOME", &home)
+            .stdin(Stdio::null());
+        match capture {
+            Some(path) => cmd.env("FLEETCOM_CAPTURE_FILE", path),
+            None => cmd.env_remove("FLEETCOM_CAPTURE_FILE"),
+        };
+        let out = cmd.output().unwrap();
+        assert!(out.stdout.is_empty(), "the mode prints nothing: {out:?}");
+        assert!(out.stderr.is_empty(), "the mode prints nothing: {out:?}");
+        out.status.code()
+    };
+
+    assert_eq!(notify(&turn_complete(CODEX_ID), None), Some(1));
+    assert!(!cap.exists(), "no capture path, no write");
+    assert_eq!(notify(&turn_complete(CODEX_TITLE), Some(&cap)), Some(1));
+    assert!(!cap.exists(), "a refused thread writes nothing");
+    assert_eq!(notify(&turn_complete(CODEX_ID), Some(&cap)), Some(0));
+    assert_eq!(std::fs::read_to_string(&cap).unwrap(), CODEX_ID);
+    assert_eq!(notify(&turn_complete(CODEX_TITLE), Some(&cap)), Some(1));
+    assert_eq!(std::fs::read_to_string(&cap).unwrap(), CODEX_ID);
+    let mut names: Vec<String> = std::fs::read_dir(s.runtime())
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    assert_eq!(names, ["task-1-0.json"], "no temporary file may remain");
+}
+
+/// Persist a managed entry, replace the daemon, and resume the same ID afterward.
 #[test]
 fn saved_recipe_resumes_across_a_daemon_restart() {
     let s = Scratch::new("restart");
@@ -393,13 +505,13 @@ fn saved_recipe_resumes_across_a_daemon_restart() {
     hello(&mut stream_a, &s);
     drain_events(&stream_a);
     stream_a
-        .write_all(&spawn_frame("claude", &s.work()))
+        .write_all(&spawn_agent_frame("claude", &s.work()))
         .unwrap();
     let argv = wait_run(&rec, 0, |a| a.iter().any(|t| t == "--session-id"));
     let id = value_after(&argv, "--session-id").to_string();
     let recipe = save_once(&mut stream_a, &s.recipe("overnight"), "overnight");
     assert!(
-        recipe.contains(&format!("claude --resume '{id}'")),
+        recipe.contains(&managed_entry("claude", &id)),
         "the recipe must resume the pinned id: {recipe}"
     );
     stop_daemon(&mut daemon_a);
@@ -420,7 +532,7 @@ fn saved_recipe_resumes_across_a_daemon_restart() {
     );
     assert!(
         !argv.iter().any(|t| t == "--session-id"),
-        "the loaded command is a resume; no second id: {argv:?}"
+        "the loaded entry is a resume; no second id: {argv:?}"
     );
 
     stop_daemon(&mut daemon_b);

@@ -79,6 +79,8 @@ Usage:
   fleetcom --kill                    kill the daemon and every task it owns
   fleetcom --daemon                  run the daemon (internal; the first
                                      fleetcom starts it automatically)
+  fleetcom --codex-notify-v1 <json>  record a codex turn (internal; the
+                                     injected notify script runs it)
 
 Options:
   -h, --help            print this help
@@ -96,6 +98,9 @@ enum Invocation {
     Version,
     Daemon,
     Kill,
+    /// `--codex-notify-v1 <payload>`: validate one notification JSON from the injected
+    /// codex notify script.
+    CodexNotify(String),
     Client {
         foreground: bool,
         session: Option<String>,
@@ -111,6 +116,7 @@ fn parse_args(args: &[String]) -> Result<Invocation, String> {
     let (mut daemon, mut kill, mut foreground) = (false, false, false);
     let mut session: Option<String> = None;
     let mut scrollback: Option<usize> = None;
+    let mut notify: Option<String> = None;
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -118,6 +124,14 @@ fn parse_args(args: &[String]) -> Result<Invocation, String> {
             "-V" | "--version" => return Ok(Invocation::Version),
             "--daemon" => daemon = true,
             "--kill" => kill = true,
+            "--codex-notify-v1" => {
+                // Take the payload verbatim. JSON cannot begin with `-`; reject a
+                // flag-shaped value later as non-JSON.
+                let v = it
+                    .next()
+                    .ok_or_else(|| "--codex-notify-v1 requires a value".to_string())?;
+                notify = Some(v.clone());
+            }
             "--foreground" => foreground = true,
             "--scrollback" => {
                 let v = it
@@ -139,15 +153,21 @@ fn parse_args(args: &[String]) -> Result<Invocation, String> {
             }
         }
     }
-    if daemon && (kill || foreground || session.is_some() || scrollback.is_some()) {
+    if daemon
+        && (kill || notify.is_some() || foreground || session.is_some() || scrollback.is_some())
+    {
         return Err("--daemon takes no other arguments".to_string());
     }
-    if kill && (foreground || session.is_some() || scrollback.is_some()) {
+    if kill && (notify.is_some() || foreground || session.is_some() || scrollback.is_some()) {
         return Err("--kill takes no other arguments".to_string());
     }
-    match (daemon, kill) {
-        (true, _) => Ok(Invocation::Daemon),
-        (_, true) => Ok(Invocation::Kill),
+    if notify.is_some() && (foreground || session.is_some() || scrollback.is_some()) {
+        return Err("--codex-notify-v1 takes no other arguments".to_string());
+    }
+    match (daemon, kill, notify) {
+        (true, _, _) => Ok(Invocation::Daemon),
+        (_, true, _) => Ok(Invocation::Kill),
+        (_, _, Some(payload)) => Ok(Invocation::CodexNotify(payload)),
         _ => Ok(Invocation::Client {
             foreground,
             session,
@@ -185,6 +205,15 @@ fn run() -> io::Result<()> {
         Ok(Invocation::Daemon) => return daemon::run_daemon(),
         // `fleetcom --kill`: tell a running daemon to kill everything and exit.
         Ok(Invocation::Kill) => return daemon::run_kill(),
+        // Validate the codex notification without terminal setup or output. Exit 1 on
+        // refusal; the calling script ignores this informational status.
+        Ok(Invocation::CodexNotify(payload)) => {
+            let env = |key: &str| std::env::var_os(key).map(std::path::PathBuf::from);
+            if harness::record_arrival(&payload, &env).is_none() {
+                std::process::exit(1);
+            }
+            return Ok(());
+        }
         Ok(Invocation::Client {
             foreground,
             session,
@@ -405,6 +434,12 @@ mod tests {
     fn modes_parse() {
         assert_eq!(parse(&["--daemon"]), Ok(Invocation::Daemon));
         assert_eq!(parse(&["--kill"]), Ok(Invocation::Kill));
+        assert_eq!(
+            parse(&["--codex-notify-v1", r#"{"type":"agent-turn-complete"}"#]),
+            Ok(Invocation::CodexNotify(
+                r#"{"type":"agent-turn-complete"}"#.into()
+            ))
+        );
         assert_eq!(parse(&["-h"]), Ok(Invocation::Help));
         assert_eq!(parse(&["--help"]), Ok(Invocation::Help));
         assert_eq!(parse(&["-V"]), Ok(Invocation::Version));
@@ -434,6 +469,29 @@ mod tests {
         assert!(parse(&["--daemon", "--foreground"]).is_err());
         assert!(parse(&["--kill", "--foreground"]).is_err());
         assert!(parse(&["--kill", "work"]).is_err());
+    }
+
+    /// Accept only the notify payload. Reject a missing value, another mode, a session
+    /// name, or a client flag, in either argument order.
+    #[test]
+    fn codex_notify_mode_takes_only_its_payload() {
+        assert!(parse(&["--codex-notify-v1"]).is_err());
+        for other in ["--daemon", "--kill", "--foreground", "work"] {
+            assert!(
+                parse(&["--codex-notify-v1", "{}", other]).is_err(),
+                "{other}"
+            );
+            assert!(
+                parse(&[other, "--codex-notify-v1", "{}"]).is_err(),
+                "{other}"
+            );
+        }
+        assert!(parse(&["--codex-notify-v1", "{}", "--scrollback", "5"]).is_err());
+        assert!(parse(&["--scrollback", "5", "--codex-notify-v1", "{}"]).is_err());
+        assert_eq!(
+            parse(&["--help", "--codex-notify-v1", "{}"]),
+            Ok(Invocation::Help)
+        );
     }
 
     #[test]

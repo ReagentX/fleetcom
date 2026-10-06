@@ -12,13 +12,10 @@
 //!
 //! omp's IDs are UUIDv7. [`is_uuid`](super::is_uuid) validates the 8-4-4-4-12
 //! lowercase-hex shape and not the version field, so they pass unchanged.
-//!
-//! `-r`, `--session`, and `-c` resume as well, but detection stays on the
-//! canonical pair: a command fleetcom cannot rewrite exactly is left verbatim.
 
 use std::path::Path;
 
-use super::{CAPTURE_ENV, CapturePaths, Harness, Invocation, SpawnPlan, capture_id, shell_quote};
+use super::{CAPTURE_ENV, CapturePaths, Harness, SpawnPlan, capture_id};
 
 pub struct Omp;
 
@@ -27,23 +24,16 @@ impl Harness for Omp {
         ("omp", "--resume")
     }
 
-    /// Append the capture extension with `-e` for both accepted command shapes.
-    fn instrument(
-        &self,
-        _inv: &Invocation,
-        capture: &CapturePaths,
-        _home: Option<&Path>,
-    ) -> SpawnPlan {
+    /// Load the capture extension with `-e`. No session flag: omp has no
+    /// `--session-id`, so a pinned UUID could not be resumed.
+    fn overlay(&self, capture: &CapturePaths, _home: Option<&Path>) -> SpawnPlan {
         SpawnPlan {
-            args_suffix: format!(
-                " -e {}",
-                shell_quote(&capture.omp_capture.to_string_lossy())
-            ),
+            args: vec!["-e".into(), capture.omp_capture.clone().into_os_string()],
             env: vec![(
                 CAPTURE_ENV.into(),
                 capture.capture_file.clone().into_os_string(),
             )],
-            injected_id: None,
+            ..SpawnPlan::default()
         }
     }
 
@@ -65,50 +55,38 @@ mod tests {
     use std::path::PathBuf;
 
     use super::*;
-    use crate::harness::fixtures::{ID, assert_all_opaque, paths};
+    use crate::harness::{
+        Intent,
+        fixtures::{ID, argv, paths},
+        plan,
+    };
 
     /// Valid UUIDv7 used in capture payloads.
     const CAPTURED: &str = "01a0077c-e18e-7000-ae0b-016f4834b6e9";
 
-    /// omp-specific aliases, shortcuts, prompts, and malformed resume forms
-    /// remain opaque.
-    #[test]
-    fn everything_else_is_opaque_and_never_rewritten() {
-        let opaque: Vec<String> = ["omp -c", "omp --continue", "omp --resume", "ompx"]
-            .iter()
-            .map(|s| s.to_string())
-            .chain([
-                format!("omp -r {ID}"),
-                format!("omp --session {ID}"),
-                format!("omp --resume {}", &ID[..8]),
-                "omp -p 'fix the tests'".to_string(),
-            ])
-            .collect();
-        assert_all_opaque(&Omp, ID, &opaque);
-    }
+    /// The extension path from [`paths`].
+    const EXTENSION: &str = "/tmp/Application Support/omp-capture.js";
 
-    /// Load the extension and specify the capture file for both accepted shapes. Pin no
-    /// ID: omp has no `--session-id`, so a pinned UUID could not be resumed. Include a
-    /// space in the fixture's asset path to verify quoting as one word.
+    /// For fresh launches, load only the extension: omp has no `--session-id`, so a minted
+    /// ID would not be resumable. For resumes, specify the conversation first. Set the
+    /// capture file in the environment in both cases.
     #[test]
-    fn instrument_loads_the_extension_for_either_accepted_shape() {
-        for cmd in ["omp".to_string(), format!("omp --resume {ID}")] {
-            let inv = Omp.detect(&cmd).unwrap();
-            let plan = Omp.instrument(&inv, &paths(), None);
-            assert_eq!(plan.injected_id, None, "{cmd}");
-            assert_eq!(
-                plan.args_suffix, " -e '/tmp/Application Support/omp-capture.js'",
-                "{cmd}"
-            );
-            assert_eq!(
-                plan.env,
-                vec![(
-                    CAPTURE_ENV.into(),
-                    PathBuf::from("/tmp/cap/session.json").into_os_string()
-                )],
-                "{cmd}"
-            );
-        }
+    fn managed_argv_loads_the_extension_and_pins_nothing() {
+        let fresh = plan(&Omp, &Intent::Fresh, Some(ID), &paths(), None);
+        assert_eq!(fresh.args, argv(&["-e", EXTENSION]));
+        assert_eq!(fresh.resume_id, None, "the minted id is ignored");
+        assert_eq!(
+            fresh.env,
+            vec![(
+                CAPTURE_ENV.into(),
+                PathBuf::from("/tmp/cap/session.json").into_os_string()
+            )]
+        );
+
+        let resume = plan(&Omp, &Intent::Resume(CAPTURED.into()), None, &paths(), None);
+        assert_eq!(resume.args, argv(&["--resume", CAPTURED, "-e", EXTENSION]));
+        assert_eq!(resume.resume_id.as_deref(), Some(CAPTURED));
+        assert_eq!(resume.env, fresh.env);
     }
 
     /// Extract only a validated ID from the extension payload.

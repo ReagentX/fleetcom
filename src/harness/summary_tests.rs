@@ -62,8 +62,8 @@ fn titled(text: &str) -> (String, PreviewSource, Option<&'static str>) {
     (text.to_string(), PreviewSource::Title, None)
 }
 
-/// Selection is a basename match on the first word only: wider than
-/// harness detection (arguments are tolerated), but env prefixes and
+/// Selection is a basename match on the first word only: arguments and a
+/// path are tolerated, since this is display only, but env prefixes and
 /// shell syntax glued to the word select nothing.
 #[test]
 fn select_matches_first_word_basenames_only() {

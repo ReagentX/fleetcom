@@ -1,18 +1,18 @@
-//! A saved agent command is incomplete without its conversation ID. Relaunching
-//! the command can otherwise start a new conversation. Each harness detects a
-//! narrow set of commands, captures a validated ID, and builds the corresponding
-//! resume command.
+//! Save an agent's conversation ID to resume it later; without the ID, relaunching may
+//! start a new conversation. Capture and validate the ID through the harness, then build
+//! the argv to open or resume it.
 //!
-//! Detection accepts only a bare program word or its canonical resume form:
-//! program word, fixed selector, one strict UUID, and end of line. Everything
-//! else remains opaque and runs and saves verbatim.
+//! Build managed launches from an [`Intent`]: the binary found on `PATH`, the conversation
+//! selection, then the harness overlay (capture hook, config overrides, environment).
+//! Execute that argv directly, without shell parsing. Run and save literal commands
+//! verbatim; inspect their text only to select a display adapter ([`select`]).
 //!
 //! # Security invariant
 //!
-//! Every ID returned by `parse_capture` or `live_session_id` eventually enters a shell
-//! command. These methods return only strings accepted by [`is_uuid`]; return `None`
-//! for free text, paths, and malformed IDs. Summary adapters and `live_blocked_status`
-//! are display-only.
+//! Use each ID from `parse_capture` or `live_session_id` as one argv element and as the
+//! `resume` field in a session file. Return only IDs accepted by [`is_uuid`]; return `None`
+//! for free text, paths, and malformed IDs. Use summary adapters and `live_blocked_status`
+//! only for display.
 
 pub mod assets;
 mod claude;
@@ -22,15 +22,16 @@ mod omp;
 pub mod summary;
 
 use std::{
-    ffi::OsString,
-    fs::File,
+    ffi::{OsStr, OsString},
+    fs::{self, File},
     io::Read,
+    os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
     time::SystemTime,
 };
 
 pub use claude::Claude;
-pub use codex::Codex;
+pub use codex::{Codex, record_arrival};
 pub use grok::Grok;
 pub use omp::Omp;
 
@@ -42,7 +43,13 @@ pub const CAPTURE_ENV: &str = "FLEETCOM_CAPTURE_FILE";
 /// configured so inherited values cannot reach the capture script.
 pub const NOTIFY_CHAIN_ENV: &str = "FLEETCOM_NOTIFY_CHAIN";
 
-/// Detection, capture, and resume behavior for one agent CLI.
+/// Environment variable for the fleetcom executable used by the injected `codex` notifier.
+/// Set it from the daemon's path on each launch so notifications are validated through
+/// `--codex-notify-v1` with the same binary used to install the script. When the path is
+/// unusable, omit the variable and skip validation.
+pub const BINARY_ENV: &str = "FLEETCOM_BINARY";
+
+/// Launch, capture, and resume behavior for one agent CLI.
 pub trait Harness: Sync {
     /// Resolve configuration needed by instrumentation, capture parsing, or
     /// the live registry from the launch environment. Return `None` when no
@@ -51,26 +58,22 @@ pub trait Harness: Sync {
         None
     }
 
-    /// Program word and canonical resume selector. The default detection and
-    /// resume rewriting derive from this pair.
+    /// Program word and resume selector. Identify the tool by its word in the registry,
+    /// launcher, and session files. Use the selector flag or subcommand before the
+    /// conversation ID in [`intent_args`].
     fn shape(&self) -> (&'static str, &'static str);
 
-    /// Classify a command. Return `None` for another tool or an unsupported
-    /// command shape.
-    fn detect(&self, cmd: &str) -> Option<Invocation> {
-        let (program, selector) = self.shape();
-        detect_shape(cmd, program, selector)
+    /// Flag for pinning a session ID at launch, if supported. With `None`, use the ID
+    /// assigned by the tool and read it from capture or the registry.
+    fn session_flag(&self) -> Option<&'static str> {
+        None
     }
 
-    /// Build spawn-time command and environment additions. `home` is resolved
-    /// from the launch environment; `None` uses the harness's platform-home
-    /// fallback.
-    fn instrument(
-        &self,
-        inv: &Invocation,
-        capture: &CapturePaths,
-        home: Option<&Path>,
-    ) -> SpawnPlan;
+    /// Instrumentation for every launch of this tool: argv elements after the conversation
+    /// selection, environment pairs, and a notice for reduced instrumentation. Resolve
+    /// `home` from the launch environment; with `None`, use the platform-home fallback.
+    /// Leave `resume_id` unset here and assign it from the intent in [`plan`].
+    fn overlay(&self, capture: &CapturePaths, home: Option<&Path>) -> SpawnPlan;
 
     /// Extract a session ID from the capture file's contents. `pid` is the
     /// task's session leader and `home` the launch-time harness home. When
@@ -111,13 +114,6 @@ pub trait Harness: Sync {
     ) -> Option<(String, &'static str)> {
         None
     }
-
-    /// Rewrite an accepted `cmd` into the canonical command that resumes
-    /// `id`.
-    fn resume_command(&self, cmd: &str, id: &str) -> String {
-        let (program, selector) = self.shape();
-        resume_shape(cmd, program, selector, id)
-    }
 }
 
 /// Resolve a tool-specific override before the launch environment's home.
@@ -143,7 +139,7 @@ struct Agent {
     summary: &'static dyn crate::preview::SummaryAdapter,
 }
 
-/// Registered CLIs in detection order.
+/// Registered CLIs, in launcher order.
 static AGENTS: &[Agent] = &[
     Agent {
         harness: &Claude,
@@ -163,17 +159,50 @@ static AGENTS: &[Agent] = &[
     },
 ];
 
-/// Return the first harness that recognizes `cmd`.
-pub fn detect(cmd: &str) -> Option<(&'static dyn Harness, Invocation)> {
+/// Look up a harness by its exact registered `program` word, as used for managed launches
+/// and session entries. Do not match paths or basenames.
+pub fn registered(program: &str) -> Option<&'static dyn Harness> {
     AGENTS
         .iter()
-        .find_map(|a| a.harness.detect(cmd).map(|inv| (a.harness, inv)))
+        .map(|a| a.harness)
+        .find(|h| h.shape().0 == program)
 }
 
-/// Select a summary adapter by the basename of the command's first
-/// whitespace-separated word. Arguments are accepted; do not select an adapter
-/// for environment prefixes or compound shell commands. Selection is
-/// independent of session-capture instrumentation.
+/// List every registered program word in registry order. Subtract `installed` to identify
+/// agents missing from the host.
+pub fn program_words() -> impl Iterator<Item = &'static str> {
+    AGENTS.iter().map(|a| a.harness.shape().0)
+}
+
+/// List registered program words found on `path`, in registry order, for the launcher menu.
+/// Search for each word independently. Keep menu order independent of `path` order; return
+/// an empty list for an empty `path`.
+pub fn installed(path: &OsStr) -> Vec<&'static str> {
+    program_words()
+        .filter(|program| find_on_path(program, path).is_some())
+        .collect()
+}
+
+/// Find the first executable regular file named `program` in `path`. Preserve the path as
+/// found: after a self-update of `~/.local/bin/claude`, follow the new symlink target on
+/// the next launch. Skip relative components (empty, `.`, `bin`): resolving them against
+/// the daemon's cwd during lookup and the task's cwd at exec could select different files.
+pub fn find_on_path(program: &str, path: &OsStr) -> Option<PathBuf> {
+    std::env::split_paths(path)
+        .filter(|dir| dir.is_absolute())
+        .map(|dir| dir.join(program))
+        .find(|candidate| executable_file(candidate))
+}
+
+/// Whether `path` is a regular file with any execute bit, following symlinks.
+fn executable_file(path: &Path) -> bool {
+    fs::metadata(path).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+}
+
+/// Select a display-only summary adapter by the basename of the command's first
+/// whitespace-separated word. Accept arguments; do not select an adapter for environment
+/// prefixes or compound shell commands. Apply this selection to literal and managed tasks
+/// without enabling harness reads for literal tasks.
 pub fn select(command: &str) -> Option<&'static dyn crate::preview::SummaryAdapter> {
     let first = command.split_whitespace().next()?;
     let name = Path::new(first).file_name()?.to_str()?;
@@ -183,23 +212,59 @@ pub fn select(command: &str) -> Option<&'static dyn crate::preview::SummaryAdapt
         .map(|a| a.summary)
 }
 
-/// Classification of an accepted agent-CLI command.
+/// Conversation selection for a managed launch.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Invocation {
-    /// The bare program word: `instrument` may pin a fresh session ID.
-    Bare,
-    /// The canonical resume form: the command already targets this ID, so
-    /// launch-time pinning is off.
+pub enum Intent {
+    /// Start a new conversation. When a [`Harness::session_flag`] is available, mint an ID
+    /// in the supervisor.
+    Fresh,
+    /// Resume the conversation with this ID, validated by [`is_uuid`] at its source:
+    /// capture, a registry record, or a session file.
     Resume(String),
 }
 
-impl Invocation {
-    /// The session ID the command already targets.
-    pub fn known_id(self) -> Option<String> {
-        match self {
-            Self::Bare => None,
-            Self::Resume(id) => Some(id),
+/// Build conversation-selection argv and report the target ID when known. For `Fresh`, pin
+/// `fresh_id` through the tool's session flag, if supported. With `None` (a mint failure),
+/// launch unpinned, as in prior releases. For `Resume`, place the ID after the resume
+/// selector. Pass the ID as one argv element without shell parsing; also validate it with
+/// [`is_uuid`].
+pub fn intent_args(
+    h: &dyn Harness,
+    intent: &Intent,
+    fresh_id: Option<&str>,
+) -> (Vec<OsString>, Option<String>) {
+    match intent {
+        Intent::Fresh => match (h.session_flag(), fresh_id) {
+            (Some(flag), Some(id)) => (vec![flag.into(), id.into()], Some(id.to_string())),
+            _ => (Vec::new(), None),
+        },
+        Intent::Resume(id) => {
+            debug_assert!(is_uuid(id), "Intent::Resume carries a validated ID");
+            (
+                vec![h.shape().1.into(), id.as_str().into()],
+                Some(id.clone()),
+            )
         }
+    }
+}
+
+/// Build the complete launch plan for `h`: conversation selection first, then the overlay.
+/// Use this order for every tool because each accepts its subcommand or session flag before
+/// config flags (`codex resume <id> -c …`).
+pub fn plan(
+    h: &dyn Harness,
+    intent: &Intent,
+    fresh_id: Option<&str>,
+    capture: &CapturePaths,
+    home: Option<&Path>,
+) -> SpawnPlan {
+    let (mut args, resume_id) = intent_args(h, intent, fresh_id);
+    let overlay = h.overlay(capture, home);
+    args.extend(overlay.args);
+    SpawnPlan {
+        args,
+        resume_id,
+        ..overlay
     }
 }
 
@@ -215,71 +280,30 @@ pub struct CapturePaths {
     /// Extension module loaded by `omp -e`, which appends to the user's own
     /// extensions rather than replacing them.
     pub omp_capture: PathBuf,
+    /// The daemon's executable, checked at allocation for a regular file with an execute
+    /// bit. Use `None` when `current_exe` is unusable. On Linux, the path read through
+    /// `/proc/self/exe` ends in ` (deleted)` after the binary is replaced on disk under the
+    /// running daemon.
+    pub fleetcom_binary: Option<PathBuf>,
 }
 
-/// Spawn-time additions for one instrumented launch.
+/// Spawn-time additions for one managed launch: argv elements passed to the
+/// binary directly, never shell text.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SpawnPlan {
-    /// Appended verbatim to the user's command string before it is passed to
-    /// `$SHELL -c`. Starts with a space when non-empty.
-    pub args_suffix: String,
+    /// Argv elements after the binary.
+    pub args: Vec<OsString>,
     /// Environment pairs added to the child.
     pub env: Vec<(OsString, OsString)>,
-    /// The session ID chosen at launch, when the harness can pin one.
-    pub injected_id: Option<String>,
+    /// Session ID known at launch: the pinned fresh ID or the resumed ID.
+    pub resume_id: Option<String>,
+    /// One-line explanation of reduced instrumentation, for the status line after a
+    /// successful spawn.
+    pub notice: Option<String>,
 }
 
-/// Shell metacharacters that make the program token unsafe to instrument.
-/// `=` can turn it into an environment assignment, `*?[]` and `{}` can expand
-/// it into different words, and the remaining characters can separate, quote,
-/// expand, or comment out shell input. Tilde remains valid because it expands
-/// to one word with the same basename.
-const PROGRAM_WORD_REFUSALS: &[char] = &[
-    '|', ';', '&', '<', '>', '$', '#', '`', '(', ')', '\\', '\'', '"', '=', '\n', '\r', '*', '?',
-    '[', ']', '{', '}',
-];
-
-/// Match `cmd` against a bare `program` or its canonical resume form. The
-/// program matches by basename, and the strict UUID may be bare or wrapped in
-/// the single quote pair emitted by `resume_command`. Extra arguments, prompts,
-/// alternate selectors, and shell syntax do not match.
-fn detect_shape(cmd: &str, program: &str, selector: &str) -> Option<Invocation> {
-    let mut words = cmd.split([' ', '\t']).filter(|w| !w.is_empty());
-    let first = words.next()?;
-    if first.contains(PROGRAM_WORD_REFUSALS) || Path::new(first).file_name()?.to_str()? != program {
-        return None;
-    }
-    let Some(sel) = words.next() else {
-        return Some(Invocation::Bare);
-    };
-    let id = unquote(words.next()?);
-    (sel == selector && is_uuid(id) && words.next().is_none())
-        .then(|| Invocation::Resume(id.to_string()))
-}
-
-/// Strip the optional single quote pair emitted by `resume_command`.
-fn unquote(token: &str) -> &str {
-    token
-        .strip_prefix('\'')
-        .and_then(|t| t.strip_suffix('\''))
-        .unwrap_or(token)
-}
-
-/// Rewrite an accepted command as
-/// `<program word as typed> <selector> '<id>'`. Invalid IDs and unsupported
-/// command shapes pass through unchanged.
-fn resume_shape(cmd: &str, program: &str, selector: &str, id: &str) -> String {
-    if !is_uuid(id) || detect_shape(cmd, program, selector).is_none() {
-        return cmd.to_string();
-    }
-    let first = cmd
-        .split([' ', '\t'])
-        .find(|w| !w.is_empty())
-        .expect("detect_shape accepted a program word");
-    format!("{first} {selector} {}", shell_quote(id))
-}
-
-/// Validate the shell-insertion boundary: exactly `8-4-4-4-12` lowercase hex.
+/// Validate a session ID at the argv and session-file boundary: exactly
+/// `8-4-4-4-12` lowercase hex.
 pub fn is_uuid(s: &str) -> bool {
     let b = s.as_bytes();
     b.len() == 36
@@ -289,8 +313,8 @@ pub fn is_uuid(s: &str) -> bool {
         })
 }
 
-/// Validated session ID at `key` in a capture payload or a Codex rollout
-/// header; [`is_uuid`] is the shell-insertion boundary.
+/// Read a validated session ID at `key` in a capture payload or Codex rollout header.
+/// Validate with [`is_uuid`].
 fn capture_id(v: &jzon::JsonValue, key: &str) -> Option<String> {
     let id = v[key].as_str()?;
     is_uuid(id).then(|| id.to_string())
@@ -298,7 +322,7 @@ fn capture_id(v: &jzon::JsonValue, key: &str) -> Option<String> {
 
 /// Generate a v4 UUID from `/dev/urandom`. Return `None` on a read failure; launch
 /// without pinning an ID in that case.
-fn uuid_v4() -> Option<String> {
+pub(crate) fn uuid_v4() -> Option<String> {
     use std::fmt::Write;
     let mut bytes = [0u8; 16];
     File::open("/dev/urandom")
@@ -317,36 +341,22 @@ fn uuid_v4() -> Option<String> {
     Some(out)
 }
 
-/// Spawn plan for the launch-time ID pin: a bare launch pins a fresh v4 UUID
-/// through `--session-id`, the resume form already targets its conversation,
-/// and a `uuid_v4` failure launches without pinning.
-fn pin_plan(inv: &Invocation) -> SpawnPlan {
-    let mut plan = SpawnPlan::default();
-    if *inv == Invocation::Bare
-        && let Some(id) = uuid_v4()
-    {
-        plan.args_suffix = format!(" --session-id {}", shell_quote(&id));
-        plan.injected_id = Some(id);
-    }
-    plan
-}
-
-/// Single-quote `s` for `$SHELL -c`, encoding embedded `'` as `'\''`.
-fn shell_quote(s: &str) -> String {
-    format!("'{}'", s.replace('\'', "'\\''"))
-}
-
-/// Fixtures and assertions for harness detection and capture.
+/// Fixtures for harness launch and capture tests.
 #[cfg(test)]
 pub(crate) mod fixtures {
-    use std::path::PathBuf;
+    use std::{ffi::OsString, path::PathBuf};
 
-    use super::{CapturePaths, Harness};
+    use super::CapturePaths;
 
     /// Strict v4 UUID used wherever a valid session ID is needed.
     pub(crate) const ID: &str = "c8c4a5cc-0b32-4ba0-a6b4-6ed08c218e0d";
     /// A second distinct ID for requote and precedence cases.
     pub(crate) const OTHER: &str = "11111111-2222-4333-8444-555555555555";
+
+    /// Argv elements from string literals, for snapshot assertions.
+    pub(super) fn argv(words: &[&str]) -> Vec<OsString> {
+        words.iter().map(OsString::from).collect()
+    }
 
     /// Capture-path fixture. Include spaces in asset paths to test shell and TOML
     /// quoting.
@@ -356,16 +366,7 @@ pub(crate) mod fixtures {
             claude_settings: PathBuf::from("/tmp/Application Support/fleetcom.json"),
             codex_notify: PathBuf::from("/tmp/Application Support/notify.sh"),
             omp_capture: PathBuf::from("/tmp/Application Support/omp-capture.js"),
-        }
-    }
-
-    /// Assert that every command is opaque to `h`: detection fails and resume
-    /// leaves the command unchanged.
-    pub(super) fn assert_all_opaque(h: &dyn Harness, id: &str, cmds: &[String]) {
-        for cmd in cmds {
-            assert_eq!(h.detect(cmd), None, "{cmd:?} must be opaque");
-            let resumed = h.resume_command(cmd, id);
-            assert_eq!(resumed, *cmd, "an opaque command must never be rewritten");
+            fleetcom_binary: Some(PathBuf::from("/tmp/Application Support/fleetcom")),
         }
     }
 }
@@ -377,98 +378,8 @@ mod tests {
         *,
     };
 
-    /// Path prefix used to verify basename matching.
+    /// Path prefix used to verify that registration never matches by basename.
     const BIN: &str = "/usr/local/bin";
-
-    /// Each registered harness accepts bare and canonical resume forms,
-    /// including path-qualified programs and quoted IDs.
-    #[test]
-    fn every_harness_detects_the_two_authored_shapes() {
-        for a in AGENTS {
-            let h = a.harness;
-            let (prog, sel) = h.shape();
-            assert_eq!(h.detect(prog), Some(Invocation::Bare), "{prog}");
-            assert_eq!(
-                h.detect(&format!("{BIN}/{prog}")),
-                Some(Invocation::Bare),
-                "{prog}"
-            );
-            for cmd in [
-                format!("{prog} {sel} {ID}"),
-                format!("{prog} {sel} '{ID}'"),
-                format!("{BIN}/{prog} {sel} '{ID}'"),
-            ] {
-                assert_eq!(h.detect(&cmd), Some(Invocation::Resume(ID.into())), "{cmd}");
-            }
-        }
-    }
-
-    /// Regenerate the canonical resume form for both accepted shapes, preserving the
-    /// program word as typed. Keep the command unchanged for invalid IDs.
-    #[test]
-    fn every_harness_regenerates_the_canonical_resume_form() {
-        for a in AGENTS {
-            let h = a.harness;
-            let (prog, sel) = h.shape();
-            let canonical = format!("{prog} {sel} '{ID}'");
-            assert_eq!(h.resume_command(prog, ID), canonical, "{prog}");
-            assert_eq!(
-                h.resume_command(&format!("{BIN}/{prog}"), ID),
-                format!("{BIN}/{prog} {sel} '{ID}'")
-            );
-            assert_eq!(
-                h.resume_command(&format!("{prog} {sel} '{OTHER}'"), ID),
-                canonical
-            );
-            assert_eq!(
-                h.resume_command(&format!("{prog} {sel} {OTHER}"), ID),
-                canonical
-            );
-            for bad in ["evil'", "not-an-id"] {
-                assert_eq!(h.resume_command(prog, bad), prog, "{prog} {bad:?}");
-            }
-        }
-    }
-
-    /// Shared shell-syntax shapes are opaque for every harness and are never
-    /// rewritten: prompts, a bare or malformed selector, `=`-joined IDs,
-    /// quoted-ID-plus-prompt, token-extending IDs, pipes, separators, env
-    /// prefixes, other tools, and the empty command. Harness-specific
-    /// opacity cases stay in each harness's own test module.
-    #[test]
-    fn every_harness_keeps_shared_shell_syntax_opaque() {
-        for a in AGENTS {
-            let h = a.harness;
-            let (prog, sel) = h.shape();
-            let opaque = [
-                format!("{prog} 'fix the tests'"),
-                format!("{prog} {sel}"),
-                format!("{prog} {sel} not-a-uuid"),
-                format!("{prog} {sel} $ID"),
-                format!("{prog} {sel}={ID}"),
-                format!("{prog} {sel} '{ID}' 'and do x'"),
-                format!("{prog} {sel} {ID}ff"),
-                format!("{prog} | tee log"),
-                format!("{prog}; ls"),
-                format!("FOO=bar {prog}"),
-                String::new(),
-            ];
-            for cmd in opaque {
-                assert_eq!(h.detect(&cmd), None, "{cmd:?} must be opaque");
-                assert_eq!(
-                    h.resume_command(&cmd, ID),
-                    cmd,
-                    "an opaque command must never be rewritten"
-                );
-            }
-            // Another tool's program word never matches.
-            for other in AGENTS.iter().map(|o| o.harness.shape().0) {
-                if other != prog {
-                    assert_eq!(h.detect(other), None, "{other:?} is not {prog}");
-                }
-            }
-        }
-    }
 
     #[test]
     fn is_uuid_accepts_only_the_strict_shape() {
@@ -499,89 +410,127 @@ mod tests {
         assert_ne!(a, b);
     }
 
-    /// The UUID token may be bare or in exactly one single-quote pair;
-    /// anything half-quoted or nested fails the strict check.
+    /// Pin an ID only when a session flag is supported. On resume, place the ID after the
+    /// tool's selector. Report the ID selected by the intent.
     #[test]
-    fn detect_shape_strips_exactly_one_quote_pair() {
-        assert_eq!(
-            detect_shape(&format!("claude --resume '{ID}'"), "claude", "--resume"),
-            Some(Invocation::Resume(ID.into()))
-        );
-        for token in [format!("'{ID}"), format!("{ID}'"), format!("''{ID}''")] {
+    fn intent_args_pin_only_behind_a_session_flag_and_always_resume() {
+        for a in AGENTS {
+            let h = a.harness;
+            let (prog, sel) = h.shape();
+            let expected = match h.session_flag() {
+                Some(flag) => (vec![OsString::from(flag), ID.into()], Some(ID.to_string())),
+                None => (Vec::new(), None),
+            };
+            assert_eq!(intent_args(h, &Intent::Fresh, Some(ID)), expected, "{prog}");
             assert_eq!(
-                detect_shape(&format!("claude --resume {token}"), "claude", "--resume"),
-                None,
-                "{token:?}"
+                intent_args(h, &Intent::Fresh, None),
+                (Vec::new(), None),
+                "{prog}: a mint failure launches unpinned"
+            );
+            assert_eq!(
+                intent_args(h, &Intent::Resume(OTHER.into()), Some(ID)),
+                (
+                    vec![OsString::from(sel), OTHER.into()],
+                    Some(OTHER.to_string())
+                ),
+                "{prog}: a resume ignores the minted id"
             );
         }
     }
 
-    /// A path-form program word matches by basename only while it stays one
-    /// plain shell word.
+    /// Only the exact program word is a registered agent: no paths, no
+    /// prefixes, no basename matching.
     #[test]
-    fn detect_shape_matches_basenames_and_refuses_shell_syntax_in_them() {
-        assert_eq!(
-            detect_shape("/usr/local/bin/claude", "claude", "--resume"),
-            Some(Invocation::Bare)
-        );
-        for cmd in [
-            "$HOME/bin/claude",
-            "a=b/claude",
-            "'/bin/claude'",
-            "/tmp/x;y/claude",
-            "/tmp/x`y`/claude",
-            "claude\nls",
-        ] {
-            assert_eq!(detect_shape(cmd, "claude", "--resume"), None, "{cmd:?}");
-        }
-    }
-
-    /// Glob and brace metacharacters can expand the program word into
-    /// several words or a different path, losing flag binding; tilde expands
-    /// to one word with the same basename, so it stays accepted.
-    #[test]
-    fn detect_shape_refuses_expanding_metacharacters_but_accepts_tilde() {
-        assert_eq!(
-            detect_shape("~/bin/claude", "claude", "--resume"),
-            Some(Invocation::Bare)
-        );
-        for (cmd, prog, sel) in [
-            ("tools/*/claude", "claude", "--resume"),
-            ("/opt/{stable,beta}/codex", "codex", "resume"),
-            ("a?b/claude", "claude", "--resume"),
-            ("[a]/grok", "grok", "--resume"),
-        ] {
-            assert_eq!(detect_shape(cmd, prog, sel), None, "{cmd:?}");
-        }
-    }
-
-    /// Shell quoting preserves spaces and embedded single quotes.
-    #[test]
-    fn shell_quote_survives_spaces_and_single_quotes() {
-        let path = "/Users/x/Application Support/it's here/settings.json";
-        let quoted = shell_quote(path);
-        assert_eq!(
-            quoted,
-            "'/Users/x/Application Support/it'\\''s here/settings.json'"
-        );
-        let out = std::process::Command::new("sh")
-            .arg("-c")
-            .arg(format!("printf '%s' {quoted}"))
-            .output()
-            .expect("sh must run");
-        assert_eq!(String::from_utf8(out.stdout).unwrap(), path);
-    }
-
-    #[test]
-    fn registry_detect_routes_to_the_matching_harness() {
+    fn registered_matches_the_exact_program_word() {
         for a in AGENTS {
-            let (prog, sel) = a.harness.shape();
-            let (h, inv) = detect(prog).unwrap();
-            assert_eq!((h.shape().0, inv), (prog, Invocation::Bare));
-            let (h, inv) = detect(&format!("{prog} {sel} {ID}")).unwrap();
-            assert_eq!((h.shape().0, inv), (prog, Invocation::Resume(ID.into())));
+            let prog = a.harness.shape().0;
+            assert_eq!(registered(prog).map(|h| h.shape().0), Some(prog));
+            assert!(registered(&format!("{BIN}/{prog}")).is_none(), "{prog}");
+            assert!(registered(&format!("{prog}x")).is_none(), "{prog}");
         }
-        assert!(detect("vim").is_none());
-        assert!(detect("").is_none());
+        assert!(registered("vim").is_none());
+        assert!(registered("").is_none());
+    }
+
+    /// Search absolute PATH components only. Skip directories and files without an execute
+    /// bit; stop at the first match. Preserve symlinks as found without canonicalizing the
+    /// target.
+    #[test]
+    fn find_on_path_takes_the_first_executable_file_in_an_absolute_dir() {
+        use crate::testutil::{temp, write_executable};
+        use std::{os::unix::fs::symlink, path::Component};
+        let dir = temp("find_on_path");
+        let (a, b, c, l) = (dir.join("a"), dir.join("b"), dir.join("c"), dir.join("l"));
+        for d in [&a, &b, &c] {
+            fs::create_dir_all(d).unwrap();
+        }
+        fs::write(a.join("claude"), "#!/bin/sh\n").unwrap(); // no execute bit
+        fs::create_dir_all(a.join("codex")).unwrap(); // a directory
+        write_executable(&b.join("claude"), "");
+        write_executable(&c.join("claude"), "");
+        write_executable(&c.join("grok"), "");
+        symlink(&c, &l).unwrap();
+        let join = |dirs: &[&Path]| std::env::join_paths(dirs).unwrap();
+
+        assert_eq!(
+            find_on_path("claude", &join(&[&a, &b, &c])),
+            Some(b.join("claude")),
+            "the first executable regular file wins"
+        );
+        assert_eq!(find_on_path("codex", &join(&[&a, &b, &c])), None);
+        assert_eq!(find_on_path("omp", &join(&[&a, &b, &c])), None);
+        assert_eq!(
+            find_on_path("grok", &join(&[&l, &c])),
+            Some(l.join("grok")),
+            "a link is returned as found, never canonicalized"
+        );
+        assert_eq!(find_on_path("claude", OsStr::new("")), None);
+
+        // Skip this relative spelling of `b` even though it is reachable from this
+        // process's cwd: at exec, it would be resolved against the task's cwd.
+        let cwd = std::env::current_dir().unwrap();
+        let ups = cwd
+            .components()
+            .filter(|c| matches!(c, Component::Normal(_)))
+            .count();
+        let rel: PathBuf = std::iter::repeat_n("..", ups)
+            .collect::<PathBuf>()
+            .join(b.strip_prefix("/").unwrap());
+        assert!(
+            executable_file(&rel.join("claude")),
+            "premise: the relative spelling reaches the binary from here"
+        );
+        let mut relative = vec![PathBuf::new(), ".".into(), "bin".into(), rel];
+        assert_eq!(
+            find_on_path("claude", &std::env::join_paths(&relative).unwrap()),
+            None
+        );
+        relative.push(b.clone());
+        assert_eq!(
+            find_on_path("claude", &std::env::join_paths(&relative).unwrap()),
+            Some(b.join("claude")),
+            "the absolute component behind them still resolves"
+        );
+    }
+
+    /// List only registered words, in registry order, regardless of `PATH` order. Return an
+    /// empty menu for an empty `PATH`.
+    #[test]
+    fn installed_follows_registry_order_not_path_order() {
+        use crate::testutil::{temp, write_executable};
+        let dir = temp("installed");
+        let (a, b) = (dir.join("a"), dir.join("b"));
+        for d in [&a, &b] {
+            fs::create_dir_all(d).unwrap();
+        }
+        for name in ["omp", "grok", "vim"] {
+            write_executable(&a.join(name), "");
+        }
+        write_executable(&b.join("claude"), "");
+        let join = |dirs: &[&Path]| std::env::join_paths(dirs).unwrap();
+
+        assert_eq!(installed(&join(&[&a, &b])), ["claude", "grok", "omp"]);
+        assert_eq!(installed(&join(&[&b])), ["claude"]);
+        assert_eq!(installed(OsStr::new("")), Vec::<&str>::new());
     }
 }

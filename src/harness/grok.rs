@@ -1,9 +1,9 @@
-//! Grok has no injectable live-capture channel. Bare launches instead pin a v4
-//! UUID; canonical resume commands retain their explicit ID.
+//! Grok has no injectable live-capture channel. Pin a v4 UUID on fresh launches and specify
+//! it on resume.
 
 use std::path::Path;
 
-use super::{CapturePaths, Harness, Invocation, SpawnPlan, pin_plan};
+use super::{CapturePaths, Harness, SpawnPlan};
 
 pub struct Grok;
 
@@ -12,14 +12,13 @@ impl Harness for Grok {
         ("grok", "--resume")
     }
 
-    fn instrument(
-        &self,
-        inv: &Invocation,
-        // Grok instrumentation does not use capture paths or home config.
-        _capture: &CapturePaths,
-        _home: Option<&Path>,
-    ) -> SpawnPlan {
-        pin_plan(inv)
+    fn session_flag(&self) -> Option<&'static str> {
+        Some("--session-id")
+    }
+
+    /// No overlay: grok has no capture channel to install.
+    fn overlay(&self, _capture: &CapturePaths, _home: Option<&Path>) -> SpawnPlan {
+        SpawnPlan::default()
     }
 }
 
@@ -27,51 +26,24 @@ impl Harness for Grok {
 mod tests {
     use super::*;
     use crate::harness::{
-        fixtures::{ID, assert_all_opaque, paths},
-        is_uuid,
+        Intent,
+        fixtures::{ID, OTHER, argv, paths},
+        plan,
     };
 
-    /// Grok-specific opaque shapes: flags, the `-r`/`-s`/`=` spellings the
-    /// tool prints but detection refuses, and subcommands. The syntax shared
-    /// by every harness is covered by the table test in `harness::tests`.
+    /// Build argv from the intent alone: Grok has no live-capture channel, so add no
+    /// overlay for fresh launches or resumes.
     #[test]
-    fn everything_else_is_opaque_and_never_rewritten() {
-        let opaque: Vec<String> = [
-            "grok --model grok-4",
-            "grok --continue",
-            "grok -r",
-            "grok -r my-session",
-            "grok sessions list",
-            "grokk",
-        ]
-        .iter()
-        .map(|s| s.to_string())
-        .chain([
-            format!("grok -r {ID}"),
-            format!("grok -s {ID}"),
-            format!("grok --resume {ID} --debug"),
-        ])
-        .collect();
-        assert_all_opaque(&Grok, ID, &opaque);
-    }
+    fn managed_argv_is_the_pin_or_the_resume_and_nothing_else() {
+        let fresh = plan(&Grok, &Intent::Fresh, Some(ID), &paths(), None);
+        assert_eq!(fresh.args, argv(&["--session-id", ID]));
+        assert_eq!(fresh.resume_id.as_deref(), Some(ID));
+        assert!(fresh.env.is_empty(), "no capture channel, no capture env");
 
-    /// A bare launch gains only the pinned ID because Grok exposes no live
-    /// capture channel.
-    #[test]
-    fn instrument_pins_an_id_and_nothing_else() {
-        let inv = Grok.detect("grok").unwrap();
-        let plan = Grok.instrument(&inv, &paths(), None);
-        let id = plan.injected_id.expect("a bare launch pins an id");
-        assert!(is_uuid(&id));
-        assert_eq!(plan.args_suffix, format!(" --session-id '{id}'"));
-        assert!(plan.env.is_empty(), "no capture channel, no capture env");
-    }
-
-    /// A resume command needs no pin, overlay, or environment change.
-    #[test]
-    fn instrument_leaves_the_resume_form_untouched() {
-        let inv = Grok.detect(&format!("grok --resume {ID}")).unwrap();
-        assert_eq!(Grok.instrument(&inv, &paths(), None), SpawnPlan::default());
+        let resume = plan(&Grok, &Intent::Resume(OTHER.into()), None, &paths(), None);
+        assert_eq!(resume.args, argv(&["--resume", OTHER]));
+        assert_eq!(resume.resume_id.as_deref(), Some(OTHER));
+        assert!(resume.env.is_empty());
     }
 
     #[test]

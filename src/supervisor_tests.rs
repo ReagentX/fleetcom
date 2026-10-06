@@ -65,29 +65,16 @@ fn session_config_groups_by_dir_in_spawn_order() {
     spawn(&mut s, "c", here());
 
     let cfg = s.session_config();
+    let literal = |cmd: &str| SessionEntry {
+        kind: EntryKind::Literal(cmd.into()),
+        group: None,
+        name: None,
+    };
     assert_eq!(
         cfg[&path::abbreviate(&here())],
-        vec![
-            SessionEntry {
-                cmd: "a".into(),
-                group: None,
-                name: None,
-            },
-            SessionEntry {
-                cmd: "c".into(),
-                group: None,
-                name: None,
-            },
-        ]
+        vec![literal("a"), literal("c")]
     );
-    assert_eq!(
-        cfg["/tmp"],
-        vec![SessionEntry {
-            cmd: "b".into(),
-            group: None,
-            name: None,
-        }]
-    );
+    assert_eq!(cfg["/tmp"], vec![literal("b")]);
 }
 
 /// `tick` emits exactly a `Tasks` snapshot while nothing is watched, and
@@ -2081,8 +2068,141 @@ fn recovery_arms_on_structural_mutations_not_tag() {
     });
     assert!(take_dirty(&mut s), "LoadRecovery must arm");
 
+    s.apply(Command::SpawnAgent {
+        agent: "vim".into(),
+        cwd: here(),
+        group: None,
+    });
+    assert!(take_dirty(&mut s), "SpawnAgent must arm, even when refused");
+
     s.apply(Command::Remove { id });
     assert!(take_dirty(&mut s), "Remove must arm");
+}
+
+/// Drain and return the newest `Agents` list, without ticking.
+fn agents_of(s: &mut Supervisor) -> Vec<String> {
+    s.drain()
+        .into_iter()
+        .rev()
+        .find_map(|e| match e {
+            Event::Agents(a) => Some(a),
+            _ => None,
+        })
+        .expect("expected an Agents event")
+}
+
+/// Spell `dir` relative to this process's cwd through `..` components. Although reachable
+/// from here, this path must be excluded from discovery: at exec, it would be resolved
+/// against the task's cwd.
+fn relative_spelling(dir: &Path) -> PathBuf {
+    use std::path::Component;
+    let ups = here()
+        .components()
+        .filter(|c| matches!(c, Component::Normal(_)))
+        .count();
+    std::iter::repeat_n("..", ups)
+        .collect::<PathBuf>()
+        .join(dir.strip_prefix("/").unwrap())
+}
+
+/// On context install, queue the registered agents found on its `PATH` in registry order.
+/// Ignore unregistered executables and relative components. Send the whole list on every
+/// install, including an empty list without `PATH`, to clear stale menu entries on
+/// reconnect.
+#[test]
+fn launch_context_install_discovers_agents_in_registry_order() {
+    let dir = scratch("discover");
+    let (a, b, c) = (dir.join("a"), dir.join("b"), dir.join("c"));
+    for d in [&a, &b, &c] {
+        std::fs::create_dir_all(d).unwrap();
+    }
+    write_executable(&a.join("claude"), "");
+    write_executable(&a.join("vim"), "");
+    write_executable(&b.join("omp"), "");
+    write_executable(&b.join("codex"), "");
+    write_executable(&c.join("grok"), "");
+    let rel = relative_spelling(&c);
+    assert!(
+        std::fs::metadata(rel.join("grok")).is_ok(),
+        "premise: the relative spelling reaches grok from here"
+    );
+    let ctx = |dirs: &[&Path]| LaunchContext {
+        env: vec![("PATH".into(), std::env::join_paths(dirs).unwrap())],
+        cwd: dir.to_path_buf(),
+    };
+
+    let mut s = Supervisor::new(24, 80, 2000);
+    assert!(
+        s.drain().is_empty(),
+        "no discovery before a context is installed"
+    );
+    s.set_launch_context(ctx(&[&b, &rel, &a]));
+    assert_eq!(agents_of(&mut s), ["claude", "codex", "omp"]);
+    s.set_launch_context(ctx(&[&a]));
+    assert_eq!(agents_of(&mut s), ["claude"]);
+    s.set_launch_context(LaunchContext {
+        env: Vec::new(),
+        cwd: dir.to_path_buf(),
+    });
+    assert_eq!(agents_of(&mut s), Vec::<String>::new());
+}
+
+/// Admit a managed task for a registered word found on the context's `PATH` through
+/// `Command::SpawnAgent`. Acknowledge with `Spawned` and set `managed` in the snapshot.
+/// Keep literal spawns of the same word unmanaged.
+#[test]
+fn spawn_agent_admits_a_managed_task() {
+    let dir = scratch("spawn_agent");
+    let bin = dir.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let rec = dir.join("argv");
+    write_executable(
+        &bin.join("claude"),
+        &format!("printf '%s\\n' \"$@\" > '{}'", rec.display()),
+    );
+    // Keep capture assets and the registry read inside the scratch tree.
+    let mut s = sup_ctx(LaunchContext {
+        env: vec![
+            ("PATH".into(), bin.as_os_str().to_os_string()),
+            (
+                path::FLEETCOM_RUNTIME_DIR.into(),
+                dir.join("run").into_os_string(),
+            ),
+            (
+                "CLAUDE_CONFIG_DIR".into(),
+                dir.join("claude-home").into_os_string(),
+            ),
+        ],
+        cwd: dir.to_path_buf(),
+    });
+    assert_eq!(agents_of(&mut s), ["claude"]);
+
+    s.apply(Command::SpawnAgent {
+        agent: "claude".into(),
+        cwd: dir.to_path_buf(),
+        group: Some("agents".into()),
+    });
+    let id = spawned_id(&mut s);
+    let v = view_of(&mut s, id);
+    assert!(v.managed, "a SpawnAgent task must report managed");
+    assert_eq!(v.command, "claude", "the row shows the program word");
+    assert_eq!(v.group.as_deref(), Some("agents"));
+    assert!(
+        wait_until(Duration::from_secs(5), || rec.exists()),
+        "the stub never ran"
+    );
+    let argv = std::fs::read_to_string(&rec).unwrap();
+    assert!(
+        argv.lines().any(|l| l == "--session-id"),
+        "the launch must carry the harness argv: {argv:?}"
+    );
+
+    spawn(&mut s, "claude", dir.to_path_buf());
+    let literal = spawned_id(&mut s);
+    assert!(
+        !view_of(&mut s, literal).managed,
+        "a typed word is a literal task"
+    );
 }
 
 /// Tick once and return the flagship ids from the snapshot.
@@ -2238,7 +2358,7 @@ fn list_sessions_includes_recovery_snapshots_newest_first() {
 
     let rec = config.join("sessions").join("recovery");
     let entry = |cmd: &str| SessionEntry {
-        cmd: cmd.into(),
+        kind: EntryKind::Literal(cmd.into()),
         group: None,
         name: None,
     };
@@ -2297,12 +2417,12 @@ fn load_recovery_materializes_the_fleet_and_notices() {
         dir.to_string_lossy().into_owned(),
         vec![
             SessionEntry {
-                cmd: "sleep 30".into(),
+                kind: EntryKind::Literal("sleep 30".into()),
                 group: Some("api".into()),
                 name: None,
             },
             SessionEntry {
-                cmd: "sleep 31".into(),
+                kind: EntryKind::Literal("sleep 31".into()),
                 group: None,
                 name: Some("web".into()),
             },

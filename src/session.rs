@@ -12,15 +12,30 @@ use std::{
 };
 
 use crate::{
+    harness,
     protocol::{RecoveryEntry, insert_opt_str, opt_str},
     task::{pid_is_dead, positive_pid},
 };
 
-/// One recipe entry. Serialize entries without a group or name as strings; use objects
-/// for other entries, writing optional fields only when set.
+/// Launch specification for one recipe entry. Preserve a literal task's command text. For a
+/// managed task, store the agent word and last conversation ID instead of a command string.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EntryKind {
+    /// Typed text, run under `$SHELL -c` exactly as stored.
+    Literal(String),
+    /// Managed agent identified by its registered program word. Use `resume` to reopen a
+    /// session, or `None` to start fresh.
+    Managed {
+        agent: String,
+        resume: Option<String>,
+    },
+}
+
+/// One recipe entry. Serialize a literal without group or name as a bare string. Use an
+/// object for every other entry, writing optional fields only when set.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionEntry {
-    pub cmd: String,
+    pub kind: EntryKind,
     pub group: Option<String>,
     pub name: Option<String>,
 }
@@ -65,9 +80,10 @@ pub fn sessions_dir(root: Option<PathBuf>) -> Option<PathBuf> {
         .map(|base| base.join("sessions"))
 }
 
-/// Session format version written by `to_json` and accepted by `from_json`.
-/// Missing versions are interpreted as version 1; unsupported versions fail.
-const FORMAT_VERSION: u64 = 1;
+/// Session format version written by `to_json` and accepted by `from_json`. Managed entries
+/// were introduced in version 2. Treat a missing version as 1 and convert its literals
+/// through [`migrate_v1`]. Reject newer versions.
+const FORMAT_VERSION: u64 = 2;
 
 /// Build the recipe's `dirs` object.
 fn dirs_json(cfg: &SessionConfig) -> jzon::JsonValue {
@@ -75,20 +91,65 @@ fn dirs_json(cfg: &SessionConfig) -> jzon::JsonValue {
     for (dir, entries) in cfg {
         let mut arr = jzon::JsonValue::new_array();
         for e in entries {
-            let member = if e.group.is_none() && e.name.is_none() {
-                // Use the string form for entries without optional labels.
-                jzon::JsonValue::from(e.cmd.as_str())
-            } else {
-                let mut m = jzon::object! { "cmd": e.cmd.as_str() };
-                insert_opt_str(&mut m, "group", &e.group);
-                insert_opt_str(&mut m, "name", &e.name);
-                m
+            let mut m = match &e.kind {
+                // Use the string form for a literal without optional labels.
+                EntryKind::Literal(cmd) if e.group.is_none() && e.name.is_none() => {
+                    let _ = arr.push(cmd.as_str());
+                    continue;
+                }
+                EntryKind::Literal(cmd) => jzon::object! { "cmd": cmd.as_str() },
+                EntryKind::Managed { agent, resume } => {
+                    let mut m = jzon::object! { "agent": agent.as_str() };
+                    insert_opt_str(&mut m, "resume", resume);
+                    m
+                }
             };
-            let _ = arr.push(member);
+            insert_opt_str(&mut m, "group", &e.group);
+            insert_opt_str(&mut m, "name", &e.name);
+            let _ = arr.push(m);
         }
         let _ = dirs.insert(dir, arr);
     }
     dirs
+}
+
+/// Convert v1 literal entries to the corresponding managed form. In v1, bare program words
+/// and canonical resume commands were instrumented; preserving them as literals would
+/// silently disable conversation tracking. Convert exactly those two forms, accepting v1's
+/// whitespace between tokens and single-quoted IDs. Require an exact registered word as the
+/// first token. With a path (`/usr/local/bin/claude`, `~/bin/claude`), preserve the user's
+/// chosen binary as a literal rather than substitute the first binary found on `PATH`;
+/// managed resume tracking is then unavailable. Leave all other commands literal.
+///
+/// Remove this conversion one release after format v2 ships. After removal, load
+/// unconverted v1 entries as literals: continue to accept the file, but without managed
+/// resume tracking.
+fn migrate_v1(cmd: &str) -> EntryKind {
+    let literal = || EntryKind::Literal(cmd.to_string());
+    let mut words = cmd.split([' ', '\t']).filter(|w| !w.is_empty());
+    let Some(h) = words.next().and_then(harness::registered) else {
+        return literal();
+    };
+    let (agent, selector) = h.shape();
+    let managed = |resume| EntryKind::Managed {
+        agent: agent.to_string(),
+        resume,
+    };
+    match (words.next(), words.next(), words.next()) {
+        (None, _, _) => managed(None),
+        (Some(sel), Some(id), None) if sel == selector => {
+            let id = id
+                .strip_prefix('\'')
+                .and_then(|t| t.strip_suffix('\''))
+                .unwrap_or(id);
+            if harness::is_uuid(id) {
+                managed(Some(id.to_string()))
+            } else {
+                literal()
+            }
+        }
+        _ => literal(),
+    }
 }
 
 /// Serialize the versioned wrapped schema. Store the name to distinguish names
@@ -107,11 +168,13 @@ pub fn fingerprint_json(cfg: &SessionConfig) -> String {
     dirs_json(cfg).dump()
 }
 
-/// Parse wrapped and flat schemas, returning the stored name when present.
-/// A wrapped file has an object-valued `dirs`; flat files have entry arrays at
-/// the top level, including when a directory is literally named `dirs`.
-/// A top-level `version` must be an integer from 1 through [`FORMAT_VERSION`];
-/// a missing version is interpreted as 1.
+/// Parse wrapped and flat schemas, returning the stored name when present. Identify a
+/// wrapped file by object-valued `dirs`; accept top-level entry arrays as a flat map,
+/// including an array under a directory named `dirs`. Require an integer `version` from 1
+/// through [`FORMAT_VERSION`]. Treat a missing version as 1 and convert its literal entries
+/// through [`migrate_v1`]. Accept entry forms regardless of version: strings and `{"cmd"}`
+/// objects for literals, `{"agent"}` objects for managed agents. Reject the whole file for
+/// objects with both keys, unregistered agents, or resume IDs that are not strict UUIDs.
 fn from_json(text: &str) -> io::Result<(Option<String>, SessionConfig)> {
     let invalid = |message| io::Error::new(io::ErrorKind::InvalidData, message);
     let parsed = jzon::parse(text).map_err(|e| invalid(e.to_string()))?;
@@ -120,9 +183,10 @@ fn from_json(text: &str) -> io::Result<(Option<String>, SessionConfig)> {
     }
     // Validate version metadata before detecting the schema shape.
     let version = &parsed["version"];
+    let mut v1 = true;
     if parsed.has_key("version") {
         match version.as_u64() {
-            Some(n) if (1..=FORMAT_VERSION).contains(&n) => {}
+            Some(n) if (1..=FORMAT_VERSION).contains(&n) => v1 = n == 1,
             Some(n) if n > FORMAT_VERSION => {
                 return Err(invalid(format!(
                     "session format version {n} is newer than this fleetcom \
@@ -156,10 +220,18 @@ fn from_json(text: &str) -> io::Result<(Option<String>, SessionConfig)> {
             return Err(invalid(format!("directory {dir:?}: expected an array")));
         }
         let mut entries = Vec::new();
+        // In v1, managed launches could only be stored as command text.
+        let literal = |cmd: &str| {
+            if v1 {
+                migrate_v1(cmd)
+            } else {
+                EntryKind::Literal(cmd.to_string())
+            }
+        };
         for (index, member) in val.members().enumerate() {
             if let Some(cmd) = member.as_str() {
                 entries.push(SessionEntry {
-                    cmd: cmd.to_string(),
+                    kind: literal(cmd),
                     group: None,
                     name: None,
                 });
@@ -171,9 +243,6 @@ fn from_json(text: &str) -> io::Result<(Option<String>, SessionConfig)> {
                     "{location}: expected a command string or an object"
                 )));
             }
-            let cmd = member["cmd"]
-                .as_str()
-                .ok_or_else(|| invalid(format!("{location}, field \"cmd\": expected a string")))?;
             let label = |field| {
                 opt_str(&member[field]).ok_or_else(|| {
                     invalid(format!(
@@ -181,8 +250,41 @@ fn from_json(text: &str) -> io::Result<(Option<String>, SessionConfig)> {
                     ))
                 })
             };
+            let kind = if member.has_key("agent") {
+                if member.has_key("cmd") {
+                    return Err(invalid(format!(
+                        "{location}: has both \"cmd\" and \"agent\"; an entry is one or the other"
+                    )));
+                }
+                let agent = member["agent"].as_str().ok_or_else(|| {
+                    invalid(format!("{location}, field \"agent\": expected a string"))
+                })?;
+                if harness::registered(agent).is_none() {
+                    return Err(invalid(format!(
+                        "{location}, field \"agent\": no agent named {agent:?}"
+                    )));
+                }
+                let resume = label("resume")?;
+                if let Some(id) = &resume
+                    && !harness::is_uuid(id)
+                {
+                    return Err(invalid(format!(
+                        "{location}, field \"resume\": expected a session ID \
+                         (8-4-4-4-12 lowercase hex) or null"
+                    )));
+                }
+                EntryKind::Managed {
+                    agent: agent.to_string(),
+                    resume,
+                }
+            } else {
+                let cmd = member["cmd"].as_str().ok_or_else(|| {
+                    invalid(format!("{location}, field \"cmd\": expected a string"))
+                })?;
+                literal(cmd)
+            };
             entries.push(SessionEntry {
-                cmd: cmd.to_string(),
+                kind,
                 group: label("group")?,
                 name: label("name")?,
             });
@@ -458,41 +560,54 @@ fn prune_recovery(dir: &Path, keep_stem: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testutil::{dead_pid, temp};
+    use crate::{
+        harness::fixtures::{ID, OTHER},
+        testutil::{dead_pid, temp},
+    };
 
-    /// Unadorned entry: the plain-string member form.
+    /// Unadorned literal: the plain-string member form.
     fn e(cmd: &str) -> SessionEntry {
         SessionEntry {
-            cmd: cmd.into(),
+            kind: EntryKind::Literal(cmd.into()),
             group: None,
             name: None,
         }
     }
 
-    /// Grouped entry: the `{"cmd", "group"}` member form.
+    /// Grouped literal: the `{"cmd", "group"}` member form.
     fn ge(cmd: &str, group: &str) -> SessionEntry {
         SessionEntry {
-            cmd: cmd.into(),
             group: Some(group.into()),
-            name: None,
+            ..e(cmd)
         }
     }
 
-    /// Named entry: the `{"cmd", "name"}` member form.
+    /// Named literal: the `{"cmd", "name"}` member form.
     fn ne(cmd: &str, name: &str) -> SessionEntry {
         SessionEntry {
-            cmd: cmd.into(),
-            group: None,
             name: Some(name.into()),
+            ..e(cmd)
         }
     }
 
-    /// Grouped and named entry: the full `{"cmd", "group", "name"}` form.
+    /// Grouped and named literal: the full `{"cmd", "group", "name"}` form.
     fn gne(cmd: &str, group: &str, name: &str) -> SessionEntry {
         SessionEntry {
-            cmd: cmd.into(),
             group: Some(group.into()),
             name: Some(name.into()),
+            ..e(cmd)
+        }
+    }
+
+    /// Unadorned managed entry: the `{"agent"[, "resume"]}` member form.
+    fn m(agent: &str, resume: Option<&str>) -> SessionEntry {
+        SessionEntry {
+            kind: EntryKind::Managed {
+                agent: agent.into(),
+                resume: resume.map(String::from),
+            },
+            group: None,
+            name: None,
         }
     }
 
@@ -580,13 +695,13 @@ mod tests {
         cfg.insert("~/proj".into(), vec![e("cargo test"), e("vim")]);
         cfg.insert("/tmp".into(), vec![e("top")]);
 
-        let expected = "{\n  \"version\": 1,\n  \"name\": \"work\",\n  \"dirs\": {\n    \"/tmp\": [\n      \"top\"\n    ],\n    \"~/proj\": [\n      \"cargo test\",\n      \"vim\"\n    ]\n  }\n}";
+        let expected = "{\n  \"version\": 2,\n  \"name\": \"work\",\n  \"dirs\": {\n    \"/tmp\": [\n      \"top\"\n    ],\n    \"~/proj\": [\n      \"cargo test\",\n      \"vim\"\n    ]\n  }\n}";
         assert_eq!(to_json("work", &cfg), expected);
     }
 
     /// Saved files include the accepted format version.
     #[test]
-    fn save_writes_version_1_and_load_accepts_it() {
+    fn save_writes_version_2_and_load_accepts_it() {
         let dir = temp("session_version_roundtrip");
         let mut cfg = SessionConfig::new();
         cfg.insert("~/p".into(), vec![e("vim")]);
@@ -595,9 +710,264 @@ mod tests {
         assert!(
             fs::read_to_string(&file)
                 .unwrap()
-                .contains("\"version\": 1")
+                .contains("\"version\": 2")
         );
         assert_eq!(load_in(&dir, "versioned").unwrap(), cfg);
+    }
+
+    /// Round-trip managed entries in every label combination, with and without resume IDs,
+    /// alongside literals.
+    #[test]
+    fn round_trips_managed_entries() {
+        let dir = temp("session_managed_roundtrip");
+        let mut cfg = SessionConfig::new();
+        cfg.insert(
+            "~/proj".into(),
+            vec![
+                m("claude", Some(ID)),
+                m("omp", None),
+                SessionEntry {
+                    group: Some("agents".into()),
+                    ..m("codex", Some(OTHER))
+                },
+                SessionEntry {
+                    name: Some("pilot".into()),
+                    ..m("grok", None)
+                },
+                SessionEntry {
+                    group: Some("agents".into()),
+                    name: Some("reviewer".into()),
+                    ..m("claude", None)
+                },
+                gne("cargo test", "ci", "unit tests"),
+                e("vim"),
+            ],
+        );
+
+        save_in(&dir, "managed", &cfg).unwrap();
+        assert_eq!(load_in(&dir, "managed").unwrap(), cfg);
+    }
+
+    /// Serialize managed entries as objects with `agent` first. Include `resume`, `group`,
+    /// and `name` only when set; never use a bare string.
+    #[test]
+    fn managed_entries_serialize_as_agent_objects_with_optional_fields() {
+        let mut cfg = SessionConfig::new();
+        cfg.insert(
+            "~/p".into(),
+            vec![
+                m("omp", None),
+                SessionEntry {
+                    group: Some("agents".into()),
+                    name: Some("pilot".into()),
+                    ..m("claude", Some(ID))
+                },
+            ],
+        );
+        assert_eq!(
+            fingerprint_json(&cfg),
+            format!(
+                r#"{{"~/p":[{{"agent":"omp"}},{{"agent":"claude","resume":"{ID}","group":"agents","name":"pilot"}}]}}"#
+            )
+        );
+    }
+
+    /// Include the resume ID in the fingerprint so a cadence pass detects newly captured
+    /// sessions without other fleet changes.
+    #[test]
+    fn fingerprint_tracks_a_managed_entrys_resume_id() {
+        let fp = |resume| {
+            let mut cfg = SessionConfig::new();
+            cfg.insert("~/p".into(), vec![m("claude", resume)]);
+            fingerprint_json(&cfg)
+        };
+        assert_ne!(fp(None), fp(Some(ID)));
+        assert_ne!(fp(Some(ID)), fp(Some(OTHER)));
+        assert_eq!(fp(Some(ID)), fp(Some(ID)));
+    }
+
+    /// Preserve literal agent words in v2 files; migrate only v1 literals.
+    #[test]
+    fn v2_literal_agent_words_stay_literal() {
+        let (_, cfg) = from_json(&format!(
+            r#"{{"version": 2, "name": "v", "dirs": {{"d": ["claude",
+                {{"cmd": "codex resume '{ID}'", "group": "g"}}, {{"agent": "omp"}}]}}}}"#
+        ))
+        .unwrap();
+        assert_eq!(
+            cfg["d"],
+            vec![
+                e("claude"),
+                ge(&format!("codex resume '{ID}'"), "g"),
+                m("omp", None)
+            ]
+        );
+    }
+
+    /// Convert the two instrumented v1 forms to managed entries, accepting the original
+    /// whitespace and quoted IDs. Keep paths, extra arguments, shell syntax, and malformed
+    /// IDs literal.
+    #[test]
+    fn v1_literals_migrate_exactly_the_two_instrumented_shapes() {
+        let cases: Vec<(String, SessionEntry)> = vec![
+            ("claude".into(), m("claude", None)),
+            ("codex".into(), m("codex", None)),
+            ("grok".into(), m("grok", None)),
+            ("omp".into(), m("omp", None)),
+            (format!("claude --resume {ID}"), m("claude", Some(ID))),
+            (format!("claude --resume '{ID}'"), m("claude", Some(ID))),
+            (format!("codex resume '{ID}'"), m("codex", Some(ID))),
+            (format!("grok --resume {ID}"), m("grok", Some(ID))),
+            (format!("omp --resume '{ID}'"), m("omp", Some(ID))),
+            // v1's token tolerance: tabs, repeated and surrounding whitespace.
+            ("  claude\t".into(), m("claude", None)),
+            (format!("claude\t--resume  '{ID}' "), m("claude", Some(ID))),
+            // Preserve the user's chosen binary path as a literal, without managed resume
+            // tracking.
+            ("/usr/local/bin/claude".into(), e("/usr/local/bin/claude")),
+            ("~/bin/claude".into(), e("~/bin/claude")),
+            (
+                format!("/usr/local/bin/claude --resume '{ID}'"),
+                e(&format!("/usr/local/bin/claude --resume '{ID}'")),
+            ),
+            // Arguments, prompts, the wrong selector, and shell syntax.
+            ("claude --model opus".into(), e("claude --model opus")),
+            ("claude 'fix the tests'".into(), e("claude 'fix the tests'")),
+            (format!("claude -r {ID}"), e(&format!("claude -r {ID}"))),
+            (
+                format!("codex --resume {ID}"),
+                e(&format!("codex --resume {ID}")),
+            ),
+            (
+                format!("claude --resume {ID} --model opus"),
+                e(&format!("claude --resume {ID} --model opus")),
+            ),
+            ("claude --resume".into(), e("claude --resume")),
+            (
+                "claude --resume not-a-uuid".into(),
+                e("claude --resume not-a-uuid"),
+            ),
+            (
+                format!("claude --resume '{ID}"),
+                e(&format!("claude --resume '{ID}")),
+            ),
+            (
+                format!("claude --resume ''{ID}''"),
+                e(&format!("claude --resume ''{ID}''")),
+            ),
+            ("claude --resume $ID".into(), e("claude --resume $ID")),
+            ("claude | tee log".into(), e("claude | tee log")),
+            ("claude; ls".into(), e("claude; ls")),
+            ("FOO=bar claude".into(), e("FOO=bar claude")),
+            ("'claude'".into(), e("'claude'")),
+            ("claudius".into(), e("claudius")),
+            ("vim".into(), e("vim")),
+            (String::new(), e("")),
+        ];
+        for (cmd, expected) in &cases {
+            assert_eq!(migrate_v1(cmd), expected.kind, "{cmd:?}");
+        }
+        // Through the loader: every v1 spelling, wrapped and flat, string and
+        // object form, with labels carried over.
+        let member = jzon::JsonValue::from(cases[4].0.as_str()).dump();
+        for text in [
+            format!(r#"{{"version": 1, "name": "v", "dirs": {{"d": [{member}]}}}}"#),
+            format!(r#"{{"name": "v", "dirs": {{"d": [{member}]}}}}"#),
+            format!(r#"{{"d": [{member}]}}"#),
+            format!(r#"{{"version": 1, "d": [{member}]}}"#),
+        ] {
+            let (_, cfg) = from_json(&text).unwrap();
+            assert_eq!(cfg["d"], vec![m("claude", Some(ID))], "{text}");
+        }
+        let (_, cfg) = from_json(
+            r#"{"d": [{"cmd": "claude", "group": "agents", "name": "pilot"},
+                      {"cmd": "/usr/local/bin/claude", "name": "mine"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            cfg["d"],
+            vec![
+                SessionEntry {
+                    group: Some("agents".into()),
+                    name: Some("pilot".into()),
+                    ..m("claude", None)
+                },
+                ne("/usr/local/bin/claude", "mine"),
+            ]
+        );
+    }
+
+    /// Reject the entire file for a managed entry with a `cmd` field, an unregistered
+    /// agent, or a malformed resume ID.
+    #[test]
+    fn rejects_malformed_managed_entries() {
+        let cases = [
+            (
+                r#"{"cmd": "claude", "agent": "claude"}"#.to_string(),
+                "directory \"d\", entry 2: has both \"cmd\" and \"agent\"; \
+                 an entry is one or the other"
+                    .to_string(),
+            ),
+            (
+                r#"{"agent": "vim"}"#.into(),
+                "directory \"d\", entry 2, field \"agent\": no agent named \"vim\"".into(),
+            ),
+            (
+                r#"{"agent": "/usr/local/bin/claude"}"#.into(),
+                "directory \"d\", entry 2, field \"agent\": no agent named \
+                 \"/usr/local/bin/claude\""
+                    .into(),
+            ),
+            (
+                r#"{"agent": null}"#.into(),
+                "directory \"d\", entry 2, field \"agent\": expected a string".into(),
+            ),
+            (
+                r#"{"agent": 42}"#.into(),
+                "directory \"d\", entry 2, field \"agent\": expected a string".into(),
+            ),
+            (
+                r#"{"agent": "claude", "resume": "not-a-uuid"}"#.into(),
+                "directory \"d\", entry 2, field \"resume\": expected a session ID \
+                 (8-4-4-4-12 lowercase hex) or null"
+                    .into(),
+            ),
+            (
+                format!(
+                    r#"{{"agent": "claude", "resume": "{}"}}"#,
+                    ID.to_uppercase()
+                ),
+                "directory \"d\", entry 2, field \"resume\": expected a session ID \
+                 (8-4-4-4-12 lowercase hex) or null"
+                    .into(),
+            ),
+            (
+                format!(r#"{{"agent": "claude", "resume": "'{ID}'"}}"#),
+                "directory \"d\", entry 2, field \"resume\": expected a session ID \
+                 (8-4-4-4-12 lowercase hex) or null"
+                    .into(),
+            ),
+            (
+                r#"{"agent": "claude", "resume": 42}"#.into(),
+                "directory \"d\", entry 2, field \"resume\": expected a string or null".into(),
+            ),
+        ];
+        for (entry, expected) in cases {
+            for version in ["", r#""version": 1, "#, r#""version": 2, "#] {
+                let dirs = format!(r#""d": ["valid-command", {entry}]"#);
+                for text in [
+                    format!("{{{version}{dirs}}}"),
+                    format!("{{{version}\"dirs\": {{{dirs}}}}}"),
+                ] {
+                    let err = from_json(&text).unwrap_err();
+                    assert_eq!(err.kind(), io::ErrorKind::InvalidData, "{text}");
+                    assert_eq!(err.to_string(), expected, "{text}");
+                }
+            }
+        }
+        // A null resume is "fresh", the same as an absent one.
+        let (_, cfg) = from_json(r#"{"d": [{"agent": "claude", "resume": null}]}"#).unwrap();
+        assert_eq!(cfg["d"], vec![m("claude", None)]);
     }
 
     /// A missing version is interpreted as version 1.
@@ -616,13 +986,14 @@ mod tests {
         assert_eq!(cfg["~/proj"], vec![e("vim")]);
     }
 
-    /// A newer format fails with an error naming both versions.
+    /// Reject newer formats and name both versions in the error. Apply the same version
+    /// check as v1 builds when reading v2 files.
     #[test]
     fn newer_version_refuses_naming_both_versions() {
-        let err = from_json(r#"{"version": 2, "name": "v", "dirs": {}}"#).unwrap_err();
+        let err = from_json(r#"{"version": 3, "name": "v", "dirs": {}}"#).unwrap_err();
         assert_eq!(
             err.to_string(),
-            "session format version 2 is newer than this fleetcom (supports 1); \
+            "session format version 3 is newer than this fleetcom (supports 2); \
              load it with a newer build"
         );
     }
@@ -634,7 +1005,7 @@ mod tests {
         assert_eq!(
             err.to_string(),
             "session format version 0 is not one this fleetcom reads \
-             (supports 1); load it with a newer build"
+             (supports 2); load it with a newer build"
         );
     }
 
@@ -645,7 +1016,7 @@ mod tests {
         assert_eq!(
             err.to_string(),
             "session format version \"2.0\" is not one this fleetcom reads \
-             (supports 1); load it with a newer build"
+             (supports 2); load it with a newer build"
         );
     }
 
@@ -661,7 +1032,7 @@ mod tests {
 
         let err = load_in(&dir, "future").unwrap_err();
         assert!(err.to_string().contains("version 3"), "{err}");
-        assert!(err.to_string().contains("supports 1"), "{err}");
+        assert!(err.to_string().contains("supports 2"), "{err}");
     }
 
     /// A flat schema treats `version` as metadata, not a directory.
@@ -773,7 +1144,7 @@ mod tests {
                     err.to_string().contains(&format!("version {value}")),
                     "{err}"
                 );
-                assert!(err.to_string().contains("supports 1"), "{err}");
+                assert!(err.to_string().contains("supports 2"), "{err}");
             }
         }
     }
@@ -940,7 +1311,7 @@ mod tests {
         for text in [
             r#"{"name": "a/b", "dirs": {"d": ["valid", {"cmd": false}]}}"#,
             r#"{"name": "a/b", "dirs": {"d": null}}"#,
-            r#"{"version": 2, "name": "a/b", "dirs": {}}"#,
+            r#"{"version": 3, "name": "a/b", "dirs": {}}"#,
         ] {
             fs::write(&file, text).unwrap();
             assert!(load_in(&dir, "a/b").is_err());
@@ -982,6 +1353,34 @@ mod tests {
             vec![e("cargo test")]
         );
         assert_eq!(list_in(&dir), vec!["old".to_string()]);
+    }
+
+    /// Load v1 recovery snapshots as managed entries when the stored strings match the old
+    /// instrumented forms. Preserve recovery across the upgrade.
+    #[test]
+    fn v1_recovery_snapshots_migrate_on_load() {
+        let base = temp("session_recovery_migrate");
+        let rec = recovery_dir(&base);
+        fs::create_dir_all(&rec).unwrap();
+        fs::write(
+            rec.join("20260714-093015-11.json"),
+            format!(
+                r#"{{"version": 1, "name": "autosaved 2026-07-14 09:30", "dirs": {{"~/p": [
+                    {{"cmd": "claude --resume '{ID}'", "group": "agents"}}, "omp", "cargo test"]}}}}"#
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            load_recovery_in(&rec, "20260714-093015-11").unwrap()["~/p"],
+            vec![
+                SessionEntry {
+                    group: Some("agents".into()),
+                    ..m("claude", Some(ID))
+                },
+                m("omp", None),
+                e("cargo test"),
+            ]
+        );
     }
 
     /// A flat-schema file can be replaced under its filename stem.
@@ -1045,7 +1444,7 @@ mod tests {
         let file = save_recovery_in(&rec, &stem, &label, &cfg).unwrap();
         assert_eq!(file, rec.join("20260714-093015-4242.json"));
         let text = fs::read_to_string(&file).unwrap();
-        assert!(text.contains("\"version\": 1"), "{text}");
+        assert!(text.contains("\"version\": 2"), "{text}");
         let (stored, parsed) = from_json(&text).unwrap();
         assert_eq!(stored.as_deref(), Some("autosaved 2026-07-14 09:30"));
         assert_eq!(parsed, cfg);

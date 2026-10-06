@@ -2,7 +2,7 @@ use super::*;
 use crate::{
     protocol::{Preview, PreviewSource},
     supervisor::Supervisor,
-    testutil::{Scratch, temp, wait_until},
+    testutil::{Scratch, temp, wait_until, write_executable},
     transport::LocalTransport,
     ui::scroll_window,
 };
@@ -114,6 +114,7 @@ fn view(id: u64, cwd: PathBuf, tagged: bool, group: Option<&str>) -> TaskView {
         cwd,
         tagged,
         flagship: false,
+        managed: false,
         group: group.map(str::to_string),
         name: None,
         lifecycle: Lifecycle::Active,
@@ -3078,6 +3079,443 @@ fn state_and_dir_mode_spawns_stay_unassigned() {
     app.pump();
     let v = app.views.iter().find(|v| v.id == 2).unwrap();
     assert_eq!(v.group, None);
+}
+
+// --- `n` spawn prompt: Agent page --------------------------------------
+
+/// Supply core events to the app without a running core.
+struct Scripted(Vec<Event>);
+
+impl Transport for Scripted {
+    fn send(&mut self, _cmd: Command) {}
+
+    fn poll(&mut self) -> Vec<Event> {
+        std::mem::take(&mut self.0)
+    }
+
+    fn connected(&self) -> bool {
+        true
+    }
+
+    fn shutdown(&mut self, _intent: ExitIntent) {}
+}
+
+impl App {
+    /// Create a detached app with the supplied `agents` list and return the send log. Do
+    /// not pump `new_local`, so the host's installed agents are never read into the list.
+    /// Do not forward Enter to a core.
+    fn with_agents(agents: &[&str]) -> (Self, Arc<std::sync::Mutex<Vec<Command>>>) {
+        let mut app = Self::new_local(30, 100);
+        app.agents = agents.iter().map(|a| a.to_string()).collect();
+        app.transport = Box::new(Unplugged);
+        let sent = app.record_sends();
+        (app, sent)
+    }
+
+    /// Press `n`, then Tab to open the Agent page.
+    fn open_agent_page(&mut self) {
+        self.on_key_dashboard(key(KeyCode::Char('n')));
+        self.on_key_spawn(key(KeyCode::Tab));
+        assert_eq!(self.spawn_page, SpawnPage::Agent);
+    }
+
+    /// Type `text` into the open spawn prompt one key at a time.
+    fn type_spawn(&mut self, text: &str) {
+        for c in text.chars() {
+            self.on_key_spawn(key(KeyCode::Char(c)));
+        }
+    }
+}
+
+/// Create an app with only a stub `claude` on the core's `PATH`. Discover and launch that
+/// stub without running a real agent. Keep capture assets and Claude registry reads inside
+/// the scratch tree.
+fn stub_claude_fixture(tag: &str) -> (App, Scratch) {
+    let dir = temp(&format!("agent_{tag}"));
+    let bin = dir.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    write_executable(&bin.join("claude"), "exit 0");
+    let ctx = crate::protocol::LaunchContext {
+        env: vec![
+            ("PATH".into(), bin.as_os_str().to_os_string()),
+            (
+                path::FLEETCOM_RUNTIME_DIR.into(),
+                dir.join("run").into_os_string(),
+            ),
+            (
+                "CLAUDE_CONFIG_DIR".into(),
+                dir.join("claude-home").into_os_string(),
+            ),
+        ],
+        cwd: dir.to_path_buf(),
+    };
+    let mut app = App::new_local_with_ctx(30, 100, ctx);
+    app.pump();
+    assert_eq!(app.agents, ["claude"], "discovery must see only the stub");
+    (app, dir)
+}
+
+/// Switch between Command and Agent with Tab only when agents are installed. With no
+/// agents, ignore Tab and BackTab and keep the current page.
+#[test]
+fn spawn_tab_toggles_pages_only_with_agents() {
+    let (mut app, _) = App::with_agents(&[]);
+    app.on_key_dashboard(key(KeyCode::Char('n')));
+    assert_eq!(app.spawn_page, SpawnPage::Command);
+    app.on_key_spawn(key(KeyCode::Tab));
+    assert_eq!(
+        app.spawn_page,
+        SpawnPage::Command,
+        "no agents: Tab is unbound"
+    );
+    app.on_key_spawn(key(KeyCode::BackTab));
+    assert_eq!(app.spawn_page, SpawnPage::Command);
+    assert_eq!(app.mode, Mode::Spawn, "and the prompt stays open");
+    app.on_key_spawn(key(KeyCode::Esc));
+
+    app.agents = vec!["claude".to_string()];
+    app.on_key_dashboard(key(KeyCode::Char('n')));
+    app.on_key_spawn(key(KeyCode::Tab));
+    assert_eq!(app.spawn_page, SpawnPage::Agent);
+    app.on_key_spawn(key(KeyCode::Tab));
+    assert_eq!(app.spawn_page, SpawnPage::Command);
+    app.on_key_spawn(key(KeyCode::BackTab));
+    assert_eq!(app.spawn_page, SpawnPage::Agent);
+}
+
+/// Filter by a case-insensitive substring of the program word. Preserve registry order
+/// regardless of match position, and select the first match after every edit.
+#[test]
+fn agent_filter_matches_substrings_in_registry_order() {
+    let (mut app, _) = App::with_agents(&["claude", "codex", "grok", "omp"]);
+    app.open_agent_page();
+    assert_eq!(app.agent_candidates, ["claude", "codex", "grok", "omp"]);
+    assert_eq!(app.agent_sel, 0);
+
+    // `o` is at index 1 of codex, 2 of grok and 0 of omp.
+    app.type_spawn("O");
+    assert_eq!(
+        app.agent_candidates,
+        ["codex", "grok", "omp"],
+        "case folds; the order is the registry's, not the match position"
+    );
+    app.type_spawn("k");
+    assert_eq!(
+        app.agent_candidates,
+        ["grok"],
+        "\"ok\" is a substring, not a prefix"
+    );
+    app.type_spawn("z");
+    assert!(app.agent_candidates.is_empty());
+    app.on_key_spawn(key(KeyCode::Backspace));
+    assert_eq!(app.agent_candidates, ["grok"], "backspace re-widens");
+}
+
+/// Move through matches with Down and Up, clamping at both ends. Select the first match
+/// after a filter edit.
+#[test]
+fn agent_arrows_step_within_the_matches() {
+    let (mut app, _) = App::with_agents(&["claude", "codex", "grok", "omp"]);
+    app.open_agent_page();
+    app.type_spawn("o"); // codex, grok, omp
+    app.on_key_spawn(key(KeyCode::Up));
+    assert_eq!(app.agent_sel, 0, "Up clamps at the first match");
+    for _ in 0..3 {
+        app.on_key_spawn(key(KeyCode::Down));
+    }
+    assert_eq!(app.agent_sel, 2, "Down clamps at the last match");
+    app.on_key_spawn(key(KeyCode::Up));
+    assert_eq!(app.agent_sel, 1);
+    app.type_spawn("m");
+    assert_eq!(app.agent_candidates, ["omp"]);
+    assert_eq!(app.agent_sel, 0, "a filter edit reselects the first match");
+}
+
+/// Include every launch notice and failure in the displayed session-load status. In `sync`,
+/// only the last status in a poll is retained, so include all reasons in the final summary.
+#[test]
+fn session_load_status_keeps_capture_notices_and_failures() {
+    let dir = temp("load_status");
+    let (bin, config, codex_home) = (dir.join("bin"), dir.join("config"), dir.join("codex"));
+    for d in [&bin, &codex_home] {
+        std::fs::create_dir_all(d).unwrap();
+    }
+    write_executable(&bin.join("codex"), "exit 0");
+    // Use an unchainable notify route to launch codex without capture.
+    std::fs::write(codex_home.join("config.toml"), "notify = [1]\n").unwrap();
+    let ctx = crate::protocol::LaunchContext {
+        env: vec![
+            ("PATH".into(), bin.as_os_str().to_os_string()),
+            (
+                path::FLEETCOM_RUNTIME_DIR.into(),
+                dir.join("run").into_os_string(),
+            ),
+            (
+                "FLEETCOM_CONFIG_DIR".into(),
+                config.as_os_str().to_os_string(),
+            ),
+            ("CODEX_HOME".into(), codex_home.as_os_str().to_os_string()),
+        ],
+        cwd: dir.to_path_buf(),
+    };
+    let managed = |agent: &str| crate::session::SessionEntry {
+        kind: crate::session::EntryKind::Managed {
+            agent: agent.into(),
+            resume: None,
+        },
+        group: None,
+        name: None,
+    };
+    let cfg = crate::session::SessionConfig::from([(
+        dir.to_string_lossy().into_owned(),
+        vec![managed("codex"), managed("grok"), managed("codex")],
+    )]);
+    crate::session::save_in(&config.join("sessions"), "fleet", &cfg).unwrap();
+
+    let mut app = App::new_local_with_ctx(30, 100, ctx);
+    app.pump();
+    app.transport.send(Command::LoadSession {
+        name: "fleet".into(),
+    });
+    app.pump();
+    let status = app.status.clone().unwrap_or_default();
+    assert_eq!(app.views.len(), 2, "both codex entries load: {status}");
+    for needle in [
+        "loaded 'fleet'",
+        "1 failed to spawn",
+        "grok not found on PATH",
+        "codex capture unavailable",
+        "(2 tasks)",
+    ] {
+        assert!(
+            status.contains(needle),
+            "{needle:?} missing from {status:?}"
+        );
+    }
+}
+
+/// Press `n`, Tab, then Enter to launch the first installed agent in the invocation
+/// directory. Close the prompt, admit a managed task, and label its row with the
+/// program word.
+#[test]
+fn agent_enter_launches_the_highlighted_agent_managed() {
+    let (mut app, _dir) = stub_claude_fixture("enter");
+    let sent = app.record_sends();
+    app.open_agent_page();
+    app.on_key_spawn(key(KeyCode::Enter));
+    assert_eq!(app.mode, Mode::Dashboard, "Enter closes the prompt");
+    assert_eq!(
+        sent.lock().unwrap().as_slice(),
+        [Command::SpawnAgent {
+            agent: "claude".to_string(),
+            cwd: app.invocation_dir.clone(),
+            group: None,
+        }]
+    );
+    app.pump();
+    assert_eq!(app.views.len(), 1);
+    assert!(app.views[0].managed, "the core must admit a managed task");
+    assert_eq!(
+        app.views[0].command, "claude",
+        "the row shows the program word"
+    );
+}
+
+/// Launch the selected row on Enter, using the directory selected through `@` and the group
+/// inherited in Custom mode. Use the same destination as for Command-page launches.
+#[test]
+fn agent_enter_uses_the_picked_directory_and_inherited_group() {
+    let root = temp("agent_dest");
+    let (mut app, sent) = App::with_agents(&["claude", "codex"]);
+    app.views = vec![view(1, app.invocation_dir.clone(), false, Some("alpha"))];
+    app.selected_id = Some(1);
+    app.group_mode = GroupMode::Custom;
+
+    // With a trailing slash, there is no path fragment. Keep row 0 selected (the resolved
+    // path, `DirKind::Use`) and open Spawn on Enter.
+    type_pickdir(&mut app, &format!("{}/", root.display()));
+    app.on_key_pickdir(key(KeyCode::Enter));
+    assert_eq!(app.mode, Mode::Spawn);
+    assert_eq!(app.spawn_cwd, *root);
+    assert_eq!(app.spawn_group.as_deref(), Some("alpha"));
+
+    app.on_key_spawn(key(KeyCode::Tab));
+    app.on_key_spawn(key(KeyCode::Down));
+    app.on_key_spawn(key(KeyCode::Enter));
+    assert_eq!(
+        sent.lock().unwrap().as_slice(),
+        [Command::SpawnAgent {
+            agent: "codex".to_string(),
+            cwd: root.to_path_buf(),
+            group: Some("alpha".to_string()),
+        }]
+    );
+    assert_eq!(app.mode, Mode::Dashboard);
+}
+
+/// With no match, send nothing on Enter and keep the prompt open on the Agent page.
+#[test]
+fn agent_enter_with_no_match_sends_nothing() {
+    let (mut app, sent) = App::with_agents(&["claude"]);
+    app.open_agent_page();
+    app.type_spawn("x");
+    assert!(app.agent_candidates.is_empty());
+    app.on_key_spawn(key(KeyCode::Enter));
+    assert_eq!(app.mode, Mode::Spawn, "no match: Enter must not close");
+    assert_eq!(app.spawn_page, SpawnPage::Agent);
+    assert!(sent.lock().unwrap().is_empty());
+}
+
+/// Close the prompt on Esc without sending a command.
+#[test]
+fn agent_page_esc_closes_the_prompt_without_sending() {
+    let (mut app, sent) = App::with_agents(&["claude"]);
+    app.open_agent_page();
+    app.type_spawn("cl");
+    app.on_key_spawn(key(KeyCode::Esc));
+    assert_eq!(app.mode, Mode::Dashboard);
+    assert!(sent.lock().unwrap().is_empty());
+}
+
+/// Preserve separate command and filter buffers across Tab. Clear both when reopening the
+/// prompt on the Command page, so the full agent list is available on Tab.
+#[test]
+fn spawn_pages_keep_separate_buffers_until_the_prompt_reopens() {
+    let (mut app, _) = App::with_agents(&["claude", "codex"]);
+    app.on_key_dashboard(key(KeyCode::Char('n')));
+    app.type_spawn("cargo");
+    app.on_key_spawn(key(KeyCode::Tab));
+    assert!(app.agent_input.is_empty(), "command text is not a filter");
+    assert_eq!(app.agent_candidates, ["claude", "codex"]);
+    app.type_spawn("co");
+    assert_eq!(app.agent_candidates, ["codex"]);
+    app.on_key_spawn(key(KeyCode::Tab));
+    assert_eq!(app.input.as_str(), "cargo", "the command survives the flip");
+    app.on_key_spawn(key(KeyCode::Tab));
+    assert_eq!(app.agent_input.as_str(), "co", "and so does the filter");
+    assert_eq!(app.agent_candidates, ["codex"]);
+
+    app.on_key_spawn(key(KeyCode::Esc));
+    app.on_key_dashboard(key(KeyCode::Char('n')));
+    assert_eq!(app.spawn_page, SpawnPage::Command, "reopens on Command");
+    assert!(app.input.is_empty());
+    assert!(
+        app.agent_input.is_empty(),
+        "the filter is empty at every open"
+    );
+    assert_eq!(
+        app.agent_candidates,
+        ["claude", "codex"],
+        "so Tab shows the full list"
+    );
+}
+
+/// Run Command-page text literally even when agents are installed: submit a typed `claude`
+/// as `Spawn`, never `SpawnAgent`.
+#[test]
+fn command_page_enter_still_spawns_the_literal_text() {
+    let (mut app, sent) = App::with_agents(&["claude"]);
+    app.on_key_dashboard(key(KeyCode::Char('n')));
+    app.type_spawn("claude");
+    app.on_key_spawn(key(KeyCode::Enter));
+    assert_eq!(app.mode, Mode::Dashboard);
+    assert_eq!(
+        sent.lock().unwrap().as_slice(),
+        [Command::Spawn {
+            command: "claude".to_string(),
+            cwd: app.invocation_dir.clone(),
+            group: None,
+        }]
+    );
+}
+
+/// Paste into the filter on the Agent page, without changing the command buffer.
+#[test]
+fn agent_page_paste_filters_the_rows() {
+    let (mut app, _) = App::with_agents(&["claude", "codex"]);
+    app.open_agent_page();
+    app.on_paste("cod");
+    assert_eq!(app.agent_input.as_str(), "cod");
+    assert_eq!(app.agent_candidates, ["codex"]);
+    assert!(app.input.is_empty(), "the command buffer is untouched");
+}
+
+/// Refilter an open Agent page after receiving `Agents` on reconnect. With an empty list,
+/// switch to Command and disable Tab.
+#[test]
+fn agents_event_refilters_and_an_empty_list_leaves_the_agent_page() {
+    let (mut app, _) = App::with_agents(&["claude", "codex"]);
+    app.open_agent_page();
+    app.type_spawn("c");
+
+    app.transport = Box::new(Scripted(vec![Event::Agents(vec!["codex".to_string()])]));
+    app.sync();
+    assert_eq!(app.spawn_page, SpawnPage::Agent);
+    assert_eq!(
+        app.agent_candidates,
+        ["codex"],
+        "the rows follow the new list"
+    );
+
+    app.transport = Box::new(Scripted(vec![Event::Agents(Vec::new())]));
+    app.sync();
+    assert_eq!(app.spawn_page, SpawnPage::Command);
+    assert_eq!(app.mode, Mode::Spawn, "the prompt itself stays open");
+    app.on_key_spawn(key(KeyCode::Tab));
+    assert_eq!(app.spawn_page, SpawnPage::Command);
+}
+
+/// Include the Agent-page hint in the Command footer only when agents are installed. On the
+/// Agent page, render the `❯` destination, filter, matching rows, first-row highlight, and
+/// page hint.
+#[test]
+fn agent_page_paints_the_rows_and_highlights_the_first_match() {
+    let (mut app, _) = App::with_agents(&[]);
+    app.cols = 80;
+    app.on_key_dashboard(key(KeyCode::Char('n')));
+    let frame = painted(&mut app);
+    assert!(frame.contains("  enter run · esc"), "{frame:?}");
+    assert!(!frame.contains("tab agents"), "no agents: no Agent page");
+    app.on_key_spawn(key(KeyCode::Esc));
+
+    app.agents = ["claude", "codex"].map(String::from).to_vec();
+    app.on_key_dashboard(key(KeyCode::Char('n')));
+    app.spawn_cwd = PathBuf::from("/x");
+    app.spawn_group = Some("alpha".to_string());
+    let frame = painted(&mut app);
+    assert!(
+        frame.contains("enter run · tab agents (2) · esc"),
+        "{frame:?}"
+    );
+
+    app.on_key_spawn(key(KeyCode::Tab));
+    app.type_spawn("c");
+    let frame = painted(&mut app);
+    assert!(frame.contains("  ❯ /x ▸ alpha ▸ agent: c"), "{frame:?}");
+    assert!(frame.contains("    ▸ claude"), "{frame:?}");
+    assert!(frame.contains("      codex"), "{frame:?}");
+    assert!(!frame.contains("▸ codex"), "only the first match is marked");
+    assert!(
+        frame.contains("↑↓ pick · enter launch · tab command · esc"),
+        "{frame:?}"
+    );
+}
+
+/// When nothing matches, list the registered agents missing from the host in registry
+/// order.
+#[test]
+fn agent_page_no_match_names_the_missing_agents() {
+    let (mut app, _) = App::with_agents(&["claude", "codex"]);
+    app.cols = 80;
+    assert_eq!(app.missing_agents(), ["grok", "omp"]);
+    app.open_agent_page();
+    app.type_spawn("zz");
+    let frame = painted(&mut app);
+    assert!(
+        frame.contains("(no installed agent matches · grok, omp not found on this host)"),
+        "{frame:?}"
+    );
+    assert!(!frame.contains("▸ claude"), "{frame:?}");
 }
 
 // --- OSC 52 clipboard emission ------------------------------------------

@@ -27,7 +27,7 @@ use crossterm::{
 use crate::{
     editbuf::EditBuffer,
     format::collation_key,
-    path,
+    harness, path,
     protocol::{
         ClipboardKind, Command, Event, Key, Lifecycle, Mods, MouseBtn, MouseKind, RecoveryEntry,
         ScreenView, ScrollAction, TaskView, UNASSIGNED,
@@ -139,6 +139,14 @@ pub enum SessionPage {
     Recovery,
 }
 
+/// Active page of the spawn prompt: `Command` for literal text, `Agent` for managed
+/// launches.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum SpawnPage {
+    Command,
+    Agent,
+}
+
 /// What Enter does with a picker row.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum DirKind {
@@ -195,6 +203,9 @@ pub struct App {
     transport: Box<dyn Transport>,
     /// Task snapshot received from `Event::Tasks`.
     pub views: Vec<TaskView>,
+    /// Installed agents from the latest `Event::Agents`, in registry order. Show the Agent
+    /// page only when this list is non-empty.
+    pub agents: Vec<String>,
     /// The watched task's screen (attach/peek), from `Event::Screen`.
     focused_screen: Option<ScreenView>,
     /// Last `(target, attached)` watch state sent to the core.
@@ -220,6 +231,18 @@ pub struct App {
     /// Group assigned to the next spawn. Custom mode snapshots the selected
     /// task's group; State and Dir modes leave the spawn unassigned.
     pub spawn_group: Option<String>,
+    /// Displayed spawn-prompt page. Reset to `Command` when opening the prompt; allow Tab
+    /// to switch pages only when `agents` is non-empty.
+    pub spawn_page: SpawnPage,
+    /// Agent filter buffer, separate from the command buffer. Preserve both across page
+    /// changes. Clear the filter when opening the prompt so the initial Agent list is
+    /// unfiltered.
+    pub agent_input: EditBuffer,
+    /// Program words of `agents` matching `agent_input`, in registry order.
+    pub agent_candidates: Vec<String>,
+    /// Highlighted row of `agent_candidates`; reset to the first match on
+    /// every filter edit.
+    pub agent_sel: usize,
     /// Id of the attached task, if any: by id (not index) so it survives the
     /// task list changing underneath it.
     pub focused_id: Option<u64>,
@@ -450,6 +473,7 @@ impl App {
         Self {
             transport,
             views: Vec::new(),
+            agents: Vec::new(),
             focused_screen: None,
             watched: None,
             daemon_backed: false,
@@ -460,6 +484,10 @@ impl App {
             input: EditBuffer::default(),
             spawn_cwd: invocation_dir.clone(),
             spawn_group: None,
+            spawn_page: SpawnPage::Command,
+            agent_input: EditBuffer::default(),
+            agent_candidates: Vec::new(),
+            agent_sel: 0,
             focused_id: None,
             return_to: None,
             terminal_focused: true,
@@ -750,6 +778,21 @@ impl App {
             match ev {
                 // The handshake is handled before the transport is created.
                 Event::HelloOk => {}
+                // Replace the whole list on each context install; do not merge it with the
+                // previous list.
+                Event::Agents(a) => {
+                    self.agents = a;
+                    // After reconnecting, refilter an open prompt against the new list. If
+                    // no agents are installed, switch to Command: the Agent page is no
+                    // longer accessible through Tab. Apply the same rule as for an emptied
+                    // Recovery page.
+                    if self.mode == Mode::Spawn {
+                        self.refresh_agent_candidates();
+                        if self.agents.is_empty() {
+                            self.spawn_page = SpawnPage::Command;
+                        }
+                    }
+                }
                 Event::Tasks(v) => {
                     self.views = v;
                     // The acknowledgement precedes its row. Select only after
@@ -1032,13 +1075,39 @@ impl App {
             .collect()
     }
 
-    /// Lock in `dir` as the spawn target and move to command entry.
+    /// Set `dir` as the spawn target and open command entry. Clear the Agent filter so the
+    /// full list is available on Tab.
     fn open_spawn_prompt(&mut self, dir: PathBuf) {
         self.spawn_cwd = dir;
         self.spawn_group = self.inherited_group();
         self.input.clear();
         self.dir_candidates.clear();
+        self.spawn_page = SpawnPage::Command;
+        self.agent_input.clear();
+        self.refresh_agent_candidates();
         self.mode = Mode::Spawn;
+    }
+
+    /// Filter installed agents by a case-insensitive substring of the program word and
+    /// select the first match. Preserve registry order rather than sorting by match
+    /// position: for `o`, list codex, grok, omp.
+    fn refresh_agent_candidates(&mut self) {
+        let needle = self.agent_input.to_lowercase();
+        self.agent_candidates = self
+            .agents
+            .iter()
+            .filter(|a| a.to_lowercase().contains(&needle))
+            .cloned()
+            .collect();
+        self.agent_sel = 0;
+    }
+
+    /// Registered agents absent from `agents`, for the no-match message. Identify missing
+    /// installations when the user filters for an unavailable agent.
+    pub fn missing_agents(&self) -> Vec<&'static str> {
+        harness::program_words()
+            .filter(|w| !self.agents.iter().any(|a| a == w))
+            .collect()
     }
 
     /// Navigate into `dir`: retype the input as its path (trailing slash) so
@@ -1471,11 +1540,52 @@ impl App {
     }
 
     fn on_key_spawn(&mut self, k: KeyEvent) {
-        self.on_key_textinput(k, |app, cmd| {
-            if !cmd.is_empty() {
-                app.spawn_task(cmd);
+        match k.code {
+            // Allow page changes only when agents are installed, as with the Recovery page.
+            // Otherwise, pass Tab to the editor, where it is ignored.
+            KeyCode::Tab | KeyCode::BackTab if !self.agents.is_empty() => {
+                self.spawn_page = match self.spawn_page {
+                    SpawnPage::Command => SpawnPage::Agent,
+                    SpawnPage::Agent => SpawnPage::Command,
+                };
             }
-        });
+            _ => match self.spawn_page {
+                SpawnPage::Command => self.on_key_textinput(k, |app, cmd| {
+                    if !cmd.is_empty() {
+                        app.spawn_task(cmd);
+                    }
+                }),
+                SpawnPage::Agent => self.on_key_agent(k),
+            },
+        }
+    }
+
+    /// Handle Agent-page filtering, selection, and launch in the prompt's directory and
+    /// group. Keep the prompt open on Enter when there is no match.
+    fn on_key_agent(&mut self, k: KeyEvent) {
+        match k.code {
+            KeyCode::Esc => self.close_prompt(),
+            KeyCode::Up => self.agent_sel = self.agent_sel.saturating_sub(1),
+            KeyCode::Down => {
+                self.agent_sel = step_down(self.agent_sel, self.agent_candidates.len())
+            }
+            KeyCode::Enter => {
+                if let Some(agent) = self.agent_candidates.get(self.agent_sel).cloned() {
+                    self.transport.send(Command::SpawnAgent {
+                        agent,
+                        cwd: self.spawn_cwd.clone(),
+                        group: self.spawn_group.clone(),
+                    });
+                    self.close_prompt();
+                }
+            }
+            // Do not refilter on caret motion.
+            _ => {
+                if on_key_edit(&mut self.agent_input, k) {
+                    self.refresh_agent_candidates();
+                }
+            }
+        }
     }
 
     fn on_key_peek(&mut self, k: KeyEvent) {
@@ -1575,6 +1685,10 @@ impl App {
                         bytes: s.as_bytes().to_vec(),
                     });
                 }
+            }
+            Mode::Spawn if self.spawn_page == SpawnPage::Agent => {
+                paste_into(&mut self.agent_input, s);
+                self.refresh_agent_candidates();
             }
             Mode::Spawn | Mode::SaveSession | Mode::Rename(_) => {
                 paste_into(&mut self.input, s);

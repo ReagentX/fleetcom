@@ -15,13 +15,13 @@ use std::{
 
 use crate::{
     core::{Wake, Waker},
-    harness::{self, assets},
+    harness::{self, Harness, Intent, assets},
     path,
     protocol::{
         Command, Event, LaunchContext, ScreenView, ScrollAction, TaskView, UNASSIGNED, env_get,
     },
-    session::{self, SessionConfig, SessionEntry},
-    task::{Task, WriteRefused},
+    session::{self, EntryKind, SessionConfig, SessionEntry},
+    task::{Exec, Task, WriteRefused},
 };
 
 /// Quiet period after which a live task becomes idle.
@@ -44,12 +44,85 @@ const _: () = assert!(MAX_CELLS >= MAX_DIM as u32);
 /// guardrail, not a working limit.
 const MAX_TASKS: usize = 256;
 
-/// Maximum command length in bytes. Direct spawns and session loads enforce
-/// this limit to bound shell arguments and serialized task snapshots.
+/// Requested launch mode. Preserve literal text and pass it to the shell unchanged; execute
+/// managed argv directly without shell parsing.
+enum Launch<'a> {
+    /// The text the user typed, run verbatim under `$SHELL -c`.
+    Literal(&'a str),
+    /// Managed agent under fleetcom supervision.
+    Managed(ManagedLaunch),
+}
+
+/// A managed agent launch: which tool, which binary, which conversation.
+struct ManagedLaunch {
+    agent: &'static dyn Harness,
+    /// Found on the launch context's `PATH` at this spawn; executed as-is.
+    binary: PathBuf,
+    intent: Intent,
+}
+
+/// Maximum literal command length in bytes. Enforce this limit for direct spawns and
+/// session loads to bound shell arguments and serialized snapshots. Managed entries contain
+/// only a registered program word and a UUID; no cap is needed.
 const MAX_COMMAND_LEN: usize = 64 * 1024;
 
 /// Conditions counted as skipped by `materialize`.
 const SKIP_REASONS: &str = "missing dir, task limit, or command too long";
+
+/// Recipe-load counts and per-entry diagnostics from `materialize`. Report them together in
+/// the summary: only the last status in a client poll is retained, so earlier diagnostics
+/// would be overwritten.
+#[derive(Default)]
+struct LoadOutcome {
+    spawned: usize,
+    skipped: usize,
+    failed: usize,
+    /// Launch notices and failure reasons, in load order.
+    notes: Vec<String>,
+}
+
+impl LoadOutcome {
+    /// Append each distinct note to `summary` once, with a count for repeated notes. For
+    /// example, report an unchainable Codex notifier once for all affected entries.
+    fn annotate(&self, mut summary: String) -> String {
+        let mut distinct: Vec<(&str, usize)> = Vec::new();
+        for note in &self.notes {
+            match distinct.iter_mut().find(|(n, _)| *n == note) {
+                Some((_, count)) => *count += 1,
+                None => distinct.push((note, 1)),
+            }
+        }
+        for (note, count) in distinct {
+            summary.push_str("; ");
+            summary.push_str(note);
+            if count > 1 {
+                summary.push_str(&format!(" ({count} tasks)"));
+            }
+        }
+        summary
+    }
+}
+
+/// Resolve the registered harness and current binary on `launch`'s `PATH`, then build a
+/// managed launch with `intent`. Return a diagnostic for the caller if either lookup fails.
+fn resolve_agent(
+    agent: &str,
+    launch: &LaunchContext,
+    intent: Intent,
+) -> Result<ManagedLaunch, String> {
+    let h = harness::registered(agent).ok_or_else(|| format!("no agent named {agent:?}"))?;
+    Ok(ManagedLaunch {
+        agent: h,
+        binary: agent_binary(agent, launch)?,
+        intent,
+    })
+}
+
+/// Resolve `agent` on `launch`'s `PATH`, or return a diagnostic for the caller.
+fn agent_binary(agent: &str, launch: &LaunchContext) -> Result<PathBuf, String> {
+    let path = env_get(&launch.env, "PATH").unwrap_or_default();
+    harness::find_on_path(agent, path).ok_or_else(|| format!("{agent} not found on PATH"))
+}
 
 /// Environment variable overriding per-task terminal history depth.
 pub const FLEETCOM_SCROLLBACK: &str = "FLEETCOM_SCROLLBACK";
@@ -131,10 +204,11 @@ fn fnv1a_hex(bytes: &[u8]) -> String {
     format!("{h:016x}")
 }
 
-/// Resolve the session ID in precedence order: capture file, live registry,
-/// then spawn-time ID. Prefer the first two sources because a session may have
-/// been selected after launch. Validate the capture with the task's leader PID
-/// and launch-time home through the harness. If rejected, try the next source.
+/// Resolve a managed task's session ID in precedence order: capture file, live registry,
+/// then spawn-time ID. Prefer the first two sources because a session may have been
+/// selected after launch. Validate capture through the harness using the task's leader PID
+/// and launch-time home. On rejection, try the next source. For literal tasks, skip all
+/// sources and return `None`.
 fn current_resume_id(task: &Task) -> Option<String> {
     if let (Some(h), Some(path)) = (task.harness, &task.capture_file)
         && let Ok(payload) = std::fs::read_to_string(path)
@@ -155,15 +229,6 @@ fn current_resume_id(task: &Task) -> Option<String> {
     task.resume_id.clone()
 }
 
-/// Build the saved or rerun command from the task's best-known ID.
-/// Without an ID, preserve the requested command exactly.
-fn recipe_command(t: &Task) -> String {
-    match (t.harness, current_resume_id(t)) {
-        (Some(h), Some(id)) => h.resume_command(&t.command, &id),
-        _ => t.command.clone(),
-    }
-}
-
 /// Resolve harness configuration from the task's launch environment.
 fn harness_home(env: &[(OsString, OsString)], h: &dyn harness::Harness) -> Option<PathBuf> {
     h.resolve_home(&|key| env_get(env, key).map(PathBuf::from))
@@ -174,6 +239,7 @@ fn harness_home(env: &[(OsString, OsString)], h: &dyn harness::Harness) -> Optio
 fn affects_recipe(cmd: &Command) -> bool {
     match cmd {
         Command::Spawn { .. }
+        | Command::SpawnAgent { .. }
         | Command::Remove { .. }
         | Command::Restart { .. }
         | Command::SetGroup { .. }
@@ -275,6 +341,9 @@ pub struct Supervisor {
     /// TERM→KILL escalation window. `KILL_GRACE` in production; a field so tests
     /// shrink it instead of sleeping through real seconds.
     kill_grace: Duration,
+    /// Live-task ceiling. Use `MAX_TASKS` in production; lower the field in tests to avoid
+    /// opening hundreds of PTYs.
+    max_tasks: usize,
     /// Capture assets keyed by canonicalized root and reused for this
     /// supervisor's lifetime.
     capture: BTreeMap<PathBuf, assets::CaptureAssets>,
@@ -299,13 +368,24 @@ impl Supervisor {
             events: Vec::new(),
             waker: Arc::new(Mutex::new(None)),
             kill_grace: KILL_GRACE,
+            max_tasks: MAX_TASKS,
             capture: BTreeMap::new(),
             recovery: Recovery::new(),
         }
     }
 
-    /// Install the launch context used by subsequent spawns.
+    /// Install the launch context for subsequent spawns and queue the agents found on its
+    /// `PATH` as `Event::Agents`. Discover agents on every context install: the daemon may
+    /// run for weeks, but a different environment can be supplied by each client. Send an
+    /// empty list when no agents are found to clear the previous client's menu on
+    /// reconnect.
     pub fn set_launch_context(&mut self, ctx: LaunchContext) {
+        let path = env_get(&ctx.env, "PATH").unwrap_or_default();
+        let agents = harness::installed(path)
+            .into_iter()
+            .map(String::from)
+            .collect();
+        self.events.push(Event::Agents(agents));
         self.launch = Some(ctx);
     }
 
@@ -313,6 +393,12 @@ impl Supervisor {
     #[cfg(test)]
     pub fn set_kill_grace(&mut self, grace: Duration) {
         self.kill_grace = grace;
+    }
+
+    /// Lower the live-task ceiling so limit tests need a handful of tasks.
+    #[cfg(test)]
+    pub fn set_max_tasks(&mut self, limit: usize) {
+        self.max_tasks = limit;
     }
 
     /// Enable recovery with test-specific timings.
@@ -362,6 +448,7 @@ impl Supervisor {
                 cwd,
                 group,
             } => self.spawn(&command, cwd, group),
+            Command::SpawnAgent { agent, cwd, group } => self.spawn_agent(&agent, cwd, group),
             Command::Kill { id } => self.with_task(id, Task::terminate),
             Command::Remove { id } => {
                 if let Some(i) = self.index_of(id) {
@@ -512,6 +599,7 @@ impl Supervisor {
                     cwd: t.cwd.clone(),
                     tagged: t.tagged,
                     flagship: self.flagship == Some(t.id),
+                    managed: t.managed,
                     group: t.group.clone(),
                     name: t.name.clone(),
                     lifecycle: t.lifecycle(now, IDLE_AFTER),
@@ -733,37 +821,62 @@ impl Supervisor {
         Some(self.capture.entry(key).or_insert(installed))
     }
 
-    /// Spawn a direct command, rerun, or session entry. Instrument only the executed
-    /// shell string; retain the requested command for display and persistence.
+    /// Spawn a literal command, managed agent, rerun, or session entry. Retain the typed
+    /// text or managed program word in `command` for display and persistence. Instrument
+    /// only managed launches; pass literal text to the shell unchanged. Return any
+    /// reduced-instrumentation notice alongside the task for the caller to report.
     fn spawn_task(
         &mut self,
         id: u64,
         run: u32,
-        command: &str,
+        launch: &Launch,
         cwd: &Path,
         env: &[(OsString, OsString)],
-    ) -> io::Result<Task> {
-        // Instrumentation, when active, contributes an exec suffix, extra env,
-        // and post-spawn metadata; a plain command contributes nothing. A
-        // detected harness without capture assets (install failure) spawns
-        // plain: instrumentation is disabled, not the task.
-        let mut exec = std::borrow::Cow::Borrowed(command);
+    ) -> io::Result<(Task, Option<String>)> {
         let mut env = std::borrow::Cow::Borrowed(env);
         let mut meta = None;
-        if let Some((h, inv)) = harness::detect(command)
-            && let Some(paths) = self.ensure_capture_assets().map(|a| a.paths_for(id, run))
-        {
-            let home = harness_home(&env, h);
-            let plan = h.instrument(&inv, &paths, home.as_deref());
-            exec = format!("{command}{}", plan.args_suffix).into();
-            env.to_mut().extend(plan.env);
-            let resume_id = plan.injected_id.or_else(|| inv.known_id());
-            meta = Some((h, home, paths.capture_file, resume_id));
-        }
+        let mut notice = None;
+        let (command, exec) = match launch {
+            Launch::Literal(text) => (*text, Exec::Literal((*text).to_string())),
+            Launch::Managed(m) => {
+                // Require the overlay to retain process ownership. Without the embedded
+                // override, codex would use its shared server outside fleetcom supervision.
+                // Refuse the launch if the assets cannot be installed.
+                let Some(paths) = self.ensure_capture_assets().map(|a| a.paths_for(id, run)) else {
+                    return Err(io::Error::other(
+                        "capture assets unavailable; a managed launch needs them",
+                    ));
+                };
+                let home = harness_home(&env, m.agent);
+                // Mint an ID only for fresh conversations; reuse the specified ID on
+                // resume.
+                let fresh = match m.intent {
+                    Intent::Fresh => harness::uuid_v4(),
+                    Intent::Resume(_) => None,
+                };
+                let plan = harness::plan(
+                    m.agent,
+                    &m.intent,
+                    fresh.as_deref(),
+                    &paths,
+                    home.as_deref(),
+                );
+                env.to_mut().extend(plan.env);
+                notice = plan.notice;
+                meta = Some((m.agent, home, paths.capture_file, plan.resume_id));
+                (
+                    m.agent.shape().0,
+                    Exec::Managed {
+                        binary: m.binary.clone(),
+                        args: plan.args,
+                    },
+                )
+            }
+        };
         let mut task = Task::spawn(
             id,
             command,
-            &exec,
+            exec,
             cwd,
             self.rows,
             self.cols,
@@ -779,27 +892,57 @@ impl Supervisor {
             task.resume_id = resume_id;
         }
         task.run = run;
-        Ok(task)
+        // Return the notice for inclusion in the load summary. A separate status queued
+        // here would be overwritten by that summary in the same client poll.
+        Ok((task, notice))
     }
 
-    /// Spawn a task under the next id, normalize its labels, and return the id.
-    /// The caller enforces `MAX_TASKS` and reports failures because direct
-    /// spawns and session loads handle them differently.
+    /// Spawn under the next id, normalize labels, and return the id with any launch notice.
+    /// Enforce the task ceiling and report failures and notices at the call site, according
+    /// to whether this is a direct spawn or session load.
     fn admit(
         &mut self,
-        command: &str,
+        launch: &Launch,
         cwd: &Path,
         env: &[(OsString, OsString)],
         group: Option<String>,
         name: Option<String>,
-    ) -> io::Result<u64> {
+    ) -> io::Result<(u64, Option<String>)> {
         let id = self.next_id;
-        let mut task = self.spawn_task(id, 0, command, cwd, env)?;
+        let (mut task, notice) = self.spawn_task(id, 0, launch, cwd, env)?;
         task.group = normalize_group(group);
         task.name = normalize_label(name);
         self.next_id += 1;
         self.tasks.push(task);
-        Ok(id)
+        Ok((id, notice))
+    }
+
+    /// Report an interactive spawn: send its notice, then acknowledge the new row for
+    /// selection. On failure, report the error.
+    fn report_spawn(&mut self, admitted: io::Result<(u64, Option<String>)>) {
+        match admitted {
+            Ok((id, notice)) => {
+                if let Some(notice) = notice {
+                    self.status(format!("task {id}: {notice}"));
+                }
+                // Send the acknowledgement before the next `Tasks` snapshot containing this
+                // id.
+                self.events.push(Event::Spawned { id });
+            }
+            Err(e) => self.status(format!("spawn failed: {e}")),
+        }
+    }
+
+    /// Check the task ceiling and report when no more tasks can be admitted.
+    fn below_task_ceiling(&mut self) -> bool {
+        if self.tasks.len() >= self.max_tasks {
+            self.status(format!(
+                "task limit reached ({}), not spawning",
+                self.max_tasks
+            ));
+            return false;
+        }
+        true
     }
 
     fn spawn(&mut self, command: &str, cwd: PathBuf, group: Option<String>) {
@@ -811,24 +954,37 @@ impl Supervisor {
             ));
             return;
         }
-        if self.tasks.len() >= MAX_TASKS {
-            self.status(format!("task limit reached ({MAX_TASKS}), not spawning"));
+        if !self.below_task_ceiling() {
             return;
         }
         let Some(launch) = self.launch_or_refuse() else {
             return;
         };
-        match self.admit(command, &cwd, &launch.env, group, None) {
-            // Preserve event order: the acknowledgement precedes the next
-            // `Tasks` snapshot containing this id.
-            Ok(id) => self.events.push(Event::Spawned { id }),
-            Err(e) => self.status(format!("spawn failed: {e}")),
-        }
+        let admitted = self.admit(&Launch::Literal(command), &cwd, &launch.env, group, None);
+        self.report_spawn(admitted);
     }
 
-    /// Rerun a finished task in place while preserving its ID, tag, group, and name. If
-    /// the task has a captured agent session, resume the best-known ID in the
-    /// replacement.
+    /// Launch registered `agent` as a managed task with a fresh conversation. Resolve the
+    /// binary on the launch context's current `PATH`; do not accept a path from the client.
+    /// Refuse to spawn when no binary is found.
+    fn spawn_agent(&mut self, agent: &str, cwd: PathBuf, group: Option<String>) {
+        if !self.below_task_ceiling() {
+            return;
+        }
+        let Some(launch) = self.launch_or_refuse() else {
+            return;
+        };
+        let managed = match resolve_agent(agent, &launch, Intent::Fresh) {
+            Ok(m) => m,
+            Err(why) => return self.status(format!("{why}, not spawning")),
+        };
+        let admitted = self.admit(&Launch::Managed(managed), &cwd, &launch.env, group, None);
+        self.report_spawn(admitted);
+    }
+
+    /// Rerun a finished task in place, preserving its ID, tag, group, and name. For managed
+    /// tasks, resolve the binary on the current `PATH` and resume the best-known session
+    /// ID, or start fresh if none is known. For literal tasks, rerun the exact text.
     fn rerun(&mut self, id: u64) {
         let Some(i) = self.index_of(id) else {
             self.status(format!("rerun failed: no task {id}"));
@@ -849,23 +1005,41 @@ impl Supervisor {
         let Some(launch) = self.launch_or_refuse() else {
             return;
         };
-        // Store the resuming form so detection treats the replacement as a
-        // targeted conversation.
-        let (command, cwd) = {
-            let old = &self.tasks[i];
-            let command = recipe_command(old);
-            (command, old.cwd.clone())
+        let cwd = self.tasks[i].cwd.clone();
+        // Only managed tasks have a harness; use it to distinguish the launch mode.
+        let command;
+        let relaunch = match self.tasks[i].harness {
+            Some(agent) => {
+                let binary = match agent_binary(agent.shape().0, &launch) {
+                    Ok(b) => b,
+                    Err(why) => return self.status(format!("{why}, not spawning")),
+                };
+                let intent =
+                    current_resume_id(&self.tasks[i]).map_or(Intent::Fresh, Intent::Resume);
+                Launch::Managed(ManagedLaunch {
+                    agent,
+                    binary,
+                    intent,
+                })
+            }
+            None => {
+                command = self.tasks[i].command.clone();
+                Launch::Literal(&command)
+            }
         };
         // Preserve the finished task if its replacement cannot start. Use a distinct
         // run number to isolate the replacement's capture file.
         let run = self.tasks[i].run + 1;
-        match self.spawn_task(id, run, &command, &cwd, &launch.env) {
-            Ok(mut fresh) => {
+        match self.spawn_task(id, run, &relaunch, &cwd, &launch.env) {
+            Ok((mut fresh, notice)) => {
+                if let Some(notice) = notice {
+                    self.status(format!("task {id}: {notice}"));
+                }
                 fresh.tagged = self.tasks[i].tagged;
                 fresh.group = self.tasks[i].group.clone();
                 fresh.name = self.tasks[i].name.clone();
-                // Derive the resume command before removing the displaced run's capture
-                // file during retirement.
+                // Read the resume ID before retiring the displaced run and removing its
+                // capture file.
                 let old = std::mem::replace(&mut self.tasks[i], fresh);
                 self.retire(old);
                 // Reset the fingerprint for the replacement task's screen.
@@ -877,8 +1051,9 @@ impl Supervisor {
         }
     }
 
-    /// Build `{dir: [entries]}` in spawn order. Groups and names remain intact;
-    /// agent entries use the command returned by `recipe_command`.
+    /// Build `{dir: [entries]}` in spawn order, preserving groups and names. Save managed
+    /// tasks as agent words with the best-known session IDs; save literals as their exact
+    /// text.
     fn session_config(&self) -> SessionConfig {
         // `admit` appends monotonic IDs; `rerun` preserves both index and ID;
         // removal preserves relative order.
@@ -888,10 +1063,17 @@ impl Supervisor {
         );
         let mut cfg = SessionConfig::new();
         for t in &self.tasks {
+            let kind = match t.harness {
+                Some(h) => EntryKind::Managed {
+                    agent: h.shape().0.to_string(),
+                    resume: current_resume_id(t),
+                },
+                None => EntryKind::Literal(t.command.clone()),
+            };
             cfg.entry(path::abbreviate(&t.cwd))
                 .or_default()
                 .push(SessionEntry {
-                    cmd: recipe_command(t),
+                    kind,
                     group: t.group.clone(),
                     name: t.name.clone(),
                 });
@@ -940,40 +1122,65 @@ impl Supervisor {
         self.events.push(Event::Sessions { names, recovery });
     }
 
-    /// Spawn every entry of a loaded recipe, each in its (existing) dir.
-    /// Missing dirs are skipped rather than spawning tasks doomed to fail on
-    /// chdir. Returns `(spawned, skipped, failed)` for the caller's notice, or
-    /// `None` when no launch context is installed (already refused with its
-    /// own notice).
-    fn materialize(&mut self, cfg: &SessionConfig) -> Option<(usize, usize, usize)> {
+    /// Spawn each recipe entry in its existing directory; skip missing directories. Resolve
+    /// managed binaries as on the Agent page. Record a missing binary as a failed entry
+    /// with a diagnostic, then continue loading. Return the outcome for one summary line,
+    /// or `None` after reporting a missing launch context.
+    fn materialize(&mut self, cfg: &SessionConfig) -> Option<LoadOutcome> {
         let launch = self.launch_or_refuse()?;
-        let (mut spawned, mut skipped, mut failed) = (0usize, 0usize, 0usize);
+        let mut out = LoadOutcome::default();
         for (dir, entries) in cfg {
             let resolved = path::resolve(&launch.cwd, dir);
             if !resolved.is_dir() {
-                skipped += entries.len();
+                out.skipped += entries.len();
                 continue;
             }
             for entry in entries {
-                if self.tasks.len() >= MAX_TASKS || entry.cmd.len() > MAX_COMMAND_LEN {
-                    skipped += 1;
+                if self.tasks.len() >= self.max_tasks {
+                    out.skipped += 1;
                     continue;
                 }
+                let kind = match &entry.kind {
+                    EntryKind::Literal(text) => {
+                        if text.len() > MAX_COMMAND_LEN {
+                            out.skipped += 1;
+                            continue;
+                        }
+                        Launch::Literal(text)
+                    }
+                    EntryKind::Managed { agent, resume } => {
+                        let intent = resume.clone().map_or(Intent::Fresh, Intent::Resume);
+                        match resolve_agent(agent, &launch, intent) {
+                            Ok(m) => Launch::Managed(m),
+                            Err(why) => {
+                                out.failed += 1;
+                                out.notes.push(why);
+                                continue;
+                            }
+                        }
+                    }
+                };
                 // `admit` normalizes the persisted labels before assignment.
                 match self.admit(
-                    &entry.cmd,
+                    &kind,
                     &resolved,
                     &launch.env,
                     entry.group.clone(),
                     entry.name.clone(),
                 ) {
-                    Ok(_) => spawned += 1,
+                    Ok((_, notice)) => {
+                        out.spawned += 1;
+                        out.notes.extend(notice);
+                    }
                     // Track spawn failures separately from skipped entries.
-                    Err(_) => failed += 1,
+                    Err(e) => {
+                        out.failed += 1;
+                        out.notes.push(format!("spawn failed: {e}"));
+                    }
                 }
             }
         }
-        Some((spawned, skipped, failed))
+        Some(out)
     }
 
     /// Run a config loader against the sessions root, prefixing errors with
@@ -1008,21 +1215,22 @@ impl Supervisor {
         }) else {
             return;
         };
-        let Some((spawned, skipped, failed)) = self.materialize(&cfg) else {
+        let Some(out) = self.materialize(&cfg) else {
             return;
         };
         // Report zero tasks only for an empty recipe.
         let mut parts = Vec::new();
-        if spawned > 0 || (skipped == 0 && failed == 0) {
-            parts.push(format!("{spawned} task(s)"));
+        if out.spawned > 0 || (out.skipped == 0 && out.failed == 0) {
+            parts.push(format!("{} task(s)", out.spawned));
         }
-        if skipped > 0 {
-            parts.push(format!("{skipped} skipped ({SKIP_REASONS})"));
+        if out.skipped > 0 {
+            parts.push(format!("{} skipped ({SKIP_REASONS})", out.skipped));
         }
-        if failed > 0 {
-            parts.push(format!("{failed} failed to spawn"));
+        if out.failed > 0 {
+            parts.push(format!("{} failed to spawn", out.failed));
         }
-        self.status(format!("loaded '{name}': {}", parts.join(", ")));
+        let msg = format!("loaded '{name}': {}", parts.join(", "));
+        self.status(out.annotate(msg));
     }
 
     /// Load a recovery snapshot by stem and suggest saving it as a named session.
@@ -1032,18 +1240,18 @@ impl Supervisor {
         }) else {
             return;
         };
-        let Some((_, skipped, failed)) = self.materialize(&cfg) else {
+        let Some(out) = self.materialize(&cfg) else {
             return;
         };
         // Append optional clauses to the fixed message prefix.
         let mut msg = String::from("loaded recovery snapshot; save to name it");
-        if skipped > 0 {
-            msg.push_str(&format!(", {skipped} skipped ({SKIP_REASONS})"));
+        if out.skipped > 0 {
+            msg.push_str(&format!(", {} skipped ({SKIP_REASONS})", out.skipped));
         }
-        if failed > 0 {
-            msg.push_str(&format!(", {failed} failed to spawn"));
+        if out.failed > 0 {
+            msg.push_str(&format!(", {} failed to spawn", out.failed));
         }
-        self.status(msg);
+        self.status(out.annotate(msg));
     }
 }
 
