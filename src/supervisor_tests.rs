@@ -2150,10 +2150,9 @@ fn launch_context_install_discovers_agents_in_registry_order() {
 
 /// `Command::SpawnAgent` admits a managed task for a registered word on the
 /// context's `PATH`, acking with `Spawned` and reporting `managed` in the
-/// snapshot; an unregistered word or a missing binary gets a notice and no
-/// task. A literal spawn of the same word stays unmanaged.
+/// snapshot. A literal spawn of the same word stays unmanaged.
 #[test]
-fn spawn_agent_admits_a_managed_task_and_refuses_the_rest() {
+fn spawn_agent_admits_a_managed_task() {
     let dir = scratch("spawn_agent");
     let bin = dir.join("bin");
     std::fs::create_dir_all(&bin).unwrap();
@@ -2197,31 +2196,6 @@ fn spawn_agent_admits_a_managed_task_and_refuses_the_rest() {
     assert!(
         argv.lines().any(|l| l == "--session-id"),
         "the launch must carry the harness argv: {argv:?}"
-    );
-
-    for (agent, needle) in [("vim", "no agent named"), ("codex", "not found on PATH")] {
-        s.apply(Command::SpawnAgent {
-            agent: agent.into(),
-            cwd: dir.to_path_buf(),
-            group: None,
-        });
-        let evs = s.drain();
-        assert!(
-            evs.iter()
-                .any(|e| matches!(e, Event::Status(m) if m.contains(needle))),
-            "{agent}: expected a refusal; got {evs:?}"
-        );
-        assert!(
-            !evs.iter().any(|e| matches!(e, Event::Spawned { .. })),
-            "{agent}: a refusal must not ack; got {evs:?}"
-        );
-    }
-    s.tick();
-    assert!(
-        s.drain()
-            .iter()
-            .any(|e| matches!(e, Event::Tasks(v) if v.len() == 1)),
-        "refusals must add no task"
     );
 
     spawn(&mut s, "claude", dir.to_path_buf());

@@ -70,6 +70,64 @@ const MAX_COMMAND_LEN: usize = 64 * 1024;
 /// Conditions counted as skipped by `materialize`.
 const SKIP_REASONS: &str = "missing dir, task limit, or command too long";
 
+/// What `materialize` did with a recipe: the counts for the summary line, and
+/// the per-entry reasons behind them. A load reports through that one line
+/// because the client keeps only the latest status of a poll, so any status
+/// queued ahead of the summary would never be seen.
+#[derive(Default)]
+struct LoadOutcome {
+    spawned: usize,
+    skipped: usize,
+    failed: usize,
+    /// Launch notices and failure reasons, in load order.
+    notes: Vec<String>,
+}
+
+impl LoadOutcome {
+    /// Append the distinct notes to `summary`, each once, with a count when
+    /// several entries share it: every codex in a recipe reports the same
+    /// unchainable notifier.
+    fn annotate(&self, mut summary: String) -> String {
+        let mut distinct: Vec<(&str, usize)> = Vec::new();
+        for note in &self.notes {
+            match distinct.iter_mut().find(|(n, _)| *n == note) {
+                Some((_, count)) => *count += 1,
+                None => distinct.push((note, 1)),
+            }
+        }
+        for (note, count) in distinct {
+            summary.push_str("; ");
+            summary.push_str(note);
+            if count > 1 {
+                summary.push_str(&format!(" ({count} tasks)"));
+            }
+        }
+        summary
+    }
+}
+
+/// Build the managed launch of `agent` with `intent`: the registered harness
+/// and the binary `launch`'s `PATH` finds now. Either miss is the reason, for
+/// the caller to report.
+fn resolve_agent(
+    agent: &str,
+    launch: &LaunchContext,
+    intent: Intent,
+) -> Result<ManagedLaunch, String> {
+    let h = harness::registered(agent).ok_or_else(|| format!("no agent named {agent:?}"))?;
+    Ok(ManagedLaunch {
+        agent: h,
+        binary: agent_binary(agent, launch)?,
+        intent,
+    })
+}
+
+/// Resolve `agent` on `launch`'s `PATH`; a miss is the reason.
+fn agent_binary(agent: &str, launch: &LaunchContext) -> Result<PathBuf, String> {
+    let path = env_get(&launch.env, "PATH").unwrap_or_default();
+    harness::find_on_path(agent, path).ok_or_else(|| format!("{agent} not found on PATH"))
+}
+
 /// Environment variable overriding per-task terminal history depth.
 pub const FLEETCOM_SCROLLBACK: &str = "FLEETCOM_SCROLLBACK";
 
@@ -772,7 +830,8 @@ impl Supervisor {
     /// task's `command` is display and recipe text: a literal's typed text, a
     /// managed agent's program word. Only a managed launch carries
     /// instrumentation: a literal's text reaches the shell untouched, whatever
-    /// it names.
+    /// it names. The second value is the plan's notice when the launch carries
+    /// less instrumentation than usual; the caller decides how to report it.
     fn spawn_task(
         &mut self,
         id: u64,
@@ -780,7 +839,7 @@ impl Supervisor {
         launch: &Launch,
         cwd: &Path,
         env: &[(OsString, OsString)],
-    ) -> io::Result<Task> {
+    ) -> io::Result<(Task, Option<String>)> {
         let mut env = std::borrow::Cow::Borrowed(env);
         let mut meta = None;
         let mut notice = None;
@@ -840,16 +899,16 @@ impl Supervisor {
             task.resume_id = resume_id;
         }
         task.run = run;
-        // Report reduced instrumentation only for a task that exists.
-        if let Some(notice) = notice {
-            self.status(format!("task {id}: {notice}"));
-        }
-        Ok(task)
+        // Returned rather than queued: a session load reports every task's
+        // notice in its one summary line, where a separate status would be
+        // overwritten by the summary in the same client poll.
+        Ok((task, notice))
     }
 
-    /// Spawn a task under the next id, normalize its labels, and return the id.
-    /// The caller enforces the task ceiling and reports failures because direct
-    /// spawns and session loads handle them differently.
+    /// Spawn a task under the next id, normalize its labels, and return the id
+    /// with any launch notice. The caller enforces the task ceiling and reports
+    /// failures and notices because direct spawns and session loads handle them
+    /// differently.
     fn admit(
         &mut self,
         launch: &Launch,
@@ -857,14 +916,30 @@ impl Supervisor {
         env: &[(OsString, OsString)],
         group: Option<String>,
         name: Option<String>,
-    ) -> io::Result<u64> {
+    ) -> io::Result<(u64, Option<String>)> {
         let id = self.next_id;
-        let mut task = self.spawn_task(id, 0, launch, cwd, env)?;
+        let (mut task, notice) = self.spawn_task(id, 0, launch, cwd, env)?;
         task.group = normalize_group(group);
         task.name = normalize_label(name);
         self.next_id += 1;
         self.tasks.push(task);
-        Ok(id)
+        Ok((id, notice))
+    }
+
+    /// Report one interactive spawn: its notice, then the acknowledgement that
+    /// selects the new row, or the failure.
+    fn report_spawn(&mut self, admitted: io::Result<(u64, Option<String>)>) {
+        match admitted {
+            Ok((id, notice)) => {
+                if let Some(notice) = notice {
+                    self.status(format!("task {id}: {notice}"));
+                }
+                // Preserve event order: the acknowledgement precedes the next
+                // `Tasks` snapshot containing this id.
+                self.events.push(Event::Spawned { id });
+            }
+            Err(e) => self.status(format!("spawn failed: {e}")),
+        }
     }
 
     /// Whether the fleet has room for one more task, reporting when not.
@@ -894,12 +969,8 @@ impl Supervisor {
         let Some(launch) = self.launch_or_refuse() else {
             return;
         };
-        match self.admit(&Launch::Literal(command), &cwd, &launch.env, group, None) {
-            // Preserve event order: the acknowledgement precedes the next
-            // `Tasks` snapshot containing this id.
-            Ok(id) => self.events.push(Event::Spawned { id }),
-            Err(e) => self.status(format!("spawn failed: {e}")),
-        }
+        let admitted = self.admit(&Launch::Literal(command), &cwd, &launch.env, group, None);
+        self.report_spawn(admitted);
     }
 
     /// Launch `agent`, a registered program word, as a managed task with a
@@ -912,44 +983,12 @@ impl Supervisor {
         let Some(launch) = self.launch_or_refuse() else {
             return;
         };
-        let Some(managed) = self.resolve_agent(agent, &launch, Intent::Fresh) else {
-            return;
+        let managed = match resolve_agent(agent, &launch, Intent::Fresh) {
+            Ok(m) => m,
+            Err(why) => return self.status(format!("{why}, not spawning")),
         };
-        match self.admit(&Launch::Managed(managed), &cwd, &launch.env, group, None) {
-            Ok(id) => self.events.push(Event::Spawned { id }),
-            Err(e) => self.status(format!("spawn failed: {e}")),
-        }
-    }
-
-    /// Build the managed launch of `agent` with `intent`: the registered
-    /// harness and the binary `launch`'s `PATH` finds now. Either miss is a
-    /// status line and `None`.
-    fn resolve_agent(
-        &mut self,
-        agent: &str,
-        launch: &LaunchContext,
-        intent: Intent,
-    ) -> Option<ManagedLaunch> {
-        let Some(h) = harness::registered(agent) else {
-            self.status(format!("no agent named {agent:?}, not spawning"));
-            return None;
-        };
-        let binary = self.agent_binary(agent, launch)?;
-        Some(ManagedLaunch {
-            agent: h,
-            binary,
-            intent,
-        })
-    }
-
-    /// Resolve `agent` on `launch`'s `PATH`, reporting a miss.
-    fn agent_binary(&mut self, agent: &str, launch: &LaunchContext) -> Option<PathBuf> {
-        let path = env_get(&launch.env, "PATH").unwrap_or_default();
-        let found = harness::find_on_path(agent, path);
-        if found.is_none() {
-            self.status(format!("{agent} not found on PATH, not spawning"));
-        }
-        found
+        let admitted = self.admit(&Launch::Managed(managed), &cwd, &launch.env, group, None);
+        self.report_spawn(admitted);
     }
 
     /// Rerun a finished task in place while preserving its ID, tag, group, and name.
@@ -981,8 +1020,9 @@ impl Supervisor {
         let command;
         let relaunch = match self.tasks[i].harness {
             Some(agent) => {
-                let Some(binary) = self.agent_binary(agent.shape().0, &launch) else {
-                    return;
+                let binary = match agent_binary(agent.shape().0, &launch) {
+                    Ok(b) => b,
+                    Err(why) => return self.status(format!("{why}, not spawning")),
                 };
                 let intent =
                     current_resume_id(&self.tasks[i]).map_or(Intent::Fresh, Intent::Resume);
@@ -1001,7 +1041,10 @@ impl Supervisor {
         // run number to isolate the replacement's capture file.
         let run = self.tasks[i].run + 1;
         match self.spawn_task(id, run, &relaunch, &cwd, &launch.env) {
-            Ok(mut fresh) => {
+            Ok((mut fresh, notice)) => {
+                if let Some(notice) = notice {
+                    self.status(format!("task {id}: {notice}"));
+                }
                 fresh.tagged = self.tasks[i].tagged;
                 fresh.group = self.tasks[i].group.clone();
                 fresh.name = self.tasks[i].name.clone();
@@ -1092,39 +1135,42 @@ impl Supervisor {
     /// Spawn every entry of a loaded recipe, each in its (existing) dir.
     /// Missing dirs are skipped rather than spawning tasks doomed to fail on
     /// chdir. A managed entry goes through the same resolution as the Agent
-    /// page: an agent with no binary on this context's `PATH` is a status
-    /// line and a failed entry, the rest still load. Returns `(spawned,
-    /// skipped, failed)` for the caller's notice, or `None` when no launch
-    /// context is installed (already refused with its own notice).
-    fn materialize(&mut self, cfg: &SessionConfig) -> Option<(usize, usize, usize)> {
+    /// page: an agent with no binary on this context's `PATH` is a reason and
+    /// a failed entry, the rest still load. Returns the outcome for
+    /// the caller's one summary line, or `None` when no launch context is
+    /// installed (already refused with its own notice).
+    fn materialize(&mut self, cfg: &SessionConfig) -> Option<LoadOutcome> {
         let launch = self.launch_or_refuse()?;
-        let (mut spawned, mut skipped, mut failed) = (0usize, 0usize, 0usize);
+        let mut out = LoadOutcome::default();
         for (dir, entries) in cfg {
             let resolved = path::resolve(&launch.cwd, dir);
             if !resolved.is_dir() {
-                skipped += entries.len();
+                out.skipped += entries.len();
                 continue;
             }
             for entry in entries {
                 if self.tasks.len() >= self.max_tasks {
-                    skipped += 1;
+                    out.skipped += 1;
                     continue;
                 }
                 let kind = match &entry.kind {
                     EntryKind::Literal(text) => {
                         if text.len() > MAX_COMMAND_LEN {
-                            skipped += 1;
+                            out.skipped += 1;
                             continue;
                         }
                         Launch::Literal(text)
                     }
                     EntryKind::Managed { agent, resume } => {
                         let intent = resume.clone().map_or(Intent::Fresh, Intent::Resume);
-                        let Some(m) = self.resolve_agent(agent, &launch, intent) else {
-                            failed += 1;
-                            continue;
-                        };
-                        Launch::Managed(m)
+                        match resolve_agent(agent, &launch, intent) {
+                            Ok(m) => Launch::Managed(m),
+                            Err(why) => {
+                                out.failed += 1;
+                                out.notes.push(why);
+                                continue;
+                            }
+                        }
                     }
                 };
                 // `admit` normalizes the persisted labels before assignment.
@@ -1135,13 +1181,19 @@ impl Supervisor {
                     entry.group.clone(),
                     entry.name.clone(),
                 ) {
-                    Ok(_) => spawned += 1,
+                    Ok((_, notice)) => {
+                        out.spawned += 1;
+                        out.notes.extend(notice);
+                    }
                     // Track spawn failures separately from skipped entries.
-                    Err(_) => failed += 1,
+                    Err(e) => {
+                        out.failed += 1;
+                        out.notes.push(format!("spawn failed: {e}"));
+                    }
                 }
             }
         }
-        Some((spawned, skipped, failed))
+        Some(out)
     }
 
     /// Run a config loader against the sessions root, prefixing errors with
@@ -1176,21 +1228,22 @@ impl Supervisor {
         }) else {
             return;
         };
-        let Some((spawned, skipped, failed)) = self.materialize(&cfg) else {
+        let Some(out) = self.materialize(&cfg) else {
             return;
         };
         // Report zero tasks only for an empty recipe.
         let mut parts = Vec::new();
-        if spawned > 0 || (skipped == 0 && failed == 0) {
-            parts.push(format!("{spawned} task(s)"));
+        if out.spawned > 0 || (out.skipped == 0 && out.failed == 0) {
+            parts.push(format!("{} task(s)", out.spawned));
         }
-        if skipped > 0 {
-            parts.push(format!("{skipped} skipped ({SKIP_REASONS})"));
+        if out.skipped > 0 {
+            parts.push(format!("{} skipped ({SKIP_REASONS})", out.skipped));
         }
-        if failed > 0 {
-            parts.push(format!("{failed} failed to spawn"));
+        if out.failed > 0 {
+            parts.push(format!("{} failed to spawn", out.failed));
         }
-        self.status(format!("loaded '{name}': {}", parts.join(", ")));
+        let msg = format!("loaded '{name}': {}", parts.join(", "));
+        self.status(out.annotate(msg));
     }
 
     /// Load a recovery snapshot by stem and suggest saving it as a named session.
@@ -1200,18 +1253,18 @@ impl Supervisor {
         }) else {
             return;
         };
-        let Some((_, skipped, failed)) = self.materialize(&cfg) else {
+        let Some(out) = self.materialize(&cfg) else {
             return;
         };
         // Append optional clauses to the fixed message prefix.
         let mut msg = String::from("loaded recovery snapshot; save to name it");
-        if skipped > 0 {
-            msg.push_str(&format!(", {skipped} skipped ({SKIP_REASONS})"));
+        if out.skipped > 0 {
+            msg.push_str(&format!(", {} skipped ({SKIP_REASONS})", out.skipped));
         }
-        if failed > 0 {
-            msg.push_str(&format!(", {failed} failed to spawn"));
+        if out.failed > 0 {
+            msg.push_str(&format!(", {} failed to spawn", out.failed));
         }
-        self.status(msg);
+        self.status(out.annotate(msg));
     }
 }
 

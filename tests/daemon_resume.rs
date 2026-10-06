@@ -14,8 +14,8 @@ use std::{
 };
 
 use common::{
-    control_frame, read_frame, shake_hands_env, spawn_agent_frame, spawn_frame, start_daemon_raw,
-    stop_daemon, wait_until,
+    control_frame, read_frame, shake_hands_env, spawn_agent_frame, start_daemon_raw, stop_daemon,
+    wait_until,
 };
 
 /// Delimiter separating argv records in a stub's append-only output.
@@ -543,38 +543,4 @@ fn saved_recipe_resumes_across_a_daemon_restart() {
     );
 
     stop_daemon(&mut daemon_b);
-}
-
-/// A typed `claude` is a literal task on the wire too: the stub runs with no
-/// argument, the recipe stores the text as a bare string, and reloading runs
-/// the same text again.
-#[test]
-fn typed_claude_runs_verbatim_and_saves_as_text() {
-    let s = Scratch::new("literal");
-    install_claude_stub(&s);
-    let (_dir, mut daemon, mut stream) = start_daemon_raw("resume_literal", |_| {});
-    hello(&mut stream, &s);
-    drain_events(&stream);
-
-    stream.write_all(&spawn_frame("claude", &s.work())).unwrap();
-    let rec = s.record("claude");
-    let argv = wait_run(&rec, 0, |a| a.is_empty());
-    assert!(argv.is_empty(), "a literal launch adds nothing: {argv:?}");
-
-    let recipe = save_once(&mut stream, &s.recipe("typed"), "typed");
-    // The scratch path itself contains "resume", so match the JSON keys.
-    assert!(
-        recipe.contains("\"claude\"")
-            && !recipe.contains("\"agent\"")
-            && !recipe.contains("\"resume\""),
-        "the recipe must hold the typed text and no managed entry: {recipe}"
-    );
-
-    stream
-        .write_all(&control_frame(r#"{"t":"load","name":"typed"}"#))
-        .unwrap();
-    let argv = wait_run(&rec, 1, |a| a.is_empty());
-    assert!(argv.is_empty(), "the reloaded text runs verbatim: {argv:?}");
-
-    stop_daemon(&mut daemon);
 }

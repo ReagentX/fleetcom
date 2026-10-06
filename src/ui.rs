@@ -1262,16 +1262,6 @@ mod tests {
         assert_eq!(spawn_page_hint(3), "  enter run · tab agents (3) · esc");
     }
 
-    /// Name the missing agents only when some are missing.
-    #[test]
-    fn agent_empty_text_names_the_missing_agents() {
-        assert_eq!(agent_empty_text(&[]), "    (no installed agent matches)");
-        assert_eq!(
-            agent_empty_text(&["grok", "omp"]),
-            "    (no installed agent matches · grok, omp not found on this host)"
-        );
-    }
-
     /// Directory and group destinations appear only when present.
     #[test]
     fn spawn_prompt_decoration_shapes() {

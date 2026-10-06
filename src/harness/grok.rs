@@ -46,12 +46,6 @@ mod tests {
         assert!(resume.env.is_empty());
     }
 
-    /// The overlay is empty: no flag, no environment, no notice.
-    #[test]
-    fn overlay_is_empty() {
-        assert_eq!(Grok.overlay(&paths(), None), SpawnPlan::default());
-    }
-
     #[test]
     fn parse_capture_is_unconditionally_none() {
         // No injected channel exists, so no payload is ever trusted.

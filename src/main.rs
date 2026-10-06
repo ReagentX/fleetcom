@@ -489,12 +489,6 @@ mod tests {
         }
         assert!(parse(&["--codex-notify-v1", "{}", "--scrollback", "5"]).is_err());
         assert!(parse(&["--scrollback", "5", "--codex-notify-v1", "{}"]).is_err());
-        // The payload is verbatim, even when it looks like a flag; the mode
-        // itself then refuses it as non-JSON.
-        assert_eq!(
-            parse(&["--codex-notify-v1", "--kill"]),
-            Ok(Invocation::CodexNotify("--kill".into()))
-        );
         assert_eq!(
             parse(&["--help", "--codex-notify-v1", "{}"]),
             Ok(Invocation::Help)

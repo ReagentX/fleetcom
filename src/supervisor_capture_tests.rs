@@ -121,6 +121,17 @@ fn notices(s: &mut Supervisor) -> Vec<String> {
         .collect()
 }
 
+/// Assert that `s` queued exactly one status line and that it names `needle`.
+/// Match on the distinctive token, not the full sentence, so rewording a
+/// message never breaks a test of the behavior behind it.
+fn assert_sole_notice(s: &mut Supervisor, needle: &str) {
+    let got = notices(s);
+    assert!(
+        got.len() == 1 && got[0].contains(needle),
+        "expected one notice naming {needle:?}; got {got:?}"
+    );
+}
+
 /// Whether a drained event batch acknowledges a spawn.
 fn acknowledged(events: &[Event]) -> bool {
     events.iter().any(|e| matches!(e, Event::Spawned { .. }))
@@ -1535,10 +1546,7 @@ fn unrepresentable_config_notify_suppresses_injection() {
         &[("CODEX_HOME", &codex_home)],
     ));
     s.spawn_agent("codex", dir.to_path_buf(), None);
-    assert_eq!(
-        notices(&mut s),
-        ["task 1: codex capture unavailable: `notify` config can't be chained"]
-    );
+    assert_sole_notice(&mut s, "capture unavailable");
     let argv = wait_argv(&mut s, &dir.join("argv"));
     assert_eq!(
         argv,
@@ -1754,17 +1762,11 @@ fn managed_spawn_refuses_an_unknown_word_a_missing_binary_and_a_full_fleet() {
     s.spawn_agent("vim", dir.to_path_buf(), None);
     let events = s.drain();
     assert!(!acknowledged(&events));
-    assert_eq!(
-        notices(&mut sup_with(events)),
-        ["no agent named \"vim\", not spawning"]
-    );
+    assert_sole_notice(&mut sup_with(events), "no agent named");
     s.spawn_agent("claude", dir.to_path_buf(), None);
     let events = s.drain();
     assert!(!acknowledged(&events));
-    assert_eq!(
-        notices(&mut sup_with(events)),
-        ["claude not found on PATH, not spawning"]
-    );
+    assert_sole_notice(&mut sup_with(events), "not found on PATH");
     assert!(s.tasks.is_empty(), "a refused launch creates nothing");
     assert!(!runtime.exists(), "a refused launch installs nothing");
 
@@ -1774,9 +1776,9 @@ fn managed_spawn_refuses_an_unknown_word_a_missing_binary_and_a_full_fleet() {
     assert!(acknowledged(&s.drain()));
     assert_eq!(s.tasks.len(), 1);
     s.spawn_agent("claude", dir.to_path_buf(), None);
-    assert_eq!(notices(&mut s), ["task limit reached (1), not spawning"]);
+    assert_sole_notice(&mut s, "task limit");
     spawn(&mut s, "sleep 1", dir.to_path_buf());
-    assert_eq!(notices(&mut s), ["task limit reached (1), not spawning"]);
+    assert_sole_notice(&mut s, "task limit");
     assert_eq!(s.tasks.len(), 1, "the ceiling holds for both launch kinds");
 }
 
@@ -1843,7 +1845,7 @@ fn managed_rerun_resumes_the_captured_id_from_the_binary_path_finds_now() {
     wait_for_lifecycle(&mut s, id, |l| l == Lifecycle::Ok);
     std::fs::remove_file(bin.join("claude")).unwrap();
     s.apply(Command::Restart { id });
-    assert_eq!(notices(&mut s), ["claude not found on PATH, not spawning"]);
+    assert_sole_notice(&mut s, "not found on PATH");
     assert_eq!(s.tasks[0].run, 1, "the finished task is preserved");
 }
 
@@ -1969,9 +1971,10 @@ fn managed_task_saves_as_a_managed_entry_and_reloads_managed() {
     );
 }
 
-/// A recipe naming an agent this host lacks reports it and loads the rest:
-/// the literal and the installed agent spawn, the missing one counts as
-/// failed.
+/// A recipe naming an agent this host lacks loads the rest, and the one
+/// summary line carries the reason: the client shows only a poll's last
+/// status, so a separate line queued before the summary would be lost.
+/// Recovery loads report the same way.
 #[test]
 fn load_reports_a_missing_agent_and_loads_the_rest() {
     let dir = scratch("load_missing_agent");
@@ -1997,12 +2000,12 @@ fn load_reports_a_missing_agent_and_loads_the_rest() {
             },
         ],
     );
-    assert_eq!(
-        notices(&mut s),
-        [
-            "grok not found on PATH, not spawning",
-            "loaded 'fleet': 2 task(s), 1 failed to spawn"
-        ]
+    let got = notices(&mut s);
+    assert!(
+        got.len() == 1
+            && got[0].contains("1 failed to spawn")
+            && got[0].contains("grok not found on PATH"),
+        "one summary naming the missing agent; got {got:?}"
     );
     assert_eq!(s.tasks.len(), 2);
     assert!(!s.tasks[0].managed);
@@ -2013,6 +2016,21 @@ fn load_reports_a_missing_agent_and_loads_the_rest() {
         wait_argv(&mut s, &dir.join("argv"))[..2],
         ["--resume", CAP_ID]
     );
+
+    let stem = "20990101-000000-1";
+    let cfg = SessionConfig::from([(
+        dir.to_string_lossy().into_owned(),
+        vec![managed("grok", None)],
+    )]);
+    session::save_recovery_in(
+        &session::recovery_dir(&config.join("sessions")),
+        stem,
+        "snapshot",
+        &cfg,
+    )
+    .unwrap();
+    s.apply(Command::LoadRecovery { stem: stem.into() });
+    assert_sole_notice(&mut s, "grok not found on PATH");
 }
 
 /// A managed codex carries the embedded override even when capture is off,
@@ -2031,10 +2049,7 @@ fn managed_codex_reports_the_capture_notice_and_leads_a_rerun_with_resume() {
         &[("CODEX_HOME", &codex_home)],
     ));
     s.spawn_agent("codex", dir.to_path_buf(), None);
-    assert_eq!(
-        notices(&mut s),
-        ["task 1: codex capture unavailable: `notify` config can't be chained"]
-    );
+    assert_sole_notice(&mut s, "capture unavailable");
     let argv = wait_argv(&mut s, &dir.join("argv"));
     assert_eq!(argv, ["-c", "features.daemon_auto_start=false"]);
     let id = s.tasks[0].id;
@@ -2046,10 +2061,7 @@ fn managed_codex_reports_the_capture_notice_and_leads_a_rerun_with_resume() {
     std::fs::write(s.tasks[0].capture_file.as_ref().unwrap(), CAP_ID).unwrap();
     std::fs::remove_file(dir.join("argv")).unwrap();
     s.apply(Command::Restart { id });
-    assert_eq!(
-        notices(&mut s),
-        ["task 1: codex capture unavailable: `notify` config can't be chained"]
-    );
+    assert_sole_notice(&mut s, "capture unavailable");
     assert_eq!(
         wait_argv(&mut s, &dir.join("argv")),
         ["resume", CAP_ID, "-c", "features.daemon_auto_start=false"]

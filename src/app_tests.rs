@@ -3236,6 +3236,71 @@ fn agent_arrows_step_within_the_matches() {
 /// The common case, `n` → Tab → Enter: `SpawnAgent` for the first installed
 /// agent in the invocation directory, the prompt closed, and the core admits
 /// the task as managed with the program word as its row label.
+/// A session load reports every task's launch notice and every failure in
+/// the status the app actually displays. The core queues the per-task
+/// reasons and the summary in one batch, and `sync` keeps only the last
+/// status, so the summary itself must carry them.
+#[test]
+fn session_load_status_keeps_capture_notices_and_failures() {
+    let dir = temp("load_status");
+    let (bin, config, codex_home) = (dir.join("bin"), dir.join("config"), dir.join("codex"));
+    for d in [&bin, &codex_home] {
+        std::fs::create_dir_all(d).unwrap();
+    }
+    write_executable(&bin.join("codex"), "exit 0");
+    // A notify route fleetcom cannot chain: codex launches without capture.
+    std::fs::write(codex_home.join("config.toml"), "notify = [1]\n").unwrap();
+    let ctx = crate::protocol::LaunchContext {
+        env: vec![
+            ("PATH".into(), bin.as_os_str().to_os_string()),
+            (
+                path::FLEETCOM_RUNTIME_DIR.into(),
+                dir.join("run").into_os_string(),
+            ),
+            (
+                "FLEETCOM_CONFIG_DIR".into(),
+                config.as_os_str().to_os_string(),
+            ),
+            ("CODEX_HOME".into(), codex_home.as_os_str().to_os_string()),
+        ],
+        cwd: dir.to_path_buf(),
+    };
+    let managed = |agent: &str| crate::session::SessionEntry {
+        kind: crate::session::EntryKind::Managed {
+            agent: agent.into(),
+            resume: None,
+        },
+        group: None,
+        name: None,
+    };
+    let cfg = crate::session::SessionConfig::from([(
+        dir.to_string_lossy().into_owned(),
+        vec![managed("codex"), managed("grok"), managed("codex")],
+    )]);
+    crate::session::save_in(&config.join("sessions"), "fleet", &cfg).unwrap();
+
+    let mut app = App::new_local_with_ctx(30, 100, ctx);
+    app.pump();
+    app.transport.send(Command::LoadSession {
+        name: "fleet".into(),
+    });
+    app.pump();
+    let status = app.status.clone().unwrap_or_default();
+    assert_eq!(app.views.len(), 2, "both codex entries load: {status}");
+    for needle in [
+        "loaded 'fleet'",
+        "1 failed to spawn",
+        "grok not found on PATH",
+        "codex capture unavailable",
+        "(2 tasks)",
+    ] {
+        assert!(
+            status.contains(needle),
+            "{needle:?} missing from {status:?}"
+        );
+    }
+}
+
 #[test]
 fn agent_enter_launches_the_highlighted_agent_managed() {
     let (mut app, _dir) = stub_claude_fixture("enter");
