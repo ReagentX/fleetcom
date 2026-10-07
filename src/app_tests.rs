@@ -70,6 +70,16 @@ impl App {
         panic!("spawn never landed: {:?}", self.status);
     }
 
+    /// Pump until task `id` has exited (`Ok` or `Failed`), or panic after 5 s.
+    fn wait_finished(&mut self, id: u64) {
+        let exited = wait_until(Duration::from_secs(5), || {
+            self.pump();
+            let lifecycle = self.task_index(id).map(|i| self.views[i].lifecycle);
+            matches!(lifecycle, Some(Lifecycle::Ok | Lifecycle::Failed))
+        });
+        assert!(exited, "task {id} never exited: {:?}", self.views);
+    }
+
     /// Return section labels with task ids instead of `views` indices.
     fn section_ids(&self) -> Vec<(String, Vec<u64>)> {
         self.sections()
@@ -78,13 +88,11 @@ impl App {
             .collect()
     }
 
-    /// Spawn `cmd`, resolve its dashboard selection, and attach to it.
+    /// Spawn `cmd` (which selects it) and attach to it.
     fn attached(rows: u16, cols: u16, cmd: &str) -> (Self, u64) {
         let mut app = Self::new_local(rows, cols);
         let dir = app.invocation_dir.clone();
         app.spawn_in(cmd, dir);
-        app.pump();
-        app.resolve_selection();
         app.attach();
         let id = app.focused_id.expect("attached");
         (app, id)
@@ -102,6 +110,121 @@ fn ctrl(code: KeyCode) -> KeyEvent {
 
 fn shift(code: KeyCode) -> KeyEvent {
     KeyEvent::new(code, KeyModifiers::SHIFT)
+}
+
+/// Type `text` into the open prompt one key at a time through `handler`,
+/// the prompt's `on_key_*` method.
+fn type_into(app: &mut App, handler: fn(&mut App, KeyEvent), text: &str) {
+    for c in text.chars() {
+        handler(app, key(KeyCode::Char(c)));
+    }
+}
+
+/// An app attached to task `id` with no task behind it: clipboard and paste
+/// handling gate on `mode` and `focused_id` alone, never on `views`.
+fn attached_stub(id: u64) -> App {
+    let mut app = App::new_local(30, 100);
+    app.mode = Mode::Attached;
+    app.focused_id = Some(id);
+    app
+}
+
+/// Paint one frame of the current mode and return it as text.
+fn painted(app: &mut App) -> String {
+    app.last_frame.clear(); // identical frames are skipped
+    let mut out = Vec::new();
+    crate::ui::render(&mut out, app).unwrap();
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Supply core events to the app without a running core: `poll` drains
+/// `events` once, `send` discards.
+struct Scripted {
+    events: Vec<Event>,
+    connected: bool,
+}
+
+impl Scripted {
+    /// A live core that delivers `events` on the next poll.
+    fn events(events: Vec<Event>) -> Box<dyn Transport> {
+        Box::new(Self {
+            events,
+            connected: true,
+        })
+    }
+
+    /// A dropped core: nothing to deliver, and `connected` is false so
+    /// `check_connection` lands in `Mode::Disconnected`.
+    fn unplugged() -> Box<dyn Transport> {
+        Box::new(Self {
+            events: Vec::new(),
+            connected: false,
+        })
+    }
+}
+
+impl Transport for Scripted {
+    fn send(&mut self, _cmd: Command) {}
+
+    fn poll(&mut self) -> Vec<Event> {
+        std::mem::take(&mut self.events)
+    }
+
+    fn connected(&self) -> bool {
+        self.connected
+    }
+
+    fn shutdown(&mut self, _intent: ExitIntent) {}
+}
+
+/// Pass commands through to a real core and log each one.
+struct Recording {
+    inner: Box<dyn Transport>,
+    sent: Arc<std::sync::Mutex<Vec<Command>>>,
+}
+
+impl Transport for Recording {
+    fn send(&mut self, cmd: Command) {
+        self.sent.lock().unwrap().push(cmd.clone());
+        self.inner.send(cmd);
+    }
+
+    fn poll(&mut self) -> Vec<Event> {
+        self.inner.poll()
+    }
+
+    fn connected(&self) -> bool {
+        self.inner.connected()
+    }
+
+    fn shutdown(&mut self, intent: ExitIntent) {
+        self.inner.shutdown(intent);
+    }
+}
+
+impl App {
+    /// Wrap the transport in `Recording` and return its log.
+    fn record_sends(&mut self) -> Arc<std::sync::Mutex<Vec<Command>>> {
+        let sent = Arc::default();
+        let inner = std::mem::replace(&mut self.transport, Scripted::unplugged());
+        self.transport = Box::new(Recording {
+            inner,
+            sent: Arc::clone(&sent),
+        });
+        sent
+    }
+
+    /// Dispatch `k` through `on_key`, the run loop's entry point.
+    fn hit(&mut self, k: KeyEvent) {
+        self.on_key(&mut io::sink(), k);
+    }
+
+    /// Flush pending clipboard stores and return the bytes written.
+    fn flushed(&mut self) -> Vec<u8> {
+        let mut out = Vec::new();
+        self.flush_clipboard(&mut out).unwrap();
+        out
+    }
 }
 
 /// Construct a stable live task without spawning a child. `Active` keeps an
@@ -153,7 +276,6 @@ fn spawn_moves_selection_to_the_new_task() {
     let mut app = App::new_local(30, 100);
     let dir = app.invocation_dir.clone();
     app.spawn_in("sleep 30", dir.clone());
-    app.resolve_selection();
     let first = app.selected_id.expect("first spawn selected");
 
     app.spawn_in("sleep 31", dir);
@@ -301,7 +423,6 @@ fn custom_sections_collate_case_insensitively() {
     app.spawn_grouped("sleep 5", inv.clone(), "API"); // id 2
     app.spawn_grouped("sleep 5", inv.clone(), "Review"); // id 3
     app.spawn_grouped("sleep 5", inv, "api"); // id 4
-    app.pump();
     app.group_mode = GroupMode::Custom;
 
     assert_eq!(
@@ -326,7 +447,6 @@ fn dir_sections_collate_case_insensitively() {
     std::fs::create_dir_all(&lower).unwrap();
     app.spawn_in("sleep 5", upper.clone()); // id 1
     app.spawn_in("sleep 5", lower.clone()); // id 2
-    app.pump();
     app.group_mode = GroupMode::Dir;
 
     let (z, a) = (path::abbreviate(&upper), path::abbreviate(&lower));
@@ -361,7 +481,6 @@ fn custom_mode_groups_by_name_with_unassigned_last() {
     app.spawn_grouped("sleep 5", inv.clone(), "beta"); // id 1
     app.spawn_grouped("sleep 5", inv.clone(), "alpha"); // id 2
     app.spawn_in("sleep 5", inv); // id 3, no group
-    app.pump();
 
     app.group_mode = GroupMode::Custom;
     assert_eq!(
@@ -380,36 +499,14 @@ fn custom_mode_unassigned_tracks_membership() {
     let mut app = App::new_local(30, 100);
     let inv = app.invocation_dir.clone();
     app.spawn_grouped("sleep 5", inv, "alpha"); // id 1
-    app.pump();
     app.group_mode = GroupMode::Custom;
     assert_eq!(app.section_ids(), vec![("alpha".to_string(), vec![1])]);
 
     let mut app = App::new_local(30, 100);
     let inv = app.invocation_dir.clone();
     app.spawn_in("sleep 5", inv); // id 1, no group
-    app.pump();
     app.group_mode = GroupMode::Custom;
     assert_eq!(app.section_ids(), vec![("Unassigned".to_string(), vec![1])]);
-}
-
-/// In Custom mode, tagged tasks sort first within their existing group.
-#[test]
-fn custom_mode_tag_floats_within_group() {
-    let mut app = App::new_local(30, 100);
-    let inv = app.invocation_dir.clone();
-    app.spawn_grouped("sleep 5", inv.clone(), "alpha"); // id 1
-    app.spawn_grouped("sleep 5", inv, "alpha"); // id 2
-    app.pump();
-    app.group_mode = GroupMode::Custom;
-    assert_eq!(app.section_ids(), vec![("alpha".to_string(), vec![1, 2])]);
-
-    app.transport.send(Command::Tag { id: 2, on: true });
-    app.pump();
-    assert_eq!(
-        app.section_ids(),
-        vec![("alpha".to_string(), vec![2, 1])],
-        "tag floats id 2 to the top of alpha, not into an In use section"
-    );
 }
 
 /// Group reassignment can reorder sections without changing the selected id.
@@ -419,7 +516,6 @@ fn custom_mode_selection_survives_group_move() {
     let inv = app.invocation_dir.clone();
     app.spawn_grouped("sleep 5", inv.clone(), "alpha"); // id 1
     app.spawn_grouped("sleep 5", inv, "beta"); // id 2
-    app.pump();
     app.group_mode = GroupMode::Custom;
     // Exercise moving id 1 rather than the selected second spawn.
     app.selected_id = Some(1);
@@ -452,7 +548,6 @@ fn custom_mode_clusters_by_dir_within_group() {
     app.spawn_grouped("sleep 5", dir_b, "alpha"); // id 1, dir b
     app.spawn_grouped("sleep 5", dir_a.clone(), "alpha"); // id 2, dir a
     app.spawn_grouped("sleep 5", dir_a, "alpha"); // id 3, dir a
-    app.pump();
 
     app.group_mode = GroupMode::Custom;
     assert_eq!(
@@ -469,13 +564,7 @@ fn tagging_a_finished_task_moves_it_to_in_use() {
     let mut app = App::new_local(30, 100);
     let inv = app.invocation_dir.clone();
     app.spawn_in("true", inv); // exits ~immediately
-    wait_until(Duration::from_secs(5), || {
-        app.pump();
-        app.views
-            .first()
-            .map(|v| matches!(v.lifecycle, Lifecycle::Ok | Lifecycle::Failed))
-            .unwrap_or(false)
-    });
+    app.wait_finished(1);
     assert!(matches!(
         app.views[0].lifecycle,
         Lifecycle::Ok | Lifecycle::Failed
@@ -500,16 +589,11 @@ fn idle_task_lands_in_idle_between_running_and_completed() {
     app.spawn_in("sleep 5", inv.clone()); // id 2: idle below
     app.spawn_in("sleep 5", inv.clone()); // id 3: tagged below
     app.spawn_in("true", inv); // id 4: exits ~immediately
-    wait_until(Duration::from_secs(5), || {
-        app.pump();
-        app.views
-            .iter()
-            .any(|v| v.id == 4 && matches!(v.lifecycle, Lifecycle::Ok | Lifecycle::Failed))
-    });
+    app.wait_finished(4);
     app.transport.send(Command::Tag { id: 3, on: true });
     app.pump();
 
-    let i = app.views.iter().position(|v| v.id == 2).unwrap();
+    let i = app.task_index(2).unwrap();
     app.views[i].lifecycle = Lifecycle::Idle;
 
     assert_eq!(
@@ -530,11 +614,10 @@ fn tagged_task_stays_in_use_across_lifecycles() {
     let inv = app.invocation_dir.clone();
     app.spawn_in("sleep 5", inv.clone()); // id 1: tagged + idle
     app.spawn_in("sleep 5", inv); // id 2: running
-    app.pump();
     app.transport.send(Command::Tag { id: 1, on: true });
     app.pump();
 
-    let i = app.views.iter().position(|v| v.id == 1).unwrap();
+    let i = app.task_index(1).unwrap();
     for lifecycle in [
         Lifecycle::Active,
         Lifecycle::Idle,
@@ -561,11 +644,10 @@ fn selection_follows_task_across_idle_rebucket() {
     let dir = app.invocation_dir.clone();
     app.spawn_in("sleep 5", dir.clone()); // id 1
     app.spawn_in("sleep 5", dir); // id 2
-    app.pump();
     app.selected_id = Some(1);
 
     // Idle id 1 -> it sinks into "Idle", below id 2's "Running".
-    let i = app.views.iter().position(|v| v.id == 1).unwrap();
+    let i = app.task_index(1).unwrap();
     app.views[i].lifecycle = Lifecycle::Idle;
 
     let order = app.display_order();
@@ -592,108 +674,65 @@ fn selection_follows_task_across_idle_rebucket() {
     assert_eq!(app.views[app.selected_task().unwrap()].id, 1);
 }
 
-/// Idle state does not affect row order within a custom group.
-#[test]
-fn custom_mode_idle_task_holds_its_row() {
-    let mut app = App::new_local(30, 100);
-    let inv = app.invocation_dir.clone();
-    app.spawn_grouped("sleep 5", inv.clone(), "alpha"); // id 1
-    app.spawn_grouped("sleep 5", inv, "alpha"); // id 2
-    app.pump();
-    app.group_mode = GroupMode::Custom;
-    assert_eq!(app.section_ids(), vec![("alpha".to_string(), vec![1, 2])]);
-
-    let i = app.views.iter().position(|v| v.id == 1).unwrap();
-    app.views[i].lifecycle = Lifecycle::Idle;
-    assert_eq!(
-        app.section_ids(),
-        vec![("alpha".to_string(), vec![1, 2])],
-        "idle id 1 keeps its row above id 2 within alpha"
-    );
-}
-
-/// Idle state does not affect row order within a directory section.
-#[test]
-fn dir_mode_idle_task_holds_its_row() {
-    let mut app = App::new_local(30, 100);
-    let inv = app.invocation_dir.clone();
-    app.spawn_in("sleep 5", inv.clone()); // id 1
-    app.spawn_in("sleep 5", inv); // id 2
-    app.pump();
-    app.group_mode = GroupMode::Dir;
-    let label = path::abbreviate(&app.invocation_dir);
-    assert_eq!(app.section_ids(), vec![(label.clone(), vec![1, 2])]);
-
-    let i = app.views.iter().position(|v| v.id == 1).unwrap();
-    app.views[i].lifecycle = Lifecycle::Idle;
-    assert_eq!(
-        app.section_ids(),
-        vec![(label, vec![1, 2])],
-        "idle id 1 keeps its row above id 2 within its directory"
-    );
-}
-
-/// Entering and leaving idle state preserves row order.
+/// Entering and leaving idle state preserves row order within a section,
+/// whether that section is a custom group or a directory (the group is inert
+/// in Dir mode, so one spawn shape serves both).
 #[test]
 fn idle_round_trip_leaves_row_order_identical() {
-    let mut app = App::new_local(30, 100);
-    let inv = app.invocation_dir.clone();
-    app.spawn_grouped("sleep 5", inv.clone(), "alpha"); // id 1
-    app.spawn_grouped("sleep 5", inv.clone(), "alpha"); // id 2
-    app.spawn_grouped("sleep 5", inv, "alpha"); // id 3
-    app.pump();
-    app.group_mode = GroupMode::Custom;
-    let want = vec![("alpha".to_string(), vec![1, 2, 3])];
-    assert_eq!(app.section_ids(), want);
+    for mode in [GroupMode::Custom, GroupMode::Dir] {
+        let mut app = App::new_local(30, 100);
+        let inv = app.invocation_dir.clone();
+        app.spawn_grouped("sleep 5", inv.clone(), "alpha"); // id 1
+        app.spawn_grouped("sleep 5", inv.clone(), "alpha"); // id 2
+        app.spawn_grouped("sleep 5", inv.clone(), "alpha"); // id 3
+        app.group_mode = mode;
+        let label = match mode {
+            GroupMode::Custom => "alpha".to_string(),
+            GroupMode::Dir => path::abbreviate(&inv),
+            GroupMode::State => unreachable!(),
+        };
+        let want = vec![(label, vec![1, 2, 3])];
+        assert_eq!(app.section_ids(), want, "{mode:?}");
 
-    let i = app.views.iter().position(|v| v.id == 2).unwrap();
-    app.views[i].lifecycle = Lifecycle::Idle;
-    assert_eq!(app.section_ids(), want, "quiet does not move id 2");
+        let i = app.task_index(2).unwrap();
+        app.views[i].lifecycle = Lifecycle::Idle;
+        assert_eq!(
+            app.section_ids(),
+            want,
+            "{mode:?}: quiet does not move id 2"
+        );
 
-    app.views[i].lifecycle = Lifecycle::Active;
-    assert_eq!(app.section_ids(), want, "waking does not move id 2 back");
+        app.views[i].lifecycle = Lifecycle::Active;
+        assert_eq!(
+            app.section_ids(),
+            want,
+            "{mode:?}: waking does not move id 2 back"
+        );
+    }
 }
 
-/// Completed tasks sort after live tasks within a custom group.
+/// Completed tasks sort after live tasks within a section, whether that
+/// section is a custom group or a directory.
 #[test]
-fn custom_mode_finished_sinks_within_group() {
-    let mut app = App::new_local(30, 100);
-    let inv = app.invocation_dir.clone();
-    app.spawn_grouped("true", inv.clone(), "alpha"); // id 1: exits ~immediately
-    app.spawn_grouped("sleep 30", inv, "alpha"); // id 2: stays live
-    wait_until(Duration::from_secs(5), || {
-        app.pump();
-        app.views
-            .iter()
-            .any(|v| v.id == 1 && matches!(v.lifecycle, Lifecycle::Ok | Lifecycle::Failed))
-    });
-    app.group_mode = GroupMode::Custom;
-    assert_eq!(
-        app.section_ids(),
-        vec![("alpha".to_string(), vec![2, 1])],
-        "finished id 1 sinks below live id 2 within alpha"
-    );
-}
-
-/// Completed tasks sort after live tasks within a directory section.
-#[test]
-fn dir_mode_finished_sinks_within_section() {
-    let mut app = App::new_local(30, 100);
-    let inv = app.invocation_dir.clone();
-    app.spawn_in("true", inv.clone()); // id 1: exits ~immediately
-    app.spawn_in("sleep 30", inv); // id 2: stays live
-    wait_until(Duration::from_secs(5), || {
-        app.pump();
-        app.views
-            .iter()
-            .any(|v| v.id == 1 && matches!(v.lifecycle, Lifecycle::Ok | Lifecycle::Failed))
-    });
-    app.group_mode = GroupMode::Dir;
-    assert_eq!(
-        app.section_ids(),
-        vec![(path::abbreviate(&app.invocation_dir), vec![2, 1])],
-        "finished id 1 sinks below live id 2 within its directory"
-    );
+fn finished_task_sinks_within_its_section() {
+    for mode in [GroupMode::Custom, GroupMode::Dir] {
+        let mut app = App::new_local(30, 100);
+        let inv = app.invocation_dir.clone();
+        app.spawn_grouped("true", inv.clone(), "alpha"); // id 1: exits ~immediately
+        app.spawn_grouped("sleep 30", inv.clone(), "alpha"); // id 2: stays live
+        app.wait_finished(1);
+        app.group_mode = mode;
+        let label = match mode {
+            GroupMode::Custom => "alpha".to_string(),
+            GroupMode::Dir => path::abbreviate(&inv),
+            GroupMode::State => unreachable!(),
+        };
+        assert_eq!(
+            app.section_ids(),
+            vec![(label, vec![2, 1])],
+            "{mode:?}: finished id 1 sinks below live id 2"
+        );
+    }
 }
 
 /// Tagged tasks sort first within a custom group, including while idle.
@@ -702,14 +741,19 @@ fn custom_mode_tagged_task_floats_and_holds_while_idle() {
     let mut app = App::new_local(30, 100);
     let inv = app.invocation_dir.clone();
     app.spawn_grouped("sleep 5", inv.clone(), "alpha"); // id 1
-    app.spawn_grouped("sleep 5", inv, "alpha"); // id 2: tagged
-    app.pump();
+    app.spawn_grouped("sleep 5", inv, "alpha"); // id 2: tagged below
+    app.group_mode = GroupMode::Custom;
+    assert_eq!(app.section_ids(), vec![("alpha".to_string(), vec![1, 2])]);
+
     app.transport.send(Command::Tag { id: 2, on: true });
     app.pump();
-    app.group_mode = GroupMode::Custom;
-    assert_eq!(app.section_ids(), vec![("alpha".to_string(), vec![2, 1])]);
+    assert_eq!(
+        app.section_ids(),
+        vec![("alpha".to_string(), vec![2, 1])],
+        "tag floats id 2 to the top of alpha, not into an In use section"
+    );
 
-    let i = app.views.iter().position(|v| v.id == 2).unwrap();
+    let i = app.task_index(2).unwrap();
     app.views[i].lifecycle = Lifecycle::Idle;
     assert_eq!(
         app.section_ids(),
@@ -737,14 +781,8 @@ fn state_mode_ordering_survives_the_row_key_split() {
     app.spawn_in("sleep 30", dir_a.clone()); // id 6: tagged + idle, dir a
     app.spawn_in("true", dir_b.clone()); // id 7: finished, dir b
     app.spawn_in("true", dir_a.clone()); // id 8: finished, dir a
-    wait_until(Duration::from_secs(5), || {
-        app.pump();
-        [7u64, 8].iter().all(|id| {
-            app.views
-                .iter()
-                .any(|v| v.id == *id && matches!(v.lifecycle, Lifecycle::Ok | Lifecycle::Failed))
-        })
-    });
+    app.wait_finished(7);
+    app.wait_finished(8);
     for id in [5u64, 6] {
         app.transport.send(Command::Tag { id, on: true });
     }
@@ -759,7 +797,7 @@ fn state_mode_ordering_survives_the_row_key_split() {
         (5, Lifecycle::Active),
         (6, Lifecycle::Idle),
     ] {
-        let i = app.views.iter().position(|v| v.id == id).unwrap();
+        let i = app.task_index(id).unwrap();
         app.views[i].lifecycle = lifecycle;
     }
 
@@ -913,37 +951,29 @@ fn session_selection_clamps_when_a_shorter_list_arrives() {
     assert_eq!(app.session_sel, 0);
 }
 
-/// Write a recovery fixture whose commands run in `dir`.
-fn write_recovery(dir: &Path, stem: &str, label: &str, cmds: &[&str]) {
+/// Write the autosaved recovery snapshot for 2026-01-`day` (stem
+/// `202601DD-000000-1`) with one task running `cmd` in `dir`, and return
+/// its path.
+fn autosave(dir: &Path, day: u8, cmd: &str) -> PathBuf {
     let rec = dir.join("sessions").join("recovery");
     std::fs::create_dir_all(&rec).unwrap();
-    let list: Vec<String> = cmds.iter().map(|c| format!("{c:?}")).collect();
+    let path = rec.join(format!("202601{day:02}-000000-1.json"));
     std::fs::write(
-        rec.join(format!("{stem}.json")),
+        &path,
         format!(
-            r#"{{"version":1,"name":"{label}","dirs":{{".":[{}]}}}}"#,
-            list.join(",")
+            r#"{{"version":1,"name":"autosaved 2026-01-{day:02} 00:00","dirs":{{".":[{cmd:?}]}}}}"#
         ),
     )
     .unwrap();
+    path
 }
 
 /// Session events populate and independently clamp both picker lists.
 #[test]
 fn sessions_reply_populates_and_clamps_both_lists() {
     let dir = session_scratch("rec_lists", &["a"]);
-    write_recovery(
-        &dir,
-        "20260101-000000-1",
-        "autosaved 2026-01-01 00:00",
-        &["sleep 5"],
-    );
-    write_recovery(
-        &dir,
-        "20260102-000000-1",
-        "autosaved 2026-01-02 00:00",
-        &["sleep 5"],
-    );
+    let older = autosave(&dir, 1, "sleep 5");
+    autosave(&dir, 2, "sleep 5");
     let mut app = app_with_config_dir(&dir);
 
     app.on_key_dashboard(key(KeyCode::Char('o')));
@@ -960,12 +990,7 @@ fn sessions_reply_populates_and_clamps_both_lists() {
 
     // Refresh after removing the selected recovery entry.
     app.recovery_sel = 1;
-    std::fs::remove_file(
-        dir.join("sessions")
-            .join("recovery")
-            .join("20260101-000000-1.json"),
-    )
-    .unwrap();
+    std::fs::remove_file(older).unwrap();
     app.transport.send(Command::ListSessions);
     app.pump();
     assert_eq!(app.session_recovery.len(), 1);
@@ -977,12 +1002,7 @@ fn sessions_reply_populates_and_clamps_both_lists() {
 #[test]
 fn o_key_resets_the_picker_to_the_saved_page() {
     let dir = session_scratch("rec_reset", &["a"]);
-    write_recovery(
-        &dir,
-        "20260101-000000-1",
-        "autosaved 2026-01-01 00:00",
-        &["sleep 5"],
-    );
+    autosave(&dir, 1, "sleep 5");
     let mut app = app_with_config_dir(&dir);
 
     app.on_key_dashboard(key(KeyCode::Char('o')));
@@ -1019,18 +1039,8 @@ fn tab_is_a_no_op_without_recovery_entries() {
 #[test]
 fn tab_toggles_pages_and_selections_stay_independent() {
     let dir = session_scratch("rec_tab", &["a", "b"]);
-    write_recovery(
-        &dir,
-        "20260101-000000-1",
-        "autosaved 2026-01-01 00:00",
-        &["sleep 5"],
-    );
-    write_recovery(
-        &dir,
-        "20260102-000000-1",
-        "autosaved 2026-01-02 00:00",
-        &["sleep 5"],
-    );
+    autosave(&dir, 1, "sleep 5");
+    autosave(&dir, 2, "sleep 5");
     let mut app = app_with_config_dir(&dir);
     app.on_key_dashboard(key(KeyCode::Char('o')));
     app.pump();
@@ -1053,24 +1063,14 @@ fn tab_toggles_pages_and_selections_stay_independent() {
 #[test]
 fn emptied_recovery_list_returns_to_the_saved_page() {
     let dir = session_scratch("rec_empty", &["a"]);
-    write_recovery(
-        &dir,
-        "20260101-000000-1",
-        "autosaved 2026-01-01 00:00",
-        &["sleep 5"],
-    );
+    let only = autosave(&dir, 1, "sleep 5");
     let mut app = app_with_config_dir(&dir);
     app.on_key_dashboard(key(KeyCode::Char('o')));
     app.pump();
     app.on_key_loadsession(key(KeyCode::Tab));
     assert_eq!(app.session_page, SessionPage::Recovery);
 
-    std::fs::remove_file(
-        dir.join("sessions")
-            .join("recovery")
-            .join("20260101-000000-1.json"),
-    )
-    .unwrap();
+    std::fs::remove_file(only).unwrap();
     app.transport.send(Command::ListSessions);
     app.pump();
     assert!(app.session_recovery.is_empty());
@@ -1081,18 +1081,8 @@ fn emptied_recovery_list_returns_to_the_saved_page() {
 #[test]
 fn enter_on_the_recovery_page_loads_the_selected_stem() {
     let dir = session_scratch("rec_load", &[]);
-    write_recovery(
-        &dir,
-        "20260101-000000-1",
-        "autosaved 2026-01-01 00:00",
-        &["sleep 7"],
-    );
-    write_recovery(
-        &dir,
-        "20260102-000000-1",
-        "autosaved 2026-01-02 00:00",
-        &["sleep 9"],
-    );
+    autosave(&dir, 1, "sleep 7");
+    autosave(&dir, 2, "sleep 9");
     let mut app = app_with_config_dir(&dir);
     app.on_key_dashboard(key(KeyCode::Char('o')));
     app.pump();
@@ -1119,12 +1109,7 @@ fn enter_on_the_recovery_page_loads_the_selected_stem() {
 #[test]
 fn esc_closes_the_picker_from_the_recovery_page() {
     let dir = session_scratch("rec_esc", &[]);
-    write_recovery(
-        &dir,
-        "20260101-000000-1",
-        "autosaved 2026-01-01 00:00",
-        &["sleep 5"],
-    );
+    autosave(&dir, 1, "sleep 5");
     let mut app = app_with_config_dir(&dir);
     app.on_key_dashboard(key(KeyCode::Char('o')));
     app.pump();
@@ -1142,7 +1127,6 @@ fn recent_dirs_are_distinct_and_newest_first() {
     app.spawn_in("sleep 5", PathBuf::from("/tmp")); // id 1  /tmp
     app.spawn_in("sleep 5", inv.clone()); // id 2  invocation
     app.spawn_in("sleep 5", PathBuf::from("/tmp")); // id 3  /tmp (dup)
-    app.pump();
 
     let dirs = app.in_use_dirs();
     assert_eq!(dirs.len(), 2, "duplicate dirs collapse");
@@ -1194,16 +1178,13 @@ fn recents_fixture(tag: &str) -> (App, Scratch) {
     for name in ["crabstep", "crabapple", "Logria"] {
         app.spawn_in("sleep 5", rust.join(name));
     }
-    app.pump();
     (app, root)
 }
 
-/// Open the `@` picker and type `fragment` one key at a time.
+/// Open the `@` picker and type `fragment` into it.
 fn type_pickdir(app: &mut App, fragment: &str) {
     app.on_key_dashboard(key(KeyCode::Char('@')));
-    for c in fragment.chars() {
-        app.on_key_pickdir(key(KeyCode::Char(c)));
-    }
+    type_into(app, App::on_key_pickdir, fragment);
 }
 
 /// Current-task directory paths in picker order.
@@ -1319,9 +1300,7 @@ fn pickdir_slash_suppresses_recents() {
     );
 
     // Filtering the resolved path still omits current-task directory rows.
-    for c in "log".chars() {
-        app.on_key_pickdir(key(KeyCode::Char(c)));
-    }
+    type_into(&mut app, App::on_key_pickdir, "log");
     assert!(jump_paths(&app).is_empty());
     assert_eq!(app.dir_candidates[1].path, rust.join("Logria"));
     assert_eq!(app.dir_candidates[1].kind, DirKind::Into);
@@ -1355,7 +1334,6 @@ fn pickdir_dedupes_a_recent_that_is_also_a_subdirectory() {
     let (mut app, root) = recents_fixture("pickdir_recent_dedupe");
     let docs = root.join("Documents/Code/Rust/fleetcom/docs");
     app.spawn_in("sleep 5", docs.clone());
-    app.pump();
 
     type_pickdir(&mut app, "doc");
 
@@ -1378,7 +1356,6 @@ fn focus_by_id_survives_index_shift() {
     let inv = app.invocation_dir.clone();
     app.spawn_in("sleep 5", inv.clone()); // id 1
     app.spawn_in("sleep 5", inv); // id 2
-    app.pump();
     app.focused_id = Some(2);
     assert_eq!(app.views[app.focused_task().unwrap()].id, 2);
 
@@ -1399,7 +1376,6 @@ fn rows_interleave_headers_and_tasks() {
     let inv = app.invocation_dir.clone();
     app.spawn_in("a", inv); // id 1, invocation dir
     app.spawn_in("b", PathBuf::from("/tmp")); // id 2, /tmp
-    app.pump();
 
     app.group_mode = GroupMode::Dir;
     let rows = app.list_rows();
@@ -1420,8 +1396,6 @@ fn dashboard_selection_stays_in_scroll_window() {
     for _ in 0..8 {
         app.spawn_in("sleep 5", inv.clone());
     }
-    app.pump();
-    app.resolve_selection();
 
     // A 4-row window over 9 rows (1 header + 8 tasks): walking the whole
     // list down and back up must never let the selection leave the window.
@@ -1458,7 +1432,6 @@ fn selection_wraps_at_list_edges() {
     app.spawn_in("sleep 5", inv.clone()); // id 1
     app.spawn_in("sleep 5", inv.clone()); // id 2
     app.spawn_in("sleep 5", inv); // id 3
-    app.pump();
 
     // Tag id 2 -> it sorts into a leading "In use" section, so the wrap
     // below crosses a section boundary.
@@ -1486,20 +1459,25 @@ fn selection_wraps_at_list_edges() {
     );
 }
 
-/// With a single task, wrap degrades to a no-op in both directions.
+/// With a single task, every navigation step is a no-op: wrap in both
+/// directions and section stepping both ways.
 #[test]
-fn selection_wrap_is_noop_with_one_task() {
+fn navigation_is_noop_with_one_task() {
     let mut app = App::new_local(30, 100);
     let inv = app.invocation_dir.clone();
     app.spawn_in("sleep 5", inv);
-    app.pump();
-    app.resolve_selection();
     assert_eq!(app.selected_id, Some(1));
 
-    app.select_up();
-    assert_eq!(app.selected_id, Some(1));
-    app.select_down();
-    assert_eq!(app.selected_id, Some(1));
+    let steps = [
+        ("up", App::select_up as fn(&mut App)),
+        ("down", App::select_down),
+        ("next section", App::select_next_section),
+        ("prev section", App::select_prev_section),
+    ];
+    for (name, step) in steps {
+        step(&mut app);
+        assert_eq!(app.selected_id, Some(1), "{name}");
+    }
 }
 
 /// Build two two-task sections: In use [3, 4] and Running [1, 2].
@@ -1509,7 +1487,6 @@ fn app_with_two_sections() -> App {
     for _ in 0..4 {
         app.spawn_in("sleep 5", inv.clone());
     }
-    app.pump();
     app.transport.send(Command::Tag { id: 3, on: true });
     app.transport.send(Command::Tag { id: 4, on: true });
     app.pump();
@@ -1568,22 +1545,6 @@ fn backtab_jumps_to_previous_section_first_task() {
     );
 }
 
-/// Keep a single task selected during section navigation.
-#[test]
-fn section_nav_is_noop_with_one_task() {
-    let mut app = App::new_local(30, 100);
-    let inv = app.invocation_dir.clone();
-    app.spawn_in("sleep 5", inv);
-    app.pump();
-    app.resolve_selection();
-    assert_eq!(app.selected_id, Some(1));
-
-    app.select_next_section();
-    assert_eq!(app.selected_id, Some(1));
-    app.select_prev_section();
-    assert_eq!(app.selected_id, Some(1));
-}
-
 /// Without a selection, navigation chooses the boundary section.
 #[test]
 fn section_nav_defaults_without_selection() {
@@ -1621,7 +1582,6 @@ fn app_with_tagged_pair() -> App {
     for _ in 0..4 {
         app.spawn_in("sleep 5", inv.clone());
     }
-    app.pump();
     app.transport.send(Command::Tag { id: 2, on: true });
     app.transport.send(Command::Tag { id: 4, on: true });
     app.pump();
@@ -1644,7 +1604,6 @@ fn app_with_tags_split_across_groups() -> App {
     app.spawn_grouped("sleep 5", inv.clone(), "alpha"); // id 2
     app.spawn_grouped("sleep 5", inv.clone(), "beta"); // id 3
     app.spawn_grouped("sleep 5", inv, "beta"); // id 4
-    app.pump();
     app.group_mode = GroupMode::Custom;
     app.transport.send(Command::Tag { id: 1, on: true });
     app.transport.send(Command::Tag { id: 3, on: true });
@@ -1699,7 +1658,6 @@ fn cycle_tagged_is_noop_without_tags() {
     let inv = app.invocation_dir.clone();
     app.spawn_in("sleep 5", inv.clone()); // id 1
     app.spawn_in("sleep 5", inv); // id 2
-    app.pump();
     app.selected_id = Some(1);
 
     app.on_key_dashboard(key(KeyCode::Char('M')));
@@ -1731,7 +1689,6 @@ fn cycle_tagged_with_one_tag_holds_the_selection() {
     app.spawn_in("sleep 5", inv.clone()); // id 1
     app.spawn_in("sleep 5", inv.clone()); // id 2
     app.spawn_in("sleep 5", inv); // id 3
-    app.pump();
     app.transport.send(Command::Tag { id: 2, on: true });
     app.pump();
     app.selected_id = Some(2); // Start on the only tagged row.
@@ -1864,9 +1821,7 @@ fn unencodable_modifiers_and_keys_are_dropped() {
 /// Refuse an oversized attached paste before sending it would close the connection.
 #[test]
 fn oversized_paste_is_refused_with_a_status_line() {
-    let mut app = App::new_local(30, 100);
-    app.mode = Mode::Attached;
-    app.focused_id = Some(1);
+    let mut app = attached_stub(1);
     app.on_paste(&"x".repeat(MAX_PASTE + 1));
     let status = app.status.clone().unwrap_or_default();
     // MiB values are truncated, so both sizes display as 8 MiB.
@@ -2051,7 +2006,6 @@ fn wheel_moves_dashboard_selection() {
     let dir = app.invocation_dir.clone();
     app.spawn_in("sleep 5", dir.clone()); // id 1
     app.spawn_in("sleep 5", dir); // id 2
-    app.pump();
     app.selected_id = Some(1);
 
     let wheel = |kind| MouseEvent {
@@ -2078,8 +2032,6 @@ fn group_picker_opens_on_g_only_with_a_selection() {
 
     let inv = app.invocation_dir.clone();
     app.spawn_in("sleep 5", inv);
-    app.pump();
-    app.resolve_selection();
     app.on_key_dashboard(key(KeyCode::Char('g')));
     assert_eq!(app.mode, Mode::PickGroup(1));
 }
@@ -2094,7 +2046,6 @@ fn group_candidates_are_distinct_sorted_and_marked() {
     app.spawn_grouped("sleep 5", inv.clone(), "alpha"); // id 2
     app.spawn_grouped("sleep 5", inv.clone(), "alpha"); // id 3, dup group
     app.spawn_in("sleep 5", inv); // id 4, no group
-    app.pump();
 
     app.selected_id = Some(1); // group "beta"
     app.on_key_dashboard(key(KeyCode::Char('g')));
@@ -2130,7 +2081,6 @@ fn group_candidates_collate_case_insensitively() {
     app.spawn_grouped("sleep 5", inv.clone(), "Review"); // id 3
     app.spawn_grouped("sleep 5", inv.clone(), "api"); // id 4
     app.spawn_grouped("sleep 5", inv, "api"); // id 5, exact duplicate
-    app.pump();
 
     app.selected_id = Some(1);
     app.on_key_dashboard(key(KeyCode::Char('g')));
@@ -2160,7 +2110,6 @@ fn group_filter_narrows_and_preselects_the_first_match() {
     let inv = app.invocation_dir.clone();
     app.spawn_grouped("sleep 5", inv.clone(), "alpha"); // id 1
     app.spawn_grouped("sleep 5", inv, "beta"); // id 2
-    app.pump();
     // Keep alpha selected so filtered beta is not marked "(current)".
     app.selected_id = Some(1);
     app.on_key_dashboard(key(KeyCode::Char('g')));
@@ -2194,7 +2143,6 @@ fn group_enter_on_a_candidate_assigns_it() {
     let inv = app.invocation_dir.clone();
     app.spawn_grouped("sleep 5", inv.clone(), "alpha"); // id 1
     app.spawn_in("sleep 5", inv); // id 2, no group
-    app.pump();
 
     app.selected_id = Some(2);
     app.on_key_dashboard(key(KeyCode::Char('g')));
@@ -2212,12 +2160,8 @@ fn group_enter_on_novel_text_creates_the_group() {
     let mut app = App::new_local(30, 100);
     let inv = app.invocation_dir.clone();
     app.spawn_grouped("sleep 5", inv, "alpha"); // id 1
-    app.pump();
-    app.resolve_selection();
     app.on_key_dashboard(key(KeyCode::Char('g')));
-    for c in "gamma".chars() {
-        app.on_key_pickgroup(key(KeyCode::Char(c)));
-    }
+    type_into(&mut app, App::on_key_pickgroup, "gamma");
     assert_eq!(app.group_candidates.len(), 1, "nothing matches");
     app.on_key_pickgroup(key(KeyCode::Enter));
     app.pump();
@@ -2231,8 +2175,6 @@ fn group_enter_on_empty_input_clears_to_unassigned() {
     let mut app = App::new_local(30, 100);
     let inv = app.invocation_dir.clone();
     app.spawn_grouped("sleep 5", inv, "alpha"); // id 1
-    app.pump();
-    app.resolve_selection();
     app.on_key_dashboard(key(KeyCode::Char('g')));
     assert_eq!(app.group_sel, 0, "empty input highlights the clear row");
     app.on_key_pickgroup(key(KeyCode::Enter));
@@ -2247,12 +2189,8 @@ fn group_esc_cancels_without_sending() {
     let mut app = App::new_local(30, 100);
     let inv = app.invocation_dir.clone();
     app.spawn_grouped("sleep 5", inv, "alpha"); // id 1
-    app.pump();
-    app.resolve_selection();
     app.on_key_dashboard(key(KeyCode::Char('g')));
-    for c in "gamma".chars() {
-        app.on_key_pickgroup(key(KeyCode::Char(c)));
-    }
+    type_into(&mut app, App::on_key_pickgroup, "gamma");
     app.on_key_pickgroup(key(KeyCode::Esc));
     assert_eq!(app.mode, Mode::Dashboard);
     assert!(app.group_input.is_empty() && app.group_candidates.is_empty());
@@ -2263,16 +2201,9 @@ fn group_esc_cancels_without_sending() {
 
 // --- `/` find palette ---------------------------------------------------
 
-/// Candidate IDs for the current palette state.
-fn find_ids(app: &App) -> Vec<u64> {
-    app.find_candidates.clone()
-}
-
-/// Type `text` into the open palette one key at a time.
+/// Type `text` into the open palette.
 fn find_type(app: &mut App, text: &str) {
-    for c in text.chars() {
-        app.on_key_find(key(KeyCode::Char(c)));
-    }
+    type_into(app, App::on_key_find, text);
 }
 
 /// The find palette requires at least one task but no current selection.
@@ -2285,12 +2216,11 @@ fn find_palette_opens_on_slash_only_with_tasks() {
 
     let inv = app.invocation_dir.clone();
     app.spawn_in("sleep 5", inv);
-    app.pump();
     // Exercise opening find without a current selection.
     app.selected_id = None;
     app.on_key_dashboard(key(KeyCode::Char('/')));
     assert_eq!(app.mode, Mode::Find);
-    assert_eq!(find_ids(&app), vec![1]);
+    assert_eq!(app.find_candidates, vec![1]);
 }
 
 /// Find candidates follow dashboard order rather than task-ID order.
@@ -2311,7 +2241,7 @@ fn find_candidates_follow_display_order() {
     assert_eq!(order, vec![3, 1, 2], "tag floats id 3 first");
 
     app.on_key_dashboard(key(KeyCode::Char('/')));
-    assert_eq!(find_ids(&app), order);
+    assert_eq!(app.find_candidates, order);
     assert_eq!(app.find_sel, 0, "the first match is highlighted");
 }
 
@@ -2325,15 +2255,15 @@ fn find_empty_input_lists_every_task() {
         view(2, inv, false, Some("alpha")),
     ];
     app.on_key_dashboard(key(KeyCode::Char('/')));
-    assert_eq!(find_ids(&app), vec![1, 2]);
+    assert_eq!(app.find_candidates, vec![1, 2]);
 
     // Type, then delete, to list the full fleet again.
     find_type(&mut app, "alpha");
-    assert_eq!(find_ids(&app), vec![2]);
+    assert_eq!(app.find_candidates, vec![2]);
     for _ in 0.."alpha".len() {
         app.on_key_find(key(KeyCode::Backspace));
     }
-    assert_eq!(find_ids(&app), vec![1, 2]);
+    assert_eq!(app.find_candidates, vec![1, 2]);
 }
 
 /// Matching ignores case and hits substrings anywhere in the field, not just
@@ -2344,21 +2274,28 @@ fn find_matches_case_insensitive_substrings() {
     let inv = app.invocation_dir.clone();
     app.spawn_in("sleep 5", inv.clone()); // id 1
     app.spawn_in("true", inv); // id 2
-    app.pump();
 
     app.on_key_dashboard(key(KeyCode::Char('/')));
     find_type(&mut app, "SLEEP");
-    assert_eq!(find_ids(&app), vec![1], "case-insensitive");
+    assert_eq!(app.find_candidates, vec![1], "case-insensitive");
 
     app.on_key_find(key(KeyCode::Esc));
     app.on_key_dashboard(key(KeyCode::Char('/')));
     find_type(&mut app, "eep");
-    assert_eq!(find_ids(&app), vec![1], "matches mid-command, not a prefix");
+    assert_eq!(
+        app.find_candidates,
+        vec![1],
+        "matches mid-command, not a prefix"
+    );
 
     app.on_key_find(key(KeyCode::Esc));
     app.on_key_dashboard(key(KeyCode::Char('/')));
     find_type(&mut app, "ru");
-    assert_eq!(find_ids(&app), vec![2], "matches mid-command of \"true\"");
+    assert_eq!(
+        app.find_candidates,
+        vec![2],
+        "matches mid-command of \"true\""
+    );
 }
 
 /// A named task matches both its display name and command.
@@ -2376,12 +2313,12 @@ fn find_matches_a_named_task_on_both_fields() {
 
     app.on_key_dashboard(key(KeyCode::Char('/')));
     find_type(&mut app, "api");
-    assert_eq!(find_ids(&app), vec![1], "matches the name");
+    assert_eq!(app.find_candidates, vec![1], "matches the name");
 
     app.on_key_find(key(KeyCode::Esc));
     app.on_key_dashboard(key(KeyCode::Char('/')));
     find_type(&mut app, "sleep");
-    assert_eq!(find_ids(&app), vec![1], "still matches the command");
+    assert_eq!(app.find_candidates, vec![1], "still matches the command");
 }
 
 /// Group names are a match field.
@@ -2391,11 +2328,10 @@ fn find_matches_group_names() {
     let inv = app.invocation_dir.clone();
     app.spawn_grouped("sleep 5", inv.clone(), "backend"); // id 1
     app.spawn_in("sleep 5", inv); // id 2, no group
-    app.pump();
 
     app.on_key_dashboard(key(KeyCode::Char('/')));
     find_type(&mut app, "backend");
-    assert_eq!(find_ids(&app), vec![1]);
+    assert_eq!(app.find_candidates, vec![1]);
 }
 
 /// Find does not match working-directory names.
@@ -2405,22 +2341,21 @@ fn find_does_not_match_the_directory() {
     let dir = temp("findpalettedir");
     let name = dir.file_name().unwrap().to_string_lossy().into_owned();
     app.spawn_in("sleep 5", dir.to_path_buf()); // id 1
-    app.pump();
     assert!(name.contains("findpalettedir"), "scratch dir name: {name}");
 
     app.on_key_dashboard(key(KeyCode::Char('/')));
     find_type(&mut app, "findpalettedir");
     assert!(
-        find_ids(&app).is_empty(),
+        app.find_candidates.is_empty(),
         "the directory must not match: {:?}",
-        find_ids(&app)
+        app.find_candidates
     );
 
     // The command remains searchable.
     app.on_key_find(key(KeyCode::Esc));
     app.on_key_dashboard(key(KeyCode::Char('/')));
     find_type(&mut app, "sleep");
-    assert_eq!(find_ids(&app), vec![1]);
+    assert_eq!(app.find_candidates, vec![1]);
 }
 
 /// On Enter, select the highlighted task on the dashboard and close the palette.
@@ -2431,7 +2366,6 @@ fn find_enter_jumps_the_selection() {
     app.spawn_in("sleep 5", inv.clone()); // id 1
     app.spawn_in("sleep 5", inv.clone()); // id 2
     app.spawn_in("sleep 5", inv); // id 3
-    app.pump();
     app.selected_id = Some(1);
 
     app.on_key_dashboard(key(KeyCode::Char('/')));
@@ -2455,12 +2389,11 @@ fn find_esc_leaves_the_selection_alone() {
     let inv = app.invocation_dir.clone();
     app.spawn_in("sleep 5", inv.clone()); // id 1
     app.spawn_in("true", inv); // id 2
-    app.pump();
     app.selected_id = Some(1);
 
     app.on_key_dashboard(key(KeyCode::Char('/')));
     find_type(&mut app, "true");
-    assert_eq!(find_ids(&app), vec![2]);
+    assert_eq!(app.find_candidates, vec![2]);
     app.on_key_find(key(KeyCode::Esc));
     assert_eq!(app.mode, Mode::Dashboard);
     assert_eq!(app.selected_id, Some(1), "Esc must not move the selection");
@@ -2474,12 +2407,10 @@ fn find_enter_without_candidates_keeps_the_panel_open() {
     let mut app = App::new_local(30, 100);
     let inv = app.invocation_dir.clone();
     app.spawn_in("sleep 5", inv);
-    app.pump();
-    app.resolve_selection();
 
     app.on_key_dashboard(key(KeyCode::Char('/')));
     find_type(&mut app, "zzz");
-    assert!(find_ids(&app).is_empty());
+    assert!(app.find_candidates.is_empty());
     app.on_key_find(key(KeyCode::Enter));
     assert_eq!(app.mode, Mode::Find, "no match: Enter must not close");
     assert_eq!(app.selected_id, Some(1), "selection is untouched");
@@ -2489,7 +2420,7 @@ fn find_enter_without_candidates_keeps_the_panel_open() {
         app.on_key_find(key(KeyCode::Backspace));
     }
     find_type(&mut app, "sleep");
-    assert_eq!(find_ids(&app), vec![1]);
+    assert_eq!(app.find_candidates, vec![1]);
 }
 
 /// Find rows include status, label, and section; empty results show a message.
@@ -2521,23 +2452,14 @@ fn find_paste_filters_the_candidates() {
     let inv = app.invocation_dir.clone();
     app.spawn_in("sleep 5", inv.clone()); // id 1
     app.spawn_in("true", inv); // id 2
-    app.pump();
 
     app.on_key_dashboard(key(KeyCode::Char('/')));
     app.on_paste("true");
     assert_eq!(app.find_input.as_str(), "true");
-    assert_eq!(find_ids(&app), vec![2]);
+    assert_eq!(app.find_candidates, vec![2]);
 }
 
 // --- `?` controls overlay -----------------------------------------------
-
-/// Paint one frame of the current mode and return it as text.
-fn painted(app: &mut App) -> String {
-    app.last_frame.clear(); // identical frames are skipped
-    let mut out = Vec::new();
-    crate::ui::render(&mut out, app).unwrap();
-    String::from_utf8_lossy(&out).into_owned()
-}
 
 /// Highlight rows swap reverse video for a bright-black background while the
 /// host terminal is unfocused.
@@ -2556,7 +2478,6 @@ fn unfocused_terminal_mutes_the_highlight_rows() {
     let mut app = App::new_local(30, 100);
     let inv = app.invocation_dir.clone();
     app.spawn_in("sleep 5", inv);
-    app.pump();
     app.selected_id = Some(1);
 
     // The dashboard's only reverse-video line is the selected row, so its
@@ -2575,31 +2496,24 @@ fn unfocused_terminal_mutes_the_highlight_rows() {
     assert!(painted(&mut app).contains(&reverse));
 }
 
-/// Open the overlay on `?`; close on `?`, `Esc`, or `q`.
+/// Open the overlay on either event form of Shift-`/` (`?`, or `/` with
+/// Shift); close it on either form, `Esc`, or `q`.
 #[test]
 fn controls_overlay_opens_on_question_and_closes_on_question_esc_q() {
     let mut app = App::new_local(30, 100);
-    for close in [KeyCode::Char('?'), KeyCode::Esc, KeyCode::Char('q')] {
-        app.on_key_dashboard(key(KeyCode::Char('?')));
-        assert_eq!(app.mode, Mode::Controls, "? must open the overlay");
-        app.on_key_controls(key(close));
-        assert_eq!(app.mode, Mode::Dashboard, "{close:?} must close it");
-    }
-}
-
-/// Both accepted Shift-`/` event forms, `?` and `/` with Shift, open and close
-/// the overlay.
-#[test]
-fn controls_overlay_accepts_both_spellings_of_the_chord() {
-    let mut app = App::new_local(30, 100);
-    for chord in [key(KeyCode::Char('?')), shift(KeyCode::Char('/'))] {
-        app.on_key_dashboard(chord);
-        assert!(
-            app.mode == Mode::Controls,
-            "{chord:?} must open the overlay"
-        );
-        app.on_key_controls(chord);
-        assert_eq!(app.mode, Mode::Dashboard, "{chord:?} must close it");
+    let chords = [key(KeyCode::Char('?')), shift(KeyCode::Char('/'))];
+    for open in chords {
+        for close in [
+            chords[0],
+            chords[1],
+            key(KeyCode::Esc),
+            key(KeyCode::Char('q')),
+        ] {
+            app.on_key_dashboard(open);
+            assert_eq!(app.mode, Mode::Controls, "{open:?} must open the overlay");
+            app.on_key_controls(close);
+            assert_eq!(app.mode, Mode::Dashboard, "{close:?} must close it");
+        }
     }
 }
 
@@ -2609,7 +2523,6 @@ fn plain_slash_still_opens_the_find_palette() {
     let mut app = App::new_local(30, 100);
     let inv = app.invocation_dir.clone();
     app.spawn_in("sleep 5", inv);
-    app.pump();
     app.on_key_dashboard(key(KeyCode::Char('/')));
     assert_eq!(app.mode, Mode::Find);
 }
@@ -2620,8 +2533,6 @@ fn controls_overlay_ignores_dashboard_keys() {
     let mut app = App::new_local(30, 100);
     let inv = app.invocation_dir.clone();
     app.spawn_in("sleep 5", inv);
-    app.pump();
-    app.resolve_selection();
 
     app.on_key_dashboard(key(KeyCode::Char('?')));
     app.on_key_controls(key(KeyCode::Char('m')));
@@ -2714,8 +2625,6 @@ fn rename_prompt_opens_on_shift_r_only_with_a_selection() {
 
     let inv = app.invocation_dir.clone();
     app.spawn_in("sleep 5", inv);
-    app.pump();
-    app.resolve_selection();
     app.on_key_dashboard(key(KeyCode::Char('R')));
     assert_eq!(app.mode, Mode::Rename(1));
     assert_eq!(app.input.as_str(), "", "an unnamed task prefills empty");
@@ -2737,12 +2646,8 @@ fn rename_enter_sends_the_typed_name() {
     let mut app = App::new_local(30, 100);
     let inv = app.invocation_dir.clone();
     app.spawn_in("sleep 5", inv);
-    app.pump();
-    app.resolve_selection();
     app.on_key_dashboard(key(KeyCode::Char('R')));
-    for c in "api server".chars() {
-        app.on_key_rename(key(KeyCode::Char(c)));
-    }
+    type_into(&mut app, App::on_key_rename, "api server");
     app.on_key_rename(key(KeyCode::Enter));
     assert_eq!(app.mode, Mode::Dashboard);
     assert!(app.input.is_empty());
@@ -2762,7 +2667,6 @@ fn rename_enter_on_empty_input_clears_the_name() {
         name: Some("api".to_string()),
     });
     app.pump();
-    app.resolve_selection();
     app.on_key_dashboard(key(KeyCode::Char('R')));
     assert_eq!(app.input.as_str(), "api");
     for _ in 0.."api".len() {
@@ -2785,11 +2689,8 @@ fn rename_esc_cancels_without_sending() {
         name: Some("api".to_string()),
     });
     app.pump();
-    app.resolve_selection();
     app.on_key_dashboard(key(KeyCode::Char('R')));
-    for c in "junk".chars() {
-        app.on_key_rename(key(KeyCode::Char(c)));
-    }
+    type_into(&mut app, App::on_key_rename, "junk");
     app.on_key_rename(key(KeyCode::Esc));
     assert_eq!(app.mode, Mode::Dashboard);
     assert!(app.input.is_empty());
@@ -2812,7 +2713,6 @@ fn rename_caret_keys_edit_mid_name() {
         name: Some("api".to_string()),
     });
     app.pump();
-    app.resolve_selection();
     app.on_key_dashboard(key(KeyCode::Char('R')));
     assert_eq!(app.input.as_str(), "api");
 
@@ -2851,8 +2751,6 @@ fn ctrl_chords_never_insert_their_letter() {
     let mut app = App::new_local(30, 100);
     let inv = app.invocation_dir.clone();
     app.spawn_grouped("sleep 5", inv, "alpha"); // id 1
-    app.pump();
-    app.resolve_selection();
 
     app.on_key_dashboard(key(KeyCode::Char('w')));
     app.on_key_savesession(ctrl(KeyCode::Char('k')));
@@ -2884,9 +2782,7 @@ fn pickdir_right_descends_only_from_the_end() {
     app.invocation_dir = dir.to_path_buf();
 
     app.on_key_dashboard(key(KeyCode::Char('@')));
-    for c in "al".chars() {
-        app.on_key_pickdir(key(KeyCode::Char(c)));
-    }
+    type_into(&mut app, App::on_key_pickdir, "al");
     assert_eq!(app.dir_sel, 1, "the fragment preselects alpha");
 
     // One position before the end, move the caret on Right without descending.
@@ -2939,8 +2835,6 @@ fn pickgroup_caret_edits_refresh_the_filter() {
     let inv = app.invocation_dir.clone();
     app.spawn_grouped("sleep 5", inv.clone(), "alpha"); // id 1
     app.spawn_grouped("sleep 5", inv, "beta"); // id 2
-    app.pump();
-    app.resolve_selection();
     app.on_key_dashboard(key(KeyCode::Char('g')));
 
     app.on_key_pickgroup(key(KeyCode::Char('b')));
@@ -3000,9 +2894,7 @@ fn custom_mode_spawn_inherits_the_selected_group() {
     let mut app = App::new_local(30, 100);
     let inv = app.invocation_dir.clone();
     app.spawn_grouped("sleep 5", inv, "alpha"); // id 1
-    app.pump();
     app.group_mode = GroupMode::Custom;
-    app.resolve_selection();
 
     app.on_key_dashboard(key(KeyCode::Char('n')));
     assert_eq!(app.mode, Mode::Spawn);
@@ -3025,9 +2917,7 @@ fn dir_picker_handoff_inherits_the_selected_group_in_custom_mode() {
     let mut app = App::new_local(30, 100);
     let inv = app.invocation_dir.clone();
     app.spawn_grouped("sleep 5", inv, "alpha"); // id 1
-    app.pump();
     app.group_mode = GroupMode::Custom;
-    app.resolve_selection();
 
     app.on_key_dashboard(key(KeyCode::Char('@')));
     assert_eq!(app.mode, Mode::PickDir);
@@ -3043,8 +2933,6 @@ fn state_and_dir_mode_spawns_stay_unassigned() {
     let mut app = App::new_local(30, 100);
     let inv = app.invocation_dir.clone();
     app.spawn_grouped("sleep 5", inv, "alpha"); // id 1
-    app.pump();
-    app.resolve_selection();
 
     for mode in [GroupMode::State, GroupMode::Dir] {
         app.group_mode = mode;
@@ -3064,23 +2952,6 @@ fn state_and_dir_mode_spawns_stay_unassigned() {
 
 // --- `n` spawn prompt: Agent page --------------------------------------
 
-/// Supply core events to the app without a running core.
-struct Scripted(Vec<Event>);
-
-impl Transport for Scripted {
-    fn send(&mut self, _cmd: Command) {}
-
-    fn poll(&mut self) -> Vec<Event> {
-        std::mem::take(&mut self.0)
-    }
-
-    fn connected(&self) -> bool {
-        true
-    }
-
-    fn shutdown(&mut self, _intent: ExitIntent) {}
-}
-
 impl App {
     /// Create a detached app with the supplied `agents` list and return the send log. Do
     /// not pump `new_local`, so the host's installed agents are never read into the list.
@@ -3088,7 +2959,7 @@ impl App {
     fn with_agents(agents: &[&str]) -> (Self, Arc<std::sync::Mutex<Vec<Command>>>) {
         let mut app = Self::new_local(30, 100);
         app.agents = agents.iter().map(|a| a.to_string()).collect();
-        app.transport = Box::new(Unplugged);
+        app.transport = Scripted::unplugged();
         let sent = app.record_sends();
         (app, sent)
     }
@@ -3100,11 +2971,9 @@ impl App {
         assert_eq!(self.spawn_page, SpawnPage::Agent);
     }
 
-    /// Type `text` into the open spawn prompt one key at a time.
+    /// Type `text` into the open spawn prompt.
     fn type_spawn(&mut self, text: &str) {
-        for c in text.chars() {
-            self.on_key_spawn(key(KeyCode::Char(c)));
-        }
+        type_into(self, Self::on_key_spawn, text);
     }
 }
 
@@ -3385,7 +3254,7 @@ fn agents_event_refilters_and_an_empty_list_leaves_the_agent_page() {
     app.open_agent_page();
     app.type_spawn("c");
 
-    app.transport = Box::new(Scripted(vec![Event::Agents(vec!["codex".to_string()])]));
+    app.transport = Scripted::events(vec![Event::Agents(vec!["codex".to_string()])]);
     app.sync();
     assert_eq!(app.spawn_page, SpawnPage::Agent);
     assert_eq!(
@@ -3394,7 +3263,7 @@ fn agents_event_refilters_and_an_empty_list_leaves_the_agent_page() {
         "the rows follow the new list"
     );
 
-    app.transport = Box::new(Scripted(vec![Event::Agents(Vec::new())]));
+    app.transport = Scripted::events(vec![Event::Agents(Vec::new())]);
     app.sync();
     assert_eq!(app.spawn_page, SpawnPage::Command);
     assert_eq!(app.mode, Mode::Spawn, "the prompt itself stays open");
@@ -3457,57 +3326,36 @@ fn agent_page_no_match_names_the_missing_agents() {
 
 // --- OSC 52 clipboard emission ------------------------------------------
 
-/// An attached clipboard store emits one BEL-terminated OSC 52 sequence.
+/// An attached store emits one BEL-terminated OSC 52 sequence whose
+/// selector byte names the store's kind.
 #[test]
-fn attached_clipboard_store_emits_the_osc52_envelope() {
-    let mut app = App::new_local(30, 100);
-    app.mode = Mode::Attached;
-    app.focused_id = Some(1);
-    app.on_clipboard_copy(1, ClipboardKind::Clipboard, "hello".to_string());
-    let mut out = Vec::new();
-    app.flush_clipboard(&mut out).unwrap();
-    assert_eq!(out, b"\x1b]52;c;aGVsbG8=\x07");
-    assert_eq!(app.notice(), Some("copied 5 chars"));
-    assert!(
-        app.status.is_none(),
-        "the copy confirmation is ephemeral; it must not occupy the status"
-    );
-}
-
-/// A selection store emits the `s` selector.
-#[test]
-fn selection_store_emits_its_own_kind_byte() {
-    let mut app = App::new_local(30, 100);
-    app.mode = Mode::Attached;
-    app.focused_id = Some(1);
-    app.on_clipboard_copy(1, ClipboardKind::Selection, "hello".to_string());
-    let mut out = Vec::new();
-    app.flush_clipboard(&mut out).unwrap();
-    assert_eq!(out, b"\x1b]52;s;aGVsbG8=\x07");
-}
-
-/// A primary-selection store emits the `p` selector.
-#[test]
-fn primary_store_emits_its_own_kind_byte() {
-    let mut app = App::new_local(30, 100);
-    app.mode = Mode::Attached;
-    app.focused_id = Some(1);
-    app.on_clipboard_copy(1, ClipboardKind::Primary, "hello".to_string());
-    let mut out = Vec::new();
-    app.flush_clipboard(&mut out).unwrap();
-    assert_eq!(out, b"\x1b]52;p;aGVsbG8=\x07");
+fn attached_store_emits_the_osc52_envelope_with_its_kind_byte() {
+    for (kind, selector) in [
+        (ClipboardKind::Clipboard, 'c'),
+        (ClipboardKind::Selection, 's'),
+        (ClipboardKind::Primary, 'p'),
+    ] {
+        let mut app = attached_stub(1);
+        app.on_clipboard_copy(1, kind, "hello".to_string());
+        assert_eq!(
+            app.flushed(),
+            format!("\x1b]52;{selector};aGVsbG8=\x07").as_bytes()
+        );
+        assert_eq!(app.notice(), Some("copied 5 chars"));
+        assert!(
+            app.status.is_none(),
+            "the copy confirmation is ephemeral; it must not occupy the status"
+        );
+    }
 }
 
 /// Clipboard payloads are base64-encoded before reaching the host terminal.
 #[test]
 fn clipboard_payload_bytes_never_reach_the_terminal_raw() {
     let payload = "line1\nline2\x1b[31mred\x1b]52;c;evil\x07";
-    let mut app = App::new_local(30, 100);
-    app.mode = Mode::Attached;
-    app.focused_id = Some(1);
+    let mut app = attached_stub(1);
     app.on_clipboard_copy(1, ClipboardKind::Clipboard, payload.to_string());
-    let mut out = Vec::new();
-    app.flush_clipboard(&mut out).unwrap();
+    let out = app.flushed();
 
     assert!(out.starts_with(b"\x1b]52;c;"));
     assert!(out.ends_with(b"\x07"));
@@ -3533,8 +3381,7 @@ fn clipboard_stores_outside_attached_mode_are_dropped() {
         app.focused_id = Some(1);
         app.on_clipboard_copy(1, ClipboardKind::Clipboard, "hello".to_string());
         assert!(app.pending_clipboard.is_empty(), "nothing may buffer");
-        let mut out = Vec::new();
-        app.flush_clipboard(&mut out).unwrap();
+        let out = app.flushed();
         assert!(out.is_empty(), "nothing may emit");
         assert!(app.notice().is_none(), "no notice without an emission");
     }
@@ -3543,9 +3390,7 @@ fn clipboard_stores_outside_attached_mode_are_dropped() {
 /// Stores from tasks other than the attached task are ignored.
 #[test]
 fn mismatched_id_clipboard_store_drops_at_receipt() {
-    let mut app = App::new_local(30, 100);
-    app.mode = Mode::Attached;
-    app.focused_id = Some(7);
+    let mut app = attached_stub(7);
     app.on_clipboard_copy(3, ClipboardKind::Clipboard, "stale".to_string());
     assert!(
         app.pending_clipboard.is_empty(),
@@ -3570,7 +3415,6 @@ fn set_watch_resends_on_kind_change_with_the_same_id() {
         f = flag.display()
     );
     app.spawn_in(&cmd, cwd);
-    app.pump();
     let id = app.views[0].id;
 
     // Change only the attachment mode.
@@ -3597,14 +3441,11 @@ fn set_watch_resends_on_kind_change_with_the_same_id() {
 /// Pending stores emit in order, and the notice counts the last store's characters.
 #[test]
 fn pending_stores_emit_in_order_and_notice_counts_last_entry_chars() {
-    let mut app = App::new_local(30, 100);
-    app.mode = Mode::Attached;
-    app.focused_id = Some(1);
+    let mut app = attached_stub(1);
     app.on_clipboard_copy(1, ClipboardKind::Clipboard, "first".to_string());
     app.on_clipboard_copy(1, ClipboardKind::Primary, "second".to_string());
     app.on_clipboard_copy(1, ClipboardKind::Selection, "héllo日".to_string());
-    let mut out = Vec::new();
-    app.flush_clipboard(&mut out).unwrap();
+    let out = app.flushed();
 
     let expected = format!(
         "\x1b]52;c;{}\x07\x1b]52;p;{}\x07\x1b]52;s;{}\x07",
@@ -3626,8 +3467,7 @@ fn pending_stores_emit_in_order_and_notice_counts_last_entry_chars() {
 fn empty_clipboard_flush_writes_nothing() {
     let mut app = App::new_local(30, 100);
     app.mode = Mode::Attached;
-    let mut out = Vec::new();
-    app.flush_clipboard(&mut out).unwrap();
+    let out = app.flushed();
     assert!(out.is_empty());
     assert!(app.notice().is_none());
 }
@@ -3649,13 +3489,10 @@ fn notice_expires_lazily_after_the_ttl() {
 /// A copy confirmation does not replace an active warning.
 #[test]
 fn warning_notice_survives_the_copy_confirmation() {
-    let mut app = App::new_local(30, 100);
-    app.mode = Mode::Attached;
-    app.focused_id = Some(1);
+    let mut app = attached_stub(1);
     app.set_notice("clipboard copy dropped".to_string(), NoticeLevel::Warning);
     app.on_clipboard_copy(1, ClipboardKind::Clipboard, "hello".to_string());
-    let mut out = Vec::new();
-    app.flush_clipboard(&mut out).unwrap();
+    let out = app.flushed();
     assert_eq!(out, b"\x1b]52;c;aGVsbG8=\x07", "the copy must still emit");
     assert_eq!(app.notice(), Some("clipboard copy dropped"));
 }
@@ -3697,27 +3534,23 @@ fn expired_warning_yields_to_info() {
     assert_eq!(app.notice(), Some("copied 5 chars"));
 }
 
-/// Attached-mode status events update both the notice and persistent status.
+/// A status event sets the persistent status in every mode and mirrors into
+/// the ephemeral notice only while attached.
 #[test]
-fn attached_status_event_mirrors_into_the_notice() {
-    let dir = session_scratch("status_mirror", &[]);
-    let mut app = app_with_config_dir(&dir);
-    app.mode = Mode::Attached;
-    app.save_session("mirror");
-    app.pump();
-    assert_eq!(app.status.as_deref(), Some("saved 'mirror': 0 command(s)"));
-    assert_eq!(app.notice(), Some("saved 'mirror': 0 command(s)"));
-}
-
-/// Dashboard status events do not create an ephemeral notice.
-#[test]
-fn dashboard_status_event_sets_only_the_status() {
-    let dir = session_scratch("status_dash", &[]);
-    let mut app = app_with_config_dir(&dir);
-    app.save_session("dash");
-    app.pump();
-    assert_eq!(app.status.as_deref(), Some("saved 'dash': 0 command(s)"));
-    assert!(app.notice().is_none(), "no mirror outside attached mode");
+fn status_event_mirrors_into_the_notice_only_while_attached() {
+    for (mode, name, mirrored) in [
+        (Mode::Attached, "mirror", true),
+        (Mode::Dashboard, "dash", false),
+    ] {
+        let dir = session_scratch(&format!("status_{name}"), &[]);
+        let mut app = app_with_config_dir(&dir);
+        app.mode = mode;
+        app.save_session(name);
+        app.pump();
+        let want = format!("saved '{name}': 0 command(s)");
+        assert_eq!(app.status.as_deref(), Some(want.as_str()));
+        assert_eq!(app.notice(), mirrored.then_some(want.as_str()), "{mode:?}");
+    }
 }
 
 // --- drag-copy selection ------------------------------------------------
@@ -3788,8 +3621,7 @@ fn drag_copy_gesture_emits_the_selection_via_osc52() {
         vec![(ClipboardKind::Clipboard, "hello".to_string())]
     );
     assert!(app.selection.is_none(), "release must clear the selection");
-    let mut out = Vec::new();
-    app.flush_clipboard(&mut out).unwrap();
+    let out = app.flushed();
     assert_eq!(out, b"\x1b]52;c;aGVsbG8=\x07");
     assert_eq!(app.notice(), Some("copied 5 chars"));
 }
@@ -3815,8 +3647,7 @@ fn click_without_drag_copies_nothing() {
     app.on_mouse(release(0, 3));
     assert!(app.pending_clipboard.is_empty());
     assert!(app.selection.is_none());
-    let mut out = Vec::new();
-    app.flush_clipboard(&mut out).unwrap();
+    let out = app.flushed();
     assert!(out.is_empty());
     assert_eq!(app.notice(), None);
 }
@@ -4234,8 +4065,6 @@ fn frame_is_wrapped_in_one_synchronized_update() {
     let mut app = App::new_local(30, 100);
     let dir = app.invocation_dir.clone();
     app.spawn_in("sleep 5", dir);
-    app.pump();
-    app.resolve_selection();
     for (label, mode) in [
         ("dashboard", Mode::Dashboard),
         ("peek", Mode::Peek),
@@ -4265,8 +4094,6 @@ fn unchanged_frame_emits_nothing() {
     let mut app = App::new_local(30, 100);
     let dir = app.invocation_dir.clone();
     app.spawn_in("sleep 5", dir);
-    app.pump();
-    app.resolve_selection();
     app.mode = Mode::Peek;
     let mut first = Vec::new();
     assert!(
@@ -4328,65 +4155,7 @@ fn input_and_attached_echo_bypass_the_repaint_floor() {
 
 // --- flagship ----------------------------------------------------------------
 
-/// Simulate a disconnected core: discard commands and return false from `connected`.
-struct Unplugged;
-
-impl Transport for Unplugged {
-    fn send(&mut self, _cmd: Command) {}
-
-    fn poll(&mut self) -> Vec<Event> {
-        Vec::new()
-    }
-
-    fn connected(&self) -> bool {
-        false
-    }
-
-    fn shutdown(&mut self, _intent: ExitIntent) {}
-}
-
-/// Pass commands through to a real core and log each one.
-struct Recording {
-    inner: Box<dyn Transport>,
-    sent: Arc<std::sync::Mutex<Vec<Command>>>,
-}
-
-impl Transport for Recording {
-    fn send(&mut self, cmd: Command) {
-        self.sent.lock().unwrap().push(cmd.clone());
-        self.inner.send(cmd);
-    }
-
-    fn poll(&mut self) -> Vec<Event> {
-        self.inner.poll()
-    }
-
-    fn connected(&self) -> bool {
-        self.inner.connected()
-    }
-
-    fn shutdown(&mut self, intent: ExitIntent) {
-        self.inner.shutdown(intent);
-    }
-}
-
 impl App {
-    /// Wrap the transport in `Recording` and return its log.
-    fn record_sends(&mut self) -> Arc<std::sync::Mutex<Vec<Command>>> {
-        let sent = Arc::default();
-        let inner = std::mem::replace(&mut self.transport, Box::new(Unplugged));
-        self.transport = Box::new(Recording {
-            inner,
-            sent: Arc::clone(&sent),
-        });
-        sent
-    }
-
-    /// Dispatch `k` through `on_key`, the run loop's entry point.
-    fn hit(&mut self, k: KeyEvent) {
-        self.on_key(&mut io::sink(), k);
-    }
-
     /// Return the flagship id from the latest snapshot.
     fn flagship(&self) -> Option<u64> {
         self.views.iter().find(|v| v.flagship).map(|v| v.id)
@@ -4736,7 +4505,7 @@ fn return_to_clears_on_disconnect() {
     let (mut app, _, _) = flagship_pair();
     app.hit(chord());
     assert!(app.return_to.is_some());
-    app.transport = Box::new(Unplugged);
+    app.transport = Scripted::unplugged();
     app.check_connection();
     assert_eq!(app.mode, Mode::Disconnected);
     assert_eq!(app.return_to, None);
