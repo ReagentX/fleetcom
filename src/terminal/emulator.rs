@@ -181,8 +181,7 @@ pub struct Emulator {
     responses: Arc<Mutex<Vec<String>>>,
     /// OSC 52 stores captured since the last drain.
     clipboard: ClipboardStores,
-    /// Advanced at parser-event granularity by [`ObservedTerm`] during the
-    /// parse itself.
+    /// Have [`ObservedTerm`] update title state for each parser event.
     alt_title: AltTitleState,
     /// Bumped once per grid advance; cheap change detection for consumers
     /// that poll the grid.
@@ -455,8 +454,8 @@ impl Emulator {
 }
 
 impl ScreenFacts for Emulator {
-    /// Incremented on every `process` call, each sync-frame landing, and
-    /// `resize`.
+    /// Read the revision counter. `process`, sync-frame landings, and `resize`
+    /// each increment it.
     fn revision(&self) -> u64 {
         self.revision
     }
@@ -465,11 +464,10 @@ impl ScreenFacts for Emulator {
         Self::alternate_screen(self)
     }
 
-    /// On the alternate screen: the captured title, honored only while its
-    /// alt-screen epoch is current; a title from a previous alt session reads
-    /// as `None`. On the primary screen: a live staged announce (a title still
-    /// staged because no printable output has been parsed) surfaces first,
-    /// then a still-current captured title.
+    /// On the alternate screen, return a captured title only while its epoch is
+    /// current. Return `None` for titles from earlier alt sessions. On the
+    /// primary screen, return a staged title until the parser handles printable
+    /// output; otherwise return the current captured title.
     fn title(&self) -> Option<&str> {
         // Surface a staged primary-screen title until printable output is parsed or the
         // alternate screen is entered.
@@ -497,9 +495,8 @@ impl ScreenFacts for Emulator {
         live_floor_of(&self.term)
     }
 
-    /// Every live-viewport row, top to bottom, trailing padding trimmed: the
-    /// summary adapters' structural scan input. Ignores the scrollback view
-    /// offset for the same reason as `live_floor`.
+    /// Return each live-viewport row from top to bottom with trailing padding
+    /// removed. Ignore the scrollback offset so summary adapters scan live output.
     fn live_rows(&self) -> Vec<String> {
         (0..self.term.grid().screen_lines() as i32)
             .map(|row| live_row_text_of(&self.term, row))
@@ -551,9 +548,9 @@ fn live_row_text_of(term: &Term<ProbeSink>, row: i32) -> String {
     text
 }
 
-/// Updated at parser-event boundaries. Each nonempty sanitized primary-screen
-/// title is retained and staged. On alternate-screen entry, consume the staged
-/// copy unless already discarded on printable output.
+/// Update title state at parser-event boundaries. Retain and stage each nonempty
+/// sanitized primary-screen title. On alternate-screen entry, promote the staged
+/// title unless the parser has already cleared it after printable output.
 #[derive(Default)]
 struct AltTitleState {
     /// Count of alt-screen entries. Compared against
@@ -581,7 +578,7 @@ struct AltTitleState {
     title_stack: Vec<Option<String>>,
 }
 
-/// Capacity of the backend title stack mirrored by [`AltTitleState::title_stack`].
+/// Match the backend title-stack capacity in [`AltTitleState::title_stack`].
 const TITLE_STACK_SHADOW_MAX: usize = 4096;
 
 /// Delegating [`Handler`] that forwards every parser event to the wrapped

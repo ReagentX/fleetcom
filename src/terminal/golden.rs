@@ -1,6 +1,6 @@
-//! Plain text can remain correct after terminal parser changes even with incorrect
-//! cursor state, styling, or scrollback. Replay the recorded PTY corpus
-//! (`tests/corpus`) and report the exact row, cell, or count on a mismatch.
+//! Replay the recorded PTY corpus (`tests/corpus`) to check text, cursor state,
+//! styling, and scrollback together. Report the exact row, cell, or count on a
+//! mismatch.
 //!
 //! **Displayed state.** Verify every final plain-text row via [`ansi::contents`],
 //! cursor position and visibility via [`ansi::formatted`], and selected styled
@@ -9,12 +9,12 @@
 //! **Parser semantics.** Verify exact scrollback retention, bold-plus-dim intensity
 //! stacking, DEC charset translation, and VS16 width with targeted fixtures.
 //!
-//! **Wrapper oracle.** Replay every fixture through [`Emulator`] and a raw `Term`
-//! and require identical styled bytes, text, cursor, and alternate-screen bit:
-//! this pins the `Handler` delegation in `ObservedTerm`.
+//! **Wrapper oracle.** Replay every fixture through [`Emulator`] and a raw `Term`.
+//! Require identical styled bytes, text, cursor, and alternate-screen state to
+//! check that `ObservedTerm` forwards each `Handler` event to the backend.
 //!
 //! **Codex release replay.** Walk the `codex_0158_terminal` captures checkpoint
-//! by checkpoint, applying resizes at their recorded offsets, and pin
+//! by checkpoint, apply resizes at their recorded offsets, and assert
 //! alternate-screen transitions, grid geometry, and OSC 52 stores.
 
 use alacritty_terminal::{
@@ -38,8 +38,8 @@ fn alacritty(bytes: &[u8]) -> Term<VoidListener> {
     parse_term(bytes, LINES, COLS)
 }
 
-/// Pin every visible text row, cursor position and visibility, and the active
-/// primary screen. Any row omitted from `rows` must be blank.
+/// Compare every visible text row, the cursor position and visibility, and the
+/// active primary screen. Require every row omitted from `rows` to be blank.
 fn assert_screen(
     fixture: &str,
     al: &Term<VoidListener>,
@@ -65,10 +65,10 @@ fn assert_screen(
     assert!(!hidden, "{fixture}: cursor visibility");
 }
 
-/// One pinned cell: `((row, col), char, fg, bg, exact flag set)`.
+/// Record each pinned cell as `((row, col), char, fg, bg, exact flag set)`.
 type StyledCell = ((usize, usize), char, Color, Color, Flags);
 
-/// Pin load-bearing styled cells.
+/// Compare each cell's character, foreground, background, and flags with its fixture values.
 fn assert_cells(fixture: &str, al: &Term<VoidListener>, cells: &[StyledCell]) {
     for &((row, col), c, fg, bg, flags) in cells {
         let cell = &al.grid()[Line(row as i32)][Column(col)];
@@ -79,9 +79,8 @@ fn assert_cells(fixture: &str, al: &Term<VoidListener>, cells: &[StyledCell]) {
     }
 }
 
-/// Pin default characters, colors, and flags across the primary grid after an
-/// alternate-screen fixture exits. This catches styling on blank cells, which
-/// the plain-text assertion cannot observe.
+/// Compare every primary-screen cell after the alternate-screen fixture exits.
+/// Check blank cells too; compare their colors and flags because text output omits them.
 fn assert_grid_unstyled(fixture: &str, al: &Term<VoidListener>) {
     for row in 0..LINES {
         for col in 0..COLS {
@@ -583,7 +582,7 @@ fn codex_release_terminal_transitions() {
         let name = fixture["name"].as_str().unwrap();
         let outer = fixture["surface"] == "outer fleetcom client";
         assert_eq!(fixture["bytes"].as_usize().unwrap(), bytes.len(), "{name}");
-        // Small chunks also split UTF-8 and escape sequences across parser calls.
+        // Feed small chunks to split UTF-8 and escape sequences across parser calls.
         for chunk_size in [usize::MAX, 7] {
             let mut emu = Emulator::new(40, 120, 10_000);
             assert!(!emu.alternate_screen());
@@ -592,7 +591,7 @@ fn codex_release_terminal_transitions() {
             for mark in fixture["marks"].members() {
                 let checkpoint = mark["name"].as_str().unwrap();
                 let end = mark["offset"].as_usize().unwrap();
-                // A resize at a checkpoint's end belongs to the following state.
+                // Apply a resize at a checkpoint's end before checking the next state.
                 while let Some(resize) = resizes.peek() {
                     let offset = resize["offset"].as_usize().unwrap();
                     if offset >= end {
