@@ -229,9 +229,9 @@ pub fn scratch(tag: &str) -> RuntimeDir {
     RuntimeDir(dir)
 }
 
-/// Scratch tree holding everything one managed-launch test touches: stub executables in
-/// `bin`, an empty `nobin`, the daemon's runtime and config dirs, each harness's home,
-/// a working directory, and the stubs' argv records.
+/// Create a scratch tree for a managed-launch test with stub executables in
+/// `bin`, an empty `nobin`, daemon runtime and config directories, harness homes,
+/// a working directory, and argv records for the stubs.
 pub struct Scratch {
     pub root: RuntimeDir,
 }
@@ -259,7 +259,7 @@ impl Scratch {
         self.root.join("bin")
     }
 
-    /// Runtime directory passed to the daemon handshake.
+    /// Return the runtime directory to pass in the daemon handshake.
     pub fn runtime(&self) -> PathBuf {
         self.root.join("run")
     }
@@ -275,13 +275,13 @@ impl Scratch {
             .join(format!("{name}.json"))
     }
 
-    /// The named stub's argv record, one element per line.
+    /// Return the named stub's argv record, with one argument per line.
     pub fn record(&self, tool: &str) -> PathBuf {
         self.root.join(format!("{tool}-argv"))
     }
 
-    /// Handshake environment with every fleetcom and harness path under `root`. `path` is
-    /// the `PATH` value verbatim: callers decide whether system directories ride it.
+    /// Build the handshake environment with Fleetcom and harness paths under `root`.
+    /// Use `path` verbatim for `PATH`; callers choose whether to include system directories.
     pub fn hello_env(&self, path: String) -> Vec<(String, String)> {
         vec![
             ("PATH".into(), path),

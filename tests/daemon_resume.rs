@@ -40,8 +40,8 @@ fn turn_complete(thread: &str) -> String {
 /// every instrumented `codex` launch.
 const CODEX_EMBEDDED: &str = "features.daemon_auto_start=false";
 
-/// Send a handshake scoped to the scratch tree. `PATH` keeps `/usr/bin:/bin` after the
-/// stubs: the `codex` stub runs `mkdir`.
+/// Send a handshake scoped to the scratch tree. Put `/usr/bin:/bin` after the
+/// stubs in `PATH` because the `codex` stub runs `mkdir`.
 fn hello(stream: &mut UnixStream, s: &Scratch) {
     let path = format!("{}:/usr/bin:/bin", s.bin().display());
     shake_hands_env(stream, &s.work().display().to_string(), &s.hello_env(path));
@@ -168,7 +168,8 @@ fn assert_daemon_namespaced(asset: &Path, daemon_pid: u32, what: &str, argv: &[S
     );
 }
 
-/// Send `save` and return the recipe once it lands; callers assert the resume ID.
+/// Send `save`, wait for the recipe file, and return its contents. Callers
+/// verify the persisted resume ID.
 fn save_once(stream: &mut UnixStream, recipe: &Path, name: &str) -> String {
     stream
         .write_all(&control_frame(&format!(

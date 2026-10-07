@@ -1,7 +1,6 @@
-//! The fleet's lifetime is bounded by the daemon's: SIGKILLing the daemon closes every
-//! PTY master, and the resulting hangup SIGHUPs each task's foreground group. Ordinary
-//! tasks die; only HUP-immune tasks survive, unowned. Verify both cases against the
-//! documented lifetime guarantees.
+//! Test task lifetime after daemon exit. When a SIGKILLed daemon exits, the kernel
+//! closes each PTY master and sends SIGHUP to the task's foreground group. Ordinary
+//! tasks exit; HUP-immune tasks survive without an owner. Verify both outcomes.
 
 mod common;
 
@@ -23,8 +22,8 @@ fn ordinary_tasks_die_with_a_sigkilled_daemon() {
     );
     assert!(kill(task, None).is_ok(), "task should be alive");
 
-    // `drop` SIGKILLs the daemon: no shutdown path runs; only the fd-close/HUP
-    // mechanism remains.
+    // Drop the daemon handle to send SIGKILL; this bypasses shutdown. The kernel
+    // closes the PTY master on process exit and sends SIGHUP to the foreground group.
     drop(daemon);
 
     assert!(
