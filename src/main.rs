@@ -70,7 +70,7 @@ use app::App;
 static KITTY_PUSHED: AtomicBool = AtomicBool::new(false);
 
 const USAGE: &str = "\
-fleetcom - a fleet-view supervisor for arbitrary shell commands
+fleetcom - a fleet-view supervisor for shell commands and managed agents
 
 Usage:
   fleetcom [<session>]               connect to the daemon (autostarting it),

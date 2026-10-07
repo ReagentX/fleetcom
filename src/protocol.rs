@@ -18,7 +18,7 @@ pub const PROTOCOL_VERSION: u32 = 14;
 pub const UNASSIGNED: &str = "Unassigned";
 
 /// Environment and working directory supplied by the launching client.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LaunchContext {
     pub env: Vec<(OsString, OsString)>,
     /// Base directory for relative session-recipe paths.
@@ -43,11 +43,17 @@ pub fn env_get<'a>(env: &'a [(OsString, OsString)], key: &str) -> Option<&'a OsS
         .map(|(_, v)| v.as_os_str())
 }
 
+/// Shared env key for the runtime directory. For sockets and locks, read it
+/// from the process environment in `resolve_runtime_dir`. For captures, read
+/// it from the launch context, falling back to `runtime_root`. The fallback
+/// directories differ between these uses.
+pub const FLEETCOM_RUNTIME_DIR: &str = "FLEETCOM_RUNTIME_DIR";
+
 /// A client→core request. Every mutation of the task set is one of these; the
 /// client never touches a `Task` directly. Fire-and-forget: results come back
 /// as `Event`s, never as return values. The handshake uses `KIND_HELLO`, not a
 /// command.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
     /// Run `command` under `$SHELL -c` in `cwd`; `group` is the initial
     /// dashboard assignment.
@@ -269,6 +275,29 @@ pub enum Lifecycle {
     Failed,
 }
 
+impl Lifecycle {
+    /// Lowercase state identifier used as the protocol `life` tag.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Active => "active",
+            Self::Idle => "idle",
+            Self::Ok => "ok",
+            Self::Failed => "failed",
+        }
+    }
+
+    /// Parse an exact [`Self::label`] string.
+    pub fn from_label(s: &str) -> Option<Self> {
+        match s {
+            "active" => Some(Self::Active),
+            "idle" => Some(Self::Idle),
+            "ok" => Some(Self::Ok),
+            "failed" => Some(Self::Failed),
+            _ => None,
+        }
+    }
+}
+
 /// Where a preview's text came from. Declared in ascending authority so the
 /// derived `Ord` ranks provenance directly: `Anchor > Title > Marker >
 /// Floor`.
@@ -288,7 +317,7 @@ pub enum PreviewSource {
 }
 
 impl PreviewSource {
-    /// Lowercase provenance identifier.
+    /// Lowercase provenance identifier, also the protocol `src` tag.
     pub fn label(self) -> &'static str {
         match self {
             Self::Floor => "floor",
@@ -297,10 +326,21 @@ impl PreviewSource {
             Self::Anchor => "anchor",
         }
     }
+
+    /// Parse an exact [`Self::label`] string.
+    pub fn from_label(s: &str) -> Option<Self> {
+        match s {
+            "floor" => Some(Self::Floor),
+            "marker" => Some(Self::Marker),
+            "title" => Some(Self::Title),
+            "anchor" => Some(Self::Anchor),
+            _ => None,
+        }
+    }
 }
 
 /// A resolved dashboard preview sent as part of [`TaskView`].
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Preview {
     pub text: String,
     pub source: PreviewSource,
@@ -354,10 +394,12 @@ pub struct TaskView {
     pub finished_ago: Option<Duration>,
 }
 
-/// The watched task's screen, in both forms the UI needs: `lines` for the peek
-/// overlay's plain-text box, `formatted` (+cursor) for full attached rendering.
-/// Only ever produced for the single watched task, so carrying both is cheap.
-#[derive(Debug, Clone, PartialEq)]
+/// The watched task's screen, in both forms the UI needs: `lines` is the
+/// plain-text grid for everything that reads text (the peek box, selection
+/// extraction and its overlay), `formatted` (+cursor) is the styled stream for
+/// attached rendering. Only ever produced for the single watched task, so
+/// carrying both is cheap.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScreenView {
     pub id: u64,
     pub lines: Vec<String>,
@@ -488,35 +530,6 @@ fn recovery_vec(v: &jzon::JsonValue) -> Vec<RecoveryEntry> {
     out
 }
 
-fn lifecycle_str(l: Lifecycle) -> &'static str {
-    match l {
-        Lifecycle::Active => "active",
-        Lifecycle::Idle => "idle",
-        Lifecycle::Ok => "ok",
-        Lifecycle::Failed => "failed",
-    }
-}
-
-fn lifecycle_from(s: &str) -> Option<Lifecycle> {
-    match s {
-        "active" => Some(Lifecycle::Active),
-        "idle" => Some(Lifecycle::Idle),
-        "ok" => Some(Lifecycle::Ok),
-        "failed" => Some(Lifecycle::Failed),
-        _ => None,
-    }
-}
-
-fn source_from(s: &str) -> Option<PreviewSource> {
-    match s {
-        "floor" => Some(PreviewSource::Floor),
-        "marker" => Some(PreviewSource::Marker),
-        "title" => Some(PreviewSource::Title),
-        "anchor" => Some(PreviewSource::Anchor),
-        _ => None,
-    }
-}
-
 /// Serialize a launch context as a `KIND_HELLO` frame.
 pub fn encode_hello(ctx: &LaunchContext) -> (u8, Vec<u8>) {
     let mut pairs = jzon::JsonValue::new_array();
@@ -631,12 +644,16 @@ pub fn encode_command(cmd: &Command) -> (u8, Vec<u8>) {
                 MouseKind::Drag(b) => ("d", Some(*b)),
                 MouseKind::Release(b) => ("r", Some(*b)),
             };
-            let mut o = jzon::object! { "t": "mouse", "id": *id, "k": k };
+            let mut o = jzon::object! {
+                "t": "mouse",
+                "id": *id,
+                "k": k,
+                "col": *col as u64,
+                "row": *row as u64,
+            };
             if let Some(b) = btn {
                 let _ = o.insert("b", b as u64);
             }
-            let _ = o.insert("col", *col as u64);
-            let _ = o.insert("row", *row as u64);
             o
         }
         Command::Key { id, code, mods } => {
@@ -872,7 +889,7 @@ pub fn encode_event(ev: &Event) -> (u8, Vec<u8>) {
                 // Group and name fields are present only when set.
                 insert_opt_str(&mut o, "group", &tv.group);
                 insert_opt_str(&mut o, "name", &tv.name);
-                let _ = o.insert("life", lifecycle_str(tv.lifecycle));
+                let _ = o.insert("life", tv.lifecycle.label());
                 let _ = o.insert("preview", tv.preview.text.as_str());
                 // Matcher rules are process-local and omitted from the wire.
                 let _ = o.insert("src", tv.preview.source.label());
@@ -957,10 +974,10 @@ pub fn decode_event(kind: u8, payload: &[u8]) -> Option<Event> {
                             // Missing and null both mean unassigned/unnamed.
                             group: opt_str(&tv["group"])?,
                             name: opt_str(&tv["name"])?,
-                            lifecycle: lifecycle_from(tv["life"].as_str()?)?,
+                            lifecycle: Lifecycle::from_label(tv["life"].as_str()?)?,
                             preview: Preview {
                                 text: tv["preview"].as_str()?.to_string(),
-                                source: source_from(tv["src"].as_str()?)?,
+                                source: PreviewSource::from_label(tv["src"].as_str()?)?,
                                 rule: None,
                                 frozen: tv["frozen"].as_bool()?,
                             },

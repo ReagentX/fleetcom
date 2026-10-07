@@ -3212,7 +3212,7 @@ fn session_load_status_keeps_capture_notices_and_failures() {
         env: vec![
             ("PATH".into(), bin.as_os_str().to_os_string()),
             (
-                path::FLEETCOM_RUNTIME_DIR.into(),
+                crate::protocol::FLEETCOM_RUNTIME_DIR.into(),
                 dir.join("run").into_os_string(),
             ),
             (

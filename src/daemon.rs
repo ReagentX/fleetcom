@@ -44,10 +44,9 @@ use nix::{
 use crate::{
     core::{LoopExit, Wake, run_loop},
     frame::{MAX_FRAME, SEND_TIMEOUT, read_frame, write_frame},
-    path::FLEETCOM_RUNTIME_DIR,
     protocol::{
-        Command, Event, LaunchContext, PROTOCOL_VERSION, decode_command, decode_event,
-        decode_hello, encode_event, encode_hello, hello_version,
+        Command, Event, FLEETCOM_RUNTIME_DIR, LaunchContext, PROTOCOL_VERSION, decode_command,
+        decode_event, decode_hello, encode_event, encode_hello, hello_version,
     },
     supervisor::{self, Supervisor},
 };
@@ -94,9 +93,19 @@ fn resolve_runtime_dir(
     tmp.join(format!("fleetcom-{uid}"))
 }
 
-/// Return the daemon socket path under `dir`.
-fn socket_in(dir: &Path) -> PathBuf {
-    dir.join("default.sock")
+/// Runtime-directory filenames; docs/README.md documents all three.
+const SOCKET_FILE: &str = "default.sock";
+const LOCK_FILE: &str = "daemon.lock";
+const LOG_FILE: &str = "daemon.log";
+
+/// Open the single-instance lock file, creating it if absent, without truncating:
+/// the pid inside is rewritten only once the flock is ours.
+fn open_lock(dir: &Path) -> io::Result<fs::File> {
+    fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(dir.join(LOCK_FILE))
 }
 
 /// Create or validate a user-owned runtime directory with `0700` permissions.
@@ -302,7 +311,7 @@ fn connect_or_autostart_in(dir: &Path) -> io::Result<(UnixStream, DaemonOrigin)>
     // unvalidated directory, we could follow a planted symlink and truncate an
     // attacker-chosen file before directory validation in the new daemon.
     ensure_runtime_dir(dir)?;
-    let path = socket_in(dir);
+    let path = dir.join(SOCKET_FILE);
     if let Ok(s) = UnixStream::connect(&path) {
         return Ok((s, DaemonOrigin::AlreadyRunning));
     }
@@ -321,7 +330,7 @@ fn connect_or_autostart_in(dir: &Path) -> io::Result<(UnixStream, DaemonOrigin)>
         ErrorKind::TimedOut,
         format!(
             "daemon did not come up; check {}",
-            dir.join("daemon.log").display()
+            dir.join(LOG_FILE).display()
         ),
     ))
 }
@@ -330,7 +339,7 @@ fn connect_or_autostart_in(dir: &Path) -> io::Result<(UnixStream, DaemonOrigin)>
 /// `daemon.log` under `dir`, which the caller has validated.
 fn spawn_daemon(dir: &Path) -> io::Result<()> {
     let exe = std::env::current_exe()?;
-    let log = fs::File::create(dir.join("daemon.log")).ok();
+    let log = fs::File::create(dir.join(LOG_FILE)).ok();
     let mut cmd = std::process::Command::new(exe);
     cmd.arg("--daemon")
         .stdin(Stdio::null())
@@ -369,7 +378,7 @@ fn run_kill_in(dir: &Path) -> io::Result<()> {
     // The lock PID is a signal target, and the socket receives the client's
     // environment, so validate the directory before reading either file.
     ensure_runtime_dir(dir)?;
-    let lock_path = dir.join("daemon.lock");
+    let lock_path = dir.join(LOCK_FILE);
     let Ok(file) = fs::OpenOptions::new()
         .read(true)
         .write(true)
@@ -433,18 +442,14 @@ fn run_kill_in(dir: &Path) -> io::Result<()> {
 pub fn run_daemon() -> io::Result<()> {
     let dir = runtime_dir();
     ensure_runtime_dir(&dir)?; // private 0700 directory
-    let path = socket_in(&dir);
+    let path = dir.join(SOCKET_FILE);
 
     // Only the holder of `daemon.lock` may own the
     // socket. A concurrent autostart (two clients racing to spawn a daemon) or a
     // spurious respawn fails this lock and exits, instead of unlinking a live
     // daemon's socket out from under it. flock releases automatically when this
     // process dies, so a crash leaves no stale lock. The next daemon reclaims.
-    let lock_file = fs::OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(false) // rewritten below, only once the lock is ours
-        .open(dir.join("daemon.lock"))?;
+    let lock_file = open_lock(&dir)?;
     // `lock` is held for the whole function, so the flock lives until this
     // daemon exits, then releases on drop.
     let Ok(mut lock) = Flock::lock(lock_file, FlockArg::LockExclusiveNonblock) else {
@@ -849,12 +854,7 @@ mod tests {
         let base = temp("kill_lock_no_pid");
         let dir = base.join("runtime");
         ensure_runtime_dir(&dir).unwrap();
-        let holder = fs::OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(false)
-            .open(dir.join("daemon.lock"))
-            .unwrap();
+        let holder = open_lock(&dir).unwrap();
         // The second open creates a distinct open-file description, so it
         // contends with this lock even within one process.
         let _held = Flock::lock(holder, FlockArg::LockExclusiveNonblock).unwrap();

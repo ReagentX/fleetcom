@@ -462,99 +462,83 @@ fn tasks_round_trip() {
     assert_eq!(decode_event(k, &p), Some(tasks));
 }
 
-/// `SetGroup` emits `"g"` only for an assignment. A missing or null `"g"`
-/// decodes as a clear.
+/// `SetGroup` emits `"g"` and `SetName` emits `"n"` only for an assignment. A
+/// missing or null key decodes as a clear; a present value must be a string.
 #[test]
-fn set_group_wire_form() {
-    let (k, p) = encode_command(&Command::SetGroup {
-        id: 3,
-        group: Some("infra".into()),
-    });
-    assert_eq!(k, KIND_CONTROL);
-    assert_eq!(
-        std::str::from_utf8(&p).unwrap(),
-        r#"{"t":"group","id":3,"g":"infra"}"#
-    );
-    let (_, p) = encode_command(&Command::SetGroup { id: 3, group: None });
-    assert!(!String::from_utf8(p).unwrap().contains("\"g\""));
-    // An explicit null clears, same as an omitted key.
-    assert_eq!(
-        decode_command(KIND_CONTROL, br#"{"t":"group","id":3,"g":null}"#),
-        Some(Command::SetGroup { id: 3, group: None })
-    );
-    // A present group must be a string.
-    assert_eq!(
-        decode_command(KIND_CONTROL, br#"{"t":"group","id":3,"g":5}"#),
-        None
-    );
+fn set_group_and_set_name_wire_forms() {
+    for (set, cleared, key, set_wire, null_wire, bad_wire) in [
+        (
+            Command::SetGroup {
+                id: 3,
+                group: Some("infra".into()),
+            },
+            Command::SetGroup { id: 3, group: None },
+            "\"g\"",
+            r#"{"t":"group","id":3,"g":"infra"}"#,
+            r#"{"t":"group","id":3,"g":null}"#,
+            r#"{"t":"group","id":3,"g":5}"#,
+        ),
+        (
+            Command::SetName {
+                id: 3,
+                name: Some("api".into()),
+            },
+            Command::SetName { id: 3, name: None },
+            "\"n\"",
+            r#"{"t":"name","id":3,"n":"api"}"#,
+            r#"{"t":"name","id":3,"n":null}"#,
+            r#"{"t":"name","id":3,"n":5}"#,
+        ),
+    ] {
+        let (k, p) = encode_command(&set);
+        assert_eq!(k, KIND_CONTROL);
+        assert_eq!(std::str::from_utf8(&p).unwrap(), set_wire);
+        let (_, p) = encode_command(&cleared);
+        let p = String::from_utf8(p).unwrap();
+        assert!(!p.contains(key), "clearing must omit {key}; frame was {p}");
+        // An explicit null clears, same as an omitted key.
+        assert_eq!(
+            decode_command(KIND_CONTROL, null_wire.as_bytes()),
+            Some(cleared),
+            "frame was {null_wire}"
+        );
+        assert_eq!(
+            decode_command(KIND_CONTROL, bad_wire.as_bytes()),
+            None,
+            "frame was {bad_wire}"
+        );
+    }
 }
 
-/// `SetName` omits `"n"` when clearing; a missing or null `"n"` decodes as
-/// a clear.
+/// Task frames omit `"group"` and `"name"` when unset; an absent key decodes
+/// as `None`.
 #[test]
-fn set_name_wire_form() {
-    let (k, p) = encode_command(&Command::SetName {
-        id: 3,
-        name: Some("api".into()),
-    });
-    assert_eq!(k, KIND_CONTROL);
-    assert_eq!(
-        std::str::from_utf8(&p).unwrap(),
-        r#"{"t":"name","id":3,"n":"api"}"#
-    );
-    let (_, p) = encode_command(&Command::SetName { id: 3, name: None });
-    assert!(!String::from_utf8(p).unwrap().contains("\"n\""));
-    // An explicit null clears, same as an omitted key.
-    assert_eq!(
-        decode_command(KIND_CONTROL, br#"{"t":"name","id":3,"n":null}"#),
-        Some(Command::SetName { id: 3, name: None })
-    );
-    // A present name must be a string.
-    assert_eq!(
-        decode_command(KIND_CONTROL, br#"{"t":"name","id":3,"n":5}"#),
-        None
-    );
-}
-
-/// Task frames omit `"group"` when unassigned; an absent key decodes as
-/// `None`.
-#[test]
-fn tasks_frame_group_key_is_optional() {
+fn tasks_frame_label_keys_are_optional() {
+    let labels = |v: &[TaskView]| (v[0].group.clone(), v[0].name.clone());
     // "Lw==" is the base64 encoding of "/".
-    let ungrouped = r#"{"t":"tasks","tasks":[{"id":1,"command":"x","cwd":"Lw==","tagged":false,"flagship":false,"managed":false,"life":"ok","preview":"","src":"floor","frozen":false,"started_ms":0}]}"#;
-    match decode_event(KIND_CONTROL, ungrouped.as_bytes()) {
-        Some(Event::Tasks(v)) => assert_eq!(v[0].group, None),
+    let unlabelled = r#"{"t":"tasks","tasks":[{"id":1,"command":"x","cwd":"Lw==","tagged":false,"flagship":false,"managed":false,"life":"ok","preview":"","src":"floor","frozen":false,"started_ms":0}]}"#;
+    match decode_event(KIND_CONTROL, unlabelled.as_bytes()) {
+        Some(Event::Tasks(v)) => assert_eq!(labels(&v), (None, None)),
         other => panic!("expected tasks event, got {other:?}"),
     }
-    // Encoding an unassigned task omits the group key.
+    // Encoding an unassigned, unnamed task omits both keys.
     let (_, p) = encode_event(&Event::Tasks(vec![tv(1)]));
-    assert_eq!(std::str::from_utf8(&p).unwrap(), ungrouped);
+    assert_eq!(std::str::from_utf8(&p).unwrap(), unlabelled);
 
-    let grouped = r#"{"t":"tasks","tasks":[{"id":1,"command":"x","cwd":"Lw==","tagged":false,"flagship":false,"managed":false,"group":"infra","life":"ok","preview":"","src":"floor","frozen":false,"started_ms":0}]}"#;
-    match decode_event(KIND_CONTROL, grouped.as_bytes()) {
-        Some(Event::Tasks(v)) => assert_eq!(v[0].group.as_deref(), Some("infra")),
-        other => panic!("expected tasks event, got {other:?}"),
-    }
-}
-
-/// Task frames omit `"name"` when unnamed; an absent key decodes as
-/// `None`.
-#[test]
-fn tasks_frame_name_key_is_optional() {
-    // "Lw==" is the base64 encoding of "/".
-    let unnamed = r#"{"t":"tasks","tasks":[{"id":1,"command":"x","cwd":"Lw==","tagged":false,"flagship":false,"managed":false,"life":"ok","preview":"","src":"floor","frozen":false,"started_ms":0}]}"#;
-    match decode_event(KIND_CONTROL, unnamed.as_bytes()) {
-        Some(Event::Tasks(v)) => assert_eq!(v[0].name, None),
-        other => panic!("expected tasks event, got {other:?}"),
-    }
-    // Encoding an unnamed task omits the name key.
-    let (_, p) = encode_event(&Event::Tasks(vec![tv(1)]));
-    assert_eq!(std::str::from_utf8(&p).unwrap(), unnamed);
-
-    let named = r#"{"t":"tasks","tasks":[{"id":1,"command":"x","cwd":"Lw==","tagged":false,"flagship":false,"managed":false,"name":"build","life":"ok","preview":"","src":"floor","frozen":false,"started_ms":0}]}"#;
-    match decode_event(KIND_CONTROL, named.as_bytes()) {
-        Some(Event::Tasks(v)) => assert_eq!(v[0].name.as_deref(), Some("build")),
-        other => panic!("expected tasks event, got {other:?}"),
+    for (labelled, expected) in [
+        (
+            r#"{"t":"tasks","tasks":[{"id":1,"command":"x","cwd":"Lw==","tagged":false,"flagship":false,"managed":false,"group":"infra","life":"ok","preview":"","src":"floor","frozen":false,"started_ms":0}]}"#,
+            (Some("infra".to_string()), None),
+        ),
+        (
+            r#"{"t":"tasks","tasks":[{"id":1,"command":"x","cwd":"Lw==","tagged":false,"flagship":false,"managed":false,"name":"build","life":"ok","preview":"","src":"floor","frozen":false,"started_ms":0}]}"#,
+            (None, Some("build".to_string())),
+        ),
+    ] {
+        match decode_event(KIND_CONTROL, labelled.as_bytes()) {
+            Some(Event::Tasks(v)) => assert_eq!(labels(&v), expected, "frame was {labelled}"),
+            other => panic!("expected tasks event, got {other:?}"),
+        }
     }
 }
 
@@ -654,7 +638,7 @@ fn preview_source_and_frozen_round_trip() {
             rule: Some("claude-status"),
             ..base.preview.clone()
         },
-        ..base.clone()
+        ..base
     }]);
     let (k, p) = encode_event(&ruled);
     assert!(
@@ -671,12 +655,21 @@ fn preview_source_and_frozen_round_trip() {
     }
 }
 
-/// Same-version task frames require a known source and a boolean frozen flag.
+/// Same-version task frames require a known source and boolean frozen and
+/// managed flags; the managed flag round-trips in both states.
 #[test]
-fn tasks_frame_requires_valid_preview_metadata() {
-    let tasks = Event::Tasks(vec![tv(1)]);
-    let (k, p) = encode_event(&tasks);
-    assert_eq!(decode_event(k, &p), Some(tasks));
+fn tasks_frame_requires_row_fields() {
+    for managed in [false, true] {
+        let tasks = Event::Tasks(vec![TaskView { managed, ..tv(1) }]);
+        let (k, p) = encode_event(&tasks);
+        let s = std::str::from_utf8(&p).unwrap();
+        assert!(
+            s.contains(&format!("\"managed\":{managed}")),
+            "frame was {s}"
+        );
+        assert_eq!(decode_event(k, &p), Some(tasks));
+    }
+    let (k, p) = encode_event(&Event::Tasks(vec![tv(1)]));
     let valid = String::from_utf8(p).unwrap();
     for (field, value, invalid) in [
         (
@@ -689,9 +682,11 @@ fn tasks_frame_requires_valid_preview_metadata() {
             "false",
             &["null", "0", "\"false\"", "[]", "{}"][..],
         ),
+        ("managed", "false", &["null", "0", "\"true\"", "[]"][..]),
     ] {
         let member = format!("\"{field}\":{value}");
         let missing = valid.replace(&format!("{member},"), "");
+        assert_ne!(missing, valid, "premise: the encoder writes {field}");
         assert_eq!(decode_event(k, missing.as_bytes()), None, "missing {field}");
         for value in invalid {
             let bad = valid.replace(&member, &format!("\"{field}\":{value}"));
@@ -945,30 +940,6 @@ fn agents_event_round_trips_and_pins_the_wire_shape() {
             None,
             "should reject {json}"
         );
-    }
-}
-
-/// Require a boolean `managed` field on every task row during encoding and decoding.
-#[test]
-fn tasks_frame_managed_flag_round_trips_and_is_required() {
-    for managed in [false, true] {
-        let tasks = Event::Tasks(vec![TaskView { managed, ..tv(1) }]);
-        let (k, p) = encode_event(&tasks);
-        let s = std::str::from_utf8(&p).unwrap();
-        assert!(
-            s.contains(&format!("\"managed\":{managed}")),
-            "frame was {s}"
-        );
-        assert_eq!(decode_event(k, &p), Some(tasks));
-    }
-    let (k, p) = encode_event(&Event::Tasks(vec![tv(1)]));
-    let valid = String::from_utf8(p).unwrap();
-    let missing = valid.replace("\"managed\":false,", "");
-    assert_ne!(missing, valid, "premise: the encoder writes the key");
-    assert_eq!(decode_event(k, missing.as_bytes()), None, "missing managed");
-    for bad in ["null", "0", "\"true\"", "[]"] {
-        let frame = valid.replace("\"managed\":false", &format!("\"managed\":{bad}"));
-        assert_eq!(decode_event(k, frame.as_bytes()), None, "frame was {frame}");
     }
 }
 

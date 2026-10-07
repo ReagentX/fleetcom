@@ -1,5 +1,7 @@
-//! JSON session recipes stored one file per name in the user's config directory. On
-//! recipe load, start new tasks without restoring live processes.
+//! JSON session recipes: named recipes and automatic recovery snapshots share one
+//! schema (`to_json`/`from_json`), stored one file per name or stem. Every fs function
+//! takes its root from the caller; the supervisor resolves it from the connection's
+//! launch context. On load, start new tasks without restoring live processes.
 
 use std::{
     collections::BTreeMap,
@@ -597,6 +599,13 @@ mod tests {
     /// Unadorned managed entry: the `{"agent"[, "resume"]}` member form.
     fn m(agent: &str, resume: Option<&str>) -> SessionEntry {
         SessionEntry::managed(agent, resume)
+    }
+
+    /// One-entry recipe: `vim` in `~/p`.
+    fn vim_cfg() -> SessionConfig {
+        let mut cfg = SessionConfig::new();
+        cfg.insert("~/p".into(), vec![e("vim")]);
+        cfg
     }
 
     /// Grouped literal: the `{"cmd", "group"}` member form.
@@ -1219,8 +1228,7 @@ mod tests {
     #[test]
     fn long_names_save_within_name_max() {
         let dir = temp("session_long_name");
-        let mut cfg = SessionConfig::new();
-        cfg.insert("~/p".into(), vec![e("vim")]);
+        let cfg = vim_cfg();
         let name = "n".repeat(255);
 
         let file = save_in(&dir, &name, &cfg).unwrap();
@@ -1250,8 +1258,7 @@ mod tests {
     fn sessions_dir_is_created_private_and_retightened() {
         let base = temp("session_dir_mode");
         let mode = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o777;
-        let mut cfg = SessionConfig::new();
-        cfg.insert("~/p".into(), vec![e("vim")]);
+        let cfg = vim_cfg();
 
         let nested = base.join("parent").join("sessions");
         save_in(&nested, "fresh", &cfg).unwrap();
@@ -1269,8 +1276,7 @@ mod tests {
     #[test]
     fn save_leaves_no_temp_file() {
         let dir = temp("session_notemp");
-        let mut cfg = SessionConfig::new();
-        cfg.insert("~/p".into(), vec![e("vim")]);
+        let cfg = vim_cfg();
 
         save_in(&dir, "clean", &cfg).unwrap();
         let names: Vec<String> = fs::read_dir(&*dir)
@@ -1393,8 +1399,7 @@ mod tests {
     #[test]
     fn lists_stored_names_for_new_schema_files() {
         let dir = temp("session_list_names");
-        let mut cfg = SessionConfig::new();
-        cfg.insert("~/p".into(), vec![e("vim")]);
+        let cfg = vim_cfg();
         save_in(&dir, "a/b", &cfg).unwrap();
         fs::write(dir.join("legacy.json"), r#"{"~/x": ["top"]}"#).unwrap();
 
@@ -1411,6 +1416,32 @@ mod tests {
 
     /// Out-of-range PID used for dead-writer fixtures.
     const DEAD_FIXTURE_PID: u32 = 9_999_999;
+
+    /// Write one dead-writer snapshot per `minutes` value, stemmed
+    /// `<day>-0930NN-<DEAD_FIXTURE_PID>` and labelled with that day's `09:30`.
+    fn fill_dead(
+        rec: &Path,
+        day: &str,
+        minutes: std::ops::RangeInclusive<u32>,
+        cfg: &SessionConfig,
+    ) {
+        let label = format!("autosaved {}-{}-{} 09:30", &day[..4], &day[4..6], &day[6..]);
+        for i in minutes {
+            let stem = format!("{day}-0930{i:02}-{DEAD_FIXTURE_PID}");
+            save_recovery_in(rec, &stem, &label, cfg).unwrap();
+        }
+    }
+
+    /// Sorted file names under `dir`.
+    fn names_in(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = fs::read_dir(dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().into_string().unwrap())
+            .collect();
+        names.sort();
+        names
+    }
 
     /// The stem is `<YYYYMMDD-HHMMSS>-<pid>`; the label is the write minute.
     #[test]
@@ -1454,19 +1485,10 @@ mod tests {
     fn recovery_prune_keeps_the_newest_ten() {
         let base = temp("session_recovery_prune");
         let rec = recovery_dir(&base);
-        let mut cfg = SessionConfig::new();
-        cfg.insert("~/p".into(), vec![e("vim")]);
-        for i in 1..=12u32 {
-            let stem = format!("20260714-0930{i:02}-{DEAD_FIXTURE_PID}");
-            save_recovery_in(&rec, &stem, "autosaved 2026-07-14 09:30", &cfg).unwrap();
-        }
+        let cfg = vim_cfg();
+        fill_dead(&rec, "20260714", 1..=12, &cfg);
 
-        let mut names: Vec<String> = fs::read_dir(&rec)
-            .unwrap()
-            .flatten()
-            .map(|e| e.file_name().into_string().unwrap())
-            .collect();
-        names.sort();
+        let names = names_in(&rec);
         let expected: Vec<String> = (3..=12u32)
             .map(|i| format!("20260714-0930{i:02}-{DEAD_FIXTURE_PID}.json"))
             .collect();
@@ -1478,12 +1500,8 @@ mod tests {
     fn recovery_prune_exempts_the_active_stem() {
         let base = temp("session_recovery_prune_active");
         let rec = recovery_dir(&base);
-        let mut cfg = SessionConfig::new();
-        cfg.insert("~/p".into(), vec![e("vim")]);
-        for i in 1..=10u32 {
-            let stem = format!("20260715-0930{i:02}-{DEAD_FIXTURE_PID}");
-            save_recovery_in(&rec, &stem, "autosaved 2026-07-15 09:30", &cfg).unwrap();
-        }
+        let cfg = vim_cfg();
+        fill_dead(&rec, "20260715", 1..=10, &cfg);
 
         // This dead-PID stem sorts below every existing snapshot.
         let active_stem = format!("20260714-093000-{DEAD_FIXTURE_PID}");
@@ -1491,12 +1509,7 @@ mod tests {
             save_recovery_in(&rec, &active_stem, "autosaved 2026-07-15 09:30", &cfg).unwrap();
         assert!(active.exists(), "the just-written snapshot must survive");
 
-        let mut names: Vec<String> = fs::read_dir(&rec)
-            .unwrap()
-            .flatten()
-            .map(|e| e.file_name().into_string().unwrap())
-            .collect();
-        names.sort();
+        let names = names_in(&rec);
         let mut expected = vec![format!("{active_stem}.json")];
         expected
             .extend((2..=10u32).map(|i| format!("20260715-0930{i:02}-{DEAD_FIXTURE_PID}.json")));
@@ -1511,12 +1524,8 @@ mod tests {
     fn recovery_prune_below_limit_removes_nothing() {
         let base = temp("session_recovery_prune_few");
         let rec = recovery_dir(&base);
-        let mut cfg = SessionConfig::new();
-        cfg.insert("~/p".into(), vec![e("vim")]);
-        for i in 1..=5u32 {
-            let stem = format!("20260714-0930{i:02}-{DEAD_FIXTURE_PID}");
-            save_recovery_in(&rec, &stem, "autosaved 2026-07-14 09:30", &cfg).unwrap();
-        }
+        let cfg = vim_cfg();
+        fill_dead(&rec, "20260714", 1..=5, &cfg);
 
         assert_eq!(
             fs::read_dir(&rec).unwrap().flatten().count(),
@@ -1530,22 +1539,13 @@ mod tests {
     fn recovery_prune_exempts_live_pid_stems() {
         let base = temp("session_recovery_prune_live");
         let rec = recovery_dir(&base);
-        let mut cfg = SessionConfig::new();
-        cfg.insert("~/p".into(), vec![e("vim")]);
+        let cfg = vim_cfg();
         // The oldest candidate names this live test process.
         let live_stem = format!("20260101-000000-{}", std::process::id());
         save_recovery_in(&rec, &live_stem, "autosaved 2026-01-01 00:00", &cfg).unwrap();
-        for i in 1..=11u32 {
-            let stem = format!("20260714-0930{i:02}-{DEAD_FIXTURE_PID}");
-            save_recovery_in(&rec, &stem, "autosaved 2026-07-14 09:30", &cfg).unwrap();
-        }
+        fill_dead(&rec, "20260714", 1..=11, &cfg);
 
-        let mut names: Vec<String> = fs::read_dir(&rec)
-            .unwrap()
-            .flatten()
-            .map(|e| e.file_name().into_string().unwrap())
-            .collect();
-        names.sort();
+        let names = names_in(&rec);
         let mut expected = vec![format!("{live_stem}.json")];
         expected
             .extend((2..=11u32).map(|i| format!("20260714-0930{i:02}-{DEAD_FIXTURE_PID}.json")));
@@ -1560,14 +1560,10 @@ mod tests {
     fn recovery_prune_removes_dead_pid_stems() {
         let base = temp("session_recovery_prune_dead");
         let rec = recovery_dir(&base);
-        let mut cfg = SessionConfig::new();
-        cfg.insert("~/p".into(), vec![e("vim")]);
+        let cfg = vim_cfg();
         let oldest = format!("20260101-000000-{}", dead_pid());
         save_recovery_in(&rec, &oldest, "autosaved 2026-01-01 00:00", &cfg).unwrap();
-        for i in 1..=10u32 {
-            let stem = format!("20260714-0930{i:02}-{DEAD_FIXTURE_PID}");
-            save_recovery_in(&rec, &stem, "autosaved 2026-07-14 09:30", &cfg).unwrap();
-        }
+        fill_dead(&rec, "20260714", 1..=10, &cfg);
 
         assert!(
             !rec.join(format!("{oldest}.json")).exists(),
@@ -1585,8 +1581,7 @@ mod tests {
     fn recovery_prune_ignores_malformed_pid_suffixes() {
         let base = temp("session_recovery_prune_malformed");
         let rec = recovery_dir(&base);
-        let mut cfg = SessionConfig::new();
-        cfg.insert("~/p".into(), vec![e("vim")]);
+        let cfg = vim_cfg();
         let malformed = [
             "20260101-000000-x42",         // non-numeric pid
             "20260101-000001-99999999999", // past i32::MAX
@@ -1596,10 +1591,7 @@ mod tests {
         for stem in malformed {
             save_recovery_in(&rec, stem, "autosaved 2026-01-01 00:00", &cfg).unwrap();
         }
-        for i in 1..=10u32 {
-            let stem = format!("20260714-0930{i:02}-{DEAD_FIXTURE_PID}");
-            save_recovery_in(&rec, &stem, "autosaved 2026-07-14 09:30", &cfg).unwrap();
-        }
+        fill_dead(&rec, "20260714", 1..=10, &cfg);
 
         for stem in malformed {
             assert!(
@@ -1618,8 +1610,7 @@ mod tests {
     #[test]
     fn list_ignores_the_recovery_subdirectory() {
         let dir = temp("session_list_recovery");
-        let mut cfg = SessionConfig::new();
-        cfg.insert("~/p".into(), vec![e("vim")]);
+        let cfg = vim_cfg();
         save_in(&dir, "real", &cfg).unwrap();
         save_recovery_in(
             &recovery_dir(&dir),
