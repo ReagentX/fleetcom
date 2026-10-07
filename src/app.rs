@@ -226,9 +226,9 @@ pub struct App {
     pub mode: Mode,
     pub group_mode: GroupMode,
     pub input: EditBuffer,
-    /// Directory a typed command or a picked agent launches in. Set to
-    /// `invocation_dir` for the `n` flow, or to the picked directory for the
-    /// `@` flow.
+    /// Directory a typed command or a picked agent launches in. Set to the
+    /// selected task's directory for the `n` flow in Dir mode, `invocation_dir`
+    /// for the `n` flow otherwise, or the picked directory for the `@` flow.
     pub spawn_cwd: PathBuf,
     /// Group assigned to the next spawn. Custom mode snapshots the selected
     /// task's group; State and Dir modes leave the spawn unassigned.
@@ -1110,6 +1110,15 @@ impl App {
         self.refresh_dir_candidates();
     }
 
+    /// Resolve the `n` spawn directory: the selected task's cwd in Dir mode, else
+    /// `invocation_dir`.
+    fn inherited_dir(&self) -> PathBuf {
+        match (self.group_mode, self.selected_task()) {
+            (GroupMode::Dir, Some(i)) => self.views[i].cwd.clone(),
+            _ => self.invocation_dir.clone(),
+        }
+    }
+
     // --- `g` group picker -------------------------------------------------------
 
     /// Resolve spawn inheritance from the selected task in Custom mode.
@@ -1328,7 +1337,7 @@ impl App {
             KeyCode::Char('/') => self.open_find_palette(),
             // Uppercase R renames; lowercase r reruns.
             KeyCode::Char('R') => self.open_rename_prompt(),
-            KeyCode::Char('n') => self.open_spawn_prompt(self.invocation_dir.clone()),
+            KeyCode::Char('n') => self.open_spawn_prompt(self.inherited_dir()),
             KeyCode::Char('@') => {
                 self.dir_input.clear();
                 self.refresh_dir_candidates();
