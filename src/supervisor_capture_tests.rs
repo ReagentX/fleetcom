@@ -1226,24 +1226,25 @@ fn refused_codex_capture_keeps_the_launch_target() {
 /// joined with the tool's dot directory, then nothing.
 #[test]
 fn harness_home_prefers_the_tool_var_then_home() {
-    use crate::harness::{Claude, Codex, Grok, Omp};
+    let [claude, codex, grok, omp] =
+        ["claude", "codex", "grok", "omp"].map(|p| crate::harness::registered(p).unwrap());
     let env: Vec<(OsString, OsString)> = vec![
         ("HOME".into(), "/h".into()),
         ("CODEX_HOME".into(), "/x".into()),
     ];
-    assert_eq!(harness_home(&env, &Codex).as_deref(), Some(Path::new("/x")));
+    assert_eq!(harness_home(&env, codex).as_deref(), Some(Path::new("/x")));
     let env: Vec<(OsString, OsString)> = vec![("HOME".into(), "/h".into())];
     assert_eq!(
-        harness_home(&env, &Codex).as_deref(),
+        harness_home(&env, codex).as_deref(),
         Some(Path::new("/h/.codex"))
     );
     assert_eq!(
-        harness_home(&env, &Claude).as_deref(),
+        harness_home(&env, claude).as_deref(),
         Some(Path::new("/h/.claude"))
     );
-    assert_eq!(harness_home(&env, &Grok), None);
-    assert_eq!(harness_home(&env, &Omp), None);
-    assert_eq!(harness_home(&[], &Codex), None);
+    assert_eq!(harness_home(&env, grok), None);
+    assert_eq!(harness_home(&env, omp), None);
+    assert_eq!(harness_home(&[], codex), None);
 }
 
 /// With only `HOME` in the launch environment, read notify routing from

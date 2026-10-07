@@ -30,10 +30,7 @@ use std::{
     time::SystemTime,
 };
 
-pub use claude::Claude;
-pub use codex::{Codex, record_arrival};
-pub use grok::Grok;
-pub use omp::Omp;
+pub use codex::record_arrival;
 
 /// Environment variable naming the capture file used by injected assets.
 pub const CAPTURE_ENV: &str = "FLEETCOM_CAPTURE_FILE";
@@ -113,7 +110,7 @@ pub trait Harness: Sync {
 
 /// Resolve a tool-specific override before the launch environment's home.
 /// Without either, the consumer applies [`home_root`]'s platform fallback.
-fn resolve_home(
+fn env_home(
     env: &dyn Fn(&str) -> Option<PathBuf>,
     override_var: &str,
     dot_dir: &str,
@@ -137,30 +134,33 @@ struct Agent {
 /// Registered CLIs, in launcher order.
 static AGENTS: &[Agent] = &[
     Agent {
-        harness: &Claude,
+        harness: &claude::Claude,
         summary: &summary::ClaudeSummary,
     },
     Agent {
-        harness: &Codex,
+        harness: &codex::Codex,
         summary: &summary::CodexSummary,
     },
     Agent {
-        harness: &Grok,
+        harness: &grok::Grok,
         summary: &summary::GrokSummary,
     },
     Agent {
-        harness: &Omp,
+        harness: &omp::Omp,
         summary: &summary::OmpSummary,
     },
 ];
 
+/// Look up an agent by its exact registered `program` word. Do not match paths or
+/// basenames.
+fn agent(program: &str) -> Option<&'static Agent> {
+    AGENTS.iter().find(|a| a.harness.shape().0 == program)
+}
+
 /// Look up a harness by its exact registered `program` word, as used for managed launches
-/// and session entries. Do not match paths or basenames.
+/// and session entries.
 pub fn registered(program: &str) -> Option<&'static dyn Harness> {
-    AGENTS
-        .iter()
-        .map(|a| a.harness)
-        .find(|h| h.shape().0 == program)
+    agent(program).map(|a| a.harness)
 }
 
 /// List every registered program word in registry order. Subtract `installed` to identify
@@ -202,10 +202,7 @@ fn executable_file(path: &Path) -> bool {
 pub fn select(command: &str) -> Option<&'static dyn crate::preview::SummaryAdapter> {
     let first = command.split_whitespace().next()?;
     let name = Path::new(first).file_name()?.to_str()?;
-    AGENTS
-        .iter()
-        .find(|a| a.harness.shape().0 == name)
-        .map(|a| a.summary)
+    agent(name).map(|a| a.summary)
 }
 
 /// Conversation selection for a managed launch.
@@ -276,10 +273,8 @@ pub struct CapturePaths {
     /// Extension module loaded by `omp -e`, which appends to the user's own
     /// extensions rather than replacing them.
     pub omp_capture: PathBuf,
-    /// The daemon's executable, checked at allocation for a regular file with an execute
-    /// bit. Use `None` when `current_exe` is unusable. On Linux, the path read through
-    /// `/proc/self/exe` ends in ` (deleted)` after the binary is replaced on disk under the
-    /// running daemon.
+    /// The daemon's executable as probed by [`assets::fleetcom_binary`] at allocation;
+    /// `None` when it is unusable.
     pub fleetcom_binary: Option<PathBuf>,
 }
 

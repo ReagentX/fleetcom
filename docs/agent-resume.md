@@ -172,7 +172,7 @@ Implement `Harness` in [`src/harness/mod.rs`](../src/harness/mod.rs) for each to
 - `shape`: supply the program word and resume selector. Use the word to identify the tool on the Agent page and in session files. In `harness::intent_args`, place the selector and ID first in resume argv.
 - `session_flag`: specify the flag for pinning a session ID on a fresh launch, or return `None` (the default) for tool-assigned IDs. In `harness::plan`, build the conversation-selection argv from this flag and the resume selector.
 - `overlay`: return argv elements to append after conversation selection, environment entries, and any launch notice. Pass the elements directly to the binary and report the notice through the supervisor after a successful spawn.
-- `parse_capture`: read an ID from the capture file's contents. The task leader's PID and the launch-time home are supplied; when other processes can reach the capture channel, use them to refuse a payload the task's own process did not write.
+- `parse_capture`: read an ID from the capture file's contents. The task leader's PID is supplied; when other processes can reach the capture channel, use it to refuse a payload the task's own process did not write.
 - `live_session_id`: read the ID published on disk for a live session. Return `None` by default when no registry is available.
 - `live_blocked_status`: read that registry for blocked-on-user status. Return preview text, never an ID; return `None` by default.
 - `resolve_home`: resolve configuration needed by instrumentation, capture parsing, or the live registry. Return `None` by default.

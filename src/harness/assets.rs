@@ -323,8 +323,10 @@ mod tests {
     use super::*;
     use crate::{
         harness::{
-            BINARY_ENV, CAPTURE_ENV, Claude, Harness, NOTIFY_CHAIN_ENV, Omp,
+            BINARY_ENV, CAPTURE_ENV, Harness, NOTIFY_CHAIN_ENV,
+            claude::Claude,
             fixtures::{ID, OTHER},
+            omp::Omp,
         },
         testutil::{dead_pid, install_fake_notifier, temp, write_executable},
     };

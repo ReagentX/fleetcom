@@ -34,6 +34,14 @@ fn grok_screen<S: AsRef<str>>(above: &[S]) -> Vec<String> {
     rows
 }
 
+/// Place the provided rows above an adjacent two-row omp input box.
+fn omp_screen<S: AsRef<str>>(above: &[S]) -> Vec<String> {
+    let mut rows: Vec<String> = above.iter().map(|s| s.as_ref().to_string()).collect();
+    rows.push("╭── π  > ⬢ model · ◒ high > ◫ 12.2%/131K ▶──╮".to_string());
+    rows.push("╰─                                         ─╯".to_string());
+    rows
+}
+
 /// Resolve a corpus fixture at the corpus row count and `cols` columns;
 /// return its text, source, and rule.
 fn corpus(
@@ -1199,14 +1207,6 @@ fn grok_still_running_shapes() {
         GrokSummary.live_preview(&rows),
         Some(("Worked for 8.7s".to_string(), "grok:worked"))
     );
-}
-
-/// Place the provided rows above an adjacent two-row omp input box.
-fn omp_screen<S: AsRef<str>>(above: &[S]) -> Vec<String> {
-    let mut rows: Vec<String> = above.iter().map(|s| s.as_ref().to_string()).collect();
-    rows.push("╭── π  > ⬢ model · ◒ high > ◫ 12.2%/131K ▶──╮".to_string());
-    rows.push("╰─                                         ─╯".to_string());
-    rows
 }
 
 /// Build an omp approval screen with `head` naming the tool.

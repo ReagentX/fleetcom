@@ -51,6 +51,19 @@ fn after_frame(s: &str, is_frame: impl Fn(char) -> bool) -> Option<&str> {
     (is_frame(chars.next()?) && chars.next()? == ' ').then_some(chars.as_str())
 }
 
+/// Return the text after a leading run of one or more ASCII digits.
+fn after_digits(s: &str) -> Option<&str> {
+    let rest = s.trim_start_matches(|c: char| c.is_ascii_digit());
+    (rest.len() < s.len()).then_some(rest)
+}
+
+/// Whether `row`, trimmed, runs from the `open` corner glyph to the `close` one: a
+/// horizontal border of a rounded input box.
+fn box_edge(row: &str, open: char, close: char) -> bool {
+    let t = row.trim();
+    t.starts_with(open) && t.ends_with(close)
+}
+
 /// The status phrase of a spinner row: a frame char accepted by `is_frame`,
 /// a space, then text through the first `…` inclusive. The phrase must open
 /// alphanumeric; past that it is task-derived and unconstrained. Trailing
@@ -194,11 +207,7 @@ fn claude_spinner_status(rows: &[String], top: usize) -> Option<(String, &'stati
 fn claude_waiting_text(row: &str) -> Option<String> {
     let text = after_frame(row, |c| CLAUDE_SPINNER.contains(&c))?;
     let rest = text.strip_prefix("Waiting for ")?;
-    let digits = rest.chars().take_while(char::is_ascii_digit).count();
-    if digits == 0 {
-        return None;
-    }
-    let middle = rest[digits..]
+    let middle = after_digits(rest)?
         .strip_prefix(' ')?
         .strip_suffix(" to finish")?;
     (1..=3)
@@ -372,9 +381,7 @@ fn codex_menu_head(row: &str) -> bool {
 
 /// An unselected modal option: indented, `{digit}. `-headed.
 fn codex_numbered_option(row: &str) -> bool {
-    let t = row.trim_start();
-    let digits = t.chars().take_while(char::is_ascii_digit).count();
-    t.len() > digits && digits >= 1 && t[digits..].starts_with(". ")
+    after_digits(row.trim_start()).is_some_and(|r| r.starts_with(". "))
 }
 
 /// Codex's approval modal: a selector row with an indented numbered sibling adjacent to
@@ -623,11 +630,7 @@ fn codex_elapsed(s: &str) -> Option<&str> {
     let mut rest = s;
     let mut units = "hms";
     loop {
-        let digits = rest.chars().take_while(char::is_ascii_digit).count();
-        if digits == 0 {
-            return None;
-        }
-        let tail = &rest[digits..];
+        let tail = after_digits(rest)?;
         let unit = tail.chars().next()?;
         let at = units.find(unit)?;
         units = &units[at + 1..];
@@ -691,14 +694,10 @@ impl SummaryAdapter for GrokSummary {
 /// sits higher), a `╭…╮` top border within six rows above it, and at least
 /// one `│`-headed row between. Returns `(top, bottom)` border indexes.
 fn grok_input_box(rows: &[String]) -> Option<(usize, usize)> {
-    let bottom = rows.iter().rposition(|r| {
-        let t = r.trim();
-        t.starts_with('╰') && t.ends_with('╯')
-    })?;
-    let top = (bottom.saturating_sub(6)..bottom).rev().find(|&i| {
-        let t = rows[i].trim();
-        t.starts_with('╭') && t.ends_with('╮')
-    })?;
+    let bottom = rows.iter().rposition(|r| box_edge(r, '╰', '╯'))?;
+    let top = (bottom.saturating_sub(6)..bottom)
+        .rev()
+        .find(|&i| box_edge(&rows[i], '╭', '╮'))?;
     rows[top + 1..bottom]
         .iter()
         .any(|r| r.trim_start().starts_with('│'))
@@ -738,14 +737,9 @@ fn grok_still_running(t: &str) -> Option<String> {
 
 /// One count segment: ASCII digits, a space, then one to three words.
 fn grok_still_running_count(seg: &str) -> bool {
-    let digits = seg.chars().take_while(char::is_ascii_digit).count();
-    if digits == 0 {
-        return false;
-    }
-    let Some(words) = seg[digits..].strip_prefix(' ') else {
-        return false;
-    };
-    (1..=3).contains(&words.split_whitespace().count())
+    after_digits(seg)
+        .and_then(|r| r.strip_prefix(' '))
+        .is_some_and(|words| (1..=3).contains(&words.split_whitespace().count()))
 }
 
 /// `╰──── Grok 4.5 (xhigh) · always-approve ─╯` → `Grok 4.5 (xhigh)`: the text grok
@@ -822,12 +816,8 @@ impl SummaryAdapter for OmpSummary {
 /// `╭…╮` border. Require adjacent borders to exclude preview boxes containing a
 /// command.
 fn omp_input_box(rows: &[String]) -> Option<usize> {
-    let bottom = rows.iter().rposition(|r| {
-        let t = r.trim();
-        t.starts_with('╰') && t.ends_with('╯')
-    })?;
-    let t = rows[..bottom].last()?.trim();
-    (t.starts_with('╭') && t.ends_with('╮')).then(|| bottom - 1)
+    let bottom = rows.iter().rposition(|r| box_edge(r, '╰', '╯'))?;
+    box_edge(rows[..bottom].last()?, '╭', '╮').then(|| bottom - 1)
 }
 
 /// The status row: the first painted row above the input box, shaped `{frame} {phrase}

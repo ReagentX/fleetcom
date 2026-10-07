@@ -22,7 +22,7 @@ use std::{
 
 use super::{
     BINARY_ENV, CAPTURE_ENV, CapturePaths, Harness, NOTIFY_CHAIN_ENV, SpawnPlan, capture_id,
-    home_root, is_uuid, resolve_home,
+    env_home, home_root, is_uuid,
 };
 
 /// Config override for explicitly launching in embedded mode.
@@ -49,7 +49,7 @@ pub struct Codex;
 
 impl Harness for Codex {
     fn resolve_home(&self, env: &dyn Fn(&str) -> Option<PathBuf>) -> Option<PathBuf> {
-        resolve_home(env, "CODEX_HOME", ".codex")
+        env_home(env, "CODEX_HOME", ".codex")
     }
 
     fn shape(&self) -> (&'static str, &'static str) {
@@ -438,7 +438,7 @@ mod tests {
             (NOTIFY_CHAIN_ENV.into(), chain.into()),
             (
                 BINARY_ENV.into(),
-                PathBuf::from("/tmp/Application Support/fleetcom").into_os_string(),
+                paths().fleetcom_binary.unwrap().into_os_string(),
             ),
         ]
     }
