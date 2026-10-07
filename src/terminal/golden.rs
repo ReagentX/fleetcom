@@ -29,6 +29,7 @@ use alacritty_terminal::{
 use crate::{
     ansi,
     emulator::Emulator,
+    preview::ScreenFacts,
     protocol::ClipboardKind,
     testutil::{CORPUS_COLS as COLS, CORPUS_LINES as LINES, parse_term},
 };

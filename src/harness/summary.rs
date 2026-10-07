@@ -768,7 +768,8 @@ const OMP_CURSORS: &[&str] = &["❯", "\u{f054}", ">"];
 ///
 /// Locate status by Unicode box corners. Do not use ASCII `+` and `-`: the same glyphs
 /// are present in transcript tables and rules. Accept the plain-text approval selector
-/// under ASCII.
+/// under ASCII. No model label: omp's model text is user-configurable status-line
+/// content, not a stable label.
 pub struct OmpSummary;
 
 impl SummaryAdapter for OmpSummary {
@@ -778,11 +779,6 @@ impl SummaryAdapter for OmpSummary {
             // Consider the approval selector only with the input box gone.
             None => omp_approval(rows),
         }
-    }
-
-    /// Model text is user-configurable status-line content, not a stable label.
-    fn model_label(&self, _rows: &[String]) -> Option<String> {
-        None
     }
 
     /// Normalize omp's `π {separator} {label}` and `π: {label}` titles. Extract a

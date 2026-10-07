@@ -4,7 +4,7 @@ use super::*;
 use crate::{
     emulator::Emulator,
     harness::select,
-    preview::{MARKER, PreviewState, SummaryAdapter},
+    preview::{MARKER, PreviewState, ScreenFacts, SummaryAdapter},
     protocol::PreviewSource,
     testutil::CORPUS_LINES,
 };

@@ -801,6 +801,9 @@ impl Supervisor {
             return self.capture.get(&key);
         }
         let installed = assets::CaptureAssets::install(&root, std::process::id()).ok()?;
+        // The first canonicalize fails until `install` creates `root`; resolve again so
+        // the entry is keyed by the same canonical path later lookups compute (on macOS
+        // `/tmp` is `/private/tmp`), else every lookup misses and installs anew.
         let key = std::fs::canonicalize(&root).unwrap_or(root);
         Some(self.capture.entry(key).or_insert(installed))
     }

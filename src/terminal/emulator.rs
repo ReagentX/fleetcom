@@ -452,17 +452,6 @@ impl Emulator {
     pub fn alt_epoch(&self) -> u64 {
         self.alt_title.epoch
     }
-
-    /// Every live-viewport row, top to bottom, trailing padding trimmed: the
-    /// summary adapters' structural scan input. Ignores the scrollback view
-    /// offset for the same reason as [`ScreenFacts::live_floor`]. Inherent as
-    /// well as a trait method: `harness::summary_tests` reads rows without
-    /// the trait in scope.
-    pub fn live_rows(&self) -> Vec<String> {
-        (0..self.term.grid().screen_lines() as i32)
-            .map(|row| live_row_text_of(&self.term, row))
-            .collect()
-    }
 }
 
 impl ScreenFacts for Emulator {
@@ -508,8 +497,13 @@ impl ScreenFacts for Emulator {
         live_floor_of(&self.term)
     }
 
+    /// Every live-viewport row, top to bottom, trailing padding trimmed: the
+    /// summary adapters' structural scan input. Ignores the scrollback view
+    /// offset for the same reason as `live_floor`.
     fn live_rows(&self) -> Vec<String> {
-        Self::live_rows(self)
+        (0..self.term.grid().screen_lines() as i32)
+            .map(|row| live_row_text_of(&self.term, row))
+            .collect()
     }
 
     fn alt_leave_floor(&self) -> Option<&str> {
