@@ -2948,6 +2948,35 @@ fn state_and_dir_mode_spawns_stay_unassigned() {
     assert_eq!(v.group, None);
 }
 
+/// In Dir mode, `n` opens in the selected task's directory; State and Custom modes keep
+/// the invocation directory.
+#[test]
+fn dir_mode_spawn_inherits_the_selected_directory() {
+    let mut app = App::new_local(30, 100);
+    let scratch = temp("app_dir_inherit");
+    let (dir, inv) = (scratch.to_path_buf(), app.invocation_dir.clone());
+    app.spawn_in("sleep 5", dir.clone()); // id 1
+
+    for (mode, want) in [
+        (GroupMode::Dir, &dir),
+        (GroupMode::State, &inv),
+        (GroupMode::Custom, &inv),
+    ] {
+        app.group_mode = mode;
+        app.on_key_dashboard(key(KeyCode::Char('n')));
+        assert_eq!(&app.spawn_cwd, want, "{mode:?}");
+        app.on_key_spawn(key(KeyCode::Esc));
+    }
+
+    app.group_mode = GroupMode::Dir;
+    app.on_key_dashboard(key(KeyCode::Char('n')));
+    app.type_spawn("sleep 5");
+    app.on_key_spawn(key(KeyCode::Enter));
+    app.pump();
+    let v = app.views.iter().find(|v| v.id == 2).unwrap();
+    assert_eq!(v.cwd, dir, "the spawn must launch in the inherited directory");
+}
+
 // --- `n` spawn prompt: Agent page --------------------------------------
 
 impl App {
