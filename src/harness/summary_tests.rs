@@ -12,10 +12,7 @@ use crate::{
 /// The ten braille spinner frames codex and omp cycle through their titles.
 const BRAILLE_FRAMES: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 
-/// Build a synthetic live viewport for an adapter.
-fn rs(rows: &[&str]) -> Vec<String> {
-    rows.iter().map(|s| s.to_string()).collect()
-}
+use crate::testutil::rows as rs;
 
 /// Place status rows above a 120-column Claude input box.
 fn claude_screen<S: AsRef<str>>(above: &[S]) -> Vec<String> {
