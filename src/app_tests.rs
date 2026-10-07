@@ -379,7 +379,7 @@ fn custom_mode_groups_by_name_with_unassigned_last() {
 fn custom_mode_unassigned_tracks_membership() {
     let mut app = App::new_local(30, 100);
     let inv = app.invocation_dir.clone();
-    app.spawn_grouped("sleep 5", inv.clone(), "alpha"); // id 1
+    app.spawn_grouped("sleep 5", inv, "alpha"); // id 1
     app.pump();
     app.group_mode = GroupMode::Custom;
     assert_eq!(app.section_ids(), vec![("alpha".to_string(), vec![1])]);
@@ -449,7 +449,7 @@ fn custom_mode_clusters_by_dir_within_group() {
     std::fs::create_dir_all(&dir_a).unwrap();
     std::fs::create_dir_all(&dir_b).unwrap();
 
-    app.spawn_grouped("sleep 5", dir_b.clone(), "alpha"); // id 1, dir b
+    app.spawn_grouped("sleep 5", dir_b, "alpha"); // id 1, dir b
     app.spawn_grouped("sleep 5", dir_a.clone(), "alpha"); // id 2, dir a
     app.spawn_grouped("sleep 5", dir_a, "alpha"); // id 3, dir a
     app.pump();
@@ -1397,7 +1397,7 @@ fn focus_by_id_survives_index_shift() {
 fn rows_interleave_headers_and_tasks() {
     let mut app = App::new_local(30, 100);
     let inv = app.invocation_dir.clone();
-    app.spawn_in("a", inv.clone()); // id 1, invocation dir
+    app.spawn_in("a", inv); // id 1, invocation dir
     app.spawn_in("b", PathBuf::from("/tmp")); // id 2, /tmp
     app.pump();
 
@@ -1863,7 +1863,7 @@ fn unencodable_modifiers_and_keys_are_dropped() {
 
 /// Refuse an oversized attached paste before sending it would close the connection.
 #[test]
-fn oversized_paste_is_refused_with_a_notice() {
+fn oversized_paste_is_refused_with_a_status_line() {
     let mut app = App::new_local(30, 100);
     app.mode = Mode::Attached;
     app.focused_id = Some(1);
@@ -2589,7 +2589,7 @@ fn unfocused_terminal_mutes_the_highlight_rows() {
 
 /// Open the overlay on `?`; close on `?`, `Esc`, or `q`.
 #[test]
-fn controls_overlay_opens_on_question_and_closes_on_peeks_key_set() {
+fn controls_overlay_opens_on_question_and_closes_on_question_esc_q() {
     let mut app = App::new_local(30, 100);
     for close in [KeyCode::Char('?'), KeyCode::Esc, KeyCode::Char('q')] {
         app.on_key_dashboard(key(KeyCode::Char('?')));

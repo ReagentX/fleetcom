@@ -247,7 +247,7 @@ pub struct App {
     pub agent_sel: usize,
     /// Id of the attached task, if any: by id (not index) so it survives the
     /// task list changing underneath it.
-    pub focused_id: Option<u64>,
+    focused_id: Option<u64>,
     /// Return destination for `Ctrl-]`. Set on attachment only if the target
     /// is marked as flagship in the current snapshot. Retain after the
     /// flagship's exit so the user can still return. Clear on every exit from
@@ -291,7 +291,8 @@ pub struct App {
     pub session_page: SessionPage,
     /// Selection in the recovery list, clamped independently of `session_sel`.
     pub recovery_sel: usize,
-    /// Transient one-line notice (save/load result), dismissed on the next key.
+    /// Transient one-line notice (daemon status events, the reconnect and paste
+    /// outcomes, the ignored-scrollback warning), dismissed on the next key.
     pub status: Option<String>,
     /// Ephemeral notice text, priority, and creation time.
     notice: Option<(String, NoticeLevel, Instant)>,
@@ -638,7 +639,7 @@ impl App {
     }
 
     /// Flattened section order: the sequence the selection cursor moves through.
-    pub fn display_order(&self) -> Vec<usize> {
+    fn display_order(&self) -> Vec<usize> {
         self.sections().into_iter().flat_map(|(_, v)| v).collect()
     }
 
@@ -1237,7 +1238,7 @@ impl App {
     }
 
     fn on_key(&mut self, out: &mut impl Write, k: KeyEvent) {
-        // Any key dismisses a lingering save/load notice.
+        // Any key dismisses a lingering status notice.
         self.status = None;
         // Global escape hatch, except while attached (Ctrl-C belongs to the child).
         // Ctrl-C disconnects: it leaves the daemon and tasks running.
@@ -1684,22 +1685,22 @@ impl App {
                 }
             }
             Mode::Spawn if self.spawn_page == SpawnPage::Agent => {
-                paste_into(&mut self.agent_input, s);
+                self.agent_input.paste(s);
                 self.refresh_agent_candidates();
             }
             Mode::Spawn | Mode::SaveSession | Mode::Rename(_) => {
-                paste_into(&mut self.input, s);
+                self.input.paste(s);
             }
             Mode::PickDir => {
-                paste_into(&mut self.dir_input, s);
+                self.dir_input.paste(s);
                 self.refresh_dir_candidates();
             }
             Mode::PickGroup(_) => {
-                paste_into(&mut self.group_input, s);
+                self.group_input.paste(s);
                 self.refresh_group_candidates();
             }
             Mode::Find => {
-                paste_into(&mut self.find_input, s);
+                self.find_input.paste(s);
                 self.refresh_find_candidates();
             }
             _ => {}
@@ -2084,13 +2085,6 @@ fn task_matches(v: &TaskView, needle: &str) -> bool {
     .into_iter()
     .flatten()
     .any(|field| field.to_lowercase().contains(needle))
-}
-
-/// Insert pasted text at the caret after removing control characters.
-fn paste_into(buf: &mut EditBuffer, s: &str) {
-    for c in s.chars().filter(|c| !c.is_control()) {
-        buf.insert(c);
-    }
 }
 
 /// Split a typed path into its directory prefix and trailing search fragment. Apply the

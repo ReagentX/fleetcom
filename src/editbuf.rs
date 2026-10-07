@@ -49,6 +49,13 @@ impl EditBuffer {
         self.caret += c.len_utf8();
     }
 
+    /// Insert pasted text at the caret after removing control characters.
+    pub fn paste(&mut self, s: &str) {
+        for c in s.chars().filter(|c| !c.is_control()) {
+            self.insert(c);
+        }
+    }
+
     /// Remove the character before the caret; a no-op at the start.
     pub fn backspace(&mut self) {
         if let Some((i, _)) = self.text[..self.caret].char_indices().next_back() {
@@ -94,17 +101,10 @@ impl Deref for EditBuffer {
 mod tests {
     use super::*;
 
-    /// Type each char of `s` into `buf`.
-    fn type_str(buf: &mut EditBuffer, s: &str) {
-        for c in s.chars() {
-            buf.insert(c);
-        }
-    }
-
     #[test]
     fn insert_and_backspace_track_the_caret() {
         let mut b = EditBuffer::default();
-        type_str(&mut b, "abc");
+        b.paste("abc");
         assert_eq!(b.as_str(), "abc");
         assert!(b.at_end());
         b.backspace();
@@ -178,7 +178,7 @@ mod tests {
         b.left();
         b.clear();
         assert!(b.is_empty() && b.at_end());
-        type_str(&mut b, "ab");
+        b.paste("ab");
         b.left();
         assert_eq!(b.take(), "ab");
         assert!(b.is_empty() && b.at_end());
