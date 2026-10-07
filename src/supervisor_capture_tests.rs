@@ -3,8 +3,8 @@ use crate::{
     harness::fixtures::{CODEX_CHILD, CODEX_ROOT, CODEX_TITLE, ID as CAP_ID, OTHER as CAP_OTHER},
     protocol::{Lifecycle, Preview, PreviewSource},
     testutil::{
-        codex_session_meta, dead_pid, install_codex_rollout, install_codex_root,
-        install_resident_shell,
+        codex_session_meta, dead_pid, hook_json, install_codex_rollout, install_codex_root,
+        install_resident_shell, with_shell,
     },
 };
 
@@ -38,7 +38,7 @@ fn agent_ctx(bin: &Path, runtime: &Path, cwd: PathBuf) -> LaunchContext {
             ),
             ("SHELL".into(), "/bin/sh".into()),
             (
-                "FLEETCOM_RUNTIME_DIR".into(),
+                FLEETCOM_RUNTIME_DIR.into(),
                 runtime.as_os_str().to_os_string(),
             ),
         ],
@@ -103,11 +103,6 @@ fn stamped(task: &Task, json: &str) -> String {
         "{}\n{json}\n",
         task.pid().expect("a spawned task has a pid")
     )
-}
-
-/// The JSON Claude's `SessionStart` hook writes for session `id` started from `source`.
-fn hook_json(id: &str, source: &str) -> String {
-    format!(r#"{{"session_id":"{id}","hook_event_name":"SessionStart","source":"{source}"}}"#)
 }
 
 /// Save a recipe and return its persisted JSON.
@@ -367,7 +362,7 @@ fn typed_agent_word_is_literal_runs_verbatim_and_saves_as_text() {
         &dir,
         r#""status":"waiting","waitingFor":"permission prompt""#,
     );
-    assert_eq!(current_resume_id(&s.tasks[0]), None);
+    assert_eq!(s.tasks[0].current_resume_id(), None);
     let entries = saved_entries(&mut s, &config, "typed");
     assert_eq!(entries[0], SessionEntry::literal("claude"));
     assert!(matches!(
@@ -403,9 +398,7 @@ fn rerun_cannot_read_the_old_runs_stale_capture() {
         stamped(&s.tasks[0], &format!(r#"{{"session_id":"{CAP_ID}"}}"#)),
     )
     .unwrap();
-    assert!(reap_until(&mut s, Duration::from_secs(5), |s| s.tasks[0]
-        .finished
-        .is_some()));
+    wait_exited(&mut s, id);
 
     s.apply(Command::Restart { id });
     let new_cap = s.tasks[0].capture_file.clone().expect("capture file set");
@@ -425,25 +418,6 @@ fn rerun_cannot_read_the_old_runs_stale_capture() {
         Some(CAP_ID),
         "the fresh run must save its launch target, never the old run's stale capture"
     );
-}
-
-/// Removing a task also removes its capture file.
-#[test]
-fn remove_deletes_the_capture_file() {
-    use crate::protocol::Lifecycle;
-    let dir = scratch("cap_remove");
-    let (bin, runtime) = (dir.join("bin"), dir.join("run"));
-    install_stub(&bin, "claude", &dir);
-    let mut s = sup_ctx(agent_ctx(&bin, &runtime, dir.to_path_buf()));
-    s.spawn_agent("claude", dir.to_path_buf(), None);
-    let _ = wait_argv(&mut s, &dir.join("argv"));
-    let id = s.tasks[0].id;
-    wait_for_lifecycle(&mut s, id, |l| l == Lifecycle::Ok);
-    let cap = s.tasks[0].capture_file.clone().unwrap();
-    std::fs::write(&cap, "{}").unwrap();
-
-    s.apply(Command::Remove { id });
-    assert!(!cap.exists(), "Remove must delete the task's capture file");
 }
 
 /// Reconnecting with the active root reuses installed assets and preserves
@@ -507,7 +481,6 @@ fn returning_to_a_prior_root_preserves_its_live_captures() {
 /// not under whichever root the current client presents.
 #[test]
 fn remove_deletes_the_capture_file_under_the_spawn_root() {
-    use crate::protocol::Lifecycle;
     let dir = scratch("cap_remove_cross");
     let (bin, root_a, root_b) = (dir.join("bin"), dir.join("run-a"), dir.join("run-b"));
     install_stub(&bin, "claude", &dir);
@@ -943,7 +916,7 @@ until [ -e '{d}/done' ]; do sleep 0.05; done"#,
 
     std::fs::write(&cap, stamped(&s.tasks[0], &hook_json(CAP_OTHER, "clear"))).unwrap();
     assert_eq!(
-        current_resume_id(&s.tasks[0]).as_deref(),
+        s.tasks[0].current_resume_id().as_deref(),
         Some(CAP_OTHER),
         "the task's own capture must beat the pin"
     );
@@ -969,13 +942,13 @@ until [ -e '{d}/done' ]; do sleep 0.05; done"#,
 
     // With no registry record yet, use the pinned ID after rejecting the capture.
     assert_eq!(
-        current_resume_id(&s.tasks[0]).as_deref(),
+        s.tasks[0].current_resume_id().as_deref(),
         Some(pinned.as_str()),
         "a foreign capture must fall through to the spawn-time id"
     );
     install_status_record(&claude_home, pid, &dir, r#""status":"idle""#);
     assert_eq!(
-        current_resume_id(&s.tasks[0]).as_deref(),
+        s.tasks[0].current_resume_id().as_deref(),
         Some(CAP_ID),
         "a foreign capture must fall through to the registry"
     );
@@ -1036,7 +1009,7 @@ fn silent_codex_tasks_save_and_recover_without_a_resume_id() {
         .all(|t| t.finished.is_some())));
     for task in &s.tasks {
         assert!(
-            current_resume_id(task).is_none(),
+            task.current_resume_id().is_none(),
             "no capture channel fired"
         );
         let spawn_ms = task
@@ -1226,24 +1199,25 @@ fn refused_codex_capture_keeps_the_launch_target() {
 /// joined with the tool's dot directory, then nothing.
 #[test]
 fn harness_home_prefers_the_tool_var_then_home() {
-    use crate::harness::{Claude, Codex, Grok, Omp};
+    let [claude, codex, grok, omp] =
+        ["claude", "codex", "grok", "omp"].map(|p| crate::harness::registered(p).unwrap());
     let env: Vec<(OsString, OsString)> = vec![
         ("HOME".into(), "/h".into()),
         ("CODEX_HOME".into(), "/x".into()),
     ];
-    assert_eq!(harness_home(&env, &Codex).as_deref(), Some(Path::new("/x")));
+    assert_eq!(harness_home(&env, codex).as_deref(), Some(Path::new("/x")));
     let env: Vec<(OsString, OsString)> = vec![("HOME".into(), "/h".into())];
     assert_eq!(
-        harness_home(&env, &Codex).as_deref(),
+        harness_home(&env, codex).as_deref(),
         Some(Path::new("/h/.codex"))
     );
     assert_eq!(
-        harness_home(&env, &Claude).as_deref(),
+        harness_home(&env, claude).as_deref(),
         Some(Path::new("/h/.claude"))
     );
-    assert_eq!(harness_home(&env, &Grok), None);
-    assert_eq!(harness_home(&env, &Omp), None);
-    assert_eq!(harness_home(&[], &Codex), None);
+    assert_eq!(harness_home(&env, grok), None);
+    assert_eq!(harness_home(&env, omp), None);
+    assert_eq!(harness_home(&[], codex), None);
 }
 
 /// With only `HOME` in the launch environment, read notify routing from
@@ -1286,9 +1260,8 @@ fn home_only_launch_env_targets_the_clients_dot_codex() {
         ["-c", "features.daemon_auto_start=false"],
         "the guard must read <home>/.codex/config.toml and inject only embedded mode"
     );
-    assert!(reap_until(&mut s, Duration::from_secs(5), |s| s.tasks[0]
-        .finished
-        .is_some()));
+    let id = s.tasks[0].id;
+    wait_exited(&mut s, id);
 
     assert_eq!(
         saved_entries(&mut s, &config, "homeonly"),
@@ -1335,9 +1308,8 @@ fn stale_inherited_notify_chain_is_never_executed() {
     ));
     let mut s = sup_ctx(ctx);
     s.spawn_agent("codex", dir.to_path_buf(), None);
-    assert!(reap_until(&mut s, Duration::from_secs(5), |s| s.tasks[0]
-        .finished
-        .is_some()));
+    let id = s.tasks[0].id;
+    wait_exited(&mut s, id);
     let cap = s.tasks[0].capture_file.clone().expect("capture file set");
     assert_eq!(
         std::fs::read_to_string(&cap).unwrap(),
@@ -1349,7 +1321,7 @@ fn stale_inherited_notify_chain_is_never_executed() {
         "the stale inherited chain must not execute"
     );
     assert_eq!(
-        current_resume_id(&s.tasks[0]).as_deref(),
+        s.tasks[0].current_resume_id().as_deref(),
         Some(CAP_ID),
         "the notifier's payload for a root thread must pass the capture gate"
     );
@@ -1373,9 +1345,8 @@ fn managed_save_without_any_id_omits_resume() {
         ],
     ));
     s.spawn_agent("codex", dir.to_path_buf(), None);
-    assert!(reap_until(&mut s, Duration::from_secs(5), |s| s.tasks[0]
-        .finished
-        .is_some()));
+    let id = s.tasks[0].id;
+    wait_exited(&mut s, id);
 
     let text = save_and_read(&mut s, &config, "plainagent");
     assert!(
@@ -1457,7 +1428,7 @@ fn config_toml_notify_chains_through_the_injected_script() {
         "the validation step must precede the chain handoff"
     );
     assert_eq!(
-        current_resume_id(&s.tasks[0]).as_deref(),
+        s.tasks[0].current_resume_id().as_deref(),
         Some(CAP_ID),
         "the notifier's payload for a root thread must pass the capture gate"
     );
@@ -1628,11 +1599,7 @@ fn managed_claude_accepts_its_own_capture_and_refuses_a_foreign_stamp() {
         ),
     );
     let mut ctx = agent_ctx(&bin, &runtime, dir.to_path_buf());
-    ctx.env.retain(|(k, _)| k != "SHELL");
-    ctx.env.push((
-        "SHELL".into(),
-        install_resident_shell(&dir).into_os_string(),
-    ));
+    ctx.env = with_shell(ctx.env, install_resident_shell(&dir));
     let mut s = sup_ctx(ctx);
     s.spawn_agent("claude", dir.to_path_buf(), None);
     assert!(acknowledged(&s.drain()), "a managed spawn is acknowledged");
@@ -1652,7 +1619,7 @@ fn managed_claude_accepts_its_own_capture_and_refuses_a_foreign_stamp() {
         ["--session-id", &pinned, "--settings", &settings_beside(&s)]
     );
     assert_eq!(
-        current_resume_id(&s.tasks[0]).as_deref(),
+        s.tasks[0].current_resume_id().as_deref(),
         Some(CAP_OTHER),
         "the stub's `$$` is the leader pid: no shell sat between"
     );
@@ -1663,7 +1630,7 @@ fn managed_claude_accepts_its_own_capture_and_refuses_a_foreign_stamp() {
     let (_, json) = text.split_once('\n').unwrap();
     std::fs::write(&cap, format!("{}\n{json}", dead_pid())).unwrap();
     assert_eq!(
-        current_resume_id(&s.tasks[0]).as_deref(),
+        s.tasks[0].current_resume_id().as_deref(),
         Some(pinned.as_str()),
         "a foreign stamp must fall through to the pinned id"
     );
@@ -1864,7 +1831,7 @@ fn managed_task_saves_as_a_managed_entry_and_reloads_managed() {
         "the reloaded claude entry must resume its captured ID: {claude_argv:?}"
     );
     assert_eq!(
-        current_resume_id(&s.tasks[2]).as_deref(),
+        s.tasks[2].current_resume_id().as_deref(),
         Some(CAP_OTHER),
         "the reloaded run's own capture outranks the recipe's resume ID"
     );
@@ -1984,14 +1951,7 @@ fn tick_until_preview(
 ) -> Preview {
     let mut last = None;
     wait_until(budget, || {
-        s.tick();
-        for e in s.drain() {
-            if let Event::Tasks(v) = e
-                && let Some(t) = v.into_iter().next()
-            {
-                last = Some(t.preview);
-            }
-        }
+        last = snapshot(s).into_iter().next().map(|t| t.preview);
         last.as_ref().is_some_and(&mut pred)
     });
     last.expect("a Tasks snapshot must carry the task's preview")
@@ -2056,12 +2016,8 @@ fn registry_waiting_status_reaches_the_dashboard_preview() {
     // After exit, a changed record must neither retain nor replace the cached
     // blocked preview.
     std::fs::write(&done, b"").unwrap();
-    assert!(
-        reap_until(&mut s, Duration::from_secs(5), |s| s.tasks[0]
-            .finished
-            .is_some()),
-        "the leader never exited"
-    );
+    let id = s.tasks[0].id;
+    wait_exited(&mut s, id);
     install_status_record(
         &claude_home,
         pid,

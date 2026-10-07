@@ -1,4 +1,9 @@
 #![forbid(unsafe_code)]
+// Default to private. Use `pub(super)` when callers stay within the parent
+// module's subtree, and `pub` when they need a broader scope. Every module here
+// is private to this binary, so `pub` already means crate-visible; Clippy rejects
+// redundant `pub(crate)`.
+#![warn(clippy::redundant_pub_crate)]
 
 //! `fleetcom`: a fleet-view supervisor for shell commands and managed agents. Each
 //! task runs in its own PTY; the dashboard groups them by status, and you can
@@ -36,7 +41,7 @@ mod terminal;
 #[cfg(test)]
 mod testutil;
 
-pub(crate) use terminal::{ansi, emulator, input};
+pub use terminal::{ansi, emulator, input};
 
 use std::{
     io::{self, IsTerminal},
@@ -70,7 +75,7 @@ use app::App;
 static KITTY_PUSHED: AtomicBool = AtomicBool::new(false);
 
 const USAGE: &str = "\
-fleetcom - a fleet-view supervisor for arbitrary shell commands
+fleetcom - a fleet-view supervisor for shell commands and managed agents
 
 Usage:
   fleetcom [<session>]               connect to the daemon (autostarting it),
@@ -347,7 +352,7 @@ fn emit_restore_sequences(out: &mut impl io::Write, kitty_pushed: bool) -> io::R
 /// the terminal instead of dying in raw mode, and the daemon kills its tasks
 /// cleanly. `flag::register` only stores into an atomic, so it stays within
 /// `#![forbid(unsafe_code)]`.
-pub(crate) fn install_signal_handlers(flag: Arc<AtomicBool>) -> io::Result<()> {
+pub fn install_signal_handlers(flag: Arc<AtomicBool>) -> io::Result<()> {
     use signal_hook::consts::{SIGHUP, SIGINT, SIGTERM};
     signal_hook::flag::register(SIGTERM, Arc::clone(&flag))?;
     signal_hook::flag::register(SIGHUP, Arc::clone(&flag))?;

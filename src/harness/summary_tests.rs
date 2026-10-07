@@ -4,7 +4,7 @@ use super::*;
 use crate::{
     emulator::Emulator,
     harness::select,
-    preview::{MARKER, PreviewState, SummaryAdapter},
+    preview::{MARKER, PreviewState, ScreenFacts, SummaryAdapter},
     protocol::PreviewSource,
     testutil::CORPUS_LINES,
 };
@@ -12,10 +12,7 @@ use crate::{
 /// The ten braille spinner frames codex and omp cycle through their titles.
 const BRAILLE_FRAMES: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 
-/// Build a synthetic live viewport for an adapter.
-fn rs(rows: &[&str]) -> Vec<String> {
-    rows.iter().map(|s| s.to_string()).collect()
-}
+use crate::testutil::rows as rs;
 
 /// Place status rows above a 120-column Claude input box.
 fn claude_screen<S: AsRef<str>>(above: &[S]) -> Vec<String> {
@@ -31,6 +28,14 @@ fn grok_screen<S: AsRef<str>>(above: &[S]) -> Vec<String> {
     rows.push("  ╭──────────────────────╮".to_string());
     rows.push("  │ ❯                    │".to_string());
     rows.push("  ╰── Grok 4.5 (xhigh) · always-approve ─╯".to_string());
+    rows
+}
+
+/// Place the supplied rows above the two-row omp input box.
+fn omp_screen<S: AsRef<str>>(above: &[S]) -> Vec<String> {
+    let mut rows: Vec<String> = above.iter().map(|s| s.as_ref().to_string()).collect();
+    rows.push("╭── π  > ⬢ model · ◒ high > ◫ 12.2%/131K ▶──╮".to_string());
+    rows.push("╰─                                         ─╯".to_string());
     rows
 }
 
@@ -1199,14 +1204,6 @@ fn grok_still_running_shapes() {
         GrokSummary.live_preview(&rows),
         Some(("Worked for 8.7s".to_string(), "grok:worked"))
     );
-}
-
-/// Place the provided rows above an adjacent two-row omp input box.
-fn omp_screen<S: AsRef<str>>(above: &[S]) -> Vec<String> {
-    let mut rows: Vec<String> = above.iter().map(|s| s.as_ref().to_string()).collect();
-    rows.push("╭── π  > ⬢ model · ◒ high > ◫ 12.2%/131K ▶──╮".to_string());
-    rows.push("╰─                                         ─╯".to_string());
-    rows
 }
 
 /// Build an omp approval screen with `head` naming the tool.

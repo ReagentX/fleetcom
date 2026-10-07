@@ -30,10 +30,7 @@ use std::{
     time::SystemTime,
 };
 
-pub use claude::Claude;
-pub use codex::{Codex, record_arrival};
-pub use grok::Grok;
-pub use omp::Omp;
+pub use codex::record_arrival;
 
 /// Environment variable naming the capture file used by injected assets.
 pub const CAPTURE_ENV: &str = "FLEETCOM_CAPTURE_FILE";
@@ -113,7 +110,7 @@ pub trait Harness: Sync {
 
 /// Resolve a tool-specific override before the launch environment's home.
 /// Without either, the consumer applies [`home_root`]'s platform fallback.
-fn resolve_home(
+fn env_home(
     env: &dyn Fn(&str) -> Option<PathBuf>,
     override_var: &str,
     dot_dir: &str,
@@ -137,30 +134,33 @@ struct Agent {
 /// Registered CLIs, in launcher order.
 static AGENTS: &[Agent] = &[
     Agent {
-        harness: &Claude,
+        harness: &claude::Claude,
         summary: &summary::ClaudeSummary,
     },
     Agent {
-        harness: &Codex,
+        harness: &codex::Codex,
         summary: &summary::CodexSummary,
     },
     Agent {
-        harness: &Grok,
+        harness: &grok::Grok,
         summary: &summary::GrokSummary,
     },
     Agent {
-        harness: &Omp,
+        harness: &omp::Omp,
         summary: &summary::OmpSummary,
     },
 ];
 
-/// Look up a harness by its exact registered `program` word, as used for managed launches
-/// and session entries. Do not match paths or basenames.
+/// Look up an agent by its exact registered `program` word. Do not match paths or
+/// basenames.
+fn agent(program: &str) -> Option<&'static Agent> {
+    AGENTS.iter().find(|a| a.harness.shape().0 == program)
+}
+
+/// Look up the harness registered for an exact program word used by a managed
+/// launch or session entry. Do not match paths or basenames.
 pub fn registered(program: &str) -> Option<&'static dyn Harness> {
-    AGENTS
-        .iter()
-        .map(|a| a.harness)
-        .find(|h| h.shape().0 == program)
+    agent(program).map(|a| a.harness)
 }
 
 /// List every registered program word in registry order. Subtract `installed` to identify
@@ -202,10 +202,7 @@ fn executable_file(path: &Path) -> bool {
 pub fn select(command: &str) -> Option<&'static dyn crate::preview::SummaryAdapter> {
     let first = command.split_whitespace().next()?;
     let name = Path::new(first).file_name()?.to_str()?;
-    AGENTS
-        .iter()
-        .find(|a| a.harness.shape().0 == name)
-        .map(|a| a.summary)
+    agent(name).map(|a| a.summary)
 }
 
 /// Conversation selection for a managed launch.
@@ -276,10 +273,8 @@ pub struct CapturePaths {
     /// Extension module loaded by `omp -e`, which appends to the user's own
     /// extensions rather than replacing them.
     pub omp_capture: PathBuf,
-    /// The daemon's executable, checked at allocation for a regular file with an execute
-    /// bit. Use `None` when `current_exe` is unusable. On Linux, the path read through
-    /// `/proc/self/exe` ends in ` (deleted)` after the binary is replaced on disk under the
-    /// running daemon.
+    /// Store the executable path returned by the allocation-time probe; use
+    /// `None` when it finds no usable executable.
     pub fleetcom_binary: Option<PathBuf>,
 }
 
@@ -328,7 +323,7 @@ fn capture_id(v: &jzon::JsonValue, key: &str) -> Option<String> {
 
 /// Generate a v4 UUID from `/dev/urandom`. Return `None` on a read failure; launch
 /// without pinning an ID in that case.
-pub(crate) fn uuid_v4() -> Option<String> {
+pub fn uuid_v4() -> Option<String> {
     use std::fmt::Write;
     let mut bytes = [0u8; 16];
     File::open("/dev/urandom")
@@ -349,22 +344,22 @@ pub(crate) fn uuid_v4() -> Option<String> {
 
 /// Fixtures for harness launch and capture tests.
 #[cfg(test)]
-pub(crate) mod fixtures {
+pub mod fixtures {
     use std::{ffi::OsString, path::PathBuf};
 
     use super::CapturePaths;
 
     /// Strict v4 UUID used wherever a valid session ID is needed.
-    pub(crate) const ID: &str = "c8c4a5cc-0b32-4ba0-a6b4-6ed08c218e0d";
+    pub const ID: &str = "c8c4a5cc-0b32-4ba0-a6b4-6ed08c218e0d";
     /// A second distinct ID for precedence cases.
-    pub(crate) const OTHER: &str = "11111111-2222-4333-8444-555555555555";
+    pub const OTHER: &str = "11111111-2222-4333-8444-555555555555";
 
     /// Thread IDs reported through one codex process's notifier: the conversation on
     /// screen, a sub-agent it spawned, and the hidden title thread. Codex thread IDs are
     /// v7; use these so fixtures match real rollouts (`is_uuid` checks no version field).
-    pub(crate) const CODEX_ROOT: &str = "019f5453-de22-7240-b2e5-0d32692aa6d9";
-    pub(crate) const CODEX_CHILD: &str = "019f5454-0c11-7b33-9a4e-5f0e6d7c8b9a";
-    pub(crate) const CODEX_TITLE: &str = "019f5453-de9f-7e61-8c0d-1a2b3c4d5e6f";
+    pub const CODEX_ROOT: &str = "019f5453-de22-7240-b2e5-0d32692aa6d9";
+    pub const CODEX_CHILD: &str = "019f5454-0c11-7b33-9a4e-5f0e6d7c8b9a";
+    pub const CODEX_TITLE: &str = "019f5453-de9f-7e61-8c0d-1a2b3c4d5e6f";
 
     /// Argv elements from string literals, for snapshot assertions.
     pub(super) fn argv(words: &[&str]) -> Vec<OsString> {

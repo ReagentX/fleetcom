@@ -4,19 +4,16 @@
 
 use std::time::{Duration, Instant};
 
-use crate::{
-    emulator::Emulator,
-    protocol::{Preview, PreviewSource},
-};
+use crate::protocol::{Preview, PreviewSource};
 
 // Holds use elapsed time because tick intervals range from the 8 ms frame
 // minimum to the 200 ms idle backstop.
 
 /// Minimum interval between rendered title changes.
-pub const TITLE_MIN_HOLD: Duration = Duration::from_millis(500);
+const TITLE_MIN_HOLD: Duration = Duration::from_millis(500);
 
 /// Hold duration before rendering a lower-ranked preview source.
-pub const DEMOTION_HOLD: Duration = Duration::from_millis(600);
+const DEMOTION_HOLD: Duration = Duration::from_millis(600);
 
 /// Preview text for an alternate-screen child with no usable title.
 pub const MARKER: &str = "full-screen";
@@ -42,37 +39,9 @@ pub trait ScreenFacts {
     fn alt_leave_floor(&self) -> Option<&str>;
 }
 
-impl ScreenFacts for Emulator {
-    fn revision(&self) -> u64 {
-        Self::revision(self)
-    }
-
-    fn alternate_screen(&self) -> bool {
-        Self::alternate_screen(self)
-    }
-
-    fn title(&self) -> Option<&str> {
-        Self::title(self)
-    }
-
-    fn primary_title(&self) -> Option<&str> {
-        Self::primary_title(self)
-    }
-
-    fn live_floor(&self) -> String {
-        Self::live_floor(self)
-    }
-
-    fn live_rows(&self) -> Vec<String> {
-        Self::live_rows(self)
-    }
-
-    fn alt_leave_floor(&self) -> Option<&str> {
-        Self::alt_leave_floor(self)
-    }
-}
-
 /// Display-only status and model-label extraction for one agent CLI.
+/// Require every adapter to implement `live_preview`. Return `None` from model-label
+/// and title-normalization methods when an adapter has no value to report.
 pub trait SummaryAdapter: Sync {
     /// Return normalized live status and its matcher ID when the expected
     /// chrome is present. `rows` contains live rows with trailing padding
@@ -81,7 +50,9 @@ pub trait SummaryAdapter: Sync {
 
     /// Return a model label from stable CLI chrome. Preview resolution prepends
     /// the label and ` · ` to the live status.
-    fn model_label(&self, rows: &[String]) -> Option<String>;
+    fn model_label(&self, _rows: &[String]) -> Option<String> {
+        None
+    }
 
     /// Normalize a title recognized as this CLI's output. On the alternate screen,
     /// preserve the captured title verbatim for `None`. On the primary screen, reject
@@ -335,7 +306,10 @@ mod tests {
     use std::cell::Cell;
 
     use super::*;
-    use crate::harness::summary::{CodexSummary, OmpSummary};
+    use crate::{
+        emulator::Emulator,
+        harness::summary::{CodexSummary, OmpSummary},
+    };
 
     /// Synthetic screen facts with a floor-read counter for the
     /// revision-gate test. Every mutator bumps `revision`, matching the
@@ -364,6 +338,15 @@ mod tests {
                 alt_leave_floor: None,
                 floor_calls: Cell::new(0),
             }
+        }
+
+        /// Build an alternate-screen fixture with `floor` on the primary screen and
+        /// `title` captured on the alternate screen.
+        fn alt_titled(floor: &str, title: &str) -> Self {
+            let mut s = Self::primary(floor);
+            s.enter_alt();
+            s.set_title(title);
+            s
         }
 
         /// Bump the revision alone: the emulator counts every grid advance.
@@ -443,6 +426,16 @@ mod tests {
         label: Option<&'static str>,
     }
 
+    impl StubAdapter {
+        /// Build a stub adapter with a working status and the given model label.
+        fn working(label: Option<&'static str>) -> Self {
+            Self {
+                live: Some(("Working", "stub:working")),
+                label,
+            }
+        }
+    }
+
     impl SummaryAdapter for StubAdapter {
         fn live_preview(&self, _rows: &[String]) -> Option<(String, &'static str)> {
             self.live.map(|(text, rule)| (text.to_string(), rule))
@@ -465,13 +458,8 @@ mod tests {
     fn anchor_outranks_title_and_prepends_the_label() {
         let now = Instant::now();
         let mut st = PreviewState::new();
-        let mut s = FakeScreen::primary("shell");
-        s.enter_alt();
-        s.set_title("app");
-        let adapter = StubAdapter {
-            live: Some(("Working", "stub:working")),
-            label: Some("model-x"),
-        };
+        let s = FakeScreen::alt_titled("shell", "app");
+        let adapter = StubAdapter::working(Some("model-x"));
         let p = st.resolve(now, &s, Some(&adapter), None).clone();
         assert_eq!(
             (p.text.as_str(), p.source, p.rule),
@@ -483,10 +471,7 @@ mod tests {
         );
 
         // Without a label, render the bare status for the anchor.
-        let bare = StubAdapter {
-            live: Some(("Working", "stub:working")),
-            label: None,
-        };
+        let bare = StubAdapter::working(None);
         let mut st = PreviewState::new();
         let p = st.resolve(now, &s, Some(&bare), None).clone();
         assert_eq!(p.text, "Working");
@@ -497,13 +482,8 @@ mod tests {
     fn a_registry_anchor_outranks_the_adapters_anchor() {
         let now = Instant::now();
         let mut st = PreviewState::new();
-        let mut s = FakeScreen::primary("shell");
-        s.enter_alt();
-        s.set_title("app");
-        let adapter = StubAdapter {
-            live: Some(("Working", "stub:working")),
-            label: Some("model-x"),
-        };
+        let s = FakeScreen::alt_titled("shell", "app");
+        let adapter = StubAdapter::working(Some("model-x"));
         let p = st
             .resolve(
                 now,
@@ -561,13 +541,8 @@ mod tests {
     fn anchor_loss_demotes_through_the_hold() {
         let t0 = Instant::now();
         let mut st = PreviewState::new();
-        let mut s = FakeScreen::primary("shell");
-        s.enter_alt();
-        s.set_title("app");
-        let working = StubAdapter {
-            live: Some(("Working", "stub:working")),
-            label: None,
-        };
+        let mut s = FakeScreen::alt_titled("shell", "app");
+        let working = StubAdapter::working(None);
         st.resolve(t0, &s, Some(&working), None);
 
         let idle = StubAdapter {
@@ -622,9 +597,7 @@ mod tests {
         );
 
         let mut st = PreviewState::new();
-        let mut s = FakeScreen::primary("shell");
-        s.enter_alt();
-        s.set_title("app");
+        let s = FakeScreen::alt_titled("shell", "app");
         let p = st.resolve(now, &s, None, None).clone();
         assert_eq!((p.text.as_str(), p.source), ("app", PreviewSource::Title));
 
@@ -683,10 +656,7 @@ mod tests {
         let mut st = PreviewState::new();
         let mut s = FakeScreen::primary("shell");
         s.set_primary_title("π ⠋ fix parser");
-        let adapter = StubAdapter {
-            live: Some(("Working", "stub:working")),
-            label: None,
-        };
+        let adapter = StubAdapter::working(None);
         let p = st.resolve(now, &s, Some(&adapter), None).clone();
         assert_eq!(
             (p.text.as_str(), p.source, p.rule),
@@ -738,9 +708,7 @@ mod tests {
     fn demotion_commits_only_after_the_hold() {
         let t0 = Instant::now();
         let mut st = PreviewState::new();
-        let mut s = FakeScreen::primary("shell");
-        s.enter_alt();
-        s.set_title("app");
+        let mut s = FakeScreen::alt_titled("shell", "app");
         st.resolve(t0, &s, None, None);
 
         s.clear_title();
@@ -765,9 +733,7 @@ mod tests {
         let t0 = Instant::now();
         let ms = Duration::from_millis;
         let mut st = PreviewState::new();
-        let mut s = FakeScreen::primary("shell");
-        s.enter_alt();
-        s.set_title("app");
+        let mut s = FakeScreen::alt_titled("shell", "app");
         st.resolve(t0, &s, None, None);
 
         s.clear_title();
@@ -797,9 +763,7 @@ mod tests {
     fn flapping_pending_keeps_the_timer_and_commits_the_latest() {
         let t0 = Instant::now();
         let mut st = PreviewState::new();
-        let mut s = FakeScreen::primary("shell");
-        s.enter_alt();
-        s.set_title("app");
+        let mut s = FakeScreen::alt_titled("shell", "app");
         st.resolve(t0, &s, None, None);
 
         // First demoted candidate: the marker.
@@ -828,9 +792,7 @@ mod tests {
         let t0 = Instant::now();
         let ms = Duration::from_millis;
         let mut st = PreviewState::new();
-        let mut s = FakeScreen::primary("shell");
-        s.enter_alt();
-        s.set_title("one");
+        let mut s = FakeScreen::alt_titled("shell", "one");
         assert_eq!(st.resolve(t0, &s, None, None).text, "one");
 
         s.set_title("two");
@@ -915,9 +877,7 @@ mod tests {
     fn finalize_keeps_the_rendered_preview_across_alt_teardown() {
         let t0 = Instant::now();
         let mut st = PreviewState::new();
-        let mut s = FakeScreen::primary("prelaunch junk");
-        s.enter_alt();
-        s.set_title("agent: working");
+        let mut s = FakeScreen::alt_titled("prelaunch junk", "agent: working");
         st.resolve(t0, &s, None, None);
 
         // Apply the exit's 1049l without an intervening live resolution.
@@ -943,9 +903,7 @@ mod tests {
     fn finalize_keeps_the_render_when_a_resolve_saw_the_teardown() {
         let t0 = Instant::now();
         let mut st = PreviewState::new();
-        let mut s = FakeScreen::primary("prelaunch junk");
-        s.enter_alt();
-        s.set_title("agent: working");
+        let mut s = FakeScreen::alt_titled("prelaunch junk", "agent: working");
         st.resolve(t0, &s, None, None);
 
         // Apply teardown and resolve on a tick before output completion.
@@ -971,9 +929,7 @@ mod tests {
     fn finalize_trusts_the_screen_after_a_primary_commit() {
         let t0 = Instant::now();
         let mut st = PreviewState::new();
-        let mut s = FakeScreen::primary("prelaunch junk");
-        s.enter_alt();
-        s.set_title("agent: working");
+        let mut s = FakeScreen::alt_titled("prelaunch junk", "agent: working");
         st.resolve(t0, &s, None, None);
 
         // The child returns to the primary screen and keeps printing; the
@@ -1004,9 +960,7 @@ mod tests {
     fn finalize_freezes_primary_output_written_after_teardown() {
         let t0 = Instant::now();
         let mut st = PreviewState::new();
-        let mut s = FakeScreen::primary("prelaunch junk");
-        s.enter_alt();
-        s.set_title("agent: working");
+        let mut s = FakeScreen::alt_titled("prelaunch junk", "agent: working");
         st.resolve(t0, &s, None, None);
 
         // Teardown observed (snapshot: "prelaunch junk"), title still held.
@@ -1031,9 +985,7 @@ mod tests {
     fn finalize_holds_through_control_only_output_after_teardown() {
         let t0 = Instant::now();
         let mut st = PreviewState::new();
-        let mut s = FakeScreen::primary("prelaunch junk");
-        s.enter_alt();
-        s.set_title("agent: working");
+        let mut s = FakeScreen::alt_titled("prelaunch junk", "agent: working");
         st.resolve(t0, &s, None, None);
 
         s.leave_alt();
@@ -1146,9 +1098,7 @@ mod tests {
     fn finalize_on_the_alt_screen_freezes_the_final_cascade() {
         let t0 = Instant::now();
         let mut st = PreviewState::new();
-        let mut s = FakeScreen::primary("shell");
-        s.enter_alt();
-        s.set_title("step 1");
+        let mut s = FakeScreen::alt_titled("shell", "step 1");
         st.resolve(t0, &s, None, None);
 
         s.set_title("step 2: done");

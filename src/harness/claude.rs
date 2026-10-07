@@ -16,13 +16,13 @@ use std::{
 };
 
 use super::summary::AWAITING_APPROVAL;
-use super::{CapturePaths, Harness, SpawnPlan, capture_id, home_root, is_uuid, resolve_home};
+use super::{CapturePaths, Harness, SpawnPlan, capture_id, env_home, home_root};
 
 pub struct Claude;
 
 impl Harness for Claude {
     fn resolve_home(&self, env: &dyn Fn(&str) -> Option<PathBuf>) -> Option<PathBuf> {
-        resolve_home(env, "CLAUDE_CONFIG_DIR", ".claude")
+        env_home(env, "CLAUDE_CONFIG_DIR", ".claude")
     }
 
     fn shape(&self) -> (&'static str, &'static str) {
@@ -90,7 +90,7 @@ impl Harness for Claude {
 /// Validated fields used to correlate a registry record with a task and render
 /// its blocked status.
 struct SessionRecord {
-    /// `sessionId`, validated by [`is_uuid`].
+    /// Validate `sessionId` with [`super::is_uuid`].
     id: String,
     pid: i32,
     cwd: PathBuf,
@@ -121,9 +121,8 @@ fn parse_record(text: &str) -> Option<SessionRecord> {
     if v["kind"].as_str()? != "interactive" {
         return None;
     }
-    let id = v["sessionId"].as_str().filter(|id| is_uuid(id))?;
     Some(SessionRecord {
-        id: id.to_string(),
+        id: capture_id(&v, "sessionId")?,
         pid: v["pid"].as_i32().filter(|p| *p > 0)?,
         cwd: PathBuf::from(v["cwd"].as_str()?),
         started_at: u128::from(v["startedAt"].as_u64()?),
@@ -168,7 +167,7 @@ mod tests {
             fixtures::{ID, OTHER, argv, paths},
             plan,
         },
-        testutil::temp,
+        testutil::{hook_json, temp},
     };
 
     /// The overlay path from [`paths`].
@@ -239,14 +238,6 @@ mod tests {
     /// Task leader PID used by the capture-gate cases.
     const OWNER: u32 = 4242;
 
-    /// `SessionStart` JSON supplied to the hook: one object and a trailing
-    /// newline.
-    fn hook_json(id: &str, source: &str) -> String {
-        format!(
-            r#"{{"session_id":"{id}","transcript_path":"/t/x.jsonl","cwd":"/w","hook_event_name":"SessionStart","source":"{source}"}}"#
-        ) + "\n"
-    }
-
     /// Parse `payload` as the capture file of a task led by [`OWNER`].
     fn parse_owned(payload: &str) -> Option<String> {
         Claude.parse_capture(payload, Some(OWNER))
@@ -257,7 +248,7 @@ mod tests {
     #[test]
     fn parse_capture_accepts_the_task_leaders_stamp() {
         for source in ["startup", "resume", "clear", "fork"] {
-            let payload = format!("{OWNER}\n{}", hook_json(ID, source));
+            let payload = format!("{OWNER}\n{}\n", hook_json(ID, source));
             assert_eq!(parse_owned(&payload).as_deref(), Some(ID), "{source}");
         }
     }
@@ -266,7 +257,7 @@ mod tests {
     /// Also reject captures when the task has no PID.
     #[test]
     fn parse_capture_refuses_a_foreign_stamp() {
-        let json = hook_json(ID, "startup");
+        let json = format!("{}\n", hook_json(ID, "startup"));
         for foreign in [1, 424, 4243, 42420, 14242] {
             assert_eq!(
                 parse_owned(&format!("{foreign}\n{json}")),
@@ -284,7 +275,7 @@ mod tests {
     /// older, unstamped format, with JSON on the first line.
     #[test]
     fn parse_capture_refuses_a_missing_or_malformed_stamp() {
-        let json = hook_json(ID, "startup");
+        let json = format!("{}\n", hook_json(ID, "startup"));
         assert_eq!(parse_owned(&json), None, "bare JSON");
         assert_eq!(parse_owned(json.trim_end()), None, "bare JSON, no newline");
         for stamp in [
@@ -298,7 +289,7 @@ mod tests {
     /// writes can return any prefix of the complete capture.
     #[test]
     fn parse_capture_refuses_empty_and_torn_payloads() {
-        let complete = format!("{OWNER}\n{}", hook_json(ID, "startup"));
+        let complete = format!("{OWNER}\n{}\n", hook_json(ID, "startup"));
         assert_eq!(parse_owned(&complete).as_deref(), Some(ID));
         // The object is complete without its trailing newline. For every
         // shorter prefix, the stamp, its newline, or the closing brace is missing.

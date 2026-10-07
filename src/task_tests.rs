@@ -1,28 +1,36 @@
 use super::*;
-use crate::testutil::{
-    env_here, here, install_resident_shell, read_pid, sh_env, temp, wait_until, write_executable,
+use crate::{
+    preview::ScreenFacts,
+    protocol::PreviewSource,
+    testutil::{
+        env_here, here, install_resident_shell, read_pid, sh_env, temp, wait_until, with_shell,
+        write_executable,
+    },
 };
 
-/// Tests drive the reader directly, so there is no core loop to wake.
+/// Run reader tests without a core-loop waker.
 fn no_waker() -> Waker {
     Arc::new(Mutex::new(None))
 }
 
-fn spawn(id: u64, command: &str) -> Task {
-    Task::spawn(
-        id,
-        command,
-        Exec::Literal,
-        &here(),
-        24,
-        80,
-        2000,
-        &env_here(),
-        no_waker(),
-    )
-    .unwrap()
+/// Spawn a task with a 24x80 grid, 2000 rows of scrollback, and this process's
+/// working directory.
+fn spawn_with(id: u64, command: &str, exec: Exec, env: &[(OsString, OsString)]) -> Task {
+    Task::spawn(id, command, exec, &here(), 24, 80, 2000, env, no_waker()).unwrap()
 }
 
+/// Spawn a literal task with this process's environment.
+fn spawn(id: u64, command: &str) -> Task {
+    spawn_with(id, command, Exec::Literal, &env_here())
+}
+
+/// Spawn a literal task with `SHELL=/bin/sh` so background jobs and `trap`s
+/// use consistent shell behavior in process-group tests.
+fn spawn_sh(id: u64, command: &str) -> Task {
+    spawn_with(id, command, Exec::Literal, &sh_env())
+}
+
+/// Poll until the child has exited; the reader may still be running.
 fn wait_finished(t: &mut Task) {
     assert!(
         wait_until(Duration::from_secs(5), || {
@@ -30,6 +38,17 @@ fn wait_finished(t: &mut Task) {
             t.finished.is_some()
         }),
         "task never finished"
+    );
+}
+
+/// Wait for child exit and reader EOF before checking the complete grid output.
+fn wait_complete(t: &mut Task) {
+    assert!(
+        wait_until(Duration::from_secs(60), || {
+            t.poll_exit().unwrap();
+            t.output_complete()
+        }),
+        "child never completed"
     );
 }
 
@@ -122,7 +141,6 @@ fn resize_is_reflected_in_the_grid() {
 /// signals); `Drop` collects it and only then does the pid free up.
 #[test]
 fn exited_leader_stays_a_zombie_until_drop() {
-    use nix::sys::signal::kill;
     let mut t = spawn(4, "exit 7");
     wait_finished(&mut t);
     assert_eq!(t.exit_code, Some(7));
@@ -153,15 +171,13 @@ fn managed_launch_makes_the_agent_the_task_leader_under_any_shell() {
         &agent,
         &format!("printf '%s' \"$$\" > '{}'", pid_file.display()),
     );
-    let mut env = env_here();
-    env.retain(|(k, _)| k != "SHELL");
-    env.push(("SHELL".into(), shell.into_os_string()));
+    let env = with_shell(env_here(), shell);
 
     let managed = Exec::Managed {
         binary: agent.clone(),
         args: Vec::new(),
     };
-    let mut t = Task::spawn(1, "agent", managed, &here(), 24, 80, 2000, &env, no_waker()).unwrap();
+    let mut t = spawn_with(1, "agent", managed, &env);
     wait_finished(&mut t);
     assert_eq!(
         read_pid(&pid_file).as_raw() as u32,
@@ -171,18 +187,7 @@ fn managed_launch_makes_the_agent_the_task_leader_under_any_shell() {
 
     std::fs::remove_file(&pid_file).unwrap();
     let typed = format!("'{}'", agent.display());
-    let mut t = Task::spawn(
-        2,
-        &typed,
-        Exec::Literal,
-        &here(),
-        24,
-        80,
-        2000,
-        &env,
-        no_waker(),
-    )
-    .unwrap();
+    let mut t = spawn_with(2, &typed, Exec::Literal, &env);
     wait_finished(&mut t);
     assert_ne!(
         read_pid(&pid_file).as_raw() as u32,
@@ -194,25 +199,13 @@ fn managed_launch_makes_the_agent_the_task_leader_under_any_shell() {
 /// `terminate` reaches live group members after the leader exits.
 #[test]
 fn terminate_reaches_stragglers_after_leader_exit() {
-    use nix::sys::signal::kill;
     let dir = temp("task_straggler");
     let spid = dir.join("spid");
     // `trap '' HUP` first: the ignore is inherited by the `&` child, which
     // must survive its session leader's exit (leader death HUPs the
     // foreground group) to *be* a straggler.
     let cmd = format!("trap '' HUP; sleep 300 & echo $! > {}", spid.display());
-    let mut t = Task::spawn(
-        5,
-        &cmd,
-        Exec::Literal,
-        &here(),
-        24,
-        80,
-        2000,
-        &sh_env(),
-        no_waker(),
-    )
-    .unwrap();
+    let mut t = spawn_sh(5, &cmd);
     wait_finished(&mut t); // leader exits as soon as the background job is up
     let straggler = read_pid(&spid);
     assert!(kill(straggler, None).is_ok(), "straggler should be alive");
@@ -263,7 +256,7 @@ fn viewport_scrolls_and_snaps_live_on_input() {
     let mut t = spawn(9, "cat");
     // Feed enough rows to create scrollback.
     for i in 0..50 {
-        grid(&t.parser).process(format!("line{i}\r\n").as_bytes());
+        t.parser.lock().process(format!("line{i}\r\n").as_bytes());
     }
     assert_eq!(t.scroll_offset(), 0);
     t.scroll_view(ScrollAction::Up(10));
@@ -292,7 +285,7 @@ fn viewport_scrolls_and_snaps_live_on_input() {
 #[test]
 fn screen_lines_yields_one_entry_per_grid_row() {
     let mut t = spawn(60, "sleep 300");
-    grid(&t.parser).process(b"top");
+    t.parser.lock().process(b"top");
     let lines = t.screen_lines();
     // The spawn helper's grid is 24x80.
     assert_eq!(lines.len(), 24, "one entry per grid row");
@@ -309,7 +302,7 @@ fn queued_writes_reach_the_child_in_order() {
     t.send_input(b"zqsecondqz\n".to_vec()).unwrap();
     let mut contents = String::new();
     wait_until(Duration::from_secs(5), || {
-        contents = grid(&t.parser).contents();
+        contents = t.parser.lock().contents();
         contents.contains("zqsecondqz")
     });
     let first = contents
@@ -380,11 +373,11 @@ fn write_error_keeps_draining_the_pending_counter() {
 fn input_hints_track_child_modes() {
     let mut t = spawn(8, "sleep 5");
     assert_eq!(t.input_hints(), (false, false, false));
-    grid(&t.parser).process(b"\x1b[?1000h");
+    t.parser.lock().process(b"\x1b[?1000h");
     assert_eq!(t.input_hints(), (true, false, false));
-    grid(&t.parser).process(b"\x1b[?1000l\x1b[?1049h");
+    t.parser.lock().process(b"\x1b[?1000l\x1b[?1049h");
     assert_eq!(t.input_hints(), (false, true, true));
-    grid(&t.parser).process(b"\x1b[?1007l");
+    t.parser.lock().process(b"\x1b[?1007l");
     assert_eq!(t.input_hints(), (false, true, false));
     t.terminate();
 }
@@ -393,26 +386,8 @@ fn input_hints_track_child_modes() {
 /// finalization waits for reader EOF even after the child exits.
 #[test]
 fn finalize_preview_waits_for_reader_eof() {
-    let cmd = "printf 'test result: ok\\n'";
-    let mut t = Task::spawn(
-        20,
-        cmd,
-        Exec::Literal,
-        &here(),
-        24,
-        80,
-        2000,
-        &sh_env(),
-        no_waker(),
-    )
-    .unwrap();
-    assert!(
-        wait_until(Duration::from_secs(60), || {
-            t.poll_exit().unwrap();
-            t.output_complete()
-        }),
-        "child never exited"
-    );
+    let mut t = spawn_sh(20, "printf 'test result: ok\\n'");
+    wait_complete(&mut t);
 
     // Reopen the reader gate: a thread outliving the child's exit stands in
     // for a reader still working through bytes the grid has not seen.
@@ -425,7 +400,7 @@ fn finalize_preview_waits_for_reader_eof() {
         !t.resolve_preview(Instant::now()).frozen,
         "finalization must wait for reader EOF"
     );
-    grid(&t.parser).process(b"late output\r\n");
+    t.parser.lock().process(b"late output\r\n");
 
     // Dropping the sender ends the stand-in: the reader reached EOF.
     drop(release);
@@ -442,32 +417,14 @@ fn finalize_preview_waits_for_reader_eof() {
 /// no ESU can arrive, so finalization must land the frame before resolving.
 #[test]
 fn finalize_preview_lands_an_open_sync_frame() {
-    let cmd = "printf '\\033[?2026htest result: ok\\n'";
-    let mut t = Task::spawn(
-        21,
-        cmd,
-        Exec::Literal,
-        &here(),
-        24,
-        80,
-        2000,
-        &sh_env(),
-        no_waker(),
-    )
-    .unwrap();
+    let mut t = spawn_sh(21, "printf '\\033[?2026htest result: ok\\n'");
+    wait_complete(&mut t);
     assert!(
-        wait_until(Duration::from_secs(60), || {
-            t.poll_exit().unwrap();
-            t.finished.is_some() && t.reader_done()
-        }),
-        "child never exited"
-    );
-    assert!(
-        !grid(&t.parser).contents().contains("test result: ok"),
+        !t.parser.lock().contents().contains("test result: ok"),
         "premise: the unclosed frame still buffers the final output"
     );
     t.finalize_preview();
-    assert!(grid(&t.parser).contents().contains("test result: ok"));
+    assert!(t.parser.lock().contents().contains("test result: ok"));
     let p = t.resolve_preview(Instant::now());
     assert_eq!((p.text.as_str(), p.frozen), ("test result: ok", true));
 }
@@ -477,36 +434,18 @@ fn finalize_preview_lands_an_open_sync_frame() {
 /// floor.
 #[test]
 fn finalize_preview_freezes_the_final_primary_line() {
-    use crate::protocol::PreviewSource;
     let dir = temp("task_final_primary");
     let flag = dir.join("flag");
     let cmd = format!(
         "until [ -e '{}' ]; do sleep 0.05; done; printf 'test result: ok\\n'",
         flag.display()
     );
-    let mut t = Task::spawn(
-        40,
-        &cmd,
-        Exec::Literal,
-        &here(),
-        24,
-        80,
-        2000,
-        &sh_env(),
-        no_waker(),
-    )
-    .unwrap();
+    let mut t = spawn_sh(40, &cmd);
     // The last live resolution predates every byte of output.
     let early = t.resolve_preview(Instant::now());
     assert!(!early.frozen);
     std::fs::write(&flag, b"").unwrap();
-    assert!(
-        wait_until(Duration::from_secs(60), || {
-            t.poll_exit().unwrap();
-            t.output_complete()
-        }),
-        "child never completed"
-    );
+    wait_complete(&mut t);
     t.finalize_preview();
     let p = t.resolve_preview(Instant::now());
     assert_eq!(
@@ -519,7 +458,6 @@ fn finalize_preview_freezes_the_final_primary_line() {
 /// alternate-screen title when the restored primary floor is unchanged.
 #[test]
 fn finalize_preview_keeps_the_last_render_across_alt_teardown() {
-    use crate::protocol::PreviewSource;
     let dir = temp("task_final_alt");
     let teardown = dir.join("teardown");
     let exit = dir.join("exit");
@@ -531,18 +469,7 @@ fn finalize_preview_keeps_the_last_render_across_alt_teardown() {
         td = teardown.display(),
         ex = exit.display()
     );
-    let mut t = Task::spawn(
-        41,
-        &cmd,
-        Exec::Literal,
-        &here(),
-        24,
-        80,
-        2000,
-        &sh_env(),
-        no_waker(),
-    )
-    .unwrap();
+    let mut t = spawn_sh(41, &cmd);
     assert!(
         wait_until(Duration::from_secs(5), || {
             t.resolve_preview(Instant::now()).source == PreviewSource::Title
@@ -552,7 +479,7 @@ fn finalize_preview_keeps_the_last_render_across_alt_teardown() {
     std::fs::write(&teardown, b"").unwrap();
     assert!(
         wait_until(Duration::from_secs(60), || {
-            !grid(&t.parser).alternate_screen()
+            !t.parser.lock().alternate_screen()
         }),
         "teardown never reached the grid"
     );
@@ -564,16 +491,10 @@ fn finalize_preview_keeps_the_last_render_across_alt_teardown() {
         "premise: the demotion hold keeps the title rendered"
     );
     std::fs::write(&exit, b"").unwrap();
-    assert!(
-        wait_until(Duration::from_secs(60), || {
-            t.poll_exit().unwrap();
-            t.output_complete()
-        }),
-        "child never completed"
-    );
+    wait_complete(&mut t);
     t.finalize_preview();
     assert_eq!(
-        grid(&t.parser).live_floor(),
+        t.parser.lock().live_floor(),
         "prelaunch junk",
         "premise: 1049l restored the pre-launch primary screen"
     );
@@ -589,7 +510,6 @@ fn finalize_preview_keeps_the_last_render_across_alt_teardown() {
 /// hold.
 #[test]
 fn finalize_preview_freezes_primary_output_after_alt_teardown() {
-    use crate::protocol::PreviewSource;
     let dir = temp("task_final_alt_output");
     let flag = dir.join("flag");
     let cmd = format!(
@@ -599,18 +519,7 @@ fn finalize_preview_freezes_primary_output_after_alt_teardown() {
          printf '\\033[?1049ldone\\n'",
         flag.display()
     );
-    let mut t = Task::spawn(
-        43,
-        &cmd,
-        Exec::Literal,
-        &here(),
-        24,
-        80,
-        2000,
-        &sh_env(),
-        no_waker(),
-    )
-    .unwrap();
+    let mut t = spawn_sh(43, &cmd);
     assert!(
         wait_until(Duration::from_secs(5), || {
             t.resolve_preview(Instant::now()).source == PreviewSource::Title
@@ -618,13 +527,7 @@ fn finalize_preview_freezes_primary_output_after_alt_teardown() {
         "title never rendered"
     );
     std::fs::write(&flag, b"").unwrap();
-    assert!(
-        wait_until(Duration::from_secs(60), || {
-            t.poll_exit().unwrap();
-            t.output_complete()
-        }),
-        "child never completed"
-    );
+    wait_complete(&mut t);
     t.finalize_preview();
     let p = t.resolve_preview(Instant::now());
     assert_eq!(
@@ -639,7 +542,6 @@ fn finalize_preview_freezes_primary_output_after_alt_teardown() {
 /// child command is `printf`.
 #[test]
 fn summary_adapter_anchors_live_and_freezes_completion_at_exit() {
-    use crate::protocol::PreviewSource;
     let dir = temp("task_anchor_e2e");
     let flag = dir.join("flag");
     let cmd = format!(
@@ -648,18 +550,7 @@ fn summary_adapter_anchors_live_and_freezes_completion_at_exit() {
          printf '\\033[H\\033[2J• Ran echo ok\\n\\n› \\n  synth-model high · 2 in · 3 out'",
         f = flag.display()
     );
-    let mut t = Task::spawn(
-        42,
-        &cmd,
-        Exec::Literal,
-        &here(),
-        24,
-        80,
-        2000,
-        &sh_env(),
-        no_waker(),
-    )
-    .unwrap();
+    let mut t = spawn_sh(42, &cmd);
     assert!(t.summary_adapter.is_none(), "printf selects nothing");
     t.summary_adapter = crate::harness::select("codex");
     assert!(t.summary_adapter.is_some());
@@ -678,13 +569,7 @@ fn summary_adapter_anchors_live_and_freezes_completion_at_exit() {
     );
 
     std::fs::write(&flag, b"").unwrap();
-    assert!(
-        wait_until(Duration::from_secs(60), || {
-            t.poll_exit().unwrap();
-            t.output_complete()
-        }),
-        "child never completed"
-    );
+    wait_complete(&mut t);
     t.finalize_preview();
     let p = t.resolve_preview(Instant::now());
     assert_eq!(
@@ -715,18 +600,7 @@ fn probe_replies_reach_the_child_through_the_allowlist() {
          head -c 11 > {}",
         out.display()
     );
-    let mut t = Task::spawn(
-        11,
-        &cmd,
-        Exec::Literal,
-        &here(),
-        24,
-        80,
-        2000,
-        &sh_env(),
-        no_waker(),
-    )
-    .unwrap();
+    let mut t = spawn_sh(11, &cmd);
     let mut got = Vec::new();
     wait_until(Duration::from_secs(5), || {
         got = std::fs::read(&out).unwrap_or_default();

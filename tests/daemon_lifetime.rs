@@ -1,22 +1,18 @@
-//! The fleet's lifetime is bounded by the daemon's: SIGKILLing the daemon closes every
-//! PTY master, and the resulting hangup SIGHUPs each task's foreground group. Ordinary
-//! tasks die; only HUP-immune tasks survive, unowned. Verify both cases against the
-//! documented lifetime guarantees.
+//! Test task lifetime after daemon exit. When a SIGKILLed daemon exits, the kernel
+//! closes each PTY master and sends SIGHUP to the task's foreground group. Ordinary
+//! tasks exit; HUP-immune tasks survive without an owner. Verify both outcomes.
 
 mod common;
 
 use std::time::{Duration, Instant};
 
-use nix::{
-    sys::signal::{Signal, kill, killpg},
-    unistd::Pid,
-};
+use nix::sys::signal::{Signal, kill, killpg};
 
 use common::{spawn_task, start_daemon, wait_until};
 
 #[test]
 fn ordinary_tasks_die_with_a_sigkilled_daemon() {
-    let (dir, mut daemon, mut stream) = start_daemon("hup_dies", |_| {});
+    let (dir, daemon, mut stream) = start_daemon("hup_dies", |_| {});
     let pidfile = dir.join("task.pid");
     let task = spawn_task(
         &mut stream,
@@ -26,9 +22,9 @@ fn ordinary_tasks_die_with_a_sigkilled_daemon() {
     );
     assert!(kill(task, None).is_ok(), "task should be alive");
 
-    // SIGKILL: no shutdown path runs; only the fd-close/HUP mechanism remains.
-    kill(Pid::from_raw(daemon.0.id() as i32), Signal::SIGKILL).unwrap();
-    let _ = daemon.0.wait();
+    // Drop the daemon handle to send SIGKILL; this bypasses shutdown. The kernel
+    // closes the PTY master on process exit and sends SIGHUP to the foreground group.
+    drop(daemon);
 
     assert!(
         wait_until(Duration::from_secs(5), || kill(task, None).is_err()),
@@ -38,7 +34,7 @@ fn ordinary_tasks_die_with_a_sigkilled_daemon() {
 
 #[test]
 fn hup_immune_tasks_survive_a_sigkilled_daemon_unowned() {
-    let (dir, mut daemon, mut stream) = start_daemon("hup_immune", |_| {});
+    let (dir, daemon, mut stream) = start_daemon("hup_immune", |_| {});
     let pidfile = dir.join("task.pid");
     // The trap precedes the long sleep, and the fg child inherits the ignore.
     let task = spawn_task(
@@ -49,8 +45,7 @@ fn hup_immune_tasks_survive_a_sigkilled_daemon_unowned() {
     );
     assert!(kill(task, None).is_ok(), "task should be alive");
 
-    kill(Pid::from_raw(daemon.0.id() as i32), Signal::SIGKILL).unwrap();
-    let _ = daemon.0.wait();
+    drop(daemon);
 
     // Survival can't be polled-to-true (it's the absence of death): hold the
     // assertion window open, then check it's still there.

@@ -77,7 +77,7 @@ pub fn pad(s: &str, width: usize) -> String {
 
 /// Return the longest UTF-8 prefix no longer than `max` bytes. Unlike
 /// [`truncate`], this limits bytes rather than display columns.
-pub(crate) fn prefix_bytes(s: &str, max: usize) -> &str {
+pub fn prefix_bytes(s: &str, max: usize) -> &str {
     if s.len() <= max {
         return s;
     }
@@ -90,12 +90,12 @@ pub(crate) fn prefix_bytes(s: &str, max: usize) -> &str {
 
 /// Sort key for human-readable names. Sort by lowercase value, then by exact value to
 /// order case-distinct names deterministically without merging them.
-pub(crate) fn collation_key(name: &str) -> (String, String) {
+pub fn collation_key(name: &str) -> (String, String) {
     (name.to_lowercase(), name.to_string())
 }
 
 /// Convert days since 1970-01-01 to a proleptic Gregorian date.
-pub(crate) fn civil_from_days(days: i64) -> (i64, u32, u32) {
+pub fn civil_from_days(days: i64) -> (i64, u32, u32) {
     let z = days + 719_468;
     let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
     let doe = z - era * 146_097; // [0, 146096]

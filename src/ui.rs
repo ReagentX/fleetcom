@@ -31,40 +31,29 @@ pub fn render(out: &mut impl Write, app: &mut App) -> io::Result<bool> {
     let mut buf: Vec<u8> = Vec::with_capacity(app.cols as usize * app.rows as usize * 3 + 128);
     // DECSET 2026 around the whole frame
     queue!(buf, BeginSynchronizedUpdate)?;
-    match app.mode {
-        Mode::Attached => render_attached(&mut buf, app)?,
-        Mode::Peek => {
-            render_dashboard(&mut buf, app)?;
-            render_peek(&mut buf, app)?;
-        }
-        Mode::PickDir => {
-            render_dashboard(&mut buf, app)?;
-            render_pickdir(&mut buf, app)?;
-        }
-        Mode::PickGroup(_) => {
-            render_dashboard(&mut buf, app)?;
-            render_pickgroup(&mut buf, app)?;
-        }
-        Mode::Find => {
-            render_dashboard(&mut buf, app)?;
-            render_find(&mut buf, app)?;
-        }
-        Mode::Controls => {
-            render_dashboard(&mut buf, app)?;
-            render_controls(&mut buf, app)?;
-        }
-        Mode::LoadSession => {
-            render_dashboard(&mut buf, app)?;
-            render_session_picker(&mut buf, app)?;
-        }
+    // Render `Attached` and `Disconnected` without a dashboard. Start every other mode
+    // from the dashboard and add an overlay where needed. Keep this match exhaustive
+    // so the compiler requires a rendering choice for each new `Mode`.
+    type Layer = fn(&mut Vec<u8>, &App) -> io::Result<()>;
+    let (base, overlay): (Layer, Option<Layer>) = match app.mode {
+        Mode::Attached => (render_attached, None),
+        Mode::Disconnected => (render_disconnected, None),
+        Mode::Peek => (render_dashboard, Some(render_peek)),
+        Mode::PickDir => (render_dashboard, Some(render_pickdir)),
+        Mode::PickGroup(_) => (render_dashboard, Some(render_pickgroup)),
+        Mode::Find => (render_dashboard, Some(render_find)),
+        Mode::Controls => (render_dashboard, Some(render_controls)),
+        Mode::LoadSession => (render_dashboard, Some(render_session_picker)),
         Mode::Spawn if app.spawn_page == SpawnPage::Agent => {
-            render_dashboard(&mut buf, app)?;
-            render_agent_page(&mut buf, app)?;
+            (render_dashboard, Some(render_agent_page))
         }
-        Mode::Disconnected => render_disconnected(&mut buf, app)?,
         Mode::Dashboard | Mode::Spawn | Mode::SaveSession | Mode::Rename(_) => {
-            render_dashboard(&mut buf, app)?
+            (render_dashboard, None)
         }
+    };
+    base(&mut buf, app)?;
+    if let Some(overlay) = overlay {
+        overlay(&mut buf, app)?;
     }
     queue!(buf, EndSynchronizedUpdate)?;
     // Repaint only on change: a stable frame (idle tasks, no input) is a no-op,
@@ -216,7 +205,7 @@ fn render_dashboard(out: &mut impl Write, app: &App) -> io::Result<()> {
     // Keep common actions visible and route the remaining bindings through `?`. In the
     // spawn prompt, use the footer for the Tab hint.
     let footer = match app.mode {
-        Mode::Spawn => spawn_page_hint(app.agents.len()),
+        Mode::Spawn => tab_hint("  enter run", "agents", app.agents.len()),
         _ => dashboard_hint(app.chord_target()),
     };
     dim(out, rows.saturating_sub(1), &footer, cols)?;
@@ -243,13 +232,13 @@ fn transient_line(notice: Option<&str>, status: Option<&str>) -> Option<String> 
     notice.or(status).map(|s| format!("  {s}"))
 }
 
-/// Build the Command-page footer. Include the Agent-page hint only when agents are
-/// installed, as with the Recovery-page hint in the session picker.
-fn spawn_page_hint(agents: usize) -> String {
-    if agents > 0 {
-        format!("  enter run · tab agents ({agents}) · esc")
+/// Build a footer for a page that can switch to a sibling with Tab. Include the
+/// destination name and count only when the destination has entries.
+fn tab_hint(base: &str, page: &str, entries: usize) -> String {
+    if entries > 0 {
+        format!("{base} · tab {page} ({entries}) · esc")
     } else {
-        "  enter run · esc".to_string()
+        format!("{base} · esc")
     }
 }
 
@@ -908,15 +897,6 @@ fn recovery_row(e: &RecoveryEntry) -> String {
     )
 }
 
-/// Include the recovery Tab hint only when snapshots exist.
-fn saved_page_hint(recovery: usize) -> String {
-    if recovery > 0 {
-        format!("↑↓ pick · enter load · tab recovery ({recovery}) · esc")
-    } else {
-        "↑↓ pick · enter load · esc".to_string()
-    }
-}
-
 /// Render the saved-session or recovery page of the session picker.
 fn render_session_picker(out: &mut impl Write, app: &App) -> io::Result<()> {
     // Preformat recovery rows for the recovery page.
@@ -926,7 +906,7 @@ fn render_session_picker(out: &mut impl Write, app: &App) -> io::Result<()> {
             "  load session",
             app.session_names.as_slice(),
             app.session_sel,
-            saved_page_hint(recovery.len()),
+            tab_hint("↑↓ pick · enter load", "recovery", recovery.len()),
             Some("    (no saved sessions)"),
         ),
         SessionPage::Recovery => (
@@ -1114,13 +1094,11 @@ pub fn scroll_window(sel: usize, total: usize, max: usize) -> (usize, usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testutil::rows;
 
     #[test]
     fn selection_overlay_spans_rows_and_rounds_wide_glyphs() {
-        let lines: Vec<String> = ["a日本b", "  mid ", "tail"]
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
+        let lines = rows(&["a日本b", "  mid ", "tail"]);
         // A boundary inside 日 expands to the glyph's first cell; the middle
         // row starts at column 0 and excludes trailing whitespace.
         let mut sel = Selection::begin(0, 2);
@@ -1131,10 +1109,6 @@ mod tests {
         );
         assert!(selection_overlay(None, &lines).is_empty());
         assert!(selection_overlay(Some(&sel), &[]).is_empty());
-    }
-
-    fn rows(spec: &[&str]) -> Vec<String> {
-        spec.iter().map(|s| s.to_string()).collect()
     }
 
     /// A pane-sized grid whose first rows carry `content`, the rest blank.
@@ -1249,12 +1223,15 @@ mod tests {
         }
     }
 
-    /// Include recovery in the saved-page hint only when snapshots exist.
+    /// Add the sibling page's name to the hint only when it has entries.
     #[test]
-    fn saved_page_hint_shows_the_count_only_when_nonzero() {
-        assert_eq!(saved_page_hint(0), "↑↓ pick · enter load · esc");
+    fn tab_hint_shows_the_count_only_when_nonzero() {
         assert_eq!(
-            saved_page_hint(3),
+            tab_hint("↑↓ pick · enter load", "recovery", 0),
+            "↑↓ pick · enter load · esc"
+        );
+        assert_eq!(
+            tab_hint("↑↓ pick · enter load", "recovery", 3),
             "↑↓ pick · enter load · tab recovery (3) · esc"
         );
     }

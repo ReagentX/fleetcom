@@ -1,10 +1,15 @@
 use std::path::Path;
 
+use nix::{
+    sys::signal::{Signal, kill},
+    unistd::Pid,
+};
+
 use super::*;
 use crate::{
-    protocol::{ClipboardKind, Key, Mods},
+    protocol::{ClipboardKind, FLEETCOM_RUNTIME_DIR, Key, Lifecycle, Mods},
     testutil::{
-        Scratch, here, install_fake_notifier, now_ms, read_pid, sh_env, wait_until,
+        Scratch, here, install_fake_notifier, now_ms, read_pid, screen, sh_env, wait_until,
         write_executable,
     },
 };
@@ -55,8 +60,8 @@ fn scrollback_resolution_precedence_clamp_and_fallback() {
     assert_eq!(effective_scrollback(Some(0), Some("500")), 0);
 }
 
-/// The recipe groups commands by dir and preserves spawn order within a dir.
-/// `a`/`c` share the invocation dir; `b` is off in `/tmp`.
+/// Check grouping by directory and preservation of spawn order: `a` and `c`
+/// share the invocation directory; `b` runs in `/tmp`.
 #[test]
 fn session_config_groups_by_dir_in_spawn_order() {
     let mut s = sup(24, 80);
@@ -72,9 +77,8 @@ fn session_config_groups_by_dir_in_spawn_order() {
     assert_eq!(cfg["/tmp"], vec![SessionEntry::literal("b")]);
 }
 
-/// `tick` emits exactly a `Tasks` snapshot while nothing is watched, and
-/// adds a `Screen` for the watched task once `Watch` is set: the contract
-/// the client's render loop depends on.
+/// Verify that `tick` queues only a `Tasks` snapshot when no task is watched,
+/// then queues a `Screen` for the watched task after `Watch`.
 #[test]
 fn tick_emits_snapshot_and_watched_screen() {
     let mut s = sup(24, 80);
@@ -107,8 +111,7 @@ fn tick_emits_snapshot_and_watched_screen() {
     );
 }
 
-/// A watched task whose screen hasn't changed must not re-emit a `Screen`
-/// every tick: the send-on-change that kills idle attach churn.
+/// Verify that the supervisor sends a watched task's screen only after it changes.
 #[test]
 fn watched_screen_not_resent_when_unchanged() {
     let mut s = sup(24, 80);
@@ -117,37 +120,21 @@ fn watched_screen_not_resent_when_unchanged() {
     // stabilizes before we assert nothing changes.
     let mut id = 0;
     for _ in 0..5 {
-        s.tick();
-        for e in s.drain() {
-            if let Event::Tasks(v) = e
-                && let Some(t) = v.first()
-            {
-                id = t.id;
-            }
-        }
+        id = first_id(&mut s);
         std::thread::sleep(Duration::from_millis(20));
     }
-    assert!(id != 0, "task never appeared");
 
-    s.apply(Command::Watch {
-        id: Some(id),
-        attached: true,
-    });
-    s.tick();
+    watch(&mut s, id);
     assert!(
-        s.drain().iter().any(|e| matches!(e, Event::Screen(_))),
+        screen_sent(&mut s),
         "first watched tick sends a full screen"
     );
     // The screen is now stable; further ticks must not re-send it.
-    s.tick();
-    assert!(
-        !s.drain().iter().any(|e| matches!(e, Event::Screen(_))),
-        "unchanged screen must not be resent"
-    );
+    assert!(!screen_sent(&mut s), "unchanged screen must not be resent");
 }
 
-/// A DECSET 1007 change emits a new `Screen` event even when the rendered
-/// contents are unchanged.
+/// Verify that toggling DECSET 1007 queues a `Screen` event even when the
+/// rendered contents do not change.
 #[test]
 fn decset_1007_flip_resends_watched_screen() {
     let dir = scratch("flip_1007");
@@ -162,10 +149,7 @@ fn decset_1007_flip_resends_watched_screen() {
         f = flag.display()
     );
     let id = spawn_ready(&mut s, cmd, here(), &ready);
-    s.apply(Command::Watch {
-        id: Some(id),
-        attached: true,
-    });
+    watch(&mut s, id);
 
     // Wait for the initial alternate-scroll state.
     let open = wait_until(Duration::from_secs(5), || {
@@ -186,8 +170,8 @@ fn decset_1007_flip_resends_watched_screen() {
     assert!(closed, "the ?1007l flip never re-sent the screen");
 }
 
-/// A periodic tick flushes an expired synchronized update from a child
-/// that stops producing output.
+/// Verify that a periodic tick flushes an expired synchronized update after the
+/// child stops producing output.
 #[test]
 fn tick_flushes_a_stalled_sync_update() {
     let mut s = sup(24, 80);
@@ -198,14 +182,7 @@ fn tick_flushes_a_stalled_sync_update() {
     );
     let mut preview = String::new();
     wait_until(Duration::from_secs(5), || {
-        s.tick();
-        for e in s.drain() {
-            if let Event::Tasks(v) = e
-                && let Some(t) = v.first()
-            {
-                preview = t.preview.text.clone();
-            }
-        }
+        preview = snapshot(&mut s)[0].preview.text.clone();
         preview.contains("stalled")
     });
     assert!(
@@ -214,7 +191,7 @@ fn tick_flushes_a_stalled_sync_update() {
     );
 }
 
-/// Stores from the attached task are forwarded in arrival order.
+/// Forward attached-task clipboard stores in arrival order.
 #[test]
 fn watched_task_clipboard_stores_are_forwarded() {
     let dir = scratch("clip_fwd");
@@ -228,10 +205,7 @@ fn watched_task_clipboard_stores_are_forwarded() {
         f = flag.display()
     );
     let id = spawn_ready(&mut s, cmd, here(), &ready);
-    s.apply(Command::Watch {
-        id: Some(id),
-        attached: true,
-    });
+    watch(&mut s, id);
     std::fs::write(&flag, b"").unwrap();
 
     let mut copies = Vec::new();
@@ -265,33 +239,20 @@ fn watch_purges_stores_captured_before_the_watch() {
         "printf '\\033]52;c;c3RhbGU=\\007MARKER'; sleep 30",
         here(),
     );
-    let parsed = wait_until(Duration::from_secs(5), || {
-        s.tasks.first().is_some_and(|t| {
-            let (formatted, _, _) = t.formatted();
-            String::from_utf8_lossy(&formatted).contains("MARKER")
-        })
-    });
-    assert!(parsed, "the marker never reached the grid");
+    assert!(
+        wait_until(Duration::from_secs(5), || grid_shows(&s, "MARKER")),
+        "the marker never reached the grid"
+    );
 
     let id = s.tasks[0].id;
-    s.apply(Command::Watch {
-        id: Some(id),
-        attached: true,
-    });
-    let mut saw_screen = false;
-    for _ in 0..3 {
-        s.tick();
-        for e in s.drain() {
-            match e {
-                Event::ClipboardCopy { .. } => {
-                    panic!("a store captured before the watch must not fire after it")
-                }
-                Event::Screen(_) => saw_screen = true,
-                _ => {}
-            }
-        }
-    }
-    assert!(saw_screen, "watching the task should stream its screen");
+    watch(&mut s, id);
+    assert!(
+        ticks_without_copies(
+            &mut s,
+            "a store captured before the watch must not fire after it"
+        ),
+        "watching the task should stream its screen"
+    );
 }
 
 /// Stores from an unwatched task are discarded instead of deferred.
@@ -329,24 +290,14 @@ fn backgrounded_clipboard_store_is_discarded_not_deferred() {
     s.tick();
     let _ = s.drain();
 
-    s.apply(Command::Watch {
-        id: Some(id),
-        attached: true,
-    });
-    let mut saw_screen = false;
-    for _ in 0..3 {
-        s.tick();
-        for e in s.drain() {
-            match e {
-                Event::ClipboardCopy { .. } => {
-                    panic!("a store buffered while backgrounded must never fire on watch")
-                }
-                Event::Screen(_) => saw_screen = true,
-                _ => {}
-            }
-        }
-    }
-    assert!(saw_screen, "watching the task should stream its screen");
+    watch(&mut s, id);
+    assert!(
+        ticks_without_copies(
+            &mut s,
+            "a store buffered while backgrounded must never fire on watch"
+        ),
+        "watching the task should stream its screen"
+    );
 }
 
 /// Peeked stores are discarded, while stores captured after attachment forward.
@@ -379,52 +330,26 @@ fn peeked_stores_never_forward_and_die_at_the_attach_transition() {
 
     // A store drained during peek is not forwarded.
     std::fs::write(&flag1, b"").unwrap();
-    let parsed = wait_until(Duration::from_secs(5), || {
-        s.tasks.first().is_some_and(|t| {
-            let (formatted, _, _) = t.formatted();
-            String::from_utf8_lossy(&formatted).contains("M1")
-        })
-    });
-    assert!(parsed, "the first marker never reached the grid");
-    let mut saw_screen = false;
-    for _ in 0..3 {
-        s.tick();
-        for e in s.drain() {
-            match e {
-                Event::ClipboardCopy { .. } => {
-                    panic!("a peeked task's store must never forward")
-                }
-                Event::Screen(_) => saw_screen = true,
-                _ => {}
-            }
-        }
-    }
     assert!(
-        saw_screen,
+        wait_until(Duration::from_secs(5), || grid_shows(&s, "M1")),
+        "the first marker never reached the grid"
+    );
+    assert!(
+        ticks_without_copies(&mut s, "a peeked task's store must never forward"),
         "peeking the task should still stream its screen"
     );
 
     // A buffered peek store is discarded when the same task becomes attached.
     std::fs::write(&flag2, b"").unwrap();
-    let parsed = wait_until(Duration::from_secs(5), || {
-        s.tasks.first().is_some_and(|t| {
-            let (formatted, _, _) = t.formatted();
-            String::from_utf8_lossy(&formatted).contains("M2")
-        })
-    });
-    assert!(parsed, "the second marker never reached the grid");
-    s.apply(Command::Watch {
-        id: Some(id),
-        attached: true,
-    });
-    for _ in 0..3 {
-        s.tick();
-        for e in s.drain() {
-            if let Event::ClipboardCopy { .. } = e {
-                panic!("a store captured during peek must not fire after attach")
-            }
-        }
-    }
+    assert!(
+        wait_until(Duration::from_secs(5), || grid_shows(&s, "M2")),
+        "the second marker never reached the grid"
+    );
+    watch(&mut s, id);
+    ticks_without_copies(
+        &mut s,
+        "a store captured during peek must not fire after attach",
+    );
 
     // A store captured after attachment is forwarded.
     std::fs::write(&flag3, b"").unwrap();
@@ -461,10 +386,7 @@ fn oversized_watched_store_yields_notice_and_no_copy() {
         f = flag.display()
     );
     let id = spawn_ready(&mut s, cmd, here(), &ready);
-    s.apply(Command::Watch {
-        id: Some(id),
-        attached: true,
-    });
+    watch(&mut s, id);
     std::fs::write(&flag, b"").unwrap();
 
     let mut notice = None;
@@ -488,14 +410,14 @@ fn oversized_watched_store_yields_notice_and_no_copy() {
     );
 }
 
-/// Scratch dir for tests that sync through marker files.
+/// Create a `sup_<tag>`-prefixed scratch directory for the test's config root,
+/// stub binaries, and marker files.
 fn scratch(tag: &str) -> Scratch {
     crate::testutil::temp(&format!("sup_{tag}"))
 }
 
-/// Spawn `command` and block until it has written `ready`: the sync that
-/// keeps kill-path tests deterministic (no signalling a shell that hasn't
-/// installed its trap yet).
+/// Spawn `command` and wait for its `ready` marker before sending signals or
+/// changing clipboard and DECSET gates.
 fn spawn_ready(s: &mut Supervisor, command: String, cwd: PathBuf, ready: &Path) -> u64 {
     spawn(s, command, cwd);
     assert!(
@@ -505,29 +427,90 @@ fn spawn_ready(s: &mut Supervisor, command: String, cwd: PathBuf, ready: &Path) 
     first_id(s)
 }
 
-/// Tick once and return the first task id from `Tasks`, ignoring other events.
-fn first_id(s: &mut Supervisor) -> u64 {
+/// Tick once and return the `Tasks` snapshot it queues, discarding every
+/// other event.
+fn snapshot(s: &mut Supervisor) -> Vec<TaskView> {
     s.tick();
     s.drain()
-        .iter()
+        .into_iter()
         .find_map(|e| match e {
-            Event::Tasks(v) => Some(v[0].id),
+            Event::Tasks(v) => Some(v),
             _ => None,
         })
         .expect("expected a Tasks snapshot")
 }
 
-/// Tick once and return task `id` from the emitted snapshot.
+/// Tick once and return the first task id from the snapshot.
+fn first_id(s: &mut Supervisor) -> u64 {
+    snapshot(s)[0].id
+}
+
+/// Tick once and return task `id` from the snapshot.
 fn view_of(s: &mut Supervisor, id: u64) -> TaskView {
+    snapshot(s)
+        .into_iter()
+        .find(|t| t.id == id)
+        .unwrap_or_else(|| panic!("task {id} missing from the snapshot"))
+}
+
+/// Tick once and report whether a `Screen` event was queued.
+fn screen_sent(s: &mut Supervisor) -> bool {
     s.tick();
-    for e in s.drain() {
-        if let Event::Tasks(v) = e
-            && let Some(t) = v.iter().find(|t| t.id == id)
-        {
-            return t.clone();
+    s.drain().iter().any(|e| matches!(e, Event::Screen(_)))
+}
+
+/// Apply an attached `Watch` of `id`.
+fn watch(s: &mut Supervisor, id: u64) {
+    s.apply(Command::Watch {
+        id: Some(id),
+        attached: true,
+    });
+}
+
+/// Tick three times, panicking with `why` on any `ClipboardCopy`; report
+/// whether a `Screen` arrived meanwhile.
+fn ticks_without_copies(s: &mut Supervisor, why: &str) -> bool {
+    let mut saw_screen = false;
+    for _ in 0..3 {
+        s.tick();
+        for e in s.drain() {
+            match e {
+                Event::ClipboardCopy { .. } => panic!("{why}"),
+                Event::Screen(_) => saw_screen = true,
+                _ => {}
+            }
         }
     }
-    panic!("task {id} missing from the snapshot");
+    saw_screen
+}
+
+/// Search the first task's formatted grid for `marker`.
+fn grid_shows(s: &Supervisor, marker: &str) -> bool {
+    s.tasks.first().is_some_and(|t| {
+        let (formatted, _, _) = t.formatted();
+        String::from_utf8_lossy(&formatted).contains(marker)
+    })
+}
+
+/// Build a short-grid supervisor with one watched task in retained history.
+/// `seq 1 200` overflows six rows at once.
+fn scrolled_task() -> (Supervisor, u64) {
+    let mut s = sup(6, 80);
+    spawn(&mut s, "seq 1 200; sleep 30", here());
+    let id = first_id(&mut s);
+    watch(&mut s, id);
+    // Retry until output has produced retained history.
+    let scrolled = wait_until(Duration::from_secs(5), || {
+        s.tick();
+        let _ = s.drain();
+        s.apply(Command::Scrollback {
+            id,
+            action: ScrollAction::Up(3),
+        });
+        s.tasks[0].scroll_offset() > 0
+    });
+    assert!(scrolled, "the task never accrued scrollback");
+    (s, id)
 }
 
 /// Launch context with `FLEETCOM_CONFIG_DIR` and optional environment entries.
@@ -543,11 +526,7 @@ fn config_ctx(config: &Path, cwd: PathBuf, extra: &[(&str, &str)]) -> LaunchCont
 }
 
 /// Poll ticks until the task's lifecycle satisfies `pred`, or fail.
-fn wait_for_lifecycle(
-    s: &mut Supervisor,
-    id: u64,
-    pred: impl Fn(crate::protocol::Lifecycle) -> bool,
-) {
+fn wait_for_lifecycle(s: &mut Supervisor, id: u64, pred: impl Fn(Lifecycle) -> bool) {
     let ok = wait_until(Duration::from_secs(5), || {
         s.tick();
         s.drain().iter().any(|e| {
@@ -563,7 +542,6 @@ fn wait_for_lifecycle(
 /// plus the `Ok` lifecycle is proof of TERM-before-KILL.
 #[test]
 fn kill_delivers_term_before_kill() {
-    use crate::protocol::Lifecycle;
     let dir = scratch("term_first");
     let (ready, trapped) = (dir.join("ready"), dir.join("trapped"));
     let mut s = sup(24, 80);
@@ -586,7 +564,6 @@ fn kill_delivers_term_before_kill() {
 /// reap-driven escalation. `Kill` must never leave an immortal task.
 #[test]
 fn term_ignoring_task_escalates_to_kill() {
-    use crate::protocol::Lifecycle;
     let dir = scratch("escalate");
     let ready = dir.join("ready");
     let mut s = sup(24, 80);
@@ -616,12 +593,7 @@ fn shutdown_waits_the_grace_when_tasks_respect_term() {
         t0.elapsed() >= Duration::from_millis(200),
         "shutdown skipped the grace for a TERM-respecting task"
     );
-    s.tick();
-    assert!(
-        s.drain()
-            .iter()
-            .any(|e| matches!(e, Event::Tasks(v) if v.is_empty()))
-    );
+    assert!(snapshot(&mut s).is_empty());
 }
 
 /// A blocked PTY write runs off the core thread, so shutdown remains bounded
@@ -644,12 +616,7 @@ fn shutdown_survives_a_child_that_never_reads_stdin() {
         t0.elapsed() < Duration::from_secs(2),
         "shutdown blocked behind a PTY write to a non-reading child"
     );
-    s.tick();
-    assert!(
-        s.drain()
-            .iter()
-            .any(|e| matches!(e, Event::Tasks(v) if v.is_empty()))
-    );
+    assert!(snapshot(&mut s).is_empty());
 }
 
 /// A message that would exceed the writer-queue limit is refused whole,
@@ -709,12 +676,7 @@ fn shutdown_is_bounded_by_grace() {
         elapsed >= Duration::from_millis(200) && elapsed < Duration::from_secs(1),
         "shutdown took {elapsed:?}: eight tasks must share the 200 ms grace"
     );
-    s.tick();
-    assert!(
-        s.drain()
-            .iter()
-            .any(|e| matches!(e, Event::Tasks(v) if v.is_empty()))
-    );
+    assert!(snapshot(&mut s).is_empty());
 }
 
 /// `clear_watch` (the client-disconnect path) must stop the `Screen` stream
@@ -726,33 +688,21 @@ fn clear_watch_stops_screen_stream_and_resets_dedup() {
     spawn(&mut s, "sleep 30", here());
     let id = first_id(&mut s);
 
-    s.apply(Command::Watch {
-        id: Some(id),
-        attached: true,
-    });
-    s.tick();
-    assert!(
-        s.drain().iter().any(|e| matches!(e, Event::Screen(_))),
-        "watching should stream a Screen"
-    );
+    watch(&mut s, id);
+    assert!(screen_sent(&mut s), "watching should stream a Screen");
 
     // Disconnect: no client is watching anymore.
     s.clear_watch();
-    s.tick();
     assert!(
-        !s.drain().iter().any(|e| matches!(e, Event::Screen(_))),
+        !screen_sent(&mut s),
         "a disconnected client's watch must not keep streaming"
     );
 
     // A new client watching the same task gets a full screen at once, even
     // though the screen bytes haven't changed since the last send.
-    s.apply(Command::Watch {
-        id: Some(id),
-        attached: true,
-    });
-    s.tick();
+    watch(&mut s, id);
     assert!(
-        s.drain().iter().any(|e| matches!(e, Event::Screen(_))),
+        screen_sent(&mut s),
         "re-watch after clear_watch must resend the full screen"
     );
 }
@@ -760,27 +710,7 @@ fn clear_watch_stops_screen_stream_and_resets_dedup() {
 /// `clear_watch` restores the watched task's live viewport.
 #[test]
 fn clear_watch_snaps_the_watched_task_live() {
-    // Use a short grid to build scrollback quickly.
-    let mut s = sup(6, 80);
-    spawn(&mut s, "seq 1 200; sleep 30", here());
-    let id = first_id(&mut s);
-    s.apply(Command::Watch {
-        id: Some(id),
-        attached: true,
-    });
-
-    // Retry until output has produced retained history.
-    let scrolled = wait_until(Duration::from_secs(5), || {
-        s.tick();
-        let _ = s.drain();
-        s.apply(Command::Scrollback {
-            id,
-            action: ScrollAction::Up(3),
-        });
-        s.tasks[0].scroll_offset() > 0
-    });
-    assert!(scrolled, "the task never accrued scrollback");
-
+    let (mut s, _) = scrolled_task();
     s.clear_watch();
     assert_eq!(
         s.tasks[0].scroll_offset(),
@@ -794,7 +724,6 @@ fn clear_watch_snaps_the_watched_task_live() {
 /// gains one line per run).
 #[test]
 fn rerun_replaces_finished_task_in_place() {
-    use crate::protocol::Lifecycle;
     let dir = scratch("rerun");
     let marker = dir.join("marker");
     let mut s = sup(24, 80);
@@ -811,31 +740,16 @@ fn rerun_replaces_finished_task_in_place() {
     wait_for_lifecycle(&mut s, id, |l| l == Lifecycle::Ok);
     let runs = std::fs::read_to_string(&marker).unwrap().lines().count();
     assert_eq!(runs, 2, "rerun must re-execute the command");
-
-    s.tick();
-    let tagged = s
-        .drain()
-        .iter()
-        .any(|e| matches!(e, Event::Tasks(v) if v.iter().any(|t| t.id == id && t.tagged)));
-    assert!(tagged, "rerun must carry the tag over");
+    assert!(view_of(&mut s, id).tagged, "rerun must carry the tag over");
 }
 
-/// Group normalization strips controls, trims whitespace, caps by character,
-/// reserves `Unassigned`, and preserves case.
+/// Check whitespace trimming, exact-case `Unassigned` reservation, and case
+/// preservation for group labels. The label tests cover the remaining rules.
 #[test]
 fn group_names_normalize_at_the_boundary() {
     let n = |s: &str| normalize_group(Some(s.to_string()));
     assert_eq!(normalize_group(None), None);
-    // Controls are removed while printable text remains.
-    assert_eq!(n("\x1b[31mapi\x07"), Some("[31mapi".into()));
     assert_eq!(n("  backend  "), Some("backend".into()));
-    // Control-only names become unassigned.
-    assert_eq!(n(" \t \x1b \x7f \u{9b} "), None);
-    assert_eq!(n(""), None);
-    // The cap counts Unicode scalar values, not UTF-8 bytes.
-    assert_eq!(n(&"\u{e9}".repeat(80)), Some("\u{e9}".repeat(64)));
-    // The cap applies after the trim, so padding spends none of it.
-    assert_eq!(n(&format!("  {}  ", "x".repeat(64))), Some("x".repeat(64)));
     // The reserved section label maps to unassigned.
     assert_eq!(n("Unassigned"), None);
     assert_eq!(n("  Unassigned  "), None);
@@ -958,26 +872,7 @@ fn tag_with_an_unknown_id_leaves_the_live_task_alone() {
 /// Scrolling an unknown id does not change a live task's viewport.
 #[test]
 fn scrollback_with_an_unknown_id_leaves_the_live_task_alone() {
-    // Short grid: history accrues within a few rows of output.
-    let mut s = sup(6, 80);
-    spawn(&mut s, "seq 1 200; sleep 30", here());
-    let id = first_id(&mut s);
-    s.apply(Command::Watch {
-        id: Some(id),
-        attached: true,
-    });
-
-    // Retry until output has produced retained history.
-    let scrolled = wait_until(Duration::from_secs(5), || {
-        s.tick();
-        let _ = s.drain();
-        s.apply(Command::Scrollback {
-            id,
-            action: ScrollAction::Up(3),
-        });
-        s.tasks[0].scroll_offset() > 0
-    });
-    assert!(scrolled, "the task never accrued scrollback");
+    let (mut s, _) = scrolled_task();
     let offset = s.tasks[0].scroll_offset();
 
     s.apply(Command::Scrollback {
@@ -1000,17 +895,12 @@ fn scrollback_with_an_unknown_id_leaves_the_live_task_alone() {
 fn spawn_carries_a_normalized_group_from_birth() {
     let mut s = sup(24, 80);
     spawn_grouped(&mut s, "sleep 30", here(), "  ui\x1b[2J  ");
-    s.tick();
-    match s.drain().iter().find(|e| matches!(e, Event::Tasks(_))) {
-        Some(Event::Tasks(v)) => assert_eq!(v[0].group.as_deref(), Some("ui[2J")),
-        _ => panic!("expected a Tasks snapshot"),
-    }
+    assert_eq!(snapshot(&mut s)[0].group.as_deref(), Some("ui[2J"));
 }
 
 /// Rerun preserves the task's group and tag.
 #[test]
 fn rerun_carries_the_group_over() {
-    use crate::protocol::Lifecycle;
     let mut s = sup(24, 80);
     spawn_grouped(&mut s, "true", here(), "infra");
     let id = first_id(&mut s);
@@ -1018,18 +908,16 @@ fn rerun_carries_the_group_over() {
 
     s.apply(Command::Restart { id });
     wait_for_lifecycle(&mut s, id, |l| l == Lifecycle::Ok);
-    s.tick();
-    let carried = s.drain().iter().any(|e| {
-        matches!(e, Event::Tasks(v)
-                if v.iter().any(|t| t.id == id && t.group.as_deref() == Some("infra")))
-    });
-    assert!(carried, "rerun must carry the group over");
+    assert_eq!(
+        view_of(&mut s, id).group.as_deref(),
+        Some("infra"),
+        "rerun must carry the group over"
+    );
 }
 
 /// Rerun preserves the task's name.
 #[test]
 fn rerun_carries_the_name_over() {
-    use crate::protocol::Lifecycle;
     let mut s = sup(24, 80);
     spawn(&mut s, "true", here());
     let id = first_id(&mut s);
@@ -1041,19 +929,17 @@ fn rerun_carries_the_name_over() {
 
     s.apply(Command::Restart { id });
     wait_for_lifecycle(&mut s, id, |l| l == Lifecycle::Ok);
-    s.tick();
-    let carried = s.drain().iter().any(|e| {
-        matches!(e, Event::Tasks(v)
-                if v.iter().any(|t| t.id == id && t.name.as_deref() == Some("smoke")))
-    });
-    assert!(carried, "rerun must carry the name over");
+    assert_eq!(
+        view_of(&mut s, id).name.as_deref(),
+        Some("smoke"),
+        "rerun must carry the name over"
+    );
 }
 
 /// `Restart` never kills: a running task is refused with a status notice
 /// and keeps running. An unknown id gets a notice too, not a panic.
 #[test]
 fn rerun_refuses_running_task_and_unknown_id() {
-    use crate::protocol::Lifecycle;
     let mut s = sup(24, 80);
     spawn(&mut s, "sleep 30", here());
     let id = first_id(&mut s);
@@ -1065,13 +951,13 @@ fn rerun_refuses_running_task_and_unknown_id() {
             .any(|e| matches!(e, Event::Status(m) if m.contains("still running"))),
         "a running task must be refused"
     );
-    s.tick();
-    let alive = s.drain().iter().any(|e| {
-        matches!(e, Event::Tasks(v) if v.iter().any(
-            |t| t.id == id && matches!(t.lifecycle, Lifecycle::Active | Lifecycle::Idle)
-        ))
-    });
-    assert!(alive, "the refused task must keep running");
+    assert!(
+        matches!(
+            view_of(&mut s, id).lifecycle,
+            Lifecycle::Active | Lifecycle::Idle
+        ),
+        "the refused task must keep running"
+    );
 
     s.apply(Command::Restart { id: 999 });
     assert!(
@@ -1087,26 +973,20 @@ fn rerun_refuses_running_task_and_unknown_id() {
 /// fresh screen would be skipped as "unchanged".
 #[test]
 fn rerun_watched_task_resends_screen() {
-    use crate::protocol::Lifecycle;
     let mut s = sup(24, 80);
     spawn(&mut s, "true", here());
     let id = first_id(&mut s);
     wait_for_lifecycle(&mut s, id, |l| l == Lifecycle::Ok);
 
-    s.apply(Command::Watch {
-        id: Some(id),
-        attached: true,
-    });
-    s.tick();
+    watch(&mut s, id);
     assert!(
-        s.drain().iter().any(|e| matches!(e, Event::Screen(_))),
+        screen_sent(&mut s),
         "first watched tick sends a full screen"
     );
 
     s.apply(Command::Restart { id });
-    s.tick();
     assert!(
-        s.drain().iter().any(|e| matches!(e, Event::Screen(_))),
+        screen_sent(&mut s),
         "rerun of the watched task must resend the screen"
     );
 }
@@ -1208,15 +1088,11 @@ fn worst_case_screen_frame_fits_max_frame() {
     let (formatted, cursor, hide) = ansi::formatted(&term);
     let lines: Vec<String> = ansi::contents(&term).lines().map(str::to_string).collect();
     let (kind, payload) = encode_event(&Event::Screen(ScreenView {
-        id: 1,
         lines,
         formatted,
         cursor,
         hide_cursor: hide,
-        wants_mouse: false,
-        alt_screen: false,
-        alt_scroll: false,
-        scrollback: 0,
+        ..screen(1)
     }));
     assert_eq!(kind, KIND_SCREEN);
 
@@ -1251,26 +1127,34 @@ fn reap_until(
     })
 }
 
-/// Use `/bin/sh` so background-process tests have consistent semantics.
-fn hello_with_sh(s: &mut Supervisor, cwd: PathBuf) {
-    s.set_launch_context(LaunchContext { env: sh_env(), cwd });
+/// Poll `reap` until the supervisor records task `id` as finished, or fail.
+fn wait_exited(s: &mut Supervisor, id: u64) {
+    assert!(
+        reap_until(s, Duration::from_secs(5), |s| {
+            s.tasks.iter().all(|t| t.id != id || t.finished.is_some())
+        }),
+        "task {id} never exited"
+    );
 }
 
-/// `Remove` must sweep group members the exited leader left behind (a
-/// non-interactive shell's `&` child never leaves the group): TERM at
-/// removal, delivered through the graveyard. This is the leak the old
-/// `finished.is_none()` gate guaranteed.
-#[test]
-fn remove_sweeps_stragglers_of_an_exited_leader() {
-    use nix::sys::signal::kill;
-    let dir = scratch("remove_sweep");
+/// Use `/bin/sh` in `dir` so the straggler fixtures use consistent
+/// background-job and trap semantics.
+fn sh_sup(dir: &Path) -> Supervisor {
+    sup_ctx(LaunchContext {
+        env: sh_env(),
+        cwd: dir.to_path_buf(),
+    })
+}
+
+/// Run `script` as a background job and wait for the task leader to exit.
+/// Return the task ID and the job PID read from `$!`. Start `script` with a
+/// `trap` that ignores the signal the child must inherit to outlive its leader.
+fn exited_leader_with_straggler(s: &mut Supervisor, dir: &Path, script: &str) -> (u64, Pid) {
     let (spid, ready) = (dir.join("spid"), dir.join("ready"));
-    let mut s = sup(24, 80);
-    hello_with_sh(&mut s, dir.to_path_buf());
     let id = spawn_ready(
-        &mut s,
+        s,
         format!(
-            "trap '' HUP; sleep 300 & echo $! > {sp}; echo r > {r}",
+            "{script} & echo $! > {sp}; echo r > {r}",
             sp = spid.display(),
             r = ready.display()
         ),
@@ -1278,10 +1162,19 @@ fn remove_sweeps_stragglers_of_an_exited_leader() {
         &ready,
     );
     let straggler = read_pid(&spid);
+    wait_exited(s, id);
+    (id, straggler)
+}
+
+/// Verify that `Remove` sends TERM through the graveyard to every group member
+/// the exited leader left behind. The `&` child stays in the shell's process group;
+/// the old `finished.is_none()` guard leaked it.
+#[test]
+fn remove_sweeps_stragglers_of_an_exited_leader() {
+    let dir = scratch("remove_sweep");
+    let mut s = sh_sup(&dir);
     // The leader exits on its own; the straggler stays.
-    assert!(reap_until(&mut s, Duration::from_secs(5), |s| {
-        s.tasks.iter().all(|t| t.id != id || t.finished.is_some())
-    }));
+    let (id, straggler) = exited_leader_with_straggler(&mut s, &dir, "trap '' HUP; sleep 300");
     assert!(kill(straggler, None).is_ok(), "straggler should be alive");
 
     s.apply(Command::Remove { id });
@@ -1302,25 +1195,9 @@ fn remove_sweeps_stragglers_of_an_exited_leader() {
 /// (same id) is already up.
 #[test]
 fn rerun_sweeps_stragglers_of_the_old_run() {
-    use nix::sys::signal::kill;
     let dir = scratch("rerun_sweep");
-    let (spid, ready) = (dir.join("spid"), dir.join("ready"));
-    let mut s = sup(24, 80);
-    hello_with_sh(&mut s, dir.to_path_buf());
-    let id = spawn_ready(
-        &mut s,
-        format!(
-            "trap '' HUP; sleep 300 & echo $! > {sp}; echo r > {r}",
-            sp = spid.display(),
-            r = ready.display()
-        ),
-        dir.to_path_buf(),
-        &ready,
-    );
-    let old_straggler = read_pid(&spid);
-    assert!(reap_until(&mut s, Duration::from_secs(5), |s| {
-        s.tasks.iter().all(|t| t.id != id || t.finished.is_some())
-    }));
+    let mut s = sh_sup(&dir);
+    let (id, old_straggler) = exited_leader_with_straggler(&mut s, &dir, "trap '' HUP; sleep 300");
     assert!(kill(old_straggler, None).is_ok());
 
     // The rerun overwrites the pid file with the *new* run's straggler.
@@ -1343,29 +1220,14 @@ fn rerun_sweeps_stragglers_of_the_old_run() {
 /// exact case a `finished.is_none()` gate silently no-ops.
 #[test]
 fn kill_escalation_reaches_term_ignoring_straggler_after_leader_exit() {
-    use nix::sys::signal::kill;
     let dir = scratch("kill_escalate_straggler");
-    let (spid, ready) = (dir.join("spid"), dir.join("ready"));
-    let mut s = sup(24, 80);
+    let mut s = sh_sup(&dir);
     s.set_kill_grace(Duration::from_millis(150));
-    hello_with_sh(&mut s, dir.to_path_buf());
     // The leader ignores HUP (inherited by the `&` child, so it survives
     // the leader's exit); the subshell ignores TERM, then execs sleep,
     // which inherits both. Only the KILL can end it.
-    let id = spawn_ready(
-        &mut s,
-        format!(
-            "trap '' HUP; (trap '' TERM; exec sleep 300) & echo $! > {sp}; echo r > {r}",
-            sp = spid.display(),
-            r = ready.display()
-        ),
-        dir.to_path_buf(),
-        &ready,
-    );
-    let straggler = read_pid(&spid);
-    assert!(reap_until(&mut s, Duration::from_secs(5), |s| {
-        s.tasks.iter().all(|t| t.id != id || t.finished.is_some())
-    }));
+    let (id, straggler) =
+        exited_leader_with_straggler(&mut s, &dir, "trap '' HUP; (trap '' TERM; exec sleep 300)");
 
     s.apply(Command::Kill { id }); // TERM: ignored by the straggler
     assert!(
@@ -1378,27 +1240,11 @@ fn kill_escalation_reaches_term_ignoring_straggler_after_leader_exit() {
 /// Shutdown after removal preserves the removed task's TERM grace.
 #[test]
 fn shutdown_waits_for_graveyard_grace() {
-    use nix::sys::signal::{Signal, kill};
     let dir = scratch("shutdown_graveyard");
-    let (spid, ready) = (dir.join("spid"), dir.join("ready"));
-    let mut s = sup(24, 80);
+    let mut s = sh_sup(&dir);
     s.set_kill_grace(Duration::from_millis(400));
-    hello_with_sh(&mut s, dir.to_path_buf());
     // The background process ignores HUP and TERM.
-    let id = spawn_ready(
-        &mut s,
-        format!(
-            "trap '' HUP TERM; sleep 300 & echo $! > {sp}; echo r > {r}",
-            sp = spid.display(),
-            r = ready.display()
-        ),
-        dir.to_path_buf(),
-        &ready,
-    );
-    let straggler = read_pid(&spid);
-    assert!(reap_until(&mut s, Duration::from_secs(5), |s| {
-        s.tasks.iter().all(|t| t.id != id || t.finished.is_some())
-    }));
+    let (id, straggler) = exited_leader_with_straggler(&mut s, &dir, "trap '' HUP TERM; sleep 300");
 
     s.apply(Command::Remove { id }); // graveyard: TERM sent, grace running
     // Check that the background process remains alive during the grace.
@@ -1424,26 +1270,10 @@ fn shutdown_waits_for_graveyard_grace() {
 /// process-group ID before escalation.
 #[test]
 fn shutdown_holds_the_grace_for_members_of_an_exited_leader() {
-    use nix::sys::signal::{Signal, kill};
     let dir = scratch("shutdown_leaderless");
-    let (spid, ready) = (dir.join("spid"), dir.join("ready"));
-    let mut s = sup(24, 80);
+    let mut s = sh_sup(&dir);
     s.set_kill_grace(Duration::from_millis(400));
-    hello_with_sh(&mut s, dir.to_path_buf());
-    let id = spawn_ready(
-        &mut s,
-        format!(
-            "trap '' HUP TERM; sleep 300 & echo $! > {sp}; echo r > {r}",
-            sp = spid.display(),
-            r = ready.display()
-        ),
-        dir.to_path_buf(),
-        &ready,
-    );
-    let straggler = read_pid(&spid);
-    assert!(reap_until(&mut s, Duration::from_secs(5), |s| {
-        s.tasks.iter().all(|t| t.id != id || t.finished.is_some())
-    }));
+    let (_, straggler) = exited_leader_with_straggler(&mut s, &dir, "trap '' HUP TERM; sleep 300");
     assert!(kill(straggler, None).is_ok(), "straggler should be alive");
 
     let alive_mid_grace = std::thread::spawn(move || {
@@ -1567,15 +1397,7 @@ fn load_session_restores_saved_groups_and_names() {
     fresh.apply(Command::LoadSession {
         name: "fleet".into(),
     });
-    fresh.tick();
-    let evs = fresh.drain();
-    let tasks = evs
-        .iter()
-        .find_map(|e| match e {
-            Event::Tasks(v) => Some(v),
-            _ => None,
-        })
-        .expect("a Tasks snapshot after load");
+    let tasks = snapshot(&mut fresh);
     let by_cmd = |cmd: &str| {
         let t = tasks
             .iter()
@@ -1613,16 +1435,12 @@ fn load_session_renormalizes_hand_edited_groups() {
     s.apply(Command::LoadSession {
         name: "edited".into(),
     });
-    s.tick();
-    let evs = s.drain();
-    let restored = evs.iter().any(|e| {
-        matches!(e, Event::Tasks(v)
-                if v.iter().any(|t| t.group.as_deref() == Some("x")
-                    && t.name.as_deref() == Some("y")))
-    });
+    let tasks = snapshot(&mut s);
     assert!(
-        restored,
-        "loaded group and name must come back normalized; got {evs:?}"
+        tasks
+            .iter()
+            .any(|t| t.group.as_deref() == Some("x") && t.name.as_deref() == Some("y")),
+        "loaded group and name must come back normalized; got {tasks:?}"
     );
 }
 
@@ -1743,11 +1561,8 @@ fn load_reports_admit_failures_not_clean_success() {
                 if m.contains("2 failed to spawn") && !m.contains("task(s)"))),
         "failed spawns must be reported, never folded into success; got {evs:?}"
     );
-    s.tick();
     assert!(
-        s.drain()
-            .iter()
-            .any(|e| matches!(e, Event::Tasks(v) if v.is_empty())),
+        snapshot(&mut s).is_empty(),
         "no task may exist when every spawn failed"
     );
 }
@@ -1774,18 +1589,6 @@ fn spawn_acks_with_spawned_before_the_snapshot() {
     };
     assert_eq!(v.len(), 1);
     assert_eq!(*id, v[0].id, "the ack must name the admitted task");
-}
-
-/// A command-length refusal emits no `Spawned` event.
-#[test]
-fn refused_spawn_emits_no_spawned() {
-    let mut s = sup(24, 80);
-    spawn(&mut s, "x".repeat(MAX_COMMAND_LEN + 1), here());
-    let evs = s.drain();
-    assert!(
-        !evs.iter().any(|e| matches!(e, Event::Spawned { .. })),
-        "a refused spawn must not ack; got {evs:?}"
-    );
 }
 
 /// Session loads admit tasks without emitting `Spawned` events.
@@ -1816,22 +1619,24 @@ fn session_load_emits_no_spawned() {
     );
 }
 
-/// Direct spawns reject commands above `MAX_COMMAND_LEN` without creating a task.
+/// Verify that direct spawns refuse commands over `MAX_COMMAND_LEN` with a
+/// notice, no `Spawned` acknowledgment, and no task.
 #[test]
 fn spawn_refuses_over_length_command() {
     let mut s = sup(24, 80);
     spawn(&mut s, "x".repeat(MAX_COMMAND_LEN + 1), here());
+    let evs = s.drain();
     assert!(
-        s.drain()
-            .iter()
+        evs.iter()
             .any(|e| matches!(e, Event::Status(m) if m.contains("command too long"))),
         "an over-length spawn must be refused with a notice"
     );
-    s.tick();
     assert!(
-        s.drain()
-            .iter()
-            .any(|e| matches!(e, Event::Tasks(v) if v.is_empty())),
+        !evs.iter().any(|e| matches!(e, Event::Spawned { .. })),
+        "a refused spawn must not ack; got {evs:?}"
+    );
+    assert!(
+        snapshot(&mut s).is_empty(),
         "no task may exist after a refused spawn"
     );
 }
@@ -1901,11 +1706,8 @@ fn launch_without_context_is_refused() {
             .any(|e| matches!(e, Event::Status(m) if m.contains("no launch context"))),
         "context-less spawn must be refused with a status notice"
     );
-    s.tick();
     assert!(
-        s.drain()
-            .iter()
-            .any(|e| matches!(e, Event::Tasks(v) if v.is_empty())),
+        snapshot(&mut s).is_empty(),
         "no task may exist after a refused spawn"
     );
 
@@ -1923,8 +1725,7 @@ fn launch_without_context_is_refused() {
 fn key_command_encodes_against_live_cursor_mode() {
     let dir = scratch("key_live_mode");
     let (ready, out) = (dir.join("ready"), dir.join("out"));
-    let mut s = sup(24, 80);
-    hello_with_sh(&mut s, dir.to_path_buf());
+    let mut s = sh_sup(&dir);
 
     // Raw mode lets `cat` receive ESC-prefixed keys without a newline. The
     // child enables DECCKM before alternate-screen mode, so observing the
@@ -2142,18 +1943,13 @@ fn launch_context_install_discovers_agents_in_registry_order() {
 fn spawn_agent_admits_a_managed_task() {
     let dir = scratch("spawn_agent");
     let bin = dir.join("bin");
-    std::fs::create_dir_all(&bin).unwrap();
-    let rec = dir.join("argv");
-    write_executable(
-        &bin.join("claude"),
-        &format!("printf '%s\\n' \"$@\" > '{}'", rec.display()),
-    );
+    install_fake_notifier(&bin.join("claude"), &dir.join("argv"));
     // Keep capture assets and the registry read inside the scratch tree.
     let mut s = sup_ctx(LaunchContext {
         env: vec![
             ("PATH".into(), bin.as_os_str().to_os_string()),
             (
-                path::FLEETCOM_RUNTIME_DIR.into(),
+                FLEETCOM_RUNTIME_DIR.into(),
                 dir.join("run").into_os_string(),
             ),
             (
@@ -2175,15 +1971,6 @@ fn spawn_agent_admits_a_managed_task() {
     assert!(v.managed, "a SpawnAgent task must report managed");
     assert_eq!(v.command, "claude", "the row shows the program word");
     assert_eq!(v.group.as_deref(), Some("agents"));
-    assert!(
-        wait_until(Duration::from_secs(5), || rec.exists()),
-        "the stub never ran"
-    );
-    let argv = std::fs::read_to_string(&rec).unwrap();
-    assert!(
-        argv.lines().any(|l| l == "--session-id"),
-        "the launch must carry the harness argv: {argv:?}"
-    );
 
     spawn(&mut s, "claude", dir.to_path_buf());
     let literal = spawned_id(&mut s);
@@ -2195,14 +1982,11 @@ fn spawn_agent_admits_a_managed_task() {
 
 /// Tick once and return the flagship ids from the snapshot.
 fn flagship_ids(s: &mut Supervisor) -> Vec<u64> {
-    s.tick();
-    s.drain()
+    snapshot(s)
         .iter()
-        .find_map(|e| match e {
-            Event::Tasks(v) => Some(v.iter().filter(|t| t.flagship).map(|t| t.id).collect()),
-            _ => None,
-        })
-        .expect("expected a Tasks snapshot")
+        .filter(|t| t.flagship)
+        .map(|t| t.id)
+        .collect()
 }
 
 /// Take the id from the `Spawned` acknowledgement without calling `tick` or `reap`.
@@ -2275,7 +2059,7 @@ fn flagship_on_finished_task_never_surfaces() {
     let mut s = sup(24, 80);
     spawn(&mut s, "true", here());
     let id = spawned_id(&mut s);
-    wait_for_lifecycle(&mut s, id, |l| l == crate::protocol::Lifecycle::Ok);
+    wait_for_lifecycle(&mut s, id, |l| l == Lifecycle::Ok);
 
     s.apply(Command::Flagship { id: Some(id) });
     assert!(!view_of(&mut s, id).flagship);
@@ -2288,7 +2072,6 @@ fn flagship_on_finished_task_never_surfaces() {
 /// for the marker file.
 #[test]
 fn rerun_clears_flagship() {
-    use crate::protocol::Lifecycle;
     let dir = scratch("rerun_flagship");
     let marker = dir.join("ran");
     let mut s = sup(24, 80);
@@ -2578,12 +2361,9 @@ fn recovery_write_failure_notices_once_and_keeps_supervising() {
         std::thread::sleep(Duration::from_millis(10));
     }
     assert_eq!(notices, 1, "persistent failure must notice exactly once");
-
-    s.tick();
-    assert!(
-        s.drain()
-            .iter()
-            .any(|e| matches!(e, Event::Tasks(v) if v.len() == 1)),
+    assert_eq!(
+        snapshot(&mut s).len(),
+        1,
         "a failing writer must never disturb supervision"
     );
 }

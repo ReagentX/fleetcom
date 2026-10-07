@@ -14,6 +14,7 @@ use alacritty_terminal::{
     term::{
         Config, TermMode,
         cell::{Cell, Flags},
+        test::TermSize,
     },
     vte::ansi::{self as vt, Handler, Processor},
 };
@@ -21,6 +22,7 @@ use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
 
 use crate::{
     format::prefix_bytes,
+    preview::ScreenFacts,
     protocol::{ClipboardKind, ScrollAction},
 };
 
@@ -42,7 +44,7 @@ pub enum MouseProtocolEncoding {
 }
 
 /// Maximum decoded size of one buffered OSC 52 clipboard payload.
-pub(crate) const CLIPBOARD_STORE_MAX_BYTES: usize = 1024 * 1024;
+pub const CLIPBOARD_STORE_MAX_BYTES: usize = 1024 * 1024;
 
 // A maximum-size store leaves the daemon base64-encoded in one `Event::ClipboardCopy` frame.
 const _: () = assert!(
@@ -61,7 +63,7 @@ pub struct ClipboardStores {
 
 /// Buffers backend-generated PTY responses while the parser advances. Other
 /// events are discarded; [`ObservedTerm`] captures titles and clipboard stores.
-pub struct ProbeSink {
+struct ProbeSink {
     responses: Arc<Mutex<Vec<String>>>,
 }
 
@@ -74,26 +76,6 @@ impl EventListener for ProbeSink {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             buf.push(text);
         }
-    }
-}
-
-/// Terminal dimensions supplied to `Term::new` and `Term::resize`.
-struct GridSize {
-    lines: usize,
-    columns: usize,
-}
-
-impl Dimensions for GridSize {
-    fn total_lines(&self) -> usize {
-        self.lines
-    }
-
-    fn screen_lines(&self) -> usize {
-        self.lines
-    }
-
-    fn columns(&self) -> usize {
-        self.columns
     }
 }
 
@@ -199,9 +181,8 @@ pub struct Emulator {
     responses: Arc<Mutex<Vec<String>>>,
     /// OSC 52 stores captured since the last drain.
     clipboard: ClipboardStores,
-    /// Alt-screen and title facts, advanced at parser-event granularity by
-    /// [`ObservedTerm`] during the parse itself.
-    alt: AltScreen,
+    /// Have [`ObservedTerm`] update title state for each parser event.
+    alt_title: AltTitleState,
     /// Bumped once per grid advance; cheap change detection for consumers
     /// that poll the grid.
     revision: u64,
@@ -213,7 +194,7 @@ impl Emulator {
     /// Drain buffered `PtyWrite` responses through the allowlist, preserving
     /// generation order. Runs after `advance`/`stop_sync` returns, outside
     /// the listener callback.
-    fn drain_allowed(&mut self) -> Vec<String> {
+    fn drain_allowed(&self) -> Vec<String> {
         let mut buf = self
             .responses
             .lock()
@@ -277,10 +258,7 @@ impl Emulator {
         };
         let term = Term::new(
             config,
-            &GridSize {
-                lines: rows as usize,
-                columns: cols as usize,
-            },
+            &TermSize::new(cols as usize, rows as usize),
             ProbeSink {
                 responses: Arc::clone(&responses),
             },
@@ -290,7 +268,7 @@ impl Emulator {
             parser: Processor::new(),
             responses,
             clipboard: ClipboardStores::default(),
-            alt: AltScreen::default(),
+            alt_title: AltTitleState::default(),
             revision: 0,
             bytes_since_sweep: 0,
         }
@@ -302,7 +280,7 @@ impl Emulator {
     pub fn process(&mut self, bytes: &[u8]) -> Vec<String> {
         let mut observed = ObservedTerm {
             term: &mut self.term,
-            alt: &mut self.alt,
+            alt_title: &mut self.alt_title,
             clipboard: &mut self.clipboard,
         };
         self.parser.advance(&mut observed, bytes);
@@ -319,7 +297,7 @@ impl Emulator {
     fn land_sync_frame(&mut self) -> Vec<String> {
         let mut observed = ObservedTerm {
             term: &mut self.term,
-            alt: &mut self.alt,
+            alt_title: &mut self.alt_title,
             clipboard: &mut self.clipboard,
         };
         self.parser.stop_sync(&mut observed);
@@ -443,16 +421,14 @@ impl Emulator {
         // Re-snapshot an unchanged restored floor after reflow. A floor that
         // already differs records primary output after the alt-screen exit.
         let untouched = self
-            .alt
+            .alt_title
             .leave_floor
             .as_deref()
             .is_some_and(|snapshot| live_floor_of(&self.term) == snapshot);
-        self.term.resize(GridSize {
-            lines: rows as usize,
-            columns: cols as usize,
-        });
+        self.term
+            .resize(TermSize::new(cols as usize, rows as usize));
         if untouched {
-            self.alt.leave_floor = Some(live_floor_of(&self.term));
+            self.alt_title.leave_floor = Some(live_floor_of(&self.term));
         }
         // Reflow changes grid contents without parser input, so cached screen
         // facts must be invalidated.
@@ -467,74 +443,68 @@ impl Emulator {
             self.term.grid().columns() as u16,
         )
     }
-}
-
-/// Capture accessors for the dashboard-preview resolution layer
-/// (`crate::preview`).
-impl Emulator {
-    /// Monotonic count of grid advances: incremented on every `process` call,
-    /// each sync-frame landing, and `resize`. If unchanged between polls,
-    /// skip re-reading the grid.
-    pub fn revision(&self) -> u64 {
-        self.revision
-    }
 
     /// Count of alt-screen entries observed so far. Production consults the
     /// epoch only inside this module (title stamping and `title`'s currency
     /// filter); the accessor exists for tests.
     #[cfg(test)]
     pub fn alt_epoch(&self) -> u64 {
-        self.alt.epoch
+        self.alt_title.epoch
+    }
+}
+
+impl ScreenFacts for Emulator {
+    /// Read the revision counter. `process`, sync-frame landings, and `resize`
+    /// each increment it.
+    fn revision(&self) -> u64 {
+        self.revision
     }
 
-    /// The live floor captured at the most recent alt-screen exit, or `None`
-    /// before the first exit.
-    pub fn alt_leave_floor(&self) -> Option<&str> {
-        self.alt.leave_floor.as_deref()
+    fn alternate_screen(&self) -> bool {
+        Self::alternate_screen(self)
     }
 
-    /// The window title. On the alternate screen: the captured title, honored only
-    /// while its alt-screen epoch is current; a title from a previous alt session reads
-    /// as `None`. On the primary screen: a live staged announce (a title still staged
-    /// because no printable output has been parsed) surfaces first, then a
-    /// still-current captured title.
-    pub fn title(&self) -> Option<&str> {
+    /// On the alternate screen, return a captured title only while its epoch is
+    /// current. Return `None` for titles from earlier alt sessions. On the
+    /// primary screen, return a staged title until the parser handles printable
+    /// output; otherwise return the current captured title.
+    fn title(&self) -> Option<&str> {
         // Surface a staged primary-screen title until printable output is parsed or the
         // alternate screen is entered.
         if !self.alternate_screen()
-            && let Some(staged) = self.alt.staged_title.as_deref()
+            && let Some(staged) = self.alt_title.staged_title.as_deref()
         {
             return Some(staged);
         }
-        self.alt
+        self.alt_title
             .title
             .as_ref()
-            .filter(|t| t.alt_epoch == self.alt.epoch)
+            .filter(|t| t.alt_epoch == self.alt_title.epoch)
             .map(|t| t.text.as_str())
     }
 
-    /// Last sanitized primary-screen title. Printable output and
-    /// alternate-screen transitions do not clear it; an empty title or RIS
-    /// does.
-    pub fn primary_title(&self) -> Option<&str> {
-        self.alt.primary_title.as_deref()
+    fn primary_title(&self) -> Option<&str> {
+        self.alt_title.primary_title.as_deref()
     }
 
     /// The last non-blank row of the live screen, trailing padding trimmed;
     /// empty when the screen is blank. Ignores the scrollback view offset:
     /// `contents` follows `display_offset`, which would make a scrolled-back
     /// task preview historical rows instead of live output.
-    pub fn live_floor(&self) -> String {
+    fn live_floor(&self) -> String {
         live_floor_of(&self.term)
     }
 
-    /// Every live-viewport row, top to bottom, trailing padding trimmed: the
-    /// summary adapters' structural scan input. Ignores the scrollback view
-    /// offset for the same reason as [`Emulator::live_floor`].
-    pub fn live_rows(&self) -> Vec<String> {
+    /// Return each live-viewport row from top to bottom with trailing padding
+    /// removed. Ignore the scrollback offset so summary adapters scan live output.
+    fn live_rows(&self) -> Vec<String> {
         (0..self.term.grid().screen_lines() as i32)
             .map(|row| live_row_text_of(&self.term, row))
             .collect()
+    }
+
+    fn alt_leave_floor(&self) -> Option<&str> {
+        self.alt_title.leave_floor.as_deref()
     }
 }
 
@@ -578,11 +548,11 @@ fn live_row_text_of(term: &Term<ProbeSink>, row: i32) -> String {
     text
 }
 
-/// Alternate-screen and title state updated at parser-event boundaries. Each nonempty
-/// sanitized primary-screen title is retained and staged. On alternate-screen entry,
-/// consume the staged copy unless already discarded on printable output.
+/// Update title state at parser-event boundaries. Retain and stage each nonempty
+/// sanitized primary-screen title. On alternate-screen entry, promote the staged
+/// title unless the parser has already cleared it after printable output.
 #[derive(Default)]
-struct AltScreen {
+struct AltTitleState {
     /// Count of alt-screen entries. Compared against
     /// `CapturedTitle::alt_epoch` to expire titles at app boundaries.
     epoch: u64,
@@ -608,7 +578,7 @@ struct AltScreen {
     title_stack: Vec<Option<String>>,
 }
 
-/// Capacity of the backend title stack mirrored by [`AltScreen::title_stack`].
+/// Match the backend title-stack capacity in [`AltTitleState::title_stack`].
 const TITLE_STACK_SHADOW_MAX: usize = 4096;
 
 /// Delegating [`Handler`] that forwards every parser event to the wrapped
@@ -630,7 +600,7 @@ const TITLE_STACK_SHADOW_MAX: usize = 4096;
 /// before buffered updates are applied.
 struct ObservedTerm<'a> {
     term: &'a mut Term<ProbeSink>,
-    alt: &'a mut AltScreen,
+    alt_title: &'a mut AltTitleState,
     clipboard: &'a mut ClipboardStores,
 }
 
@@ -642,18 +612,18 @@ impl ObservedTerm<'_> {
     fn observe_alt(&mut self, was: bool) {
         let alt = self.term.mode().contains(TermMode::ALT_SCREEN);
         if alt && !was {
-            self.alt.epoch += 1;
+            self.alt_title.epoch += 1;
             // Promote a staged primary-screen announce into the new epoch: consume the
             // staged copy so it cannot be reused for another entry.
-            if let Some(text) = self.alt.staged_title.take() {
-                self.alt.title = Some(CapturedTitle {
+            if let Some(text) = self.alt_title.staged_title.take() {
+                self.alt_title.title = Some(CapturedTitle {
                     text,
-                    alt_epoch: self.alt.epoch,
+                    alt_epoch: self.alt_title.epoch,
                 });
             }
         }
         if !alt && was {
-            self.alt.leave_floor = Some(live_floor_of(self.term));
+            self.alt_title.leave_floor = Some(live_floor_of(self.term));
         }
     }
 
@@ -662,24 +632,24 @@ impl ObservedTerm<'_> {
     /// titles on an empty title. Discard a staged title on printable output, but retain
     /// it across control traffic.
     fn observe_title(&mut self, title: Option<String>) {
-        self.alt.raw_title.clone_from(&title);
+        self.alt_title.raw_title.clone_from(&title);
         let text = title
             .map(|raw| sanitize_title(&raw))
             .filter(|text| !text.is_empty());
         let Some(text) = text else {
-            self.alt.title = None;
-            self.alt.staged_title = None;
-            self.alt.primary_title = None;
+            self.alt_title.title = None;
+            self.alt_title.staged_title = None;
+            self.alt_title.primary_title = None;
             return;
         };
         if self.term.mode().contains(TermMode::ALT_SCREEN) {
-            self.alt.title = Some(CapturedTitle {
+            self.alt_title.title = Some(CapturedTitle {
                 text,
-                alt_epoch: self.alt.epoch,
+                alt_epoch: self.alt_title.epoch,
             });
         } else {
-            self.alt.staged_title = Some(text.clone());
-            self.alt.primary_title = Some(text);
+            self.alt_title.staged_title = Some(text.clone());
+            self.alt_title.primary_title = Some(text);
         }
     }
 }
@@ -713,7 +683,7 @@ impl Handler for ObservedTerm<'_> {
     fn input(&mut self, a0: char) {
         self.term.input(a0);
         // Discard a staged primary-screen title on printable output.
-        self.alt.staged_title = None;
+        self.alt_title.staged_title = None;
     }
     delegate! {
         goto(a0: i32, a1: usize);
@@ -757,10 +727,10 @@ impl Handler for ObservedTerm<'_> {
         self.observe_alt(was);
         // RIS clears the backend title and title stack without separate
         // handler events. The captured title remains epoch-gated.
-        self.alt.raw_title = None;
-        self.alt.title_stack.clear();
-        self.alt.staged_title = None;
-        self.alt.primary_title = None;
+        self.alt_title.raw_title = None;
+        self.alt_title.title_stack.clear();
+        self.alt_title.staged_title = None;
+        self.alt_title.primary_title = None;
     }
     delegate! {
         reverse_index();
@@ -817,16 +787,18 @@ impl Handler for ObservedTerm<'_> {
     fn push_title(&mut self) {
         self.term.push_title();
         // Mirror the backend's bounded push of its current raw title.
-        if self.alt.title_stack.len() >= TITLE_STACK_SHADOW_MAX {
-            self.alt.title_stack.remove(0);
+        if self.alt_title.title_stack.len() >= TITLE_STACK_SHADOW_MAX {
+            self.alt_title.title_stack.remove(0);
         }
-        self.alt.title_stack.push(self.alt.raw_title.clone());
+        self.alt_title
+            .title_stack
+            .push(self.alt_title.raw_title.clone());
     }
     fn pop_title(&mut self) {
         self.term.pop_title();
         // Replay the pop against the shadow: the restored value is a title
         // event in every sense (a popped `None` is a reset).
-        if let Some(popped) = self.alt.title_stack.pop() {
+        if let Some(popped) = self.alt_title.title_stack.pop() {
             self.observe_title(popped);
         }
     }
@@ -1732,24 +1704,6 @@ mod tests {
             "a coalesced read still snapshots at the mode event"
         );
         assert_eq!(emu.live_floor(), "coalesced");
-    }
-
-    /// Advance the epoch and expire the preceding alternate-screen title on leave and
-    /// re-entry within one read.
-    #[test]
-    fn same_read_alt_bounce_advances_the_epoch_and_expires_the_title() {
-        let mut emu = Emulator::new(4, 20, 0);
-        emu.process(b"\x1b[?1049h\x1b]0;first app\x07ui");
-        assert_eq!(emu.alt_epoch(), 1);
-        assert_eq!(emu.title(), Some("first app"), "premise: title honored");
-
-        emu.process(b"\x1b[?1049l\x1b[?1049h");
-        assert_eq!(emu.alt_epoch(), 2, "the bounce is two transitions");
-        assert_eq!(
-            emu.title(),
-            None,
-            "the old app's title must not survive the swap"
-        );
     }
 
     /// `live_floor` reads the live grid's last non-blank row even while the

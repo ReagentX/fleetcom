@@ -128,10 +128,7 @@ fn segment_span(row: &str, from: usize, to: Option<usize>) -> Option<(usize, &st
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn screen(rows: &[&str]) -> Vec<String> {
-        rows.iter().map(|r| r.to_string()).collect()
-    }
+    use crate::testutil::rows as screen;
 
     /// A selection pressed at `a` and dragged to `b`, both `(row, col)`.
     fn drag(a: (u16, u16), b: (u16, u16)) -> Selection {
