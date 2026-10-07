@@ -219,7 +219,7 @@ pub fn formatted<T>(term: &Term<T>) -> (Vec<u8>, (u16, u16), bool) {
 /// marks are included with their base character; `'\t'` cells, concealed (SGR 8) cells,
 /// and orphaned wide halves read as the blank the replayed screen shows; trailing
 /// spaces are trimmed per row. This display policy differs from
-/// [`crate::emulator::Emulator::live_rows`], which preserves the stored glyphs for
+/// [`crate::preview::ScreenFacts::live_rows`], which preserves the stored glyphs for
 /// structural matching.
 pub fn contents<T>(term: &Term<T>) -> String {
     let grid = term.grid();
