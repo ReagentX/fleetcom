@@ -59,10 +59,11 @@ fn session_commands_follow_the_hello_config_dir() {
     });
     // Hand-rolled hello whose env carries the client-side config override.
     let cwd = dir.display().to_string();
-    let client_cfg_str = client_cfg.display().to_string();
-    let env: Vec<(&[u8], &[u8])> =
-        vec![(b"FLEETCOM_CONFIG_DIR".as_slice(), client_cfg_str.as_bytes())];
-    shake_hands_env(&mut stream, &cwd, &env);
+    shake_hands_env(
+        &mut stream,
+        &cwd,
+        &[("FLEETCOM_CONFIG_DIR", client_cfg.display().to_string())],
+    );
 
     stream
         .write_all(&control_frame(r#"{"t":"save","name":"where"}"#))

@@ -1,5 +1,6 @@
-//! `fleetcom --kill` must stop the daemon and its tasks while another client is
-//! attached.
+//! Daemon teardown while a client is attached: SIGTERM, raw or sent by `fleetcom --kill`,
+//! must group-kill the tasks, remove the socket, and exit. The tasks live in their own
+//! process groups and must be terminated explicitly during daemon shutdown.
 
 mod common;
 
@@ -10,7 +11,7 @@ use std::{
 
 use nix::sys::signal::kill;
 
-use common::{spawn_task, start_daemon, wait_until};
+use common::{spawn_task, start_daemon, stop_daemon, wait_until};
 
 #[test]
 fn kill_works_while_a_client_is_attached() {
@@ -59,5 +60,38 @@ fn kill_works_while_a_client_is_attached() {
         wait_until(Duration::from_secs(5), || kill(task, None).is_err()),
         "task survived --kill"
     );
+    assert!(!sock.exists(), "socket file left behind");
+}
+
+#[test]
+fn sigterm_kills_daemon_and_its_tasks() {
+    let (dir, mut daemon, mut stream) = start_daemon("sigterm", |_| {});
+    let sock = dir.join("default.sock");
+
+    // Spawn a task that records its own pid ($$ is the setsid'd shell, so pid ==
+    // pgid) and then outlives the test unless killed.
+    let pidfile = dir.join("task.pid");
+    let task = spawn_task(
+        &mut stream,
+        &dir,
+        &pidfile,
+        &format!("echo $$ > {} && sleep 300", pidfile.display()),
+    );
+    // Signal 0: existence check only.
+    assert!(
+        kill(task, None).is_ok(),
+        "task should be alive before SIGTERM"
+    );
+
+    // SIGTERM the daemon *while our client is attached*: the flag must
+    // interrupt `run_loop` mid-serve, not just the idle accept loop.
+    stop_daemon(&mut daemon);
+
+    // The task was group-killed on the way out (grace: init still has to reap
+    // the reparented child before ESRCH).
+    let task_dead = wait_until(Duration::from_secs(5), || kill(task, None).is_err());
+    assert!(task_dead, "task survived the daemon's SIGTERM shutdown");
+
+    // Clean shutdown removes the socket.
     assert!(!sock.exists(), "socket file left behind");
 }

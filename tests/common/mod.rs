@@ -15,6 +15,8 @@ use std::{
     time::{Duration, Instant},
 };
 
+use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
+
 /// Protocol version used by this test suite; must match
 /// `protocol::PROTOCOL_VERSION`.
 pub const PROTOCOL_VERSION: u32 = 14;
@@ -35,27 +37,7 @@ pub fn control_frame(json: &str) -> Vec<u8> {
 
 /// Encode bytes as padded standard base64.
 pub fn b64(bytes: &[u8]) -> String {
-    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
-    for chunk in bytes.chunks(3) {
-        let n = (u32::from(chunk[0]) << 16)
-            | (u32::from(*chunk.get(1).unwrap_or(&0)) << 8)
-            | u32::from(*chunk.get(2).unwrap_or(&0));
-        let idx = [(n >> 18) & 63, (n >> 12) & 63, (n >> 6) & 63, n & 63];
-        out.push(ALPHABET[idx[0] as usize] as char);
-        out.push(ALPHABET[idx[1] as usize] as char);
-        out.push(if chunk.len() > 1 {
-            ALPHABET[idx[2] as usize] as char
-        } else {
-            '='
-        });
-        out.push(if chunk.len() > 2 {
-            ALPHABET[idx[3] as usize] as char
-        } else {
-            '='
-        });
-    }
-    out
+    B64.encode(bytes)
 }
 
 /// Read one frame, blocking: `(kind, payload)`. Mirrors `frame::read_frame`.
@@ -245,6 +227,83 @@ pub fn scratch(tag: &str) -> RuntimeDir {
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     RuntimeDir(dir)
+}
+
+/// Scratch tree holding everything one managed-launch test touches: stub executables in
+/// `bin`, an empty `nobin`, the daemon's runtime and config dirs, each harness's home,
+/// a working directory, and the stubs' argv records.
+pub struct Scratch {
+    pub root: RuntimeDir,
+}
+
+impl Scratch {
+    pub fn new(tag: &str) -> Self {
+        // Keep the scratch tree separate from start_daemon_raw's directory,
+        // which is cleared during daemon setup.
+        let root = scratch(&format!("{tag}_scratch"));
+        for sub in [
+            "bin",
+            "nobin",
+            "run",
+            "config",
+            "claude-home",
+            "codex-home",
+            "work",
+        ] {
+            std::fs::create_dir_all(root.join(sub)).unwrap();
+        }
+        Self { root }
+    }
+
+    pub fn bin(&self) -> PathBuf {
+        self.root.join("bin")
+    }
+
+    /// Runtime directory passed to the daemon handshake.
+    pub fn runtime(&self) -> PathBuf {
+        self.root.join("run")
+    }
+
+    pub fn work(&self) -> PathBuf {
+        self.root.join("work")
+    }
+
+    pub fn recipe(&self, name: &str) -> PathBuf {
+        self.root
+            .join("config")
+            .join("sessions")
+            .join(format!("{name}.json"))
+    }
+
+    /// The named stub's argv record, one element per line.
+    pub fn record(&self, tool: &str) -> PathBuf {
+        self.root.join(format!("{tool}-argv"))
+    }
+
+    /// Handshake environment with every fleetcom and harness path under `root`. `path` is
+    /// the `PATH` value verbatim: callers decide whether system directories ride it.
+    pub fn hello_env(&self, path: String) -> Vec<(String, String)> {
+        vec![
+            ("PATH".into(), path),
+            ("SHELL".into(), "/bin/sh".into()),
+            (
+                "FLEETCOM_CONFIG_DIR".into(),
+                self.root.join("config").display().to_string(),
+            ),
+            (
+                "FLEETCOM_RUNTIME_DIR".into(),
+                self.runtime().display().to_string(),
+            ),
+            (
+                "CLAUDE_CONFIG_DIR".into(),
+                self.root.join("claude-home").display().to_string(),
+            ),
+            (
+                "CODEX_HOME".into(),
+                self.root.join("codex-home").display().to_string(),
+            ),
+        ]
+    }
 }
 
 /// Start a `fleetcom --daemon` against an isolated runtime dir and connect a

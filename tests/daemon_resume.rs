@@ -13,8 +13,8 @@ use std::{
 };
 
 use common::{
-    RuntimeDir, control_frame, read_frame, scratch, shake_hands_env, spawn_agent_frame,
-    start_daemon_raw, stop_daemon, wait_until, write_executable,
+    Scratch, control_frame, read_frame, shake_hands_env, spawn_agent_frame, start_daemon_raw,
+    stop_daemon, wait_until, write_executable,
 };
 
 /// Delimiter separating argv records in a stub's append-only output.
@@ -40,84 +40,11 @@ fn turn_complete(thread: &str) -> String {
 /// every instrumented `codex` launch.
 const CODEX_EMBEDDED: &str = "features.daemon_auto_start=false";
 
-/// Scratch tree containing every executable, store, working directory, and argv
-/// record used by one test.
-struct Scratch {
-    root: RuntimeDir,
-}
-
-impl Scratch {
-    fn new(tag: &str) -> Self {
-        // Keep the scratch tree separate from start_daemon_raw's directory,
-        // which is cleared during daemon setup.
-        let root = scratch(&format!("{tag}_scratch"));
-        for sub in ["bin", "run", "config", "claude-home", "codex-home", "work"] {
-            std::fs::create_dir_all(root.join(sub)).unwrap();
-        }
-        Self { root }
-    }
-
-    fn bin(&self) -> PathBuf {
-        self.root.join("bin")
-    }
-
-    /// Runtime directory passed to the daemon handshake.
-    fn runtime(&self) -> PathBuf {
-        self.root.join("run")
-    }
-
-    fn work(&self) -> PathBuf {
-        self.root.join("work")
-    }
-
-    fn recipe(&self, name: &str) -> PathBuf {
-        self.root
-            .join("config")
-            .join("sessions")
-            .join(format!("{name}.json"))
-    }
-
-    /// The named stub's argv record.
-    fn record(&self, tool: &str) -> PathBuf {
-        self.root.join(format!("{tool}-argv"))
-    }
-
-    /// Marker touched by the `codex` stub after both notifications.
-    fn notified(&self) -> PathBuf {
-        self.root.join("codex-notified")
-    }
-
-    /// Explicit handshake environment with every resolved path under `root`.
-    fn hello_env(&self) -> Vec<(String, String)> {
-        vec![
-            (
-                "PATH".into(),
-                format!("{}:/usr/bin:/bin", self.bin().display()),
-            ),
-            ("SHELL".into(), "/bin/sh".into()),
-            (
-                "FLEETCOM_CONFIG_DIR".into(),
-                self.root.join("config").display().to_string(),
-            ),
-            (
-                "FLEETCOM_RUNTIME_DIR".into(),
-                self.runtime().display().to_string(),
-            ),
-            (
-                "CLAUDE_CONFIG_DIR".into(),
-                self.root.join("claude-home").display().to_string(),
-            ),
-            (
-                "CODEX_HOME".into(),
-                self.root.join("codex-home").display().to_string(),
-            ),
-        ]
-    }
-}
-
-/// Send a handshake scoped to the scratch tree.
+/// Send a handshake scoped to the scratch tree. `PATH` keeps `/usr/bin:/bin` after the
+/// stubs: the `codex` stub runs `mkdir`.
 fn hello(stream: &mut UnixStream, s: &Scratch) {
-    shake_hands_env(stream, &s.work().display().to_string(), &s.hello_env());
+    let path = format!("{}:/usr/bin:/bin", s.bin().display());
+    shake_hands_env(stream, &s.work().display().to_string(), &s.hello_env(path));
 }
 
 /// Drain daemon events while a test polls files. Without this reader, snapshot
@@ -180,7 +107,7 @@ fi"#,
         id = CODEX_ID,
         root = turn_complete(CODEX_ID),
         title = turn_complete(CODEX_TITLE),
-        notified = s.notified().display(),
+        notified = s.root.join("codex-notified").display(),
     );
     write_executable(&s.bin().join("codex"), &body);
 }
@@ -241,9 +168,7 @@ fn assert_daemon_namespaced(asset: &Path, daemon_pid: u32, what: &str, argv: &[S
     );
 }
 
-/// Save once and return the persisted recipe. Wait for the ID channel at each call site;
-/// scrape finished tasks in the daemon before reading IDs. Require the resume ID in that
-/// first save.
+/// Send `save` and return the recipe once it lands; callers assert the resume ID.
 fn save_once(stream: &mut UnixStream, recipe: &Path, name: &str) -> String {
     stream
         .write_all(&control_frame(&format!(
@@ -377,7 +302,9 @@ fn codex_capture_file_drives_save_and_load_resumes() {
     // Exit the stub silently so the notify script is the only ID channel. Wait for both
     // notifications, then require a bare root UUID and no temporary file. Preserve the root
     // after the title notification and persist the resume ID on the first save.
-    let ok = wait_until(Duration::from_secs(10), || s.notified().exists());
+    let ok = wait_until(Duration::from_secs(10), || {
+        s.root.join("codex-notified").exists()
+    });
     assert!(ok, "the codex stub never finished notifying");
     let files = namespace_files(&s.runtime());
     let names: Vec<&str> = files.iter().map(|(name, _)| name.as_str()).collect();
@@ -490,7 +417,6 @@ fn saved_recipe_resumes_across_a_daemon_restart() {
         "the recipe must resume the pinned id: {recipe}"
     );
     stop_daemon(&mut daemon_a);
-    drop(stream_a);
 
     // Start another daemon with the same config and handshake environment.
     let (_dir_b, mut daemon_b, mut stream_b) = start_daemon_raw("resume_restart_b", |_| {});
