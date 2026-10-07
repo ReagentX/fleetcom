@@ -83,6 +83,18 @@ struct LoadOutcome {
 }
 
 impl LoadOutcome {
+    /// The skipped and failed counts as summary clauses, each only when nonzero.
+    fn clauses(&self) -> Vec<String> {
+        let mut parts = Vec::new();
+        if self.skipped > 0 {
+            parts.push(format!("{} skipped ({SKIP_REASONS})", self.skipped));
+        }
+        if self.failed > 0 {
+            parts.push(format!("{} failed to spawn", self.failed));
+        }
+        parts
+    }
+
     /// Append each distinct note to `summary` once, with a count for repeated notes. For
     /// example, report an unchainable Codex notifier once for all affected entries.
     fn annotate(&self, mut summary: String) -> String {
@@ -127,7 +139,7 @@ fn resolve_agent(
 pub const FLEETCOM_SCROLLBACK: &str = "FLEETCOM_SCROLLBACK";
 
 /// Default history rows retained by each task's terminal grid.
-pub const DEFAULT_SCROLLBACK: usize = 2000;
+const DEFAULT_SCROLLBACK: usize = 2000;
 
 /// Maximum configured history rows per task.
 const MAX_SCROLLBACK: usize = 100_000;
@@ -201,31 +213,6 @@ fn fnv1a_hex(bytes: &[u8]) -> String {
         h = h.wrapping_mul(0x0000_0100_0000_01b3);
     }
     format!("{h:016x}")
-}
-
-/// Resolve a managed task's session ID in precedence order: capture file, live registry,
-/// then spawn-time ID. Prefer the first two sources because a session may have been
-/// selected after launch. Validate capture through the harness using the task's leader PID.
-/// On rejection, try the next source. For literal tasks, skip all sources and return
-/// `None`.
-fn current_resume_id(task: &Task) -> Option<String> {
-    if let (Some(h), Some(path)) = (task.harness, &task.capture_file)
-        && let Ok(payload) = std::fs::read_to_string(path)
-        && let Some(id) = h.parse_capture(&payload, task.pid())
-    {
-        return Some(id);
-    }
-    if let (Some(h), Some(pid)) = (task.harness, task.pid())
-        && let Some(id) = h.live_session_id(
-            pid,
-            &task.cwd,
-            task.spawned_at,
-            task.harness_home.as_deref(),
-        )
-    {
-        return Some(id);
-    }
-    task.resume_id.clone()
 }
 
 /// Resolve harness configuration from the task's launch environment.
@@ -673,14 +660,14 @@ impl Supervisor {
         if cadence_due {
             self.recovery.last_cadence = now;
         }
+        // Every path below consumes the pending mutation, written or not.
+        self.recovery.last_mutation = None;
         // Do not replace an existing snapshot with an empty recipe.
         if self.tasks.is_empty() {
-            self.recovery.last_mutation = None;
             return;
         }
         // Skip this pass without a config root.
         let Some(root) = self.sessions_root() else {
-            self.recovery.last_mutation = None;
             return;
         };
         let cfg = self.session_config();
@@ -695,7 +682,6 @@ impl Supervisor {
             .as_ref()
             .is_some_and(|(r, dest, h)| *r == root && *h == hash && std::fs::metadata(dest).is_ok())
         {
-            self.recovery.last_mutation = None;
             return;
         }
         let label = session::recovery_label(std::time::SystemTime::now());
@@ -718,7 +704,6 @@ impl Supervisor {
                 }
             }
         }
-        self.recovery.last_mutation = None;
     }
 
     /// Run recovery maintenance between clients without queuing task or screen
@@ -1009,7 +994,7 @@ impl Supervisor {
         let command;
         let relaunch = match self.tasks[i].harness {
             Some(agent) => {
-                let resume = current_resume_id(&self.tasks[i]);
+                let resume = self.tasks[i].current_resume_id();
                 match resolve_agent(agent.shape().0, &launch, resume) {
                     Ok(m) => Launch::Managed(m),
                     Err(why) => return self.status(format!("{why}, not spawning")),
@@ -1029,8 +1014,8 @@ impl Supervisor {
                     self.status(format!("task {id}: {notice}"));
                 }
                 fresh.tagged = self.tasks[i].tagged;
-                fresh.group = self.tasks[i].group.clone();
-                fresh.name = self.tasks[i].name.clone();
+                fresh.group.clone_from(&self.tasks[i].group);
+                fresh.name.clone_from(&self.tasks[i].name);
                 // Read the resume ID before retiring the displaced run and removing its
                 // capture file.
                 let old = std::mem::replace(&mut self.tasks[i], fresh);
@@ -1059,7 +1044,7 @@ impl Supervisor {
             let kind = match t.harness {
                 Some(h) => EntryKind::Managed {
                     agent: h.shape().0.to_string(),
-                    resume: current_resume_id(t),
+                    resume: t.current_resume_id(),
                 },
                 None => EntryKind::Literal(t.command.clone()),
             };
@@ -1215,12 +1200,7 @@ impl Supervisor {
         if out.spawned > 0 || (out.skipped == 0 && out.failed == 0) {
             parts.push(format!("{} task(s)", out.spawned));
         }
-        if out.skipped > 0 {
-            parts.push(format!("{} skipped ({SKIP_REASONS})", out.skipped));
-        }
-        if out.failed > 0 {
-            parts.push(format!("{} failed to spawn", out.failed));
-        }
+        parts.extend(out.clauses());
         let msg = format!("loaded '{name}': {}", parts.join(", "));
         self.status(out.annotate(msg));
     }
@@ -1237,11 +1217,8 @@ impl Supervisor {
         };
         // Append optional clauses to the fixed message prefix.
         let mut msg = String::from("loaded recovery snapshot; save to name it");
-        if out.skipped > 0 {
-            let _ = write!(msg, ", {} skipped ({SKIP_REASONS})", out.skipped);
-        }
-        if out.failed > 0 {
-            let _ = write!(msg, ", {} failed to spawn", out.failed);
+        for clause in out.clauses() {
+            let _ = write!(msg, ", {clause}");
         }
         self.status(out.annotate(msg));
     }

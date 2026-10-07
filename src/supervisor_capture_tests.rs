@@ -367,7 +367,7 @@ fn typed_agent_word_is_literal_runs_verbatim_and_saves_as_text() {
         &dir,
         r#""status":"waiting","waitingFor":"permission prompt""#,
     );
-    assert_eq!(current_resume_id(&s.tasks[0]), None);
+    assert_eq!(s.tasks[0].current_resume_id(), None);
     let entries = saved_entries(&mut s, &config, "typed");
     assert_eq!(entries[0], SessionEntry::literal("claude"));
     assert!(matches!(
@@ -943,7 +943,7 @@ until [ -e '{d}/done' ]; do sleep 0.05; done"#,
 
     std::fs::write(&cap, stamped(&s.tasks[0], &hook_json(CAP_OTHER, "clear"))).unwrap();
     assert_eq!(
-        current_resume_id(&s.tasks[0]).as_deref(),
+        s.tasks[0].current_resume_id().as_deref(),
         Some(CAP_OTHER),
         "the task's own capture must beat the pin"
     );
@@ -969,13 +969,13 @@ until [ -e '{d}/done' ]; do sleep 0.05; done"#,
 
     // With no registry record yet, use the pinned ID after rejecting the capture.
     assert_eq!(
-        current_resume_id(&s.tasks[0]).as_deref(),
+        s.tasks[0].current_resume_id().as_deref(),
         Some(pinned.as_str()),
         "a foreign capture must fall through to the spawn-time id"
     );
     install_status_record(&claude_home, pid, &dir, r#""status":"idle""#);
     assert_eq!(
-        current_resume_id(&s.tasks[0]).as_deref(),
+        s.tasks[0].current_resume_id().as_deref(),
         Some(CAP_ID),
         "a foreign capture must fall through to the registry"
     );
@@ -1036,7 +1036,7 @@ fn silent_codex_tasks_save_and_recover_without_a_resume_id() {
         .all(|t| t.finished.is_some())));
     for task in &s.tasks {
         assert!(
-            current_resume_id(task).is_none(),
+            task.current_resume_id().is_none(),
             "no capture channel fired"
         );
         let spawn_ms = task
@@ -1350,7 +1350,7 @@ fn stale_inherited_notify_chain_is_never_executed() {
         "the stale inherited chain must not execute"
     );
     assert_eq!(
-        current_resume_id(&s.tasks[0]).as_deref(),
+        s.tasks[0].current_resume_id().as_deref(),
         Some(CAP_ID),
         "the notifier's payload for a root thread must pass the capture gate"
     );
@@ -1458,7 +1458,7 @@ fn config_toml_notify_chains_through_the_injected_script() {
         "the validation step must precede the chain handoff"
     );
     assert_eq!(
-        current_resume_id(&s.tasks[0]).as_deref(),
+        s.tasks[0].current_resume_id().as_deref(),
         Some(CAP_ID),
         "the notifier's payload for a root thread must pass the capture gate"
     );
@@ -1653,7 +1653,7 @@ fn managed_claude_accepts_its_own_capture_and_refuses_a_foreign_stamp() {
         ["--session-id", &pinned, "--settings", &settings_beside(&s)]
     );
     assert_eq!(
-        current_resume_id(&s.tasks[0]).as_deref(),
+        s.tasks[0].current_resume_id().as_deref(),
         Some(CAP_OTHER),
         "the stub's `$$` is the leader pid: no shell sat between"
     );
@@ -1664,7 +1664,7 @@ fn managed_claude_accepts_its_own_capture_and_refuses_a_foreign_stamp() {
     let (_, json) = text.split_once('\n').unwrap();
     std::fs::write(&cap, format!("{}\n{json}", dead_pid())).unwrap();
     assert_eq!(
-        current_resume_id(&s.tasks[0]).as_deref(),
+        s.tasks[0].current_resume_id().as_deref(),
         Some(pinned.as_str()),
         "a foreign stamp must fall through to the pinned id"
     );
@@ -1865,7 +1865,7 @@ fn managed_task_saves_as_a_managed_entry_and_reloads_managed() {
         "the reloaded claude entry must resume its captured ID: {claude_argv:?}"
     );
     assert_eq!(
-        current_resume_id(&s.tasks[2]).as_deref(),
+        s.tasks[2].current_resume_id().as_deref(),
         Some(CAP_OTHER),
         "the reloaded run's own capture outranks the recipe's resume ID"
     );

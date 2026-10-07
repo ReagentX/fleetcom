@@ -1,6 +1,10 @@
 use super::*;
-use crate::testutil::{
-    env_here, here, install_resident_shell, read_pid, sh_env, temp, wait_until, write_executable,
+use crate::{
+    preview::ScreenFacts,
+    testutil::{
+        env_here, here, install_resident_shell, read_pid, sh_env, temp, wait_until,
+        write_executable,
+    },
 };
 
 /// Tests drive the reader directly, so there is no core loop to wake.
@@ -263,7 +267,7 @@ fn viewport_scrolls_and_snaps_live_on_input() {
     let mut t = spawn(9, "cat");
     // Feed enough rows to create scrollback.
     for i in 0..50 {
-        grid(&t.parser).process(format!("line{i}\r\n").as_bytes());
+        t.parser.lock().process(format!("line{i}\r\n").as_bytes());
     }
     assert_eq!(t.scroll_offset(), 0);
     t.scroll_view(ScrollAction::Up(10));
@@ -292,7 +296,7 @@ fn viewport_scrolls_and_snaps_live_on_input() {
 #[test]
 fn screen_lines_yields_one_entry_per_grid_row() {
     let mut t = spawn(60, "sleep 300");
-    grid(&t.parser).process(b"top");
+    t.parser.lock().process(b"top");
     let lines = t.screen_lines();
     // The spawn helper's grid is 24x80.
     assert_eq!(lines.len(), 24, "one entry per grid row");
@@ -309,7 +313,7 @@ fn queued_writes_reach_the_child_in_order() {
     t.send_input(b"zqsecondqz\n".to_vec()).unwrap();
     let mut contents = String::new();
     wait_until(Duration::from_secs(5), || {
-        contents = grid(&t.parser).contents();
+        contents = t.parser.lock().contents();
         contents.contains("zqsecondqz")
     });
     let first = contents
@@ -380,11 +384,11 @@ fn write_error_keeps_draining_the_pending_counter() {
 fn input_hints_track_child_modes() {
     let mut t = spawn(8, "sleep 5");
     assert_eq!(t.input_hints(), (false, false, false));
-    grid(&t.parser).process(b"\x1b[?1000h");
+    t.parser.lock().process(b"\x1b[?1000h");
     assert_eq!(t.input_hints(), (true, false, false));
-    grid(&t.parser).process(b"\x1b[?1000l\x1b[?1049h");
+    t.parser.lock().process(b"\x1b[?1000l\x1b[?1049h");
     assert_eq!(t.input_hints(), (false, true, true));
-    grid(&t.parser).process(b"\x1b[?1007l");
+    t.parser.lock().process(b"\x1b[?1007l");
     assert_eq!(t.input_hints(), (false, true, false));
     t.terminate();
 }
@@ -425,7 +429,7 @@ fn finalize_preview_waits_for_reader_eof() {
         !t.resolve_preview(Instant::now()).frozen,
         "finalization must wait for reader EOF"
     );
-    grid(&t.parser).process(b"late output\r\n");
+    t.parser.lock().process(b"late output\r\n");
 
     // Dropping the sender ends the stand-in: the reader reached EOF.
     drop(release);
@@ -463,11 +467,11 @@ fn finalize_preview_lands_an_open_sync_frame() {
         "child never exited"
     );
     assert!(
-        !grid(&t.parser).contents().contains("test result: ok"),
+        !t.parser.lock().contents().contains("test result: ok"),
         "premise: the unclosed frame still buffers the final output"
     );
     t.finalize_preview();
-    assert!(grid(&t.parser).contents().contains("test result: ok"));
+    assert!(t.parser.lock().contents().contains("test result: ok"));
     let p = t.resolve_preview(Instant::now());
     assert_eq!((p.text.as_str(), p.frozen), ("test result: ok", true));
 }
@@ -552,7 +556,7 @@ fn finalize_preview_keeps_the_last_render_across_alt_teardown() {
     std::fs::write(&teardown, b"").unwrap();
     assert!(
         wait_until(Duration::from_secs(60), || {
-            !grid(&t.parser).alternate_screen()
+            !t.parser.lock().alternate_screen()
         }),
         "teardown never reached the grid"
     );
@@ -573,7 +577,7 @@ fn finalize_preview_keeps_the_last_render_across_alt_teardown() {
     );
     t.finalize_preview();
     assert_eq!(
-        grid(&t.parser).live_floor(),
+        t.parser.lock().live_floor(),
         "prelaunch junk",
         "premise: 1049l restored the pre-launch primary screen"
     );

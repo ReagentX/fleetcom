@@ -3,8 +3,6 @@
 //! events into PTY bytes.
 
 pub(crate) mod ansi;
-#[cfg(test)]
-mod codex_tests;
 pub(crate) mod emulator;
 // Absolute pins over the recorded PTY corpus, plus the wrapper-vs-backend
 // oracle.

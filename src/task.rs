@@ -47,12 +47,6 @@ pub struct WriteRefused {
     pub len: usize,
 }
 
-/// Map a dependency error (`portable-pty` returns `anyhow`) into `io::Error` so
-/// the crate uses `io::Result` without a direct `anyhow` dependency.
-fn io_err(e: impl std::fmt::Display) -> io::Error {
-    io::Error::other(e.to_string())
-}
-
 /// Return true only when signal 0 reports `ESRCH`. `EPERM` remains potentially
 /// live so callers do not delete another owner's files.
 pub(crate) fn pid_is_dead(pid: i32) -> bool {
@@ -75,7 +69,8 @@ pub struct Task {
     /// Working directory the command was launched in: the grouping key for
     /// "by dir" mode and the label shown when it differs from the default.
     pub cwd: PathBuf,
-    /// Kept for resize (`TIOCSWINSZ`); `try_clone_reader`/`take_writer` borrow it.
+    /// The PTY master, kept open for `resize` (`TIOCSWINSZ`); the reader and
+    /// writer handles were split off it at spawn.
     master: Box<dyn MasterPty + Send>,
     /// Sender for the detached PTY writer worker. `None` after `force_kill`. Queue
     /// writes to avoid blocking the core thread on PTY I/O.
@@ -91,7 +86,8 @@ pub struct Task {
     pid: Option<u32>,
     /// Shared with the reader thread: it writes (process bytes), the UI reads
     /// (render/preview). Fair locking prevents repeated parser writes from
-    /// starving the supervisor's snapshot reads.
+    /// starving the supervisor's snapshot reads. `FairMutex` does not poison,
+    /// so a later access can read the state left by a panicking operation.
     parser: Arc<FairMutex<Emulator>>,
     last_activity: Arc<Mutex<Instant>>,
     handle: Option<JoinHandle<()>>,
@@ -150,12 +146,6 @@ fn signal(waker: &Waker) {
     {
         let _ = tx.send(Wake::Output);
     }
-}
-
-/// Lock the shared emulator grid. `FairMutex` does not poison, so a later
-/// access can read the state left by a panicking operation.
-fn grid(parser: &FairMutex<Emulator>) -> impl std::ops::DerefMut<Target = Emulator> + '_ {
-    parser.lock()
 }
 
 /// Admit one whole message to a writer queue bounded by `MAX_PENDING_WRITE`,
@@ -250,7 +240,7 @@ impl Task {
                 pixel_width: 0,
                 pixel_height: 0,
             })
-            .map_err(io_err)?;
+            .map_err(io::Error::other)?;
 
         let mut cmd = match exec {
             Exec::Literal => {
@@ -287,13 +277,13 @@ impl Task {
         cmd.env("PWD", cwd.as_os_str());
         cmd.cwd(cwd);
 
-        let child = pair.slave.spawn_command(cmd).map_err(io_err)?;
+        let child = pair.slave.spawn_command(cmd).map_err(io::Error::other)?;
         // Drop our slave handle: once the child's own fds close, the master
         // read hits EOF and the reader thread can exit.
         drop(pair.slave);
 
-        let mut reader = pair.master.try_clone_reader().map_err(io_err)?;
-        let writer = pair.master.take_writer().map_err(io_err)?;
+        let mut reader = pair.master.try_clone_reader().map_err(io::Error::other)?;
+        let writer = pair.master.take_writer().map_err(io::Error::other)?;
 
         let parser = Arc::new(FairMutex::new(Emulator::new(rows, cols, scrollback)));
         let last_activity = Arc::new(Mutex::new(Instant::now()));
@@ -321,7 +311,7 @@ impl Task {
                             break;
                         }
                         Ok(n) => {
-                            let replies = grid(&parser).process(&buf[..n]);
+                            let replies = parser.lock().process(&buf[..n]);
                             if !replies.is_empty() {
                                 // Probe replies answer the child through the
                                 // same writer worker as client input, keeping
@@ -386,6 +376,31 @@ impl Task {
     /// Return the task's session-leader PID.
     pub fn pid(&self) -> Option<u32> {
         self.pid
+    }
+
+    /// Resolve a managed task's session ID in precedence order: capture file, live registry,
+    /// then spawn-time ID. Prefer the first two sources because a session may have been
+    /// selected after launch. Validate capture through the harness using the task's leader PID.
+    /// On rejection, try the next source. For literal tasks, skip all sources and return
+    /// `None`.
+    pub fn current_resume_id(&self) -> Option<String> {
+        if let (Some(h), Some(path)) = (self.harness, &self.capture_file)
+            && let Ok(payload) = std::fs::read_to_string(path)
+            && let Some(id) = h.parse_capture(&payload, self.pid())
+        {
+            return Some(id);
+        }
+        if let (Some(h), Some(pid)) = (self.harness, self.pid())
+            && let Some(id) = h.live_session_id(
+                pid,
+                &self.cwd,
+                self.spawned_at,
+                self.harness_home.as_deref(),
+            )
+        {
+            return Some(id);
+        }
+        self.resume_id.clone()
     }
 
     /// Latch the exit code and finish time if the leader has exited, without
@@ -462,6 +477,9 @@ impl Task {
         self.reaped
     }
 
+    /// The dashboard's liveness glyph: `Ok`/`Failed` once the leader's exit is
+    /// latched (`poll_exit`), else `Idle` after `idle_after` without PTY output,
+    /// else `Active`. Derived on every snapshot, never stored.
     pub fn lifecycle(&self, now: Instant, idle_after: Duration) -> Lifecycle {
         if self.finished.is_some() {
             return if self.exit_code == Some(0) {
@@ -493,7 +511,7 @@ impl Task {
     /// ones. Called from the supervisor's tick (the loop's only periodic
     /// path) because vte re-checks its sync timeout only when bytes arrive.
     pub fn flush_expired_sync(&self) {
-        let replies = grid(&self.parser).flush_expired_sync();
+        let replies = self.parser.lock().flush_expired_sync();
         if !replies.is_empty()
             && let Some(tx) = &self.input_tx
         {
@@ -503,7 +521,7 @@ impl Task {
 
     /// Drain OSC 52 clipboard stores captured by this task's emulator.
     pub fn drain_clipboard(&self) -> ClipboardStores {
-        grid(&self.parser).drain_clipboard()
+        self.parser.lock().drain_clipboard()
     }
 
     /// The dashboard preview, resolved through the provenance cascade under
@@ -511,7 +529,7 @@ impl Task {
     /// instant so every task in one snapshot resolves against the same clock.
     pub fn resolve_preview(&mut self, now: Instant) -> Preview {
         self.refresh_blocked(now);
-        let emu = grid(&self.parser);
+        let emu = self.parser.lock();
         let blocked = self.blocked.as_ref().map(|(text, rule)| (&**text, *rule));
         self.preview
             .resolve(now, &*emu, self.summary_adapter, blocked)
@@ -547,7 +565,7 @@ impl Task {
         if self.preview.finalized() || !self.output_complete() {
             return;
         }
-        let mut emu = grid(&self.parser);
+        let mut emu = self.parser.lock();
         let _ = emu.finish_output();
         self.preview.finalize(&*emu, self.summary_adapter);
     }
@@ -555,7 +573,7 @@ impl Task {
     /// Full screen as ANSI bytes for attached mode, plus cursor state so we can
     /// place the real cursor where the child put it.
     pub fn formatted(&self) -> (Vec<u8>, (u16, u16), bool) {
-        grid(&self.parser).formatted()
+        self.parser.lock().formatted()
     }
 
     /// Return one plain-text string per visible grid row for peek and drag
@@ -563,14 +581,15 @@ impl Task {
     pub fn screen_lines(&self) -> Vec<String> {
         // `contents()` separates grid rows with `\n`; `split` preserves the
         // trailing empty field that represents a blank final row.
-        grid(&self.parser)
+        self.parser
+            .lock()
             .contents()
             .split('\n')
             .map(str::to_string)
             .collect()
     }
 
-    pub fn resize(&mut self, rows: u16, cols: u16) -> io::Result<()> {
+    pub fn resize(&self, rows: u16, cols: u16) -> io::Result<()> {
         self.master
             .resize(PtySize {
                 rows,
@@ -578,15 +597,15 @@ impl Task {
                 pixel_width: 0,
                 pixel_height: 0,
             })
-            .map_err(io_err)?;
-        grid(&self.parser).resize(rows, cols);
+            .map_err(io::Error::other)?;
+        self.parser.lock().resize(rows, cols);
         Ok(())
     }
 
     /// Return the viewport to live, then queue `bytes` for the PTY as one
     /// message without blocking the caller. Refuse it whole if admission would
     /// exceed `MAX_PENDING_WRITE`.
-    pub fn send_input(&mut self, bytes: Vec<u8>) -> Result<(), WriteRefused> {
+    pub fn send_input(&self, bytes: Vec<u8>) -> Result<(), WriteRefused> {
         self.scroll_view(ScrollAction::Live);
         self.queue_write(bytes)
     }
@@ -601,27 +620,27 @@ impl Task {
     }
 
     /// Move the scrollback viewport, clamped to retained history.
-    pub fn scroll_view(&mut self, action: ScrollAction) {
-        grid(&self.parser).scroll(action);
+    pub fn scroll_view(&self, action: ScrollAction) {
+        self.parser.lock().scroll(action);
     }
 
     /// Rows the viewport is scrolled back from live output.
     pub fn scroll_offset(&self) -> usize {
-        grid(&self.parser).scrollback()
+        self.parser.lock().scrollback()
     }
 
     /// Encode a paste using the child's bracketed-paste mode, read under the
     /// grid lock, then queue it as one PTY write.
-    pub fn send_paste(&mut self, content: &[u8]) -> Result<(), WriteRefused> {
-        let bracketed = grid(&self.parser).bracketed_paste();
+    pub fn send_paste(&self, content: &[u8]) -> Result<(), WriteRefused> {
+        let bracketed = self.parser.lock().bracketed_paste();
         self.send_input(input::paste_bytes(bracketed, content))
     }
 
     /// Encode and queue one mouse action using the child's screen modes.
     /// Unsupported actions send nothing.
-    pub fn send_mouse(&mut self, kind: MouseKind, col: u16, row: u16) -> Result<(), WriteRefused> {
+    pub fn send_mouse(&self, kind: MouseKind, col: u16, row: u16) -> Result<(), WriteRefused> {
         let bytes = {
-            let p = grid(&self.parser);
+            let p = self.parser.lock();
             input::mouse_bytes(&p, kind, col, row)
         };
         bytes.map_or(Ok(()), |b| self.send_input(b))
@@ -629,9 +648,9 @@ impl Task {
 
     /// Encode and queue one key using the child's cursor-key mode, read under
     /// the grid lock. Unsupported combinations send nothing.
-    pub fn send_key(&mut self, code: Key, mods: Mods) -> Result<(), WriteRefused> {
+    pub fn send_key(&self, code: Key, mods: Mods) -> Result<(), WriteRefused> {
         let bytes = {
-            let p = grid(&self.parser);
+            let p = self.parser.lock();
             input::key_bytes(p.application_cursor(), code, mods)
         };
         bytes.map_or(Ok(()), |b| self.send_input(b))
@@ -640,7 +659,7 @@ impl Task {
     /// Return the child's mouse, alternate-screen, and alternate-scroll modes
     /// for `ScreenView`.
     pub fn input_hints(&self) -> (bool, bool, bool) {
-        let p = grid(&self.parser);
+        let p = self.parser.lock();
         (
             p.mouse_protocol_mode() != crate::emulator::MouseProtocolMode::None,
             p.alternate_screen(),

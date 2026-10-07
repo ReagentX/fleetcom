@@ -8,6 +8,14 @@
 //!
 //! **Parser semantics.** Verify exact scrollback retention, bold-plus-dim intensity
 //! stacking, DEC charset translation, and VS16 width with targeted fixtures.
+//!
+//! **Wrapper oracle.** Replay every fixture through [`Emulator`] and a raw `Term`
+//! and require identical styled bytes, text, cursor, and alternate-screen bit:
+//! this pins the `Handler` delegation in `ObservedTerm`.
+//!
+//! **Codex release replay.** Walk the `codex_0158_terminal` captures checkpoint
+//! by checkpoint, applying resizes at their recorded offsets, and pin
+//! alternate-screen transitions, grid geometry, and OSC 52 stores.
 
 use alacritty_terminal::{
     Term,
@@ -20,6 +28,8 @@ use alacritty_terminal::{
 
 use crate::{
     ansi,
+    emulator::Emulator,
+    protocol::ClipboardKind,
     testutil::{CORPUS_COLS as COLS, CORPUS_LINES as LINES, parse_term},
 };
 
@@ -54,21 +64,18 @@ fn assert_screen(
     assert!(!hidden, "{fixture}: cursor visibility");
 }
 
-/// Pin one load-bearing styled cell: character, colors, exact flag set.
-fn assert_cell(
-    fixture: &str,
-    al: &Term<VoidListener>,
-    (row, col): (usize, usize),
-    c: char,
-    fg: Color,
-    bg: Color,
-    flags: Flags,
-) {
-    let cell = &al.grid()[Line(row as i32)][Column(col)];
-    assert_eq!(cell.c, c, "{fixture}: char at ({row},{col})");
-    assert_eq!(cell.fg, fg, "{fixture}: fg at ({row},{col})");
-    assert_eq!(cell.bg, bg, "{fixture}: bg at ({row},{col})");
-    assert_eq!(cell.flags, flags, "{fixture}: flags at ({row},{col})");
+/// One pinned cell: `((row, col), char, fg, bg, exact flag set)`.
+type StyledCell = ((usize, usize), char, Color, Color, Flags);
+
+/// Pin load-bearing styled cells.
+fn assert_cells(fixture: &str, al: &Term<VoidListener>, cells: &[StyledCell]) {
+    for &((row, col), c, fg, bg, flags) in cells {
+        let cell = &al.grid()[Line(row as i32)][Column(col)];
+        assert_eq!(cell.c, c, "{fixture}: char at ({row},{col})");
+        assert_eq!(cell.fg, fg, "{fixture}: fg at ({row},{col})");
+        assert_eq!(cell.bg, bg, "{fixture}: bg at ({row},{col})");
+        assert_eq!(cell.flags, flags, "{fixture}: flags at ({row},{col})");
+    }
 }
 
 /// Pin default characters, colors, and flags across the primary grid after an
@@ -105,14 +112,16 @@ fn compat_tmux_split() {
         &[(0, "[detached (from session 0)]")],
         (1, 0),
     );
-    assert_cell(
+    assert_cells(
         "tmux_split.bin",
         &al,
-        (0, 0),
-        '[',
-        Color::Named(NamedColor::Foreground),
-        Color::Named(NamedColor::Background),
-        Flags::empty(),
+        &[(
+            (0, 0),
+            '[',
+            Color::Named(NamedColor::Foreground),
+            Color::Named(NamedColor::Background),
+            Flags::empty(),
+        )],
     );
 }
 
@@ -295,86 +304,34 @@ fn compat_shell_colors() {
 
     let fg = Color::Named(NamedColor::Foreground);
     let bg = Color::Named(NamedColor::Background);
-    // ls colors: executable, setuid (fg plus bg), symlink.
-    assert_cell(
+    let red = Color::Named(NamedColor::Red);
+    let black = Color::Named(NamedColor::Black);
+    let magenta = Color::Named(NamedColor::Magenta);
+    let yellow = Color::Named(NamedColor::Yellow);
+    let green = Color::Named(NamedColor::Green);
+    let truecolor = Color::Spec(Rgb {
+        r: 100,
+        g: 200,
+        b: 50,
+    });
+    assert_cells(
         F,
         &al,
-        (0, 52),
-        'a',
-        Color::Named(NamedColor::Red),
-        bg,
-        Flags::empty(),
-    );
-    assert_cell(
-        F,
-        &al,
-        (6, 52),
-        'a',
-        Color::Named(NamedColor::Black),
-        Color::Named(NamedColor::Red),
-        Flags::empty(),
-    );
-    assert_cell(
-        F,
-        &al,
-        (13, 52),
-        'a',
-        Color::Named(NamedColor::Magenta),
-        bg,
-        Flags::empty(),
-    );
-    // git log hash.
-    assert_cell(
-        F,
-        &al,
-        (17, 0),
-        'f',
-        Color::Named(NamedColor::Yellow),
-        bg,
-        Flags::empty(),
-    );
-    // Scripted attribute row: bold, underline, reverse.
-    assert_cell(
-        F,
-        &al,
-        (37, 0),
-        'b',
-        Color::Named(NamedColor::Red),
-        bg,
-        Flags::BOLD,
-    );
-    assert_cell(
-        F,
-        &al,
-        (37, 9),
-        'u',
-        Color::Named(NamedColor::Green),
-        bg,
-        Flags::UNDERLINE,
-    );
-    assert_cell(F, &al, (37, 25), 'r', fg, bg, Flags::INVERSE);
-    // Color depth: 256-color index and truecolor RGB.
-    assert_cell(
-        F,
-        &al,
-        (38, 0),
-        '2',
-        Color::Indexed(208),
-        bg,
-        Flags::empty(),
-    );
-    assert_cell(
-        F,
-        &al,
-        (38, 9),
-        't',
-        Color::Spec(Rgb {
-            r: 100,
-            g: 200,
-            b: 50,
-        }),
-        bg,
-        Flags::empty(),
+        &[
+            // ls colors: executable, setuid (fg plus bg), symlink.
+            ((0, 52), 'a', red, bg, Flags::empty()),
+            ((6, 52), 'a', black, red, Flags::empty()),
+            ((13, 52), 'a', magenta, bg, Flags::empty()),
+            // git log hash.
+            ((17, 0), 'f', yellow, bg, Flags::empty()),
+            // Scripted attribute row: bold, underline, reverse.
+            ((37, 0), 'b', red, bg, Flags::BOLD),
+            ((37, 9), 'u', green, bg, Flags::UNDERLINE),
+            ((37, 25), 'r', fg, bg, Flags::INVERSE),
+            // Color depth: 256-color index and truecolor RGB.
+            ((38, 0), '2', Color::Indexed(208), bg, Flags::empty()),
+            ((38, 9), 't', truecolor, bg, Flags::empty()),
+        ],
     );
 }
 
@@ -442,23 +399,14 @@ fn compat_build_log() {
     );
 
     let bg = Color::Named(NamedColor::Background);
-    assert_cell(
+    let bright_green = Color::Named(NamedColor::BrightGreen);
+    assert_cells(
         F,
         &al,
-        (0, 3),
-        'C',
-        Color::Named(NamedColor::BrightGreen),
-        bg,
-        Flags::BOLD,
-    );
-    assert_cell(
-        F,
-        &al,
-        (34, 4),
-        'F',
-        Color::Named(NamedColor::BrightGreen),
-        bg,
-        Flags::BOLD,
+        &[
+            ((0, 3), 'C', bright_green, bg, Flags::BOLD),
+            ((34, 4), 'F', bright_green, bg, Flags::BOLD),
+        ],
     );
 }
 
@@ -570,7 +518,7 @@ fn semantic_dec_scrollregion_charset_translation() {
 }
 
 /// Assert identical styled cells, screen text, cursor state, and alternate-screen mode
-/// for one fixture replayed through [`crate::emulator::Emulator`] and a raw `Term`.
+/// for one fixture replayed through [`Emulator`] and a raw `Term`.
 fn assert_wrapper_matches(file: &str, bytes: &[u8]) {
     let al = alacritty(bytes);
     let mut emu = crate::testutil::corpus_emulator();
@@ -613,3 +561,107 @@ wrapper_oracle!(wrapper_grok_resume, "grok_resume.bin");
 wrapper_oracle!(wrapper_wide_emoji, "wide_emoji.bin");
 wrapper_oracle!(wrapper_dec_scrollregion, "dec_scrollregion.bin");
 wrapper_oracle!(wrapper_topregion_scroll, "topregion_scroll.bin");
+
+// codex_0158_terminal: release-binary output with locally scripted model responses.
+
+const REPLY: &str = "PHASE0 COMPLETE. Deterministic local response.";
+const PROMPT: &str = "Phase zero fixture: reply with the completion marker.";
+const MANIFEST: &str = include_str!("../../tests/corpus/codex_0158_terminal/manifest.json");
+const STREAMS: [&[u8]; 4] = [
+    include_bytes!("../../tests/corpus/codex_0158_terminal/0.157.1-fullscreen-transitions.bin"),
+    include_bytes!("../../tests/corpus/codex_0158_terminal/0.157.1-fullscreen-fleetcom-load.bin"),
+    include_bytes!("../../tests/corpus/codex_0158_terminal/0.158.0-fullscreen-transitions.bin"),
+    include_bytes!("../../tests/corpus/codex_0158_terminal/0.158.0-fullscreen-fleetcom-load.bin"),
+];
+
+#[test]
+fn codex_release_terminal_transitions() {
+    let manifest = jzon::parse(MANIFEST).unwrap();
+    assert_eq!(manifest["fixtures"].len(), STREAMS.len());
+    for (fixture, bytes) in manifest["fixtures"].members().zip(STREAMS) {
+        let name = fixture["name"].as_str().unwrap();
+        let outer = fixture["surface"] == "outer fleetcom client";
+        assert_eq!(fixture["bytes"].as_usize().unwrap(), bytes.len(), "{name}");
+        // Small chunks also split UTF-8 and escape sequences across parser calls.
+        for chunk_size in [usize::MAX, 7] {
+            let mut emu = Emulator::new(40, 120, 10_000);
+            assert!(!emu.alternate_screen());
+            let mut at = 0;
+            let mut resizes = fixture["resizes"].members().peekable();
+            for mark in fixture["marks"].members() {
+                let checkpoint = mark["name"].as_str().unwrap();
+                let end = mark["offset"].as_usize().unwrap();
+                // A resize at a checkpoint's end belongs to the following state.
+                while let Some(resize) = resizes.peek() {
+                    let offset = resize["offset"].as_usize().unwrap();
+                    if offset >= end {
+                        break;
+                    }
+                    for chunk in bytes[at..offset].chunks(chunk_size) {
+                        emu.process(chunk);
+                    }
+                    emu.resize(
+                        resize["resize"][0].as_u16().unwrap(),
+                        resize["resize"][1].as_u16().unwrap(),
+                    );
+                    at = offset;
+                    resizes.next();
+                }
+                for chunk in bytes[at..end].chunks(chunk_size) {
+                    emu.process(chunk);
+                }
+                at = end;
+                let context = format!("{name}/{checkpoint}, chunk size {chunk_size}");
+                assert_eq!(
+                    emu.size(),
+                    (
+                        mark["rows"].as_u16().unwrap(),
+                        mark["cols"].as_u16().unwrap()
+                    ),
+                    "{context}"
+                );
+                assert_eq!(emu.alternate_screen(), checkpoint != "exit", "{context}");
+                let text = emu.live_rows().join("\n");
+                match checkpoint {
+                    "attached" | "completed" | "copied" | "narrow" | "restored" => {
+                        assert!(text.contains(PROMPT), "{context}: missing prompt: {text}");
+                        assert!(text.contains(REPLY), "{context}: missing reply: {text}");
+                        if outer {
+                            assert!(text.contains("[attached] codex resume '"), "{context}");
+                            let replies = if checkpoint == "attached" { 1 } else { 2 };
+                            assert_eq!(text.matches(REPLY).count(), replies, "{context}");
+                        }
+                    }
+                    "new-thread" | "exit" => {
+                        assert!(!text.contains(PROMPT), "{context}: stale prompt");
+                        assert!(!text.contains(REPLY), "{context}: stale reply");
+                    }
+                    "startup" | "copy-menu" => {}
+                    other => panic!("{context}: unknown checkpoint {other}"),
+                }
+                if checkpoint == "copied" {
+                    assert!(
+                        text.contains("Copied Whole response to clipboard"),
+                        "{context}"
+                    );
+                    if name.starts_with("0.158.0") {
+                        assert!(text.contains("Copying Whole response"), "{context}");
+                    }
+                }
+                let clipboard = emu.drain_clipboard();
+                assert_eq!(clipboard.oversized_len, None, "{context}");
+                let expected = if checkpoint == "copied" {
+                    vec![(ClipboardKind::Clipboard, REPLY.to_owned())]
+                } else {
+                    vec![]
+                };
+                assert_eq!(clipboard.stores, expected, "{context}");
+                assert!(
+                    emu.drain_clipboard().stores.is_empty(),
+                    "{context}: drained twice"
+                );
+            }
+            assert_eq!(at, bytes.len(), "{name}: untested trailing output");
+        }
+    }
+}
