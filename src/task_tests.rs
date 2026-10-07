@@ -2,7 +2,7 @@ use super::*;
 use crate::{
     preview::ScreenFacts,
     testutil::{
-        env_here, here, install_resident_shell, read_pid, sh_env, temp, wait_until,
+        env_here, here, install_resident_shell, read_pid, sh_env, temp, wait_until, with_shell,
         write_executable,
     },
 };
@@ -157,9 +157,7 @@ fn managed_launch_makes_the_agent_the_task_leader_under_any_shell() {
         &agent,
         &format!("printf '%s' \"$$\" > '{}'", pid_file.display()),
     );
-    let mut env = env_here();
-    env.retain(|(k, _)| k != "SHELL");
-    env.push(("SHELL".into(), shell.into_os_string()));
+    let env = with_shell(env_here(), shell);
 
     let managed = Exec::Managed {
         binary: agent.clone(),

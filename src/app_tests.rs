@@ -2,7 +2,7 @@ use super::*;
 use crate::{
     protocol::{Preview, PreviewSource},
     supervisor::Supervisor,
-    testutil::{Scratch, temp, wait_until, write_executable},
+    testutil::{Scratch, rows, screen, temp, wait_until, write_executable},
     transport::LocalTransport,
     ui::scroll_window,
 };
@@ -1892,15 +1892,10 @@ fn paste_into_text_entry_strips_controls() {
 #[test]
 fn input_modes_match_screen_type() {
     let screen = |wants_mouse, alt_screen, alt_scroll| ScreenView {
-        id: 1,
-        lines: Vec::new(),
-        formatted: Vec::new(),
-        cursor: (0, 0),
-        hide_cursor: false,
         wants_mouse,
         alt_screen,
         alt_scroll,
-        scrollback: 0,
+        ..crate::testutil::screen(1)
     };
     // No attached screen: keep native selection available.
     assert!(!desired_mouse_capture(None, false));
@@ -1942,15 +1937,8 @@ fn input_modes_match_screen_type() {
 fn wheel_up_enters_scroll_view_for_inline_children() {
     let (mut app, id) = App::attached(30, 100, "sleep 5");
     let screen = |wants_mouse| ScreenView {
-        id,
-        lines: Vec::new(),
-        formatted: Vec::new(),
-        cursor: (0, 0),
-        hide_cursor: false,
         wants_mouse,
-        alt_screen: false,
-        alt_scroll: false,
-        scrollback: 0,
+        ..crate::testutil::screen(id)
     };
     let wheel_up = MouseEvent {
         kind: MouseEventKind::ScrollUp,
@@ -3761,18 +3749,11 @@ impl App {
     /// `lines` the test controls.
     fn attached_with_lines(lines: &[&str]) -> Self {
         let (mut app, id) = Self::attached(30, 100, "sleep 5");
-        let mut lines: Vec<String> = lines.iter().map(|l| l.to_string()).collect();
+        let mut lines = rows(lines);
         lines.resize(app.pane_rows() as usize, String::new());
         app.focused_screen = Some(ScreenView {
-            id,
             lines,
-            formatted: Vec::new(),
-            cursor: (0, 0),
-            hide_cursor: false,
-            wants_mouse: false,
-            alt_screen: false,
-            alt_scroll: false,
-            scrollback: 0,
+            ..screen(id)
         });
         app.mouse_captured = true;
         app
@@ -4120,15 +4101,8 @@ fn one_row_terminal_has_no_selectable_pane() {
     let (mut app, id) = App::attached(1, 80, "sleep 5");
     app.mouse_captured = true;
     app.focused_screen = Some(ScreenView {
-        id,
-        lines: vec!["hidden".to_string()],
-        formatted: Vec::new(),
-        cursor: (0, 0),
-        hide_cursor: false,
-        wants_mouse: false,
-        alt_screen: false,
-        alt_scroll: false,
-        scrollback: 0,
+        lines: rows(&["hidden"]),
+        ..screen(id)
     });
     app.on_mouse(press(0, 0));
     assert!(app.selection().is_none(), "the bar row is not selectable");

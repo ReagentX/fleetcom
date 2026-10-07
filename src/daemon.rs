@@ -679,7 +679,7 @@ fn serve_client(sup: &mut Supervisor, stream: UnixStream, stop: &AtomicBool) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testutil::temp;
+    use crate::testutil::{screen, temp};
 
     /// A symlink at the runtime-dir path is the planted shared-`/tmp` attack:
     /// it must be rejected even when its target is a real directory, or the
@@ -722,15 +722,8 @@ mod tests {
     fn oversized_event_is_skipped_not_fatal() {
         use crate::protocol::ScreenView;
         let oversized = Event::Screen(ScreenView {
-            id: 1,
-            lines: Vec::new(),
             formatted: vec![b'x'; MAX_FRAME as usize + 1],
-            cursor: (0, 0),
-            hide_cursor: false,
-            wants_mouse: false,
-            alt_screen: false,
-            alt_scroll: false,
-            scrollback: 0,
+            ..screen(1)
         });
         let mut buf: Vec<u8> = Vec::new();
         assert!(

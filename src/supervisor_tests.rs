@@ -4,7 +4,7 @@ use super::*;
 use crate::{
     protocol::{ClipboardKind, Key, Mods},
     testutil::{
-        Scratch, here, install_fake_notifier, now_ms, read_pid, sh_env, wait_until,
+        Scratch, here, install_fake_notifier, now_ms, read_pid, screen, sh_env, wait_until,
         write_executable,
     },
 };
@@ -1208,15 +1208,11 @@ fn worst_case_screen_frame_fits_max_frame() {
     let (formatted, cursor, hide) = ansi::formatted(&term);
     let lines: Vec<String> = ansi::contents(&term).lines().map(str::to_string).collect();
     let (kind, payload) = encode_event(&Event::Screen(ScreenView {
-        id: 1,
         lines,
         formatted,
         cursor,
         hide_cursor: hide,
-        wants_mouse: false,
-        alt_screen: false,
-        alt_scroll: false,
-        scrollback: 0,
+        ..screen(1)
     }));
     assert_eq!(kind, KIND_SCREEN);
 

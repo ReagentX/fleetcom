@@ -3,8 +3,8 @@ use crate::{
     harness::fixtures::{CODEX_CHILD, CODEX_ROOT, CODEX_TITLE, ID as CAP_ID, OTHER as CAP_OTHER},
     protocol::{Lifecycle, Preview, PreviewSource},
     testutil::{
-        codex_session_meta, dead_pid, install_codex_rollout, install_codex_root,
-        install_resident_shell,
+        codex_session_meta, dead_pid, hook_json, install_codex_rollout, install_codex_root,
+        install_resident_shell, with_shell,
     },
 };
 
@@ -103,11 +103,6 @@ fn stamped(task: &Task, json: &str) -> String {
         "{}\n{json}\n",
         task.pid().expect("a spawned task has a pid")
     )
-}
-
-/// The JSON Claude's `SessionStart` hook writes for session `id` started from `source`.
-fn hook_json(id: &str, source: &str) -> String {
-    format!(r#"{{"session_id":"{id}","hook_event_name":"SessionStart","source":"{source}"}}"#)
 }
 
 /// Save a recipe and return its persisted JSON.
@@ -1629,11 +1624,7 @@ fn managed_claude_accepts_its_own_capture_and_refuses_a_foreign_stamp() {
         ),
     );
     let mut ctx = agent_ctx(&bin, &runtime, dir.to_path_buf());
-    ctx.env.retain(|(k, _)| k != "SHELL");
-    ctx.env.push((
-        "SHELL".into(),
-        install_resident_shell(&dir).into_os_string(),
-    ));
+    ctx.env = with_shell(ctx.env, install_resident_shell(&dir));
     let mut s = sup_ctx(ctx);
     s.spawn_agent("claude", dir.to_path_buf(), None);
     assert!(acknowledged(&s.drain()), "a managed spawn is acknowledged");

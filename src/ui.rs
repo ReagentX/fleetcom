@@ -1095,13 +1095,11 @@ pub fn scroll_window(sel: usize, total: usize, max: usize) -> (usize, usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testutil::rows;
 
     #[test]
     fn selection_overlay_spans_rows_and_rounds_wide_glyphs() {
-        let lines: Vec<String> = ["a日本b", "  mid ", "tail"]
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
+        let lines = rows(&["a日本b", "  mid ", "tail"]);
         // A boundary inside 日 expands to the glyph's first cell; the middle
         // row starts at column 0 and excludes trailing whitespace.
         let mut sel = Selection::begin(0, 2);
@@ -1112,10 +1110,6 @@ mod tests {
         );
         assert!(selection_overlay(None, &lines).is_empty());
         assert!(selection_overlay(Some(&sel), &[]).is_empty());
-    }
-
-    fn rows(spec: &[&str]) -> Vec<String> {
-        spec.iter().map(|s| s.to_string()).collect()
     }
 
     /// A pane-sized grid whose first rows carry `content`, the rest blank.

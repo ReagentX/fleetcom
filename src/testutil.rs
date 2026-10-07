@@ -1,6 +1,9 @@
 //! Test scaffolds shared by the in-src test modules: scratch directories,
-//! deadline polling, and corpus fixtures. Test-only (`#[cfg(test)]`
-//! at the declaration in `main.rs`), so nothing here ships.
+//! deadline polling, child-process and launch-environment helpers, stub
+//! executables (resident shell, fake notifier), harness fixtures (Codex
+//! rollouts, Claude hook JSON), and neutral `ScreenView` and row builders.
+//! Test-only (`#[cfg(test)]` at the declaration in `main.rs`), so nothing
+//! here ships.
 
 use std::{
     ffi::OsString,
@@ -24,6 +27,7 @@ use alacritty_terminal::{
 
 use crate::{
     emulator::Emulator,
+    protocol::ScreenView,
     task::{pid_is_dead, positive_pid},
 };
 
@@ -178,13 +182,21 @@ pub(crate) fn env_here() -> Vec<(OsString, OsString)> {
     std::env::vars_os().collect()
 }
 
+/// `env` with `SHELL` pinned to `shell`: the inherited entry is dropped so the
+/// pin is the only one a launch sees.
+pub fn with_shell(
+    mut env: Vec<(OsString, OsString)>,
+    shell: impl Into<OsString>,
+) -> Vec<(OsString, OsString)> {
+    env.retain(|(k, _)| k != "SHELL");
+    env.push(("SHELL".into(), shell.into()));
+    env
+}
+
 /// `env_here` with `SHELL` pinned to `/bin/sh` for portable background-job
 /// behavior in process-group tests.
 pub(crate) fn sh_env() -> Vec<(OsString, OsString)> {
-    let mut env = env_here();
-    env.retain(|(k, _)| k != "SHELL");
-    env.push(("SHELL".into(), "/bin/sh".into()));
-    env
+    with_shell(env_here(), "/bin/sh")
 }
 
 /// Write an executable `#!/bin/sh` script at `path`. The parent must exist.
@@ -247,6 +259,37 @@ pub(crate) fn install_codex_root(home: &Path, thread: &str) -> PathBuf {
             r#"{{"id":"{thread}","session_id":"{thread}","source":"cli"}}"#
         )),
     )
+}
+
+/// The JSON object Claude's `SessionStart` hook receives on stdin for session
+/// `id` started from `source`, without the newline the hook's input carries:
+/// callers that need the complete capture payload append it.
+pub fn hook_json(id: &str, source: &str) -> String {
+    format!(
+        r#"{{"session_id":"{id}","transcript_path":"/t/x.jsonl","cwd":"/w","hook_event_name":"SessionStart","source":"{source}"}}"#
+    )
+}
+
+/// Owned rows from string literals.
+pub fn rows(spec: &[&str]) -> Vec<String> {
+    spec.iter().map(|s| s.to_string()).collect()
+}
+
+/// A neutral screen for task `id`: no rows, cursor at the origin and shown,
+/// no mouse protocol, primary screen, not scrolled back. Tests spell only the
+/// fields they exercise over it with struct-update syntax.
+pub fn screen(id: u64) -> ScreenView {
+    ScreenView {
+        id,
+        lines: Vec::new(),
+        formatted: Vec::new(),
+        cursor: (0, 0),
+        hide_cursor: false,
+        wants_mouse: false,
+        alt_screen: false,
+        alt_scroll: false,
+        scrollback: 0,
+    }
 }
 
 /// Corpus geometry: the fixture recordings in `tests/corpus/` were captured
