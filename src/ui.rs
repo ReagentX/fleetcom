@@ -31,9 +31,9 @@ pub fn render(out: &mut impl Write, app: &mut App) -> io::Result<bool> {
     let mut buf: Vec<u8> = Vec::with_capacity(app.cols as usize * app.rows as usize * 3 + 128);
     // DECSET 2026 around the whole frame
     queue!(buf, BeginSynchronizedUpdate)?;
-    // Attached and Disconnected paint alone; the rest paint the dashboard, most
-    // with an overlay on top. The match stays exhaustive so a new `Mode` fails to
-    // compile until someone decides what it paints.
+    // Render `Attached` and `Disconnected` without a dashboard. Start every other mode
+    // from the dashboard and add an overlay where needed. Keep this match exhaustive
+    // so the compiler requires a rendering choice for each new `Mode`.
     type Layer = fn(&mut Vec<u8>, &App) -> io::Result<()>;
     let (base, overlay): (Layer, Option<Layer>) = match app.mode {
         Mode::Attached => (render_attached, None),
@@ -232,9 +232,8 @@ fn transient_line(notice: Option<&str>, status: Option<&str>) -> Option<String> 
     notice.or(status).map(|s| format!("  {s}"))
 }
 
-/// Footer for a page with a Tab-reachable sibling: name the sibling and its entry
-/// count only when it has entries (the spawn prompt's Agent page, the session
-/// picker's Recovery page).
+/// Build a footer for a page that can switch to a sibling with Tab. Include the
+/// destination name and count only when the destination has entries.
 fn tab_hint(base: &str, page: &str, entries: usize) -> String {
     if entries > 0 {
         format!("{base} · tab {page} ({entries}) · esc")
@@ -1224,7 +1223,7 @@ mod tests {
         }
     }
 
-    /// Name the Tab sibling in a page hint only when it has entries.
+    /// Add the sibling page's name to the hint only when it has entries.
     #[test]
     fn tab_hint_shows_the_count_only_when_nonzero() {
         assert_eq!(

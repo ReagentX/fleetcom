@@ -70,7 +70,7 @@ impl App {
         panic!("spawn never landed: {:?}", self.status);
     }
 
-    /// Pump until task `id` has exited (`Ok` or `Failed`), or panic after 5 s.
+    /// Pump until task `id` reaches `Ok` or `Failed`; panic after 5 s.
     fn wait_finished(&mut self, id: u64) {
         let exited = wait_until(Duration::from_secs(5), || {
             self.pump();
@@ -88,7 +88,7 @@ impl App {
             .collect()
     }
 
-    /// Spawn `cmd` (which selects it) and attach to it.
+    /// Spawn `cmd`, then attach to the newly selected task.
     fn attached(rows: u16, cols: u16, cmd: &str) -> (Self, u64) {
         let mut app = Self::new_local(rows, cols);
         let dir = app.invocation_dir.clone();
@@ -112,16 +112,16 @@ fn shift(code: KeyCode) -> KeyEvent {
     KeyEvent::new(code, KeyModifiers::SHIFT)
 }
 
-/// Type `text` into the open prompt one key at a time through `handler`,
-/// the prompt's `on_key_*` method.
+/// Pass each character of `text` through `handler`, the prompt's
+/// `on_key_*` method.
 fn type_into(app: &mut App, handler: fn(&mut App, KeyEvent), text: &str) {
     for c in text.chars() {
         handler(app, key(KeyCode::Char(c)));
     }
 }
 
-/// An app attached to task `id` with no task behind it: clipboard and paste
-/// handling gate on `mode` and `focused_id` alone, never on `views`.
+/// Build an app attached to task `id` without a task view. The clipboard and paste
+/// handlers check only `mode` and `focused_id`.
 fn attached_stub(id: u64) -> App {
     let mut app = App::new_local(30, 100);
     app.mode = Mode::Attached;
@@ -137,15 +137,15 @@ fn painted(app: &mut App) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
-/// Supply core events to the app without a running core: `poll` drains
-/// `events` once, `send` discards.
+/// Provide core events without a running core. Queue `events` for one `poll`;
+/// discard commands sent through `send`.
 struct Scripted {
     events: Vec<Event>,
     connected: bool,
 }
 
 impl Scripted {
-    /// A live core that delivers `events` on the next poll.
+    /// Queue `events` for the next poll with a connected fake transport.
     fn events(events: Vec<Event>) -> Box<dyn Transport> {
         Box::new(Self {
             events,
@@ -153,8 +153,8 @@ impl Scripted {
         })
     }
 
-    /// A dropped core: nothing to deliver, and `connected` is false so
-    /// `check_connection` lands in `Mode::Disconnected`.
+    /// Mark the fake transport disconnected with no events to deliver. Let
+    /// `check_connection` switch the app to `Mode::Disconnected`.
     fn unplugged() -> Box<dyn Transport> {
         Box::new(Self {
             events: Vec::new(),
@@ -674,9 +674,9 @@ fn selection_follows_task_across_idle_rebucket() {
     assert_eq!(app.views[app.selected_task().unwrap()].id, 1);
 }
 
-/// Entering and leaving idle state preserves row order within a section,
-/// whether that section is a custom group or a directory (the group is inert
-/// in Dir mode, so one spawn shape serves both).
+/// Verify row position after a task enters and leaves idle state, in both a
+/// custom group and a directory section. Dir mode ignores the group, so both
+/// cases can use the same spawn setup.
 #[test]
 fn idle_round_trip_leaves_row_order_identical() {
     for mode in [GroupMode::Custom, GroupMode::Dir] {
@@ -711,8 +711,7 @@ fn idle_round_trip_leaves_row_order_identical() {
     }
 }
 
-/// Completed tasks sort after live tasks within a section, whether that
-/// section is a custom group or a directory.
+/// Verify completion ordering in both custom-group and directory sections.
 #[test]
 fn finished_task_sinks_within_its_section() {
     for mode in [GroupMode::Custom, GroupMode::Dir] {
@@ -951,9 +950,8 @@ fn session_selection_clamps_when_a_shorter_list_arrives() {
     assert_eq!(app.session_sel, 0);
 }
 
-/// Write the autosaved recovery snapshot for 2026-01-`day` (stem
-/// `202601DD-000000-1`) with one task running `cmd` in `dir`, and return
-/// its path.
+/// Write one autosaved recovery snapshot for 2026-01-`day`, with stem
+/// `202601DD-000000-1` and one task running `cmd` in `dir`. Return its path.
 fn autosave(dir: &Path, day: u8, cmd: &str) -> PathBuf {
     let rec = dir.join("sessions").join("recovery");
     std::fs::create_dir_all(&rec).unwrap();
@@ -1181,7 +1179,7 @@ fn recents_fixture(tag: &str) -> (App, Scratch) {
     (app, root)
 }
 
-/// Open the `@` picker and type `fragment` into it.
+/// Type `fragment` into the open `@` picker.
 fn type_pickdir(app: &mut App, fragment: &str) {
     app.on_key_dashboard(key(KeyCode::Char('@')));
     type_into(app, App::on_key_pickdir, fragment);
@@ -1459,8 +1457,8 @@ fn selection_wraps_at_list_edges() {
     );
 }
 
-/// With a single task, every navigation step is a no-op: wrap in both
-/// directions and section stepping both ways.
+/// With one task, verify that wrapping in either direction and stepping to
+/// either section leave the selection unchanged.
 #[test]
 fn navigation_is_noop_with_one_task() {
     let mut app = App::new_local(30, 100);
@@ -2201,7 +2199,7 @@ fn group_esc_cancels_without_sending() {
 
 // --- `/` find palette ---------------------------------------------------
 
-/// Type `text` into the open palette.
+/// Type `text` into the open find palette.
 fn find_type(app: &mut App, text: &str) {
     type_into(app, App::on_key_find, text);
 }
@@ -2496,8 +2494,8 @@ fn unfocused_terminal_mutes_the_highlight_rows() {
     assert!(painted(&mut app).contains(&reverse));
 }
 
-/// Open the overlay on either event form of Shift-`/` (`?`, or `/` with
-/// Shift); close it on either form, `Esc`, or `q`.
+/// Open the overlay for either Shift-`/` event: `?` or `/` with Shift.
+/// Close it with either event form, `Esc`, or `q`.
 #[test]
 fn controls_overlay_opens_on_question_and_closes_on_question_esc_q() {
     let mut app = App::new_local(30, 100);
@@ -3326,8 +3324,8 @@ fn agent_page_no_match_names_the_missing_agents() {
 
 // --- OSC 52 clipboard emission ------------------------------------------
 
-/// An attached store emits one BEL-terminated OSC 52 sequence whose
-/// selector byte names the store's kind.
+/// Verify that an attached store emits one BEL-terminated OSC 52 sequence and
+/// that its selector byte identifies the store kind.
 #[test]
 fn attached_store_emits_the_osc52_envelope_with_its_kind_byte() {
     for (kind, selector) in [
@@ -3534,8 +3532,8 @@ fn expired_warning_yields_to_info() {
     assert_eq!(app.notice(), Some("copied 5 chars"));
 }
 
-/// A status event sets the persistent status in every mode and mirrors into
-/// the ephemeral notice only while attached.
+/// Verify that status events set persistent status in every mode and mirror it
+/// into the ephemeral notice only while attached.
 #[test]
 fn status_event_mirrors_into_the_notice_only_while_attached() {
     for (mode, name, mirrored) in [

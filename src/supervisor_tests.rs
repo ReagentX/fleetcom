@@ -60,8 +60,8 @@ fn scrollback_resolution_precedence_clamp_and_fallback() {
     assert_eq!(effective_scrollback(Some(0), Some("500")), 0);
 }
 
-/// The recipe groups commands by dir and preserves spawn order within a dir.
-/// `a`/`c` share the invocation dir; `b` is off in `/tmp`.
+/// Check grouping by directory and preservation of spawn order: `a` and `c`
+/// share the invocation directory; `b` runs in `/tmp`.
 #[test]
 fn session_config_groups_by_dir_in_spawn_order() {
     let mut s = sup(24, 80);
@@ -77,9 +77,8 @@ fn session_config_groups_by_dir_in_spawn_order() {
     assert_eq!(cfg["/tmp"], vec![SessionEntry::literal("b")]);
 }
 
-/// `tick` emits exactly a `Tasks` snapshot while nothing is watched, and
-/// adds a `Screen` for the watched task once `Watch` is set: the contract
-/// the client's render loop depends on.
+/// Verify that `tick` queues only a `Tasks` snapshot when no task is watched,
+/// then queues a `Screen` for the watched task after `Watch`.
 #[test]
 fn tick_emits_snapshot_and_watched_screen() {
     let mut s = sup(24, 80);
@@ -112,8 +111,7 @@ fn tick_emits_snapshot_and_watched_screen() {
     );
 }
 
-/// A watched task whose screen hasn't changed must not re-emit a `Screen`
-/// every tick: the send-on-change that kills idle attach churn.
+/// Verify that the supervisor sends a watched task's screen only after it changes.
 #[test]
 fn watched_screen_not_resent_when_unchanged() {
     let mut s = sup(24, 80);
@@ -135,8 +133,8 @@ fn watched_screen_not_resent_when_unchanged() {
     assert!(!screen_sent(&mut s), "unchanged screen must not be resent");
 }
 
-/// A DECSET 1007 change emits a new `Screen` event even when the rendered
-/// contents are unchanged.
+/// Verify that toggling DECSET 1007 queues a `Screen` event even when the
+/// rendered contents do not change.
 #[test]
 fn decset_1007_flip_resends_watched_screen() {
     let dir = scratch("flip_1007");
@@ -172,8 +170,8 @@ fn decset_1007_flip_resends_watched_screen() {
     assert!(closed, "the ?1007l flip never re-sent the screen");
 }
 
-/// A periodic tick flushes an expired synchronized update from a child
-/// that stops producing output.
+/// Verify that a periodic tick flushes an expired synchronized update after the
+/// child stops producing output.
 #[test]
 fn tick_flushes_a_stalled_sync_update() {
     let mut s = sup(24, 80);
@@ -193,7 +191,7 @@ fn tick_flushes_a_stalled_sync_update() {
     );
 }
 
-/// Stores from the attached task are forwarded in arrival order.
+/// Forward attached-task clipboard stores in arrival order.
 #[test]
 fn watched_task_clipboard_stores_are_forwarded() {
     let dir = scratch("clip_fwd");
@@ -412,15 +410,14 @@ fn oversized_watched_store_yields_notice_and_no_copy() {
     );
 }
 
-/// Scratch dir, `sup_<tag>`-prefixed, for a test's config root, stub
-/// binaries, and marker files.
+/// Create a `sup_<tag>`-prefixed scratch directory for the test's config root,
+/// stub binaries, and marker files.
 fn scratch(tag: &str) -> Scratch {
     crate::testutil::temp(&format!("sup_{tag}"))
 }
 
-/// Spawn `command` and block until it has written `ready`: the sync that
-/// keeps a test from acting on a shell that has not yet installed its trap
-/// (kill paths) or reached its gate (clipboard and DECSET paths).
+/// Spawn `command` and wait for its `ready` marker before sending signals or
+/// changing clipboard and DECSET gates.
 fn spawn_ready(s: &mut Supervisor, command: String, cwd: PathBuf, ready: &Path) -> u64 {
     spawn(s, command, cwd);
     assert!(
@@ -487,7 +484,7 @@ fn ticks_without_copies(s: &mut Supervisor, why: &str) -> bool {
     saw_screen
 }
 
-/// Whether the first task's formatted grid contains `marker`.
+/// Search the first task's formatted grid for `marker`.
 fn grid_shows(s: &Supervisor, marker: &str) -> bool {
     s.tasks.first().is_some_and(|t| {
         let (formatted, _, _) = t.formatted();
@@ -495,8 +492,8 @@ fn grid_shows(s: &Supervisor, marker: &str) -> bool {
     })
 }
 
-/// A short-grid supervisor with one watched task scrolled into retained
-/// history: `seq 1 200` overflows six rows at once.
+/// Build a short-grid supervisor with one watched task in retained history.
+/// `seq 1 200` overflows six rows at once.
 fn scrolled_task() -> (Supervisor, u64) {
     let mut s = sup(6, 80);
     spawn(&mut s, "seq 1 200; sleep 30", here());
@@ -746,9 +743,8 @@ fn rerun_replaces_finished_task_in_place() {
     assert!(view_of(&mut s, id).tagged, "rerun must carry the tag over");
 }
 
-/// Group normalization delegates to `normalize_label` (the trim is the
-/// witness; the label test owns the rest), then reserves `Unassigned` and
-/// preserves case.
+/// Check whitespace trimming, exact-case `Unassigned` reservation, and case
+/// preservation for group labels. The label tests cover the remaining rules.
 #[test]
 fn group_names_normalize_at_the_boundary() {
     let n = |s: &str| normalize_group(Some(s.to_string()));
@@ -1131,7 +1127,7 @@ fn reap_until(
     })
 }
 
-/// Poll `reap` until task `id` has exited, or fail.
+/// Poll `reap` until the supervisor records task `id` as finished, or fail.
 fn wait_exited(s: &mut Supervisor, id: u64) {
     assert!(
         reap_until(s, Duration::from_secs(5), |s| {
@@ -1141,8 +1137,8 @@ fn wait_exited(s: &mut Supervisor, id: u64) {
     );
 }
 
-/// A `/bin/sh` supervisor running in `dir`: background-job semantics are
-/// the shell's, so the straggler fixtures pin it.
+/// Use `/bin/sh` in `dir` so the straggler fixtures use consistent
+/// background-job and trap semantics.
 fn sh_sup(dir: &Path) -> Supervisor {
     sup_ctx(LaunchContext {
         env: sh_env(),
@@ -1150,10 +1146,9 @@ fn sh_sup(dir: &Path) -> Supervisor {
     })
 }
 
-/// Run `script` as a background job in `dir` and wait for the leader to
-/// exit on its own; return the task id and the job's pid, read back from
-/// `$!`. `script` ends in the job's command and starts with the `trap`
-/// ignores the job must inherit to outlive its leader.
+/// Run `script` as a background job and wait for the task leader to exit.
+/// Return the task ID and the job PID read from `$!`. Start `script` with a
+/// `trap` that ignores the signal the child must inherit to outlive its leader.
 fn exited_leader_with_straggler(s: &mut Supervisor, dir: &Path, script: &str) -> (u64, Pid) {
     let (spid, ready) = (dir.join("spid"), dir.join("ready"));
     let id = spawn_ready(
@@ -1171,10 +1166,9 @@ fn exited_leader_with_straggler(s: &mut Supervisor, dir: &Path, script: &str) ->
     (id, straggler)
 }
 
-/// `Remove` must sweep group members the exited leader left behind (a
-/// non-interactive shell's `&` child never leaves the group): TERM at
-/// removal, delivered through the graveyard. This is the leak the old
-/// `finished.is_none()` gate guaranteed.
+/// Verify that `Remove` sends TERM through the graveyard to every group member
+/// the exited leader left behind. The `&` child stays in the shell's process group;
+/// the old `finished.is_none()` guard leaked it.
 #[test]
 fn remove_sweeps_stragglers_of_an_exited_leader() {
     let dir = scratch("remove_sweep");
@@ -1625,8 +1619,8 @@ fn session_load_emits_no_spawned() {
     );
 }
 
-/// Direct spawns reject commands above `MAX_COMMAND_LEN` with a notice and
-/// no `Spawned` ack, creating no task.
+/// Verify that direct spawns refuse commands over `MAX_COMMAND_LEN` with a
+/// notice, no `Spawned` acknowledgment, and no task.
 #[test]
 fn spawn_refuses_over_length_command() {
     let mut s = sup(24, 80);

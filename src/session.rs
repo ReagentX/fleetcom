@@ -1,7 +1,8 @@
-//! JSON session recipes: named recipes and automatic recovery snapshots share one
-//! schema (`to_json`/`from_json`), stored one file per name or stem. Every fs function
-//! takes its root from the caller; the supervisor resolves it from the connection's
-//! launch context. On load, start new tasks without restoring live processes.
+//! Serialize named recipes and automatic recovery snapshots with the same
+//! `to_json`/`from_json` schema. Store one file per recipe name or recovery stem.
+//! Let each caller choose the filesystem root. The supervisor reads its root
+//! from the connection's launch context. On load, start new tasks without
+//! restoring live processes.
 
 use std::{
     collections::BTreeMap,
@@ -601,7 +602,7 @@ mod tests {
         SessionEntry::managed(agent, resume)
     }
 
-    /// One-entry recipe: `vim` in `~/p`.
+    /// Build a one-entry recipe with `vim` in `~/p`.
     fn vim_cfg() -> SessionConfig {
         let mut cfg = SessionConfig::new();
         cfg.insert("~/p".into(), vec![e("vim")]);
@@ -1417,8 +1418,8 @@ mod tests {
     /// Out-of-range PID used for dead-writer fixtures.
     const DEAD_FIXTURE_PID: u32 = 9_999_999;
 
-    /// Write one dead-writer snapshot per `minutes` value, stemmed
-    /// `<day>-0930NN-<DEAD_FIXTURE_PID>` and labelled with that day's `09:30`.
+    /// Write one dead-writer snapshot for each value in `minutes`. Use stem
+    /// `<day>-0930NN-<DEAD_FIXTURE_PID>` and that day's 09:30 label.
     fn fill_dead(
         rec: &Path,
         day: &str,
@@ -1432,7 +1433,7 @@ mod tests {
         }
     }
 
-    /// Sorted file names under `dir`.
+    /// Return the sorted file names in `dir`.
     fn names_in(dir: &Path) -> Vec<String> {
         let mut names: Vec<String> = fs::read_dir(dir)
             .unwrap()

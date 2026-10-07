@@ -53,9 +53,8 @@ pub fn pid_is_dead(pid: i32) -> bool {
     matches!(kill(Pid::from_raw(pid), None), Err(Errno::ESRCH))
 }
 
-/// Parse a strictly positive decimal PID from ASCII digits only: `+5`, ` 5`
-/// and `-5` are rejected along with zero, which `kill` would read as a
-/// process group.
+/// Parse a positive decimal PID containing only ASCII digits. Reject signs,
+/// whitespace, and zero; `kill(0, ...)` targets a process group.
 pub fn positive_pid(field: &str) -> Option<i32> {
     if !field.bytes().all(|b| b.is_ascii_digit()) {
         return None;
@@ -69,8 +68,8 @@ pub struct Task {
     /// Working directory the command was launched in: the grouping key for
     /// "by dir" mode and the label shown when it differs from the default.
     pub cwd: PathBuf,
-    /// The PTY master, kept open for `resize` (`TIOCSWINSZ`); the reader and
-    /// writer handles were split off it at spawn.
+    /// Keep the PTY master open for `resize` (`TIOCSWINSZ`). Split the reader and
+    /// writer handles from it at spawn.
     master: Box<dyn MasterPty + Send>,
     /// Sender for the detached PTY writer worker. `None` after `force_kill`. Queue
     /// writes to avoid blocking the core thread on PTY I/O.
@@ -84,10 +83,10 @@ pub struct Task {
     pending_write: Arc<AtomicUsize>,
     /// Session-leader PID, also used as the process-group ID.
     pid: Option<u32>,
-    /// Shared with the reader thread: it writes (process bytes), the UI reads
-    /// (render/preview). Fair locking prevents repeated parser writes from
-    /// starving the supervisor's snapshot reads. `FairMutex` does not poison,
-    /// so a later access can read the state left by a panicking operation.
+    /// Share the emulator between the PTY reader, which writes process bytes,
+    /// and the UI, which renders previews. Use fair locking so repeated parser
+    /// writes do not starve snapshot reads. `FairMutex` does not poison, so
+    /// later accesses can inspect the state a panicking operation left behind.
     parser: Arc<FairMutex<Emulator>>,
     last_activity: Arc<Mutex<Instant>>,
     handle: Option<JoinHandle<()>>,
@@ -378,11 +377,10 @@ impl Task {
         self.pid
     }
 
-    /// Resolve a managed task's session ID in precedence order: capture file, live registry,
-    /// then spawn-time ID. Prefer the first two sources because a session may have been
-    /// selected after launch. Validate capture through the harness using the task's leader PID.
-    /// On rejection, try the next source. For literal tasks, skip all sources and return
-    /// `None`.
+    /// Check the capture file, then the live registry, then the spawn-time ID. A
+    /// A managed CLI can select a session after launch, so validate captured IDs
+    /// through the harness with the task leader's PID. If a source has no valid ID,
+    /// check the next source. For literal tasks, return `None`.
     pub fn current_resume_id(&self) -> Option<String> {
         if let (Some(h), Some(path)) = (self.harness, &self.capture_file)
             && let Ok(payload) = std::fs::read_to_string(path)
@@ -477,9 +475,9 @@ impl Task {
         self.reaped
     }
 
-    /// The dashboard's liveness glyph: `Ok`/`Failed` once the leader's exit is
-    /// latched (`poll_exit`), else `Idle` after `idle_after` without PTY output,
-    /// else `Active`. Derived on every snapshot, never stored.
+    /// Return the dashboard lifecycle: `Ok` or `Failed` after `poll_exit` latches
+    /// the leader's exit, `Idle` after `idle_after` without PTY output, or `Active`
+    /// otherwise. Compute it for each snapshot; do not store it.
     pub fn lifecycle(&self, now: Instant, idle_after: Duration) -> Lifecycle {
         if self.finished.is_some() {
             return if self.exit_code == Some(0) {

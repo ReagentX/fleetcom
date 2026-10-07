@@ -8,24 +8,24 @@ use crate::{
     },
 };
 
-/// Tests drive the reader directly, so there is no core loop to wake.
+/// Run reader tests without a core-loop waker.
 fn no_waker() -> Waker {
     Arc::new(Mutex::new(None))
 }
 
-/// The one `Task::spawn` call: a 24x80 grid with 2000 rows of scrollback,
-/// run from this process's cwd.
+/// Spawn a task with a 24x80 grid, 2000 rows of scrollback, and this process's
+/// working directory.
 fn spawn_with(id: u64, command: &str, exec: Exec, env: &[(OsString, OsString)]) -> Task {
     Task::spawn(id, command, exec, &here(), 24, 80, 2000, env, no_waker()).unwrap()
 }
 
-/// A literal task under this process's environment.
+/// Spawn a literal task with this process's environment.
 fn spawn(id: u64, command: &str) -> Task {
     spawn_with(id, command, Exec::Literal, &env_here())
 }
 
-/// A literal task under `sh_env`: `SHELL` pinned to `/bin/sh`, so the
-/// script's `&` jobs and `trap`s behave the same on every machine.
+/// Spawn a literal task with `SHELL=/bin/sh` so background jobs and `trap`s
+/// use consistent shell behavior in process-group tests.
 fn spawn_sh(id: u64, command: &str) -> Task {
     spawn_with(id, command, Exec::Literal, &sh_env())
 }
@@ -41,8 +41,7 @@ fn wait_finished(t: &mut Task) {
     );
 }
 
-/// Poll until the child has exited and the reader has reached EOF, so the
-/// grid holds every byte the child wrote.
+/// Wait for child exit and reader EOF before checking the complete grid output.
 fn wait_complete(t: &mut Task) {
     assert!(
         wait_until(Duration::from_secs(60), || {

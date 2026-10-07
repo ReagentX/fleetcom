@@ -291,8 +291,8 @@ pub struct App {
     pub session_page: SessionPage,
     /// Selection in the recovery list, clamped independently of `session_sel`.
     pub recovery_sel: usize,
-    /// Transient one-line notice (daemon status events, the reconnect and paste
-    /// outcomes, the ignored-scrollback warning), dismissed on the next key.
+    /// One-line status message for daemon events, reconnect and paste outcomes, or
+    /// the ignored-scrollback warning. Clear it on the next key.
     pub status: Option<String>,
     /// Ephemeral notice text, priority, and creation time.
     notice: Option<(String, NoticeLevel, Instant)>,
@@ -1238,7 +1238,7 @@ impl App {
     }
 
     fn on_key(&mut self, out: &mut impl Write, k: KeyEvent) {
-        // Any key dismisses a lingering status notice.
+        // Clear the previous status notice before handling a key.
         self.status = None;
         // Global escape hatch, except while attached (Ctrl-C belongs to the child).
         // Ctrl-C disconnects: it leaves the daemon and tasks running.

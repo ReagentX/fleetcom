@@ -83,7 +83,7 @@ struct LoadOutcome {
 }
 
 impl LoadOutcome {
-    /// The skipped and failed counts as summary clauses, each only when nonzero.
+    /// Format nonzero skipped and failed counts as summary clauses.
     fn clauses(&self) -> Vec<String> {
         let mut parts = Vec::new();
         if self.skipped > 0 {
@@ -660,7 +660,7 @@ impl Supervisor {
         if cadence_due {
             self.recovery.last_cadence = now;
         }
-        // Every path below consumes the pending mutation, written or not.
+        // Clear the pending mutation before an early return or snapshot write.
         self.recovery.last_mutation = None;
         // Do not replace an existing snapshot with an empty recipe.
         if self.tasks.is_empty() {
@@ -801,9 +801,9 @@ impl Supervisor {
             return self.capture.get(&key);
         }
         let installed = assets::CaptureAssets::install(&root, std::process::id()).ok()?;
-        // The first canonicalize fails until `install` creates `root`; resolve again so
-        // the entry is keyed by the same canonical path later lookups compute (on macOS
-        // `/tmp` is `/private/tmp`), else every lookup misses and installs anew.
+        // Call `install` first so `root` exists, then canonicalize it before caching.
+        // On macOS, use `/private/tmp` for `/tmp`; later lookups must use the same key
+        // or the daemon will reinstall the assets.
         let key = std::fs::canonicalize(&root).unwrap_or(root);
         Some(self.capture.entry(key).or_insert(installed))
     }

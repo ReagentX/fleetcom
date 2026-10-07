@@ -1,7 +1,8 @@
 #![forbid(unsafe_code)]
-// Visibility rule: private unless another module uses it, `pub(super)` when only the
-// parent does, `pub` otherwise. Every module is private to this binary, so `pub` already
-// means crate-wide and `pub(crate)` says nothing; the lint rejects it.
+// Default to private. Use `pub(super)` when callers stay within the parent
+// module's subtree, and `pub` when they need a broader scope. Every module here
+// is private to this binary, so `pub` already means crate-visible; Clippy rejects
+// redundant `pub(crate)`.
 #![warn(clippy::redundant_pub_crate)]
 
 //! `fleetcom`: a fleet-view supervisor for shell commands and managed agents. Each

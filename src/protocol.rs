@@ -43,10 +43,10 @@ pub fn env_get<'a>(env: &'a [(OsString, OsString)], key: &str) -> Option<&'a OsS
         .map(|(_, v)| v.as_os_str())
 }
 
-/// Shared env key for the runtime directory. For sockets and locks, read it
-/// from the process environment in `resolve_runtime_dir`. For captures, read
-/// it from the launch context, falling back to `runtime_root`. The fallback
-/// directories differ between these uses.
+/// Share this environment key across runtime-directory lookups. Read it from the
+/// process environment for sockets and locks in `resolve_runtime_dir`; read it
+/// from the launch context for captures, then fall back to `runtime_root`. Keep
+/// the fallback directories separate.
 pub const FLEETCOM_RUNTIME_DIR: &str = "FLEETCOM_RUNTIME_DIR";
 
 /// A client→core request. Every mutation of the task set is one of these; the
@@ -276,7 +276,7 @@ pub enum Lifecycle {
 }
 
 impl Lifecycle {
-    /// Lowercase state identifier used as the protocol `life` tag.
+    /// Return the lowercase state value for the protocol's `life` tag.
     pub fn label(self) -> &'static str {
         match self {
             Self::Active => "active",
@@ -286,7 +286,7 @@ impl Lifecycle {
         }
     }
 
-    /// Parse an exact [`Self::label`] string.
+    /// Parse only a string returned by [`Self::label`].
     pub fn from_label(s: &str) -> Option<Self> {
         match s {
             "active" => Some(Self::Active),
@@ -317,7 +317,7 @@ pub enum PreviewSource {
 }
 
 impl PreviewSource {
-    /// Lowercase provenance identifier, also the protocol `src` tag.
+    /// Return the lowercase provenance value for the protocol's `src` tag.
     pub fn label(self) -> &'static str {
         match self {
             Self::Floor => "floor",
@@ -327,7 +327,7 @@ impl PreviewSource {
         }
     }
 
-    /// Parse an exact [`Self::label`] string.
+    /// Parse only a string returned by [`Self::label`].
     pub fn from_label(s: &str) -> Option<Self> {
         match s {
             "floor" => Some(Self::Floor),
@@ -394,11 +394,10 @@ pub struct TaskView {
     pub finished_ago: Option<Duration>,
 }
 
-/// The watched task's screen, in both forms the UI needs: `lines` is the
-/// plain-text grid for everything that reads text (the peek box, selection
-/// extraction and its overlay), `formatted` (+cursor) is the styled stream for
-/// attached rendering. Only ever produced for the single watched task, so
-/// carrying both is cheap.
+/// The watched task's screen in the two forms the UI uses. Read `lines` for the
+/// peek box and selection; use `formatted` with `cursor` for styled attached
+/// rendering. The supervisor sends both only for the watched task, which keeps
+/// the extra payload small.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScreenView {
     pub id: u64,
@@ -564,8 +563,8 @@ pub fn decode_hello(kind: u8, payload: &[u8]) -> Option<(u32, LaunchContext)> {
     ))
 }
 
-/// Extract the claimed protocol version of a hello-kind frame for mismatch
-/// reporting, even when the remaining fields do not satisfy [`decode_hello`].
+/// Extract a `KIND_HELLO` frame's claimed version for mismatch reporting, even
+/// when its other fields fail [`decode_hello`].
 pub fn hello_version(kind: u8, payload: &[u8]) -> Option<u32> {
     if kind != KIND_HELLO {
         return None;

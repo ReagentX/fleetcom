@@ -93,13 +93,14 @@ fn resolve_runtime_dir(
     tmp.join(format!("fleetcom-{uid}"))
 }
 
-/// Runtime-directory filenames; docs/README.md documents all three.
+/// Use these names for the runtime socket, lock, and log files. See
+/// `docs/README.md` for their paths.
 const SOCKET_FILE: &str = "default.sock";
 const LOCK_FILE: &str = "daemon.lock";
 const LOG_FILE: &str = "daemon.log";
 
-/// Open the single-instance lock file, creating it if absent, without truncating:
-/// the pid inside is rewritten only once the flock is ours.
+/// Open or create the single-instance lock file without truncating it. The caller
+/// writes this process's PID only after acquiring the flock.
 fn open_lock(dir: &Path) -> io::Result<fs::File> {
     fs::OpenOptions::new()
         .create(true)

@@ -462,8 +462,8 @@ fn tasks_round_trip() {
     assert_eq!(decode_event(k, &p), Some(tasks));
 }
 
-/// `SetGroup` emits `"g"` and `SetName` emits `"n"` only for an assignment. A
-/// missing or null key decodes as a clear; a present value must be a string.
+/// Encode `SetGroup` assignments with key `"g"` and `SetName` assignments with
+/// key `"n"`. Decode missing or null keys as clears; require strings for present values.
 #[test]
 fn set_group_and_set_name_wire_forms() {
     for (set, cleared, key, set_wire, null_wire, bad_wire) in [
@@ -496,7 +496,7 @@ fn set_group_and_set_name_wire_forms() {
         let (_, p) = encode_command(&cleared);
         let p = String::from_utf8(p).unwrap();
         assert!(!p.contains(key), "clearing must omit {key}; frame was {p}");
-        // An explicit null clears, same as an omitted key.
+        // Treat explicit null the same as an omitted key when decoding.
         assert_eq!(
             decode_command(KIND_CONTROL, null_wire.as_bytes()),
             Some(cleared),
@@ -510,8 +510,7 @@ fn set_group_and_set_name_wire_forms() {
     }
 }
 
-/// Task frames omit `"group"` and `"name"` when unset; an absent key decodes
-/// as `None`.
+/// Omit `group` and `name` when a task has no labels; decode missing keys as `None`.
 #[test]
 fn tasks_frame_label_keys_are_optional() {
     let labels = |v: &[TaskView]| (v[0].group.clone(), v[0].name.clone());
@@ -521,7 +520,7 @@ fn tasks_frame_label_keys_are_optional() {
         Some(Event::Tasks(v)) => assert_eq!(labels(&v), (None, None)),
         other => panic!("expected tasks event, got {other:?}"),
     }
-    // Encoding an unassigned, unnamed task omits both keys.
+    // Omit both keys when encoding an unassigned, unnamed task.
     let (_, p) = encode_event(&Event::Tasks(vec![tv(1)]));
     assert_eq!(std::str::from_utf8(&p).unwrap(), unlabelled);
 
@@ -655,8 +654,8 @@ fn preview_source_and_frozen_round_trip() {
     }
 }
 
-/// Same-version task frames require a known source and boolean frozen and
-/// managed flags; the managed flag round-trips in both states.
+/// Require a known source and boolean `frozen` and `managed` values in same-version task
+/// frames. Round-trip the managed flag in both states.
 #[test]
 fn tasks_frame_requires_row_fields() {
     for managed in [false, true] {

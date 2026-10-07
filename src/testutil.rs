@@ -1,9 +1,8 @@
-//! Test scaffolds shared by the in-src test modules: scratch directories,
-//! deadline polling, child-process and launch-environment helpers, stub
-//! executables (resident shell, fake notifier), harness fixtures (Codex
-//! rollouts, Claude hook JSON), and neutral `ScreenView` and row builders.
-//! Test-only (`#[cfg(test)]` at the declaration in `main.rs`), so nothing
-//! here ships.
+//! Test helpers shared by in-source modules: scratch directories, deadline
+//! polling, child processes and launch environments, stub executables (resident
+//! shells and fake notifiers), Codex rollout and Claude hook fixtures, neutral
+//! `ScreenView` values, and row builders. Compile this module only under
+//! `#[cfg(test)]` in `main.rs` so these helpers stay out of builds.
 
 use std::{
     ffi::OsString,
@@ -182,8 +181,8 @@ pub fn env_here() -> Vec<(OsString, OsString)> {
     std::env::vars_os().collect()
 }
 
-/// `env` with `SHELL` pinned to `shell`: the inherited entry is dropped so the
-/// pin is the only one a launch sees.
+/// Return `env` with inherited `SHELL` entries removed and `shell` as the sole
+/// value passed to the launch.
 pub fn with_shell(
     mut env: Vec<(OsString, OsString)>,
     shell: impl Into<OsString>,
@@ -193,8 +192,8 @@ pub fn with_shell(
     env
 }
 
-/// `env_here` with `SHELL` pinned to `/bin/sh` for portable background-job
-/// behavior in process-group tests.
+/// Return this process's environment with `SHELL=/bin/sh` for predictable
+/// background-job behavior in process-group tests.
 pub fn sh_env() -> Vec<(OsString, OsString)> {
     with_shell(env_here(), "/bin/sh")
 }
@@ -257,23 +256,23 @@ pub fn install_codex_root(home: &Path, thread: &str) -> PathBuf {
     )
 }
 
-/// The JSON object Claude's `SessionStart` hook receives on stdin for session
-/// `id` started from `source`, without the newline the hook's input carries:
-/// callers that need the complete capture payload append it.
+/// Build the JSON object Claude's `SessionStart` hook receives for session `id`
+/// started from `source`. Omit the newline present in hook stdin; callers that need
+/// the complete capture payload can append it.
 pub fn hook_json(id: &str, source: &str) -> String {
     format!(
         r#"{{"session_id":"{id}","transcript_path":"/t/x.jsonl","cwd":"/w","hook_event_name":"SessionStart","source":"{source}"}}"#
     )
 }
 
-/// Owned rows from string literals.
+/// Build owned rows from string literals.
 pub fn rows(spec: &[&str]) -> Vec<String> {
     spec.iter().map(|s| s.to_string()).collect()
 }
 
-/// A neutral screen for task `id`: no rows, cursor at the origin and shown,
-/// no mouse protocol, primary screen, not scrolled back. Tests spell only the
-/// fields they exercise over it with struct-update syntax.
+/// Build an empty screen for task `id` with the cursor shown at `(0, 0)`,
+/// mouse reporting and alternate-screen modes off, and no scrollback offset.
+/// Use struct update syntax to override only the fields a test exercises.
 pub fn screen(id: u64) -> ScreenView {
     ScreenView {
         id,

@@ -40,8 +40,8 @@ pub trait ScreenFacts {
 }
 
 /// Display-only status and model-label extraction for one agent CLI.
-/// `live_preview` is the adapter's reason to exist and stays required; reads
-/// that can honestly be absent default to `None`.
+/// Require every adapter to implement `live_preview`. Return `None` from model-label
+/// and title-normalization methods when an adapter has no value to report.
 pub trait SummaryAdapter: Sync {
     /// Return normalized live status and its matcher ID when the expected
     /// chrome is present. `rows` contains live rows with trailing padding
@@ -340,8 +340,8 @@ mod tests {
             }
         }
 
-        /// On the alternate screen with `title` captured, `floor` left on the
-        /// primary screen underneath.
+        /// Build an alternate-screen fixture with `floor` on the primary screen and
+        /// `title` captured on the alternate screen.
         fn alt_titled(floor: &str, title: &str) -> Self {
             let mut s = Self::primary(floor);
             s.enter_alt();
@@ -427,7 +427,7 @@ mod tests {
     }
 
     impl StubAdapter {
-        /// A working status with the given model label.
+        /// Build a stub adapter with a working status and the given model label.
         fn working(label: Option<&'static str>) -> Self {
             Self {
                 live: Some(("Working", "stub:working")),
