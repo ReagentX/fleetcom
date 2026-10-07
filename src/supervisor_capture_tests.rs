@@ -38,7 +38,7 @@ fn agent_ctx(bin: &Path, runtime: &Path, cwd: PathBuf) -> LaunchContext {
             ),
             ("SHELL".into(), "/bin/sh".into()),
             (
-                "FLEETCOM_RUNTIME_DIR".into(),
+                FLEETCOM_RUNTIME_DIR.into(),
                 runtime.as_os_str().to_os_string(),
             ),
         ],
@@ -398,9 +398,7 @@ fn rerun_cannot_read_the_old_runs_stale_capture() {
         stamped(&s.tasks[0], &format!(r#"{{"session_id":"{CAP_ID}"}}"#)),
     )
     .unwrap();
-    assert!(reap_until(&mut s, Duration::from_secs(5), |s| s.tasks[0]
-        .finished
-        .is_some()));
+    wait_exited(&mut s, id);
 
     s.apply(Command::Restart { id });
     let new_cap = s.tasks[0].capture_file.clone().expect("capture file set");
@@ -420,25 +418,6 @@ fn rerun_cannot_read_the_old_runs_stale_capture() {
         Some(CAP_ID),
         "the fresh run must save its launch target, never the old run's stale capture"
     );
-}
-
-/// Removing a task also removes its capture file.
-#[test]
-fn remove_deletes_the_capture_file() {
-    use crate::protocol::Lifecycle;
-    let dir = scratch("cap_remove");
-    let (bin, runtime) = (dir.join("bin"), dir.join("run"));
-    install_stub(&bin, "claude", &dir);
-    let mut s = sup_ctx(agent_ctx(&bin, &runtime, dir.to_path_buf()));
-    s.spawn_agent("claude", dir.to_path_buf(), None);
-    let _ = wait_argv(&mut s, &dir.join("argv"));
-    let id = s.tasks[0].id;
-    wait_for_lifecycle(&mut s, id, |l| l == Lifecycle::Ok);
-    let cap = s.tasks[0].capture_file.clone().unwrap();
-    std::fs::write(&cap, "{}").unwrap();
-
-    s.apply(Command::Remove { id });
-    assert!(!cap.exists(), "Remove must delete the task's capture file");
 }
 
 /// Reconnecting with the active root reuses installed assets and preserves
@@ -502,7 +481,6 @@ fn returning_to_a_prior_root_preserves_its_live_captures() {
 /// not under whichever root the current client presents.
 #[test]
 fn remove_deletes_the_capture_file_under_the_spawn_root() {
-    use crate::protocol::Lifecycle;
     let dir = scratch("cap_remove_cross");
     let (bin, root_a, root_b) = (dir.join("bin"), dir.join("run-a"), dir.join("run-b"));
     install_stub(&bin, "claude", &dir);
@@ -1282,9 +1260,8 @@ fn home_only_launch_env_targets_the_clients_dot_codex() {
         ["-c", "features.daemon_auto_start=false"],
         "the guard must read <home>/.codex/config.toml and inject only embedded mode"
     );
-    assert!(reap_until(&mut s, Duration::from_secs(5), |s| s.tasks[0]
-        .finished
-        .is_some()));
+    let id = s.tasks[0].id;
+    wait_exited(&mut s, id);
 
     assert_eq!(
         saved_entries(&mut s, &config, "homeonly"),
@@ -1331,9 +1308,8 @@ fn stale_inherited_notify_chain_is_never_executed() {
     ));
     let mut s = sup_ctx(ctx);
     s.spawn_agent("codex", dir.to_path_buf(), None);
-    assert!(reap_until(&mut s, Duration::from_secs(5), |s| s.tasks[0]
-        .finished
-        .is_some()));
+    let id = s.tasks[0].id;
+    wait_exited(&mut s, id);
     let cap = s.tasks[0].capture_file.clone().expect("capture file set");
     assert_eq!(
         std::fs::read_to_string(&cap).unwrap(),
@@ -1369,9 +1345,8 @@ fn managed_save_without_any_id_omits_resume() {
         ],
     ));
     s.spawn_agent("codex", dir.to_path_buf(), None);
-    assert!(reap_until(&mut s, Duration::from_secs(5), |s| s.tasks[0]
-        .finished
-        .is_some()));
+    let id = s.tasks[0].id;
+    wait_exited(&mut s, id);
 
     let text = save_and_read(&mut s, &config, "plainagent");
     assert!(
@@ -1976,14 +1951,7 @@ fn tick_until_preview(
 ) -> Preview {
     let mut last = None;
     wait_until(budget, || {
-        s.tick();
-        for e in s.drain() {
-            if let Event::Tasks(v) = e
-                && let Some(t) = v.into_iter().next()
-            {
-                last = Some(t.preview);
-            }
-        }
+        last = snapshot(s).into_iter().next().map(|t| t.preview);
         last.as_ref().is_some_and(&mut pred)
     });
     last.expect("a Tasks snapshot must carry the task's preview")
@@ -2048,12 +2016,8 @@ fn registry_waiting_status_reaches_the_dashboard_preview() {
     // After exit, a changed record must neither retain nor replace the cached
     // blocked preview.
     std::fs::write(&done, b"").unwrap();
-    assert!(
-        reap_until(&mut s, Duration::from_secs(5), |s| s.tasks[0]
-            .finished
-            .is_some()),
-        "the leader never exited"
-    );
+    let id = s.tasks[0].id;
+    wait_exited(&mut s, id);
     install_status_record(
         &claude_home,
         pid,
