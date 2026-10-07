@@ -139,7 +139,7 @@ Press `m` to toggle the "in use" tag, marked `◆`. In state mode, tagged tasks 
 
 Press `M` to select the next tagged task in dashboard order, wrapping after the last. With no tagged tasks, the selection is unchanged; with one, that task is selected.
 
-In custom mode only, a new command is assigned the selected task's group, through both `n` and the `@` picker. The destination is shown in the spawn prompt as `❯ dir ▸ group ▸ command`, each segment present only when it applies: the dir segment for a non-default directory, the group segment when a group will be inherited. New tasks are unassigned in state and dir modes.
+In custom mode only, a new command is assigned the selected task's group, through both `n` and the `@` picker. The destination is shown in the spawn prompt as `❯ dir ▸ group ▸ command`, each segment present only when it applies: the dir segment for a non-default directory, the group segment when a group will be inherited. New tasks are unassigned in state and dir modes. In dir mode, `n` instead opens in the selected task's directory; the `@` picker is unaffected.
 
 #### The flagship
 
