@@ -564,16 +564,13 @@ pub fn decode_hello(kind: u8, payload: &[u8]) -> Option<(u32, LaunchContext)> {
     ))
 }
 
-/// Extract a claimed protocol version for mismatch reporting.
-/// Accepts hello-kind frames and control frames with a `hello` discriminant,
-/// even when the remaining fields do not satisfy [`decode_hello`].
+/// Extract the claimed protocol version of a hello-kind frame for mismatch
+/// reporting, even when the remaining fields do not satisfy [`decode_hello`].
 pub fn hello_version(kind: u8, payload: &[u8]) -> Option<u32> {
-    let v = jzon::parse(std::str::from_utf8(payload).ok()?).ok()?;
-    match kind {
-        KIND_HELLO => v["v"].as_u32(),
-        KIND_CONTROL if v["t"].as_str() == Some("hello") => v["v"].as_u32(),
-        _ => None,
+    if kind != KIND_HELLO {
+        return None;
     }
+    jzon::parse(std::str::from_utf8(payload).ok()?).ok()?["v"].as_u32()
 }
 
 /// Serialize a command to `(kind, payload)` for [`crate::frame::write_frame`].

@@ -55,16 +55,6 @@ fn v3_hello_is_refused_as_a_version_mismatch() {
     expect_refusal(&mut stream, "v3");
 }
 
-/// A v2 control-frame hello is reported as a version mismatch.
-#[test]
-fn v2_hello_is_refused_as_a_version_mismatch() {
-    let (dir, _daemon, mut stream) = start_daemon_raw("v2hello", |_| {});
-    let cwd = dir.display().to_string();
-    let v2 = format!(r#"{{"t":"hello","v":2,"cwd":"{cwd}","env":[[[65],[66]]]}}"#);
-    stream.write_all(&control_frame(&v2)).unwrap();
-    expect_refusal(&mut stream, "v2");
-}
-
 #[test]
 fn pre_handshake_command_is_refused() {
     let (_dir, _daemon, mut stream) = start_daemon_raw("nohello", |_| {});
