@@ -45,7 +45,7 @@ pub struct SessionEntry {
 #[cfg(test)]
 impl SessionEntry {
     /// Unlabelled literal entry.
-    pub(crate) fn literal(cmd: &str) -> Self {
+    pub fn literal(cmd: &str) -> Self {
         Self {
             kind: EntryKind::Literal(cmd.into()),
             group: None,
@@ -54,7 +54,7 @@ impl SessionEntry {
     }
 
     /// Unlabelled managed entry.
-    pub(crate) fn managed(agent: &str, resume: Option<&str>) -> Self {
+    pub fn managed(agent: &str, resume: Option<&str>) -> Self {
         Self {
             kind: EntryKind::Managed {
                 agent: agent.into(),

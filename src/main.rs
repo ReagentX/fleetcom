@@ -1,4 +1,8 @@
 #![forbid(unsafe_code)]
+// Visibility rule: private unless another module uses it, `pub(super)` when only the
+// parent does, `pub` otherwise. Every module is private to this binary, so `pub` already
+// means crate-wide and `pub(crate)` says nothing; the lint rejects it.
+#![warn(clippy::redundant_pub_crate)]
 
 //! `fleetcom`: a fleet-view supervisor for shell commands and managed agents. Each
 //! task runs in its own PTY; the dashboard groups them by status, and you can
@@ -36,7 +40,7 @@ mod terminal;
 #[cfg(test)]
 mod testutil;
 
-pub(crate) use terminal::{ansi, emulator, input};
+pub use terminal::{ansi, emulator, input};
 
 use std::{
     io::{self, IsTerminal},
@@ -347,7 +351,7 @@ fn emit_restore_sequences(out: &mut impl io::Write, kitty_pushed: bool) -> io::R
 /// the terminal instead of dying in raw mode, and the daemon kills its tasks
 /// cleanly. `flag::register` only stores into an atomic, so it stays within
 /// `#![forbid(unsafe_code)]`.
-pub(crate) fn install_signal_handlers(flag: Arc<AtomicBool>) -> io::Result<()> {
+pub fn install_signal_handlers(flag: Arc<AtomicBool>) -> io::Result<()> {
     use signal_hook::consts::{SIGHUP, SIGINT, SIGTERM};
     signal_hook::flag::register(SIGTERM, Arc::clone(&flag))?;
     signal_hook::flag::register(SIGHUP, Arc::clone(&flag))?;

@@ -323,7 +323,7 @@ fn capture_id(v: &jzon::JsonValue, key: &str) -> Option<String> {
 
 /// Generate a v4 UUID from `/dev/urandom`. Return `None` on a read failure; launch
 /// without pinning an ID in that case.
-pub(crate) fn uuid_v4() -> Option<String> {
+pub fn uuid_v4() -> Option<String> {
     use std::fmt::Write;
     let mut bytes = [0u8; 16];
     File::open("/dev/urandom")
@@ -344,22 +344,22 @@ pub(crate) fn uuid_v4() -> Option<String> {
 
 /// Fixtures for harness launch and capture tests.
 #[cfg(test)]
-pub(crate) mod fixtures {
+pub mod fixtures {
     use std::{ffi::OsString, path::PathBuf};
 
     use super::CapturePaths;
 
     /// Strict v4 UUID used wherever a valid session ID is needed.
-    pub(crate) const ID: &str = "c8c4a5cc-0b32-4ba0-a6b4-6ed08c218e0d";
+    pub const ID: &str = "c8c4a5cc-0b32-4ba0-a6b4-6ed08c218e0d";
     /// A second distinct ID for precedence cases.
-    pub(crate) const OTHER: &str = "11111111-2222-4333-8444-555555555555";
+    pub const OTHER: &str = "11111111-2222-4333-8444-555555555555";
 
     /// Thread IDs reported through one codex process's notifier: the conversation on
     /// screen, a sub-agent it spawned, and the hidden title thread. Codex thread IDs are
     /// v7; use these so fixtures match real rollouts (`is_uuid` checks no version field).
-    pub(crate) const CODEX_ROOT: &str = "019f5453-de22-7240-b2e5-0d32692aa6d9";
-    pub(crate) const CODEX_CHILD: &str = "019f5454-0c11-7b33-9a4e-5f0e6d7c8b9a";
-    pub(crate) const CODEX_TITLE: &str = "019f5453-de9f-7e61-8c0d-1a2b3c4d5e6f";
+    pub const CODEX_ROOT: &str = "019f5453-de22-7240-b2e5-0d32692aa6d9";
+    pub const CODEX_CHILD: &str = "019f5454-0c11-7b33-9a4e-5f0e6d7c8b9a";
+    pub const CODEX_TITLE: &str = "019f5453-de9f-7e61-8c0d-1a2b3c4d5e6f";
 
     /// Argv elements from string literals, for snapshot assertions.
     pub(super) fn argv(words: &[&str]) -> Vec<OsString> {

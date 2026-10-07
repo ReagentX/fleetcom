@@ -36,7 +36,7 @@ const SCRATCH_PREFIX: &str = "fleetcom_test2_";
 
 /// Scratch directory removed on drop. A panic preserves it for inspection;
 /// later runs reclaim it after the owner exits.
-pub(crate) struct Scratch(PathBuf);
+pub struct Scratch(PathBuf);
 
 impl std::ops::Deref for Scratch {
     type Target = Path;
@@ -56,7 +56,7 @@ impl Drop for Scratch {
 
 /// Create an empty `<prefix><tag>_<pid>_<seq>` directory under the system temp
 /// directory. The PID separates processes; the sequence separates calls.
-pub(crate) fn temp(tag: &str) -> Scratch {
+pub fn temp(tag: &str) -> Scratch {
     static SEQ: AtomicU32 = AtomicU32::new(0);
     sweep_dead_scratch();
     let seq = SEQ.fetch_add(1, Ordering::Relaxed);
@@ -131,7 +131,7 @@ fn legacy_scratch_names_are_rejected_by_the_prefix() {
 
 /// Poll `pred` until it holds or `budget` elapses; returns the final answer.
 /// `pred` always runs at least once.
-pub(crate) fn wait_until(budget: Duration, mut pred: impl FnMut() -> bool) -> bool {
+pub fn wait_until(budget: Duration, mut pred: impl FnMut() -> bool) -> bool {
     let deadline = Instant::now() + budget;
     loop {
         if pred() {
@@ -145,7 +145,7 @@ pub(crate) fn wait_until(budget: Duration, mut pred: impl FnMut() -> bool) -> bo
 }
 
 /// Milliseconds since the Unix epoch.
-pub(crate) fn now_ms() -> u64 {
+pub fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
         .unwrap()
@@ -153,7 +153,7 @@ pub(crate) fn now_ms() -> u64 {
 }
 
 /// Read a pid a test task wrote, waiting for the write to land.
-pub(crate) fn read_pid(path: &Path) -> nix::unistd::Pid {
+pub fn read_pid(path: &Path) -> nix::unistd::Pid {
     let mut pid = None;
     wait_until(Duration::from_secs(5), || {
         pid = fs::read_to_string(path)
@@ -165,7 +165,7 @@ pub(crate) fn read_pid(path: &Path) -> nix::unistd::Pid {
 }
 
 /// Return the PID of a child process after reaping it.
-pub(crate) fn dead_pid() -> u32 {
+pub fn dead_pid() -> u32 {
     let mut child = Command::new("sh").arg("-c").arg("exit 0").spawn().unwrap();
     let pid = child.id();
     child.wait().unwrap();
@@ -173,12 +173,12 @@ pub(crate) fn dead_pid() -> u32 {
 }
 
 /// Return this process's working directory.
-pub(crate) fn here() -> PathBuf {
+pub fn here() -> PathBuf {
     std::env::current_dir().unwrap()
 }
 
 /// Snapshot this process's environment for a launch context.
-pub(crate) fn env_here() -> Vec<(OsString, OsString)> {
+pub fn env_here() -> Vec<(OsString, OsString)> {
     std::env::vars_os().collect()
 }
 
@@ -195,12 +195,12 @@ pub fn with_shell(
 
 /// `env_here` with `SHELL` pinned to `/bin/sh` for portable background-job
 /// behavior in process-group tests.
-pub(crate) fn sh_env() -> Vec<(OsString, OsString)> {
+pub fn sh_env() -> Vec<(OsString, OsString)> {
     with_shell(env_here(), "/bin/sh")
 }
 
 /// Write an executable `#!/bin/sh` script at `path`. The parent must exist.
-pub(crate) fn write_executable(path: &Path, body: &str) {
+pub fn write_executable(path: &Path, body: &str) {
     fs::write(path, format!("#!/bin/sh\n{body}\n")).unwrap();
     fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
 }
@@ -210,7 +210,7 @@ pub(crate) fn write_executable(path: &Path, body: &str) {
 /// keeps it resident: `sh` execs a script's last simple command in its own place, which
 /// would hand the child the leader PID. Set it as `SHELL` to verify that a managed launch
 /// bypasses the shell.
-pub(crate) fn install_resident_shell(dir: &Path) -> PathBuf {
+pub fn install_resident_shell(dir: &Path) -> PathBuf {
     let shell = dir.join("resident-sh");
     write_executable(&shell, "[ \"$1\" = -c ] || exit 2\n/bin/sh -c \"$2\"\n:");
     shell
@@ -218,7 +218,7 @@ pub(crate) fn install_resident_shell(dir: &Path) -> PathBuf {
 
 /// Install a fake notifier at `path` that records its argv, one token
 /// per line, into `record`.
-pub(crate) fn install_fake_notifier(path: &Path, record: &Path) {
+pub fn install_fake_notifier(path: &Path, record: &Path) {
     fs::create_dir_all(path.parent().unwrap()).unwrap();
     write_executable(
         path,
@@ -228,7 +228,7 @@ pub(crate) fn install_fake_notifier(path: &Path, record: &Path) {
 
 /// First line of a Codex rollout: the `session_meta` envelope around
 /// `payload`, newline-terminated like every rollout line.
-pub(crate) fn codex_session_meta(payload: &str) -> String {
+pub fn codex_session_meta(payload: &str) -> String {
     format!(
         r#"{{"timestamp":"2026-10-04T17:49:56.012Z","ordinal":0,"type":"session_meta","payload":{payload}}}"#
     ) + "\n"
@@ -236,11 +236,7 @@ pub(crate) fn codex_session_meta(payload: &str) -> String {
 
 /// Write `contents` as the rollout of `thread` under the Codex `home` and
 /// return its path.
-pub(crate) fn install_codex_rollout(
-    home: &Path,
-    thread: &str,
-    contents: impl AsRef<[u8]>,
-) -> PathBuf {
+pub fn install_codex_rollout(home: &Path, thread: &str, contents: impl AsRef<[u8]>) -> PathBuf {
     let day = home.join("sessions/2026/10/04");
     fs::create_dir_all(&day).unwrap();
     let path = day.join(format!("rollout-2026-10-04T13-49-56-{thread}.jsonl"));
@@ -251,7 +247,7 @@ pub(crate) fn install_codex_rollout(
 /// Install the rollout header of a root thread: `session_id` equals `id` and
 /// `source` is a string. Include only the fields used for capture validation;
 /// other fields are present in a real header.
-pub(crate) fn install_codex_root(home: &Path, thread: &str) -> PathBuf {
+pub fn install_codex_root(home: &Path, thread: &str) -> PathBuf {
     install_codex_rollout(
         home,
         thread,
@@ -294,13 +290,13 @@ pub fn screen(id: u64) -> ScreenView {
 
 /// Corpus geometry: the fixture recordings in `tests/corpus/` were captured
 /// under a 40-row, 120-column PTY (tests/corpus/README.md).
-pub(crate) const CORPUS_LINES: usize = 40;
-pub(crate) const CORPUS_COLS: usize = 120;
+pub const CORPUS_LINES: usize = 40;
+pub const CORPUS_COLS: usize = 120;
 
 /// A raw backend `Term` of `lines`×`cols` with `bytes` parsed into it: the
 /// reference grid for tests that compare the wrapper or the serializer
 /// against the backend without going through `Emulator`.
-pub(crate) fn parse_term(bytes: &[u8], lines: usize, cols: usize) -> Term<VoidListener> {
+pub fn parse_term(bytes: &[u8], lines: usize, cols: usize) -> Term<VoidListener> {
     let mut term = Term::new(Config::default(), &TermSize::new(cols, lines), VoidListener);
     let mut parser: Processor = Processor::new();
     parser.advance(&mut term, bytes);
@@ -309,6 +305,6 @@ pub(crate) fn parse_term(bytes: &[u8], lines: usize, cols: usize) -> Term<VoidLi
 
 /// An emulator sized for corpus replay: corpus geometry plus enough
 /// scrollback (2000 rows) to retain every fixture's history.
-pub(crate) fn corpus_emulator() -> Emulator {
+pub fn corpus_emulator() -> Emulator {
     Emulator::new(CORPUS_LINES as u16, CORPUS_COLS as u16, 2000)
 }

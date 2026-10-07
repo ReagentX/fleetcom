@@ -36,7 +36,7 @@ use crate::preview::SummaryAdapter;
 
 /// Preview text shared by approval-menu matchers and Claude's registry
 /// permission prompt.
-pub(crate) const AWAITING_APPROVAL: &str = "awaiting approval";
+pub const AWAITING_APPROVAL: &str = "awaiting approval";
 
 /// Whether `c` is a Unicode Braille Patterns code point used as a spinner
 /// frame by the supported CLIs.

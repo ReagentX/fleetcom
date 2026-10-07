@@ -49,14 +49,14 @@ pub struct WriteRefused {
 
 /// Return true only when signal 0 reports `ESRCH`. `EPERM` remains potentially
 /// live so callers do not delete another owner's files.
-pub(crate) fn pid_is_dead(pid: i32) -> bool {
+pub fn pid_is_dead(pid: i32) -> bool {
     matches!(kill(Pid::from_raw(pid), None), Err(Errno::ESRCH))
 }
 
 /// Parse a strictly positive decimal PID from ASCII digits only: `+5`, ` 5`
 /// and `-5` are rejected along with zero, which `kill` would read as a
 /// process group.
-pub(crate) fn positive_pid(field: &str) -> Option<i32> {
+pub fn positive_pid(field: &str) -> Option<i32> {
     if !field.bytes().all(|b| b.is_ascii_digit()) {
         return None;
     }
@@ -434,7 +434,7 @@ impl Task {
     }
 
     /// Report whether the reader reached EOF without driving the reap loop.
-    pub(crate) fn reader_done(&self) -> bool {
+    pub fn reader_done(&self) -> bool {
         self.handle.as_ref().is_none_or(|h| h.is_finished())
     }
 

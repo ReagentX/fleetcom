@@ -353,7 +353,7 @@ pub struct Preview {
 
 impl Preview {
     /// An unfrozen `Floor` preview of `text`.
-    pub(crate) fn floor(text: String) -> Self {
+    pub fn floor(text: String) -> Self {
         Self {
             text,
             source: PreviewSource::Floor,
@@ -461,7 +461,7 @@ fn bool_flag(v: &jzon::JsonValue) -> Option<bool> {
 /// Decode an optional-string field: missing and null both mean the cleared
 /// state (`Some(None)`), a string is the set state, and any other type
 /// rejects the message (`None`).
-pub(crate) fn opt_str(v: &jzon::JsonValue) -> Option<Option<String>> {
+pub fn opt_str(v: &jzon::JsonValue) -> Option<Option<String>> {
     if v.is_null() {
         return Some(None);
     }
@@ -470,7 +470,7 @@ pub(crate) fn opt_str(v: &jzon::JsonValue) -> Option<Option<String>> {
 
 /// Insert `key` only when the optional field is set; absence encodes `None`
 /// on the wire (see [`opt_str`]).
-pub(crate) fn insert_opt_str(o: &mut jzon::JsonValue, key: &str, val: &Option<String>) {
+pub fn insert_opt_str(o: &mut jzon::JsonValue, key: &str, val: &Option<String>) {
     if let Some(s) = val {
         let _ = o.insert(key, s.as_str());
     }

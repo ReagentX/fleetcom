@@ -1177,7 +1177,7 @@ impl App {
     }
 
     /// Return whether nonempty input matches no existing group.
-    pub(crate) fn group_is_new(&self) -> bool {
+    pub fn group_is_new(&self) -> bool {
         !self.group_input.is_empty() && self.group_candidates.len() < 2
     }
 
