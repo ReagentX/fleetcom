@@ -59,9 +59,13 @@ pub(crate) fn pid_is_dead(pid: i32) -> bool {
     matches!(kill(Pid::from_raw(pid), None), Err(Errno::ESRCH))
 }
 
-/// Parse an untrimmed, strictly positive decimal PID. Rejecting zero and
-/// negatives avoids `kill` process-group semantics.
+/// Parse a strictly positive decimal PID from ASCII digits only: `+5`, ` 5`
+/// and `-5` are rejected along with zero, which `kill` would read as a
+/// process group.
 pub(crate) fn positive_pid(field: &str) -> Option<i32> {
+    if !field.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
     field.parse::<i32>().ok().filter(|p| *p > 0)
 }
 

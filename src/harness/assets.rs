@@ -209,9 +209,6 @@ fn reap_dead_namespaces(root: &Path) {
 /// Parse `<positive decimal pid>-<12 lowercase hex characters>`.
 fn namespace_owner(name: &str) -> Option<i32> {
     let (pid, nonce) = name.split_once('-')?;
-    if pid.is_empty() || !pid.bytes().all(|b| b.is_ascii_digit()) {
-        return None;
-    }
     if nonce.len() != 12
         || !nonce
             .bytes()

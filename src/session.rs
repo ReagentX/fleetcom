@@ -544,9 +544,6 @@ pub fn load_recovery_in(dir: &Path, stem: &str) -> io::Result<SessionConfig> {
 /// Parse a recovery stem's trailing positive `i32` process ID.
 fn stem_pid(stem: &str) -> Option<i32> {
     let (_, pid) = stem.rsplit_once('-')?;
-    if pid.is_empty() || !pid.bytes().all(|b| b.is_ascii_digit()) {
-        return None;
-    }
     positive_pid(pid)
 }
 

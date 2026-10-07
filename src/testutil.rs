@@ -95,8 +95,7 @@ fn scratch_pid_of(name: &str) -> Option<i32> {
 fn scratch_pid(suffix: &str) -> Option<i32> {
     let (rest, seq) = suffix.rsplit_once('_')?;
     let (_, pid) = rest.rsplit_once('_')?;
-    let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
-    if !digits(seq) || !digits(pid) {
+    if seq.is_empty() || !seq.bytes().all(|b| b.is_ascii_digit()) {
         return None;
     }
     positive_pid(pid)
@@ -113,6 +112,7 @@ fn scratch_pid_reads_the_pid_field() {
     // A suffix without all three components is invalid.
     assert_eq!(scratch_pid("tag_123"), None);
     assert_eq!(scratch_pid("tag_0_4"), None);
+    assert_eq!(scratch_pid("tag_+123_4"), None);
 }
 
 /// Names outside the current namespace are ineligible for sweeping.
