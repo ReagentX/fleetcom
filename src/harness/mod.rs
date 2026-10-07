@@ -157,8 +157,8 @@ fn agent(program: &str) -> Option<&'static Agent> {
     AGENTS.iter().find(|a| a.harness.shape().0 == program)
 }
 
-/// Look up a harness by its exact registered `program` word, as used for managed launches
-/// and session entries.
+/// Look up the harness registered for an exact program word used by a managed
+/// launch or session entry. Do not match paths or basenames.
 pub fn registered(program: &str) -> Option<&'static dyn Harness> {
     agent(program).map(|a| a.harness)
 }
@@ -273,8 +273,8 @@ pub struct CapturePaths {
     /// Extension module loaded by `omp -e`, which appends to the user's own
     /// extensions rather than replacing them.
     pub omp_capture: PathBuf,
-    /// The daemon's executable as probed by [`assets::fleetcom_binary`] at allocation;
-    /// `None` when it is unusable.
+    /// Store the executable path returned by the allocation-time probe; use
+    /// `None` when it finds no usable executable.
     pub fleetcom_binary: Option<PathBuf>,
 }
 

@@ -90,7 +90,7 @@ impl Harness for Claude {
 /// Validated fields used to correlate a registry record with a task and render
 /// its blocked status.
 struct SessionRecord {
-    /// `sessionId`, validated by [`super::is_uuid`].
+    /// Validate `sessionId` with [`super::is_uuid`].
     id: String,
     pid: i32,
     cwd: PathBuf,

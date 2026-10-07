@@ -31,7 +31,7 @@ fn grok_screen<S: AsRef<str>>(above: &[S]) -> Vec<String> {
     rows
 }
 
-/// Place the provided rows above an adjacent two-row omp input box.
+/// Place the supplied rows above the two-row omp input box.
 fn omp_screen<S: AsRef<str>>(above: &[S]) -> Vec<String> {
     let mut rows: Vec<String> = above.iter().map(|s| s.as_ref().to_string()).collect();
     rows.push("╭── π  > ⬢ model · ◒ high > ◫ 12.2%/131K ▶──╮".to_string());

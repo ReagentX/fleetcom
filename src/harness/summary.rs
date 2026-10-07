@@ -57,8 +57,7 @@ fn after_digits(s: &str) -> Option<&str> {
     (rest.len() < s.len()).then_some(rest)
 }
 
-/// Whether `row`, trimmed, runs from the `open` corner glyph to the `close` one: a
-/// horizontal border of a rounded input box.
+/// Check whether the trimmed row starts with `open` and ends with `close`.
 fn box_edge(row: &str, open: char, close: char) -> bool {
     let t = row.trim();
     t.starts_with(open) && t.ends_with(close)
@@ -766,10 +765,10 @@ const OMP_CURSORS: &[&str] = &["❯", "\u{f054}", ">"];
 /// painted status row above it. Without the box, check for the approval selector
 /// displayed in its place.
 ///
-/// Locate status by Unicode box corners. Do not use ASCII `+` and `-`: the same glyphs
-/// are present in transcript tables and rules. Accept the plain-text approval selector
-/// under ASCII. No model label: omp's model text is user-configurable status-line
-/// content, not a stable label.
+/// Locate status with Unicode box corners; ASCII `+` and `-` also occur in
+/// transcript tables and rules. Accept the ASCII approval selector when the
+/// input box is absent. Do not extract a model label from omp's status line:
+/// users can customize that text, so it does not identify a stable model.
 pub struct OmpSummary;
 
 impl SummaryAdapter for OmpSummary {
