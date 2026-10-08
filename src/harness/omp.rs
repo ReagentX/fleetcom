@@ -10,7 +10,7 @@
 //! Capture is unavailable before omp 18.3.2: without the agent kind in the
 //! extension context, top-level sessions cannot be distinguished from sub-agents.
 //!
-//! omp's IDs are UUIDv7. [`is_uuid`](super::is_uuid) validates the 8-4-4-4-12
+//! omp's IDs are `UUIDv7`. [`is_uuid`](super::is_uuid) validates the 8-4-4-4-12
 //! lowercase-hex shape and not the version field, so they pass unchanged.
 
 use std::path::Path;
@@ -51,7 +51,7 @@ mod tests {
         plan,
     };
 
-    /// Valid UUIDv7 used in capture payloads.
+    /// Valid `UUIDv7` used in capture payloads.
     const CAPTURED: &str = "01a0077c-e18e-7000-ae0b-016f4834b6e9";
 
     /// The extension path from [`paths`].

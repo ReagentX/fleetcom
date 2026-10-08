@@ -1278,7 +1278,7 @@ mod tests {
             lifecycle,
             quiet_ago,
             finished_ago,
-            started_ago: Duration::from_secs(2 * 60 * 60),
+            started_ago: Duration::from_hours(2),
             ..view(None)
         }
     }
@@ -1286,7 +1286,7 @@ mod tests {
     /// Use exit, quiet, or launch age in the time column according to task state.
     #[test]
     fn task_row_time_column_follows_lifecycle() {
-        let quiet = Some(Duration::from_secs(4 * 60)); // renders "4m"
+        let quiet = Some(Duration::from_mins(4)); // renders "4m"
         let exited = Some(Duration::from_secs(3)); // renders "3s"
         let cases = [
             (Lifecycle::Ok, None, exited, "3s"),

@@ -1104,9 +1104,9 @@ mod tests {
         let mut wide_cells = 0usize;
         let mut colored_cells = 0usize;
         for seed in [
-            0x9e3779b97f4a7c15u64,
-            0xdeadbeefcafef00d,
-            0x0123456789abcdef,
+            0x9e37_79b9_7f4a_7c15_u64,
+            0xdead_beef_cafe_f00d,
+            0x0123_4567_89ab_cdef,
         ] {
             let bytes = escape_soup(seed, 4000, 24, 80);
             let source = parse_term(&bytes, 24, 80);

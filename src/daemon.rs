@@ -69,7 +69,7 @@ fn runtime_dir() -> PathBuf {
     resolve_runtime_dir(
         std::env::var(FLEETCOM_RUNTIME_DIR).ok(),
         std::env::var("XDG_RUNTIME_DIR").ok(),
-        std::env::temp_dir(),
+        &std::env::temp_dir(),
         nix::unistd::getuid().as_raw(),
     )
 }
@@ -79,7 +79,7 @@ fn runtime_dir() -> PathBuf {
 fn resolve_runtime_dir(
     override_dir: Option<String>,
     xdg: Option<String>,
-    tmp: PathBuf,
+    tmp: &Path,
     uid: u32,
 ) -> PathBuf {
     if let Some(d) = override_dir {
@@ -345,7 +345,7 @@ fn spawn_daemon(dir: &Path) -> io::Result<()> {
     cmd.arg("--daemon")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(log.map(Stdio::from).unwrap_or_else(Stdio::null))
+        .stderr(log.map_or_else(Stdio::null, Stdio::from))
         .process_group(0);
     // Pass the client's scrollback flag to the daemon through its environment.
     if let Some(lines) = supervisor::scrollback_flag() {
@@ -775,27 +775,22 @@ mod tests {
         let tmp = PathBuf::from("/tmpdir");
         // Prefer the explicit override over all other sources.
         assert_eq!(
-            resolve_runtime_dir(
-                Some("/override".into()),
-                Some("/xdg".into()),
-                tmp.clone(),
-                501
-            ),
+            resolve_runtime_dir(Some("/override".into()), Some("/xdg".into()), &tmp, 501),
             PathBuf::from("/override")
         );
         // XDG next, namespaced.
         assert_eq!(
-            resolve_runtime_dir(None, Some("/run/user/501".into()), tmp.clone(), 501),
+            resolve_runtime_dir(None, Some("/run/user/501".into()), &tmp, 501),
             PathBuf::from("/run/user/501/fleetcom")
         );
         // An *empty* XDG value is unset in spirit: fall through.
         assert_eq!(
-            resolve_runtime_dir(None, Some(String::new()), tmp.clone(), 501),
+            resolve_runtime_dir(None, Some(String::new()), &tmp, 501),
             PathBuf::from("/tmpdir/fleetcom-501")
         );
         // The uid-suffixed tmp fallback (the macOS steady state).
         assert_eq!(
-            resolve_runtime_dir(None, None, tmp, 42),
+            resolve_runtime_dir(None, None, &tmp, 42),
             PathBuf::from("/tmpdir/fleetcom-42")
         );
     }

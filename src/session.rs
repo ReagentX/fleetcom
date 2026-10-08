@@ -127,12 +127,12 @@ fn dirs_json(cfg: &SessionConfig) -> jzon::JsonValue {
                 EntryKind::Literal(cmd) => jzon::object! { "cmd": cmd.as_str() },
                 EntryKind::Managed { agent, resume } => {
                     let mut m = jzon::object! { "agent": agent.as_str() };
-                    insert_opt_str(&mut m, "resume", resume);
+                    insert_opt_str(&mut m, "resume", resume.as_deref());
                     m
                 }
             };
-            insert_opt_str(&mut m, "group", &e.group);
-            insert_opt_str(&mut m, "name", &e.name);
+            insert_opt_str(&mut m, "group", e.group.as_deref());
+            insert_opt_str(&mut m, "name", e.name.as_deref());
             let _ = arr.push(m);
         }
         let _ = dirs.insert(dir, arr);
@@ -1169,7 +1169,7 @@ mod tests {
             SessionConfig::from([
                 ("dirs".into(), vec![]),
                 ("name".into(), vec![e("")]),
-                ("".into(), vec![]),
+                (String::new(), vec![]),
             ])
         );
     }
@@ -1198,7 +1198,7 @@ mod tests {
         }
         assert_eq!(
             from_json(r#"{"name": "", "dirs": {}}"#).unwrap().0,
-            Some("".into())
+            Some(String::new())
         );
     }
 

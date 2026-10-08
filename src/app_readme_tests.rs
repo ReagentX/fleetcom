@@ -587,7 +587,7 @@ fn cargo_test_screen(id: u64) -> ScreenView {
     ];
     ScreenView {
         id,
-        lines: lines.iter().map(|s| s.to_string()).collect(),
+        lines: lines.iter().map(ToString::to_string).collect(),
         // Peek reads plain lines; formatted bytes are unused.
         formatted: Vec::new(),
         cursor: (0, 0),

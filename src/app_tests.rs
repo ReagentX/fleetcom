@@ -35,17 +35,17 @@ impl App {
         self.sync();
     }
 
-    fn spawn_in(&mut self, cmd: &str, cwd: PathBuf) {
+    fn spawn_in(&mut self, cmd: &str, cwd: &Path) {
         self.spawn_checked(cmd, cwd, None);
     }
 
-    fn spawn_grouped(&mut self, cmd: &str, cwd: PathBuf, group: &str) {
+    fn spawn_grouped(&mut self, cmd: &str, cwd: &Path, group: &str) {
         self.spawn_checked(cmd, cwd, Some(group));
     }
 
     /// Send a spawn and retry transient failures. Failed spawns leave
     /// `next_id` unchanged, so retries preserve task IDs.
-    fn spawn_checked(&mut self, cmd: &str, cwd: PathBuf, group: Option<&str>) {
+    fn spawn_checked(&mut self, cmd: &str, cwd: &Path, group: Option<&str>) {
         self.pump();
         let want = self.views.len() + 1;
         for attempt in 0u64..5 {
@@ -54,7 +54,7 @@ impl App {
             }
             self.transport.send(Command::Spawn {
                 command: cmd.to_string(),
-                cwd: cwd.clone(),
+                cwd: cwd.to_path_buf(),
                 group: group.map(str::to_string),
             });
             self.pump();
@@ -92,7 +92,7 @@ impl App {
     fn attached(rows: u16, cols: u16, cmd: &str) -> (Self, u64) {
         let mut app = Self::new_local(rows, cols);
         let dir = app.invocation_dir.clone();
-        app.spawn_in(cmd, dir);
+        app.spawn_in(cmd, &dir);
         app.attach();
         let id = app.focused_id.expect("attached");
         (app, id)
@@ -275,10 +275,10 @@ fn selection_follows_task_across_reorder() {
 fn spawn_moves_selection_to_the_new_task() {
     let mut app = App::new_local(30, 100);
     let dir = app.invocation_dir.clone();
-    app.spawn_in("sleep 30", dir.clone());
+    app.spawn_in("sleep 30", &dir);
     let first = app.selected_id.expect("first spawn selected");
 
-    app.spawn_in("sleep 31", dir);
+    app.spawn_in("sleep 31", &dir);
     let second = app.selected_id.expect("second spawn selected");
     assert_ne!(first, second, "selection must move off the prior task");
     assert_eq!(
@@ -324,7 +324,7 @@ fn two_spawns_in_one_sync_select_the_last() {
 fn refused_spawn_leaves_selection_alone() {
     let mut app = App::new_local(30, 100);
     let dir = app.invocation_dir.clone();
-    app.spawn_in("sleep 30", dir.clone());
+    app.spawn_in("sleep 30", &dir);
     let kept = app.selected_id;
     assert!(kept.is_some());
 
@@ -350,7 +350,7 @@ fn refused_spawn_leaves_selection_alone() {
 fn pending_select_ignores_snapshots_without_the_id() {
     let mut app = App::new_local(30, 100);
     let dir = app.invocation_dir.clone();
-    app.spawn_in("sleep 30", dir);
+    app.spawn_in("sleep 30", &dir);
     let kept = app.selected_id;
 
     app.pending_select = Some(9999);
@@ -419,10 +419,10 @@ fn dir_mode_groups_by_cwd() {
 fn custom_sections_collate_case_insensitively() {
     let mut app = App::new_local(30, 100);
     let inv = app.invocation_dir.clone();
-    app.spawn_grouped("sleep 5", inv.clone(), "zebra"); // id 1
-    app.spawn_grouped("sleep 5", inv.clone(), "API"); // id 2
-    app.spawn_grouped("sleep 5", inv.clone(), "Review"); // id 3
-    app.spawn_grouped("sleep 5", inv, "api"); // id 4
+    app.spawn_grouped("sleep 5", &inv, "zebra"); // id 1
+    app.spawn_grouped("sleep 5", &inv, "API"); // id 2
+    app.spawn_grouped("sleep 5", &inv, "Review"); // id 3
+    app.spawn_grouped("sleep 5", &inv, "api"); // id 4
     app.group_mode = GroupMode::Custom;
 
     assert_eq!(
@@ -445,8 +445,8 @@ fn dir_sections_collate_case_insensitively() {
     let (upper, lower) = (base.join("Zed"), base.join("apple"));
     std::fs::create_dir_all(&upper).unwrap();
     std::fs::create_dir_all(&lower).unwrap();
-    app.spawn_in("sleep 5", upper.clone()); // id 1
-    app.spawn_in("sleep 5", lower.clone()); // id 2
+    app.spawn_in("sleep 5", &upper); // id 1
+    app.spawn_in("sleep 5", &lower); // id 2
     app.group_mode = GroupMode::Dir;
 
     let (z, a) = (path::abbreviate(&upper), path::abbreviate(&lower));
@@ -478,9 +478,9 @@ fn group_mode_cycles_state_dir_custom() {
 fn custom_mode_groups_by_name_with_unassigned_last() {
     let mut app = App::new_local(30, 100);
     let inv = app.invocation_dir.clone();
-    app.spawn_grouped("sleep 5", inv.clone(), "beta"); // id 1
-    app.spawn_grouped("sleep 5", inv.clone(), "alpha"); // id 2
-    app.spawn_in("sleep 5", inv); // id 3, no group
+    app.spawn_grouped("sleep 5", &inv, "beta"); // id 1
+    app.spawn_grouped("sleep 5", &inv, "alpha"); // id 2
+    app.spawn_in("sleep 5", &inv); // id 3, no group
 
     app.group_mode = GroupMode::Custom;
     assert_eq!(
@@ -498,13 +498,13 @@ fn custom_mode_groups_by_name_with_unassigned_last() {
 fn custom_mode_unassigned_tracks_membership() {
     let mut app = App::new_local(30, 100);
     let inv = app.invocation_dir.clone();
-    app.spawn_grouped("sleep 5", inv, "alpha"); // id 1
+    app.spawn_grouped("sleep 5", &inv, "alpha"); // id 1
     app.group_mode = GroupMode::Custom;
     assert_eq!(app.section_ids(), vec![("alpha".to_string(), vec![1])]);
 
     let mut app = App::new_local(30, 100);
     let inv = app.invocation_dir.clone();
-    app.spawn_in("sleep 5", inv); // id 1, no group
+    app.spawn_in("sleep 5", &inv); // id 1, no group
     app.group_mode = GroupMode::Custom;
     assert_eq!(app.section_ids(), vec![("Unassigned".to_string(), vec![1])]);
 }
@@ -514,8 +514,8 @@ fn custom_mode_unassigned_tracks_membership() {
 fn custom_mode_selection_survives_group_move() {
     let mut app = App::new_local(30, 100);
     let inv = app.invocation_dir.clone();
-    app.spawn_grouped("sleep 5", inv.clone(), "alpha"); // id 1
-    app.spawn_grouped("sleep 5", inv, "beta"); // id 2
+    app.spawn_grouped("sleep 5", &inv, "alpha"); // id 1
+    app.spawn_grouped("sleep 5", &inv, "beta"); // id 2
     app.group_mode = GroupMode::Custom;
     // Exercise moving id 1 rather than the selected second spawn.
     app.selected_id = Some(1);
@@ -545,9 +545,9 @@ fn custom_mode_clusters_by_dir_within_group() {
     std::fs::create_dir_all(&dir_a).unwrap();
     std::fs::create_dir_all(&dir_b).unwrap();
 
-    app.spawn_grouped("sleep 5", dir_b, "alpha"); // id 1, dir b
-    app.spawn_grouped("sleep 5", dir_a.clone(), "alpha"); // id 2, dir a
-    app.spawn_grouped("sleep 5", dir_a, "alpha"); // id 3, dir a
+    app.spawn_grouped("sleep 5", &dir_b, "alpha"); // id 1, dir b
+    app.spawn_grouped("sleep 5", &dir_a, "alpha"); // id 2, dir a
+    app.spawn_grouped("sleep 5", &dir_a, "alpha"); // id 3, dir a
 
     app.group_mode = GroupMode::Custom;
     assert_eq!(
@@ -563,7 +563,7 @@ fn custom_mode_clusters_by_dir_within_group() {
 fn tagging_a_finished_task_moves_it_to_in_use() {
     let mut app = App::new_local(30, 100);
     let inv = app.invocation_dir.clone();
-    app.spawn_in("true", inv); // exits ~immediately
+    app.spawn_in("true", &inv); // exits ~immediately
     app.wait_finished(1);
     assert!(matches!(
         app.views[0].lifecycle,
@@ -585,10 +585,10 @@ fn tagging_a_finished_task_moves_it_to_in_use() {
 fn idle_task_lands_in_idle_between_running_and_completed() {
     let mut app = App::new_local(30, 100);
     let inv = app.invocation_dir.clone();
-    app.spawn_in("sleep 5", inv.clone()); // id 1: running
-    app.spawn_in("sleep 5", inv.clone()); // id 2: idle below
-    app.spawn_in("sleep 5", inv.clone()); // id 3: tagged below
-    app.spawn_in("true", inv); // id 4: exits ~immediately
+    app.spawn_in("sleep 5", &inv); // id 1: running
+    app.spawn_in("sleep 5", &inv); // id 2: idle below
+    app.spawn_in("sleep 5", &inv); // id 3: tagged below
+    app.spawn_in("true", &inv); // id 4: exits ~immediately
     app.wait_finished(4);
     app.transport.send(Command::Tag { id: 3, on: true });
     app.pump();
@@ -612,8 +612,8 @@ fn idle_task_lands_in_idle_between_running_and_completed() {
 fn tagged_task_stays_in_use_across_lifecycles() {
     let mut app = App::new_local(30, 100);
     let inv = app.invocation_dir.clone();
-    app.spawn_in("sleep 5", inv.clone()); // id 1: tagged + idle
-    app.spawn_in("sleep 5", inv); // id 2: running
+    app.spawn_in("sleep 5", &inv); // id 1: tagged + idle
+    app.spawn_in("sleep 5", &inv); // id 2: running
     app.transport.send(Command::Tag { id: 1, on: true });
     app.pump();
 
@@ -642,8 +642,8 @@ fn tagged_task_stays_in_use_across_lifecycles() {
 fn selection_follows_task_across_idle_rebucket() {
     let mut app = App::new_local(30, 100);
     let dir = app.invocation_dir.clone();
-    app.spawn_in("sleep 5", dir.clone()); // id 1
-    app.spawn_in("sleep 5", dir); // id 2
+    app.spawn_in("sleep 5", &dir); // id 1
+    app.spawn_in("sleep 5", &dir); // id 2
     app.selected_id = Some(1);
 
     // Idle id 1 -> it sinks into "Idle", below id 2's "Running".
@@ -682,9 +682,9 @@ fn idle_round_trip_leaves_row_order_identical() {
     for mode in [GroupMode::Custom, GroupMode::Dir] {
         let mut app = App::new_local(30, 100);
         let inv = app.invocation_dir.clone();
-        app.spawn_grouped("sleep 5", inv.clone(), "alpha"); // id 1
-        app.spawn_grouped("sleep 5", inv.clone(), "alpha"); // id 2
-        app.spawn_grouped("sleep 5", inv.clone(), "alpha"); // id 3
+        app.spawn_grouped("sleep 5", &inv, "alpha"); // id 1
+        app.spawn_grouped("sleep 5", &inv, "alpha"); // id 2
+        app.spawn_grouped("sleep 5", &inv, "alpha"); // id 3
         app.group_mode = mode;
         let label = match mode {
             GroupMode::Custom => "alpha".to_string(),
@@ -717,8 +717,8 @@ fn finished_task_sinks_within_its_section() {
     for mode in [GroupMode::Custom, GroupMode::Dir] {
         let mut app = App::new_local(30, 100);
         let inv = app.invocation_dir.clone();
-        app.spawn_grouped("true", inv.clone(), "alpha"); // id 1: exits ~immediately
-        app.spawn_grouped("sleep 30", inv.clone(), "alpha"); // id 2: stays live
+        app.spawn_grouped("true", &inv, "alpha"); // id 1: exits ~immediately
+        app.spawn_grouped("sleep 30", &inv, "alpha"); // id 2: stays live
         app.wait_finished(1);
         app.group_mode = mode;
         let label = match mode {
@@ -739,8 +739,8 @@ fn finished_task_sinks_within_its_section() {
 fn custom_mode_tagged_task_floats_and_holds_while_idle() {
     let mut app = App::new_local(30, 100);
     let inv = app.invocation_dir.clone();
-    app.spawn_grouped("sleep 5", inv.clone(), "alpha"); // id 1
-    app.spawn_grouped("sleep 5", inv, "alpha"); // id 2: tagged below
+    app.spawn_grouped("sleep 5", &inv, "alpha"); // id 1
+    app.spawn_grouped("sleep 5", &inv, "alpha"); // id 2: tagged below
     app.group_mode = GroupMode::Custom;
     assert_eq!(app.section_ids(), vec![("alpha".to_string(), vec![1, 2])]);
 
@@ -772,14 +772,14 @@ fn state_mode_ordering_survives_the_row_key_split() {
     std::fs::create_dir_all(&dir_a).unwrap();
     std::fs::create_dir_all(&dir_b).unwrap();
 
-    app.spawn_in("sleep 30", dir_b.clone()); // id 1: running, dir b
-    app.spawn_in("sleep 30", dir_a.clone()); // id 2: running, dir a
-    app.spawn_in("sleep 30", dir_b.clone()); // id 3: idle, dir b
-    app.spawn_in("sleep 30", dir_a.clone()); // id 4: idle, dir a
-    app.spawn_in("sleep 30", dir_b.clone()); // id 5: tagged, dir b
-    app.spawn_in("sleep 30", dir_a.clone()); // id 6: tagged + idle, dir a
-    app.spawn_in("true", dir_b.clone()); // id 7: finished, dir b
-    app.spawn_in("true", dir_a.clone()); // id 8: finished, dir a
+    app.spawn_in("sleep 30", &dir_b); // id 1: running, dir b
+    app.spawn_in("sleep 30", &dir_a); // id 2: running, dir a
+    app.spawn_in("sleep 30", &dir_b); // id 3: idle, dir b
+    app.spawn_in("sleep 30", &dir_a); // id 4: idle, dir a
+    app.spawn_in("sleep 30", &dir_b); // id 5: tagged, dir b
+    app.spawn_in("sleep 30", &dir_a); // id 6: tagged + idle, dir a
+    app.spawn_in("true", &dir_b); // id 7: finished, dir b
+    app.spawn_in("true", &dir_a); // id 8: finished, dir a
     app.wait_finished(7);
     app.wait_finished(8);
     for id in [5u64, 6] {
@@ -826,11 +826,8 @@ fn rerun_key_is_gated_to_finished_tasks() {
     let mut app = App::new_local(30, 100);
     let dir = temp("app_rerun");
     let marker = dir.join("marker");
-    app.spawn_in("sleep 30", dir.to_path_buf()); // id 1: stays running
-    app.spawn_in(
-        &format!("echo run >> {}", marker.display()),
-        dir.to_path_buf(),
-    ); // id 2
+    app.spawn_in("sleep 30", &dir); // id 1: stays running
+    app.spawn_in(&format!("echo run >> {}", marker.display()), &dir); // id 2
     wait_until(Duration::from_secs(5), || {
         app.pump();
         app.views
@@ -855,9 +852,7 @@ fn rerun_key_is_gated_to_finished_tasks() {
     app.on_key_dashboard(key(KeyCode::Char('r')));
     wait_until(Duration::from_secs(5), || {
         app.pump();
-        std::fs::read_to_string(&marker)
-            .map(|s| s.lines().count() == 2)
-            .unwrap_or(false)
+        std::fs::read_to_string(&marker).is_ok_and(|s| s.lines().count() == 2)
     });
     assert_eq!(
         std::fs::read_to_string(&marker).unwrap().lines().count(),
@@ -1122,9 +1117,9 @@ fn esc_closes_the_picker_from_the_recovery_page() {
 fn recent_dirs_are_distinct_and_newest_first() {
     let mut app = App::new_local(30, 100);
     let inv = app.invocation_dir.clone();
-    app.spawn_in("sleep 5", PathBuf::from("/tmp")); // id 1  /tmp
-    app.spawn_in("sleep 5", inv.clone()); // id 2  invocation
-    app.spawn_in("sleep 5", PathBuf::from("/tmp")); // id 3  /tmp (dup)
+    app.spawn_in("sleep 5", Path::new("/tmp")); // id 1  /tmp
+    app.spawn_in("sleep 5", &inv); // id 2  invocation
+    app.spawn_in("sleep 5", Path::new("/tmp")); // id 3  /tmp (dup)
 
     let dirs = app.in_use_dirs();
     assert_eq!(dirs.len(), 2, "duplicate dirs collapse");
@@ -1174,7 +1169,7 @@ fn recents_fixture(tag: &str) -> (App, Scratch) {
     app.invocation_dir = rust.join("fleetcom");
     // Spawn oldest first so `in_use_dirs` returns Logria, crabapple, crabstep.
     for name in ["crabstep", "crabapple", "Logria"] {
-        app.spawn_in("sleep 5", rust.join(name));
+        app.spawn_in("sleep 5", &rust.join(name));
     }
     (app, root)
 }
@@ -1331,7 +1326,7 @@ fn pickdir_empty_input_lists_every_recent() {
 fn pickdir_dedupes_a_recent_that_is_also_a_subdirectory() {
     let (mut app, root) = recents_fixture("pickdir_recent_dedupe");
     let docs = root.join("Documents/Code/Rust/fleetcom/docs");
-    app.spawn_in("sleep 5", docs.clone());
+    app.spawn_in("sleep 5", &docs);
 
     type_pickdir(&mut app, "doc");
 
@@ -1352,8 +1347,8 @@ fn pickdir_dedupes_a_recent_that_is_also_a_subdirectory() {
 fn focus_by_id_survives_index_shift() {
     let mut app = App::new_local(30, 100);
     let inv = app.invocation_dir.clone();
-    app.spawn_in("sleep 5", inv.clone()); // id 1
-    app.spawn_in("sleep 5", inv); // id 2
+    app.spawn_in("sleep 5", &inv); // id 1
+    app.spawn_in("sleep 5", &inv); // id 2
     app.focused_id = Some(2);
     assert_eq!(app.views[app.focused_task().unwrap()].id, 2);
 
@@ -1372,8 +1367,8 @@ fn focus_by_id_survives_index_shift() {
 fn rows_interleave_headers_and_tasks() {
     let mut app = App::new_local(30, 100);
     let inv = app.invocation_dir.clone();
-    app.spawn_in("a", inv); // id 1, invocation dir
-    app.spawn_in("b", PathBuf::from("/tmp")); // id 2, /tmp
+    app.spawn_in("a", &inv); // id 1, invocation dir
+    app.spawn_in("b", Path::new("/tmp")); // id 2, /tmp
 
     app.group_mode = GroupMode::Dir;
     let rows = app.list_rows();
@@ -1392,7 +1387,7 @@ fn dashboard_selection_stays_in_scroll_window() {
     let mut app = App::new_local(30, 100);
     let inv = app.invocation_dir.clone();
     for _ in 0..8 {
-        app.spawn_in("sleep 5", inv.clone());
+        app.spawn_in("sleep 5", &inv);
     }
 
     // A 4-row window over 9 rows (1 header + 8 tasks): walking the whole
@@ -1427,9 +1422,9 @@ fn dashboard_selection_stays_in_scroll_window() {
 fn selection_wraps_at_list_edges() {
     let mut app = App::new_local(30, 100);
     let inv = app.invocation_dir.clone();
-    app.spawn_in("sleep 5", inv.clone()); // id 1
-    app.spawn_in("sleep 5", inv.clone()); // id 2
-    app.spawn_in("sleep 5", inv); // id 3
+    app.spawn_in("sleep 5", &inv); // id 1
+    app.spawn_in("sleep 5", &inv); // id 2
+    app.spawn_in("sleep 5", &inv); // id 3
 
     // Tag id 2 -> it sorts into a leading "In use" section, so the wrap
     // below crosses a section boundary.
@@ -1463,7 +1458,7 @@ fn selection_wraps_at_list_edges() {
 fn navigation_is_noop_with_one_task() {
     let mut app = App::new_local(30, 100);
     let inv = app.invocation_dir.clone();
-    app.spawn_in("sleep 5", inv);
+    app.spawn_in("sleep 5", &inv);
     assert_eq!(app.selected_id, Some(1));
 
     let steps = [
@@ -1483,7 +1478,7 @@ fn app_with_two_sections() -> App {
     let mut app = App::new_local(30, 100);
     let inv = app.invocation_dir.clone();
     for _ in 0..4 {
-        app.spawn_in("sleep 5", inv.clone());
+        app.spawn_in("sleep 5", &inv);
     }
     app.transport.send(Command::Tag { id: 3, on: true });
     app.transport.send(Command::Tag { id: 4, on: true });
@@ -1578,7 +1573,7 @@ fn app_with_tagged_pair() -> App {
     let mut app = App::new_local(30, 100);
     let inv = app.invocation_dir.clone();
     for _ in 0..4 {
-        app.spawn_in("sleep 5", inv.clone());
+        app.spawn_in("sleep 5", &inv);
     }
     app.transport.send(Command::Tag { id: 2, on: true });
     app.transport.send(Command::Tag { id: 4, on: true });
@@ -1598,10 +1593,10 @@ fn app_with_tagged_pair() -> App {
 fn app_with_tags_split_across_groups() -> App {
     let mut app = App::new_local(30, 100);
     let inv = app.invocation_dir.clone();
-    app.spawn_grouped("sleep 5", inv.clone(), "alpha"); // id 1
-    app.spawn_grouped("sleep 5", inv.clone(), "alpha"); // id 2
-    app.spawn_grouped("sleep 5", inv.clone(), "beta"); // id 3
-    app.spawn_grouped("sleep 5", inv, "beta"); // id 4
+    app.spawn_grouped("sleep 5", &inv, "alpha"); // id 1
+    app.spawn_grouped("sleep 5", &inv, "alpha"); // id 2
+    app.spawn_grouped("sleep 5", &inv, "beta"); // id 3
+    app.spawn_grouped("sleep 5", &inv, "beta"); // id 4
     app.group_mode = GroupMode::Custom;
     app.transport.send(Command::Tag { id: 1, on: true });
     app.transport.send(Command::Tag { id: 3, on: true });
@@ -1654,8 +1649,8 @@ fn cycle_tagged_skips_untagged_tasks() {
 fn cycle_tagged_is_noop_without_tags() {
     let mut app = App::new_local(30, 100);
     let inv = app.invocation_dir.clone();
-    app.spawn_in("sleep 5", inv.clone()); // id 1
-    app.spawn_in("sleep 5", inv); // id 2
+    app.spawn_in("sleep 5", &inv); // id 1
+    app.spawn_in("sleep 5", &inv); // id 2
     app.selected_id = Some(1);
 
     app.on_key_dashboard(key(KeyCode::Char('M')));
@@ -1684,9 +1679,9 @@ fn cycle_tagged_from_untagged_selection_jumps_forward() {
 fn cycle_tagged_with_one_tag_holds_the_selection() {
     let mut app = App::new_local(30, 100);
     let inv = app.invocation_dir.clone();
-    app.spawn_in("sleep 5", inv.clone()); // id 1
-    app.spawn_in("sleep 5", inv.clone()); // id 2
-    app.spawn_in("sleep 5", inv); // id 3
+    app.spawn_in("sleep 5", &inv); // id 1
+    app.spawn_in("sleep 5", &inv); // id 2
+    app.spawn_in("sleep 5", &inv); // id 3
     app.transport.send(Command::Tag { id: 2, on: true });
     app.pump();
     app.selected_id = Some(2); // Start on the only tagged row.
@@ -1975,7 +1970,7 @@ fn attached_wheel_honors_the_childs_1007_veto() {
     );
 }
 
-/// Open scrollback on modified PageUp; close on Esc or typing.
+/// Open scrollback on modified `PageUp`; close on Esc or typing.
 #[test]
 fn scroll_view_entry_and_exit() {
     let (mut app, _) = App::attached(30, 100, "sleep 5");
@@ -2002,8 +1997,8 @@ fn scroll_view_entry_and_exit() {
 fn wheel_moves_dashboard_selection() {
     let mut app = App::new_local(30, 100);
     let dir = app.invocation_dir.clone();
-    app.spawn_in("sleep 5", dir.clone()); // id 1
-    app.spawn_in("sleep 5", dir); // id 2
+    app.spawn_in("sleep 5", &dir); // id 1
+    app.spawn_in("sleep 5", &dir); // id 2
     app.selected_id = Some(1);
 
     let wheel = |kind| MouseEvent {
@@ -2029,7 +2024,7 @@ fn group_picker_opens_on_g_only_with_a_selection() {
     assert_eq!(app.mode, Mode::Dashboard, "no selection: g must no-op");
 
     let inv = app.invocation_dir.clone();
-    app.spawn_in("sleep 5", inv);
+    app.spawn_in("sleep 5", &inv);
     app.on_key_dashboard(key(KeyCode::Char('g')));
     assert_eq!(app.mode, Mode::PickGroup(1));
 }
@@ -2040,10 +2035,10 @@ fn group_picker_opens_on_g_only_with_a_selection() {
 fn group_candidates_are_distinct_sorted_and_marked() {
     let mut app = App::new_local(30, 100);
     let inv = app.invocation_dir.clone();
-    app.spawn_grouped("sleep 5", inv.clone(), "beta"); // id 1
-    app.spawn_grouped("sleep 5", inv.clone(), "alpha"); // id 2
-    app.spawn_grouped("sleep 5", inv.clone(), "alpha"); // id 3, dup group
-    app.spawn_in("sleep 5", inv); // id 4, no group
+    app.spawn_grouped("sleep 5", &inv, "beta"); // id 1
+    app.spawn_grouped("sleep 5", &inv, "alpha"); // id 2
+    app.spawn_grouped("sleep 5", &inv, "alpha"); // id 3, dup group
+    app.spawn_in("sleep 5", &inv); // id 4, no group
 
     app.selected_id = Some(1); // group "beta"
     app.on_key_dashboard(key(KeyCode::Char('g')));
@@ -2074,11 +2069,11 @@ fn group_candidates_are_distinct_sorted_and_marked() {
 fn group_candidates_collate_case_insensitively() {
     let mut app = App::new_local(30, 100);
     let inv = app.invocation_dir.clone();
-    app.spawn_grouped("sleep 5", inv.clone(), "zebra"); // id 1
-    app.spawn_grouped("sleep 5", inv.clone(), "API"); // id 2
-    app.spawn_grouped("sleep 5", inv.clone(), "Review"); // id 3
-    app.spawn_grouped("sleep 5", inv.clone(), "api"); // id 4
-    app.spawn_grouped("sleep 5", inv, "api"); // id 5, exact duplicate
+    app.spawn_grouped("sleep 5", &inv, "zebra"); // id 1
+    app.spawn_grouped("sleep 5", &inv, "API"); // id 2
+    app.spawn_grouped("sleep 5", &inv, "Review"); // id 3
+    app.spawn_grouped("sleep 5", &inv, "api"); // id 4
+    app.spawn_grouped("sleep 5", &inv, "api"); // id 5, exact duplicate
 
     app.selected_id = Some(1);
     app.on_key_dashboard(key(KeyCode::Char('g')));
@@ -2106,8 +2101,8 @@ fn group_candidates_collate_case_insensitively() {
 fn group_filter_narrows_and_preselects_the_first_match() {
     let mut app = App::new_local(30, 100);
     let inv = app.invocation_dir.clone();
-    app.spawn_grouped("sleep 5", inv.clone(), "alpha"); // id 1
-    app.spawn_grouped("sleep 5", inv, "beta"); // id 2
+    app.spawn_grouped("sleep 5", &inv, "alpha"); // id 1
+    app.spawn_grouped("sleep 5", &inv, "beta"); // id 2
     // Keep alpha selected so filtered beta is not marked "(current)".
     app.selected_id = Some(1);
     app.on_key_dashboard(key(KeyCode::Char('g')));
@@ -2139,8 +2134,8 @@ fn group_filter_narrows_and_preselects_the_first_match() {
 fn group_enter_on_a_candidate_assigns_it() {
     let mut app = App::new_local(30, 100);
     let inv = app.invocation_dir.clone();
-    app.spawn_grouped("sleep 5", inv.clone(), "alpha"); // id 1
-    app.spawn_in("sleep 5", inv); // id 2, no group
+    app.spawn_grouped("sleep 5", &inv, "alpha"); // id 1
+    app.spawn_in("sleep 5", &inv); // id 2, no group
 
     app.selected_id = Some(2);
     app.on_key_dashboard(key(KeyCode::Char('g')));
@@ -2157,7 +2152,7 @@ fn group_enter_on_a_candidate_assigns_it() {
 fn group_enter_on_novel_text_creates_the_group() {
     let mut app = App::new_local(30, 100);
     let inv = app.invocation_dir.clone();
-    app.spawn_grouped("sleep 5", inv, "alpha"); // id 1
+    app.spawn_grouped("sleep 5", &inv, "alpha"); // id 1
     app.on_key_dashboard(key(KeyCode::Char('g')));
     type_into(&mut app, App::on_key_pickgroup, "gamma");
     assert_eq!(app.group_candidates.len(), 1, "nothing matches");
@@ -2172,7 +2167,7 @@ fn group_enter_on_novel_text_creates_the_group() {
 fn group_enter_on_empty_input_clears_to_unassigned() {
     let mut app = App::new_local(30, 100);
     let inv = app.invocation_dir.clone();
-    app.spawn_grouped("sleep 5", inv, "alpha"); // id 1
+    app.spawn_grouped("sleep 5", &inv, "alpha"); // id 1
     app.on_key_dashboard(key(KeyCode::Char('g')));
     assert_eq!(app.group_sel, 0, "empty input highlights the clear row");
     app.on_key_pickgroup(key(KeyCode::Enter));
@@ -2186,7 +2181,7 @@ fn group_enter_on_empty_input_clears_to_unassigned() {
 fn group_esc_cancels_without_sending() {
     let mut app = App::new_local(30, 100);
     let inv = app.invocation_dir.clone();
-    app.spawn_grouped("sleep 5", inv, "alpha"); // id 1
+    app.spawn_grouped("sleep 5", &inv, "alpha"); // id 1
     app.on_key_dashboard(key(KeyCode::Char('g')));
     type_into(&mut app, App::on_key_pickgroup, "gamma");
     app.on_key_pickgroup(key(KeyCode::Esc));
@@ -2213,7 +2208,7 @@ fn find_palette_opens_on_slash_only_with_tasks() {
     assert!(app.find_candidates.is_empty());
 
     let inv = app.invocation_dir.clone();
-    app.spawn_in("sleep 5", inv);
+    app.spawn_in("sleep 5", &inv);
     // Exercise opening find without a current selection.
     app.selected_id = None;
     app.on_key_dashboard(key(KeyCode::Char('/')));
@@ -2270,8 +2265,8 @@ fn find_empty_input_lists_every_task() {
 fn find_matches_case_insensitive_substrings() {
     let mut app = App::new_local(30, 100);
     let inv = app.invocation_dir.clone();
-    app.spawn_in("sleep 5", inv.clone()); // id 1
-    app.spawn_in("true", inv); // id 2
+    app.spawn_in("sleep 5", &inv); // id 1
+    app.spawn_in("true", &inv); // id 2
 
     app.on_key_dashboard(key(KeyCode::Char('/')));
     find_type(&mut app, "SLEEP");
@@ -2301,8 +2296,8 @@ fn find_matches_case_insensitive_substrings() {
 fn find_matches_a_named_task_on_both_fields() {
     let mut app = App::new_local(30, 100);
     let inv = app.invocation_dir.clone();
-    app.spawn_in("sleep 5", inv.clone()); // id 1
-    app.spawn_in("true", inv); // id 2
+    app.spawn_in("sleep 5", &inv); // id 1
+    app.spawn_in("true", &inv); // id 2
     app.transport.send(Command::SetName {
         id: 1,
         name: Some("api tests".to_string()),
@@ -2324,8 +2319,8 @@ fn find_matches_a_named_task_on_both_fields() {
 fn find_matches_group_names() {
     let mut app = App::new_local(30, 100);
     let inv = app.invocation_dir.clone();
-    app.spawn_grouped("sleep 5", inv.clone(), "backend"); // id 1
-    app.spawn_in("sleep 5", inv); // id 2, no group
+    app.spawn_grouped("sleep 5", &inv, "backend"); // id 1
+    app.spawn_in("sleep 5", &inv); // id 2, no group
 
     app.on_key_dashboard(key(KeyCode::Char('/')));
     find_type(&mut app, "backend");
@@ -2338,7 +2333,7 @@ fn find_does_not_match_the_directory() {
     let mut app = App::new_local(30, 100);
     let dir = temp("findpalettedir");
     let name = dir.file_name().unwrap().to_string_lossy().into_owned();
-    app.spawn_in("sleep 5", dir.to_path_buf()); // id 1
+    app.spawn_in("sleep 5", &dir); // id 1
     assert!(name.contains("findpalettedir"), "scratch dir name: {name}");
 
     app.on_key_dashboard(key(KeyCode::Char('/')));
@@ -2361,9 +2356,9 @@ fn find_does_not_match_the_directory() {
 fn find_enter_jumps_the_selection() {
     let mut app = App::new_local(30, 100);
     let inv = app.invocation_dir.clone();
-    app.spawn_in("sleep 5", inv.clone()); // id 1
-    app.spawn_in("sleep 5", inv.clone()); // id 2
-    app.spawn_in("sleep 5", inv); // id 3
+    app.spawn_in("sleep 5", &inv); // id 1
+    app.spawn_in("sleep 5", &inv); // id 2
+    app.spawn_in("sleep 5", &inv); // id 3
     app.selected_id = Some(1);
 
     app.on_key_dashboard(key(KeyCode::Char('/')));
@@ -2385,8 +2380,8 @@ fn find_enter_jumps_the_selection() {
 fn find_esc_leaves_the_selection_alone() {
     let mut app = App::new_local(30, 100);
     let inv = app.invocation_dir.clone();
-    app.spawn_in("sleep 5", inv.clone()); // id 1
-    app.spawn_in("true", inv); // id 2
+    app.spawn_in("sleep 5", &inv); // id 1
+    app.spawn_in("true", &inv); // id 2
     app.selected_id = Some(1);
 
     app.on_key_dashboard(key(KeyCode::Char('/')));
@@ -2404,7 +2399,7 @@ fn find_esc_leaves_the_selection_alone() {
 fn find_enter_without_candidates_keeps_the_panel_open() {
     let mut app = App::new_local(30, 100);
     let inv = app.invocation_dir.clone();
-    app.spawn_in("sleep 5", inv);
+    app.spawn_in("sleep 5", &inv);
 
     app.on_key_dashboard(key(KeyCode::Char('/')));
     find_type(&mut app, "zzz");
@@ -2426,7 +2421,7 @@ fn find_enter_without_candidates_keeps_the_panel_open() {
 fn find_panel_rows_name_the_task_and_its_section() {
     let mut app = App::new_local(30, 100);
     let inv = app.invocation_dir.clone();
-    app.spawn_in("sleep 5", inv);
+    app.spawn_in("sleep 5", &inv);
     app.transport.send(Command::SetName {
         id: 1,
         name: Some("api tests".to_string()),
@@ -2448,8 +2443,8 @@ fn find_panel_rows_name_the_task_and_its_section() {
 fn find_paste_filters_the_candidates() {
     let mut app = App::new_local(30, 100);
     let inv = app.invocation_dir.clone();
-    app.spawn_in("sleep 5", inv.clone()); // id 1
-    app.spawn_in("true", inv); // id 2
+    app.spawn_in("sleep 5", &inv); // id 1
+    app.spawn_in("true", &inv); // id 2
 
     app.on_key_dashboard(key(KeyCode::Char('/')));
     app.on_paste("true");
@@ -2475,7 +2470,7 @@ fn unfocused_terminal_mutes_the_highlight_rows() {
 
     let mut app = App::new_local(30, 100);
     let inv = app.invocation_dir.clone();
-    app.spawn_in("sleep 5", inv);
+    app.spawn_in("sleep 5", &inv);
     app.selected_id = Some(1);
 
     // The dashboard's only reverse-video line is the selected row, so its
@@ -2520,7 +2515,7 @@ fn controls_overlay_opens_on_question_and_closes_on_question_esc_q() {
 fn plain_slash_still_opens_the_find_palette() {
     let mut app = App::new_local(30, 100);
     let inv = app.invocation_dir.clone();
-    app.spawn_in("sleep 5", inv);
+    app.spawn_in("sleep 5", &inv);
     app.on_key_dashboard(key(KeyCode::Char('/')));
     assert_eq!(app.mode, Mode::Find);
 }
@@ -2530,7 +2525,7 @@ fn plain_slash_still_opens_the_find_palette() {
 fn controls_overlay_ignores_dashboard_keys() {
     let mut app = App::new_local(30, 100);
     let inv = app.invocation_dir.clone();
-    app.spawn_in("sleep 5", inv);
+    app.spawn_in("sleep 5", &inv);
 
     app.on_key_dashboard(key(KeyCode::Char('?')));
     app.on_key_controls(key(KeyCode::Char('m')));
@@ -2622,7 +2617,7 @@ fn rename_prompt_opens_on_shift_r_only_with_a_selection() {
     assert_eq!(app.mode, Mode::Dashboard, "no selection: R must no-op");
 
     let inv = app.invocation_dir.clone();
-    app.spawn_in("sleep 5", inv);
+    app.spawn_in("sleep 5", &inv);
     app.on_key_dashboard(key(KeyCode::Char('R')));
     assert_eq!(app.mode, Mode::Rename(1));
     assert_eq!(app.input.as_str(), "", "an unnamed task prefills empty");
@@ -2643,7 +2638,7 @@ fn rename_prompt_opens_on_shift_r_only_with_a_selection() {
 fn rename_enter_sends_the_typed_name() {
     let mut app = App::new_local(30, 100);
     let inv = app.invocation_dir.clone();
-    app.spawn_in("sleep 5", inv);
+    app.spawn_in("sleep 5", &inv);
     app.on_key_dashboard(key(KeyCode::Char('R')));
     type_into(&mut app, App::on_key_rename, "api server");
     app.on_key_rename(key(KeyCode::Enter));
@@ -2659,7 +2654,7 @@ fn rename_enter_sends_the_typed_name() {
 fn rename_enter_on_empty_input_clears_the_name() {
     let mut app = App::new_local(30, 100);
     let inv = app.invocation_dir.clone();
-    app.spawn_in("sleep 5", inv);
+    app.spawn_in("sleep 5", &inv);
     app.transport.send(Command::SetName {
         id: 1,
         name: Some("api".to_string()),
@@ -2681,7 +2676,7 @@ fn rename_enter_on_empty_input_clears_the_name() {
 fn rename_esc_cancels_without_sending() {
     let mut app = App::new_local(30, 100);
     let inv = app.invocation_dir.clone();
-    app.spawn_in("sleep 5", inv);
+    app.spawn_in("sleep 5", &inv);
     app.transport.send(Command::SetName {
         id: 1,
         name: Some("api".to_string()),
@@ -2705,7 +2700,7 @@ fn rename_esc_cancels_without_sending() {
 fn rename_caret_keys_edit_mid_name() {
     let mut app = App::new_local(30, 100);
     let inv = app.invocation_dir.clone();
-    app.spawn_in("sleep 5", inv);
+    app.spawn_in("sleep 5", &inv);
     app.transport.send(Command::SetName {
         id: 1,
         name: Some("api".to_string()),
@@ -2748,7 +2743,7 @@ fn rename_caret_keys_edit_mid_name() {
 fn ctrl_chords_never_insert_their_letter() {
     let mut app = App::new_local(30, 100);
     let inv = app.invocation_dir.clone();
-    app.spawn_grouped("sleep 5", inv, "alpha"); // id 1
+    app.spawn_grouped("sleep 5", &inv, "alpha"); // id 1
 
     app.on_key_dashboard(key(KeyCode::Char('w')));
     app.on_key_savesession(ctrl(KeyCode::Char('k')));
@@ -2831,8 +2826,8 @@ fn pickdir_refreshes_on_edits_not_caret_motion() {
 fn pickgroup_caret_edits_refresh_the_filter() {
     let mut app = App::new_local(30, 100);
     let inv = app.invocation_dir.clone();
-    app.spawn_grouped("sleep 5", inv.clone(), "alpha"); // id 1
-    app.spawn_grouped("sleep 5", inv, "beta"); // id 2
+    app.spawn_grouped("sleep 5", &inv, "alpha"); // id 1
+    app.spawn_grouped("sleep 5", &inv, "beta"); // id 2
     app.on_key_dashboard(key(KeyCode::Char('g')));
 
     app.on_key_pickgroup(key(KeyCode::Char('b')));
@@ -2891,7 +2886,7 @@ fn multibyte_chars_edit_cleanly_in_a_prompt() {
 fn custom_mode_spawn_inherits_the_selected_group() {
     let mut app = App::new_local(30, 100);
     let inv = app.invocation_dir.clone();
-    app.spawn_grouped("sleep 5", inv, "alpha"); // id 1
+    app.spawn_grouped("sleep 5", &inv, "alpha"); // id 1
     app.group_mode = GroupMode::Custom;
 
     app.on_key_dashboard(key(KeyCode::Char('n')));
@@ -2914,7 +2909,7 @@ fn custom_mode_spawn_inherits_the_selected_group() {
 fn dir_picker_handoff_inherits_the_selected_group_in_custom_mode() {
     let mut app = App::new_local(30, 100);
     let inv = app.invocation_dir.clone();
-    app.spawn_grouped("sleep 5", inv, "alpha"); // id 1
+    app.spawn_grouped("sleep 5", &inv, "alpha"); // id 1
     app.group_mode = GroupMode::Custom;
 
     app.on_key_dashboard(key(KeyCode::Char('@')));
@@ -2930,7 +2925,7 @@ fn dir_picker_handoff_inherits_the_selected_group_in_custom_mode() {
 fn state_and_dir_mode_spawns_stay_unassigned() {
     let mut app = App::new_local(30, 100);
     let inv = app.invocation_dir.clone();
-    app.spawn_grouped("sleep 5", inv, "alpha"); // id 1
+    app.spawn_grouped("sleep 5", &inv, "alpha"); // id 1
 
     for mode in [GroupMode::State, GroupMode::Dir] {
         app.group_mode = mode;
@@ -2955,7 +2950,7 @@ fn dir_mode_spawn_inherits_the_selected_directory() {
     let mut app = App::new_local(30, 100);
     let scratch = temp("app_dir_inherit");
     let (dir, inv) = (scratch.to_path_buf(), app.invocation_dir.clone());
-    app.spawn_in("sleep 5", dir.clone()); // id 1
+    app.spawn_in("sleep 5", &dir); // id 1
 
     for (mode, want) in [
         (GroupMode::Dir, &dir),
@@ -2974,7 +2969,10 @@ fn dir_mode_spawn_inherits_the_selected_directory() {
     app.on_key_spawn(key(KeyCode::Enter));
     app.pump();
     let v = app.views.iter().find(|v| v.id == 2).unwrap();
-    assert_eq!(v.cwd, dir, "the spawn must launch in the inherited directory");
+    assert_eq!(
+        v.cwd, dir,
+        "the spawn must launch in the inherited directory"
+    );
 }
 
 // --- `n` spawn prompt: Agent page --------------------------------------
@@ -2985,7 +2983,7 @@ impl App {
     /// Do not forward Enter to a core.
     fn with_agents(agents: &[&str]) -> (Self, Arc<std::sync::Mutex<Vec<Command>>>) {
         let mut app = Self::new_local(30, 100);
-        app.agents = agents.iter().map(|a| a.to_string()).collect();
+        app.agents = agents.iter().map(ToString::to_string).collect();
         app.transport = Scripted::unplugged();
         let sent = app.record_sends();
         (app, sent)
@@ -3005,7 +3003,7 @@ impl App {
 }
 
 /// Switch between Command and Agent with Tab only when agents are installed. With no
-/// agents, ignore Tab and BackTab and keep the current page.
+/// agents, ignore Tab and `BackTab` and keep the current page.
 #[test]
 fn spawn_tab_toggles_pages_only_with_agents() {
     let (mut app, _) = App::with_agents(&[]);
@@ -3441,7 +3439,7 @@ fn set_watch_resends_on_kind_change_with_the_same_id() {
         "until [ -e {f} ]; do sleep 0.05; done; printf '\\033]52;c;cG9zdA==\\007'; sleep 30",
         f = flag.display()
     );
-    app.spawn_in(&cmd, cwd);
+    app.spawn_in(&cmd, &cwd);
     let id = app.views[0].id;
 
     // Change only the attachment mode.
@@ -4091,7 +4089,7 @@ fn wants_mouse_child_keeps_the_left_button() {
 fn frame_is_wrapped_in_one_synchronized_update() {
     let mut app = App::new_local(30, 100);
     let dir = app.invocation_dir.clone();
-    app.spawn_in("sleep 5", dir);
+    app.spawn_in("sleep 5", &dir);
     for (label, mode) in [
         ("dashboard", Mode::Dashboard),
         ("peek", Mode::Peek),
@@ -4120,7 +4118,7 @@ fn frame_is_wrapped_in_one_synchronized_update() {
 fn unchanged_frame_emits_nothing() {
     let mut app = App::new_local(30, 100);
     let dir = app.invocation_dir.clone();
-    app.spawn_in("sleep 5", dir);
+    app.spawn_in("sleep 5", &dir);
     app.mode = Mode::Peek;
     let mut first = Vec::new();
     assert!(
@@ -4215,8 +4213,8 @@ fn chord() -> KeyEvent {
 fn flagship_pair() -> (App, u64, u64) {
     let mut app = App::new_local(30, 100);
     let dir = app.invocation_dir.clone();
-    app.spawn_in("sleep 30", dir.clone());
-    app.spawn_in("sleep 30", dir);
+    app.spawn_in("sleep 30", &dir);
+    app.spawn_in("sleep 30", &dir);
     let (a, q) = (app.views[0].id, app.views[1].id);
     app.selected_id = Some(q);
     app.hit(key(KeyCode::Char(']')));
@@ -4416,7 +4414,7 @@ fn enter_onto_flagship_sets_dashboard_return() {
 fn mark_then_enter_before_snapshot_returns_to_dashboard() {
     let mut app = App::new_local(30, 100);
     let dir = app.invocation_dir.clone();
-    app.spawn_in("sleep 30", dir);
+    app.spawn_in("sleep 30", &dir);
     let q = app.views[0].id;
     app.selected_id = Some(q);
 

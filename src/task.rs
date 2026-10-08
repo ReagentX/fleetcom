@@ -230,7 +230,7 @@ impl Task {
         cols: u16,
         scrollback: usize,
         env: &[(OsString, OsString)],
-        waker: Waker,
+        waker: &Waker,
     ) -> io::Result<Self> {
         let pair = native_pty_system()
             .openpty(PtySize {
@@ -246,9 +246,7 @@ impl Task {
                 // Read SHELL from the launch context, not the daemon's environment: a zsh
                 // client may connect to a daemon started from bash and still require zsh
                 // word-splitting. Without SHELL, use the portable default.
-                let shell = env_get(env, "SHELL")
-                    .map(OsString::from)
-                    .unwrap_or_else(|| "/bin/sh".into());
+                let shell = env_get(env, "SHELL").map_or_else(|| "/bin/sh".into(), OsString::from);
                 let mut cmd = CommandBuilder::new(shell);
                 // Use a non-interactive shell. Interactive startup files,
                 // aliases, and shell functions are not loaded.
@@ -295,7 +293,7 @@ impl Task {
         let handle = {
             let parser = Arc::clone(&parser);
             let last_activity = Arc::clone(&last_activity);
-            let waker = Arc::clone(&waker);
+            let waker = Arc::clone(waker);
             let input_tx = input_tx.clone();
             let pending = Arc::clone(&pending_write);
             thread::spawn(move || {
@@ -378,7 +376,7 @@ impl Task {
     }
 
     /// Check the capture file, then the live registry, then the spawn-time ID. A
-    /// A managed CLI can select a session after launch, so validate captured IDs
+    /// managed CLI can select a session after launch, so validate captured IDs
     /// through the harness with the task leader's PID. If a source has no valid ID,
     /// check the next source. For literal tasks, return `None`.
     pub fn current_resume_id(&self) -> Option<String> {
@@ -433,7 +431,7 @@ impl Task {
 
     /// Report whether the reader reached EOF without driving the reap loop.
     pub fn reader_done(&self) -> bool {
-        self.handle.as_ref().is_none_or(|h| h.is_finished())
+        self.handle.as_ref().is_none_or(JoinHandle::is_finished)
     }
 
     /// Reap the exited session leader without blocking.
@@ -499,8 +497,7 @@ impl Task {
     pub fn quiet_for(&self, now: Instant) -> Duration {
         self.last_activity
             .lock()
-            .map(|t| now.duration_since(*t))
-            .unwrap_or(Duration::ZERO)
+            .map_or(Duration::ZERO, |t| now.duration_since(*t))
     }
 
     /// Flush an expired `?2026` synchronized update so a stalled child's

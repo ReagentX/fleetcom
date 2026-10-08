@@ -377,7 +377,7 @@ mod tests {
     use super::*;
 
     fn parse(args: &[&str]) -> Result<Invocation, String> {
-        let owned: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+        let owned: Vec<String> = args.iter().map(ToString::to_string).collect();
         parse_args(&owned)
     }
 

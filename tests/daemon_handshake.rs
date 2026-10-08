@@ -73,16 +73,13 @@ fn silent_client_cannot_wedge_the_daemon() {
     let sock = dir.join("default.sock");
     let cwd = dir.display().to_string();
     let served_next = wait_until(Duration::from_secs(10), || {
-        UnixStream::connect(&sock)
-            .map(|mut s| {
-                // A successful handshake proves the accept loop is live again.
-                s.write_all(&hello_frame(PROTOCOL_VERSION, &[], &cwd))
-                    .is_ok()
-                    && read_frame(&mut s)
-                        .map(|(_, p)| String::from_utf8_lossy(&p).contains("hello_ok"))
-                        .unwrap_or(false)
-            })
-            .unwrap_or(false)
+        UnixStream::connect(&sock).is_ok_and(|mut s| {
+            // A successful handshake proves the accept loop is live again.
+            s.write_all(&hello_frame(PROTOCOL_VERSION, &[], &cwd))
+                .is_ok()
+                && read_frame(&mut s)
+                    .is_ok_and(|(_, p)| String::from_utf8_lossy(&p).contains("hello_ok"))
+        })
     });
     assert!(served_next, "daemon wedged behind a silent connection");
 }
