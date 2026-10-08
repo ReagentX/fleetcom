@@ -560,7 +560,7 @@ fn kill_delivers_term_before_kill() {
     assert!(trapped.exists(), "the TERM trap never ran");
 }
 
-/// A task that ignores SIGTERM is SIGKILLed once the grace elapses, via the
+/// A task that ignores SIGTERM is `SIGKILLed` once the grace elapses, via the
 /// reap-driven escalation. `Kill` must never leave an immortal task.
 #[test]
 fn term_ignoring_task_escalates_to_kill() {
@@ -1096,7 +1096,7 @@ fn worst_case_screen_frame_fits_max_frame() {
     }));
     assert_eq!(kind, KIND_SCREEN);
 
-    let per_cell = payload.len() as f64 / MAX_CELLS as f64;
+    let per_cell = payload.len() as f64 / f64::from(MAX_CELLS);
     // Keep the constructed density above 85 bytes per cell.
     assert!(
         per_cell >= 85.0,

@@ -163,9 +163,7 @@ pub fn spawn_task(
     stream.write_all(&spawn_frame(command, cwd)).unwrap();
     assert!(
         wait_until(Duration::from_secs(5), || {
-            std::fs::read_to_string(pidfile)
-                .map(|s| !s.trim().is_empty())
-                .unwrap_or(false)
+            std::fs::read_to_string(pidfile).is_ok_and(|s| !s.trim().is_empty())
         }),
         "the task never wrote its pid"
     );
@@ -186,7 +184,7 @@ pub fn stop_daemon(daemon: &mut KillOnDrop) {
     )
     .unwrap();
     let exited = wait_until(Duration::from_secs(10), || {
-        daemon.0.try_wait().map(|s| s.is_some()).unwrap_or(false)
+        daemon.0.try_wait().is_ok_and(|s| s.is_some())
     });
     assert!(exited, "daemon did not exit on SIGTERM");
 }

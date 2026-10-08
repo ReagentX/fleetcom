@@ -37,7 +37,7 @@ fn kill_works_while_a_client_is_attached() {
         .spawn()
         .unwrap();
     let kill_status = wait_until(Duration::from_secs(15), || {
-        killer.try_wait().map(|s| s.is_some()).unwrap_or(false)
+        killer.try_wait().is_ok_and(|s| s.is_some())
     });
     if !kill_status {
         let _ = killer.kill();
@@ -52,7 +52,7 @@ fn kill_works_while_a_client_is_attached() {
     // group-killed, socket removed.
     assert!(
         wait_until(Duration::from_secs(5), || {
-            daemon.0.try_wait().map(|s| s.is_some()).unwrap_or(false)
+            daemon.0.try_wait().is_ok_and(|s| s.is_some())
         }),
         "daemon still running after --kill returned"
     );

@@ -16,7 +16,7 @@ fn no_waker() -> Waker {
 /// Spawn a task with a 24x80 grid, 2000 rows of scrollback, and this process's
 /// working directory.
 fn spawn_with(id: u64, command: &str, exec: Exec, env: &[(OsString, OsString)]) -> Task {
-    Task::spawn(id, command, exec, &here(), 24, 80, 2000, env, no_waker()).unwrap()
+    Task::spawn(id, command, exec, &here(), 24, 80, 2000, env, &no_waker()).unwrap()
 }
 
 /// Spawn a literal task with this process's environment.

@@ -295,7 +295,7 @@ fn hello_with_malformed_env_is_rejected() {
         r#"[["P@TH","L2Jpbg=="]]"#,    // invalid base64 character
         r#"[["QUFBQUE","L2Jpbg=="]]"#, // truncated: missing padding
         r#"[["UEFUSA==","AAAA="]]"#,   // bad padding length
-        r#"[[[80],[65]]]"#,            // env pairs must contain base64 strings
+        r"[[[80],[65]]]",              // env pairs must contain base64 strings
         r#"["PATH=/bin"]"#,            // flat string pair
     ] {
         // Keep the cwd valid so each case isolates env validation.
@@ -550,7 +550,7 @@ fn lifecycle_and_age_fields_round_trip() {
         Lifecycle::Ok,
         Lifecycle::Failed,
     ] {
-        for age in [None, Some(Duration::from_millis(12_000))] {
+        for age in [None, Some(Duration::from_secs(12))] {
             let live = matches!(lifecycle, Lifecycle::Active | Lifecycle::Idle);
             let tasks = Event::Tasks(vec![TaskView {
                 lifecycle,

@@ -200,7 +200,7 @@ mod tests {
 
         // Byte ordering produces a different order for mixed-case names.
         let mut bytewise = vec!["Zebra", "api", "API", "banana", "Apple"];
-        bytewise.sort();
+        bytewise.sort_unstable();
         assert_eq!(bytewise, vec!["API", "Apple", "Zebra", "api", "banana"]);
     }
 

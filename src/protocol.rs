@@ -469,9 +469,9 @@ pub fn opt_str(v: &jzon::JsonValue) -> Option<Option<String>> {
 
 /// Insert `key` only when the optional field is set; absence encodes `None`
 /// on the wire (see [`opt_str`]).
-pub fn insert_opt_str(o: &mut jzon::JsonValue, key: &str, val: &Option<String>) {
+pub fn insert_opt_str(o: &mut jzon::JsonValue, key: &str, val: Option<&str>) {
     if let Some(s) = val {
-        let _ = o.insert(key, s.as_str());
+        let _ = o.insert(key, s);
     }
 }
 
@@ -586,7 +586,7 @@ pub fn encode_command(cmd: &Command) -> (u8, Vec<u8>) {
                 "command": command.as_str(),
                 "cwd": path_b64(cwd),
             };
-            insert_opt_str(&mut o, "group", group);
+            insert_opt_str(&mut o, "group", group.as_deref());
             o
         }
         Command::SpawnAgent { agent, cwd, group } => {
@@ -595,7 +595,7 @@ pub fn encode_command(cmd: &Command) -> (u8, Vec<u8>) {
                 "agent": agent.as_str(),
                 "cwd": path_b64(cwd),
             };
-            insert_opt_str(&mut o, "group", group);
+            insert_opt_str(&mut o, "group", group.as_deref());
             o
         }
         Command::Kill { id } => jzon::object! { "t": "kill", "id": *id },
@@ -607,19 +607,19 @@ pub fn encode_command(cmd: &Command) -> (u8, Vec<u8>) {
         Command::SetGroup { id, group } => {
             let mut o = jzon::object! { "t": "group", "id": *id };
             // Absence of `g` encodes an unassigned task.
-            insert_opt_str(&mut o, "g", group);
+            insert_opt_str(&mut o, "g", group.as_deref());
             o
         }
         Command::SetName { id, name } => {
             let mut o = jzon::object! { "t": "name", "id": *id };
             // Absence of `n` encodes an unnamed task.
-            insert_opt_str(&mut o, "n", name);
+            insert_opt_str(&mut o, "n", name.as_deref());
             o
         }
         Command::Resize { rows, cols } => jzon::object! {
             "t": "resize",
-            "rows": *rows as u64,
-            "cols": *cols as u64,
+            "rows": u64::from(*rows),
+            "cols": u64::from(*cols),
         },
         Command::Watch { id, attached } => {
             // Preserve an absent watch ID as JSON null.
@@ -644,8 +644,8 @@ pub fn encode_command(cmd: &Command) -> (u8, Vec<u8>) {
                 "t": "mouse",
                 "id": *id,
                 "k": k,
-                "col": *col as u64,
-                "row": *row as u64,
+                "col": u64::from(*col),
+                "row": u64::from(*row),
             };
             if let Some(b) = btn {
                 let _ = o.insert("b", b as u64);
@@ -662,7 +662,7 @@ pub fn encode_command(cmd: &Command) -> (u8, Vec<u8>) {
                     "ch"
                 }
                 Key::F(n) => {
-                    let _ = o.insert("n", *n as u64);
+                    let _ = o.insert("n", u64::from(*n));
                     "f"
                 }
                 Key::Up => "up",
@@ -703,7 +703,7 @@ pub fn encode_command(cmd: &Command) -> (u8, Vec<u8>) {
             };
             let mut o = jzon::object! { "t": "sb", "id": *id, "a": a };
             if let Some(n) = n {
-                let _ = o.insert("n", n as u64);
+                let _ = o.insert("n", u64::from(n));
             }
             o
         }
@@ -883,8 +883,8 @@ pub fn encode_event(ev: &Event) -> (u8, Vec<u8>) {
                 let _ = o.insert("flagship", tv.flagship);
                 let _ = o.insert("managed", tv.managed);
                 // Group and name fields are present only when set.
-                insert_opt_str(&mut o, "group", &tv.group);
-                insert_opt_str(&mut o, "name", &tv.name);
+                insert_opt_str(&mut o, "group", tv.group.as_deref());
+                insert_opt_str(&mut o, "name", tv.name.as_deref());
                 let _ = o.insert("life", tv.lifecycle.label());
                 let _ = o.insert("preview", tv.preview.text.as_str());
                 // Matcher rules are process-local and omitted from the wire.
@@ -927,7 +927,7 @@ pub fn encode_event(ev: &Event) -> (u8, Vec<u8>) {
         Event::Screen(sv) => {
             let header = jzon::object! {
                 "id": sv.id,
-                "cursor": [sv.cursor.0 as u64, sv.cursor.1 as u64],
+                "cursor": [u64::from(sv.cursor.0), u64::from(sv.cursor.1)],
                 "hide": sv.hide_cursor,
                 "mouse": sv.wants_mouse,
                 "alt": sv.alt_screen,

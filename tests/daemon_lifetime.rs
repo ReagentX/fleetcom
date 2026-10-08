@@ -1,4 +1,4 @@
-//! Test task lifetime after daemon exit. When a SIGKILLed daemon exits, the kernel
+//! Test task lifetime after daemon exit. When a `SIGKILLed` daemon exits, the kernel
 //! closes each PTY master and sends SIGHUP to the task's foreground group. Ordinary
 //! tasks exit; HUP-immune tasks survive without an owner. Verify both outcomes.
 

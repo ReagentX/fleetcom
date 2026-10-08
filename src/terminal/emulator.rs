@@ -223,7 +223,7 @@ impl Emulator {
         let bottom = grid.screen_lines() as i32 - 1;
         for line in top..=bottom {
             for cell in &mut grid[Line(line)][..] {
-                if !cell.zerowidth().is_some_and(|z| z.len() > MAX_ZEROWIDTH) {
+                if cell.zerowidth().is_none_or(|z| z.len() <= MAX_ZEROWIDTH) {
                     continue;
                 }
                 // Rebuild the cell because `Cell` has no setter for
@@ -409,8 +409,8 @@ impl Emulator {
     /// oldest stored row, `Live` is the live screen (offset 0).
     pub fn scroll(&mut self, action: ScrollAction) {
         self.term.scroll_display(match action {
-            ScrollAction::Up(n) => Scroll::Delta(n as i32),
-            ScrollAction::Down(n) => Scroll::Delta(-(n as i32)),
+            ScrollAction::Up(n) => Scroll::Delta(i32::from(n)),
+            ScrollAction::Down(n) => Scroll::Delta(-i32::from(n)),
             ScrollAction::Top => Scroll::Top,
             ScrollAction::Live => Scroll::Bottom,
         });
@@ -1277,11 +1277,12 @@ mod tests {
     /// A scan caps combining marks in every cell across a populated row.
     #[test]
     fn zerowidth_spray_across_cells_is_capped() {
+        use std::fmt::Write as _;
         let mut emu = Emulator::new(4, 80, 0);
         let marks = "\u{0301}".repeat(2048);
         let mut payload = String::new();
         for col in 1..=80 {
-            payload.push_str(&format!("\x1b[2;{col}Hx"));
+            let _ = write!(payload, "\x1b[2;{col}Hx");
             payload.push_str(&marks);
         }
         assert!(
@@ -1427,7 +1428,7 @@ mod tests {
     }
 
     /// Within one chunk only the last title event matters; an empty OSC title
-    /// and a ResetTitle (title-stack pop, CSI 23 t) both unset the capture
+    /// and a `ResetTitle` (title-stack pop, CSI 23 t) both unset the capture
     /// rather than freezing the previous one.
     #[test]
     fn empty_title_and_reset_unset_the_capture() {

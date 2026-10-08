@@ -194,7 +194,7 @@ fn f_bytes(n: u8, m: Option<u8>) -> Option<Vec<u8>> {
 }
 
 /// Prefix `base` with ESC when `meta` is set. `base` may be a multibyte
-/// sequence, such as BackTab's CSI Z.
+/// sequence, such as `BackTab`'s CSI Z.
 fn meta_bytes(meta: bool, base: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(base.len() + 1);
     if meta {
@@ -207,7 +207,7 @@ fn meta_bytes(meta: bool, base: &[u8]) -> Vec<u8> {
 /// Return xterm's modifier parameter `1 + shift + 2·alt + 4·ctrl`, or
 /// `None` when no modifier is held.
 fn mod_param(mods: Mods) -> Option<u8> {
-    let bits = mods.shift as u8 + 2 * mods.alt as u8 + 4 * mods.ctrl as u8;
+    let bits = u8::from(mods.shift) + 2 * u8::from(mods.alt) + 4 * u8::from(mods.ctrl);
     (bits != 0).then_some(1 + bits)
 }
 

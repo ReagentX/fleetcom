@@ -958,7 +958,8 @@ impl App {
                     CtEvent::Mouse(m) => self.on_mouse(m),
                     CtEvent::FocusGained => self.terminal_focused = true,
                     CtEvent::FocusLost => self.terminal_focused = false,
-                    _ => {}
+                    // Key releases carry nothing to forward.
+                    CtEvent::Key(_) => {}
                 }
             }
         }
@@ -1105,8 +1106,8 @@ impl App {
 
     /// Navigate into `dir`: retype the input as its path (trailing slash) so
     /// completion continues inside it, with the dir itself selected as row 0.
-    fn enter_dir(&mut self, dir: PathBuf) {
-        self.dir_input = EditBuffer::seeded(format!("{}/", path::abbreviate(&dir)));
+    fn enter_dir(&mut self, dir: &Path) {
+        self.dir_input = EditBuffer::seeded(format!("{}/", path::abbreviate(dir)));
         self.refresh_dir_candidates();
     }
 
@@ -1288,7 +1289,7 @@ impl App {
             // Reconnect only makes sense against a daemon; a dead in-process core
             // has nothing to reconnect to, so `--foreground` just quits.
             KeyCode::Char('r') if self.daemon_backed => self.reconnect(),
-            KeyCode::Char('q') | KeyCode::Char('Q') | KeyCode::Esc => {
+            KeyCode::Char('q' | 'Q') | KeyCode::Esc => {
                 self.exit_intent = Some(ExitIntent::Disconnect);
             }
             _ => {}
@@ -1457,7 +1458,7 @@ impl App {
                 && c.kind != DirKind::Use
             {
                 let path = c.path.clone();
-                self.enter_dir(path);
+                self.enter_dir(&path);
             }
             return;
         }
@@ -1476,7 +1477,7 @@ impl App {
                         // Resolved path or current-task directory: run there.
                         DirKind::Use | DirKind::Jump => self.open_spawn_prompt(path),
                         // Subdirectory: descend and select its resolved-path row.
-                        DirKind::Into => self.enter_dir(path),
+                        DirKind::Into => self.enter_dir(&path),
                     }
                 }
             }
@@ -1494,7 +1495,7 @@ impl App {
             KeyCode::Esc => self.close_group_picker(),
             KeyCode::Up => self.group_sel = self.group_sel.saturating_sub(1),
             KeyCode::Down => {
-                self.group_sel = step_down(self.group_sel, self.group_candidates.len())
+                self.group_sel = step_down(self.group_sel, self.group_candidates.len());
             }
             KeyCode::Enter => {
                 // Enter assigns the highlighted group, or creates the typed
@@ -1574,7 +1575,7 @@ impl App {
             KeyCode::Esc => self.close_prompt(),
             KeyCode::Up => self.agent_sel = self.agent_sel.saturating_sub(1),
             KeyCode::Down => {
-                self.agent_sel = step_down(self.agent_sel, self.agent_candidates.len())
+                self.agent_sel = step_down(self.agent_sel, self.agent_candidates.len());
             }
             KeyCode::Enter => {
                 if let Some(agent) = self.agent_candidates.get(self.agent_sel).cloned() {
@@ -1597,7 +1598,7 @@ impl App {
 
     fn on_key_peek(&mut self, k: KeyEvent) {
         match k.code {
-            KeyCode::Char(' ') | KeyCode::Esc | KeyCode::Char('q') => self.mode = Mode::Dashboard,
+            KeyCode::Char(' ' | 'q') | KeyCode::Esc => self.mode = Mode::Dashboard,
             KeyCode::Up | KeyCode::Char('k') => self.select_up(),
             KeyCode::Down | KeyCode::Char('j') => self.select_down(),
             KeyCode::Enter => self.attach(),
@@ -1617,7 +1618,7 @@ impl App {
     fn on_key_attached(&mut self, out: &mut impl Write, k: KeyEvent) {
         // Background on Ctrl-\; the chord may be reported by crossterm as Ctrl-4.
         let detach = k.modifiers.contains(KeyModifiers::CONTROL)
-            && matches!(k.code, KeyCode::Char('\\') | KeyCode::Char('4'));
+            && matches!(k.code, KeyCode::Char('\\' | '4'));
         if detach {
             self.detach(out);
             return;
@@ -2042,8 +2043,7 @@ fn key_event_to_key(ev: KeyEvent) -> Option<(Key, Mods)> {
 /// Recognize `Ctrl-]` in kitty and legacy encodings. Accept Ctrl-5 for legacy
 /// 0x1D: in crossterm, 0x1C..=0x1F are mapped to Ctrl-'4'..=Ctrl-'7'.
 fn is_chord_key(k: KeyEvent) -> bool {
-    k.modifiers.contains(KeyModifiers::CONTROL)
-        && matches!(k.code, KeyCode::Char(']') | KeyCode::Char('5'))
+    k.modifiers.contains(KeyModifiers::CONTROL) && matches!(k.code, KeyCode::Char(']' | '5'))
 }
 
 /// Recognize either Shift-`/` event: `?`, or `/` with the Shift modifier.

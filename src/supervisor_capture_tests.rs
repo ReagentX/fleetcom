@@ -209,7 +209,7 @@ fn spawn_claude_pins_an_id_and_layers_settings() {
     let (bin, runtime) = (dir.join("bin"), dir.join("run"));
     install_stub(&bin, "claude", &dir);
     let mut s = sup_ctx(agent_ctx(&bin, &runtime, dir.to_path_buf()));
-    s.spawn_agent("claude", dir.to_path_buf(), None);
+    s.spawn_agent("claude", &dir, None);
 
     let argv = wait_argv(&mut s, &dir.join("argv"));
     let si = argv
@@ -344,7 +344,7 @@ fn typed_agent_word_is_literal_runs_verbatim_and_saves_as_text() {
 
     // Install a namespace by launching a managed sibling. Write a capture for task 1 there,
     // stamped with task 1's leader PID, and create a registry record keyed to that PID.
-    s.spawn_agent("claude", dir.to_path_buf(), None);
+    s.spawn_agent("claude", &dir, None);
     let ns = s.tasks[1]
         .capture_file
         .as_deref()
@@ -389,7 +389,7 @@ fn rerun_cannot_read_the_old_runs_stale_capture() {
         dir.to_path_buf(),
         &[("FLEETCOM_CONFIG_DIR", &config)],
     ));
-    s.spawn_agent("claude", dir.to_path_buf(), None);
+    s.spawn_agent("claude", &dir, None);
     let id = s.tasks[0].id;
     // The old run's final capture becomes the new run's launch ID.
     let old_cap = s.tasks[0].capture_file.clone().expect("capture file set");
@@ -428,13 +428,13 @@ fn reconnect_with_unchanged_root_preserves_capture_files() {
     let (bin, runtime) = (dir.join("bin"), dir.join("run"));
     install_stub(&bin, "claude", &dir);
     let mut s = sup_ctx(agent_ctx(&bin, &runtime, dir.to_path_buf()));
-    s.spawn_agent("claude", dir.to_path_buf(), None);
+    s.spawn_agent("claude", &dir, None);
     let cap = s.tasks[0].capture_file.clone().expect("capture file set");
     std::fs::write(&cap, "{}").unwrap();
 
     // The client reconnects with an identical env and spawns again.
     s.set_launch_context(agent_ctx(&bin, &runtime, dir.to_path_buf()));
-    s.spawn_agent("claude", dir.to_path_buf(), None);
+    s.spawn_agent("claude", &dir, None);
     assert_eq!(s.tasks.len(), 2);
     assert!(
         cap.exists(),
@@ -449,16 +449,16 @@ fn returning_to_a_prior_root_preserves_its_live_captures() {
     let (bin, root_a, root_b) = (dir.join("bin"), dir.join("run-a"), dir.join("run-b"));
     install_stub(&bin, "claude", &dir);
     let mut s = sup_ctx(agent_ctx(&bin, &root_a, dir.to_path_buf()));
-    s.spawn_agent("claude", dir.to_path_buf(), None);
+    s.spawn_agent("claude", &dir, None);
     let cap_a = s.tasks[0].capture_file.clone().expect("capture file set");
     std::fs::write(&cap_a, "{}").unwrap();
 
     // The client reconnects under root B, spawns, then returns to A and
     // spawns again.
     s.set_launch_context(agent_ctx(&bin, &root_b, dir.to_path_buf()));
-    s.spawn_agent("claude", dir.to_path_buf(), None);
+    s.spawn_agent("claude", &dir, None);
     s.set_launch_context(agent_ctx(&bin, &root_a, dir.to_path_buf()));
-    s.spawn_agent("claude", dir.to_path_buf(), None);
+    s.spawn_agent("claude", &dir, None);
 
     assert_eq!(s.tasks.len(), 3);
     assert!(
@@ -485,7 +485,7 @@ fn remove_deletes_the_capture_file_under_the_spawn_root() {
     let (bin, root_a, root_b) = (dir.join("bin"), dir.join("run-a"), dir.join("run-b"));
     install_stub(&bin, "claude", &dir);
     let mut s = sup_ctx(agent_ctx(&bin, &root_a, dir.to_path_buf()));
-    s.spawn_agent("claude", dir.to_path_buf(), None);
+    s.spawn_agent("claude", &dir, None);
     let _ = wait_argv(&mut s, &dir.join("argv"));
     let id = s.tasks[0].id;
     wait_for_lifecycle(&mut s, id, |l| l == Lifecycle::Ok);
@@ -495,7 +495,7 @@ fn remove_deletes_the_capture_file_under_the_spawn_root() {
     // Root B is installed by a newer spawn; a same-id file under it must
     // survive the A task's removal.
     s.set_launch_context(agent_ctx(&bin, &root_b, dir.to_path_buf()));
-    s.spawn_agent("claude", dir.to_path_buf(), None);
+    s.spawn_agent("claude", &dir, None);
     let decoy = s.tasks[1]
         .capture_file
         .as_deref()
@@ -531,7 +531,7 @@ fn spawn_codex_installs_the_notify_and_embedded_overrides() {
         dir.to_path_buf(),
         &[("CODEX_HOME", &dir.join("codex_home"))],
     ));
-    s.spawn_agent("codex", dir.to_path_buf(), None);
+    s.spawn_agent("codex", &dir, None);
 
     let argv = wait_argv(&mut s, &dir.join("argv"));
     let ci = argv
@@ -577,7 +577,7 @@ fn spawn_grok_pins_an_id_and_injects_nothing_else() {
         dir.to_path_buf(),
         &[("FLEETCOM_CONFIG_DIR", &config)],
     ));
-    s.spawn_agent("grok", dir.to_path_buf(), None);
+    s.spawn_agent("grok", &dir, None);
 
     let argv = wait_argv(&mut s, &dir.join("argv"));
     assert_eq!(
@@ -619,7 +619,7 @@ fn spawn_omp_loads_the_capture_extension() {
     let (bin, runtime) = (dir.join("bin"), dir.join("run"));
     install_stub(&bin, "omp", &dir);
     let mut s = sup_ctx(agent_ctx(&bin, &runtime, dir.to_path_buf()));
-    s.spawn_agent("omp", dir.to_path_buf(), None);
+    s.spawn_agent("omp", &dir, None);
 
     let argv = wait_argv(&mut s, &dir.join("argv"));
     let ei = argv
@@ -697,7 +697,7 @@ fn printed_resume_hints_do_not_change_saved_recovery_or_rerun_targets() {
             ],
         ));
         s.set_recovery_timing(Duration::from_millis(20), Duration::from_millis(100));
-        s.spawn_agent(tool, dir.to_path_buf(), None);
+        s.spawn_agent(tool, &dir, None);
         s.tasks[0].group = Some("agents".into());
         s.tasks[0].name = Some(tool.into());
         let expected_id = match tool {
@@ -835,7 +835,7 @@ fn resume_id_precedence_registry_over_spawn_under_capture() {
             ("CLAUDE_CONFIG_DIR", &claude_home),
         ],
     ));
-    s.spawn_agent("claude", dir.to_path_buf(), None);
+    s.spawn_agent("claude", &dir, None);
     let injected = s.tasks[0]
         .resume_id
         .clone()
@@ -898,7 +898,7 @@ until [ -e '{d}/done' ]; do sleep 0.05; done"#,
             ("CLAUDE_CONFIG_DIR", &claude_home),
         ],
     ));
-    s.spawn_agent("claude", dir.to_path_buf(), None);
+    s.spawn_agent("claude", &dir, None);
     let pinned = s.tasks[0]
         .resume_id
         .clone()
@@ -1000,8 +1000,8 @@ fn silent_codex_tasks_save_and_recover_without_a_resume_id() {
         ],
     ));
     s.set_recovery_timing(Duration::from_millis(20), Duration::from_millis(100));
-    s.spawn_agent("codex", dir.to_path_buf(), None);
-    s.spawn_agent("codex", dir.to_path_buf(), None);
+    s.spawn_agent("codex", &dir, None);
+    s.spawn_agent("codex", &dir, None);
     assert_eq!(s.tasks.len(), 2);
     assert!(reap_until(&mut s, Duration::from_secs(5), |s| s
         .tasks
@@ -1104,7 +1104,7 @@ fn codex_capture_resolves_each_notifying_thread_to_the_root() {
             ("CODEX_HOME", &codex_home),
         ],
     ));
-    s.spawn_agent("codex", dir.to_path_buf(), None);
+    s.spawn_agent("codex", &dir, None);
     assert!(s.tasks[0].resume_id.is_none(), "codex pins no id at launch");
 
     assert_eq!(arrive(&s, &codex_home, &title_turn()), None);
@@ -1248,7 +1248,7 @@ fn home_only_launch_env_targets_the_clients_dot_codex() {
         dir.to_path_buf(),
         &[("FLEETCOM_CONFIG_DIR", &config), ("HOME", &home)],
     ));
-    s.spawn_agent("codex", dir.to_path_buf(), None);
+    s.spawn_agent("codex", &dir, None);
     assert_eq!(
         s.tasks[0].harness_home.as_deref(),
         Some(codex_home.as_path()),
@@ -1307,7 +1307,7 @@ fn stale_inherited_notify_chain_is_never_executed() {
         stale.as_os_str().to_os_string(),
     ));
     let mut s = sup_ctx(ctx);
-    s.spawn_agent("codex", dir.to_path_buf(), None);
+    s.spawn_agent("codex", &dir, None);
     let id = s.tasks[0].id;
     wait_exited(&mut s, id);
     let cap = s.tasks[0].capture_file.clone().expect("capture file set");
@@ -1344,7 +1344,7 @@ fn managed_save_without_any_id_omits_resume() {
             ("CODEX_HOME", &codex_home),
         ],
     ));
-    s.spawn_agent("codex", dir.to_path_buf(), None);
+    s.spawn_agent("codex", &dir, None);
     let id = s.tasks[0].id;
     wait_exited(&mut s, id);
 
@@ -1400,7 +1400,7 @@ fn config_toml_notify_chains_through_the_injected_script() {
         dir.to_path_buf(),
         &[("CODEX_HOME", &codex_home)],
     ));
-    s.spawn_agent("codex", dir.to_path_buf(), None);
+    s.spawn_agent("codex", &dir, None);
     let argv = wait_argv(&mut s, &dir.join("argv"));
     assert!(
         argv.iter().any(|a| a.starts_with("notify=[")),
@@ -1456,7 +1456,7 @@ fn unrepresentable_config_notify_suppresses_injection() {
         dir.to_path_buf(),
         &[("CODEX_HOME", &codex_home)],
     ));
-    s.spawn_agent("codex", dir.to_path_buf(), None);
+    s.spawn_agent("codex", &dir, None);
     assert_sole_notice(s.drain(), "capture unavailable");
     let argv = wait_argv(&mut s, &dir.join("argv"));
     assert_eq!(
@@ -1472,7 +1472,7 @@ fn unrepresentable_config_notify_suppresses_injection() {
     )
     .unwrap();
     std::fs::remove_file(dir.join("argv")).unwrap();
-    s.spawn_agent("codex", dir.to_path_buf(), None);
+    s.spawn_agent("codex", &dir, None);
     assert_eq!(notices(s.drain()), Vec::<String>::new());
     let argv = wait_argv(&mut s, &dir.join("argv"));
     assert!(
@@ -1521,7 +1521,7 @@ fn recovery_cadence_rewrites_on_capture_drift_and_skips_when_static() {
         &[("FLEETCOM_CONFIG_DIR", &config)],
     ));
     s.set_recovery_timing(Duration::from_millis(20), Duration::from_millis(100));
-    s.spawn_agent("claude", dir.to_path_buf(), None);
+    s.spawn_agent("claude", &dir, None);
     let _ = wait_argv(&mut s, &dir.join("argv"));
 
     let rec = config.join("sessions").join("recovery");
@@ -1601,7 +1601,7 @@ fn managed_claude_accepts_its_own_capture_and_refuses_a_foreign_stamp() {
     let mut ctx = agent_ctx(&bin, &runtime, dir.to_path_buf());
     ctx.env = with_shell(ctx.env, install_resident_shell(&dir));
     let mut s = sup_ctx(ctx);
-    s.spawn_agent("claude", dir.to_path_buf(), None);
+    s.spawn_agent("claude", &dir, None);
     assert!(acknowledged(&s.drain()), "a managed spawn is acknowledged");
     let argv = wait_argv(&mut s, &dir.join("argv"));
     let id = s.tasks[0].id;
@@ -1644,11 +1644,11 @@ fn managed_spawn_refuses_an_unknown_word_a_missing_binary_and_a_full_fleet() {
     let (bin, runtime) = (dir.join("bin"), dir.join("run"));
     let mut s = sup_ctx(agent_ctx(&bin, &runtime, dir.to_path_buf()));
 
-    s.spawn_agent("vim", dir.to_path_buf(), None);
+    s.spawn_agent("vim", &dir, None);
     let events = s.drain();
     assert!(!acknowledged(&events));
     assert_sole_notice(events, "no agent named");
-    s.spawn_agent("claude", dir.to_path_buf(), None);
+    s.spawn_agent("claude", &dir, None);
     let events = s.drain();
     assert!(!acknowledged(&events));
     assert_sole_notice(events, "not found on PATH");
@@ -1657,10 +1657,10 @@ fn managed_spawn_refuses_an_unknown_word_a_missing_binary_and_a_full_fleet() {
 
     install_stub(&bin, "claude", &dir);
     s.set_max_tasks(1);
-    s.spawn_agent("claude", dir.to_path_buf(), None);
+    s.spawn_agent("claude", &dir, None);
     assert!(acknowledged(&s.drain()));
     assert_eq!(s.tasks.len(), 1);
-    s.spawn_agent("claude", dir.to_path_buf(), None);
+    s.spawn_agent("claude", &dir, None);
     assert_sole_notice(s.drain(), "task limit");
     spawn(&mut s, "sleep 1", dir.to_path_buf());
     assert_sole_notice(s.drain(), "task limit");
@@ -1677,7 +1677,7 @@ fn managed_rerun_resumes_the_captured_id_from_the_binary_path_finds_now() {
     let (bin, runtime) = (dir.join("bin"), dir.join("run"));
     install_stub(&bin, "claude", &dir);
     let mut s = sup_ctx(agent_ctx(&bin, &runtime, dir.to_path_buf()));
-    s.spawn_agent("claude", dir.to_path_buf(), Some("agents".into()));
+    s.spawn_agent("claude", &dir, Some("agents".into()));
     let _ = wait_argv(&mut s, &dir.join("argv"));
     let id = s.tasks[0].id;
     s.tasks[0].tagged = true;
@@ -1730,7 +1730,7 @@ fn managed_rerun_without_an_id_starts_fresh() {
     let (bin, runtime) = (dir.join("bin"), dir.join("run"));
     install_stub(&bin, "omp", &dir);
     let mut s = sup_ctx(agent_ctx(&bin, &runtime, dir.to_path_buf()));
-    s.spawn_agent("omp", dir.to_path_buf(), None);
+    s.spawn_agent("omp", &dir, None);
     let first = wait_argv(&mut s, &dir.join("argv"));
     let id = s.tasks[0].id;
     assert_eq!(first[0], "-e");
@@ -1777,8 +1777,8 @@ fn managed_task_saves_as_a_managed_entry_and_reloads_managed() {
         dir.to_path_buf(),
         &[("FLEETCOM_CONFIG_DIR", &config)],
     ));
-    s.spawn_agent("claude", dir.to_path_buf(), Some("agents".into()));
-    s.spawn_agent("omp", dir.to_path_buf(), None);
+    s.spawn_agent("claude", &dir, Some("agents".into()));
+    s.spawn_agent("omp", &dir, None);
     assert!(s.tasks.iter().all(|t| t.harness.is_some()));
     // Wait for both first-run records before touching captures or clearing
     // them, so a late write from the original launch cannot pass for the
@@ -1920,7 +1920,7 @@ fn managed_codex_reports_the_capture_notice_and_leads_a_rerun_with_resume() {
         dir.to_path_buf(),
         &[("CODEX_HOME", &codex_home)],
     ));
-    s.spawn_agent("codex", dir.to_path_buf(), None);
+    s.spawn_agent("codex", &dir, None);
     // Drain the launch notice so the rerun's is the sole one.
     let _ = s.drain();
     let _ = wait_argv(&mut s, &dir.join("argv"));
@@ -1978,7 +1978,7 @@ fn registry_waiting_status_reaches_the_dashboard_preview() {
         dir.to_path_buf(),
         &[("CLAUDE_CONFIG_DIR", &claude_home)],
     ));
-    s.spawn_agent("claude", dir.to_path_buf(), None);
+    s.spawn_agent("claude", &dir, None);
     // Key the record to the task's leader PID.
     let pid = s.tasks[0].pid().expect("a live task has a pid");
 

@@ -291,8 +291,10 @@ fn codex_capture_file_drives_save_and_load_resumes() {
     let script = notify
         .strip_prefix(r#"notify=[""#)
         .and_then(|v| v.strip_suffix(r#""]"#))
-        .map(PathBuf::from)
-        .unwrap_or_else(|| panic!("spawn must route notify at one script: {argv:?}"));
+        .map_or_else(
+            || panic!("spawn must route notify at one script: {argv:?}"),
+            PathBuf::from,
+        );
     assert_daemon_namespaced(&script, daemon.0.id(), "notify script", &argv);
     assert_eq!(
         argv,

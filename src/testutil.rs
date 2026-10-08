@@ -267,7 +267,7 @@ pub fn hook_json(id: &str, source: &str) -> String {
 
 /// Build owned rows from string literals.
 pub fn rows(spec: &[&str]) -> Vec<String> {
-    spec.iter().map(|s| s.to_string()).collect()
+    spec.iter().map(ToString::to_string).collect()
 }
 
 /// Build an empty screen for task `id` with the cursor shown at `(0, 0)`,

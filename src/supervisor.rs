@@ -19,7 +19,8 @@ use crate::{
     harness::{self, Harness, Intent, assets},
     path,
     protocol::{
-        Command, Event, LaunchContext, ScreenView, ScrollAction, TaskView, UNASSIGNED, env_get,
+        Command, Event, FLEETCOM_RUNTIME_DIR, LaunchContext, ScreenView, ScrollAction, TaskView,
+        UNASSIGNED, env_get,
     },
     session::{self, EntryKind, SessionConfig, SessionEntry},
     task::{Exec, Task, WriteRefused},
@@ -288,7 +289,7 @@ impl Recovery {
 
 pub struct Supervisor {
     tasks: Vec<Task>,
-    /// Removed tasks whose process groups may still be winding down: TERMed at
+    /// Removed tasks whose process groups may still be winding down: `TERMed` at
     /// removal, escalated to KILL by `reap` at grace end, and dropped once the
     /// leader's zombie is collected. Invisible to `tick` snapshots, so the row
     /// disappears instantly while the sweep runs behind it.
@@ -433,8 +434,8 @@ impl Supervisor {
                 command,
                 cwd,
                 group,
-            } => self.spawn(&command, cwd, group),
-            Command::SpawnAgent { agent, cwd, group } => self.spawn_agent(&agent, cwd, group),
+            } => self.spawn(&command, &cwd, group),
+            Command::SpawnAgent { agent, cwd, group } => self.spawn_agent(&agent, &cwd, group),
             Command::Kill { id } => self.with_task(id, Task::terminate),
             Command::Remove { id } => {
                 if let Some(i) = self.index_of(id) {
@@ -446,7 +447,7 @@ impl Supervisor {
             Command::Tag { id, on } => self.with_task(id, |t| t.tagged = on),
             Command::Flagship { id } => self.flagship = id,
             Command::SetGroup { id, group } => {
-                self.with_task(id, |t| t.group = normalize_group(group))
+                self.with_task(id, |t| t.group = normalize_group(group));
             }
             Command::SetName { id, name } => self.with_task(id, |t| t.name = normalize_label(name)),
             Command::Resize { rows, cols } => {
@@ -487,11 +488,11 @@ impl Supervisor {
             // which only the core's emulator can see.
             Command::Paste { id, bytes } => self.deliver(id, "paste", |t| t.send_paste(&bytes)),
             Command::Mouse { id, kind, col, row } => {
-                self.deliver(id, "mouse input", |t| t.send_mouse(kind, col, row))
+                self.deliver(id, "mouse input", |t| t.send_mouse(kind, col, row));
             }
             // Encode keys here because the child's cursor-key mode is core-side.
             Command::Key { id, code, mods } => {
-                self.deliver(id, "key input", |t| t.send_key(code, mods))
+                self.deliver(id, "key input", |t| t.send_key(code, mods));
             }
             Command::Scrollback { id, action } => self.with_task(id, |t| t.scroll_view(action)),
             Command::SaveSession { name } => self.save_session(&name),
@@ -784,17 +785,15 @@ impl Supervisor {
     /// partitioned by session directory. Assets are cached by canonical root,
     /// and installation failure disables instrumentation for the spawn.
     fn ensure_capture_assets(&mut self) -> Option<&assets::CaptureAssets> {
-        let root = self
-            .launch_env_path(crate::protocol::FLEETCOM_RUNTIME_DIR)
-            .or_else(|| {
-                assets::runtime_root().map(|base| {
-                    let key = self
-                        .sessions_root()
-                        .map(PathBuf::into_os_string)
-                        .unwrap_or_default();
-                    base.join(fnv1a_hex(key.as_encoded_bytes()))
-                })
-            })?;
+        let root = self.launch_env_path(FLEETCOM_RUNTIME_DIR).or_else(|| {
+            assets::runtime_root().map(|base| {
+                let key = self
+                    .sessions_root()
+                    .map(PathBuf::into_os_string)
+                    .unwrap_or_default();
+                base.join(fnv1a_hex(key.as_encoded_bytes()))
+            })
+        })?;
         if let Ok(key) = std::fs::canonicalize(&root)
             && self.capture.contains_key(&key)
         {
@@ -869,7 +868,7 @@ impl Supervisor {
             self.cols,
             self.scrollback,
             &env,
-            Arc::clone(&self.waker),
+            &self.waker,
         )?;
         if let Some((h, home, capture_file, resume_id)) = meta {
             task.harness = Some(h);
@@ -932,7 +931,7 @@ impl Supervisor {
         true
     }
 
-    fn spawn(&mut self, command: &str, cwd: PathBuf, group: Option<String>) {
+    fn spawn(&mut self, command: &str, cwd: &Path, group: Option<String>) {
         if command.len() > MAX_COMMAND_LEN {
             self.status(format!(
                 "command too long ({} bytes, limit {}), not spawning",
@@ -947,14 +946,14 @@ impl Supervisor {
         let Some(launch) = self.launch_or_refuse() else {
             return;
         };
-        let admitted = self.admit(&Launch::Literal(command), &cwd, &launch.env, group, None);
+        let admitted = self.admit(&Launch::Literal(command), cwd, &launch.env, group, None);
         self.report_spawn(admitted);
     }
 
     /// Launch registered `agent` as a managed task with a fresh conversation. Resolve the
     /// binary on the launch context's current `PATH`; do not accept a path from the client.
     /// Refuse to spawn when no binary is found.
-    fn spawn_agent(&mut self, agent: &str, cwd: PathBuf, group: Option<String>) {
+    fn spawn_agent(&mut self, agent: &str, cwd: &Path, group: Option<String>) {
         if !self.below_task_ceiling() {
             return;
         }
@@ -965,7 +964,7 @@ impl Supervisor {
             Ok(m) => m,
             Err(why) => return self.status(format!("{why}, not spawning")),
         };
-        let admitted = self.admit(&Launch::Managed(managed), &cwd, &launch.env, group, None);
+        let admitted = self.admit(&Launch::Managed(managed), cwd, &launch.env, group, None);
         self.report_spawn(admitted);
     }
 

@@ -30,7 +30,7 @@ pub const fn fits_base64(n: usize) -> bool {
 }
 
 /// Maximum time one frame write to a socket peer may block. A peer that
-/// stops draining its socket (crashed, SIGSTOPped, hostile) must not wedge
+/// stops draining its socket (crashed, `SIGSTOPped`, hostile) must not wedge
 /// the writer: the daemon's event writes and the client's command writes
 /// both cap here and treat expiry as a dead connection.
 pub const SEND_TIMEOUT: Duration = Duration::from_secs(5);

@@ -28,7 +28,7 @@ impl Selection {
     }
 
     /// Whether the head and anchor occupy the same cell.
-    pub fn is_click(&self) -> bool {
+    pub fn is_click(self) -> bool {
         self.anchor == self.head
     }
 
@@ -45,7 +45,7 @@ impl Selection {
     ///
     /// Each selected screen row occupies one joined line, even when its
     /// selected span is empty.
-    pub fn extract(&self, rows: &[String]) -> String {
+    pub fn extract(self, rows: &[String]) -> String {
         let Some(last) = rows.len().checked_sub(1) else {
             return String::new();
         };
@@ -65,12 +65,7 @@ impl Selection {
     /// Endpoints are ordered and clamped before wide glyphs are expanded and
     /// trailing whitespace is removed. Returns `None` outside the selection
     /// or when the selected span is empty after trimming.
-    pub fn row_segment<'a>(
-        &self,
-        row: usize,
-        text: &'a str,
-        last_row: usize,
-    ) -> Option<(u16, &'a str)> {
+    pub fn row_segment(self, row: usize, text: &str, last_row: usize) -> Option<(u16, &str)> {
         let (start, end) = self.bounds(last_row);
         if row < start.0 || row > end.0 {
             return None;
@@ -85,7 +80,7 @@ impl Selection {
 
     /// Clamp endpoints to the last row, then order them by row and column. Clamp before
     /// ordering: both endpoints may be clamped to the same row.
-    fn bounds(&self, last: usize) -> ((usize, usize), (usize, usize)) {
+    fn bounds(self, last: usize) -> ((usize, usize), (usize, usize)) {
         let clamp = |(row, col): (u16, u16)| ((row as usize).min(last), col as usize);
         let (mut start, mut end) = (clamp(self.anchor), clamp(self.head));
         if start > end {
