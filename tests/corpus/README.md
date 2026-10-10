@@ -59,7 +59,10 @@ structural tier, since its chrome is user-themeable, so these fixtures pin that
 nothing anchors on them and that the title tier carries omp's state. The titled
 fixtures reuse their untitled rows verbatim behind a title announce: `ESC]0;π >
 fix the parser BEL` for idle and `ESC]0;π ⠇ List files in current directory
-BEL` for working.
+BEL` for working. Capture grok 1.0.50's title announce immediately after entry
+into the alternate screen. For these blocked states, title normalization is the
+only matching path. Use a same-width synthetic value for the header path to
+prevent a byte-for-byte match with the captured header.
 
 | Fixture | Scenario | Coverage |
 | --- | --- | --- |
@@ -90,6 +93,10 @@ BEL` for working.
 | `preview_grok_subagent_scrollback.bin` | grok idle with `Subagent running:` in the body, no `◎` row | fall-through; body-shaped text is not status |
 | `preview_grok_idle.bin` | grok idle session | fall-through to the marker |
 | `preview_grok_splash.bin` | grok launch splash with resume hint above the box | fall-through; distinct views excluded from anchors |
+| `preview_grok_idle_titled.bin` | `preview_grok_idle.bin` plus a `Run ls -la list directory file names - grok` title announce | Strip `- grok` and render the session name through the title tier |
+| `preview_grok_permission.bin` | grok 1.0.50 permission prompt: `┃`-fenced option list in place of the input box; `⚠ Action Required - ⠸ - … - grok` title announce | Match the `⚠ Action Required` prefix and return `awaiting approval`; this fixture has no input-box anchor |
+| `preview_grok_plan_approval.bin` | grok 1.0.50 plan approval: `plan.md` panel, `◆ Waiting on plan approval` above the input box, `plan approval` border label, `⠦ - Running: Plan: Exit - … - grok` title announce | The `◆` probe row has no structural match; return `awaiting approval` from the title tier |
+| `preview_grok_question.bin` | grok 1.0.50 Ask tool: `┃`-fenced answer list in place of the input box; `⠼ - Running: Ask: … - grok` title announce | Match the `Running: Ask:` prefix and return `awaiting approval`; this fixture has no input-box anchor |
 | `preview_omp_idle.bin` | omp 18.8.7 idle: logo, tip, `π >` status band, `╰─` composer gutter | negative: no anchor on the band layout; fall-through to the floor tier, no marker for an inline UI |
 | `preview_omp_idle_titled.bin` | `preview_omp_idle.bin` after a `π > fix the parser` title announce | idle prefix stripped and `fix the parser` rendered in the primary-screen title tier |
 | `preview_omp_working.bin` | omp 18.8.7 mid tool call: `⎋ List files in current directory` working row, `⠇ 4s >` status band, composer gutter | negative: no anchor on the working row or band; fall-through to the floor tier |
