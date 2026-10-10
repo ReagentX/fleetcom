@@ -44,6 +44,7 @@ fn anchor(text: &str, rule: &'static str) -> Preview {
         source: PreviewSource::Anchor,
         rule: Some(rule),
         frozen: false,
+        working: false,
     }
 }
 
@@ -54,6 +55,7 @@ fn title(text: &str) -> Preview {
         source: PreviewSource::Title,
         rule: None,
         frozen: false,
+        working: false,
     }
 }
 
@@ -64,6 +66,7 @@ fn floor(text: &str) -> Preview {
         source: PreviewSource::Floor,
         rule: None,
         frozen: false,
+        working: false,
     }
 }
 
@@ -74,6 +77,7 @@ fn frozen(text: &str) -> Preview {
         source: PreviewSource::Floor,
         rule: None,
         frozen: true,
+        working: false,
     }
 }
 

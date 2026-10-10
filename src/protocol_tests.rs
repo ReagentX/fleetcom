@@ -399,11 +399,11 @@ fn mistyped_event_members_are_rejected() {
     for json in [
         r#"{"t":"tasks","tasks":[{"id":"nope"}]}"#,
         // The cwd must be a base64 string.
-        r#"{"t":"tasks","tasks":[{"id":1,"command":"x","cwd":"/x","tagged":true,"flagship":false,"managed":false,"life":"ok","preview":"","src":"floor","frozen":false,"started_ms":0}]}"#,
+        r#"{"t":"tasks","tasks":[{"id":1,"command":"x","cwd":"/x","tagged":true,"flagship":false,"managed":false,"life":"ok","preview":"","src":"floor","frozen":false,"working":false,"started_ms":0}]}"#,
         // A present group must be a string; only missing/null means unassigned.
-        r#"{"t":"tasks","tasks":[{"id":1,"command":"x","cwd":"Lw==","tagged":true,"flagship":false,"managed":false,"life":"ok","preview":"","src":"floor","frozen":false,"started_ms":0,"group":5}]}"#,
+        r#"{"t":"tasks","tasks":[{"id":1,"command":"x","cwd":"Lw==","tagged":true,"flagship":false,"managed":false,"life":"ok","preview":"","src":"floor","frozen":false,"working":false,"started_ms":0,"group":5}]}"#,
         // A present name must be a string.
-        r#"{"t":"tasks","tasks":[{"id":1,"command":"x","cwd":"Lw==","tagged":true,"flagship":false,"managed":false,"life":"ok","preview":"","src":"floor","frozen":false,"started_ms":0,"name":5}]}"#,
+        r#"{"t":"tasks","tasks":[{"id":1,"command":"x","cwd":"Lw==","tagged":true,"flagship":false,"managed":false,"life":"ok","preview":"","src":"floor","frozen":false,"working":false,"started_ms":0,"name":5}]}"#,
         r#"{"t":"tasks","tasks":["flat"]}"#,
         // Numeric member in `names`.
         r#"{"t":"sessions","names":["ok",5]}"#,
@@ -443,6 +443,7 @@ fn tasks_round_trip() {
                 source: PreviewSource::Title,
                 rule: None,
                 frozen: false,
+                working: false,
             },
             started_ago: Duration::from_millis(4200),
             quiet_ago: Some(Duration::from_millis(700)),
@@ -515,7 +516,7 @@ fn set_group_and_set_name_wire_forms() {
 fn tasks_frame_label_keys_are_optional() {
     let labels = |v: &[TaskView]| (v[0].group.clone(), v[0].name.clone());
     // "Lw==" is the base64 encoding of "/".
-    let unlabelled = r#"{"t":"tasks","tasks":[{"id":1,"command":"x","cwd":"Lw==","tagged":false,"flagship":false,"managed":false,"life":"ok","preview":"","src":"floor","frozen":false,"started_ms":0}]}"#;
+    let unlabelled = r#"{"t":"tasks","tasks":[{"id":1,"command":"x","cwd":"Lw==","tagged":false,"flagship":false,"managed":false,"life":"ok","preview":"","src":"floor","frozen":false,"working":false,"started_ms":0}]}"#;
     match decode_event(KIND_CONTROL, unlabelled.as_bytes()) {
         Some(Event::Tasks(v)) => assert_eq!(labels(&v), (None, None)),
         other => panic!("expected tasks event, got {other:?}"),
@@ -526,11 +527,11 @@ fn tasks_frame_label_keys_are_optional() {
 
     for (labelled, expected) in [
         (
-            r#"{"t":"tasks","tasks":[{"id":1,"command":"x","cwd":"Lw==","tagged":false,"flagship":false,"managed":false,"group":"infra","life":"ok","preview":"","src":"floor","frozen":false,"started_ms":0}]}"#,
+            r#"{"t":"tasks","tasks":[{"id":1,"command":"x","cwd":"Lw==","tagged":false,"flagship":false,"managed":false,"group":"infra","life":"ok","preview":"","src":"floor","frozen":false,"working":false,"started_ms":0}]}"#,
             (Some("infra".to_string()), None),
         ),
         (
-            r#"{"t":"tasks","tasks":[{"id":1,"command":"x","cwd":"Lw==","tagged":false,"flagship":false,"managed":false,"name":"build","life":"ok","preview":"","src":"floor","frozen":false,"started_ms":0}]}"#,
+            r#"{"t":"tasks","tasks":[{"id":1,"command":"x","cwd":"Lw==","tagged":false,"flagship":false,"managed":false,"name":"build","life":"ok","preview":"","src":"floor","frozen":false,"working":false,"started_ms":0}]}"#,
             (None, Some("build".to_string())),
         ),
     ] {
@@ -589,8 +590,8 @@ fn tasks_frame_null_ages_decode_as_unknown() {
     assert_eq!(decode_event(k, s.as_bytes()), Some(tasks));
 }
 
-/// Every preview source round-trips with its frozen flag, and `rule`
-/// never crosses the wire: an encoded `Some` decodes as `None`.
+/// Round-trip the `frozen` and `working` flags for every preview source. Keep `rule`
+/// local to the daemon: `encode_event` omits it, so decoding yields `None`.
 #[test]
 fn preview_source_and_frozen_round_trip() {
     let base = TaskView {
@@ -626,8 +627,23 @@ fn preview_source_and_frozen_round_trip() {
             },
             ..base.clone()
         },
+        TaskView {
+            id: 5,
+            preview: Preview {
+                source: PreviewSource::Anchor,
+                working: true,
+                ..base.preview.clone()
+            },
+            ..base.clone()
+        },
     ]);
     let (k, p) = encode_event(&tasks);
+    assert!(
+        std::str::from_utf8(&p)
+            .unwrap()
+            .contains("\"working\":true"),
+        "the working flag must be its own wire field"
+    );
     assert_eq!(decode_event(k, &p), Some(tasks));
 
     // Encoding omits the process-local matcher rule.
@@ -654,8 +670,8 @@ fn preview_source_and_frozen_round_trip() {
     }
 }
 
-/// Require a known source and boolean `frozen` and `managed` values in same-version task
-/// frames. Round-trip the managed flag in both states.
+/// Reject task frames with unknown preview sources or non-boolean `frozen`, `working`,
+/// or `managed` fields. Round-trip the managed flag in both states.
 #[test]
 fn tasks_frame_requires_row_fields() {
     for managed in [false, true] {
@@ -678,6 +694,11 @@ fn tasks_frame_requires_row_fields() {
         ),
         (
             "frozen",
+            "false",
+            &["null", "0", "\"false\"", "[]", "{}"][..],
+        ),
+        (
+            "working",
             "false",
             &["null", "0", "\"false\"", "[]", "{}"][..],
         ),

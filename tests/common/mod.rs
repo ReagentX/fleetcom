@@ -19,7 +19,7 @@ use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
 
 /// Protocol version used by this test suite; must match
 /// `protocol::PROTOCOL_VERSION`.
-pub const PROTOCOL_VERSION: u32 = 14;
+pub const PROTOCOL_VERSION: u32 = 15;
 
 /// One frame of the given kind: `[u32 len][kind][payload]`.
 pub fn frame(kind: u8, payload: &[u8]) -> Vec<u8> {
