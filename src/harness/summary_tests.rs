@@ -31,14 +31,6 @@ fn grok_screen<S: AsRef<str>>(above: &[S]) -> Vec<String> {
     rows
 }
 
-/// Place the supplied rows above the two-row omp input box.
-fn omp_screen<S: AsRef<str>>(above: &[S]) -> Vec<String> {
-    let mut rows: Vec<String> = above.iter().map(|s| s.as_ref().to_string()).collect();
-    rows.push("╭── π  > ⬢ model · ◒ high > ◫ 12.2%/131K ▶──╮".to_string());
-    rows.push("╰─                                         ─╯".to_string());
-    rows
-}
-
 /// Resolve a corpus fixture at the corpus row count and `cols` columns;
 /// return its text, source, and rule.
 fn corpus(
@@ -126,10 +118,18 @@ fn select_routes_to_the_matching_adapter() {
         select("grok").unwrap().live_preview(&grok).unwrap().1,
         "grok:spinner"
     );
-    let omp = omp_screen(&[" ⠴ Listing directory contents ⟦esc⟧", ""]);
+    // omp routes to a title-only adapter: its 18.8.7 working screen anchors
+    // nothing, and its state arrives through the title.
+    let omp = select("omp").unwrap();
+    let working = rs(&[
+        "  ⎋ List files in current directory",
+        " ⠇ 4s > ◒ Nemotron 3 Ultra (free) > 🗑 …/work ▶─1.0%───╎┃─────1M─",
+        "╰─",
+    ]);
+    assert_eq!(omp.live_preview(&working), None);
     assert_eq!(
-        select("omp").unwrap().live_preview(&omp).unwrap().1,
-        "omp:spinner"
+        omp.normalize_title("π ⠇ List files in current directory"),
+        Some("⠋ List files in current directory".to_string())
     );
 }
 
@@ -1206,164 +1206,9 @@ fn grok_still_running_shapes() {
     );
 }
 
-/// Build an omp approval screen with `head` naming the tool.
-fn omp_selector(head: &str) -> Vec<String> {
-    omp_selector_row(" ❯ Approve", head)
-}
-
-/// Build an approval selector with a configurable selected row.
-fn omp_selector_row(approve: &str, head: &str) -> Vec<String> {
-    let rule = "─".repeat(120);
-    rs(&[
-        " ⠴ Listing directory contents ⟦esc⟧",
-        "",
-        &rule,
-        "",
-        head,
-        " Command: ls -la",
-        "",
-        approve,
-        "   Deny",
-        "",
-        " up/down navigate  enter select  esc cancel",
-        "",
-        &rule,
-    ])
-}
-
-/// Preserve the intent phrase verbatim across both anchoring bracket themes, the CLI's
-/// own truncating ellipsis included.
-#[test]
-fn omp_status_row_extracts_the_intent_phrase() {
-    let probe = |row: &str| OmpSummary.live_preview(&omp_screen(&[row, ""]));
-    for hint in ["⟦esc⟧", "⟨esc⟩"] {
-        assert_eq!(
-            probe(&format!(" ⠴ Listing directory contents {hint}")),
-            Some(("Listing directory contents".to_string(), "omp:spinner")),
-            "{hint:?}"
-        );
-    }
-    // omp's default phrase, used when the model streams no intent of its own.
-    assert_eq!(
-        probe(" ⠹ Working… ⟦esc⟧"),
-        Some(("Working…".to_string(), "omp:spinner"))
-    );
-    // ASCII frames and hints do not satisfy the anchored status grammar.
-    assert_eq!(probe(" - Working… [esc]"), None);
-    assert_eq!(probe(" ⠹ Working… [esc]"), None);
-    assert_eq!(
-        probe(" ⠋ Reading the fixture corpus rea… ⟦esc⟧"),
-        Some(("Reading the fixture corpus rea…".to_string(), "omp:spinner")),
-        "a phrase the CLI truncated keeps its own ellipsis"
-    );
-    // The model text is a user-configured status-line segment: never read.
-    assert_eq!(
-        OmpSummary.model_label(&omp_screen(&[" ⠴ Listing directory contents ⟦esc⟧", ""])),
-        None
-    );
-}
-
-/// The status row needs its frame, its separating space, a phrase, and the
-/// interrupt hint. A row whose hint wrapped onto the next line fails here
-/// rather than surfacing half a phrase.
-#[test]
-fn omp_status_row_requires_the_whole_skeleton() {
-    let probe = |row: &str| OmpSummary.live_preview(&omp_screen(&[row, ""]));
-    for row in [
-        " ⠴ Listing directory contents",
-        " ⠴Listing directory contents ⟦esc⟧",
-        " ⠴ ⟦esc⟧",
-        " ⠴ · queued ⟦esc⟧",
-        " Listing directory contents ⟦esc⟧",
-        " Press ⟦esc⟧ to interrupt",
-    ] {
-        assert_eq!(probe(row), None, "{row:?}");
-    }
-}
-
-/// The pin is the row above the input box, not a substring search: a
-/// status-shaped row parked in the transcript never anchors, and the
-/// tool-call preview box's matching corners are not the input box.
-#[test]
-fn omp_pins_the_status_row_to_the_input_box() {
-    let quoted = omp_screen(&[
-        " ⠴ Listing directory contents ⟦esc⟧",
-        "",
-        " That row is chrome, not transcript.",
-        "",
-    ]);
-    assert_eq!(OmpSummary.live_preview(&quoted), None);
-
-    // The preview box fences a `│`-headed command row between the same
-    // corners, so the pair is not adjacent and the pin fails.
-    let preview_box = rs(&[
-        " ⠴ Listing directory contents ⟦esc⟧",
-        "",
-        "╭──────────────────╮",
-        "│ $ ls -la         │",
-        "╰──────────────────╯",
-    ]);
-    assert_eq!(OmpSummary.live_preview(&preview_box), None);
-}
-
-/// Approval requires an `Allow tool:` head, a selected `Approve` row, and the
-/// `Deny` sibling below it. A spinner above the selector does not win.
-#[test]
-fn omp_approval_requires_the_selector_shape() {
-    assert_eq!(
-        OmpSummary.live_preview(&omp_selector(" Allow tool: bash")),
-        Some(("awaiting approval".to_string(), "omp:approval-menu"))
-    );
-    for head in [" Allow tool: ", " Reviewing the plan"] {
-        assert_eq!(
-            OmpSummary.live_preview(&omp_selector(head)),
-            None,
-            "{head:?}"
-        );
-    }
-
-    // `Deny` must be the next painted row below the selection.
-    let lone = rs(&[" Allow tool: bash", "", " ❯ Approve", "", " esc cancel"]);
-    assert_eq!(OmpSummary.live_preview(&lone), None);
-
-    // The selection must occupy one of the final nine rows.
-    let mut buried = omp_selector(" Allow tool: bash");
-    buried.extend(std::iter::repeat_n(" tool output".to_string(), 6));
-    assert_eq!(OmpSummary.live_preview(&buried), None);
-
-    // A live input box below the quoted selector routes to spinner matching.
-    // The selector's trailing rule is the nearest painted row and fails.
-    let mut quoted = omp_selector(" Allow tool: bash");
-    quoted.push(String::new());
-    assert_eq!(OmpSummary.live_preview(&omp_screen(&quoted)), None);
-}
-
-/// Every supported selector cursor reports a blocked task.
-#[test]
-fn omp_approval_accepts_every_cursor_preset() {
-    for cursor in ['❯', '\u{f054}', '>'] {
-        assert_eq!(
-            OmpSummary.live_preview(&omp_selector_row(
-                &format!(" {cursor} Approve"),
-                " Allow tool: bash"
-            )),
-            Some(("awaiting approval".to_string(), "omp:approval-menu")),
-            "{cursor:?}"
-        );
-    }
-    // The selected row must contain `Approve` exactly after the cursor: `>` is also
-    // used for quoted lines; accept only this exact shape.
-    for approve in [" > Approve now", " >Approve", " > approve", " * Approve"] {
-        assert_eq!(
-            OmpSummary.live_preview(&omp_selector_row(approve, " Allow tool: bash")),
-            None,
-            "{approve:?}"
-        );
-    }
-}
-
 /// omp title normalization strips idle and disabled-state prefixes, folds
-/// working frames to `⠋`, preserves `!`, and rejects unsupported shapes.
+/// working frames to `⠋`, maps `!` to the blocked status, and rejects
+/// unsupported shapes.
 #[test]
 fn omp_title_separators_decode_state_and_label() {
     assert_eq!(
@@ -1385,12 +1230,15 @@ fn omp_title_separators_decode_state_and_label() {
         "a label-less frame is still the working state"
     );
 
-    // The waiting marker is preserved with or without a label.
-    assert_eq!(
-        OmpSummary.normalize_title("π ! Fix the flaky test"),
-        Some("! Fix the flaky test".to_string())
-    );
-    assert_eq!(OmpSummary.normalize_title("π !"), Some("!".to_string()));
+    // `!` is the blocked state, with or without a label: a blocked omp reads
+    // like a blocked claude, codex, or grok.
+    for title in ["π ! List files in current directory", "π !"] {
+        assert_eq!(
+            OmpSummary.normalize_title(title),
+            Some(AWAITING_APPROVAL.to_string()),
+            "{title:?}"
+        );
+    }
 
     // The disabled-state form yields its label.
     assert_eq!(
@@ -1410,19 +1258,6 @@ fn omp_title_separators_decode_state_and_label() {
     ] {
         assert_eq!(OmpSummary.normalize_title(title), None, "{title:?}");
     }
-}
-
-/// ASCII box glyphs do not anchor status: transcript tables and rules use the
-/// same glyphs.
-#[test]
-fn omp_ascii_box_glyphs_do_not_anchor() {
-    let ascii_box = rs(&[
-        " - Listing directory contents [esc]",
-        "",
-        "+-- pi > model . high > 12.2%/131K --+",
-        "+-                                  -+",
-    ]);
-    assert_eq!(OmpSummary.live_preview(&ascii_box), None);
 }
 
 // ------------------------------------------------------- corpus replay --
@@ -1596,9 +1431,9 @@ fn corpus_codex_0158_stdin_requires_a_second_approval() {
 }
 
 /// Positive per-state fixtures at capture geometry (40×120): exact
-/// normalized text, Anchor provenance, and the matcher id.
+/// normalized text and provenance, with the matcher id for Anchor cases.
 #[test]
-fn corpus_positive_states_anchor_exactly() {
+fn corpus_positive_states_resolve_exactly() {
     struct Case(
         &'static str,
         &'static [u8],
@@ -1709,34 +1544,41 @@ fn corpus_positive_states_anchor_exactly() {
             "Grok 4.5 (xhigh) · 1 subagent still running",
             "grok:still-running",
         ),
-        Case(
-            "preview_omp_working",
-            include_bytes!("../../tests/corpus/preview_omp_working.bin"),
+    ];
+    // Title-tier positives: a retained primary title the adapter recognizes,
+    // on a screen that anchors nothing.
+    let titles: [(&str, &[u8], &dyn SummaryAdapter, &str); 2] = [
+        (
+            "preview_omp_idle_titled",
+            include_bytes!("../../tests/corpus/preview_omp_idle_titled.bin"),
             &OmpSummary,
-            "Listing directory contents",
-            "omp:spinner",
+            "fix the parser",
         ),
-        Case(
-            "preview_omp_approval",
-            include_bytes!("../../tests/corpus/preview_omp_approval.bin"),
+        (
+            "preview_omp_working_titled",
+            include_bytes!("../../tests/corpus/preview_omp_working_titled.bin"),
             &OmpSummary,
-            "awaiting approval",
-            "omp:approval-menu",
+            "⠋ List files in current directory",
         ),
     ];
     // Fixture names start with the program word: require a positive case for
-    // every registered harness.
+    // every registered harness, in whichever tier carries its state.
     for a in crate::harness::AGENTS {
         let program = a.harness.shape().0;
         let prefix = format!("preview_{program}_");
         assert!(
-            cases.iter().any(|Case(name, ..)| name.starts_with(&prefix)),
+            cases.iter().any(|Case(name, ..)| name.starts_with(&prefix))
+                || titles.iter().any(|(name, ..)| name.starts_with(&prefix)),
             "a new adapter needs a positive corpus fixture named {prefix}*"
         );
     }
     for Case(name, bytes, adapter, text, rule) in cases {
         let got = corpus(bytes, adapter, 120);
         assert_eq!(got, anchor(text, rule), "{name}");
+    }
+    for (name, bytes, adapter, text) in titles {
+        let got = corpus(bytes, adapter, 120);
+        assert_eq!(got, titled(text), "{name}");
     }
 }
 
@@ -1772,28 +1614,24 @@ fn corpus_idle_states_fall_through() {
     }
 }
 
-/// Without a title announce, the omp idle screen falls through to its input
-/// row in the floor tier.
+/// Without a title announce, omp's 18.8.7 screens fall through to the
+/// composer gutter in the floor tier: nothing anchors on the idle band, and
+/// nothing anchors on the working row or band either.
 #[test]
-fn corpus_omp_idle_falls_through_to_the_floor() {
-    let got = corpus(
-        include_bytes!("../../tests/corpus/preview_omp_idle.bin"),
-        &OmpSummary,
-        120,
-    );
-    assert_eq!(got, floor(&format!("╰─{}─╯", " ".repeat(116))));
-}
-
-/// An omp idle screen with a retained `π > <label>` title renders the label in
-/// the title tier.
-#[test]
-fn corpus_omp_idle_titled_renders_the_title_tier() {
-    let got = corpus(
-        include_bytes!("../../tests/corpus/preview_omp_idle_titled.bin"),
-        &OmpSummary,
-        120,
-    );
-    assert_eq!(got, titled("fix the parser"));
+fn corpus_omp_screens_fall_through_to_the_floor() {
+    for (name, bytes) in [
+        (
+            "preview_omp_idle",
+            &include_bytes!("../../tests/corpus/preview_omp_idle.bin")[..],
+        ),
+        (
+            "preview_omp_working",
+            &include_bytes!("../../tests/corpus/preview_omp_working.bin")[..],
+        ),
+    ] {
+        let got = corpus(bytes, &OmpSummary, 120);
+        assert_eq!(got, floor("╰─"), "{name}");
+    }
 }
 
 /// Status-shaped conversation text does not extract.
@@ -1863,16 +1701,6 @@ fn corpus_body_shaped_text_never_extracts() {
         120,
     );
     assert_eq!(got, marker());
-
-    // omp: a status-shaped row quoted in the transcript with prose between it and the
-    // idle input box. The pin is the row directly above the box, not a substring
-    // search, so exclude the quote from anchors and use the floor.
-    let got = corpus(
-        include_bytes!("../../tests/corpus/preview_omp_body_hint.bin"),
-        &OmpSummary,
-        120,
-    );
-    assert_eq!(got, floor(&format!("╰─{}─╯", " ".repeat(116))));
 }
 
 /// 80-column truncation: status rows are cut at a word boundary with the CLI's own

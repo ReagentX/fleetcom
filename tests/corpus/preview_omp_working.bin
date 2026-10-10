@@ -1,39 +1,21 @@
-[2J[H
-╭─── omp v17.3.4 ──────────────────────────────────────────────────────────────────────────────────╮
-│                                                                                                  │
-│                                          Welcome back!                                           │
-│                                                                                                  │
-│                                           ▀██████████▀                                           │
-│                                            ╘██    ██                                             │
-│                                             ██    ██                                             │
-│                                             ██    ██                                             │
-│                                            ▄██▄  ▄██▄                                            │
-│                                                                                                  │
-│                  /Users/dev/Projects/fixtures/qwen3/Qwen3.8-27B-UD-Q8_K_XL.gguf                  │
-│                                            llama.cpp                                             │
-╰──────────────────────────────────────────────────────────────────────────────────────────────────╯
- Tip: Drop the word `ultrathink` in your message for harder multi-step reasoning — watch it glow
-      rainbow as you type
+[2J[H                                            ████████████
+                                               ██  ██       ▄▀▀▄ █▀▄▀▄ █▀▀▄
+                                               ██  ██       ▀▄▄▀ █ █ █ █▄▄▀
+                                               ▒▒  ██                  █
+                                                   ██       v18.8.7
 
- xdev: xd://: mounted mcp__fixture_js, mcp__fixture_js_add_module_dir, mcp__fixture_js_reset
+                                   Tip: Tired of typing "keep going"? Just send a '.'
 
 
- Use the bash tool to run: ls -la
+ List the files in this directory and describe the repository structure
 
 
- ⠴ Listing directory contents ⟦esc⟧
+ The user wants me to list the files in the current working directory and describe the repository structure. Let me
+ start by reading the directory.
 
-╭── π  > ⬢ /Users/dev/Projects/fixtures/qwen3/Qwen3.8-27B-UD-Q8_K_XL.gguf · ◒ high > 🗑 …tures/proj > ◫ 12.2%/131K ⟲ ▶──╮
-╰─                                                                                                                    ─╯
+ ● Read
+/work/fixtures/corpus/preview/omp-bands/sessions/00000000-0000-4000-8000-000000000000/scratchpad/omp-workspace-dir
 
-
-
-
-
-
-
-
-
-
-
-
+  ⎋ List files in current directory
+ ⠇ 4s > ◒ Nemotron 3 Ultra (free) > 🗑 …/work/fixtures/corpus/preview/omp-bands ▶─1.0%─────────────────────────╎┃─────1M─
+╰─
