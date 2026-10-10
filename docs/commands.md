@@ -48,7 +48,8 @@ Choose the operating mode with launch arguments. Use keys to control the dashboa
 
 | Glyph | Meaning |
 | -- | -- |
-| `✻` | Running: active, producing output |
+| `●` | Working: the agent reports an active turn through its CLI |
+| `✻` | Running: producing output, no agent signal |
 | `∙` | Idle: running, but quiet |
 | `✓` | Completed, exit 0 |
 | `✗` | Completed, non-zero exit |
@@ -57,7 +58,9 @@ Choose the operating mode with launch arguments. Use keys to control the dashboa
 
 Look for marks in the row's two leading columns, aligned left with `◆` before `⚑`.
 
-After 10 seconds without output, a task is marked `∙` and grouped under Idle.
+When you run an agent, Fleetcom shows `●` while the CLI reports an active turn. Launch from the Agent page to add session resume on rerun and blocked-state detection through the agent's registry.
+
+After 10 seconds without output, Fleetcom moves the task under Idle. It shows `∙` unless the agent's CLI reports an active turn, in which case it shows `●`.
 
 ### Input and task lifecycle
 
