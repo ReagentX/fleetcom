@@ -108,8 +108,12 @@ pub fn sessions_dir(root: Option<PathBuf>) -> Option<PathBuf> {
 }
 
 /// Session format version written by `to_json` and accepted by `from_json`. Managed entries
-/// were introduced in version 2. A missing version means 1; `from_json` loads a v1 file as
-/// literals, then rewrites the recipe through [`migrate_v1`]. Reject newer versions.
+/// were introduced in version 2. A missing version means 1; `from_json` loads a v1 file
+/// verbatim, every entry literal. Through 0.15.0 the loader rewrote a v1 file's bare agent
+/// words and canonical resume commands into managed entries, because v1 had no managed form;
+/// the release after 0.15.0 retired that rewrite, so an unconverted v1 file loads without
+/// managed resume tracking, and `to_json` writes its entries back as literals. Reject newer
+/// versions.
 const FORMAT_VERSION: u64 = 2;
 
 /// Build the recipe's `dirs` object.
@@ -140,52 +144,6 @@ fn dirs_json(cfg: &SessionConfig) -> jzon::JsonValue {
     dirs
 }
 
-/// Rewrite a v1 recipe's literal entries in place to the corresponding managed form; labels
-/// are untouched. In v1, bare program words and canonical resume commands were
-/// instrumented; preserving them as literals would silently disable conversation tracking.
-/// Convert exactly those two forms, accepting v1's whitespace between tokens and
-/// single-quoted IDs. Require an exact registered word as the first token. With a path
-/// (`/usr/local/bin/claude`, `~/bin/claude`), preserve the user's chosen binary as a literal
-/// rather than substitute the first binary found on `PATH`; managed resume tracking is then
-/// unavailable. Leave all other commands literal.
-///
-/// Phase 5, one release after format v2 ships, deletes this function, its one call in
-/// `from_json`, and its tests (`v1_literals_migrate_exactly_the_two_instrumented_shapes`,
-/// `v1_recovery_snapshots_migrate_on_load`). A v1 file still loads afterward, with every
-/// entry literal: the file is accepted, managed resume tracking is not.
-fn migrate_v1(cfg: &mut SessionConfig) {
-    /// The managed form of one v1 literal, or `None` to leave it literal.
-    fn managed_form(cmd: &str) -> Option<EntryKind> {
-        let mut words = cmd.split([' ', '\t']).filter(|w| !w.is_empty());
-        let (agent, selector) = words.next().and_then(harness::registered)?.shape();
-        let resume = match (words.next(), words.next(), words.next()) {
-            (None, _, _) => None,
-            (Some(sel), Some(id), None) if sel == selector => {
-                let id = id
-                    .strip_prefix('\'')
-                    .and_then(|t| t.strip_suffix('\''))
-                    .unwrap_or(id);
-                if !harness::is_uuid(id) {
-                    return None;
-                }
-                Some(id.to_string())
-            }
-            _ => return None,
-        };
-        Some(EntryKind::Managed {
-            agent: agent.to_string(),
-            resume,
-        })
-    }
-    for entry in cfg.values_mut().flatten() {
-        if let EntryKind::Literal(cmd) = &entry.kind
-            && let Some(kind) = managed_form(cmd)
-        {
-            entry.kind = kind;
-        }
-    }
-}
-
 /// Serialize the versioned wrapped schema. Store the name to distinguish names
 /// sanitized to the same filename.
 fn to_json(name: &str, cfg: &SessionConfig) -> String {
@@ -208,17 +166,20 @@ pub fn fingerprint_json(cfg: &SessionConfig) -> String {
 /// through [`FORMAT_VERSION`]. Treat a missing version as 1. Accept entry forms regardless
 /// of version: strings and `{"cmd"}` objects for literals, `{"agent"}` objects for managed
 /// agents. Reject the whole file for objects with both keys, unregistered agents, or resume
-/// IDs that are not strict UUIDs. Pass a v1 recipe through [`migrate_v1`] once it is built.
+/// IDs that are not strict UUIDs. Never rewrite an entry: a v1 file loads verbatim, every
+/// entry literal. The rewrite that converted v1 agent commands to managed entries (v1 had no
+/// managed form) shipped in 0.15.0 and was retired in the release after it.
 fn from_json(text: &str) -> io::Result<(Option<String>, SessionConfig)> {
     let invalid = |message| io::Error::new(io::ErrorKind::InvalidData, message);
     let parsed = jzon::parse(text).map_err(|e| invalid(e.to_string()))?;
     if !parsed.is_object() {
         return Err(invalid("session root: expected an object".into()));
     }
-    // Validate version metadata before detecting the schema shape.
-    let version = if parsed.has_key("version") {
+    // Validate version metadata before detecting the schema shape. The value gates
+    // nothing else: every accepted version shares one entry grammar.
+    if parsed.has_key("version") {
         match parsed["version"].as_u64() {
-            Some(n) if (1..=FORMAT_VERSION).contains(&n) => n,
+            Some(n) if (1..=FORMAT_VERSION).contains(&n) => {}
             Some(n) if n > FORMAT_VERSION => {
                 return Err(invalid(format!(
                     "session format version {n} is newer than this fleetcom \
@@ -234,9 +195,7 @@ fn from_json(text: &str) -> io::Result<(Option<String>, SessionConfig)> {
                 )));
             }
         }
-    } else {
-        1
-    };
+    }
     let (name, dirs, flat) = if parsed["dirs"].is_object() {
         let name = opt_str(&parsed["name"])
             .ok_or_else(|| invalid("session field \"name\": expected a string or null".into()))?;
@@ -316,10 +275,6 @@ fn from_json(text: &str) -> io::Result<(Option<String>, SessionConfig)> {
             });
         }
         cfg.insert(dir.to_string(), entries);
-    }
-    // In v1, managed launches could only be stored as command text.
-    if version == 1 {
-        migrate_v1(&mut cfg);
     }
     Ok((name, cfg))
 }
@@ -793,120 +748,27 @@ mod tests {
         assert_eq!(fp(Some(ID)), fp(Some(ID)));
     }
 
-    /// Preserve literal agent words in v2 files; migrate only v1 literals.
+    /// Preserve literal agent words and resume commands in every accepted version. A v1
+    /// file now loads verbatim: the rewrite to managed entries is gone, so the spellings
+    /// it once converted stay literal beside a v2 managed entry.
     #[test]
-    fn v2_literal_agent_words_stay_literal() {
-        let (_, cfg) = from_json(&format!(
-            r#"{{"version": 2, "name": "v", "dirs": {{"d": ["claude",
-                {{"cmd": "codex resume '{ID}'", "group": "g"}}, {{"agent": "omp"}}]}}}}"#
-        ))
-        .unwrap();
-        assert_eq!(
-            cfg["d"],
-            vec![
-                e("claude"),
-                ge(&format!("codex resume '{ID}'"), "g"),
-                m("omp", None)
-            ]
-        );
-    }
-
-    /// Convert the two instrumented v1 forms to managed entries, accepting the original
-    /// whitespace and quoted IDs. Keep paths, extra arguments, shell syntax, and malformed
-    /// IDs literal.
-    #[test]
-    fn v1_literals_migrate_exactly_the_two_instrumented_shapes() {
-        let cases: Vec<(String, SessionEntry)> = vec![
-            ("claude".into(), m("claude", None)),
-            ("codex".into(), m("codex", None)),
-            ("grok".into(), m("grok", None)),
-            ("omp".into(), m("omp", None)),
-            (format!("claude --resume {ID}"), m("claude", Some(ID))),
-            (format!("claude --resume '{ID}'"), m("claude", Some(ID))),
-            (format!("codex resume '{ID}'"), m("codex", Some(ID))),
-            (format!("grok --resume {ID}"), m("grok", Some(ID))),
-            (format!("omp --resume '{ID}'"), m("omp", Some(ID))),
-            // v1's token tolerance: tabs, repeated and surrounding whitespace.
-            ("  claude\t".into(), m("claude", None)),
-            (format!("claude\t--resume  '{ID}' "), m("claude", Some(ID))),
-            // Preserve the user's chosen binary path as a literal, without managed resume
-            // tracking.
-            ("/usr/local/bin/claude".into(), e("/usr/local/bin/claude")),
-            ("~/bin/claude".into(), e("~/bin/claude")),
-            (
-                format!("/usr/local/bin/claude --resume '{ID}'"),
-                e(&format!("/usr/local/bin/claude --resume '{ID}'")),
-            ),
-            // Arguments, prompts, the wrong selector, and shell syntax.
-            ("claude --model opus".into(), e("claude --model opus")),
-            ("claude 'fix the tests'".into(), e("claude 'fix the tests'")),
-            (format!("claude -r {ID}"), e(&format!("claude -r {ID}"))),
-            (
-                format!("codex --resume {ID}"),
-                e(&format!("codex --resume {ID}")),
-            ),
-            (
-                format!("claude --resume {ID} --model opus"),
-                e(&format!("claude --resume {ID} --model opus")),
-            ),
-            ("claude --resume".into(), e("claude --resume")),
-            (
-                "claude --resume not-a-uuid".into(),
-                e("claude --resume not-a-uuid"),
-            ),
-            (
-                format!("claude --resume '{ID}"),
-                e(&format!("claude --resume '{ID}")),
-            ),
-            (
-                format!("claude --resume ''{ID}''"),
-                e(&format!("claude --resume ''{ID}''")),
-            ),
-            ("claude --resume $ID".into(), e("claude --resume $ID")),
-            ("claude | tee log".into(), e("claude | tee log")),
-            ("claude; ls".into(), e("claude; ls")),
-            ("FOO=bar claude".into(), e("FOO=bar claude")),
-            ("'claude'".into(), e("'claude'")),
-            ("claudius".into(), e("claudius")),
-            ("vim".into(), e("vim")),
-            (String::new(), e("")),
-        ];
-        let mut cfg = SessionConfig::from([(
-            "d".to_string(),
-            cases.iter().map(|(cmd, _)| e(cmd)).collect(),
-        )]);
-        migrate_v1(&mut cfg);
-        for ((cmd, expected), got) in cases.iter().zip(&cfg["d"]) {
-            assert_eq!(got, expected, "{cmd:?}");
-        }
-        // Through the loader: every v1 spelling, wrapped and flat, string and
-        // object form, with labels carried over.
-        let member = jzon::JsonValue::from(cases[4].0.as_str()).dump();
-        for text in [
-            format!(r#"{{"version": 1, "name": "v", "dirs": {{"d": [{member}]}}}}"#),
-            format!(r#"{{"name": "v", "dirs": {{"d": [{member}]}}}}"#),
-            format!(r#"{{"d": [{member}]}}"#),
-            format!(r#"{{"version": 1, "d": [{member}]}}"#),
-        ] {
+    fn literal_agent_words_stay_literal_in_every_version() {
+        for version in ["", r#""version": 1, "#, r#""version": 2, "#] {
+            let text = format!(
+                r#"{{{version}"name": "v", "dirs": {{"d": ["claude",
+                    {{"cmd": "codex resume '{ID}'", "group": "g"}}, {{"agent": "omp"}}]}}}}"#
+            );
             let (_, cfg) = from_json(&text).unwrap();
-            assert_eq!(cfg["d"], vec![m("claude", Some(ID))], "{text}");
+            assert_eq!(
+                cfg["d"],
+                vec![
+                    e("claude"),
+                    ge(&format!("codex resume '{ID}'"), "g"),
+                    m("omp", None)
+                ],
+                "{text}"
+            );
         }
-        let (_, cfg) = from_json(
-            r#"{"d": [{"cmd": "claude", "group": "agents", "name": "pilot"},
-                      {"cmd": "/usr/local/bin/claude", "name": "mine"}]}"#,
-        )
-        .unwrap();
-        assert_eq!(
-            cfg["d"],
-            vec![
-                SessionEntry {
-                    group: Some("agents".into()),
-                    name: Some("pilot".into()),
-                    ..m("claude", None)
-                },
-                ne("/usr/local/bin/claude", "mine"),
-            ]
-        );
     }
 
     /// Reject the entire file for a managed entry with a `cmd` field, an unregistered
@@ -1354,34 +1216,6 @@ mod tests {
             vec![e("cargo test")]
         );
         assert_eq!(list_in(&dir), vec!["old".to_string()]);
-    }
-
-    /// Load v1 recovery snapshots as managed entries when the stored strings match the old
-    /// instrumented forms. Preserve recovery across the upgrade.
-    #[test]
-    fn v1_recovery_snapshots_migrate_on_load() {
-        let base = temp("session_recovery_migrate");
-        let rec = recovery_dir(&base);
-        fs::create_dir_all(&rec).unwrap();
-        fs::write(
-            rec.join("20260714-093015-11.json"),
-            format!(
-                r#"{{"version": 1, "name": "autosaved 2026-07-14 09:30", "dirs": {{"~/p": [
-                    {{"cmd": "claude --resume '{ID}'", "group": "agents"}}, "omp", "cargo test"]}}}}"#
-            ),
-        )
-        .unwrap();
-        assert_eq!(
-            load_recovery_in(&rec, "20260714-093015-11").unwrap()["~/p"],
-            vec![
-                SessionEntry {
-                    group: Some("agents".into()),
-                    ..m("claude", Some(ID))
-                },
-                m("omp", None),
-                e("cargo test"),
-            ]
-        );
     }
 
     /// A flat-schema file can be replaced under its filename stem.
