@@ -1,0 +1,39 @@
+[?1049h]0;⠼ - Running: Ask: Which greeting do you pre… - Ask preferred greeting hello versus hi - grok[2J[H
+  ~/Projects/fixture-sources/grok                                                             19K / 256K │ [Dashboard]
+
+
+     ❯ Before doing anything else, use your ask-user-question tool to ask me which greeting I prefer,        1:15 PM
+       hello or hi. Wait for my answer.
+
+
+     ◆ Ask Which greeting do you prefer?
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+   ◆ Waiting on answers for Which greeting do you prefer?                                           2.4s ⇣19.0k [stop]
+
+  ┃
+  ┃  Which greeting do you prefer?
+  ┃
+  ┃
+  ┃  1 (○) Hello  Use hello as the greeting.                                                                         █
+  ┃  2 (○) Hi     Use hi as the greeting.                                                                            █
+  ┃  z (○) Type your answer here
+  ┃
+  ┃  ↑/↓ navigate · y copy                                                                            Enter:submit
+  ┃
+
+  Tab:next answer  │  Esc:scrollback  │  Shift+x:dismiss

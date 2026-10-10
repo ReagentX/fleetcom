@@ -1,0 +1,39 @@
+[?1049h]0;⚠ Action Required - ⠸ - Create junk/a.txt then remove the direct… - Create junk dir with a.txt then rm -rf - grok[2J[H
+  ~/Projects/fixture-sources/grok                                                             19K / 256K │ [Dashboard]
+
+
+     ❯ Create a directory named junk containing a file named a.txt, then remove the whole directory with     1:16 PM
+       rm -rf junk.
+
+
+     ◆ Thought for 2.3s
+
+     I'll create junk/a.txt, then remove the directory with rm -rf junk.                                     1:16 PM
+
+     ◆ Running create junk/a.txt then remove the directory
+
+
+
+
+
+
+
+
+
+
+
+
+
+   ◆ Create junk/a.txt then remove the direct… 10.0s                                              14s ⇣19.3k [↓][stop]
+
+  ┃
+  ┃  Create junk/a.txt then remove the directory
+  ┃  mkdir -p junk && printf '' > junk/a.txt && ls -la junk && rm -rf junk && if [ -e junk ];
+  ┃  then echo "STILL_EXISTS"; else echo "REMOVED"; fi
+  ┃
+  ┃  1 (●) Yes, and don't ask again for anything (always-approve mode)
+  ┃  2 (○) Yes, proceed
+  ┃  3 (○) No, reject (type to add feedback)
+  ┃
+
+  1/3:select  │  Tab:next option  │  Ctrl+o:always-approve  │  Ctrl+c:cancel  │  Esc:scrollback

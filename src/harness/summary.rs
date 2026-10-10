@@ -25,11 +25,13 @@
 //! 2. Return `None` when the expected structure is absent or inconsistent.
 //! 3. Preserve CLI-generated ellipsis truncation.
 //!
-//! Remove spinner glyphs, elapsed counters, throughput data, and key hints during
-//! normalization; preserve the CLI's status text. The only synthesized status is
-//! `awaiting approval`, for approval menus (claude's dialog and codex's modal) and
-//! for omp's `!` title, which is that harness's only blocked signal. Supported
-//! screen structures are recorded in the corpus fixtures in `tests/corpus`.
+//! During normalization, omit spinner glyphs, elapsed counters, throughput data,
+//! and key hints; preserve the CLI's status text. Synthesize `awaiting approval`
+//! only for approval menus (Claude's dialog and Codex's modal), omp's `!` title
+//! (its only blocked signal), and grok's blocked titles (`⚠ Action Required`,
+//! `Running: Plan: Exit`, `Running: Ask: …`). For grok's blocked states, normalize
+//! the announced title; no structural match exists for them. See `tests/corpus`
+//! for supported screen structures.
 
 use crate::preview::SummaryAdapter;
 
@@ -656,10 +658,14 @@ fn codex_working(header: &str, after_paren: &str) -> String {
 
 // ------------------------------------------------------------------ grok --
 
-/// grok (alt screen). The pin is its bordered input box; the status row
-/// (braille spinner while working, `Worked for {n}s` after a turn, or
-/// `◎ … still running` / `◎ waiting` while background work is live) is
-/// the first painted row above the box's top border.
+/// grok (alt screen). Use the bordered input box as the structural anchor. Read
+/// the status from the first painted row above the box's top border: a braille
+/// spinner while working, `Worked for {n}s` after a turn, or `◎ … still running`
+/// / `◎ waiting` while background work is live. Limit this tier to working and
+/// completion rows. Handle the three blocked states (permission prompt, plan
+/// approval, question) through title normalization: expect a `┃`-fenced dialog
+/// in place of the box for permission prompts and questions, and `◆` in the
+/// probe position for plan approval. See [`SummaryAdapter::normalize_title`].
 pub struct GrokSummary;
 
 impl SummaryAdapter for GrokSummary {
@@ -685,6 +691,45 @@ impl SummaryAdapter for GrokSummary {
     fn model_label(&self, rows: &[String]) -> Option<String> {
         let (_, bottom) = grok_input_box(rows)?;
         grok_border_label(&rows[bottom])
+    }
+
+    /// Parse grok 1.0.50's raw `SetTitle` announcements, unchanged by theme
+    /// processing. Observed forms:
+    /// - Splash: `grok`.
+    /// - Idle: `{summary} - grok`.
+    /// - Working before the session is named: `{frame} - {status} - grok`.
+    /// - Working after the session is named: `{frame} - {status} - {summary} - grok`.
+    /// - Permission prompt: `⚠ Action Required - {frame} - {status}… - grok`.
+    ///
+    /// Use the single braille character as the frame. Treat the status as grok's
+    /// live phrase, truncated with its own `…` at roughly 40 columns, and the
+    /// summary as the session name.
+    ///
+    /// Map the three blocked states to [`AWAITING_APPROVAL`]: match
+    /// `⚠ Action Required` for permission prompts, `Running: Plan: Exit` for plan
+    /// approval, and the `Running: Ask: ` prefix for questions. For other working
+    /// titles, replace the frame with `⠋` and keep the first status segment. For
+    /// idle titles, return the summary. Treat ` - ` as the status/session
+    /// delimiter. Keep only the first segment after the frame as the status and
+    /// discard the remainder, even if the status contains that delimiter.
+    ///
+    /// Return `None` for a title without the ` - grok` suffix, bare `grok`, or an
+    /// empty status or summary. On grok's alternate screen, render the captured
+    /// title verbatim when normalization returns `None`.
+    fn normalize_title(&self, title: &str) -> Option<String> {
+        let rest = title.strip_suffix(" - grok")?;
+        if rest.starts_with("⚠ Action Required") {
+            return Some(AWAITING_APPROVAL.to_string());
+        }
+        let Some(working) = after_frame(rest, braille_frame).and_then(|r| r.strip_prefix("- "))
+        else {
+            return (!rest.is_empty()).then(|| rest.to_string());
+        };
+        let status = working.find(" - ").map_or(working, |i| &working[..i]);
+        if status == "Running: Plan: Exit" || status.starts_with("Running: Ask: ") {
+            return Some(AWAITING_APPROVAL.to_string());
+        }
+        (!status.is_empty()).then(|| format!("⠋ {status}"))
     }
 }
 

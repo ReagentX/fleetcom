@@ -1206,6 +1206,75 @@ fn grok_still_running_shapes() {
     );
 }
 
+/// Test each observed ` - `-joined title form from grok 1.0.50. Expect the
+/// session name for idle titles, a normalized frame and first status segment for
+/// working titles, and the blocked status for the three blocked forms. Return
+/// `None` for bare `grok` and titles without the suffix.
+#[test]
+fn grok_title_segments_decode_state_and_status() {
+    let t = |title: &str| GrokSummary.normalize_title(title);
+
+    assert_eq!(
+        t("Run ls -la list directory file names - grok"),
+        Some("Run ls -la list directory file names".to_string())
+    );
+
+    // Exercise every working frame with and without a session name; expect the
+    // same normalized title for both forms.
+    for frame in BRAILLE_FRAMES {
+        assert_eq!(
+            t(&format!("{frame} - Waiting for response… - grok")),
+            Some("⠋ Waiting for response…".to_string()),
+            "{frame:?}"
+        );
+        assert_eq!(
+            t(&format!(
+                "{frame} - Thinking - Run ls -la list directory file names - grok"
+            )),
+            Some("⠋ Thinking".to_string()),
+            "{frame:?}"
+        );
+    }
+    // Treat statuses without grok's trailing `…`, including `Not responding`,
+    // as ordinary working states.
+    assert_eq!(
+        t("⠼ - Running: verbose|clap|arg\\( - Add verbose flag to main.rs - grok"),
+        Some("⠋ Running: verbose|clap|arg\\(".to_string())
+    );
+    assert_eq!(
+        t("⠋ - Not responding - grok"),
+        Some("⠋ Not responding".to_string())
+    );
+    // For statuses containing ` - `, keep only the first segment.
+    assert_eq!(
+        t("⠙ - Running: Edit a - b.rs - Add verbose flag to main.rs - grok"),
+        Some("⠋ Running: Edit a".to_string())
+    );
+
+    // Identify permission prompts by the prefix; identify plan approval and
+    // questions from their status strings.
+    for title in [
+        "⚠ Action Required - ⠙ - Create junk/a.txt then remove the direct… - grok",
+        "⚠ Action Required - grok",
+        "⠹ - Running: Plan: Exit - Add verbose flag to main.rs - grok",
+        "⠼ - Running: Ask: Which greeting do you pre… - Ask preferred greeting hello versus hi - grok",
+    ] {
+        assert_eq!(t(title), Some(AWAITING_APPROVAL.to_string()), "{title:?}");
+    }
+
+    // Return `None` for bare, foreign, suffix-less, and empty-status titles.
+    // On the alternate screen, use that result to display the captured title.
+    for title in [
+        "grok",
+        "⠋ - Thinking",
+        "⠋ -  - grok",
+        "π > fix the parser",
+        "",
+    ] {
+        assert_eq!(t(title), None, "{title:?}");
+    }
+}
+
 /// omp title normalization strips idle and disabled-state prefixes, folds
 /// working frames to `⠋`, maps `!` to the blocked status, and rejects
 /// unsupported shapes.
@@ -1545,9 +1614,10 @@ fn corpus_positive_states_resolve_exactly() {
             "grok:still-running",
         ),
     ];
-    // Title-tier positives: a retained primary title the adapter recognizes,
-    // on a screen that anchors nothing.
-    let titles: [(&str, &[u8], &dyn SummaryAdapter, &str); 2] = [
+    // Exercise both title paths against screens without structural anchors:
+    // retained OSC titles on the primary screen and live announces on the
+    // alternate screen.
+    let titles: [(&str, &[u8], &dyn SummaryAdapter, &str); 6] = [
         (
             "preview_omp_idle_titled",
             include_bytes!("../../tests/corpus/preview_omp_idle_titled.bin"),
@@ -1559,6 +1629,33 @@ fn corpus_positive_states_resolve_exactly() {
             include_bytes!("../../tests/corpus/preview_omp_working_titled.bin"),
             &OmpSummary,
             "⠋ List files in current directory",
+        ),
+        (
+            "preview_grok_idle_titled",
+            include_bytes!("../../tests/corpus/preview_grok_idle_titled.bin"),
+            &GrokSummary,
+            "Run ls -la list directory file names",
+        ),
+        // Expect a `┃`-fenced option list instead of the input box.
+        (
+            "preview_grok_permission",
+            include_bytes!("../../tests/corpus/preview_grok_permission.bin"),
+            &GrokSummary,
+            AWAITING_APPROVAL,
+        ),
+        // Exercise the title tier with the input box present and
+        // `◆ Waiting on plan approval` in the probe row.
+        (
+            "preview_grok_plan_approval",
+            include_bytes!("../../tests/corpus/preview_grok_plan_approval.bin"),
+            &GrokSummary,
+            AWAITING_APPROVAL,
+        ),
+        (
+            "preview_grok_question",
+            include_bytes!("../../tests/corpus/preview_grok_question.bin"),
+            &GrokSummary,
+            AWAITING_APPROVAL,
         ),
     ];
     // Fixture names start with the program word: require a positive case for
