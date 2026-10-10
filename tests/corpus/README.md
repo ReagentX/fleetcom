@@ -50,12 +50,16 @@ fixture, the welcome box is omitted and agent-roster rows are included below the
 input box. In the Claude task-list fixtures, generic phase names are used in a
 task-list layout and the welcome box is omitted. In the Claude workflow-wait
 fixture, generic wording is used, the welcome box is omitted, and a long blank
-gap is included above the input box with a roster below it. In the omp fixtures,
-the local model path and working directory in the status line are replaced with
-same-length synthetic values. A streamed intent phrase is used in status rows
-rather than omp's default `Working…`. In `preview_omp_idle_titled.bin`, the
-`preview_omp_idle.bin` rows are reused verbatim and preceded by an `ESC]0;π >
-fix the parser BEL` title announce.
+gap is included above the input box with a roster below it. The omp fixtures are
+the 18.8.7 default layout: logo and tip, the status band (`π >` idle, `⠇ 4s >`
+working), and a `╰─` composer gutter with no top border. The working directory
+in the band and the tool-call path in the body are replaced with same-width
+synthetic values; the model text, version, and tip are verbatim. omp has no
+structural tier, since its chrome is user-themeable, so these fixtures pin that
+nothing anchors on them and that the title tier carries omp's state. The titled
+fixtures reuse their untitled rows verbatim behind a title announce: `ESC]0;π >
+fix the parser BEL` for idle and `ESC]0;π ⠇ List files in current directory
+BEL` for working.
 
 | Fixture | Scenario | Coverage |
 | --- | --- | --- |
@@ -86,11 +90,10 @@ fix the parser BEL` title announce.
 | `preview_grok_subagent_scrollback.bin` | grok idle with `Subagent running:` in the body, no `◎` row | fall-through; body-shaped text is not status |
 | `preview_grok_idle.bin` | grok idle session | fall-through to the marker |
 | `preview_grok_splash.bin` | grok launch splash with resume hint above the box | fall-through; distinct views excluded from anchors |
-| `preview_omp_working.bin` | omp status row carrying the model's streamed intent phrase above the input box | `omp:spinner`; padding, spinner frame, and interrupt hint stripped |
-| `preview_omp_approval.bin` | omp approval selector, input box replaced, tool-call preview box and a live status row still above it | `awaiting approval` synthesized by `omp:approval-menu` with status animation still active |
-| `preview_omp_idle.bin` | omp idle with the welcome box and tip above the input box | fall-through to the floor tier; no marker for an inline UI |
+| `preview_omp_idle.bin` | omp 18.8.7 idle: logo, tip, `π >` status band, `╰─` composer gutter | negative: no anchor on the band layout; fall-through to the floor tier, no marker for an inline UI |
 | `preview_omp_idle_titled.bin` | `preview_omp_idle.bin` after a `π > fix the parser` title announce | idle prefix stripped and `fix the parser` rendered in the primary-screen title tier |
-| `preview_omp_body_hint.bin` | status-shaped row quoted in the transcript, prose between it and an idle input box | negative: the pin is the row above the box, not a substring search |
+| `preview_omp_working.bin` | omp 18.8.7 mid tool call: `⎋ List files in current directory` working row, `⠇ 4s >` status band, composer gutter | negative: no anchor on the working row or band; fall-through to the floor tier |
+| `preview_omp_working_titled.bin` | `preview_omp_working.bin` after a `π ⠇ List files in current directory` title announce | frame folded to `⠋ List files in current directory` in the primary-screen title tier |
 | `preview_trunc_claude.bin` | synthetic 40×80: spinner row truncated inside its parenthetical | `Hashing…` still extracted by head match |
 | `preview_trunc_codex.bin` | synthetic 40×80: working row truncated inside the `/ps` hint | head still matched; key-hint suffix omitted |
 | `preview_trunc_grok.bin` | synthetic 40×80: spinner label truncated with the CLI's ellipsis | CLI's own `…` kept verbatim |
