@@ -13,6 +13,9 @@
 //! screen, use the sanitized captured title when normalization is unsuccessful. On the
 //! primary screen, render a retained title only when its shape is recognized by the
 //! adapter: the terminal title may have been replaced by another inline program.
+//! For each recognized title, return normalized text and set `working` for active
+//! turns. If no adapter recognizes a title on the alternate screen, keep the captured
+//! title verbatim and set `working` to `false`.
 //!
 //! # Anchor discipline
 //!
@@ -38,6 +41,23 @@ use crate::preview::SummaryAdapter;
 /// Preview text shared by approval-menu matchers and Claude's registry
 /// permission prompt.
 pub const AWAITING_APPROVAL: &str = "awaiting approval";
+
+/// Classify each emitted anchor rule ID as working or idle. Return `None` for IDs no
+/// adapter emits. List every emitted ID so the corpus test covers each classification.
+/// Treat `grok:still-running` as idle because background subagents may remain active
+/// after the turn ends.
+pub fn rule_reports_working(rule: &str) -> Option<bool> {
+    match rule {
+        "claude:spinner" | "claude:action-row" | "codex:working" | "grok:spinner" => Some(true),
+        "claude:approval-menu"
+        | "claude:waiting"
+        | "codex:approval-menu"
+        | "codex:ran"
+        | "grok:worked"
+        | "grok:still-running" => Some(false),
+        _ => None,
+    }
+}
 
 /// Whether `c` is a Unicode Braille Patterns code point used as a spinner
 /// frame by the supported CLIs.
@@ -121,16 +141,17 @@ impl SummaryAdapter for ClaudeSummary {
         claude_welcome_label(rows)
     }
 
-    /// Strip a recognized claude spinner, braille, or quadrant-circle frame from a
-    /// nonempty title. Return `None` for other title shapes.
-    fn normalize_title(&self, title: &str) -> Option<String> {
+    /// Set `working` for braille and quadrant-circle title frames. Treat a
+    /// [`CLAUDE_SPINNER`] glyph as idle. We observed only `✳` from this family in titles,
+    /// and only while idle. Return `None` for other shapes or empty payloads.
+    fn normalize_title(&self, title: &str) -> Option<(String, bool)> {
         let rest = after_frame(title, |c| {
             CLAUDE_SPINNER.contains(&c)
                 || braille_frame(c)
                 || ('\u{25D0}'..='\u{25D3}').contains(&c)
         })?;
         // An empty payload cannot produce a usable preview.
-        (!rest.is_empty()).then(|| rest.to_string())
+        (!rest.is_empty()).then(|| (rest.to_string(), !title.starts_with(CLAUDE_SPINNER)))
     }
 }
 
@@ -361,13 +382,17 @@ impl SummaryAdapter for CodexSummary {
         codex_model_label(rows)
     }
 
-    /// Fold braille frames to `⠋` and `[ . ] ` to `[ ! ] `. Return `None` for other
-    /// title shapes.
-    fn normalize_title(&self, title: &str) -> Option<String> {
+    /// Set `working` for a title led by a braille frame. Replace `[ . ] ` with `[ ! ] `
+    /// to show the blocked blink's canonical phase. Return `None` for other title shapes
+    /// and for an empty frame payload.
+    fn normalize_title(&self, title: &str) -> Option<(String, bool)> {
         if let Some(rest) = title.strip_prefix("[ . ] ") {
-            return Some(format!("[ ! ] {rest}"));
+            return Some((format!("[ ! ] {rest}"), false));
         }
-        after_frame(title, braille_frame).map(|rest| format!("⠋ {rest}"))
+        // Do not normalize a frame with an empty payload; Claude and OMP use the same rule.
+        after_frame(title, braille_frame)
+            .filter(|rest| !rest.is_empty())
+            .map(|rest| (rest.to_string(), true))
     }
 }
 
@@ -693,43 +718,43 @@ impl SummaryAdapter for GrokSummary {
         grok_border_label(&rows[bottom])
     }
 
-    /// Parse grok 1.0.50's raw `SetTitle` announcements, unchanged by theme
-    /// processing. Observed forms:
+    /// Parse the raw `SetTitle` announcements from grok 1.0.50 before theme
+    /// processing. Captured forms:
     /// - Splash: `grok`.
     /// - Idle: `{summary} - grok`.
     /// - Working before the session is named: `{frame} - {status} - grok`.
     /// - Working after the session is named: `{frame} - {status} - {summary} - grok`.
     /// - Permission prompt: `⚠ Action Required - {frame} - {status}… - grok`.
     ///
-    /// Use the single braille character as the frame. Treat the status as grok's
-    /// live phrase, truncated with its own `…` at roughly 40 columns, and the
-    /// summary as the session name.
+    /// Use the single braille character as the frame. Keep grok's live status phrase,
+    /// including its own `…` truncation at roughly 40 columns. Read the session name
+    /// from the summary segment.
     ///
-    /// Map the three blocked states to [`AWAITING_APPROVAL`]: match
-    /// `⚠ Action Required` for permission prompts, `Running: Plan: Exit` for plan
-    /// approval, and the `Running: Ask: ` prefix for questions. For other working
-    /// titles, replace the frame with `⠋` and keep the first status segment. For
-    /// idle titles, return the summary. Treat ` - ` as the status/session
-    /// delimiter. Keep only the first segment after the frame as the status and
-    /// discard the remainder, even if the status contains that delimiter.
+    /// For the three blocked states, return [`AWAITING_APPROVAL`] and set `working` to
+    /// false. Match `⚠ Action Required` for permission prompts, `Running: Plan: Exit`
+    /// for plan approval, and the `Running: Ask: ` prefix for questions. For other
+    /// working titles, remove the frame and return the first status segment. For idle
+    /// titles, return the summary. Split on ` - ` between status and session name; keep
+    /// only the first segment after the frame, even when grok puts ` - ` inside its
+    /// status.
     ///
     /// Return `None` for a title without the ` - grok` suffix, bare `grok`, or an
-    /// empty status or summary. On grok's alternate screen, render the captured
-    /// title verbatim when normalization returns `None`.
-    fn normalize_title(&self, title: &str) -> Option<String> {
+    /// empty status or summary. If normalization fails on grok's alternate screen,
+    /// preserve the captured title verbatim.
+    fn normalize_title(&self, title: &str) -> Option<(String, bool)> {
         let rest = title.strip_suffix(" - grok")?;
         if rest.starts_with("⚠ Action Required") {
-            return Some(AWAITING_APPROVAL.to_string());
+            return Some((AWAITING_APPROVAL.to_string(), false));
         }
         let Some(working) = after_frame(rest, braille_frame).and_then(|r| r.strip_prefix("- "))
         else {
-            return (!rest.is_empty()).then(|| rest.to_string());
+            return (!rest.is_empty()).then(|| (rest.to_string(), false));
         };
         let status = working.find(" - ").map_or(working, |i| &working[..i]);
         if status == "Running: Plan: Exit" || status.starts_with("Running: Ask: ") {
-            return Some(AWAITING_APPROVAL.to_string());
+            return Some((AWAITING_APPROVAL.to_string(), false));
         }
-        (!status.is_empty()).then(|| format!("⠋ {status}"))
+        (!status.is_empty()).then(|| (status.to_string(), true))
     }
 }
 
@@ -798,28 +823,27 @@ fn grok_border_label(row: &str) -> Option<String> {
 
 // ------------------------------------------------------------------- omp --
 
-/// omp title-only adapter. omp's state reaches the preview through its OSC 0
-/// title, never through its screen: the chrome is user-themeable along three
-/// axes (composer shape, symbol preset, status-line segments), so no row
-/// structure is stable enough to pin. The title emitter is app-level and
-/// unthemed: `π >` idle, `π > label` idle with a session name, `π ⠋…⠏ label`
-/// working, `π ! label` blocked.
+/// omp title-only adapter. Read omp state from its OSC 0 title; do not parse its screen.
+/// Users can change the composer shape, symbol preset, and status-line segments, so
+/// avoid row matchers tied to one theme. Parse these unthemed, app-level title forms:
+/// `π >` when idle, `π > label` when idle with a session name, `π ⠋…⠏ label` while
+/// working, and `π ! label` while blocked.
 pub struct OmpSummary;
 
 impl SummaryAdapter for OmpSummary {
-    /// Always `None`: omp has no structural tier. A matcher pinned to one
-    /// theme stops working silently on the next, so none is kept.
+    /// Return `None`: omp has no stable structural anchor. Users can change the theme,
+    /// so avoid row matchers that depend on one theme.
     fn live_preview(&self, _rows: &[String]) -> Option<(String, &'static str)> {
         None
     }
 
     /// Normalize omp's `π {separator} {label}` and `π: {label}` titles. Extract a
-    /// nonempty label after `>` or `π:`, normalize braille frames to `⠋`, and map
-    /// `!` to [`AWAITING_APPROVAL`] with or without a label. Return `None` for
-    /// unsupported shapes and empty idle or disabled labels.
-    fn normalize_title(&self, title: &str) -> Option<String> {
+    /// nonempty label after `>` or `π:`. Strip the braille frame and set `working` to
+    /// true; map `!` to [`AWAITING_APPROVAL`] with or without a label. Return `None` for
+    /// unsupported shapes, empty idle or disabled labels, and frames without a label.
+    fn normalize_title(&self, title: &str) -> Option<(String, bool)> {
         if let Some(label) = title.strip_prefix("π: ") {
-            return (!label.is_empty()).then(|| label.to_string());
+            return (!label.is_empty()).then(|| (label.to_string(), false));
         }
         let mut chars = title.strip_prefix("π ")?.chars();
         let sep = chars.next()?;
@@ -829,13 +853,12 @@ impl SummaryAdapter for OmpSummary {
             Some(_) => return None,
         };
         match sep {
-            '>' => (!label.is_empty()).then(|| label.to_string()),
+            '>' => (!label.is_empty()).then(|| (label.to_string(), false)),
             // `!` is omp's blocked state; the label is the task, not the
             // status, so it is dropped for parity with the other harnesses.
-            '!' => Some(AWAITING_APPROVAL.to_string()),
-            // The frame stays: without a label it is the state.
-            f if braille_frame(f) && label.is_empty() => Some("⠋".to_string()),
-            f if braille_frame(f) => Some(format!("⠋ {label}")),
+            '!' => Some((AWAITING_APPROVAL.to_string(), false)),
+            // Return no normalized label when a frame has no task text.
+            f if braille_frame(f) => (!label.is_empty()).then(|| (label.to_string(), true)),
             _ => None,
         }
     }

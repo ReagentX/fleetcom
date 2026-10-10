@@ -12,7 +12,7 @@ use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
 use crate::frame::{KIND_CONTROL, KIND_HELLO, KIND_SCREEN};
 
 /// Wire-protocol version; mismatched peers are rejected during the handshake.
-pub const PROTOCOL_VERSION: u32 = 14;
+pub const PROTOCOL_VERSION: u32 = 15;
 
 /// Reserved dashboard label for tasks without a custom group.
 pub const UNASSIGNED: &str = "Unassigned";
@@ -349,6 +349,9 @@ pub struct Preview {
     pub rule: Option<&'static str>,
     /// Whether the preview froze at output-complete and can no longer change.
     pub frozen: bool,
+    /// Use `true` for an active-turn spinner rule or title frame. Set to `false` for
+    /// blocked registry statuses, floors, markers, verbatim titles, and frozen previews.
+    pub working: bool,
 }
 
 impl Preview {
@@ -359,6 +362,7 @@ impl Preview {
             source: PreviewSource::Floor,
             rule: None,
             frozen: false,
+            working: false,
         }
     }
 }
@@ -890,6 +894,9 @@ pub fn encode_event(ev: &Event) -> (u8, Vec<u8>) {
                 // Matcher rules are process-local and omitted from the wire.
                 let _ = o.insert("src", tv.preview.source.label());
                 let _ = o.insert("frozen", tv.preview.frozen);
+                // Include `working` on the wire. The dashboard has no `rule` field from
+                // which to derive it.
+                let _ = o.insert("working", tv.preview.working);
                 let _ = o.insert("started_ms", tv.started_ago.as_millis() as u64);
                 // Each age exists in exactly one phase: `quiet_ms` while
                 // live, `finished_ms` once finished.
@@ -976,6 +983,7 @@ pub fn decode_event(kind: u8, payload: &[u8]) -> Option<Event> {
                                 source: PreviewSource::from_label(tv["src"].as_str()?)?,
                                 rule: None,
                                 frozen: tv["frozen"].as_bool()?,
+                                working: tv["working"].as_bool()?,
                             },
                             started_ago: Duration::from_millis(tv["started_ms"].as_u64()?),
                             quiet_ago: opt_ms(&tv["quiet_ms"])?,

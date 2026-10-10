@@ -327,8 +327,12 @@ fn row_age(v: &TaskView) -> Duration {
 }
 
 /// A task's lifecycle glyph, shared by the dashboard row and the `/` palette.
+/// Use the agent-reported turn status to choose the glyph: an agent can keep thinking
+/// past the idle window without writing output. Select adapters by command word so
+/// hand-typed agent commands get the same glyph as Agent-page launches.
 fn status_glyph(v: &TaskView) -> &'static str {
     match v.lifecycle {
+        Lifecycle::Active | Lifecycle::Idle if v.preview.working => "●",
         Lifecycle::Active => "✻",
         Lifecycle::Idle => "∙",
         Lifecycle::Ok => "✓",
@@ -1317,6 +1321,30 @@ mod tests {
                 let body: String = row.chars().skip(2).collect();
                 assert!(body.starts_with(&format!("{glyph} ")), "{row:?}");
             }
+        }
+    }
+
+    /// Show `●` for a working agent while its task is active or idle. Without the flag,
+    /// keep the lifecycle glyphs; show completion glyphs after the task exits.
+    #[test]
+    fn task_row_glyph_follows_the_working_flag() {
+        let cases = [
+            (Lifecycle::Active, true, "●"),
+            (Lifecycle::Idle, true, "●"),
+            (Lifecycle::Active, false, "✻"),
+            (Lifecycle::Idle, false, "∙"),
+            (Lifecycle::Ok, true, "✓"),
+            (Lifecycle::Failed, true, "✗"),
+        ];
+        for (lifecycle, working, glyph) in cases {
+            let mut v = timed_view(lifecycle, None, None);
+            v.preview.working = working;
+            let row = task_row(&v, 80);
+            let body: String = row.chars().skip(2).collect();
+            assert!(
+                body.starts_with(&format!("{glyph} ")),
+                "{lifecycle:?} working={working}: {row:?}"
+            );
         }
     }
 
