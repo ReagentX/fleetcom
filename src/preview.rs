@@ -4,12 +4,16 @@
 
 use std::time::{Duration, Instant};
 
-use crate::protocol::{Preview, PreviewSource};
+use crate::{
+    harness::summary::rule_reports_working,
+    protocol::{Preview, PreviewSource},
+};
 
 // Holds use elapsed time because tick intervals range from the 8 ms frame
 // minimum to the 200 ms idle backstop.
 
-/// Minimum interval between rendered title changes.
+/// Minimum interval between title renders. Hold a title when only `working` changes;
+/// compare the full `Preview` value.
 const TITLE_MIN_HOLD: Duration = Duration::from_millis(500);
 
 /// Hold duration before rendering a lower-ranked preview source.
@@ -54,10 +58,11 @@ pub trait SummaryAdapter: Sync {
         None
     }
 
-    /// Normalize a title recognized as this CLI's output. On the alternate screen,
-    /// preserve the captured title verbatim for `None`. On the primary screen, reject
-    /// the retained title for `None` and continue resolution.
-    fn normalize_title(&self, _title: &str) -> Option<String> {
+    /// Return normalized title text and a flag indicating whether the agent is working
+    /// on a turn. If no adapter recognizes a title on the alternate screen, keep the
+    /// captured title verbatim and set `working` to `false`. On the primary screen,
+    /// ignore an unrecognized retained title and continue the cascade.
+    fn normalize_title(&self, _title: &str) -> Option<(String, bool)> {
         None
     }
 }
@@ -96,6 +101,9 @@ fn cascade(
                 source: PreviewSource::Anchor,
                 rule: Some(rule),
                 frozen: false,
+                // Registry statuses mark agents as waiting or blocked. Set `working` to
+                // false when the rule table has no classification.
+                working: rule_reports_working(rule).unwrap_or(false),
             };
         }
     }
@@ -105,19 +113,24 @@ fn cascade(
             // rotating spinner prefix, so animation does not keep changing the
             // preview. Capture itself remains program-agnostic. Keep Title and
             // no rule ID: normalization does not make a title an anchor match.
-            Some(text) => Preview {
-                text: adapter
+            Some(text) => {
+                let (text, working) = adapter
                     .and_then(|a| a.normalize_title(text))
-                    .unwrap_or_else(|| text.to_string()),
-                source: PreviewSource::Title,
-                rule: None,
-                frozen: false,
-            },
+                    .unwrap_or_else(|| (text.to_string(), false));
+                Preview {
+                    text,
+                    source: PreviewSource::Title,
+                    rule: None,
+                    frozen: false,
+                    working,
+                }
+            }
             None => Preview {
                 text: MARKER.to_string(),
                 source: PreviewSource::Marker,
                 rule: None,
                 frozen: false,
+                working: false,
             },
         };
     }
@@ -125,13 +138,14 @@ fn cascade(
     // it. Require adapter recognition instead of rendering it verbatim.
     if let Some(a) = adapter
         && let Some(title) = screen.primary_title()
-        && let Some(text) = a.normalize_title(title)
+        && let Some((text, working)) = a.normalize_title(title)
     {
         return Preview {
             text,
             source: PreviewSource::Title,
             rule: None,
             frozen: false,
+            working,
         };
     }
     // An indented status line can remain as the idle floor. Trim only the display
@@ -287,6 +301,8 @@ impl PreviewState {
                 .is_some_and(|snapshot| screen.live_floor() == snapshot);
         if alt_torn_down_at_exit {
             self.rendered.frozen = true;
+            // The child has exited, so clear `working`.
+            self.rendered.working = false;
             return;
         }
         // Finalization excludes registry state because the process has exited.
@@ -297,6 +313,8 @@ impl PreviewState {
             fin = cascade(screen, None, None);
         }
         fin.frozen = true;
+        // The child has exited, so clear `working`.
+        fin.working = false;
         self.rendered = fin;
     }
 }
@@ -424,6 +442,8 @@ mod tests {
     struct StubAdapter {
         live: Option<(&'static str, &'static str)>,
         label: Option<&'static str>,
+        /// The working flag returned for every accepted title.
+        title_working: bool,
     }
 
     impl StubAdapter {
@@ -432,6 +452,17 @@ mod tests {
             Self {
                 live: Some(("Working", "stub:working")),
                 label,
+                title_working: false,
+            }
+        }
+
+        /// Configure a stub adapter without an anchor and give each title the supplied
+        /// working flag.
+        fn titling(working: bool) -> Self {
+            Self {
+                live: None,
+                label: None,
+                title_working: working,
             }
         }
     }
@@ -447,8 +478,8 @@ mod tests {
 
         /// Accept every title so rank tests can exercise the primary-title
         /// tier without a CLI-specific grammar.
-        fn normalize_title(&self, title: &str) -> Option<String> {
-            Some(title.to_string())
+        fn normalize_title(&self, title: &str) -> Option<(String, bool)> {
+            Some((title.to_string(), self.title_working))
         }
     }
 
@@ -545,10 +576,7 @@ mod tests {
         let working = StubAdapter::working(None);
         st.resolve(t0, &s, Some(&working), None);
 
-        let idle = StubAdapter {
-            live: None,
-            label: None,
-        };
+        let idle = StubAdapter::titling(false);
         s.advance();
         assert_eq!(
             st.resolve(t0, &s, Some(&idle), None).source,
@@ -571,6 +599,7 @@ mod tests {
         let adapter = StubAdapter {
             live: Some(("Ran echo ok", "stub:ran")),
             label: None,
+            title_working: false,
         };
         st.resolve(t0, &s, None, None);
 
@@ -580,6 +609,108 @@ mod tests {
         assert_eq!(
             (p.text.as_str(), p.source, p.rule, p.frozen),
             ("Ran echo ok", PreviewSource::Anchor, Some("stub:ran"), true)
+        );
+    }
+
+    /// Check `working` at each winning tier: read anchors from the rule table and titles
+    /// from the adapter; expect `false` for registry hits, verbatim titles, markers, and
+    /// floors.
+    #[test]
+    fn working_follows_the_winning_tier() {
+        let now = Instant::now();
+        let alt = FakeScreen::alt_titled("shell", "app");
+        let working = |s: &FakeScreen, a: Option<&dyn SummaryAdapter>, b| {
+            PreviewState::new().resolve(now, s, a, b).working
+        };
+
+        // Require working anchor rules to set the flag and completion rules to clear it.
+        let spinner = StubAdapter {
+            live: Some(("Hashing…", "claude:spinner")),
+            label: None,
+            title_working: false,
+        };
+        let ran = StubAdapter {
+            live: Some(("Ran ls", "codex:ran")),
+            label: None,
+            title_working: false,
+        };
+        assert!(working(&alt, Some(&spinner), None), "anchor: working rule");
+        assert!(!working(&alt, Some(&ran), None), "anchor: completion rule");
+        assert!(
+            !working(
+                &alt,
+                None,
+                Some(("awaiting approval", "claude:registry-approval"))
+            ),
+            "a registry hit is blocked, never working"
+        );
+        assert!(
+            !working(
+                &alt,
+                Some(&spinner),
+                Some(("awaiting approval", "claude:registry-approval"))
+            ),
+            "the registry outranks the spinner on screen"
+        );
+
+        // Use the adapter's flag for normalized titles; leave verbatim titles false.
+        assert!(
+            working(&alt, Some(&StubAdapter::titling(true)), None),
+            "title: true"
+        );
+        assert!(
+            !working(&alt, Some(&StubAdapter::titling(false)), None),
+            "title: false"
+        );
+        assert!(!working(&alt, None, None), "verbatim title");
+        let mut retained = FakeScreen::primary("shell");
+        retained.set_primary_title("app");
+        assert!(
+            working(&retained, Some(&StubAdapter::titling(true)), None),
+            "retained primary title"
+        );
+
+        // Keep the flag false for markers and floors, which carry no agent-state evidence.
+        let mut bare = FakeScreen::primary("shell");
+        bare.enter_alt();
+        assert!(!working(&bare, None, None), "marker");
+        assert!(!working(&FakeScreen::primary("shell"), None, None), "floor");
+    }
+
+    /// Check that both finalization paths clear `working`: retaining an alternate-screen
+    /// render and resolving a final screen whose anchor carries a working rule.
+    #[test]
+    fn finalize_clears_working() {
+        let t0 = Instant::now();
+        let mut st = PreviewState::new();
+        let mut s = FakeScreen::alt_titled("prelaunch junk", "agent: working");
+        let titled = StubAdapter::titling(true);
+        assert!(
+            st.resolve(t0, &s, Some(&titled), None).working,
+            "premise: the title reported working"
+        );
+        s.leave_alt();
+        st.finalize(&s, Some(&titled));
+        let p = st.resolve(t0, &s, Some(&titled), None).clone();
+        assert_eq!(
+            (p.text.as_str(), p.frozen, p.working),
+            ("agent: working", true, false),
+            "the retained render must drop the flag"
+        );
+
+        let mut st = PreviewState::new();
+        let s = FakeScreen::primary("✻ Hashing…");
+        let spinner = StubAdapter {
+            live: Some(("Hashing…", "claude:spinner")),
+            label: None,
+            title_working: false,
+        };
+        st.finalize(&s, Some(&spinner));
+        let p = st.resolve(t0, &s, Some(&spinner), None).clone();
+        assert_eq!(
+            (p.rule, p.frozen, p.working),
+            (Some("claude:spinner"), true, false),
+            "a frozen anchor reports nothing even under a working rule"
         );
     }
 
@@ -1120,8 +1251,8 @@ mod tests {
         s.set_primary_title("\u{3c0} \u{2819} fix parser");
         let p = st.resolve(t0, &s, Some(&OmpSummary), None).clone();
         assert_eq!(
-            (p.text.as_str(), p.source),
-            ("\u{280b} fix parser", PreviewSource::Title),
+            (p.text.as_str(), p.source, p.working),
+            ("fix parser", PreviewSource::Title, true),
             "premise: the title tier renders while the task lives"
         );
 

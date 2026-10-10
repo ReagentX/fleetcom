@@ -31,37 +31,40 @@ fn grok_screen<S: AsRef<str>>(above: &[S]) -> Vec<String> {
     rows
 }
 
+/// A resolved preview's observable fields: text, source, rule, working.
+type Resolved = (String, PreviewSource, Option<&'static str>, bool);
+
 /// Resolve a corpus fixture at the corpus row count and `cols` columns;
-/// return its text, source, and rule.
-fn corpus(
-    bytes: &[u8],
-    adapter: &dyn SummaryAdapter,
-    cols: u16,
-) -> (String, PreviewSource, Option<&'static str>) {
+/// return its text, source, rule, and working flag.
+fn corpus(bytes: &[u8], adapter: &dyn SummaryAdapter, cols: u16) -> Resolved {
     let mut emu = Emulator::new(CORPUS_LINES as u16, cols, 2000);
     emu.process(bytes);
     let mut st = PreviewState::new();
     let p = st.resolve(Instant::now(), &emu, Some(adapter), None);
-    (p.text.clone(), p.source, p.rule)
+    (p.text.clone(), p.source, p.rule, p.working)
 }
 
-fn anchor(text: &str, rule: &'static str) -> (String, PreviewSource, Option<&'static str>) {
-    (text.to_string(), PreviewSource::Anchor, Some(rule))
+/// Use the rule table to build expected anchor tuples, including each rule's working
+/// classification.
+fn anchor(text: &str, rule: &'static str) -> Resolved {
+    let working = rule_reports_working(rule)
+        .unwrap_or_else(|| panic!("{rule}: classify the rule id in rule_reports_working"));
+    (text.to_string(), PreviewSource::Anchor, Some(rule), working)
 }
 
 /// Expected alternate-screen marker preview.
-fn marker() -> (String, PreviewSource, Option<&'static str>) {
-    (MARKER.to_string(), PreviewSource::Marker, None)
+fn marker() -> Resolved {
+    (MARKER.to_string(), PreviewSource::Marker, None, false)
 }
 
 /// Expected floor-preview tuple.
-fn floor(text: &str) -> (String, PreviewSource, Option<&'static str>) {
-    (text.to_string(), PreviewSource::Floor, None)
+fn floor(text: &str) -> Resolved {
+    (text.to_string(), PreviewSource::Floor, None, false)
 }
 
 /// Expected title-preview tuple.
-fn titled(text: &str) -> (String, PreviewSource, Option<&'static str>) {
-    (text.to_string(), PreviewSource::Title, None)
+fn titled(text: &str, working: bool) -> Resolved {
+    (text.to_string(), PreviewSource::Title, None, working)
 }
 
 /// Selection is a basename match on the first word only: arguments and a
@@ -129,7 +132,7 @@ fn select_routes_to_the_matching_adapter() {
     assert_eq!(omp.live_preview(&working), None);
     assert_eq!(
         omp.normalize_title("π ⠇ List files in current directory"),
-        Some("⠋ List files in current directory".to_string())
+        Some(("List files in current directory".to_string(), true))
     );
 }
 
@@ -294,23 +297,21 @@ fn claude_waiting_family_matches_the_skeleton_and_never_probes() {
     );
 }
 
-/// Every recognized spinner frame strips to the same bare title text;
-/// unsupported and empty shapes return `None`.
+/// Normalize every recognized frame to the same bare title text. Classify the resting
+/// family as idle and braille and quadrant frames as working; reject unsupported shapes
+/// and empty payloads.
 #[test]
 fn claude_title_frames_canonicalize_to_constant_text() {
     for frame in CLAUDE_SPINNER {
         assert_eq!(
             ClaudeSummary.normalize_title(&format!("{frame} Claude Code")),
-            Some("Claude Code".to_string()),
+            Some(("Claude Code".to_string(), false)),
             "{frame:?}"
         );
     }
-    let a = ClaudeSummary.normalize_title("✢ Claude Code");
-    let b = ClaudeSummary.normalize_title("✽ Claude Code");
-    assert_eq!(a, b, "two frames must normalize identically");
 
-    // Every spinner frame must normalize to the same title.
-    let rendered: std::collections::BTreeSet<Option<String>> = CLAUDE_SPINNER
+    // Normalize every working frame to the same title and flag.
+    let rendered: std::collections::BTreeSet<Option<(String, bool)>> = BRAILLE_FRAMES
         .iter()
         .copied()
         .chain('\u{25D0}'..='\u{25D3}')
@@ -318,18 +319,18 @@ fn claude_title_frames_canonicalize_to_constant_text() {
         .collect();
     assert_eq!(
         rendered,
-        std::collections::BTreeSet::from([Some("Run sleep command".to_string())]),
-        "spinner and quadrant frames must render one string"
+        std::collections::BTreeSet::from([Some(("Run sleep command".to_string(), true))]),
+        "braille and quadrant frames must render one string and report working"
     );
 
     // A braille frame plus the session summary.
     assert_eq!(
         ClaudeSummary.normalize_title("⠐ Review fleetcom preview design document"),
-        Some("Review fleetcom preview design document".to_string())
+        Some(("Review fleetcom preview design document".to_string(), true))
     );
     assert_eq!(
         ClaudeSummary.normalize_title("⠴ Review fleetcom preview design document"),
-        Some("Review fleetcom preview design document".to_string()),
+        Some(("Review fleetcom preview design document".to_string(), true)),
         "mid-block braille frame"
     );
 
@@ -354,19 +355,19 @@ fn title_tier_renders_the_normalized_title() {
         .resolve(Instant::now(), &emu, Some(&ClaudeSummary), None)
         .clone();
     assert_eq!(
-        (p.text.as_str(), p.source, p.rule),
-        ("Claude Code", PreviewSource::Title, None)
+        (p.text.as_str(), p.source, p.rule, p.working),
+        ("Claude Code", PreviewSource::Title, None, false)
     );
 
     let mut st = PreviewState::new();
     let p = st.resolve(Instant::now(), &emu, None, None).clone();
     assert_eq!(
-        (p.text.as_str(), p.source),
-        ("✢ Claude Code", PreviewSource::Title),
+        (p.text.as_str(), p.source, p.working),
+        ("✢ Claude Code", PreviewSource::Title, false),
         "no adapter: verbatim"
     );
 
-    // Quadrant frames strip to the same bare text as other spinner frames.
+    // Give quadrant frames the same bare text and working flag as other spinner frames.
     let mut quadrant = Emulator::new(24, 80, 100);
     quadrant.process(
         b"\x1b[?1049h\x1b]0;\xe2\x97\x90 Run sleep command for 25 seconds\x07conversation body",
@@ -376,11 +377,12 @@ fn title_tier_renders_the_normalized_title() {
         .resolve(Instant::now(), &quadrant, Some(&ClaudeSummary), None)
         .clone();
     assert_eq!(
-        (p.text.as_str(), p.source, p.rule),
+        (p.text.as_str(), p.source, p.rule, p.working),
         (
             "Run sleep command for 25 seconds",
             PreviewSource::Title,
-            None
+            None,
+            true
         )
     );
 }
@@ -736,14 +738,14 @@ fn codex_label_rejects_warning_prose_and_incomplete_footers() {
     assert_eq!(CodexSummary.model_label(&rows), None);
 }
 
-/// The braille spinner and the blocked-on-user blink each canonicalize to a
-/// single string; idle and foreign titles pass through.
+/// Normalize braille frames to the bare title and mark them working. Canonicalize the
+/// blocked-on-user blink to one phase; pass idle and foreign titles through.
 #[test]
 fn codex_title_animations_canonicalize_to_constant_text() {
     for frame in BRAILLE_FRAMES {
         assert_eq!(
             CodexSummary.normalize_title(&format!("{frame} fleetcom")),
-            Some("⠋ fleetcom".to_string()),
+            Some(("fleetcom".to_string(), true)),
             "{frame:?}"
         );
     }
@@ -751,7 +753,7 @@ fn codex_title_animations_canonicalize_to_constant_text() {
     // `[ . ]` folds to `[ ! ]`; `[ ! ]` already has the canonical text.
     assert_eq!(
         CodexSummary.normalize_title("[ . ] Action Required | fleetcom"),
-        Some("[ ! ] Action Required | fleetcom".to_string())
+        Some(("[ ! ] Action Required | fleetcom".to_string(), false))
     );
     assert_eq!(
         CodexSummary.normalize_title("[ ! ] Action Required | fleetcom"),
@@ -759,17 +761,16 @@ fn codex_title_animations_canonicalize_to_constant_text() {
         "the frozen phase needs no rewrite"
     );
 
-    // Each adapter uses a distinct canonical frame.
-    assert_ne!(
-        CodexSummary.normalize_title("⠹ fleetcom"),
-        ClaudeSummary.normalize_title("⠹ fleetcom")
-    );
-
     // Bare, foreign, frame-only, and empty titles do not match Codex's title
     // grammar.
     assert_eq!(CodexSummary.normalize_title("fleetcom"), None);
     assert_eq!(CodexSummary.normalize_title("zellij: main"), None);
     assert_eq!(CodexSummary.normalize_title("⠹"), None, "frame alone");
+    assert_eq!(
+        CodexSummary.normalize_title("⠹ "),
+        None,
+        "frame with an empty rest"
+    );
     assert_eq!(CodexSummary.normalize_title(""), None, "empty title");
 }
 
@@ -1206,9 +1207,9 @@ fn grok_still_running_shapes() {
     );
 }
 
-/// Test each observed ` - `-joined title form from grok 1.0.50. Expect the
-/// session name for idle titles, a normalized frame and first status segment for
-/// working titles, and the blocked status for the three blocked forms. Return
+/// Check each observed ` - `-joined title form from grok 1.0.50. Expect the session
+/// name for idle titles, the first status segment with its frame removed and `working`
+/// set for active titles, and the blocked status for all three blocked forms. Require
 /// `None` for bare `grok` and titles without the suffix.
 #[test]
 fn grok_title_segments_decode_state_and_status() {
@@ -1216,7 +1217,7 @@ fn grok_title_segments_decode_state_and_status() {
 
     assert_eq!(
         t("Run ls -la list directory file names - grok"),
-        Some("Run ls -la list directory file names".to_string())
+        Some(("Run ls -la list directory file names".to_string(), false))
     );
 
     // Exercise every working frame with and without a session name; expect the
@@ -1224,14 +1225,14 @@ fn grok_title_segments_decode_state_and_status() {
     for frame in BRAILLE_FRAMES {
         assert_eq!(
             t(&format!("{frame} - Waiting for response… - grok")),
-            Some("⠋ Waiting for response…".to_string()),
+            Some(("Waiting for response…".to_string(), true)),
             "{frame:?}"
         );
         assert_eq!(
             t(&format!(
                 "{frame} - Thinking - Run ls -la list directory file names - grok"
             )),
-            Some("⠋ Thinking".to_string()),
+            Some(("Thinking".to_string(), true)),
             "{frame:?}"
         );
     }
@@ -1239,27 +1240,32 @@ fn grok_title_segments_decode_state_and_status() {
     // as ordinary working states.
     assert_eq!(
         t("⠼ - Running: verbose|clap|arg\\( - Add verbose flag to main.rs - grok"),
-        Some("⠋ Running: verbose|clap|arg\\(".to_string())
+        Some(("Running: verbose|clap|arg\\(".to_string(), true))
     );
     assert_eq!(
         t("⠋ - Not responding - grok"),
-        Some("⠋ Not responding".to_string())
+        Some(("Not responding".to_string(), true))
     );
     // For statuses containing ` - `, keep only the first segment.
     assert_eq!(
         t("⠙ - Running: Edit a - b.rs - Add verbose flag to main.rs - grok"),
-        Some("⠋ Running: Edit a".to_string())
+        Some(("Running: Edit a".to_string(), true))
     );
 
     // Identify permission prompts by the prefix; identify plan approval and
-    // questions from their status strings.
+    // questions from their status strings. A blocked agent is not working,
+    // whatever frame its title carries.
     for title in [
         "⚠ Action Required - ⠙ - Create junk/a.txt then remove the direct… - grok",
         "⚠ Action Required - grok",
         "⠹ - Running: Plan: Exit - Add verbose flag to main.rs - grok",
         "⠼ - Running: Ask: Which greeting do you pre… - Ask preferred greeting hello versus hi - grok",
     ] {
-        assert_eq!(t(title), Some(AWAITING_APPROVAL.to_string()), "{title:?}");
+        assert_eq!(
+            t(title),
+            Some((AWAITING_APPROVAL.to_string(), false)),
+            "{title:?}"
+        );
     }
 
     // Return `None` for bare, foreign, suffix-less, and empty-status titles.
@@ -1275,36 +1281,31 @@ fn grok_title_segments_decode_state_and_status() {
     }
 }
 
-/// omp title normalization strips idle and disabled-state prefixes, folds
-/// working frames to `⠋`, maps `!` to the blocked status, and rejects
+/// Verify that omp titles strip idle and disabled-state prefixes, remove working
+/// frames while setting `working`, map `!` to the blocked status, and reject
 /// unsupported shapes.
 #[test]
 fn omp_title_separators_decode_state_and_label() {
     assert_eq!(
         OmpSummary.normalize_title("π > Fix the flaky test"),
-        Some("Fix the flaky test".to_string())
+        Some(("Fix the flaky test".to_string(), false))
     );
 
-    // Every working frame must normalize to the same title.
+    // Normalize every working frame to the same title and flag.
     for frame in BRAILLE_FRAMES {
         assert_eq!(
             OmpSummary.normalize_title(&format!("π {frame} Fix the flaky test")),
-            Some("⠋ Fix the flaky test".to_string()),
+            Some(("Fix the flaky test".to_string(), true)),
             "{frame:?}"
         );
     }
-    assert_eq!(
-        OmpSummary.normalize_title("π ⠴"),
-        Some("⠋".to_string()),
-        "a label-less frame is still the working state"
-    );
 
     // `!` is the blocked state, with or without a label: a blocked omp reads
     // like a blocked claude, codex, or grok.
     for title in ["π ! List files in current directory", "π !"] {
         assert_eq!(
             OmpSummary.normalize_title(title),
-            Some(AWAITING_APPROVAL.to_string()),
+            Some((AWAITING_APPROVAL.to_string(), false)),
             "{title:?}"
         );
     }
@@ -1312,14 +1313,16 @@ fn omp_title_separators_decode_state_and_label() {
     // The disabled-state form yields its label.
     assert_eq!(
         OmpSummary.normalize_title("π: Fix the flaky test"),
-        Some("Fix the flaky test".to_string())
+        Some(("Fix the flaky test".to_string(), false))
     );
 
-    // Empty idle/disabled labels and unsupported shapes return `None`.
+    // Require `None` for empty idle or disabled labels, frames without labels, and
+    // unsupported shapes.
     for title in [
         "π",
         "π >",
         "π: ",
+        "π ⠴",
         "π >> quoted",
         "custom extension title",
         "zellij: main",
@@ -1617,45 +1620,58 @@ fn corpus_positive_states_resolve_exactly() {
     // Exercise both title paths against screens without structural anchors:
     // retained OSC titles on the primary screen and live announces on the
     // alternate screen.
-    let titles: [(&str, &[u8], &dyn SummaryAdapter, &str); 6] = [
-        (
+    struct Titled(
+        &'static str,
+        &'static [u8],
+        &'static dyn SummaryAdapter,
+        &'static str,
+        bool,
+    );
+    let titles = [
+        Titled(
             "preview_omp_idle_titled",
             include_bytes!("../../tests/corpus/preview_omp_idle_titled.bin"),
             &OmpSummary,
             "fix the parser",
+            false,
         ),
-        (
+        Titled(
             "preview_omp_working_titled",
             include_bytes!("../../tests/corpus/preview_omp_working_titled.bin"),
             &OmpSummary,
-            "⠋ List files in current directory",
+            "List files in current directory",
+            true,
         ),
-        (
+        Titled(
             "preview_grok_idle_titled",
             include_bytes!("../../tests/corpus/preview_grok_idle_titled.bin"),
             &GrokSummary,
             "Run ls -la list directory file names",
+            false,
         ),
         // Expect a `┃`-fenced option list instead of the input box.
-        (
+        Titled(
             "preview_grok_permission",
             include_bytes!("../../tests/corpus/preview_grok_permission.bin"),
             &GrokSummary,
             AWAITING_APPROVAL,
+            false,
         ),
         // Exercise the title tier with the input box present and
         // `◆ Waiting on plan approval` in the probe row.
-        (
+        Titled(
             "preview_grok_plan_approval",
             include_bytes!("../../tests/corpus/preview_grok_plan_approval.bin"),
             &GrokSummary,
             AWAITING_APPROVAL,
+            false,
         ),
-        (
+        Titled(
             "preview_grok_question",
             include_bytes!("../../tests/corpus/preview_grok_question.bin"),
             &GrokSummary,
             AWAITING_APPROVAL,
+            false,
         ),
     ];
     // Fixture names start with the program word: require a positive case for
@@ -1665,17 +1681,55 @@ fn corpus_positive_states_resolve_exactly() {
         let prefix = format!("preview_{program}_");
         assert!(
             cases.iter().any(|Case(name, ..)| name.starts_with(&prefix))
-                || titles.iter().any(|(name, ..)| name.starts_with(&prefix)),
+                || titles
+                    .iter()
+                    .any(|Titled(name, ..)| name.starts_with(&prefix)),
             "a new adapter needs a positive corpus fixture named {prefix}*"
         );
     }
     for Case(name, bytes, adapter, text, rule) in cases {
+        assert!(
+            rule_reports_working(rule).is_some(),
+            "{rule}: a new rule id must be classified in rule_reports_working"
+        );
         let got = corpus(bytes, adapter, 120);
         assert_eq!(got, anchor(text, rule), "{name}");
     }
-    for (name, bytes, adapter, text) in titles {
+    for Titled(name, bytes, adapter, text, working) in titles {
         let got = corpus(bytes, adapter, 120);
-        assert_eq!(got, titled(text), "{name}");
+        assert_eq!(got, titled(text, working), "{name}");
+    }
+}
+
+/// Check every emitted rule ID against its working classification. Require `None`
+/// for unregistered IDs such as registry rules, typos, and IDs from future adapters.
+/// Fail if an adapter adds a matcher without adding its classification here.
+#[test]
+fn rule_reports_working_classifies_every_emitted_id() {
+    let table = [
+        ("claude:spinner", true),
+        ("claude:action-row", true),
+        ("codex:working", true),
+        ("grok:spinner", true),
+        ("claude:approval-menu", false),
+        ("claude:waiting", false),
+        ("codex:approval-menu", false),
+        ("codex:ran", false),
+        ("grok:worked", false),
+        // Background subagents are live, but the turn itself has ended.
+        ("grok:still-running", false),
+    ];
+    for (rule, working) in table {
+        assert_eq!(rule_reports_working(rule), Some(working), "{rule}");
+    }
+    for rule in [
+        "claude:registry-approval",
+        "claude:registry-waiting",
+        "claude:spinne",
+        "claude:",
+        "",
+    ] {
+        assert_eq!(rule_reports_working(rule), None, "{rule:?}");
     }
 }
 

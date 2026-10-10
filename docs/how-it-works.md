@@ -12,6 +12,8 @@ Each task retains 2,000 lines of scrollback by default; you can configure the de
 
 ## One activity window for grouping
 
-Group tasks by state (In use / Running / Idle / Completed), working directory, or names assigned with `g`. After more than 10 s without output, a running task becomes Idle: its glyph changes from `✻` to `∙` and, under state grouping, its row moves to Idle in the same refresh. Row order stays unchanged within directory or custom sections. A task producing output every 1–2 s, such as `top`, stays under Running with the `✻` glyph.
+Group tasks by state (In use / Running / Idle / Completed), working directory, or names assigned with `g`. After 10 s without PTY output, Fleetcom marks a running task Idle, changes its glyph from `✻` to `∙`, and moves its row under Idle on the same state-grouped refresh. Fleetcom preserves row order within directory and custom sections. When Fleetcom receives output every 1–2 s from a task such as `top`, it keeps that task under Running with `✻`.
+
+An agent may keep working while its PTY is quiet. Fleetcom reads the agent CLI's spinner row or title frame to identify an active turn, then shows `●` regardless of output timing. Fleetcom applies the same signal to hand-typed commands and Agent-page launches.
 
 Preview text is resolved independently of activity grouping. When a stronger source disappears, the resolver retains the previous preview for 600 ms before displaying a weaker source. This avoids repaint flicker without changing grouping. Claude's on-disk `waiting` status and screen-derived agent statuses both belong to the top `anchor` tier, with the on-disk status taking precedence when both are present. If only the screen-derived status remains, the resolver displays it immediately because the tier has not changed.
