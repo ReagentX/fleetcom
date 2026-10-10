@@ -298,8 +298,8 @@ fn claude_waiting_family_matches_the_skeleton_and_never_probes() {
 }
 
 /// Normalize every recognized frame to the same bare title text. Classify the resting
-/// family as idle and braille and quadrant frames as working; reject unsupported shapes
-/// and empty payloads.
+/// family as idle and quadrant frames as working; reject braille frames (an older
+/// claude's animation), unsupported shapes, and empty payloads.
 #[test]
 fn claude_title_frames_canonicalize_to_constant_text() {
     for frame in CLAUDE_SPINNER {
@@ -309,30 +309,32 @@ fn claude_title_frames_canonicalize_to_constant_text() {
             "{frame:?}"
         );
     }
+    // 2.1.296 names the session once the first turn starts; the frame stays `✳`.
+    assert_eq!(
+        ClaudeSummary.normalize_title("✳ Directory listing with ls -la"),
+        Some(("Directory listing with ls -la".to_string(), false))
+    );
 
     // Normalize every working frame to the same title and flag.
-    let rendered: std::collections::BTreeSet<Option<(String, bool)>> = BRAILLE_FRAMES
-        .iter()
-        .copied()
-        .chain('\u{25D0}'..='\u{25D3}')
+    let rendered: std::collections::BTreeSet<Option<(String, bool)>> = ('\u{25D0}'..='\u{25D3}')
         .map(|frame| ClaudeSummary.normalize_title(&format!("{frame} Run sleep command")))
         .collect();
     assert_eq!(
         rendered,
         std::collections::BTreeSet::from([Some(("Run sleep command".to_string(), true))]),
-        "braille and quadrant frames must render one string and report working"
+        "quadrant frames must render one string and report working"
     );
 
-    // A braille frame plus the session summary.
-    assert_eq!(
-        ClaudeSummary.normalize_title("⠐ Review fleetcom preview design document"),
-        Some(("Review fleetcom preview design document".to_string(), true))
-    );
-    assert_eq!(
-        ClaudeSummary.normalize_title("⠴ Review fleetcom preview design document"),
-        Some(("Review fleetcom preview design document".to_string(), true)),
-        "mid-block braille frame"
-    );
+    // Braille frames belong to the 2.1.209 title animation, which 2.1.296 no
+    // longer emits: refuse rather than guess a state.
+    for frame in BRAILLE_FRAMES.iter().chain(['⠐'].iter()) {
+        assert_eq!(
+            ClaudeSummary
+                .normalize_title(&format!("{frame} Review fleetcom preview design document")),
+            None,
+            "{frame:?}"
+        );
+    }
 
     assert_eq!(ClaudeSummary.normalize_title("zellij: main"), None);
     assert_eq!(ClaudeSummary.normalize_title("✻"), None, "frame alone");
@@ -522,42 +524,74 @@ fn claude_approval_requires_the_dialog_shape() {
     assert_eq!(ClaudeSummary.live_preview(&lone), None);
 }
 
-/// The welcome-box label accepts complete and ellipsis forms but rejects a
-/// partial effort value. No box means no label.
+/// The welcome-header label accepts complete and ellipsis forms but rejects a
+/// partial effort value. The model row is the one after `Claude Code v`; no
+/// header within the first four rows means no label.
 #[test]
-fn claude_label_reads_the_welcome_box() {
-    let boxed = |cell: &str| {
+fn claude_label_reads_the_logo_header() {
+    let header = |model_row: &str| {
         rs(&[
-            "╭─── Claude Code v2.1.233 ────────────╮",
-            cell,
-            "╰──────────────────────────────────────╯",
+            "",
+            " ▐▛███▛█   Claude Code v2.1.296",
+            model_row,
+            " ▝▝   ▝▝   ~/Projects/fixture-sources · /rc",
         ])
     };
-    let fixed_pane = "│ Opus 5 (1M context) with high… · Claude Max ·      │ Added opt-in memory cgroup support for Bas… │";
-    for (cell, want) in [
+    for (model_row, want) in [
         (
-            "│ Fable 5 with high effort · Claude Max ·  │ notes │",
-            Some("Fable 5 (high)"),
+            "▝▜██████▀  Fable 5.1 with high effort · Claude Max",
+            Some("Fable 5.1 (high)"),
         ),
         // Parentheses in the model name do not change the output shape.
         (
-            "│ Opus 5 (1M context) with high effort · Claude Max ·  │ notes │",
+            "▝▜██████▀  Opus 5 (1M context) with high effort · Claude Max",
             Some("Opus 5 (1M context) (high)"),
         ),
-        (fixed_pane, Some("Opus 5 (1M context) (high)")),
+        // A narrow terminal cuts the row with the CLI's own ellipsis.
+        (
+            "▝▜██████▀  Opus 5 (1M context) with high…",
+            Some("Opus 5 (1M context) (high)"),
+        ),
         // Partial and empty effort values are invalid.
-        ("│ Opus 5 (1M context) with hi… │ notes │", None),
-        ("│ Opus 5 (1M context) with … │ notes │", None),
+        ("▝▜██████▀  Opus 5 (1M context) with hi…", None),
+        ("▝▜██████▀  Opus 5 (1M context) with …", None),
         // Neither accepted suffix is present.
-        ("│ Some Model with high │ notes │", None),
+        ("▝▜██████▀  Some Model with high", None),
     ] {
         assert_eq!(
-            ClaudeSummary.model_label(&boxed(cell)),
+            ClaudeSummary.model_label(&header(model_row)),
             want.map(str::to_string),
-            "{cell:?}"
+            "{model_row:?}"
         );
     }
-    assert_eq!(ClaudeSummary.model_label(&rs(&["no box here"])), None);
+
+    // The model row must follow the version row directly.
+    let gapped = rs(&[
+        " ▐▛███▛█   Claude Code v2.1.296",
+        "",
+        "▝▜██████▀  Fable 5.1 with high effort · Claude Max",
+    ]);
+    assert_eq!(ClaudeSummary.model_label(&gapped), None);
+
+    // A header below the fourth row has scrolled into the body.
+    let scrolled = rs(&[
+        "",
+        "",
+        "",
+        "",
+        " ▐▛███▛█   Claude Code v2.1.296",
+        "▝▜██████▀  Fable 5.1 with high effort · Claude Max",
+    ]);
+    assert_eq!(ClaudeSummary.model_label(&scrolled), None);
+
+    // The 2.1.215 welcome box is gone; its grammar is not read.
+    let boxed = rs(&[
+        "╭─── Claude Code v2.1.215 ─────────────────────╮",
+        "│ Fable 5 with high effort · Claude Max ·  │ notes │",
+        "╰──────────────────────────────────────────────╯",
+    ]);
+    assert_eq!(ClaudeSummary.model_label(&boxed), None);
+    assert_eq!(ClaudeSummary.model_label(&rs(&["no header here"])), None);
 }
 
 /// Working-row normalization: parenthetical dropped (unclosed included),
@@ -1518,35 +1552,46 @@ fn corpus_positive_states_resolve_exactly() {
             "preview_claude_working",
             include_bytes!("../../tests/corpus/preview_claude_working.bin"),
             &ClaudeSummary,
-            "Fable 5 (high) · Concocting…",
+            "Fable 5.1 (high) · Moonwalking…",
             "claude:spinner",
         ),
         Case(
             "preview_claude_working_tool",
             include_bytes!("../../tests/corpus/preview_claude_working_tool.bin"),
             &ClaudeSummary,
-            "Fable 5 (high) · Hashing…",
+            "Fable 5.1 (high) · Hashing…",
+            "claude:spinner",
+        ),
+        Case(
+            "preview_claude_working_agent",
+            include_bytes!("../../tests/corpus/preview_claude_working_agent.bin"),
+            &ClaudeSummary,
+            // The `⎿ Backgrounded agent` attachment above the spinner is not an
+            // action row, and the roster below the box is outside the scan.
+            "Fable 5.1 (high) · Hashing…",
             "claude:spinner",
         ),
         Case(
             "preview_claude_action",
             include_bytes!("../../tests/corpus/preview_claude_action.bin"),
             &ClaudeSummary,
-            "Fable 5 (high) · Running 1 shell command…",
+            // The spinner row's `thought for 2s` segment rides along; its
+            // elapsed and token tickers do not.
+            "Fable 5.1 (high) · Running 1 shell command… · thought for 2s",
             "claude:action-row",
         ),
         Case(
             "preview_claude_approval",
             include_bytes!("../../tests/corpus/preview_claude_approval.bin"),
             &ClaudeSummary,
-            "Fable 5 (high) · awaiting approval",
+            "Fable 5.1 (high) · awaiting approval",
             "claude:approval-menu",
         ),
         Case(
             "preview_claude_tasklist",
             include_bytes!("../../tests/corpus/preview_claude_tasklist.bin"),
             &ClaudeSummary,
-            // Without the welcome box, the preview has no model prefix.
+            // Without the welcome header, the preview has no model prefix.
             "Running phase 1 (dashboard UI)…",
             "claude:spinner",
         ),
@@ -1568,7 +1613,7 @@ fn corpus_positive_states_resolve_exactly() {
             "preview_claude_waiting",
             include_bytes!("../../tests/corpus/preview_claude_waiting.bin"),
             &ClaudeSummary,
-            // The welcome box is absent, so there is no model prefix.
+            // The welcome header is absent, so there is no model prefix.
             "Waiting for 1 background agent to finish",
             "claude:waiting",
         ),
@@ -1734,7 +1779,11 @@ fn rule_reports_working_classifies_every_emitted_id() {
 }
 
 /// Idle and post-turn screens have no anchor and resolve to the
-/// alternate-screen marker.
+/// alternate-screen marker. The claude idle screen is the launch state (`Try
+/// "…"` placeholder, `● high · /effort` hint row, header still connecting);
+/// the done screen has `✻ Sautéed for 17s · done 4:14 PM` as the first
+/// column-0 row above a box holding a typed draft: no `…`, so the scan
+/// rejects it as foreign.
 #[test]
 fn corpus_idle_states_fall_through() {
     let cases: [(&str, &[u8], &dyn SummaryAdapter); 4] = [
@@ -1796,7 +1845,7 @@ fn corpus_body_shaped_text_never_extracts() {
         &ClaudeSummary,
         120,
     );
-    assert_eq!(got, anchor("Fable 5 (high) · Hashing…", "claude:spinner"));
+    assert_eq!(got, anchor("Fable 5.1 (high) · Hashing…", "claude:spinner"));
 
     // Menu touching the chrome window on an idle screen: abort, marker.
     let got = corpus(
@@ -1863,7 +1912,7 @@ fn corpus_truncated_rows_still_anchor() {
         &ClaudeSummary,
         80,
     );
-    // With no welcome box on the narrow screen, omit the label.
+    // With no welcome header on the narrow screen, omit the label.
     assert_eq!(got, anchor("Hashing…", "claude:spinner"));
 
     let got = corpus(

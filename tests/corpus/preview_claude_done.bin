@@ -1,40 +1,40 @@
 [?1049h[2J[H
-╭─── Claude Code v2.1.215 ─────────────────────────────────────────────────────────────────────────────────────────────╮
-│                                                    │ Tips for getting started                                        │
-│              Welcome back Fleet Pilot!             │ Run /init to create a CLAUDE.md file with instructions for Cla… │
-│                                                    │ ─────────────────────────────────────────────────────────────── │
-│                       ▐▛███▜▌                      │ What's new                                                      │
-│                      ▝▜█████▛▘                     │ Claude no longer runs the `/verify` and `/code-review` skills … │
-│                        ▘▘ ▝▝                       │ Fixed single-segment `dir/**` allow rules like `Edit(src/**)` … │
-│ Fable 5 with high effort · Claude Max ·            │ Fixed a permission-check bypass affecting commands run in Wind… │
-│ anonymized-account0@example.invalid's Organization │ /release-notes for more                                         │
-│             ~/Projects/fixture-sources             │                                                                 │
-╰──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+ ▐▛███▛█   Claude Code v2.1.296
+▝▜██████▀  Fable 5.1 with high effort · Claude Max
+ ▝▝   ▝▝   /…/Users/fleet-pilot/Projects/fixture-sources/ptys/claude-work · /rc
 
 
-❯ echo ok
+❯ Use the Bash tool to run ls -la and tell me the file names.
+
+⏺ Listing the working directory now.
+
+  Listed 1 directory
+
+⏺ The listing came back empty, which is unusual since ls -la always prints . and ... Checking the working directory
+  directly.
 
   Ran 1 shell command
 
-⏺ ok
+⏺ The directory holds a single file:
 
-✻ Crunched for 4s
+  - README.md (7 bytes, modified today at 15:32)
 
+  The first ls -la run produced no output at all, which is why I re-ran it by absolute path. Your ls is aliased to a
+  tool that uses a different output format and omits the . and .. entries, which fits the second listing. The initial
+  empty result most likely came from that alias misbehaving without a terminal attached. Nothing was changed.
 
-
-
-
-
-
-
+✻ Sautéed for 17s · done 4:14 PM
 
 
 
 
 
-                   tmux focus-events off · add 'set -g focus-events on' to ~/.tmux.conf and reattach for focus tracking
+
+
+
 ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
-❯ 
+❯ what's in README.md
 ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
-  (statusline scrubbed: user-configured row)                                         
-  ⏸ manual mode on · ← 2 agents
+
+  Fable 5.1 (high) | /Users/fleet-pilot/Projects/fixture-sources/corpus-capture/claude-2-1-296/sessions/fixture-pty-s…
+  ⏵⏵ auto mode on (shift+tab to cycle)

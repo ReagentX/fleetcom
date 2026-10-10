@@ -45,12 +45,20 @@ Geometry is 40×80 for `preview_codex_reasoning.bin` and 40×36 for
 reproduce the inline layout.
 
 Indentation in the Codex hint-row and approval fixtures is approximate; match
-trimmed heads and column-0 structure in their tests. In the Claude waiting
-fixture, the welcome box is omitted and agent-roster rows are included below the
-input box. In the Claude task-list fixtures, generic phase names are used in a
-task-list layout and the welcome box is omitted. In the Claude workflow-wait
-fixture, generic wording is used, the welcome box is omitted, and a long blank
-gap is included above the input box with a roster below it. The omp fixtures are
+trimmed heads and column-0 structure in their tests. The Claude fixtures with a
+model prefix open on claude 2.1.296's three-row logo header (`Claude Code
+v2.1.296`, `Fable 5.1 with high effort · Claude Max`, working directory); the
+working directory on the header row and on the statusline row below the input
+box is a same-width synthetic path. Fixtures captured on 2.1.296 omit the
+capture environment's `⚠ Transcript saving is off` statusline row, leaving it
+empty; the three fixtures whose body is from 2.1.215 carry the 2.1.296 header
+transplanted over the old welcome box, with the box's remaining rows left empty
+so the body keeps its row indexes. In the Claude waiting fixture, the header is
+omitted and agent-roster rows are included below the input box. In the Claude
+task-list fixtures, generic phase names are used in a task-list layout and the
+header is omitted. In the Claude workflow-wait fixture, generic wording is used,
+the header is omitted, and a long blank gap is included above the input box
+with a roster below it. The omp fixtures are
 the 18.8.7 default layout: logo and tip, the status band (`π >` idle, `⠇ 4s >`
 working), and a `╰─` composer gutter with no top border. The working directory
 in the band and the tool-call path in the body are replaced with same-width
@@ -66,16 +74,17 @@ prevent a byte-for-byte match with the captured header.
 
 | Fixture | Scenario | Coverage |
 | --- | --- | --- |
-| `preview_claude_working.bin` | claude spinner with the tmux focus-events hint row | `claude:spinner` extraction through an indented hint row |
-| `preview_claude_working_tool.bin` | claude spinner over an indented tool-attachment row | `claude:spinner`; the attachment row is not the action row |
-| `preview_claude_action.bin` | claude `⏺ Running 1 shell command…` above the spinner | `claude:action-row` preferred over the rotating verb |
-| `preview_claude_approval.bin` | claude file-write approval dialog, input box replaced | `awaiting approval` synthesized by `claude:approval-menu` |
-| `preview_claude_idle.bin` | claude idle with the `Try "…"` placeholder | fall-through to the marker; the placeholder excluded from anchors |
-| `preview_claude_done.bin` | claude after a finished turn (`✻ Crunched for 4s` in the body) | fall-through; body completion rows are out of the pinned window |
-| `preview_claude_body_menu.bin` | approval-menu text quoted in the body while the spinner runs | the pinned spinner preferred; body menu text is ignored |
-| `preview_claude_body_menu_idle.bin` | approval-menu text touching the chrome window, input box intact | extraction aborted at a foreign column-0 row; marker fallback |
-| `preview_claude_tasklist.bin` | claude spinner above a six-row task-list block, agent roster below the box | `claude:spinner` through a bounded indented block |
-| `preview_claude_body_above_tasklist.bin` | spinner-shaped body row above `⏺` prose and the task list | negative: status structure rejected on column-0 prose |
+| `preview_claude_working.bin` | claude 2.1.296, captured 2026-10-10: spinner over the right-aligned `● high · /effort` hint row | `claude:spinner` extraction through an indented hint row |
+| `preview_claude_working_tool.bin` | body from 2.1.215, header transplanted from 2.1.296: spinner over an indented tool-attachment row | `claude:spinner`; the attachment row is not the action row |
+| `preview_claude_working_agent.bin` | claude 2.1.296, captured 2026-10-10: spinner over a backgrounded `⏺ Agent(…)` row and its `⎿` attachment, agent roster below the box | `claude:spinner`; the attachment is not the action row, the roster is outside the scan |
+| `preview_claude_action.bin` | claude 2.1.296, captured 2026-10-10: `⏺ Running 1 shell command…` above a `· Whisking… (9s · ↓ 261 tokens · thought for 2s)` spinner | `claude:action-row` preferred over the rotating verb; `thought for 2s` kept, tickers dropped |
+| `preview_claude_approval.bin` | claude 2.1.296, captured 2026-10-10: Bash command approval dialog, input box replaced, four-option menu | `awaiting approval` synthesized by `claude:approval-menu` |
+| `preview_claude_idle.bin` | claude 2.1.296, captured 2026-10-10: launch state with the `Try "…"` placeholder, `/rc connecting…` on the header, no statusline rows yet | fall-through to the marker; the placeholder excluded from anchors |
+| `preview_claude_done.bin` | claude 2.1.296, captured 2026-10-10: finished turn (`✻ Sautéed for 17s · done 4:14 PM` in the body) with a typed draft in the box | fall-through; the ellipsis-less completion row is rejected as a foreign column-0 row |
+| `preview_claude_body_menu.bin` | body from 2.1.215, header transplanted from 2.1.296: approval-menu text quoted in the body while the spinner runs | the pinned spinner preferred; body menu text is ignored |
+| `preview_claude_body_menu_idle.bin` | body from 2.1.215, header transplanted from 2.1.296: approval-menu text touching the chrome window, input box intact | extraction aborted at a foreign column-0 row; marker fallback |
+| `preview_claude_tasklist.bin` | 2.1.215, not re-observed on 2.1.296: spinner above a six-row task-list block, agent roster below the box | `claude:spinner` through a bounded indented block |
+| `preview_claude_body_above_tasklist.bin` | 2.1.215, not re-observed on 2.1.296: spinner-shaped body row above `⏺` prose and the task list | negative: status structure rejected on column-0 prose |
 | `preview_codex_working.bin` | codex `• Working (7s • esc to interrupt) · 1 background terminal running · /ps to view · /stop to close` | `codex:working` normalization: affordances stripped, slow suffix kept |
 | `preview_codex_working_over_ran.bin` | codex working with a `• Ran` row higher in the same turn | `codex:working` preferred at the pin; stale row excluded |
 | `preview_codex_scrollback.bin` | codex finished turn, `• Ran` from the prior turn in scrollback | scan stopped at the reply bullet; floor-tier fallback |
@@ -85,8 +94,8 @@ prevent a byte-for-byte match with the captured header.
 | `preview_codex_reasoning.bin` | codex status row with a reasoning phrase over an `• Explored` group and reply bullet; composer carrying text; no status line | header kept verbatim by `codex:working`; preceding `•`-headed rows excluded; no model prefix without a status line |
 | `preview_codex_queued.bin` | codex `• Working` row separated from the composer by a `• Queued follow-up inputs` block; `model-with-reasoning · current-dir` status line below | `codex:working` extracted across queued-message heads; model label from the first status-line item |
 | `preview_codex_body_menu.bin` | modal-shaped menu quoted in the body, live composer below | negative: modal match suppressed with composer present; floor-tier fallback |
-| `preview_claude_waiting.bin` | claude waiting on a backgrounded subagent, `⏺` prose and agent roster around the box | ellipsis-less row extracted verbatim by `claude:waiting`; no model label mid-session |
-| `preview_claude_workflow_wait.bin` | claude waiting on a dynamic workflow, with 19 blank rows before the input box and a workflow roster below it | blank rows skipped during `claude:waiting` matching; the roster is excluded |
+| `preview_claude_waiting.bin` | 2.1.215, not re-observed on 2.1.296, where the `✻ Waiting for 1 background agent to finish` row was seen only in the body after the turn: waiting on a backgrounded subagent, `⏺` prose and agent roster around the box | ellipsis-less row extracted verbatim by `claude:waiting`; no model label mid-session |
+| `preview_claude_workflow_wait.bin` | 2.1.215, not re-observed on 2.1.296: waiting on a dynamic workflow, with 19 blank rows before the input box and a workflow roster below it | blank rows skipped during `claude:waiting` matching; the roster is excluded |
 | `preview_grok_working.bin` | grok braille spinner with elapsed/throughput ticker | `grok:spinner` cut at the label's `…`; border label read |
 | `preview_grok_worked.bin` | grok `Worked for 8.7s` completion row above the box | `grok:worked` kept verbatim |
 | `preview_grok_still_running.bin` | grok `◎ 1 subagent still running` above the idle box | `grok:still-running`; border label read |

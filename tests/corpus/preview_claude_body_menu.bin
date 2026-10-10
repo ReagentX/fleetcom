@@ -1,15 +1,15 @@
 [?1049h[2J[H
-╭─── Claude Code v2.1.215 ─────────────────────────────────────────────────────────────────────────────────────────────╮
-│                                                    │ Tips for getting started                                        │
-│              Welcome back Fleet Pilot!             │ Run /init to create a CLAUDE.md file with instructions for Cla… │
-│                                                    │ ─────────────────────────────────────────────────────────────── │
-│                       ▐▛███▜▌                      │ What's new                                                      │
-│                      ▝▜█████▛▘                     │ Claude no longer runs the `/verify` and `/code-review` skills … │
-│                        ▘▘ ▝▝                       │ Fixed single-segment `dir/**` allow rules like `Edit(src/**)` … │
-│ Fable 5 with high effort · Claude Max ·            │ Fixed a permission-check bypass affecting commands run in Wind… │
-│ anonymized-account0@example.invalid's Organization │ /release-notes for more                                         │
-│             ~/Projects/fixture-sources             │                                                                 │
-╰──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+ ▐▛███▛█   Claude Code v2.1.296
+▝▜██████▀  Fable 5.1 with high effort · Claude Max
+ ▝▝   ▝▝   /…/Users/fleet-pilot/Projects/fixture-sources/ptys/claude-work · /rc
+
+
+
+
+
+
+
+
 
 
 ❯ run: sleep 5 && echo ok

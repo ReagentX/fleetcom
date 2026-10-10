@@ -1,0 +1,40 @@
+[?1049h[2J[H
+ ▐▛███▛█   Claude Code v2.1.296
+▝▜██████▀  Fable 5.1 with high effort · Claude Max
+ ▝▝   ▝▝   /…/Users/fleet-pilot/Projects/fixture-sources/ptys/claude-work · /rc
+
+
+❯ Use the Task tool to launch one subagent whose only job is to reply with the word ok, then tell me what it said.
+
+⏺ Launching one subagent now.
+
+⏺ Agent(Reply with the word ok)
+  ⎿  Backgrounded agent (↓ to manage · ctrl+o to expand)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+✽ Hashing… (2s · ↓ 112 tokens)
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ 
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+  Fable 5.1 (high) | /Users/fleet-pilot/Projects/fixture-sources/corpus-capture/claude-2-1-296/sessions/fixture-pty-s…
+  ⏵⏵ auto mode on (shift+tab to cycle)
+
+  ⏺ main
+  ◯ general-purpose  Reply with the word ok                                                                         0s

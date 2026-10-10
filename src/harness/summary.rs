@@ -141,14 +141,14 @@ impl SummaryAdapter for ClaudeSummary {
         claude_welcome_label(rows)
     }
 
-    /// Set `working` for braille and quadrant-circle title frames. Treat a
-    /// [`CLAUDE_SPINNER`] glyph as idle. We observed only `✳` from this family in titles,
-    /// and only while idle. Return `None` for other shapes or empty payloads.
+    /// Set `working` for quadrant-circle title frames: 2.1.296 emits `◐ <summary>` and
+    /// `◑ <summary>` while working. Treat a [`CLAUDE_SPINNER`] glyph as idle: the same
+    /// release emits `✳ Claude Code`, then `✳ <summary>`, at rest. Braille frames were
+    /// an older claude's title animation (2.1.209) and are rejected. Return `None` for
+    /// other shapes or empty payloads.
     fn normalize_title(&self, title: &str) -> Option<(String, bool)> {
         let rest = after_frame(title, |c| {
-            CLAUDE_SPINNER.contains(&c)
-                || braille_frame(c)
-                || ('\u{25D0}'..='\u{25D3}').contains(&c)
+            CLAUDE_SPINNER.contains(&c) || ('\u{25D0}'..='\u{25D3}').contains(&c)
         })?;
         // An empty payload cannot produce a usable preview.
         (!rest.is_empty()).then(|| (rest.to_string(), !title.starts_with(CLAUDE_SPINNER)))
@@ -297,31 +297,37 @@ fn claude_approval(rows: &[String]) -> Option<(String, &'static str)> {
         .then(|| (AWAITING_APPROVAL.to_string(), "claude:approval-menu"))
 }
 
-/// Complete effort values accepted before a welcome-box ellipsis.
+/// Complete effort values accepted before a welcome-header ellipsis.
 const CLAUDE_EFFORT: &[&str] = &["low", "medium", "high", "xhigh", "max"];
 
-/// `Fable 5 with high effort` from the welcome box → `Fable 5 (high)`. The
-/// welcome box is the stable source; user-configurable statusline rows are not
-/// parsed. When the box scrolls away, the label is unavailable.
+/// `Fable 5.1 with high effort` from the welcome header → `Fable 5.1 (high)`.
+/// claude 2.1.296 paints a three-row logo header, logo glyphs left of the text:
+///
+/// ```text
+///  ▐▛███▛█   Claude Code v2.1.296
+/// ▝▜██████▀  Fable 5.1 with high effort · Claude Max
+///  ▝▝   ▝▝   /…/scratchpad/claude-work · /rc
+/// ```
+///
+/// The model row follows the `Claude Code v` row, which sits within the first
+/// four rows; its first ` · ` segment is the model text. The header is the
+/// stable source; user-configurable statusline rows are not parsed. When the
+/// header scrolls away, the label is unavailable.
 fn claude_welcome_label(rows: &[String]) -> Option<String> {
-    let start = rows
+    let version = rows
         .iter()
         .take(4)
-        .position(|r| r.trim_start().starts_with("╭─── Claude Code"))?;
-    for row in &rows[start + 1..] {
-        if row.trim_start().starts_with('╰') {
-            break;
-        }
-        // First cell of the box row: the welcome pane, left of the divider.
-        let Some(cell) = row.split('│').nth(1) else {
-            continue;
-        };
-        let head = cell.trim().split(" · ").next().unwrap_or("");
-        if let Some(label) = claude_model_effort(head) {
-            return Some(label);
-        }
-    }
-    None
+        .position(|r| claude_header_text(r).starts_with("Claude Code v"))?;
+    let head = claude_header_text(rows.get(version + 1)?)
+        .split(" · ")
+        .next()?;
+    claude_model_effort(head)
+}
+
+/// The text of a welcome-header row: strip the leading logo glyphs (block
+/// elements U+2580 to U+259F) and whitespace.
+fn claude_header_text(row: &str) -> &str {
+    row.trim_start_matches(|c: char| c.is_whitespace() || ('\u{2580}'..='\u{259F}').contains(&c))
 }
 
 /// Normalize `<model> with <effort> effort` and its ellipsis form to `<model>
