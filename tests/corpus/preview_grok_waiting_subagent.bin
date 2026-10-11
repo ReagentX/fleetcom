@@ -1,0 +1,39 @@
+[?1049h]0;⠙ - Waiting for subagent… - grok[2J[H
+  ~/Projects/fixture-sources/grok                                                             19K / 256K │ [Dashboard]
+
+
+     ❯ Launch one subagent whose only job is to reply with the word ok, then tell me what it said.           4:27 PM
+
+
+     ◆ Thought for 0.0s
+
+     I'll launch one subagent whose only task is to reply with "ok", then report exactly what it returns.    4:27 PM
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+   ⠴ Waiting for subagent… 0.0s                                                                     2.9s ⇣19.1k [stop]
+
+  ╭──────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+  │ ❯                                                                                                                │
+  ╰────────────────────────────────────────────────────────────────────────────────── Grok 4.7 (high) · auto-review ─╯
+
+  Shift+Tab:mode  │  Ctrl+c:cancel  │  Ctrl+.:shortcuts

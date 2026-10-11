@@ -1223,7 +1223,8 @@ fn codex_requires_the_composer_pin() {
 }
 
 /// Spinner label cut at its `…`; the completion row kept verbatim,
-/// longer durations included; free text above the box refuses.
+/// longer durations included; free text above the box refuses. The Tasks
+/// panel is skipped to the one row above its header.
 #[test]
 fn grok_status_shapes() {
     let probe = |status: &str| GrokSummary.live_preview(&grok_screen(&[status, ""]));
@@ -1249,6 +1250,59 @@ fn grok_status_shapes() {
         None
     );
 
+    // The Tasks panel of a backgrounded command: the probe is the one row
+    // above its header, whatever that row is.
+    let panel = |above: &str| {
+        GrokSummary.live_preview(&grok_screen(&[
+            above,
+            "",
+            "   ▾ Tasks 2",
+            "   ⸬ Run Sleep for 40 seconds                             0s",
+            "   ⁙ Run cargo build                                      3s",
+            "",
+        ]))
+    };
+    assert_eq!(
+        panel("   ⠹ Waiting for response… 0.1s             9.5s ⇣19.2k [stop]"),
+        Some(("Waiting for response…".to_string(), "grok:spinner"))
+    );
+    assert_eq!(panel("     Done."), None);
+    // A header-shaped row with a blank row below it is not a panel; a header
+    // with trailing text is not a header.
+    for (rows, want) in [
+        (
+            vec![
+                "    ⠋ Thinking… 0.2s",
+                "",
+                "   ▾ Tasks 1",
+                "",
+                "     Done.",
+                "",
+            ],
+            None,
+        ),
+        (
+            vec![
+                "    ⠋ Thinking… 0.2s",
+                "",
+                "   ▾ Tasks 1 pending",
+                "     Done.",
+                "",
+            ],
+            None,
+        ),
+        (
+            vec!["    ⠋ Thinking… 0.2s", "", "   ▾ Tasks 1", "     Done.", ""],
+            Some(("Thinking…".to_string(), "grok:spinner")),
+        ),
+    ] {
+        assert_eq!(
+            GrokSummary.live_preview(&grok_screen(&rows)),
+            want,
+            "{rows:?}"
+        );
+    }
+
     assert_eq!(
         GrokSummary.model_label(&grok_screen(&["    ⠋ Thinking… 0.2s", ""])),
         Some("Grok 4.5 (xhigh)".to_string())
@@ -1256,63 +1310,6 @@ fn grok_status_shapes() {
     // A plain border carries no label.
     let plain = rs(&["    ⠋ Thinking… 0.2s", "", "╭────╮", "│ ❯  │", "╰────╯"]);
     assert_eq!(GrokSummary.model_label(&plain), None);
-}
-
-/// Still-running chrome: `◎` plus a count phrase or `waiting`. Drop the interrupt hint;
-/// body-shaped lookalikes and pre-0.2.109 wording do not match. Prefer a closer
-/// Worked-for row: no upward scan.
-#[test]
-fn grok_still_running_shapes() {
-    let probe = |status: &str| GrokSummary.live_preview(&grok_screen(&[status, ""]));
-    assert_eq!(
-        probe("    ◎ 1 subagent still running"),
-        Some(("1 subagent still running".to_string(), "grok:still-running"))
-    );
-    assert_eq!(
-        probe("    ◎ 1 command · 2 monitors · 1 loop · 1 subagent still running"),
-        Some((
-            "1 command · 2 monitors · 1 loop · 1 subagent still running".to_string(),
-            "grok:still-running"
-        ))
-    );
-    assert_eq!(
-        probe("    ◎ 1 command still running · send a message to interrupt"),
-        Some(("1 command still running".to_string(), "grok:still-running"))
-    );
-    assert_eq!(
-        probe("    ◎ waiting · send a message to interrupt"),
-        Some(("waiting".to_string(), "grok:still-running"))
-    );
-    assert_eq!(
-        probe("    ◎ waiting"),
-        Some(("waiting".to_string(), "grok:still-running"))
-    );
-
-    for row in [
-        "    1 subagent still running",
-        "     watching · 1 subagent",
-        "  Subagent running: \"do the thing\"",
-        "    ◎ still running",
-        "    ◎ 1 to finish",
-        "    ◎ 1 command still running · leftover",
-        "    ◎ 1 still running",
-        "    ◎ command still running",
-        "    ◎ 1 a b c d still running",
-    ] {
-        assert_eq!(probe(row), None, "{row:?}");
-    }
-
-    // The probe is a single row: prefer Worked-for closer to the box.
-    let rows = grok_screen(&[
-        "    ◎ 1 subagent still running",
-        "",
-        "     Worked for 8.7s",
-        "",
-    ]);
-    assert_eq!(
-        GrokSummary.live_preview(&rows),
-        Some(("Worked for 8.7s".to_string(), "grok:worked"))
-    );
 }
 
 /// Check each observed ` - `-joined title form from grok 1.0.50. Expect the session
@@ -1679,11 +1676,20 @@ fn corpus_positive_states_resolve_exactly() {
             "grok:worked",
         ),
         Case(
-            "preview_grok_still_running",
-            include_bytes!("../../tests/corpus/preview_grok_still_running.bin"),
+            "preview_grok_background_tasks",
+            include_bytes!("../../tests/corpus/preview_grok_background_tasks.bin"),
             &GrokSummary,
-            "Grok 4.5 (xhigh) · 1 subagent still running",
-            "grok:still-running",
+            // The spinner row is read over the Tasks panel of the
+            // backgrounded command.
+            "Grok 4.7 (high) · Waiting for response…",
+            "grok:spinner",
+        ),
+        Case(
+            "preview_grok_waiting_subagent",
+            include_bytes!("../../tests/corpus/preview_grok_waiting_subagent.bin"),
+            &GrokSummary,
+            "Grok 4.7 (high) · Waiting for subagent…",
+            "grok:spinner",
         ),
     ];
     // Exercise both title paths against screens without structural anchors:
@@ -1786,8 +1792,6 @@ fn rule_reports_working_classifies_every_emitted_id() {
         ("codex:ran", false),
         ("codex:worked", false),
         ("grok:worked", false),
-        // Background subagents are live, but the turn itself has ended.
-        ("grok:still-running", false),
     ];
     for (rule, working) in table {
         assert_eq!(rule_reports_working(rule), Some(working), "{rule}");
@@ -1934,8 +1938,8 @@ fn corpus_body_shaped_text_never_extracts() {
     );
     assert_eq!(got, anchor("gpt-5.6-sol high · Working", "codex:working"));
 
-    // Grok scrollback `Subagent running:` with no `◎` chrome: the probe
-    // is that body row and refuses, same marker fall-through as idle.
+    // Grok `Subagent running:` as body text above the idle box: the probe
+    // is that row and refuses, same marker fall-through as idle.
     let got = corpus(
         include_bytes!("../../tests/corpus/preview_grok_subagent_scrollback.bin"),
         &GrokSummary,

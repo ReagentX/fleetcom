@@ -44,8 +44,6 @@ pub const AWAITING_APPROVAL: &str = "awaiting approval";
 
 /// Classify each emitted anchor rule ID as working or idle. Return `None` for IDs no
 /// adapter emits. List every emitted ID so the corpus test covers each classification.
-/// Treat `grok:still-running` as idle because background subagents may remain active
-/// after the turn ends.
 pub fn rule_reports_working(rule: &str) -> Option<bool> {
     match rule {
         "claude:spinner" | "claude:action-row" | "codex:working" | "grok:spinner" => Some(true),
@@ -54,8 +52,7 @@ pub fn rule_reports_working(rule: &str) -> Option<bool> {
         | "codex:approval-menu"
         | "codex:ran"
         | "codex:worked"
-        | "grok:worked"
-        | "grok:still-running" => Some(false),
+        | "grok:worked" => Some(false),
         _ => None,
     }
 }
@@ -728,13 +725,13 @@ fn codex_working(header: &str, after_paren: &str) -> String {
 // ------------------------------------------------------------------ grok --
 
 /// grok (alt screen). Use the bordered input box as the structural anchor. Read
-/// the status from the first painted row above the box's top border: a braille
-/// spinner while working, `Worked for {n}s` after a turn, or `◎ … still running`
-/// / `◎ waiting` while background work is live. Limit this tier to working and
-/// completion rows. Handle the three blocked states (permission prompt, plan
-/// approval, question) through title normalization: expect a `┃`-fenced dialog
-/// in place of the box for permission prompts and questions, and `◆` in the
-/// probe position for plan approval. See [`SummaryAdapter::normalize_title`].
+/// the status from the first painted row above the box's top border, skipping
+/// the Tasks panel: a braille spinner while working or `Worked for {n}s` after
+/// a turn. Limit this tier to working and completion rows. Handle the three
+/// blocked states (permission prompt, plan approval, question) through title
+/// normalization: expect a `┃`-fenced dialog in place of the box for
+/// permission prompts and questions, and `◆` in the probe position for plan
+/// approval. See [`SummaryAdapter::normalize_title`].
 pub struct GrokSummary;
 
 impl SummaryAdapter for GrokSummary {
@@ -743,18 +740,35 @@ impl SummaryAdapter for GrokSummary {
         // One probe row: the first painted row above the box. The splash
         // panel's hints and the session header land here in non-working
         // states and match neither shape.
-        let probe = rows[..top].iter().rev().find(|r| !r.is_empty())?;
+        let first = rows[..top].iter().rposition(|r| !r.is_empty())?;
+        // A command sent to the background with Ctrl+B paints a Tasks panel
+        // between the status row and the box for as long as it runs:
+        //
+        //     ⠹ Waiting for response… 0.1s             9.5s ⇣19.2k [stop]
+        //
+        //     ▾ Tasks 1
+        //     ⸬ Run Sleep for 40 seconds                                0s
+        //
+        //    ╭───…───╮
+        //
+        // The panel is the `▾ Tasks {n}` header and the painted rows under
+        // it; the task glyph animates (`⸬`, `⁙`, `⋅`, `:`), so the rows
+        // are not matched by shape. When the first painted row is in that
+        // run, the probe is the first painted row above the header: still
+        // one row, never a scan.
+        let end = (0..=first)
+            .rev()
+            .take_while(|&i| !rows[i].is_empty())
+            .find(|&i| grok_tasks_header(&rows[i]))
+            .unwrap_or(first + 1);
+        let probe = rows[..end].iter().rev().find(|r| !r.is_empty())?;
         let t = probe.trim_start();
         // Keep the label through its first ellipsis. Wrapped tail rows have no
         // spinner prefix, so they fail the frame check and fall through.
         if let Some(text) = spinner_text(t, braille_frame) {
             return Some((text, "grok:spinner"));
         }
-        // Still-running is the same probe, never a scan: a closer spinner
-        // or Worked-for row already returned above.
-        grok_worked(t)
-            .then(|| (t.to_string(), "grok:worked"))
-            .or_else(|| grok_still_running(t).map(|text| (text, "grok:still-running")))
+        grok_worked(t).then(|| (t.to_string(), "grok:worked"))
     }
 
     fn model_label(&self, rows: &[String]) -> Option<String> {
@@ -829,29 +843,14 @@ fn grok_worked(t: &str) -> bool {
         })
 }
 
-/// Background-task chrome grok paints above the box while the main turn
-/// looks idle. The `◎` head and the ` · send a message to interrupt` hint
-/// drop; `waiting` and `{count} still running` stay. Scrollback such as
-/// `Subagent running:` has no `◎` and never matches.
-fn grok_still_running(t: &str) -> Option<String> {
-    let rest = t.strip_prefix("◎ ")?;
-    let rest = rest
-        .strip_suffix(" · send a message to interrupt")
-        .unwrap_or(rest);
-    if rest == "waiting" {
-        return Some(rest.to_string());
-    }
-    let body = rest.strip_suffix(" still running")?;
-    body.split(" · ")
-        .all(grok_still_running_count)
-        .then(|| rest.to_string())
-}
-
-/// One count segment: ASCII digits, a space, then one to three words.
-fn grok_still_running_count(seg: &str) -> bool {
-    after_digits(seg)
-        .and_then(|r| r.strip_prefix(' '))
-        .is_some_and(|words| (1..=3).contains(&words.split_whitespace().count()))
+/// The Tasks panel header grok 1.0.50 paints above the box while a
+/// backgrounded command runs: `▾ Tasks {n}` with an ASCII-digit count and
+/// nothing after it.
+fn grok_tasks_header(row: &str) -> bool {
+    row.trim()
+        .strip_prefix("▾ Tasks ")
+        .and_then(after_digits)
+        .is_some_and(str::is_empty)
 }
 
 /// `╰──── Grok 4.5 (xhigh) · always-approve ─╯` → `Grok 4.5 (xhigh)`: the text grok

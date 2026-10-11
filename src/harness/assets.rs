@@ -35,10 +35,10 @@
 //!   replace `$FLEETCOM_CAPTURE_FILE` with `{reason, sessionId, sessionFile,
 //!   cwd}` JSON. Write `<capture file>.<pid>.tmp` beside the capture file and
 //!   rename it over the destination to avoid reads of partial payloads.
-//!   Report only the top-level session (`ctx.agent.kind` is `"main"`) and
-//!   only when `sessionFile` exists on disk. On omp older than 18.3.2,
-//!   `ctx.agent` is absent, so write nothing. Skip unset or empty capture
-//!   paths and ignore all errors.
+//!   Report only the top-level session (`ctx.agent.kind` is `"main"`), since
+//!   sub-agents share the handlers and their IDs are not resumable, and only
+//!   when `sessionFile` exists on disk. Skip unset or empty capture paths and
+//!   ignore all errors.
 
 use std::{
     fs, io,
@@ -89,9 +89,8 @@ exec "$@"
 /// Report only an ID usable with `omp --resume`:
 ///
 /// - Only the top-level session's ID. The same handlers are registered for
-///   sub-agent sessions, with the child's ID in their session manager.
-/// - None on an omp older than 18.3.2. `ctx.agent` is absent there, so the
-///   top-level session cannot be told from a sub-agent.
+///   sub-agent sessions, with the child's ID in their session manager, and a
+///   sub-agent's ID is not resumable.
 /// - Only after the session file exists on disk. For a fresh session, first
 ///   report at `agent_end`.
 ///
@@ -106,7 +105,7 @@ function write(ctx, reason) {
     const path = process.env.FLEETCOM_CAPTURE_FILE;
     if (!path) return;
     // These handlers are also registered for sub-agent sessions, which cannot
-    // be resumed by ID. Without `ctx.agent` (before 18.3.2), report nothing.
+    // be resumed by ID: only the top-level session reports.
     if (ctx.agent?.kind !== "main") return;
     // The session file is created after the first assistant message. Until
     // then, the ID cannot be found through `omp --resume`.
@@ -350,9 +349,8 @@ mod tests {
     /// Stand-in for omp's extension host. Load the module, collect its
     /// registrations, and fire one event with a context built from the
     /// arguments `<event> <agent kind> <session id> <session file>`. An empty
-    /// kind means no `ctx.agent`, as before omp 18.3.2; an empty file means
-    /// `undefined` from `getSessionFile()`. Print the registered event names
-    /// in registration order.
+    /// file means `undefined` from `getSessionFile()`. Print the registered
+    /// event names in registration order.
     const OMP_HOST_DRIVER: &str = r#"import register from "./omp-capture.mjs";
 
 const handlers = {};
@@ -360,12 +358,12 @@ register({ on: (event, handler) => (handlers[event] = handler) });
 const [event, kind, sessionId, sessionFile] = process.argv.slice(2);
 const ctx = {
   cwd: "/work/proj",
+  agent: { kind },
   sessionManager: {
     getSessionId: () => sessionId,
     getSessionFile: () => sessionFile || undefined,
   },
 };
-if (kind) ctx.agent = { kind };
 handlers[event]({ type: event }, ctx);
 console.log(Object.keys(handlers).join(" "));
 "#;
@@ -928,15 +926,9 @@ console.log(Object.keys(handlers).join(" "));
         }
         assert!(!orphan.parent().unwrap().exists());
 
-        // Use an existing file for the sub-agent and absent-`ctx.agent` cases
-        // to test rejection by agent kind alone. For the top-level cases,
-        // omit the file on disk.
-        for (kind, file) in [
-            ("sub", session.as_str()),
-            ("", session.as_str()),
-            ("main", unwritten),
-            ("main", ""),
-        ] {
+        // Use an existing file for the sub-agent case to test rejection by
+        // agent kind alone. For the top-level cases, omit the file on disk.
+        for (kind, file) in [("sub", session.as_str()), ("main", unwritten), ("main", "")] {
             for event in ["session_start", "agent_end"] {
                 fire(event, kind, ID, file, Some(&cap));
                 assert!(!cap.exists(), "{event} {kind:?} {file:?} must not report");

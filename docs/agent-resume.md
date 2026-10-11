@@ -129,7 +129,6 @@ At `agent_end`, after every turn, report two changes without dedicated events: s
 As a result:
 
 - For a fresh `omp` task, no ID is captured until the end of the first turn. If you save before then, no ID is stored, so you start fresh on reload.
-- Before omp 18.3.2, `ctx.agent` is unavailable, so no session ID is captured: an `omp` task is always saved without an ID.
 - After switching or branching to a session without a file on disk, continue using the previous ID until the end of the next turn.
 
 Write each report to a temporary file beside the capture file, then rename it over the destination to avoid reads of partial payloads. Capture is best-effort: return immediately for an empty capture path and ignore write errors.

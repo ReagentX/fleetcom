@@ -106,8 +106,9 @@ prevent a byte-for-byte match with the captured header.
 | `preview_claude_workflow_wait.bin` | 2.1.215, not re-observed on 2.1.296: waiting on a dynamic workflow, with 19 blank rows before the input box and a workflow roster below it | blank rows skipped during `claude:waiting` matching; the roster is excluded |
 | `preview_grok_working.bin` | grok braille spinner with elapsed/throughput ticker | `grok:spinner` cut at the label's `…`; border label read |
 | `preview_grok_worked.bin` | grok `Worked for 8.7s` completion row above the box | `grok:worked` kept verbatim |
-| `preview_grok_still_running.bin` | grok `◎ 1 subagent still running` above the idle box | `grok:still-running`; border label read |
-| `preview_grok_subagent_scrollback.bin` | grok idle with `Subagent running:` in the body, no `◎` row | fall-through; body-shaped text is not status |
+| `preview_grok_background_tasks.bin` | grok 1.0.50, captured 2026-10-10: `⠹ Waiting for response…` spinner over the `▾ Tasks 1` panel of a command sent to the background with Ctrl+B; `⠋ - Waiting for response… - … - grok` title announce | `grok:spinner` read over the Tasks panel; border label read |
+| `preview_grok_waiting_subagent.bin` | grok 1.0.50, captured 2026-10-10: `⠴ Waiting for subagent…` spinner while a subagent runs; `⠙ - Waiting for subagent… - grok` title announce | `grok:spinner`; a subagent turn is an ordinary spinner row |
+| `preview_grok_subagent_scrollback.bin` | grok idle with `Subagent running:` as body text above the box | fall-through; body-shaped text is not status |
 | `preview_grok_idle.bin` | grok idle session | fall-through to the marker |
 | `preview_grok_splash.bin` | grok launch splash with resume hint above the box | fall-through; distinct views excluded from anchors |
 | `preview_grok_idle_titled.bin` | `preview_grok_idle.bin` plus a `Run ls -la list directory file names - grok` title announce | Strip `- grok` and render the session name through the title tier |

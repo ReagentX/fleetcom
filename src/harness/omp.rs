@@ -7,8 +7,6 @@
 //! the same handlers are registered for them, but their IDs are not resumable.
 //! Wait until the session file is created after the first assistant message.
 //! For a fresh launch, no ID is captured until the end of the first turn.
-//! Capture is unavailable before omp 18.3.2: without the agent kind in the
-//! extension context, top-level sessions cannot be distinguished from sub-agents.
 //!
 //! omp's IDs are `UUIDv7`. [`is_uuid`](super::is_uuid) validates the 8-4-4-4-12
 //! lowercase-hex shape and not the version field, so they pass unchanged.
