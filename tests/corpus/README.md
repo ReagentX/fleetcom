@@ -36,16 +36,21 @@ fleetcom client's output.
 Use the `preview_*.bin` fixtures to verify summary-adapter extraction,
 normalization, and fallback behavior. Each fixture is a constructed repaint
 stream: optional alternate-screen entry, clear, home, then sanitized screen rows
-joined with CRLF. Claude and Grok use the alternate screen; Codex and omp are
-inline. Identifying and user-configured text is replaced with
-alignment-preserving synthetic values. Geometry is 40×120 unless noted.
+joined with CRLF. Claude and Grok use the alternate screen. Codex 0.162.1 runs
+on the alternate screen from startup, so the five codex fixtures captured on it
+(`idle`, `working`, `queued`, `done`, `ran_done`) open with `1049h`; the older
+codex fixtures and omp are inline. Identifying and user-configured text is
+replaced with alignment-preserving synthetic values. Geometry is 40×120 unless
+noted.
 
-Geometry is 40×80 for `preview_codex_reasoning.bin` and 40×36 for
-`preview_codex_queued.bin`. Both are bottom-anchored on a 40-row screen to
-reproduce the inline layout.
+Geometry is 40×80 for `preview_codex_reasoning.bin`, bottom-anchored on a
+40-row screen to reproduce the inline layout.
 
 Indentation in the Codex hint-row and approval fixtures is approximate; match
-trimmed heads and column-0 structure in their tests. The Claude fixtures with a
+trimmed heads and column-0 structure in their tests. The codex 0.162.1 fixtures
+open on the `>_ OpenAI Codex (v0.162.1)` header with a same-width synthetic
+working directory on the row below it; the `GPT-6-Luna max · … in · … out`
+status line, token counters, clock times, and prompts are verbatim. The Claude fixtures with a
 model prefix open on claude 2.1.296's three-row logo header (`Claude Code
 v2.1.296`, `Fable 5.1 with high effort · Claude Max`, working directory); the
 working directory on the header row and on the statusline row below the input
@@ -85,15 +90,18 @@ prevent a byte-for-byte match with the captured header.
 | `preview_claude_body_menu_idle.bin` | body from 2.1.215, header transplanted from 2.1.296: approval-menu text touching the chrome window, input box intact | extraction aborted at a foreign column-0 row; marker fallback |
 | `preview_claude_tasklist.bin` | 2.1.215, not re-observed on 2.1.296: spinner above a six-row task-list block, agent roster below the box | `claude:spinner` through a bounded indented block |
 | `preview_claude_body_above_tasklist.bin` | 2.1.215, not re-observed on 2.1.296: spinner-shaped body row above `⏺` prose and the task list | negative: status structure rejected on column-0 prose |
-| `preview_codex_working.bin` | codex `• Working (7s • esc to interrupt) · 1 background terminal running · /ps to view · /stop to close` | `codex:working` normalization: affordances stripped, slow suffix kept |
-| `preview_codex_working_over_ran.bin` | codex working with a `• Ran` row higher in the same turn | `codex:working` preferred at the pin; stale row excluded |
-| `preview_codex_scrollback.bin` | codex finished turn, `• Ran` from the prior turn in scrollback | scan stopped at the reply bullet; floor-tier fallback |
-| `preview_codex_ran.bin` | codex transient completion row | `codex:ran` extraction through the `└` attachment row |
-| `preview_codex_hint_row.bin` | codex working with `tab to queue message` below the composer, no status line | `codex:working` through the composer pin; no model prefix without one |
-| `preview_codex_approval.bin` | codex approval modal: composer and status line replaced by a numbered menu | `awaiting approval` synthesized by `codex:approval-menu` |
-| `preview_codex_reasoning.bin` | codex status row with a reasoning phrase over an `• Explored` group and reply bullet; composer carrying text; no status line | header kept verbatim by `codex:working`; preceding `•`-headed rows excluded; no model prefix without a status line |
-| `preview_codex_queued.bin` | codex `• Working` row separated from the composer by a `• Queued follow-up inputs` block; `model-with-reasoning · current-dir` status line below | `codex:working` extracted across queued-message heads; model label from the first status-line item |
-| `preview_codex_body_menu.bin` | modal-shaped menu quoted in the body, live composer below | negative: modal match suppressed with composer present; floor-tier fallback |
+| `preview_codex_working.bin` | codex 0.162.1, captured 2026-10-10: `• Working (3s • esc to interrupt) · 1 background terminal running · /ps to view · /stop to close` | `codex:working` normalization: affordances stripped, slow suffix kept |
+| `preview_codex_working_over_ran.bin` | codex 0.144.6: working with a `• Ran` row higher in the same turn | `codex:working` preferred at the pin; stale row excluded |
+| `preview_codex_scrollback.bin` | codex 0.144.6: finished turn, `• Ran` from the prior turn in scrollback | scan stopped at the reply bullet; floor-tier fallback |
+| `preview_codex_ran.bin` | codex 0.144.6, synthetic: transient completion row (no raw capture holds it) | `codex:ran` extraction through the `└` attachment row |
+| `preview_codex_ran_done.bin` | codex 0.162.1, captured 2026-10-10: finished turn, `• Ran curl -sI https://example.com` and its `└` output behind the `• HTTP/2 200` reply bullet | scan stopped at the reply bullet; marker fallback on the alternate screen |
+| `preview_codex_queued.bin` | codex 0.162.1, captured 2026-10-10: `• Working` row separated from the composer by a `• Queued follow-up inputs` block with one `↳` message and its `⇧←` hint | `codex:working` extracted across queued-message heads; model label from the `in · out` status line |
+| `preview_codex_done.bin` | codex 0.162.1, captured 2026-10-10: finished turn, `• ok` reply over the indented `Worked for 1s • 4:19 PM` completion row | `codex:worked` cut before the clock time |
+| `preview_codex_idle.bin` | codex 0.162.1, captured 2026-10-10: launch state, command list over the `› Ask Codex to do anything` placeholder, `0 in · 0 out` status line | fall-through to the marker |
+| `preview_codex_hint_row.bin` | codex 0.144.6, paste-derived from a 2026-07-20 sighting: working with `tab to queue message` below the composer, no status line | `codex:working` through the composer pin; no model prefix without one |
+| `preview_codex_approval.bin` | codex 0.144.6, paste-derived from a 2026-07-20 sighting: approval modal, composer and status line replaced by a numbered menu | `awaiting approval` synthesized by `codex:approval-menu` |
+| `preview_codex_reasoning.bin` | codex 0.147.0: status row with a reasoning phrase over an `• Explored` group and reply bullet; composer carrying text; no status line | header kept verbatim by `codex:working`; preceding `•`-headed rows excluded; no model prefix without a status line |
+| `preview_codex_body_menu.bin` | codex 0.144.6, synthetic: modal-shaped menu quoted in the body, live composer below | negative: modal match suppressed with composer present; floor-tier fallback |
 | `preview_claude_waiting.bin` | 2.1.215, not re-observed on 2.1.296, where the `✻ Waiting for 1 background agent to finish` row was seen only in the body after the turn: waiting on a backgrounded subagent, `⏺` prose and agent roster around the box | ellipsis-less row extracted verbatim by `claude:waiting`; no model label mid-session |
 | `preview_claude_workflow_wait.bin` | 2.1.215, not re-observed on 2.1.296: waiting on a dynamic workflow, with 19 blank rows before the input box and a workflow roster below it | blank rows skipped during `claude:waiting` matching; the roster is excluded |
 | `preview_grok_working.bin` | grok braille spinner with elapsed/throughput ticker | `grok:spinner` cut at the label's `…`; border label read |
@@ -115,16 +123,19 @@ prevent a byte-for-byte match with the captured header.
 | `preview_trunc_grok.bin` | synthetic 40×80: spinner label truncated with the CLI's ellipsis | CLI's own `…` kept verbatim |
 | `preview_wrap_grok.bin` | synthetic 40×30: ellipsis wrapped onto the next row | structure rejected; marker fallback |
 
-## Codex 0.157.1 and 0.158.0 captures
+## Codex 0.158.0 captures
 
 The versioned directories contain raw PTY streams from the official macOS arm64
-release executables, recorded on 2026-09-28. Codex ran with isolated homes,
-`--no-daemon`, and a loopback Responses server supplying scripted replies:
+0.158.0 release executable, recorded on 2026-09-28. Codex ran with isolated
+homes, `--no-daemon`, and a loopback Responses server supplying scripted
+replies. The 0.157.1 streams recorded alongside them were deleted on
+2026-10-10: no matcher arm depended on them alone, and 0.158.0 itself is
+behind the current release, 0.162.1.
 
 - [`codex_0158_preview`](codex_0158_preview/README.md) covers working status,
   queued input, Shift-Left draft retrieval, completed-turn rejection by the
-  working matcher, ordinary command approval, and the additional terminal-input
-  approval in 0.158.0. The existing approval matcher recognizes both menus.
+  working matcher, ordinary command approval, and the terminal-input approval
+  menu. The existing approval matcher recognizes both menus.
 - [`codex_0158_terminal`](codex_0158_terminal/README.md) covers direct Codex
   output across resize, `/new`, alternate-screen teardown, and OSC 52 copy.
   Separate outer fleetcom captures show resumed history and the exact clipboard

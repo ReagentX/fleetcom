@@ -692,19 +692,16 @@ fn codex_label_separates_right_aligned_warning_badges() {
         "⚠ 1 warning · /warnings to view",
         "⚠ 1 · f2",
         "⚠ 2 · shift+←",
-        "⚠ 3 · ⌥+w",
         "⚠ 4 · alt+w",
         "⚠ 5 · ctrl+x ctrl+w",
         "⚠ 6 · /warnings",
-        "⚠ 1 warning · ctrl+shift+⌥+f24 to view",
-        // Since Codex 0.160.0, `⌥` is displayed without `+` before the key.
+        // `⌥` is glued to its key.
         "⚠ 3 · ⌥w",
         "⚠ 2 warnings · ⌥w to view",
         "⚠ 1 warning · ctrl+shift+⌥f24 to view",
         "⚠ 5 · ctrl+x ⌥w",
-        // The `+` key itself, in the 0.160 and 0.159 spellings.
+        // The `+` key itself.
         "⚠ 1 · ⌥+",
-        "⚠ 1 · ⌥++",
         "⚠ 1 · fwd del",
         "⚠ 1 · ctrl+x ctrl+fwd del",
         "⚠ 1",
@@ -772,40 +769,70 @@ fn codex_label_rejects_warning_prose_and_incomplete_footers() {
     assert_eq!(CodexSummary.model_label(&rows), None);
 }
 
-/// Normalize braille frames to the bare title and mark them working. Canonicalize the
-/// blocked-on-user blink to one phase; pass idle and foreign titles through.
+/// The 0.162.1 title grammar is `[frame ]summary | cwd`: the summary is kept,
+/// the cwd dropped, a frame marks working, and every frame renders one string.
+/// The bare cwd and the frame placeholder yield nothing; the blocked blink
+/// folds to one phase.
 #[test]
-fn codex_title_animations_canonicalize_to_constant_text() {
+fn codex_title_grammar_yields_the_summary() {
+    let t = |title: &str| CodexSummary.normalize_title(title);
+    let named = Some(("Count to twenty slowly".to_string(), true));
+    let idle = Some(("Count to twenty slowly".to_string(), false));
+
+    // The four titles one turn shows, in order.
+    assert_eq!(t("codex-work"), None, "the cwd basename is not a summary");
+    assert_eq!(
+        t("⠴ ⠴ | codex-work"),
+        None,
+        "the placeholder is a frame, not text"
+    );
+    assert_eq!(t("⠙ Count to twenty slowly | codex-work"), named);
+    assert_eq!(t("Count to twenty slowly | codex-work"), idle);
+
     for frame in BRAILLE_FRAMES {
         assert_eq!(
-            CodexSummary.normalize_title(&format!("{frame} fleetcom")),
-            Some(("fleetcom".to_string(), true)),
+            t(&format!("{frame} Count to twenty slowly | codex-work")),
+            named,
             "{frame:?}"
+        );
+        assert_eq!(
+            t(&format!("{frame} {frame} | codex-work")),
+            None,
+            "{frame:?}"
+        );
+        assert_eq!(
+            t(&format!("{frame} fleetcom")),
+            Some(("fleetcom".to_string(), true)),
+            "{frame:?}: a frame-led title without a cwd is all summary"
         );
     }
 
-    // `[ . ]` folds to `[ ! ]`; `[ ! ]` already has the canonical text.
+    // The cwd is split off at the last separator; the summary keeps its own.
     assert_eq!(
-        CodexSummary.normalize_title("[ . ] Action Required | fleetcom"),
-        Some(("[ ! ] Action Required | fleetcom".to_string(), false))
-    );
-    assert_eq!(
-        CodexSummary.normalize_title("[ ! ] Action Required | fleetcom"),
-        None,
-        "the frozen phase needs no rewrite"
+        t("⠙ Fix a | b | codex-work"),
+        Some(("Fix a | b".to_string(), true))
     );
 
-    // Bare, foreign, frame-only, and empty titles do not match Codex's title
-    // grammar.
-    assert_eq!(CodexSummary.normalize_title("fleetcom"), None);
-    assert_eq!(CodexSummary.normalize_title("zellij: main"), None);
-    assert_eq!(CodexSummary.normalize_title("⠹"), None, "frame alone");
-    assert_eq!(
-        CodexSummary.normalize_title("⠹ "),
-        None,
-        "frame with an empty rest"
-    );
-    assert_eq!(CodexSummary.normalize_title(""), None, "empty title");
+    // Both blink phases render the `[ ! ]` phase, with and without a cwd.
+    for title in [
+        "[ . ] Action Required | fleetcom",
+        "[ ! ] Action Required | fleetcom",
+        "[ . ] Action Required",
+    ] {
+        assert_eq!(
+            t(title),
+            Some(("[ ! ] Action Required".to_string(), false)),
+            "{title:?}"
+        );
+    }
+
+    // Foreign, frame-only, empty-summary, and empty titles do not match.
+    assert_eq!(t("zellij: main"), None);
+    assert_eq!(t("⠹"), None, "frame alone");
+    assert_eq!(t("⠹ "), None, "frame with an empty rest");
+    assert_eq!(t(" | codex-work"), None, "empty summary");
+    assert_eq!(t("⠹  | codex-work"), None, "empty summary behind a frame");
+    assert_eq!(t(""), None, "empty title");
 }
 
 /// The status row anchors on its parenthetical, not on a literal verb. The
@@ -1036,6 +1063,53 @@ fn codex_ran_stops_at_foreign_rows() {
         "  gpt-5.6-sol high · 1 in · 2 out",
     ]);
     assert_eq!(CodexSummary.live_preview(&behind_reply), None);
+}
+
+/// The completion row `Worked for {duration} • {time}` is indented, so it is
+/// read before the indentation skip and cut before the clock time. Without
+/// the ` • ` it is prose and skipped like any attachment; behind a reply
+/// bullet or beyond the indentation window it is stale.
+#[test]
+fn codex_worked_row_ends_the_turn() {
+    let tail = [
+        "",
+        "› Ask Codex to do anything",
+        "",
+        "  GPT-6-Luna max · 12.8K used · 20.7K in · 5 out",
+    ];
+    let probe = |above: &[&str]| {
+        let mut rows = above.to_vec();
+        rows.extend(tail);
+        CodexSummary.live_preview(&rs(&rows))
+    };
+    let worked = Some(("Worked for 1s".to_string(), "codex:worked"));
+    assert_eq!(probe(&["• ok", "", "  Worked for 1s • 4:19 PM"]), worked);
+    assert_eq!(
+        probe(&["  Worked for 1m 05s • 4:19 PM"]),
+        Some(("Worked for 1m 05s".to_string(), "codex:worked"))
+    );
+    for row in [
+        "  Worked for 1s",
+        "  Worked for  • 4:19 PM",
+        "  Worked for 1s •4:19 PM",
+    ] {
+        assert_eq!(probe(&["• ok", "", row]), None, "{row:?}");
+    }
+    assert_eq!(
+        probe(&["  Worked for 1s • 4:19 PM", "", "• ok"]),
+        None,
+        "a prior turn's completion row sits behind the reply bullet"
+    );
+
+    let mut deep = vec!["  Worked for 1s • 4:19 PM"];
+    deep.extend(["  └ output"; 10]);
+    assert_eq!(
+        probe(&deep),
+        worked,
+        "ten indented rows are within the window"
+    );
+    deep.push("  └ output");
+    assert_eq!(probe(&deep), None, "eleven exhaust it");
 }
 
 /// A hint row may follow the composer without a status line. The anchor
@@ -1378,162 +1452,96 @@ fn codex_0158_checkpoint(bytes: &[u8], offset: usize, alternate: bool) -> Vec<St
 
 #[test]
 fn corpus_codex_0158_working_queue_and_completed_turns() {
-    for (bytes, offsets, queue_hint) in [
-        (
-            include_bytes!("../../tests/corpus/codex_0158_preview/0.157.1-inline.bin").as_slice(),
-            [12405, 15613, 17650, 18716],
-            "    ⌥+↑ edit last queued message",
-        ),
-        (
-            include_bytes!("../../tests/corpus/codex_0158_preview/0.158.0-inline.bin").as_slice(),
-            [11311, 14478, 16558, 17253],
-            "    shift+← edit last queued message",
-        ),
-    ] {
-        for (state, offset) in offsets.into_iter().enumerate() {
-            let rows = codex_0158_checkpoint(bytes, offset, false);
-            let has = |text: &str| rows.iter().any(|row| row == text);
-            let queued = state == 1;
-            let draft = state == 2;
-            assert_eq!(has("• Queued follow-up inputs"), queued);
-            assert_eq!(has("  ↳ Queued phase zero message"), queued);
-            assert_eq!(has(queue_hint), queued);
-            assert_eq!(has("› Queued phase zero message"), draft);
-            assert_eq!(has("› Ask Codex to do anything"), !draft);
-            assert_eq!(
-                has("• PHASE0 COMPLETE. Deterministic local response."),
-                state == 3
-            );
-            assert_eq!(
-                CodexSummary.live_preview(&rows),
-                (state != 3).then(|| ("Working".to_string(), "codex:working")),
-                "checkpoint {offset}"
-            );
-        }
+    let bytes = include_bytes!("../../tests/corpus/codex_0158_preview/0.158.0-inline.bin");
+    for (state, offset) in [11311, 14478, 16558, 17253].into_iter().enumerate() {
+        let rows = codex_0158_checkpoint(bytes, offset, false);
+        let has = |text: &str| rows.iter().any(|row| row == text);
+        let queued = state == 1;
+        let draft = state == 2;
+        assert_eq!(has("• Queued follow-up inputs"), queued);
+        assert_eq!(has("  ↳ Queued phase zero message"), queued);
+        assert_eq!(has("    shift+← edit last queued message"), queued);
+        assert_eq!(has("› Queued phase zero message"), draft);
+        assert_eq!(has("› Ask Codex to do anything"), !draft);
+        assert_eq!(
+            has("• PHASE0 COMPLETE. Deterministic local response."),
+            state == 3
+        );
+        assert_eq!(
+            CodexSummary.live_preview(&rows),
+            (state != 3).then(|| ("Working".to_string(), "codex:working")),
+            "checkpoint {offset}"
+        );
     }
-}
-
-fn codex_warning_footer_prefixes_working_preview(bytes: &[u8], offset: usize) {
-    let rows = codex_0158_checkpoint(bytes, offset, false);
-    assert_eq!(
-        CodexSummary.model_label(&rows),
-        Some("phase0-fixture-model default".to_string()),
-        "checkpoint {offset}"
-    );
-    assert_eq!(
-        corpus(&bytes[..offset], &CodexSummary, 120),
-        anchor("phase0-fixture-model default · Working", "codex:working"),
-        "checkpoint {offset}"
-    );
-}
-
-#[test]
-fn corpus_codex_0157_warning_footer_prefixes_working_preview() {
-    codex_warning_footer_prefixes_working_preview(
-        include_bytes!("../../tests/corpus/codex_0158_preview/0.157.1-inline.bin"),
-        12405,
-    );
 }
 
 #[test]
 fn corpus_codex_0158_warning_footer_prefixes_working_preview() {
-    codex_warning_footer_prefixes_working_preview(
-        include_bytes!("../../tests/corpus/codex_0158_preview/0.158.0-inline.bin"),
-        11311,
+    let bytes = include_bytes!("../../tests/corpus/codex_0158_preview/0.158.0-inline.bin");
+    let offset = 11311;
+    let rows = codex_0158_checkpoint(bytes, offset, false);
+    assert_eq!(
+        CodexSummary.model_label(&rows),
+        Some("phase0-fixture-model default".to_string())
+    );
+    assert_eq!(
+        corpus(&bytes[..offset], &CodexSummary, 120),
+        anchor("phase0-fixture-model default · Working", "codex:working")
     );
 }
 
 #[test]
 fn corpus_codex_0158_command_approvals() {
-    for (bytes, offset) in [
-        (
-            include_bytes!("../../tests/corpus/codex_0158_preview/0.157.1-fullscreen-approval.bin")
-                .as_slice(),
-            11965,
-        ),
-        (
-            include_bytes!("../../tests/corpus/codex_0158_preview/0.158.0-fullscreen-approval.bin")
-                .as_slice(),
-            12967,
-        ),
+    let bytes =
+        include_bytes!("../../tests/corpus/codex_0158_preview/0.158.0-fullscreen-approval.bin");
+    let offset = 12967;
+    let rows = codex_0158_checkpoint(bytes, offset, true);
+    for text in [
+        "  Would you like to run the following command?",
+        "  $ printf 'PHASE0 APPROVAL\\n'",
+        "› 1. Yes, proceed (y)",
+        "  3. No, and tell Codex what to do differently (esc)",
     ] {
-        let rows = codex_0158_checkpoint(bytes, offset, true);
-        for text in [
-            "  Would you like to run the following command?",
-            "  $ printf 'PHASE0 APPROVAL\\n'",
-            "› 1. Yes, proceed (y)",
-            "  3. No, and tell Codex what to do differently (esc)",
-        ] {
-            assert!(rows.iter().any(|row| row == text), "{text}");
-        }
-        assert_eq!(
-            corpus(&bytes[..offset], &CodexSummary, 120),
-            anchor("awaiting approval", "codex:approval-menu")
-        );
+        assert!(rows.iter().any(|row| row == text), "{text}");
     }
+    assert_eq!(
+        corpus(&bytes[..offset], &CodexSummary, 120),
+        anchor("awaiting approval", "codex:approval-menu")
+    );
 }
 
 #[test]
 fn corpus_codex_0158_stdin_requires_a_second_approval() {
-    for (bytes, command, input, needs_approval) in [
-        (
-            include_bytes!("../../tests/corpus/codex_0158_preview/0.157.1-fullscreen-stdin.bin")
-                .as_slice(),
-            12494,
-            16518,
-            false,
-        ),
-        (
-            include_bytes!("../../tests/corpus/codex_0158_preview/0.158.0-fullscreen-stdin.bin")
-                .as_slice(),
-            13496,
-            17417,
-            true,
-        ),
-    ] {
-        let rows = codex_0158_checkpoint(bytes, command, true);
-        assert!(
-            rows.iter()
-                .any(|row| row == "  Would you like to run the following command?")
-        );
-        assert_eq!(
-            CodexSummary.live_preview(&rows),
-            Some(("awaiting approval".to_string(), "codex:approval-menu"))
-        );
-        let rows = codex_0158_checkpoint(bytes, input, true);
-        assert!(
-            rows.iter()
-                .any(|row| row.starts_with("✔ You approved codex to run read line;"))
-        );
-        assert_eq!(
-            rows.iter()
-                .any(|row| row.starts_with("  Would you like to send input to terminal ")),
-            needs_approval
-        );
-        assert_eq!(
-            rows.iter().any(|row| row == "  Input: \"fixture\\n\""),
-            needs_approval
-        );
-        assert_eq!(
-            rows.iter()
-                .any(|row| row == "• PHASE0 COMPLETE. Deterministic local response."),
-            !needs_approval
-        );
-        assert_eq!(
-            rows.iter().any(|row| row == "    PHASE0 INPUT: fixture"),
-            !needs_approval
-        );
-        assert_eq!(
-            CodexSummary.live_preview(&rows),
-            needs_approval.then(|| ("awaiting approval".to_string(), "codex:approval-menu"))
-        );
-        if needs_approval {
-            assert_eq!(
-                corpus(&bytes[..input], &CodexSummary, 120),
-                anchor("awaiting approval", "codex:approval-menu")
-            );
-        }
-    }
+    let bytes =
+        include_bytes!("../../tests/corpus/codex_0158_preview/0.158.0-fullscreen-stdin.bin");
+    let (command, input) = (13496, 17417);
+    let rows = codex_0158_checkpoint(bytes, command, true);
+    assert!(
+        rows.iter()
+            .any(|row| row == "  Would you like to run the following command?")
+    );
+    assert_eq!(
+        CodexSummary.live_preview(&rows),
+        Some(("awaiting approval".to_string(), "codex:approval-menu"))
+    );
+    let rows = codex_0158_checkpoint(bytes, input, true);
+    let has = |text: &str| rows.iter().any(|row| row == text);
+    assert!(
+        rows.iter()
+            .any(|row| row.starts_with("✔ You approved codex to run read line;"))
+    );
+    assert!(
+        rows.iter()
+            .any(|row| row.starts_with("  Would you like to send input to terminal "))
+    );
+    assert!(has("  Input: \"fixture\\n\""));
+    // The turn is blocked on the second menu: no reply, no delivered input.
+    assert!(!has("• PHASE0 COMPLETE. Deterministic local response."));
+    assert!(!has("    PHASE0 INPUT: fixture"));
+    assert_eq!(
+        corpus(&bytes[..input], &CodexSummary, 120),
+        anchor("awaiting approval", "codex:approval-menu")
+    );
 }
 
 /// Positive per-state fixtures at capture geometry (40×120): exact
@@ -1599,7 +1607,7 @@ fn corpus_positive_states_resolve_exactly() {
             "preview_codex_working",
             include_bytes!("../../tests/corpus/preview_codex_working.bin"),
             &CodexSummary,
-            "gpt-5.6-sol high · Working · 1 background terminal running",
+            "GPT-6-Luna max · Working · 1 background terminal running",
             "codex:working",
         ),
         Case(
@@ -1608,6 +1616,22 @@ fn corpus_positive_states_resolve_exactly() {
             &CodexSummary,
             "gpt-5.6-sol high · Ran sleep 5 && echo ok",
             "codex:ran",
+        ),
+        Case(
+            "preview_codex_queued",
+            include_bytes!("../../tests/corpus/preview_codex_queued.bin"),
+            &CodexSummary,
+            // The status row is read through the queued-inputs block below it.
+            "GPT-6-Luna max · Working · 1 background terminal running",
+            "codex:working",
+        ),
+        Case(
+            "preview_codex_done",
+            include_bytes!("../../tests/corpus/preview_codex_done.bin"),
+            &CodexSummary,
+            // The indented completion row, cut before its clock time.
+            "GPT-6-Luna max · Worked for 1s",
+            "codex:worked",
         ),
         Case(
             "preview_claude_waiting",
@@ -1760,6 +1784,7 @@ fn rule_reports_working_classifies_every_emitted_id() {
         ("claude:waiting", false),
         ("codex:approval-menu", false),
         ("codex:ran", false),
+        ("codex:worked", false),
         ("grok:worked", false),
         // Background subagents are live, but the turn itself has ended.
         ("grok:still-running", false),
@@ -1783,10 +1808,11 @@ fn rule_reports_working_classifies_every_emitted_id() {
 /// "…"` placeholder, `● high · /effort` hint row, header still connecting);
 /// the done screen has `✻ Sautéed for 17s · done 4:14 PM` as the first
 /// column-0 row above a box holding a typed draft: no `…`, so the scan
-/// rejects it as foreign.
+/// rejects it as foreign. The codex idle screen is the 0.162.1 launch state:
+/// the command list above the placeholder composer, nothing between them.
 #[test]
 fn corpus_idle_states_fall_through() {
-    let cases: [(&str, &[u8], &dyn SummaryAdapter); 4] = [
+    let cases: [(&str, &[u8], &dyn SummaryAdapter); 5] = [
         (
             "preview_claude_idle",
             include_bytes!("../../tests/corpus/preview_claude_idle.bin"),
@@ -1796,6 +1822,11 @@ fn corpus_idle_states_fall_through() {
             "preview_claude_done",
             include_bytes!("../../tests/corpus/preview_claude_done.bin"),
             &ClaudeSummary,
+        ),
+        (
+            "preview_codex_idle",
+            include_bytes!("../../tests/corpus/preview_codex_idle.bin"),
+            &CodexSummary,
         ),
         (
             "preview_grok_idle",
@@ -1875,6 +1906,16 @@ fn corpus_body_shaped_text_never_extracts() {
         floor("gpt-5.6-sol high · 5.26K used · 28.2K in · 78 out")
     );
 
+    // The same on 0.162.1's alternate screen: `• Ran curl …` and its `└`
+    // output sit behind the `• HTTP/2 200` reply bullet, so the scan stops
+    // there and the marker reports.
+    let got = corpus(
+        include_bytes!("../../tests/corpus/preview_codex_ran_done.bin"),
+        &CodexSummary,
+        120,
+    );
+    assert_eq!(got, marker());
+
     // A modal-shaped menu quoted in the body with the live composer
     // below it: the composer suppresses the approval match, the quote
     // is foreign to the status scan, and the floor tier reports.
@@ -1942,7 +1983,7 @@ fn corpus_truncated_rows_still_anchor() {
     );
 }
 
-/// Codex status layouts replay at their fixture-native widths.
+/// The codex 0.147.0 reasoning layout replays at its fixture-native width.
 #[test]
 fn corpus_codex_0_147_rows_anchor() {
     // The status header remains verbatim. Transcript rows above it do not
@@ -1953,19 +1994,6 @@ fn corpus_codex_0_147_rows_anchor() {
         80,
     );
     assert_eq!(got, anchor("Investigating rendering code", "codex:working"));
-
-    // Sixteen queued messages separate the status row from the composer.
-    // The status line below starts with `model-with-reasoning`, so its first
-    // item supplies the label.
-    let got = corpus(
-        include_bytes!("../../tests/corpus/preview_codex_queued.bin"),
-        &CodexSummary,
-        36,
-    );
-    assert_eq!(
-        got,
-        anchor("gpt-5.6-sol default · Working", "codex:working")
-    );
 }
 
 /// At 30 columns, a wrapped status ellipsis fails the structure check and

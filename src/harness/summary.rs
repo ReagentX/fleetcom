@@ -53,6 +53,7 @@ pub fn rule_reports_working(rule: &str) -> Option<bool> {
         | "claude:waiting"
         | "codex:approval-menu"
         | "codex:ran"
+        | "codex:worked"
         | "grok:worked"
         | "grok:still-running" => Some(false),
         _ => None,
@@ -388,17 +389,41 @@ impl SummaryAdapter for CodexSummary {
         codex_model_label(rows)
     }
 
-    /// Set `working` for a title led by a braille frame. Replace `[ . ] ` with `[ ! ] `
-    /// to show the blocked blink's canonical phase. Return `None` for other title shapes
-    /// and for an empty frame payload.
+    /// Codex 0.162.1 titles the terminal `[head ]summary | cwd`, where `cwd` is
+    /// the working directory's basename and `head` is a braille frame or the
+    /// blocked blink `[ . ] `/`[ ! ] `. One turn shows four titles: `codex-work`
+    /// at startup, `⠴ ⠴ | codex-work` for the first seconds of the turn (the
+    /// summary is a frame placeholder until the turn is named), `⠙ Count to
+    /// twenty slowly | codex-work` while working, `Count to twenty slowly |
+    /// codex-work` after. Return the summary, split at the last ` | `, with
+    /// `working` set for a frame head; fold the blink to its `[ ! ] ` phase.
+    /// Return `None` for the bare cwd (the alternate screen keeps it verbatim)
+    /// and for a placeholder or empty summary: the working signal is lost for
+    /// the placeholder seconds rather than a frame rendering as text. A headed
+    /// title without ` | ` is all summary.
     fn normalize_title(&self, title: &str) -> Option<(String, bool)> {
-        if let Some(rest) = title.strip_prefix("[ . ] ") {
-            return Some((format!("[ ! ] {rest}"), false));
+        let frame = after_frame(title, braille_frame);
+        let blink = title
+            .strip_prefix("[ . ] ")
+            .or_else(|| title.strip_prefix("[ ! ] "));
+        let rest = frame.or(blink).unwrap_or(title);
+        let summary = match rest.rsplit_once(" | ") {
+            Some((summary, _)) => summary,
+            None if frame.is_some() || blink.is_some() => rest,
+            None => return None,
+        };
+        let mut chars = summary.chars();
+        match chars.next() {
+            None => return None,
+            Some(c) if braille_frame(c) && chars.next().is_none() => return None,
+            Some(_) => {}
         }
-        // Do not normalize a frame with an empty payload; Claude and OMP use the same rule.
-        after_frame(title, braille_frame)
-            .filter(|rest| !rest.is_empty())
-            .map(|rest| (rest.to_string(), true))
+        let text = if blink.is_some() {
+            format!("[ ! ] {summary}")
+        } else {
+            summary.to_string()
+        };
+        Some((text, frame.is_some()))
     }
 }
 
@@ -515,11 +540,9 @@ fn codex_warning_shortcut(hint: &str) -> bool {
         for modifier in ["ctrl+", "shift+"] {
             key = key.strip_prefix(modifier).unwrap_or(key);
         }
-        // Since Codex 0.160.0, `⌥w` is displayed instead of `⌥+w`.
-        // Treat a trailing `+` as the key itself.
+        // `⌥` is glued to its key (`⌥w`), unlike the `+`-joined modifiers.
         key = key
             .strip_prefix("alt+")
-            .or_else(|| key.strip_prefix("⌥+").filter(|rest| !rest.is_empty()))
             .or_else(|| key.strip_prefix('⌥'))
             .unwrap_or(key);
         (key.len() == 1 && !key.starts_with(char::is_whitespace))
@@ -581,11 +604,12 @@ fn codex_composer(rows: &[String]) -> Option<usize> {
 /// Walk up from the composer through the status region: blanks and indented rows
 /// (tool-output attachments like `└ ok`, wrapped continuations) are skipped,
 /// [`CODEX_QUEUED_HEADS`] are walked past, then inspect the first other column-0 row.
-/// Extract only [`codex_status_head`] or `• Ran ` shapes; stop at any other column-0
-/// row (a reply bullet, a `⚠` notice, a turn separator): `• Ran` rows from prior turns
-/// are retained in scrollback, and skipping an unknown row to reach one would resurface
-/// stale work as live status. `• Ran ` is tested first because the status head matches
-/// on structure, not on a literal verb.
+/// Extract only [`codex_worked`], [`codex_status_head`], or `• Ran ` shapes; stop at
+/// any other column-0 row (a reply bullet, a `⚠` notice, a turn separator): `• Ran`
+/// rows from prior turns are retained in scrollback, and skipping an unknown row to
+/// reach one would resurface stale work as live status. The completion row is
+/// indented, so it is tested before the indentation skip. `• Ran ` is tested before
+/// the status head because the head matches on structure, not on a literal verb.
 fn codex_status(rows: &[String], composer: usize) -> Option<(String, &'static str)> {
     // Indented rows crossed since the last column-0 row. Exclude rows below a queued
     // head from the count to avoid exhausting the window on a deep queue.
@@ -593,6 +617,9 @@ fn codex_status(rows: &[String], composer: usize) -> Option<(String, &'static st
     for row in rows[..composer].iter().rev() {
         if row.is_empty() {
             continue;
+        }
+        if let Some(text) = codex_worked(row) {
+            return (indented <= CODEX_STATUS_WINDOW).then_some((text, "codex:worked"));
         }
         if row.starts_with(' ') {
             indented += 1;
@@ -616,6 +643,17 @@ fn codex_status(rows: &[String], composer: usize) -> Option<(String, &'static st
         return None;
     }
     None
+}
+
+/// `  Worked for 1s • 4:19 PM` → `Worked for 1s`: the completion row codex
+/// 0.162.1 paints under the last reply, indented like an attachment. Require
+/// the ` • ` before the clock time: `Worked for` alone is conversation prose.
+fn codex_worked(row: &str) -> Option<String> {
+    let (duration, _) = row
+        .trim_start()
+        .strip_prefix("Worked for ")?
+        .split_once(" • ")?;
+    (!duration.is_empty()).then(|| format!("Worked for {duration}"))
 }
 
 /// Split a live status row into its header and the text after the opening
