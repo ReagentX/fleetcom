@@ -307,10 +307,10 @@ const CLAUDE_EFFORT: &[&str] = &["low", "medium", "high", "xhigh", "max"];
 ///  ▝▝   ▝▝   /…/scratchpad/claude-work · /rc
 /// ```
 ///
-/// The model row follows the `Claude Code v` row, which sits within the first
+/// The model row is the row after `Claude Code v`, found within the first
 /// four rows; its first ` · ` segment is the model text. The header is the
-/// stable source; user-configurable statusline rows are not parsed. When the
-/// header scrolls away, the label is unavailable.
+/// stable source; user-configurable statusline rows are not parsed. With the
+/// header scrolled out of view, no label is available.
 fn claude_welcome_label(rows: &[String]) -> Option<String> {
     let version = rows
         .iter()
@@ -388,13 +388,14 @@ impl SummaryAdapter for CodexSummary {
 
     /// Codex 0.162.1 titles the terminal `[head ]summary | cwd`, where `cwd` is
     /// the working directory's basename and `head` is a braille frame or the
-    /// blocked blink `[ . ] `/`[ ! ] `. One turn shows four titles: `codex-work`
-    /// at startup, `⠴ ⠴ | codex-work` for the first seconds of the turn (the
-    /// summary is a frame placeholder until the turn is named), `⠙ Count to
-    /// twenty slowly | codex-work` while working, `Count to twenty slowly |
-    /// codex-work` after. Return the summary, split at the last ` | `, with
-    /// `working` set for a frame head; fold the blink to its `[ ! ] ` phase.
-    /// Return `None` for the bare cwd (the alternate screen keeps it verbatim)
+    /// blocked blink `[ . ] `/`[ ! ] `. Across one turn the title reads
+    /// `codex-work` at startup, `⠴ ⠴ | codex-work` for the first seconds of
+    /// the turn (the summary is a frame placeholder until the turn is named),
+    /// `⠙ Count to twenty slowly | codex-work` while working, and `Count to
+    /// twenty slowly | codex-work` after. Return the summary, split at the last
+    /// ` | `, with `working` set for a frame head; fold the blink to its
+    /// `[ ! ] ` phase. Return `None` for the bare cwd (rendered verbatim on the
+    /// alternate screen)
     /// and for a placeholder or empty summary: the working signal is lost for
     /// the placeholder seconds rather than a frame rendering as text. A headed
     /// title without ` | ` is all summary.
@@ -603,10 +604,10 @@ fn codex_composer(rows: &[String]) -> Option<usize> {
 /// [`CODEX_QUEUED_HEADS`] are walked past, then inspect the first other column-0 row.
 /// Extract only [`codex_worked`], [`codex_status_head`], or `• Ran ` shapes; stop at
 /// any other column-0 row (a reply bullet, a `⚠` notice, a turn separator): `• Ran`
-/// rows from prior turns are retained in scrollback, and skipping an unknown row to
-/// reach one would resurface stale work as live status. The completion row is
+/// rows from prior turns are retained in scrollback; skip past an unknown row to
+/// reach one and stale work is reported as live status. The completion row is
 /// indented, so it is tested before the indentation skip. `• Ran ` is tested before
-/// the status head because the head matches on structure, not on a literal verb.
+/// the status head, which is matched on structure, not on a literal verb.
 fn codex_status(rows: &[String], composer: usize) -> Option<(String, &'static str)> {
     // Indented rows crossed since the last column-0 row. Exclude rows below a queued
     // head from the count to avoid exhausting the window on a deep queue.
@@ -741,8 +742,8 @@ impl SummaryAdapter for GrokSummary {
         // panel's hints and the session header land here in non-working
         // states and match neither shape.
         let first = rows[..top].iter().rposition(|r| !r.is_empty())?;
-        // A command sent to the background with Ctrl+B paints a Tasks panel
-        // between the status row and the box for as long as it runs:
+        // While a command sent to the background with Ctrl+B runs, grok paints
+        // a Tasks panel between the status row and the box:
         //
         //     ⠹ Waiting for response… 0.1s             9.5s ⇣19.2k [stop]
         //
@@ -752,7 +753,7 @@ impl SummaryAdapter for GrokSummary {
         //    ╭───…───╮
         //
         // The panel is the `▾ Tasks {n}` header and the painted rows under
-        // it; the task glyph animates (`⸬`, `⁙`, `⋅`, `:`), so the rows
+        // it; the task glyph is animated (`⸬`, `⁙`, `⋅`, `:`), so the rows
         // are not matched by shape. When the first painted row is in that
         // run, the probe is the first painted row above the header: still
         // one row, never a scan.

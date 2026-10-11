@@ -105,7 +105,7 @@ function write(ctx, reason) {
     const path = process.env.FLEETCOM_CAPTURE_FILE;
     if (!path) return;
     // These handlers are also registered for sub-agent sessions, which cannot
-    // be resumed by ID: only the top-level session reports.
+    // be resumed by ID: report only the top-level session.
     if (ctx.agent?.kind !== "main") return;
     // The session file is created after the first assistant message. Until
     // then, the ID cannot be found through `omp --resume`.

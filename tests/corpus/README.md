@@ -38,7 +38,7 @@ normalization, and fallback behavior. Each fixture is a constructed repaint
 stream: optional alternate-screen entry, clear, home, then sanitized screen rows
 joined with CRLF. Claude and Grok use the alternate screen. Codex 0.162.1 runs
 on the alternate screen from startup, so the five codex fixtures captured on it
-(`idle`, `working`, `queued`, `done`, `ran_done`) open with `1049h`; the older
+(`idle`, `working`, `queued`, `done`, `ran_done`) are prefixed with `1049h`; the older
 codex fixtures and omp are inline. Identifying and user-configured text is
 replaced with alignment-preserving synthetic values. Geometry is 40×120 unless
 noted.
@@ -47,18 +47,19 @@ Geometry is 40×80 for `preview_codex_reasoning.bin`, bottom-anchored on a
 40-row screen to reproduce the inline layout.
 
 Indentation in the Codex hint-row and approval fixtures is approximate; match
-trimmed heads and column-0 structure in their tests. The codex 0.162.1 fixtures
-open on the `>_ OpenAI Codex (v0.162.1)` header with a same-width synthetic
-working directory on the row below it; the `GPT-6-Luna max · … in · … out`
-status line, token counters, clock times, and prompts are verbatim. The Claude fixtures with a
-model prefix open on claude 2.1.296's three-row logo header (`Claude Code
+trimmed heads and column-0 structure in their tests. In the codex 0.162.1
+fixtures, the first painted row is the `>_ OpenAI Codex (v0.162.1)` header,
+with a same-width synthetic working directory on the row below it; the
+`GPT-6-Luna max · … in · … out` status line, token counters, clock times, and
+prompts are verbatim. In the Claude fixtures with a model prefix, the first
+painted rows are claude 2.1.296's three-row logo header (`Claude Code
 v2.1.296`, `Fable 5.1 with high effort · Claude Max`, working directory); the
 working directory on the header row and on the statusline row below the input
-box is a same-width synthetic path. Fixtures captured on 2.1.296 omit the
-capture environment's `⚠ Transcript saving is off` statusline row, leaving it
-empty; the three fixtures whose body is from 2.1.215 carry the 2.1.296 header
-transplanted over the old welcome box, with the box's remaining rows left empty
-so the body keeps its row indexes. In the Claude waiting fixture, the header is
+box is a same-width synthetic path. In the fixtures captured on 2.1.296, the
+capture environment's `⚠ Transcript saving is off` statusline row is omitted
+and left empty; in the three fixtures whose body is from 2.1.215, the 2.1.296
+header is transplanted over the old welcome box, with the box's remaining rows
+left empty so the body's row indexes are unchanged. In the Claude waiting fixture, the header is
 omitted and agent-roster rows are included below the input box. In the Claude
 task-list fixtures, generic phase names are used in a task-list layout and the
 header is omitted. In the Claude workflow-wait fixture, generic wording is used,
@@ -130,7 +131,7 @@ The versioned directories contain raw PTY streams from the official macOS arm64
 0.158.0 release executable, recorded on 2026-09-28. Codex ran with isolated
 homes, `--no-daemon`, and a loopback Responses server supplying scripted
 replies. The 0.157.1 streams recorded alongside them were deleted on
-2026-10-10: no matcher arm depended on them alone, and 0.158.0 itself is
+2026-10-10: nothing in the matchers was pinned by them alone, and 0.158.0 itself is
 behind the current release, 0.162.1.
 
 - [`codex_0158_preview`](codex_0158_preview/README.md) covers working status,

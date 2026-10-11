@@ -309,7 +309,7 @@ fn claude_title_frames_canonicalize_to_constant_text() {
             "{frame:?}"
         );
     }
-    // 2.1.296 names the session once the first turn starts; the frame stays `✳`.
+    // 2.1.296 names the session once the first turn starts, with the frame still `✳`.
     assert_eq!(
         ClaudeSummary.normalize_title("✳ Directory listing with ls -la"),
         Some(("Directory listing with ls -la".to_string(), false))
@@ -325,8 +325,8 @@ fn claude_title_frames_canonicalize_to_constant_text() {
         "quadrant frames must render one string and report working"
     );
 
-    // Braille frames belong to the 2.1.209 title animation, which 2.1.296 no
-    // longer emits: refuse rather than guess a state.
+    // Braille frames are the 2.1.209 title animation, which 2.1.296 no longer
+    // emits: refuse rather than guess a state.
     for frame in BRAILLE_FRAMES.iter().chain(['⠐'].iter()) {
         assert_eq!(
             ClaudeSummary
@@ -547,7 +547,7 @@ fn claude_label_reads_the_logo_header() {
             "▝▜██████▀  Opus 5 (1M context) with high effort · Claude Max",
             Some("Opus 5 (1M context) (high)"),
         ),
-        // A narrow terminal cuts the row with the CLI's own ellipsis.
+        // At a narrow width the CLI truncates the row with its own ellipsis.
         (
             "▝▜██████▀  Opus 5 (1M context) with high…",
             Some("Opus 5 (1M context) (high)"),
@@ -565,7 +565,7 @@ fn claude_label_reads_the_logo_header() {
         );
     }
 
-    // The model row must follow the version row directly.
+    // The model row is the one directly after the version row.
     let gapped = rs(&[
         " ▐▛███▛█   Claude Code v2.1.296",
         "",
@@ -573,7 +573,7 @@ fn claude_label_reads_the_logo_header() {
     ]);
     assert_eq!(ClaudeSummary.model_label(&gapped), None);
 
-    // A header below the fourth row has scrolled into the body.
+    // A header below the fourth row is body text, not the header.
     let scrolled = rs(&[
         "",
         "",
@@ -769,17 +769,17 @@ fn codex_label_rejects_warning_prose_and_incomplete_footers() {
     assert_eq!(CodexSummary.model_label(&rows), None);
 }
 
-/// The 0.162.1 title grammar is `[frame ]summary | cwd`: the summary is kept,
-/// the cwd dropped, a frame marks working, and every frame renders one string.
-/// The bare cwd and the frame placeholder yield nothing; the blocked blink
-/// folds to one phase.
+/// The 0.162.1 title grammar is `[frame ]summary | cwd`: keep the summary,
+/// drop the cwd, set `working` for a frame, and render every frame to the same
+/// string. Return `None` for the bare cwd and the frame placeholder; fold the
+/// blocked blink to one phase.
 #[test]
 fn codex_title_grammar_yields_the_summary() {
     let t = |title: &str| CodexSummary.normalize_title(title);
     let named = Some(("Count to twenty slowly".to_string(), true));
     let idle = Some(("Count to twenty slowly".to_string(), false));
 
-    // The four titles one turn shows, in order.
+    // The four title forms of one turn, in order.
     assert_eq!(t("codex-work"), None, "the cwd basename is not a summary");
     assert_eq!(
         t("⠴ ⠴ | codex-work"),
@@ -807,13 +807,13 @@ fn codex_title_grammar_yields_the_summary() {
         );
     }
 
-    // The cwd is split off at the last separator; the summary keeps its own.
+    // The cwd is split off at the last ` | `; any earlier ` | ` is part of the summary.
     assert_eq!(
         t("⠙ Fix a | b | codex-work"),
         Some(("Fix a | b".to_string(), true))
     );
 
-    // Both blink phases render the `[ ! ]` phase, with and without a cwd.
+    // Both blink phases are rendered as the `[ ! ]` phase, with and without a cwd.
     for title in [
         "[ . ] Action Required | fleetcom",
         "[ ! ] Action Required | fleetcom",
@@ -826,7 +826,7 @@ fn codex_title_grammar_yields_the_summary() {
         );
     }
 
-    // Foreign, frame-only, empty-summary, and empty titles do not match.
+    // No match for foreign, frame-only, empty-summary, and empty titles.
     assert_eq!(t("zellij: main"), None);
     assert_eq!(t("⠹"), None, "frame alone");
     assert_eq!(t("⠹ "), None, "frame with an empty rest");
@@ -1223,8 +1223,8 @@ fn codex_requires_the_composer_pin() {
 }
 
 /// Spinner label cut at its `…`; the completion row kept verbatim,
-/// longer durations included; free text above the box refuses. The Tasks
-/// panel is skipped to the one row above its header.
+/// longer durations included; free text above the box is refused. The Tasks
+/// panel is skipped: the probe is the one row above its header.
 #[test]
 fn grok_status_shapes() {
     let probe = |status: &str| GrokSummary.live_preview(&grok_screen(&[status, ""]));
@@ -1307,7 +1307,7 @@ fn grok_status_shapes() {
         GrokSummary.model_label(&grok_screen(&["    ⠋ Thinking… 0.2s", ""])),
         Some("Grok 4.5 (xhigh)".to_string())
     );
-    // A plain border carries no label.
+    // No label from a plain border.
     let plain = rs(&["    ⠋ Thinking… 0.2s", "", "╭────╮", "│ ❯  │", "╰────╯"]);
     assert_eq!(GrokSummary.model_label(&plain), None);
 }
@@ -1580,8 +1580,8 @@ fn corpus_positive_states_resolve_exactly() {
             "preview_claude_action",
             include_bytes!("../../tests/corpus/preview_claude_action.bin"),
             &ClaudeSummary,
-            // The spinner row's `thought for 2s` segment rides along; its
-            // elapsed and token tickers do not.
+            // `thought for 2s` is kept from the spinner row; the elapsed and
+            // token tickers are dropped.
             "Fable 5.1 (high) · Running 1 shell command… · thought for 2s",
             "claude:action-row",
         ),
@@ -1811,8 +1811,8 @@ fn rule_reports_working_classifies_every_emitted_id() {
 /// alternate-screen marker. The claude idle screen is the launch state (`Try
 /// "…"` placeholder, `● high · /effort` hint row, header still connecting);
 /// the done screen has `✻ Sautéed for 17s · done 4:14 PM` as the first
-/// column-0 row above a box holding a typed draft: no `…`, so the scan
-/// rejects it as foreign. The codex idle screen is the 0.162.1 launch state:
+/// column-0 row above a box holding a typed draft: no `…`, so it is rejected
+/// as a foreign row. The codex idle screen is the 0.162.1 launch state:
 /// the command list above the placeholder composer, nothing between them.
 #[test]
 fn corpus_idle_states_fall_through() {
@@ -1911,8 +1911,8 @@ fn corpus_body_shaped_text_never_extracts() {
     );
 
     // The same on 0.162.1's alternate screen: `• Ran curl …` and its `└`
-    // output sit behind the `• HTTP/2 200` reply bullet, so the scan stops
-    // there and the marker reports.
+    // output are behind the `• HTTP/2 200` reply bullet, so the scan stops
+    // at the bullet and the marker is reported.
     let got = corpus(
         include_bytes!("../../tests/corpus/preview_codex_ran_done.bin"),
         &CodexSummary,
@@ -1938,8 +1938,8 @@ fn corpus_body_shaped_text_never_extracts() {
     );
     assert_eq!(got, anchor("gpt-5.6-sol high · Working", "codex:working"));
 
-    // Grok `Subagent running:` as body text above the idle box: the probe
-    // is that row and refuses, same marker fall-through as idle.
+    // Grok `Subagent running:` as body text above the idle box: that row is
+    // the probe and is refused, the same marker fall-through as idle.
     let got = corpus(
         include_bytes!("../../tests/corpus/preview_grok_subagent_scrollback.bin"),
         &GrokSummary,

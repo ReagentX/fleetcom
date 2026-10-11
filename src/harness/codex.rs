@@ -177,7 +177,8 @@ fn replace_slot(capture: &Path, root: &str) -> io::Result<()> {
 /// `source` object.
 ///
 /// Return `None` unless exactly one rollout is named for `thread` and its
-/// header names `thread` itself or a sub-agent's root. No rollout is saved
+/// header's `session_id` is `thread` itself or, under a `subagent` source, the
+/// root. No rollout is saved
 /// for the title thread. Examine only directory listings and the first line.
 fn root_thread(home: &Path, thread: &str) -> Option<String> {
     let mut rollouts = Vec::new();

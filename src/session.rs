@@ -109,9 +109,9 @@ pub fn sessions_dir(root: Option<PathBuf>) -> Option<PathBuf> {
 
 /// Session format version written by `to_json` and accepted by `from_json`. Managed entries
 /// were introduced in version 2. A missing version means 1; `from_json` loads a v1 file
-/// verbatim, every entry literal. Through 0.15.0 the loader rewrote a v1 file's bare agent
+/// verbatim, every entry literal. Through 0.15.0 `from_json` rewrote a v1 file's bare agent
 /// words and canonical resume commands into managed entries, because v1 had no managed form;
-/// the release after 0.15.0 retired that rewrite, so an unconverted v1 file loads without
+/// that rewrite was retired in the release after 0.15.0, so an unconverted v1 file loads without
 /// managed resume tracking, and `to_json` writes its entries back as literals. Reject newer
 /// versions.
 const FORMAT_VERSION: u64 = 2;
@@ -175,8 +175,8 @@ fn from_json(text: &str) -> io::Result<(Option<String>, SessionConfig)> {
     if !parsed.is_object() {
         return Err(invalid("session root: expected an object".into()));
     }
-    // Validate version metadata before detecting the schema shape. The value gates
-    // nothing else: every accepted version shares one entry grammar.
+    // Validate version metadata before detecting the schema shape. Only the range
+    // is checked: every accepted version has the same entry grammar.
     if parsed.has_key("version") {
         match parsed["version"].as_u64() {
             Some(n) if (1..=FORMAT_VERSION).contains(&n) => {}
@@ -749,8 +749,8 @@ mod tests {
     }
 
     /// Preserve literal agent words and resume commands in every accepted version. A v1
-    /// file now loads verbatim: the rewrite to managed entries is gone, so the spellings
-    /// it once converted stay literal beside a v2 managed entry.
+    /// file now loads verbatim: with the rewrite to managed entries gone, the spellings
+    /// it once converted are literal beside a v2 managed entry.
     #[test]
     fn literal_agent_words_stay_literal_in_every_version() {
         for version in ["", r#""version": 1, "#, r#""version": 2, "#] {
