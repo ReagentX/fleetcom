@@ -105,7 +105,7 @@ Live validation on 2026-09-28 was performed with the official macOS arm64 Codex 
 
 The [recorded terminal fixtures](../tests/corpus/codex_0158_terminal/README.md) preserve resumed-history and clipboard output from those runs. Offline replay checks the recorded display and OSC 52 forwarding; it does not run the notifier or execute save/load. The separate `tests/daemon_resume.rs` integration tests exercise session resume with stub agents.
 
-Live validation on 2026-10-04 was performed with codex-cli 0.160.0 over nine TUI sessions. Three thread IDs were reported from one process: the unsaved title thread, a sub-agent, and the root. The title thread's notification arrived before the root's in three sessions and after it in six, and no rollout appeared for it even minutes later. For a root or sub-agent turn, the thread's rollout header was on disk at least 2.5 s before its notification, and `task_complete` was recorded 21–256 ms before it. When resuming the title thread, "No saved session found" was reported; for the sub-agent, "cannot resume an unloaded multi-agent v2 sub-agent through its parent" was reported. With the notify override alone, `⚠ 1 warning` was displayed in the footer; with both overrides, none was displayed. With an unknown `features.*` key, startup completed with an unrecognized-setting warning. No Codex version predating `daemon_auto_start` was tested. On the same date, 493 local rollout headers from Codex 0.135.0 through 0.160.0 were examined: `id` and `session_id` were present in each. In Codex 0.140.0 and 0.141.0, a sub-agent's own ID was stored as its `session_id`; that format is rejected.
+Live validation on 2026-10-04 was performed with codex-cli 0.160.0 over nine TUI sessions. Three thread IDs were reported from one process: the unsaved title thread, a sub-agent, and the root. The title thread's notification arrived before the root's in three sessions and after it in six, and no rollout appeared for it even minutes later. For a root or sub-agent turn, the thread's rollout header was on disk at least 2.5 s before its notification, and `task_complete` was recorded 21–256 ms before it. When resuming the title thread, "No saved session found" was reported; for the sub-agent, "cannot resume an unloaded multi-agent v2 sub-agent through its parent" was reported. With the notify override alone, `⚠ 1 warning` was displayed in the footer; with both overrides, none was displayed. With an unknown `features.*` key, startup completed with an unrecognized-setting warning. No Codex version predating `daemon_auto_start` was tested.
 
 ### `grok`
 
@@ -129,7 +129,6 @@ At `agent_end`, after every turn, report two changes without dedicated events: s
 As a result:
 
 - For a fresh `omp` task, no ID is captured until the end of the first turn. If you save before then, no ID is stored, so you start fresh on reload.
-- Before omp 18.3.2, `ctx.agent` is unavailable, so no session ID is captured: an `omp` task is always saved without an ID.
 - After switching or branching to a session without a file on disk, continue using the previous ID until the end of the next turn.
 
 Write each report to a temporary file beside the capture file, then rename it over the destination to avoid reads of partial payloads. Capture is best-effort: return immediately for an empty capture path and ignore write errors.

@@ -1,8 +1,9 @@
 # Codex terminal release captures
 
-Recorded 2026-09-28 with the official arm64 macOS Codex 0.157.1 and 0.158.0
-executables. `manifest.json` preserves source commits, executable/archive hashes,
-capture fleetcom provenance, stream hashes, checkpoint offsets, and resize events.
+Recorded 2026-09-28 with the official arm64 macOS Codex 0.158.0 executable; the
+0.157.1 pair recorded alongside it was deleted on 2026-10-10. `manifest.json`
+preserves the source commit, executable/archive hashes, capture fleetcom
+provenance, stream hashes, checkpoint offsets, and resize events.
 The capture fleetcom tree was d138a752 plus the recorded dirty patch, not a clean
 release checkout. These are raw terminal bytes, not constructed repaint fixtures.
 

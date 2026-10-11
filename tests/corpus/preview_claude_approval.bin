@@ -1,39 +1,39 @@
 [?1049h[2J[H
-╭─── Claude Code v2.1.215 ─────────────────────────────────────────────────────────────────────────────────────────────╮
-│                                                    │ Tips for getting started                                        │
-│              Welcome back Fleet Pilot!             │ Run /init to create a CLAUDE.md file with instructions for Cla… │
-│                                                    │ ─────────────────────────────────────────────────────────────── │
-│                       ▐▛███▜▌                      │ What's new                                                      │
-│                      ▝▜█████▛▘                     │ Claude no longer runs the `/verify` and `/code-review` skills … │
-│                        ▘▘ ▝▝                       │ Fixed single-segment `dir/**` allow rules like `Edit(src/**)` … │
-│ Fable 5 with high effort · Claude Max ·            │ Fixed a permission-check bypass affecting commands run in Wind… │
-│ anonymized-account0@example.invalid's Organization │ /release-notes for more                                         │
-│             ~/Projects/fixture-sources             │                                                                 │
-╰──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+ ▐▛███▛█   Claude Code v2.1.296
+▝▜██████▀  Fable 5.1 with high effort · Claude Max
+ ▝▝   ▝▝   /…/Users/fleet-pilot/Projects/fixture-sources/ptys/claude-work · /rc
 
 
-❯ echo ok
+❯ Use the Bash tool to run ls -la and tell me the file names.
 
-  Ran 1 shell command
+⏺ Listing the working directory now.
 
-⏺ ok
+  Listed 1 directory
 
-✻ Crunched for 4s
+⏺ ls -la printed nothing, which it never does for an existing directory. Checking the working directory and listing it
+  by explicit path.
 
-❯ write a file to the current directory with an interesting word as its content
-
-⏺ Write(word.txt)
+  Listing the working directory by absolute path and showing exit status
+  ⎿  $ ls -la "/Users/fleet-pilot/Projects/fixture-sources/corpus-capture/claude-2-1-296/sessions/fixture-pty-session/sc
+     ratchpad/claude-work" 2>&1; echo "exit=$?"
 
 ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
- Create file
- word.txt
+ Bash command
+ Tip: auto mode handles these prompts for you — choose "switch to auto mode" below
+ List the working directory by absolute path and show exit status
 ╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
-  1 petrichor
+ │ ls -la "/Users/fleet-pilot/Projects/fixture-sources/corpus-capture/claude-2-1-296/sessions/fixture-pty-session/scrat
+ │ chpad/claude-work" 2>&1; echo "exit=$?"
 ╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
- Do you want to create word.txt?
+ This command requires approval
+
+ Do you want to proceed?
  ❯ 1. Yes
-   2. Yes, allow all edits during this session (shift+tab)
-   3. No
+   2. Yes, and don’t ask again for: echo "exit=$?"
+   3. Yes, and switch to auto mode · auto mode handles these prompts for you
+   4. No
 
  Esc to cancel · Tab to amend
+
+
 

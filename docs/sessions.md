@@ -46,7 +46,7 @@ A session file is a JSON object with three fields: `version` for the format vers
 - Values are ordered lists, loaded in order. Each task is started in its own PTY under the specified directory.
 - Directories are serialized alphabetically, with entry order preserved within each directory.
 
-The `version` field must be an integer from 1 through the newest format supported by the running `fleetcom`. A missing field means version 1. Invalid or unsupported versions are refused on load, with the file's value and supported version in the error. A version 2 file read by an older `fleetcom` is refused by that same gate.
+The `version` field must be an integer from 1 through the newest format supported by the running `fleetcom`. A missing field means version 1. A version 1 file loads with every entry literal, including `claude` and `claude --resume '<uuid>'`, and they are written back as literals on save; to track such a task's conversation, launch it from the Agent page and save again. Invalid or unsupported versions are refused on load, with the file's value and supported version in the error. A version 2 file read by an older `fleetcom` is refused by that same gate.
 
 The schema is identified by shape, independently of the version. With an object-valued `dirs`, the wrapped form above is used. A flat map is also accepted, with directories as top-level keys and entry arrays as values. In that form, an array-valued key named `dirs` remains a directory entry, but a top-level `version` member is always the format version, never a directory. Flat-map files are listed by filename stem because no name is stored. On save, the wrapped form is written, without a stored-name collision check.
 
@@ -59,20 +59,6 @@ The entire recipe is validated before any commands are started. The root must be
 After validation, group and display names are stripped of control characters and surrounding whitespace and limited to 64 characters. `Unassigned` is treated as no group but is a legal display name. Missing directories, entries past the task limit, and literal commands past the length limit are skipped and counted in the load status. A managed entry whose agent is not found on the connected client's `PATH` is reported on the status line and counted as a failed spawn; the remaining entries are still loaded. Spawn failures are reported separately; tasks already started from a structurally valid recipe are left running.
 
 Use the string form for commands with neither a group nor a name. String and object entries can appear in the same directory array.
-
-### Loading version 1 files
-
-In format 1, instrumented tasks were stored as command strings: a bare program word, or the word followed by its resume selector and a single-quoted UUID. When loading a file with `version` 1 or no version field, convert exactly those two forms to managed entries:
-
-| Version 1 entry | Loads as |
-| -- | -- |
-| `claude`, `codex`, `grok`, or `omp` alone | managed, fresh conversation |
-| `claude --resume '<uuid>'`, `codex resume '<uuid>'`, `grok --resume '<uuid>'`, or `omp --resume '<uuid>'`, with or without the quotes | managed, resuming that ID |
-| anything else | literal, unchanged |
-
-Tabs and repeated spaces between tokens are still accepted. Commands with paths (`/usr/local/bin/claude`, `~/bin/claude`) are loaded as literals to preserve your chosen binary instead of substituting one found on `PATH`; managed resume tracking is then unavailable. Commands with extra arguments, prompts, other resume spellings, or shell syntax remain literal, as before. No conversion is applied to version 2 files: a literal `claude` stays literal.
-
-Recovery snapshots are rewritten continually in the new format; named sessions are converted on the next save. This conversion will be removed one release after format 2 ships. After that, all entries in unconverted version 1 files will be loaded as literals.
 
 ## Recovery
 

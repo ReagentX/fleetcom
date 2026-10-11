@@ -1,0 +1,39 @@
+[?1049h]0;⠋ - Waiting for response… - Run sleep 40 command then say done - grok[2J[H
+  ~/Projects/fixture-sources/grok                                                             19K / 256K │ [Dashboard]
+
+
+     ❯ Run the shell command sleep 40 and then say done.                                                     4:30 PM
+
+
+     ◆ Thought for 2.1s
+
+     I'll run sleep 40 and report back when it finishes.                                                     4:30 PM
+
+     ◆ Task started: Sleep for 40 seconds
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+   ⠹ Waiting for response… 0.1s                                                                     9.5s ⇣19.2k [stop]
+
+   ▾ Tasks 1
+   ⸬ Run Sleep for 40 seconds                                                                                       0s
+
+  ╭──────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+  │ ❯                                                                                                                │
+  ╰────────────────────────────────────────────────────────────────────────────────── Grok 4.7 (high) · auto-review ─╯
+
+  Shift+Tab:mode  │  Ctrl+c:cancel  │  Ctrl+.:shortcuts

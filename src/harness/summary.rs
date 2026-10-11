@@ -44,8 +44,6 @@ pub const AWAITING_APPROVAL: &str = "awaiting approval";
 
 /// Classify each emitted anchor rule ID as working or idle. Return `None` for IDs no
 /// adapter emits. List every emitted ID so the corpus test covers each classification.
-/// Treat `grok:still-running` as idle because background subagents may remain active
-/// after the turn ends.
 pub fn rule_reports_working(rule: &str) -> Option<bool> {
     match rule {
         "claude:spinner" | "claude:action-row" | "codex:working" | "grok:spinner" => Some(true),
@@ -53,8 +51,8 @@ pub fn rule_reports_working(rule: &str) -> Option<bool> {
         | "claude:waiting"
         | "codex:approval-menu"
         | "codex:ran"
-        | "grok:worked"
-        | "grok:still-running" => Some(false),
+        | "codex:worked"
+        | "grok:worked" => Some(false),
         _ => None,
     }
 }
@@ -141,14 +139,14 @@ impl SummaryAdapter for ClaudeSummary {
         claude_welcome_label(rows)
     }
 
-    /// Set `working` for braille and quadrant-circle title frames. Treat a
-    /// [`CLAUDE_SPINNER`] glyph as idle. We observed only `✳` from this family in titles,
-    /// and only while idle. Return `None` for other shapes or empty payloads.
+    /// Set `working` for quadrant-circle title frames: 2.1.296 emits `◐ <summary>` and
+    /// `◑ <summary>` while working. Treat a [`CLAUDE_SPINNER`] glyph as idle: the same
+    /// release emits `✳ Claude Code`, then `✳ <summary>`, at rest. Braille frames were
+    /// an older claude's title animation (2.1.209) and are rejected. Return `None` for
+    /// other shapes or empty payloads.
     fn normalize_title(&self, title: &str) -> Option<(String, bool)> {
         let rest = after_frame(title, |c| {
-            CLAUDE_SPINNER.contains(&c)
-                || braille_frame(c)
-                || ('\u{25D0}'..='\u{25D3}').contains(&c)
+            CLAUDE_SPINNER.contains(&c) || ('\u{25D0}'..='\u{25D3}').contains(&c)
         })?;
         // An empty payload cannot produce a usable preview.
         (!rest.is_empty()).then(|| (rest.to_string(), !title.starts_with(CLAUDE_SPINNER)))
@@ -297,31 +295,37 @@ fn claude_approval(rows: &[String]) -> Option<(String, &'static str)> {
         .then(|| (AWAITING_APPROVAL.to_string(), "claude:approval-menu"))
 }
 
-/// Complete effort values accepted before a welcome-box ellipsis.
+/// Complete effort values accepted before a welcome-header ellipsis.
 const CLAUDE_EFFORT: &[&str] = &["low", "medium", "high", "xhigh", "max"];
 
-/// `Fable 5 with high effort` from the welcome box → `Fable 5 (high)`. The
-/// welcome box is the stable source; user-configurable statusline rows are not
-/// parsed. When the box scrolls away, the label is unavailable.
+/// `Fable 5.1 with high effort` from the welcome header → `Fable 5.1 (high)`.
+/// claude 2.1.296 paints a three-row logo header, logo glyphs left of the text:
+///
+/// ```text
+///  ▐▛███▛█   Claude Code v2.1.296
+/// ▝▜██████▀  Fable 5.1 with high effort · Claude Max
+///  ▝▝   ▝▝   /…/scratchpad/claude-work · /rc
+/// ```
+///
+/// The model row is the row after `Claude Code v`, found within the first
+/// four rows; its first ` · ` segment is the model text. The header is the
+/// stable source; user-configurable statusline rows are not parsed. With the
+/// header scrolled out of view, no label is available.
 fn claude_welcome_label(rows: &[String]) -> Option<String> {
-    let start = rows
+    let version = rows
         .iter()
         .take(4)
-        .position(|r| r.trim_start().starts_with("╭─── Claude Code"))?;
-    for row in &rows[start + 1..] {
-        if row.trim_start().starts_with('╰') {
-            break;
-        }
-        // First cell of the box row: the welcome pane, left of the divider.
-        let Some(cell) = row.split('│').nth(1) else {
-            continue;
-        };
-        let head = cell.trim().split(" · ").next().unwrap_or("");
-        if let Some(label) = claude_model_effort(head) {
-            return Some(label);
-        }
-    }
-    None
+        .position(|r| claude_header_text(r).starts_with("Claude Code v"))?;
+    let head = claude_header_text(rows.get(version + 1)?)
+        .split(" · ")
+        .next()?;
+    claude_model_effort(head)
+}
+
+/// The text of a welcome-header row: strip the leading logo glyphs (block
+/// elements U+2580 to U+259F) and whitespace.
+fn claude_header_text(row: &str) -> &str {
+    row.trim_start_matches(|c: char| c.is_whitespace() || ('\u{2580}'..='\u{259F}').contains(&c))
 }
 
 /// Normalize `<model> with <effort> effort` and its ellipsis form to `<model>
@@ -382,17 +386,42 @@ impl SummaryAdapter for CodexSummary {
         codex_model_label(rows)
     }
 
-    /// Set `working` for a title led by a braille frame. Replace `[ . ] ` with `[ ! ] `
-    /// to show the blocked blink's canonical phase. Return `None` for other title shapes
-    /// and for an empty frame payload.
+    /// Codex 0.162.1 titles the terminal `[head ]summary | cwd`, where `cwd` is
+    /// the working directory's basename and `head` is a braille frame or the
+    /// blocked blink `[ . ] `/`[ ! ] `. Across one turn the title reads
+    /// `codex-work` at startup, `⠴ ⠴ | codex-work` for the first seconds of
+    /// the turn (the summary is a frame placeholder until the turn is named),
+    /// `⠙ Count to twenty slowly | codex-work` while working, and `Count to
+    /// twenty slowly | codex-work` after. Return the summary, split at the last
+    /// ` | `, with `working` set for a frame head; fold the blink to its
+    /// `[ ! ] ` phase. Return `None` for the bare cwd (rendered verbatim on the
+    /// alternate screen)
+    /// and for a placeholder or empty summary: the working signal is lost for
+    /// the placeholder seconds rather than a frame rendering as text. A headed
+    /// title without ` | ` is all summary.
     fn normalize_title(&self, title: &str) -> Option<(String, bool)> {
-        if let Some(rest) = title.strip_prefix("[ . ] ") {
-            return Some((format!("[ ! ] {rest}"), false));
+        let frame = after_frame(title, braille_frame);
+        let blink = title
+            .strip_prefix("[ . ] ")
+            .or_else(|| title.strip_prefix("[ ! ] "));
+        let rest = frame.or(blink).unwrap_or(title);
+        let summary = match rest.rsplit_once(" | ") {
+            Some((summary, _)) => summary,
+            None if frame.is_some() || blink.is_some() => rest,
+            None => return None,
+        };
+        let mut chars = summary.chars();
+        match chars.next() {
+            None => return None,
+            Some(c) if braille_frame(c) && chars.next().is_none() => return None,
+            Some(_) => {}
         }
-        // Do not normalize a frame with an empty payload; Claude and OMP use the same rule.
-        after_frame(title, braille_frame)
-            .filter(|rest| !rest.is_empty())
-            .map(|rest| (rest.to_string(), true))
+        let text = if blink.is_some() {
+            format!("[ ! ] {summary}")
+        } else {
+            summary.to_string()
+        };
+        Some((text, frame.is_some()))
     }
 }
 
@@ -509,11 +538,9 @@ fn codex_warning_shortcut(hint: &str) -> bool {
         for modifier in ["ctrl+", "shift+"] {
             key = key.strip_prefix(modifier).unwrap_or(key);
         }
-        // Since Codex 0.160.0, `⌥w` is displayed instead of `⌥+w`.
-        // Treat a trailing `+` as the key itself.
+        // `⌥` is glued to its key (`⌥w`), unlike the `+`-joined modifiers.
         key = key
             .strip_prefix("alt+")
-            .or_else(|| key.strip_prefix("⌥+").filter(|rest| !rest.is_empty()))
             .or_else(|| key.strip_prefix('⌥'))
             .unwrap_or(key);
         (key.len() == 1 && !key.starts_with(char::is_whitespace))
@@ -575,11 +602,12 @@ fn codex_composer(rows: &[String]) -> Option<usize> {
 /// Walk up from the composer through the status region: blanks and indented rows
 /// (tool-output attachments like `└ ok`, wrapped continuations) are skipped,
 /// [`CODEX_QUEUED_HEADS`] are walked past, then inspect the first other column-0 row.
-/// Extract only [`codex_status_head`] or `• Ran ` shapes; stop at any other column-0
-/// row (a reply bullet, a `⚠` notice, a turn separator): `• Ran` rows from prior turns
-/// are retained in scrollback, and skipping an unknown row to reach one would resurface
-/// stale work as live status. `• Ran ` is tested first because the status head matches
-/// on structure, not on a literal verb.
+/// Extract only [`codex_worked`], [`codex_status_head`], or `• Ran ` shapes; stop at
+/// any other column-0 row (a reply bullet, a `⚠` notice, a turn separator): `• Ran`
+/// rows from prior turns are retained in scrollback; skip past an unknown row to
+/// reach one and stale work is reported as live status. The completion row is
+/// indented, so it is tested before the indentation skip. `• Ran ` is tested before
+/// the status head, which is matched on structure, not on a literal verb.
 fn codex_status(rows: &[String], composer: usize) -> Option<(String, &'static str)> {
     // Indented rows crossed since the last column-0 row. Exclude rows below a queued
     // head from the count to avoid exhausting the window on a deep queue.
@@ -587,6 +615,9 @@ fn codex_status(rows: &[String], composer: usize) -> Option<(String, &'static st
     for row in rows[..composer].iter().rev() {
         if row.is_empty() {
             continue;
+        }
+        if let Some(text) = codex_worked(row) {
+            return (indented <= CODEX_STATUS_WINDOW).then_some((text, "codex:worked"));
         }
         if row.starts_with(' ') {
             indented += 1;
@@ -610,6 +641,17 @@ fn codex_status(rows: &[String], composer: usize) -> Option<(String, &'static st
         return None;
     }
     None
+}
+
+/// `  Worked for 1s • 4:19 PM` → `Worked for 1s`: the completion row codex
+/// 0.162.1 paints under the last reply, indented like an attachment. Require
+/// the ` • ` before the clock time: `Worked for` alone is conversation prose.
+fn codex_worked(row: &str) -> Option<String> {
+    let (duration, _) = row
+        .trim_start()
+        .strip_prefix("Worked for ")?
+        .split_once(" • ")?;
+    (!duration.is_empty()).then(|| format!("Worked for {duration}"))
 }
 
 /// Split a live status row into its header and the text after the opening
@@ -684,13 +726,13 @@ fn codex_working(header: &str, after_paren: &str) -> String {
 // ------------------------------------------------------------------ grok --
 
 /// grok (alt screen). Use the bordered input box as the structural anchor. Read
-/// the status from the first painted row above the box's top border: a braille
-/// spinner while working, `Worked for {n}s` after a turn, or `◎ … still running`
-/// / `◎ waiting` while background work is live. Limit this tier to working and
-/// completion rows. Handle the three blocked states (permission prompt, plan
-/// approval, question) through title normalization: expect a `┃`-fenced dialog
-/// in place of the box for permission prompts and questions, and `◆` in the
-/// probe position for plan approval. See [`SummaryAdapter::normalize_title`].
+/// the status from the first painted row above the box's top border, skipping
+/// the Tasks panel: a braille spinner while working or `Worked for {n}s` after
+/// a turn. Limit this tier to working and completion rows. Handle the three
+/// blocked states (permission prompt, plan approval, question) through title
+/// normalization: expect a `┃`-fenced dialog in place of the box for
+/// permission prompts and questions, and `◆` in the probe position for plan
+/// approval. See [`SummaryAdapter::normalize_title`].
 pub struct GrokSummary;
 
 impl SummaryAdapter for GrokSummary {
@@ -699,18 +741,35 @@ impl SummaryAdapter for GrokSummary {
         // One probe row: the first painted row above the box. The splash
         // panel's hints and the session header land here in non-working
         // states and match neither shape.
-        let probe = rows[..top].iter().rev().find(|r| !r.is_empty())?;
+        let first = rows[..top].iter().rposition(|r| !r.is_empty())?;
+        // While a command sent to the background with Ctrl+B runs, grok paints
+        // a Tasks panel between the status row and the box:
+        //
+        //     ⠹ Waiting for response… 0.1s             9.5s ⇣19.2k [stop]
+        //
+        //     ▾ Tasks 1
+        //     ⸬ Run Sleep for 40 seconds                                0s
+        //
+        //    ╭───…───╮
+        //
+        // The panel is the `▾ Tasks {n}` header and the painted rows under
+        // it; the task glyph is animated (`⸬`, `⁙`, `⋅`, `:`), so the rows
+        // are not matched by shape. When the first painted row is in that
+        // run, the probe is the first painted row above the header: still
+        // one row, never a scan.
+        let end = (0..=first)
+            .rev()
+            .take_while(|&i| !rows[i].is_empty())
+            .find(|&i| grok_tasks_header(&rows[i]))
+            .unwrap_or(first + 1);
+        let probe = rows[..end].iter().rev().find(|r| !r.is_empty())?;
         let t = probe.trim_start();
         // Keep the label through its first ellipsis. Wrapped tail rows have no
         // spinner prefix, so they fail the frame check and fall through.
         if let Some(text) = spinner_text(t, braille_frame) {
             return Some((text, "grok:spinner"));
         }
-        // Still-running is the same probe, never a scan: a closer spinner
-        // or Worked-for row already returned above.
-        grok_worked(t)
-            .then(|| (t.to_string(), "grok:worked"))
-            .or_else(|| grok_still_running(t).map(|text| (text, "grok:still-running")))
+        grok_worked(t).then(|| (t.to_string(), "grok:worked"))
     }
 
     fn model_label(&self, rows: &[String]) -> Option<String> {
@@ -785,29 +844,14 @@ fn grok_worked(t: &str) -> bool {
         })
 }
 
-/// Background-task chrome grok paints above the box while the main turn
-/// looks idle. The `◎` head and the ` · send a message to interrupt` hint
-/// drop; `waiting` and `{count} still running` stay. Scrollback such as
-/// `Subagent running:` has no `◎` and never matches.
-fn grok_still_running(t: &str) -> Option<String> {
-    let rest = t.strip_prefix("◎ ")?;
-    let rest = rest
-        .strip_suffix(" · send a message to interrupt")
-        .unwrap_or(rest);
-    if rest == "waiting" {
-        return Some(rest.to_string());
-    }
-    let body = rest.strip_suffix(" still running")?;
-    body.split(" · ")
-        .all(grok_still_running_count)
-        .then(|| rest.to_string())
-}
-
-/// One count segment: ASCII digits, a space, then one to three words.
-fn grok_still_running_count(seg: &str) -> bool {
-    after_digits(seg)
-        .and_then(|r| r.strip_prefix(' '))
-        .is_some_and(|words| (1..=3).contains(&words.split_whitespace().count()))
+/// The Tasks panel header grok 1.0.50 paints above the box while a
+/// backgrounded command runs: `▾ Tasks {n}` with an ASCII-digit count and
+/// nothing after it.
+fn grok_tasks_header(row: &str) -> bool {
+    row.trim()
+        .strip_prefix("▾ Tasks ")
+        .and_then(after_digits)
+        .is_some_and(str::is_empty)
 }
 
 /// `╰──── Grok 4.5 (xhigh) · always-approve ─╯` → `Grok 4.5 (xhigh)`: the text grok

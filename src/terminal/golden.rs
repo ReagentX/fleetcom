@@ -567,9 +567,7 @@ wrapper_oracle!(wrapper_topregion_scroll, "topregion_scroll.bin");
 const REPLY: &str = "PHASE0 COMPLETE. Deterministic local response.";
 const PROMPT: &str = "Phase zero fixture: reply with the completion marker.";
 const MANIFEST: &str = include_str!("../../tests/corpus/codex_0158_terminal/manifest.json");
-const STREAMS: [&[u8]; 4] = [
-    include_bytes!("../../tests/corpus/codex_0158_terminal/0.157.1-fullscreen-transitions.bin"),
-    include_bytes!("../../tests/corpus/codex_0158_terminal/0.157.1-fullscreen-fleetcom-load.bin"),
+const STREAMS: [&[u8]; 2] = [
     include_bytes!("../../tests/corpus/codex_0158_terminal/0.158.0-fullscreen-transitions.bin"),
     include_bytes!("../../tests/corpus/codex_0158_terminal/0.158.0-fullscreen-fleetcom-load.bin"),
 ];
@@ -644,9 +642,7 @@ fn codex_release_terminal_transitions() {
                         text.contains("Copied Whole response to clipboard"),
                         "{context}"
                     );
-                    if name.starts_with("0.158.0") {
-                        assert!(text.contains("Copying Whole response"), "{context}");
-                    }
+                    assert!(text.contains("Copying Whole response"), "{context}");
                 }
                 let clipboard = emu.drain_clipboard();
                 assert_eq!(clipboard.oversized_len, None, "{context}");

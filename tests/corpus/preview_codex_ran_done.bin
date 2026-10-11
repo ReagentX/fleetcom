@@ -1,0 +1,40 @@
+[?1049h[2J[H
+  >_ OpenAI Codex (v0.162.1)
+     /Users/fleet-pilot/Projects/fixture-sources/pty/codex-cli-0-162-1/…/scratchpad/codex-work
+
+  To get started, describe a task or try one of these commands:
+
+  /init - create an AGENTS.md file with instructions for Codex
+  /status - show current session configuration
+  /permissions - choose what Codex is allowed to do
+  /model - choose what model and reasoning effort to use
+  /review - review any changes and find issues
+
+
+› Run the shell command curl -sI https://example.com and show me the first line of output.
+
+
+• I’ll run that command and return its first output line.
+
+• Ran curl -sI https://example.com
+  └ cf-ray: 0000000000000000-XXX
+    alt-svc: h3=":443"; ma=86400
+
+    + 9 lines (⌃t to expand)
+
+• HTTP/2 200
+
+
+
+
+
+
+
+
+
+
+
+› Ask Codex to do anything
+
+  GPT-6-Luna max · 3.92K used · 41.2K in · 106 out
+  ← for agents · ? for shortcuts

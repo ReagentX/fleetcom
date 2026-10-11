@@ -177,8 +177,9 @@ fn replace_slot(capture: &Path, root: &str) -> io::Result<()> {
 /// `source` object.
 ///
 /// Return `None` unless exactly one rollout is named for `thread` and its
-/// header is in one of those two formats. No rollout is saved for the title
-/// thread. Examine only directory listings and the first line.
+/// header's `session_id` is `thread` itself or, under a `subagent` source, the
+/// root. No rollout is saved
+/// for the title thread. Examine only directory listings and the first line.
 fn root_thread(home: &Path, thread: &str) -> Option<String> {
     let mut rollouts = Vec::new();
     collect_rollouts(
@@ -197,9 +198,8 @@ fn root_thread(home: &Path, thread: &str) -> Option<String> {
         return None;
     }
     let root = capture_id(meta, "session_id")?;
-    // Require exactly one condition. In codex 0.140.0 and 0.141.0, a
-    // sub-agent's own ID was stored as `session_id`, so its root is unknown.
-    ((root == thread) != meta["source"].has_key("subagent")).then_some(root)
+    // A foreign root is trusted only from a sub-agent's header.
+    (root == thread || meta["source"].has_key("subagent")).then_some(root)
 }
 
 /// Push every entry with a name ending in `suffix`, exactly `depth` directory
@@ -1025,26 +1025,6 @@ mod tests {
             )),
         );
         assert_eq!(resolve(&home, CHILD).as_deref(), Some(ID));
-    }
-
-    /// In codex 0.140.0 and 0.141.0, a sub-agent's own ID was stored as
-    /// `session_id`. Reject `id == session_id` with a `subagent` source:
-    /// the root is unknown, and the sub-agent's ID is not resumable.
-    #[test]
-    fn arrival_root_refuses_a_sub_agent_that_names_itself_as_root() {
-        let home = temp("codex_capture_self_rooted");
-        for source in [
-            thread_spawn(ID, 1),
-            r#"{"subagent":{"other":"guardian"}}"#.to_string(),
-            r#"{"subagent":"review"}"#.to_string(),
-        ] {
-            install_codex_rollout(
-                &home,
-                CHILD,
-                codex_session_meta(&child_meta(CHILD, ID, CHILD, &source)),
-            );
-            assert_eq!(resolve(&home, CHILD), None, "{source}");
-        }
     }
 
     /// No rollout is saved for the title thread. Reject its notification

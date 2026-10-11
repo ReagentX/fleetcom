@@ -1,34 +1,20 @@
-[2J[H╭────────────────────────────────────────────────╮
-│ >_ OpenAI Codex (v0.144.6)                     │
-│                                                │
-│ model:     gpt-5.6-sol high   /model to change │
-│ directory: ~/Projects/fixture-sources          │
-╰────────────────────────────────────────────────╯
+[?1049h[2J[H
+  >_ OpenAI Codex (v0.162.1)
+     /Users/fleet-pilot/Projects/fixture-sources/pty/codex-cli-0-162-1/…/scratchpad/codex-work
 
-  Tip: New Use /fast to enable our fastest inference with increased plan usage.
+  To get started, describe a task or try one of these commands:
 
-⚠ MCP client for `demo-mcp-unresolved` failed to start: MCP startup failed: No such file or directory (os error 2)
-
-• You have 3 usage limit resets available. Run /usage to use one.
-
-⚠ MCP startup incomplete (failed: demo-mcp-unresolved)
+  /init - create an AGENTS.md file with instructions for Codex
+  /status - show current session configuration
+  /permissions - choose what Codex is allowed to do
+  /model - choose what model and reasoning effort to use
+  /review - review any changes and find issues
 
 
-› run: sleep 5 && echo ok
+› Run the shell command sleep 25 and then say done.
 
 
-⚠ MCP client for `demo-mcp-unresolved` failed to start: MCP startup failed: No such file or directory (os error 2)
-
-⚠ MCP startup incomplete (failed: demo-mcp-unresolved)
-
-• I’m running that command now.
-
-• Working (7s • esc to interrupt) · 1 background terminal running · /ps to view · /stop to close
-
-
-› Write tests for @filename
-
-  gpt-5.6-sol high · 0 in · 0 out
+• I’ll run sleep 25 now.
 
 
 
@@ -37,3 +23,18 @@
 
 
 
+
+
+
+
+
+
+
+
+• Working (3s • esc to interrupt) · 1 background terminal running · /ps to view · /stop to close
+
+
+› Ask Codex to do anything
+
+  GPT-6-Luna max · 0 in · 0 out
+  ← for agents · ? for shortcuts
