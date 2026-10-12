@@ -48,6 +48,14 @@ fn anchor(text: &str, rule: &'static str) -> Preview {
     }
 }
 
+/// Live anchor preview whose rule reports an active turn so the row displays `●`
+fn working(text: &str, rule: &'static str) -> Preview {
+    Preview {
+        working: true,
+        ..anchor(text, rule)
+    }
+}
+
 /// Live window-title preview.
 fn title(text: &str) -> Preview {
     Preview {
@@ -150,7 +158,10 @@ fn live_fleet(dirs: &Dirs) -> Vec<TaskView> {
             group: Some("dashboard".to_string()),
             name: Some("Summary Refine".to_string()),
             lifecycle: Lifecycle::Active,
-            preview: anchor("Inferring… · thinking with high effort", "claude:spinner"),
+            preview: working(
+                "Fable 5.1 (high) · Inferring… · thinking with high effort",
+                "claude:spinner",
+            ),
             started_ago: mins(5),
             quiet_ago: Some(secs(8)),
             finished_ago: None,
@@ -165,7 +176,7 @@ fn live_fleet(dirs: &Dirs) -> Vec<TaskView> {
             group: Some("dashboard".to_string()),
             name: Some("Grok Language".to_string()),
             lifecycle: Lifecycle::Active,
-            preview: anchor("Grok 4.5 (xhigh) · Responding…", "grok:spinner"),
+            preview: working("Grok 4.7 (xhigh) · Responding…", "grok:spinner"),
             started_ago: mins(12),
             quiet_ago: Some(secs(4)),
             finished_ago: None,
@@ -315,9 +326,9 @@ fn live_fleet(dirs: &Dirs) -> Vec<TaskView> {
             group: Some("turret".to_string()),
             name: Some("Missile Nerf".to_string()),
             lifecycle: Lifecycle::Active,
-            // omp's spinner phrase carries no model-label prefix: the
-            // adapter's model_label is None.
-            preview: anchor("Tuning missile damage falloff", "omp:spinner"),
+            // omp has no anchor tier: the primary-screen title tier renders
+            // the conversation label omp announces, with no model prefix.
+            preview: title("Tuning missile damage falloff"),
             started_ago: mins(33),
             quiet_ago: Some(secs(7)),
             finished_ago: None,
@@ -379,7 +390,10 @@ fn live_fleet(dirs: &Dirs) -> Vec<TaskView> {
             group: None,
             name: None,
             lifecycle: Lifecycle::Active,
-            preview: anchor("Review GitHub issue 780", "claude:action-row"),
+            preview: anchor(
+                "Opus 5.5 (high) · Review GitHub issue 780",
+                "claude:action-row",
+            ),
             started_ago: mins(6),
             quiet_ago: Some(secs(2)),
             finished_ago: None,
@@ -549,15 +563,17 @@ fn quiet_fleet(dirs: &Dirs) -> Vec<TaskView> {
         if let Some((text, rule)) = q.preview {
             v.preview = anchor(text, rule);
         }
+        // A quiet agent reports no turn: no `●` in the Idle section.
+        v.preview.working = false;
     }
     views
 }
 
 // Store full preview text so truncation comes from the renderer.
 const CODEX_LANGUAGE: &str =
-    "gpt-5.6-sol high · fleetcom · feat/cs/interface-fixes · 387K used · 9.53M in · 61.2K out";
+    "GPT-6.1-Sol high · fleetcom · feat/cs/interface-fixes · 387K used · 9.53M in · 61.2K out";
 const CODEX_REVIEW: &str =
-    "gpt-5.6-sol high · fleetcom · feat/cs/interface-fixes · 221K used · 4.41M in · 38.7K out";
+    "GPT-6.1-Sol high · fleetcom · feat/cs/interface-fixes · 221K used · 4.41M in · 38.7K out";
 const FLEETCOM_TESTS: &str =
     "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s";
 const LOGRIA_TESTS: &str = "test result: ok. 223 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.38s";
@@ -569,7 +585,7 @@ const FLEETCOM_CLIPPY: &str =
 const LOGRIA_WATCH: &str = "[Running 'cargo test'] test result: ok. 223 passed; 0 failed";
 const LOGRIA_DOC: &str = "Finished `dev` profile [unoptimized + debuginfo] target(s) in 3.41s";
 /// Quiet-fixture summary preview.
-const SUMMARY_QUIET: &str = "Review fleetcom preview design document";
+const SUMMARY_QUIET: &str = "Fable 5.1 (high) · Review fleetcom preview design document";
 
 /// Visible `cargo test` tail used by the peek fixture.
 fn cargo_test_screen(id: u64) -> ScreenView {
@@ -610,12 +626,13 @@ fn frame(app: &mut App) -> Vec<u8> {
     let painted = out.len();
     crate::ui::render(&mut out, app).expect("a fixture frame always paints");
     assert!(out.len() > painted, "a fresh App must emit its first frame");
-    // Park the cursor outside centered overlays.
-    out.extend_from_slice(format!("\x1b[{};1H", app.rows).as_bytes());
+    // Park the cursor outside centered overlays, then hide it: the Agent page
+    // leaves it shown for the filter caret, and parked it paints a stray cell.
+    out.extend_from_slice(format!("\x1b[{};1H\x1b[?25l", app.rows).as_bytes());
     out
 }
 
-/// Rewrite the four deterministic README dashboard fixtures under `docs/img`.
+/// Rewrite the five deterministic README dashboard fixtures under `docs/img`.
 #[test]
 #[ignore = "writes docs/img/*.ansi; run by hand to refresh the README screenshots"]
 fn write_readme_screenshot_fixtures() {
@@ -647,4 +664,14 @@ fn write_readme_screenshot_fixtures() {
     app.selected_id = Some(4);
     app.mode = Mode::Controls;
     std::fs::write(out_dir.join("controls.ansi"), frame(&mut app)).unwrap();
+
+    // Agent page over the directory-grouped fixture: `n`, then Tab, with every
+    // supported agent installed and the first row highlighted. The selected
+    // turret task puts its directory in the `❯` destination prefix.
+    let mut app = fixture_app(&dirs, GroupMode::Dir, live_fleet(&dirs));
+    app.selected_id = Some(11);
+    app.agents = harness::program_words().map(String::from).collect();
+    app.on_key_dashboard(key(KeyCode::Char('n')));
+    app.on_key_spawn(key(KeyCode::Tab));
+    std::fs::write(out_dir.join("agent.ansi"), frame(&mut app)).unwrap();
 }
