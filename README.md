@@ -32,6 +32,8 @@ Organize related tasks into named groups across working directories.
 
 Launch `claude`, `codex`, `grok`, or `omp` from the Agent page (`n`, then `Tab`). Rerun the task or reload a saved session to resume the conversation.
 
+![`fleetcom` Agent page](docs/img/agent.png)
+
 ## Operational model
 
 Managing several long-lived commands across terminal panes is pesky, especially when you need to reconnect later. With `fleetcom`:
