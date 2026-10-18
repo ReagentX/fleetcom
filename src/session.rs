@@ -16,7 +16,7 @@ use std::{
 
 use crate::{
     harness,
-    protocol::{RecoveryEntry, insert_opt_str, opt_str},
+    protocol::{RecoveryEntry, bool_flag, insert_opt_str, opt_str},
     task::{pid_is_dead, positive_pid},
 };
 
@@ -34,27 +34,34 @@ pub enum EntryKind {
     },
 }
 
-/// One recipe entry. Serialize a literal without group or name as a bare string. Use an
-/// object for every other entry, writing optional fields only when set.
+/// One recipe entry. Serialize a literal with no group, no name, and neither mark as a
+/// bare string. Use an object for every other entry, writing optional fields only when
+/// set and marks only when true.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionEntry {
     pub kind: EntryKind,
     pub group: Option<String>,
     pub name: Option<String>,
+    /// The `m` "in use" tag.
+    pub tagged: bool,
+    /// The `]` mark. Allow at most one flagged entry per file; reject a second in `from_json`.
+    pub flagship: bool,
 }
 
 #[cfg(test)]
 impl SessionEntry {
-    /// Unlabelled literal entry.
+    /// Unlabelled, unmarked literal entry.
     pub fn literal(cmd: &str) -> Self {
         Self {
             kind: EntryKind::Literal(cmd.into()),
             group: None,
             name: None,
+            tagged: false,
+            flagship: false,
         }
     }
 
-    /// Unlabelled managed entry.
+    /// Unlabelled, unmarked managed entry.
     pub fn managed(agent: &str, resume: Option<&str>) -> Self {
         Self {
             kind: EntryKind::Managed {
@@ -63,6 +70,8 @@ impl SessionEntry {
             },
             group: None,
             name: None,
+            tagged: false,
+            flagship: false,
         }
     }
 }
@@ -123,8 +132,10 @@ fn dirs_json(cfg: &SessionConfig) -> jzon::JsonValue {
         let mut arr = jzon::JsonValue::new_array();
         for e in entries {
             let mut m = match &e.kind {
-                // Use the string form for a literal without optional labels.
-                EntryKind::Literal(cmd) if e.group.is_none() && e.name.is_none() => {
+                // Use the string form for a literal without optional labels or marks.
+                EntryKind::Literal(cmd)
+                    if e.group.is_none() && e.name.is_none() && !e.tagged && !e.flagship =>
+                {
                     let _ = arr.push(cmd.as_str());
                     continue;
                 }
@@ -137,6 +148,13 @@ fn dirs_json(cfg: &SessionConfig) -> jzon::JsonValue {
             };
             insert_opt_str(&mut m, "group", e.group.as_deref());
             insert_opt_str(&mut m, "name", e.name.as_deref());
+            // Omit false marks to preserve the exact serialization of unmarked entries.
+            if e.tagged {
+                let _ = m.insert("tagged", true);
+            }
+            if e.flagship {
+                let _ = m.insert("flagship", true);
+            }
             let _ = arr.push(m);
         }
         let _ = dirs.insert(dir, arr);
@@ -165,10 +183,11 @@ pub fn fingerprint_json(cfg: &SessionConfig) -> String {
 /// including an array under a directory named `dirs`. Require an integer `version` from 1
 /// through [`FORMAT_VERSION`]. Treat a missing version as 1. Accept entry forms regardless
 /// of version: strings and `{"cmd"}` objects for literals, `{"agent"}` objects for managed
-/// agents. Reject the whole file for objects with both keys, unregistered agents, or resume
-/// IDs that are not strict UUIDs. Never rewrite an entry: a v1 file loads verbatim, every
-/// entry literal. The rewrite that converted v1 agent commands to managed entries (v1 had no
-/// managed form) shipped in 0.15.0 and was retired in the release after it.
+/// agents. Reject the whole file for objects with both keys, unregistered agents, resume
+/// IDs that are not strict UUIDs, non-boolean `tagged` or `flagship` fields, or a second
+/// `flagship`. Never rewrite an entry: load a v1 file verbatim, with every entry literal.
+/// Conversion of v1 agent commands to managed entries (v1 had no managed form) was
+/// introduced in 0.15.0 and retired in the release after it.
 fn from_json(text: &str) -> io::Result<(Option<String>, SessionConfig)> {
     let invalid = |message| io::Error::new(io::ErrorKind::InvalidData, message);
     let parsed = jzon::parse(text).map_err(|e| invalid(e.to_string()))?;
@@ -204,6 +223,9 @@ fn from_json(text: &str) -> io::Result<(Option<String>, SessionConfig)> {
         (None, &parsed, true)
     };
     let mut cfg = SessionConfig::new();
+    // Retain the first flagged entry's location for diagnostics: only one flagship ID
+    // can be represented in supervisor state.
+    let mut flagship_at: Option<String> = None;
     for (dir, val) in dirs.entries() {
         // In a flat file, `version` is metadata beside the directory keys.
         if flat && dir == "version" {
@@ -219,6 +241,8 @@ fn from_json(text: &str) -> io::Result<(Option<String>, SessionConfig)> {
                     kind: EntryKind::Literal(cmd.to_string()),
                     group: None,
                     name: None,
+                    tagged: false,
+                    flagship: false,
                 });
                 continue;
             }
@@ -268,11 +292,29 @@ fn from_json(text: &str) -> io::Result<(Option<String>, SessionConfig)> {
                 })?;
                 EntryKind::Literal(cmd.to_string())
             };
-            entries.push(SessionEntry {
+            let mark = |field| {
+                bool_flag(&member[field]).ok_or_else(|| {
+                    invalid(format!(
+                        "{location}, field {field:?}: expected a boolean or null"
+                    ))
+                })
+            };
+            let entry = SessionEntry {
                 kind,
                 group: label("group")?,
                 name: label("name")?,
-            });
+                tagged: mark("tagged")?,
+                flagship: mark("flagship")?,
+            };
+            if entry.flagship {
+                if let Some(first) = &flagship_at {
+                    return Err(invalid(format!(
+                        "{location}: a second flagship; {first} is already marked"
+                    )));
+                }
+                flagship_at = Some(location);
+            }
+            entries.push(entry);
         }
         cfg.insert(dir.to_string(), entries);
     }
@@ -732,6 +774,84 @@ mod tests {
                 r#"{{"~/p":[{{"agent":"omp"}},{{"agent":"claude","resume":"{ID}","group":"agents","name":"pilot"}}]}}"#
             )
         );
+    }
+
+    /// Round-trip marked entries. Serialize a tagged literal as an object and a plain
+    /// literal as a bare string. Write marks only when true, after the labels.
+    #[test]
+    fn round_trips_marked_entries() {
+        let dir = temp("session_marks_roundtrip");
+        let mut cfg = SessionConfig::new();
+        cfg.insert(
+            "~/p".into(),
+            vec![
+                SessionEntry {
+                    tagged: true,
+                    ..e("cargo test")
+                },
+                SessionEntry {
+                    flagship: true,
+                    ..m("claude", Some(ID))
+                },
+                e("vim"),
+            ],
+        );
+
+        save_in(&dir, "marks", &cfg).unwrap();
+        assert_eq!(load_in(&dir, "marks").unwrap(), cfg);
+        assert_eq!(
+            fingerprint_json(&cfg),
+            format!(
+                r#"{{"~/p":[{{"cmd":"cargo test","tagged":true}},{{"agent":"claude","resume":"{ID}","flagship":true}},"vim"]}}"#
+            )
+        );
+    }
+
+    /// Treat `false`, `null`, and omission as an unset mark on both entry forms.
+    #[test]
+    fn unset_marks_parse_as_false_in_every_spelling() {
+        for spelling in [
+            "",
+            r#", "tagged": false, "flagship": false"#,
+            r#", "tagged": null, "flagship": null"#,
+        ] {
+            let text =
+                format!(r#"{{"d": [{{"cmd": "vim"{spelling}}}, {{"agent": "omp"{spelling}}}]}}"#);
+            let (_, cfg) = from_json(&text).unwrap();
+            assert_eq!(cfg["d"], vec![e("vim"), m("omp", None)], "{text}");
+        }
+    }
+
+    /// Reject the entire file for a non-boolean mark, naming the field, or for a second
+    /// flagship, naming both locations. Use object fields to store marks; a bare-string
+    /// entry cannot be the conflicting entry.
+    #[test]
+    fn rejects_malformed_marks() {
+        let cases = [
+            (
+                r#"{"d": ["vim", {"cmd": "top", "tagged": "yes"}]}"#,
+                "directory \"d\", entry 2, field \"tagged\": expected a boolean or null",
+            ),
+            (
+                r#"{"d": [{"agent": "omp", "flagship": 1}]}"#,
+                "directory \"d\", entry 1, field \"flagship\": expected a boolean or null",
+            ),
+            (
+                r#"{"~/a": [{"cmd": "x", "flagship": true}], "~/b": ["y", {"cmd": "z", "flagship": true}]}"#,
+                "directory \"~/b\", entry 2: a second flagship; \
+                 directory \"~/a\", entry 1 is already marked",
+            ),
+            (
+                r#"{"d": [{"agent": "omp", "flagship": true}, {"cmd": "z", "flagship": true}]}"#,
+                "directory \"d\", entry 2: a second flagship; \
+                 directory \"d\", entry 1 is already marked",
+            ),
+        ];
+        for (text, expected) in cases {
+            let err = from_json(text).unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::InvalidData, "{text}");
+            assert_eq!(err.to_string(), expected, "{text}");
+        }
     }
 
     /// Include the resume ID in the fingerprint so a cadence pass detects newly captured

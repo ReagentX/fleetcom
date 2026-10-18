@@ -1,6 +1,6 @@
 # Sessions
 
-A session is a launch recipe: commands, working directories, and each task's optional group assignment and display name. Loading a session always starts new processes. To keep live processes running across client disconnects, use the [daemon](README.md#storage-paths).
+Save a session to preserve the task set's working directories, commands or managed agents with their session IDs, group assignments, display names, "in use" tags, and flagship mark. You cannot preserve client state (the attached or peeked task, selection, grouping and sort modes, terminal size) or process state (lifecycle, output, timings) in a session. Each time you load a session, you start new processes with the saved settings. To keep live processes running across client disconnects, use the [daemon](README.md#storage-paths).
 
 ## Storage
 
@@ -20,8 +20,10 @@ The filename is derived from the session name: leading and trailing whitespace i
 
 A session file is a JSON object with three fields: `version` for the format version, currently 2; `name` for the typed session name, trimmed but not sanitized; and `dirs` for an ordered list of entries per working directory. Use one of two entry forms, according to the task's launch mode:
 
-- A **literal** entry is a typed command. Use a bare string without labels, or an object with `cmd` and optional `group` and `name` fields. On load, the stored text is run unchanged through your shell: even `"claude"` is a literal command.
-- A **managed** entry is an object with `agent`, the registered program word (`claude`, `codex`, `grok`, or `omp`), plus optional `resume`, `group`, and `name` fields. Tasks launched from the Agent page are saved in this form. On load, the agent is launched as managed; with `resume`, the stored session ID is reopened, and without it, a fresh conversation is started. See [Agent session resume](agent-resume.md).
+- A **literal** entry is a typed command. Use a bare string without labels or marks, or an object with `cmd` and optional `group`, `name`, `tagged`, and `flagship` fields. Load a literal entry to run the stored text unchanged through your shell: even `"claude"` is a literal command.
+- A **managed** entry is an object with `agent`, the registered program word (`claude`, `codex`, `grok`, or `omp`), plus optional `resume`, `group`, `name`, `tagged`, and `flagship` fields. Save tasks launched from the Agent page in this form. Load a managed entry with `resume` to reopen the stored session ID, or without it to start a fresh conversation. See [Agent session resume](agent-resume.md).
+
+Use the optional booleans `tagged` and `flagship` on either object form. Set `tagged` to `true` to tag a task ["in use"](commands.md#grouping-and-tagging), or `flagship` to `true` to mark the [flagship](commands.md#the-flagship). To leave either mark unset, use `false`, `null`, or omit the field. On save, include each field only when true. Mark at most one entry per file as the flagship; with a second, you cannot load the file.
 
 ```json
 {
@@ -30,8 +32,8 @@ A session file is a JSON object with three fields: `version` for the format vers
   "dirs": {
     "~/work/api": [
       "cargo watch -x test",
-      { "cmd": "cargo run", "group": "api", "name": "api server" },
-      { "agent": "claude", "resume": "c8c4a5cc-0b32-4ba0-a6b4-6ed08c218e0d", "group": "agents" },
+      { "cmd": "cargo run", "group": "api", "name": "api server", "tagged": true },
+      { "agent": "claude", "resume": "c8c4a5cc-0b32-4ba0-a6b4-6ed08c218e0d", "group": "agents", "flagship": true },
       { "agent": "omp" }
     ],
     "/tmp": [
@@ -54,17 +56,25 @@ Saves are atomic: a private temporary file is written and synced in the session 
 
 The file is plain JSON and practical to edit by hand. Edit `name` to change the stored session identity: a subsequent save under the old name will be refused by the collision check. A readable stored name is still used for collision checks and picker labels when the command body is invalid or the version unsupported.
 
-The entire recipe is validated before any commands are started. The root must be an object, every directory value must be an array, and every entry must be a command string or an object with a string `cmd` or a string `agent`, never both. `agent` must be a supported program word, and `resume`, when present, must be a lowercase `8-4-4-4-12` UUID or `null`. Strings, `null`, or omission are accepted for optional entry `group` and `name` fields and the wrapped session's `name`; other types are rejected. Unknown fields in wrapped metadata and entry objects are ignored. Empty maps, arrays, and strings are valid. With invalid JSON or any malformed field, the whole load is refused; existing tasks and the recipe file are left intact. In schema errors, the quoted directory key, entry number (starting at 1), and offending field are included where applicable.
+On load, expect validation of the entire recipe before any commands are started. Use this schema:
+
+- Use an object for the root and an array for each directory value.
+- For each entry, use a command string or an object with a string `cmd` or a string `agent`, never both.
+- For `agent`, use a supported program word. For `resume`, use a lowercase `8-4-4-4-12` UUID, `null`, or omit the field.
+- For the optional entry `group` and `name` fields and the wrapped session's `name`, use strings, `null`, or omit the fields.
+- For `tagged` and `flagship`, use booleans, `null`, or omit the fields. Set `flagship` to `true` on at most one entry; otherwise, both entry locations are reported in the error.
+
+You can include unknown fields in wrapped metadata and entry objects; these are ignored. You can also use empty maps, arrays, and strings. With invalid JSON or any malformed field, you cannot load any part of the recipe; your existing tasks and recipe file remain intact. For schema errors, expect the quoted directory key, entry number (starting at 1), and offending field where applicable.
 
 After validation, group and display names are stripped of control characters and surrounding whitespace and limited to 64 characters. `Unassigned` is treated as no group but is a legal display name. Missing directories, entries past the task limit, and literal commands past the length limit are skipped and counted in the load status. A managed entry whose agent is not found on the connected client's `PATH` is reported on the status line and counted as a failed spawn; the remaining entries are still loaded. Spawn failures are reported separately; tasks already started from a structurally valid recipe are left running.
 
-Use the string form for commands with neither a group nor a name. String and object entries can appear in the same directory array.
+Use the string form for commands with no group, no name, and no mark. String and object entries can appear in the same directory array.
 
 ## Recovery
 
 The current task set is automatically snapshotted under `recovery/` inside the session directory. A separate file is written for each daemon (or `--foreground` core), named for its start time and process ID. After each write, the new file and files whose process IDs are still live are protected; among the remaining files, the nine newest names are retained. A shared recovery directory can therefore contain more than ten snapshots while multiple writers are live.
 
-A snapshot pass is scheduled two seconds after the last command that can change a saved recipe, coalescing a burst of commands. A nonempty recipe is written when its content or destination changed, or when the expected snapshot file is missing. Content changes that no command caused, such as a managed task's newly captured session ID, are also checked every 60 seconds.
+Expect a snapshot pass two seconds after the last command that can change a saved recipe, including marking with `m` or `]`. After a burst of commands, count the delay from the last command. You also get a pass after the flagship mark is cleared on task exit, without a command. For a nonempty recipe, expect a write when its content or destination changed, or when the expected snapshot file is missing. For changes made without a command, such as a newly captured session ID for a managed task, expect checks every 60 seconds.
 
 - No snapshot is written for an empty fleet. After removing every task, the previous snapshot is retained.
 - Snapshots are left in place after quitting, disconnecting, or `fleetcom --kill`.
@@ -77,8 +87,8 @@ As with saved recipes, full command lines are persisted in recovery files, inclu
 
 ## Saving and loading
 
-- Save: press `w` in the dashboard, type a name, and press `Enter` to write `<name>.json` with the session name and each task's directory, command or managed agent and session ID, and optional group and name.
+- Save: press `w` in the dashboard, type a name, and press `Enter` to write `<name>.json` with the session name and each task's directory, command or managed agent and session ID, optional group and name, "in use" tag, and flagship mark.
 - Load in-app: `o`, pick from the list, `Enter`.
 - Load at launch: `fleetcom <name>`.
 
-On load, new processes are always spawned from the stored commands. Live process state is retained by the daemon and never stored in session files. See [Agent session resume](agent-resume.md) for preserving supported agent conversations across relaunch.
+Load a session to start new processes from the stored commands. To retain live process state, use the daemon; you cannot store that state in session files. When you load, you keep your existing tasks and marks and recover the tags on every loaded task. You recover a stored flagship only when no task is currently marked. See [Agent session resume](agent-resume.md) for preserving supported agent conversations across relaunch.

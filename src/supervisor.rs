@@ -231,13 +231,13 @@ fn affects_recipe(cmd: &Command) -> bool {
         | Command::Restart { .. }
         | Command::SetGroup { .. }
         | Command::SetName { .. }
-        | Command::LoadSession { .. }
-        | Command::LoadRecovery { .. } => true,
-        // Preserve the recipe for lifecycle (`Kill`) and dashboard-state
-        // (`Tag`, `Flagship`) updates, and for the remaining commands.
-        Command::Kill { .. }
         | Command::Tag { .. }
         | Command::Flagship { .. }
+        | Command::LoadSession { .. }
+        | Command::LoadRecovery { .. } => true,
+        // Exclude `Kill`: lifecycle is not part of the recipe. For the remaining input,
+        // view, and meta commands, no fields serialized by `session_config` are changed.
+        Command::Kill { .. }
         | Command::Resize { .. }
         | Command::Watch { .. }
         | Command::Paste { .. }
@@ -308,9 +308,9 @@ pub struct Supervisor {
     watched: Option<u64>,
     /// Whether the current watch permits clipboard forwarding.
     watch_attached: bool,
-    /// The flagship task id, or `None`: at most one id is representable.
-    /// Clear in `tick` if the task is finished or absent, before including
-    /// the mark in a snapshot.
+    /// The flagship task ID, or `None`. Clear it in `reap` once the task is finished or
+    /// absent. Between reaps, the ID may refer to a removed task or one whose exit is not
+    /// yet latched. Use `flagship_holder` to check for an unfinished task still in the set.
     flagship: Option<u64>,
     /// The last emitted screen fingerprint. `lines` stays empty because only
     /// emitted copies carry them. Cleared when `watched` changes to force a
@@ -525,6 +525,27 @@ impl Supervisor {
             }
         }
         self.graveyard.retain_mut(|t| !t.try_collect());
+        // Check current state to cover exit, removal, session load, and marks placed on
+        // already-finished tasks. Check during reaping because `tick` is not called between
+        // clients; otherwise, an exited flagship would remain marked in recovery
+        // snapshots until the next connection.
+        if self.flagship.is_some() && self.flagship_holder().is_none() {
+            self.flagship = None;
+            // Schedule recovery explicitly after clearing the mark outside `apply`.
+            // Otherwise, a user can restore the old mark from disk before the 60 s
+            // cadence pass.
+            self.recovery.last_mutation = Some(Instant::now());
+        }
+    }
+
+    /// Return the flagship ID only for an unfinished task still in the set. Between
+    /// reaps, the stored ID may refer to a removed task or one whose exit is not yet
+    /// latched.
+    fn flagship_holder(&self) -> Option<u64> {
+        self.flagship.filter(|&id| {
+            self.index_of(id)
+                .is_some_and(|i| self.tasks[i].finished.is_none())
+        })
     }
 
     /// TERM every owned group, wait one shared grace, then SIGKILL before
@@ -551,15 +572,6 @@ impl Supervisor {
     /// client through `drain`ed events, never through a `Task`.
     pub fn tick(&mut self) {
         self.reap();
-        // Check current state rather than individual transitions to handle exit,
-        // removal, session load, and marks placed on already-finished tasks.
-        if let Some(id) = self.flagship
-            && self
-                .index_of(id)
-                .is_none_or(|i| self.tasks[i].finished.is_some())
-        {
-            self.flagship = None;
-        }
         let now = Instant::now();
         // vte re-checks its ?2026 sync timeout only when bytes arrive, so a
         // child that opens BSU and stalls would freeze its view. This tick is
@@ -1031,9 +1043,9 @@ impl Supervisor {
         }
     }
 
-    /// Build `{dir: [entries]}` in spawn order, preserving groups and names. Save managed
-    /// tasks as agent words with the best-known session IDs; save literals as their exact
-    /// text.
+    /// Build `{dir: [entries]}` in spawn order, preserving groups, names, tags, and the
+    /// flagship mark. Save managed tasks as agent words with the best-known session IDs;
+    /// save literals as their exact text.
     fn session_config(&self) -> SessionConfig {
         // `admit` appends monotonic IDs; `rerun` preserves both index and ID;
         // removal preserves relative order.
@@ -1056,6 +1068,8 @@ impl Supervisor {
                     kind,
                     group: t.group.clone(),
                     name: t.name.clone(),
+                    tagged: t.tagged,
+                    flagship: self.flagship == Some(t.id),
                 });
         }
         cfg
@@ -1104,8 +1118,10 @@ impl Supervisor {
 
     /// Spawn each recipe entry in its existing directory; skip missing directories. Resolve
     /// managed binaries as on the Agent page. Record a missing binary as a failed entry
-    /// with a diagnostic, then continue loading. Return the outcome for one summary line,
-    /// or `None` after reporting a missing launch context.
+    /// with a diagnostic, then continue loading. Restore each admitted entry's tag.
+    /// Preserve the current tasks and their marks: restore a stored flagship only when
+    /// no live task is marked. Return the outcome for one summary line, or `None` after
+    /// reporting a missing launch context.
     fn materialize(&mut self, cfg: &SessionConfig) -> Option<LoadOutcome> {
         let launch = self.launch_or_refuse()?;
         let mut out = LoadOutcome::default();
@@ -1147,9 +1163,17 @@ impl Supervisor {
                     entry.group.clone(),
                     entry.name.clone(),
                 ) {
-                    Ok((_, notice)) => {
+                    Ok((id, notice)) => {
                         out.spawned += 1;
                         out.notes.extend(notice);
+                        if entry.tagged {
+                            self.with_task(id, |t| t.tagged = true);
+                        }
+                        // Ignore a removed flagship's ID before the next reap. Preserve
+                        // the current mark only for a live holder.
+                        if entry.flagship && self.flagship_holder().is_none() {
+                            self.flagship = Some(id);
+                        }
                     }
                     // Track spawn failures separately from skipped entries.
                     Err(e) => {
