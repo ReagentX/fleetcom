@@ -155,7 +155,7 @@ Press `Ctrl-]` from the dashboard, peek, or an attached task to attach to the fl
 
 After attaching to the flagship with `Enter`, press `Ctrl-]` to return to the dashboard.
 
-The flagship mark is cleared on task completion or removal and is not saved in sessions. Tags set with `m` are retained after task completion.
+The flagship mark is cleared on task completion or removal. Tags set with `m` are retained after task completion. Both marks are saved in [sessions](sessions.md) and recovery snapshots and restored on load; a stored flagship is applied only when no task is currently marked.
 
 #### Renaming
 

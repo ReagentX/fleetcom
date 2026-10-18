@@ -77,6 +77,35 @@ fn session_config_groups_by_dir_in_spawn_order() {
     assert_eq!(cfg["/tmp"], vec![SessionEntry::literal("b")]);
 }
 
+/// The recipe carries the `m` tag and the flagship mark of each task.
+#[test]
+fn session_config_carries_marks() {
+    let mut s = sup(24, 80);
+    spawn(&mut s, "sleep 30", here());
+    spawn(&mut s, "sleep 31", here());
+    let ids: Vec<u64> = snapshot(&mut s).iter().map(|t| t.id).collect();
+    s.apply(Command::Tag {
+        id: ids[0],
+        on: true,
+    });
+    s.apply(Command::Flagship { id: Some(ids[1]) });
+
+    let cfg = s.session_config();
+    assert_eq!(
+        cfg[&path::abbreviate(&here())],
+        vec![
+            SessionEntry {
+                tagged: true,
+                ..SessionEntry::literal("sleep 30")
+            },
+            SessionEntry {
+                flagship: true,
+                ..SessionEntry::literal("sleep 31")
+            },
+        ]
+    );
+}
+
 /// Verify that `tick` queues only a `Tasks` snapshot when no task is watched,
 /// then queues a `Screen` for the watched task after `Watch`.
 #[test]
@@ -1815,9 +1844,10 @@ fn take_dirty(s: &mut Supervisor) -> bool {
     s.recovery.last_mutation.take().is_some()
 }
 
-/// Recipe-changing commands arm recovery even when rejected; tags do not.
+/// Recipe-changing commands, marks included, arm recovery even when rejected; `Kill`
+/// changes only lifecycle and does not.
 #[test]
-fn recovery_arms_on_structural_mutations_not_tag() {
+fn recovery_arms_on_recipe_mutations_not_kill() {
     let mut s = sup(24, 80);
     assert!(!take_dirty(&mut s), "a fresh supervisor starts clean");
 
@@ -1827,9 +1857,15 @@ fn recovery_arms_on_structural_mutations_not_tag() {
 
     s.recovery.last_mutation = None; // Reset after the tick in first_id.
     s.apply(Command::Tag { id, on: true });
+    assert!(take_dirty(&mut s), "Tag must arm");
+
+    s.apply(Command::Flagship { id: Some(id) });
+    assert!(take_dirty(&mut s), "Flagship must arm");
+
+    s.apply(Command::Kill { id });
     assert!(
         !take_dirty(&mut s),
-        "Tag is not recipe state and must not arm"
+        "Kill is lifecycle, not recipe state, and must not arm"
     );
 
     s.apply(Command::SetGroup {
@@ -2106,18 +2142,18 @@ fn rerun_clears_flagship() {
     assert_eq!(s.flagship, None);
 }
 
-/// Do not arm recovery when marking or clearing the flagship.
+/// Arm recovery when marking or clearing the flagship: both change the stored mark.
 #[test]
-fn flagship_does_not_affect_recipe() {
+fn flagship_mark_and_clear_arm_recovery() {
     let mut s = sup(24, 80);
     spawn(&mut s, "sleep 30", here());
     let id = spawned_id(&mut s);
     s.recovery.last_mutation = None; // Reset after spawning to test the mark in isolation.
 
     s.apply(Command::Flagship { id: Some(id) });
-    assert!(!take_dirty(&mut s), "marking must not arm");
+    assert!(take_dirty(&mut s), "marking must arm");
     s.apply(Command::Flagship { id: None });
-    assert!(!take_dirty(&mut s), "clearing must not arm");
+    assert!(take_dirty(&mut s), "clearing must arm");
 }
 
 /// Session listings include recovery metadata in descending stem order.
@@ -2225,6 +2261,141 @@ fn load_recovery_materializes_the_fleet_and_notices() {
     };
     assert_eq!(by_cmd(&s, "sleep 30"), (Some("api".into()), None));
     assert_eq!(by_cmd(&s, "sleep 31"), (None, Some("web".into())));
+}
+
+/// Loading restores each entry's tag and the stored flagship. A flagship already held
+/// outranks a stored one: the loaded task is admitted unmarked and the live mark stays.
+#[test]
+fn load_applies_marks_and_a_live_flagship_wins() {
+    let dir = scratch("load_marks");
+    let config = dir.join("config");
+    let mut s = sup_ctx(config_ctx(&config, dir.to_path_buf(), &[]));
+    let cfg = SessionConfig::from([(
+        dir.to_string_lossy().into_owned(),
+        vec![
+            SessionEntry {
+                tagged: true,
+                ..SessionEntry::literal("sleep 30")
+            },
+            SessionEntry {
+                flagship: true,
+                ..SessionEntry::literal("sleep 31")
+            },
+        ],
+    )]);
+    session::save_in(&config.join("sessions"), "marks", &cfg).unwrap();
+
+    s.apply(Command::LoadSession {
+        name: "marks".into(),
+    });
+    let views = snapshot(&mut s);
+    let marks: Vec<(&str, bool, bool)> = views
+        .iter()
+        .map(|t| (t.command.as_str(), t.tagged, t.flagship))
+        .collect();
+    assert_eq!(
+        marks,
+        [("sleep 30", true, false), ("sleep 31", false, true)]
+    );
+
+    // The live flagship is moved to a direct spawn; a second load must not take it back.
+    spawn(&mut s, "sleep 32", dir.to_path_buf());
+    let live = snapshot(&mut s).last().unwrap().id;
+    s.apply(Command::Flagship { id: Some(live) });
+    s.apply(Command::LoadSession {
+        name: "marks".into(),
+    });
+    let views = snapshot(&mut s);
+    assert_eq!(views.len(), 5, "load is additive");
+    let flagged: Vec<u64> = views.iter().filter(|t| t.flagship).map(|t| t.id).collect();
+    assert_eq!(flagged, [live], "the live flagship must survive a load");
+    assert!(
+        views.iter().filter(|t| t.id > live).all(|t| !t.flagship),
+        "a stored flagship must not displace the live one"
+    );
+    assert_eq!(
+        views.iter().filter(|t| t.tagged).count(),
+        2,
+        "tags are restored on every load"
+    );
+}
+
+/// A debounced snapshot follows `Tag`: the file is rewritten with the mark.
+#[test]
+fn recovery_snapshot_carries_a_tag() {
+    let dir = scratch("recovery_tag");
+    let config = dir.join("config");
+    let mut s = recovery_sup(
+        &config,
+        dir.to_path_buf(),
+        Duration::from_millis(100),
+        Duration::from_secs(600),
+    );
+    let snapshot_text = |config: &Path| {
+        let files = recovery_files(config);
+        assert_eq!(
+            files.len(),
+            1,
+            "one incarnation owns one snapshot: {files:?}"
+        );
+        std::fs::read_to_string(config.join("sessions").join("recovery").join(&files[0])).unwrap()
+    };
+    spawn(&mut s, "sleep 30", dir.to_path_buf());
+    let id = first_id(&mut s);
+    assert!(
+        wait_until(Duration::from_secs(5), || {
+            s.tick();
+            !recovery_files(&config).is_empty()
+        }),
+        "the first snapshot never landed"
+    );
+    assert!(
+        !snapshot_text(&config).contains("tagged"),
+        "an unmarked fleet writes no mark field"
+    );
+
+    s.apply(Command::Tag { id, on: true });
+    assert!(
+        wait_until(Duration::from_secs(5), || {
+            s.tick();
+            snapshot_text(&config).contains("\"tagged\": true")
+        }),
+        "the snapshot was never rewritten with the tag: {}",
+        snapshot_text(&config)
+    );
+}
+
+/// Clearing the flagship on task exit arms a debounced pass; a tick with nothing to
+/// clear does not.
+#[test]
+fn tick_flagship_clear_arms_recovery() {
+    let mut s = sup(24, 80);
+    spawn(&mut s, "sleep 30", here());
+    let id = first_id(&mut s);
+    s.apply(Command::Flagship { id: Some(id) });
+    assert!(
+        view_of(&mut s, id).flagship,
+        "premise: the live task is marked"
+    );
+    assert!(take_dirty(&mut s), "Flagship must arm");
+    // `snapshot` drains: a bare tick would leave this view queued ahead of the
+    // post-exit one `view_of` reads below.
+    assert!(
+        snapshot(&mut s)[0].flagship,
+        "a tick with nothing to clear keeps the mark"
+    );
+    assert!(
+        !take_dirty(&mut s),
+        "a tick with nothing to clear must not arm"
+    );
+
+    s.apply(Command::Kill { id });
+    wait_exited(&mut s, id);
+    assert!(!take_dirty(&mut s), "neither Kill nor reap arms by itself");
+    assert!(!view_of(&mut s, id).flagship, "the mark is cleared on exit");
+    assert!(take_dirty(&mut s), "the clear must arm");
+    s.tick();
+    assert!(!take_dirty(&mut s), "arm only on the tick that clears");
 }
 
 /// Unknown and path-shaped recovery stems fail without spawning tasks.

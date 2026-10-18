@@ -231,13 +231,13 @@ fn affects_recipe(cmd: &Command) -> bool {
         | Command::Restart { .. }
         | Command::SetGroup { .. }
         | Command::SetName { .. }
-        | Command::LoadSession { .. }
-        | Command::LoadRecovery { .. } => true,
-        // Preserve the recipe for lifecycle (`Kill`) and dashboard-state
-        // (`Tag`, `Flagship`) updates, and for the remaining commands.
-        Command::Kill { .. }
         | Command::Tag { .. }
         | Command::Flagship { .. }
+        | Command::LoadSession { .. }
+        | Command::LoadRecovery { .. } => true,
+        // `Kill` changes lifecycle, which the recipe does not record. The rest are
+        // input, view, or meta: they touch nothing `session_config` serializes.
+        Command::Kill { .. }
         | Command::Resize { .. }
         | Command::Watch { .. }
         | Command::Paste { .. }
@@ -559,6 +559,12 @@ impl Supervisor {
                 .is_none_or(|i| self.tasks[i].finished.is_some())
         {
             self.flagship = None;
+            // The clear is not a command, so `apply` never arms recovery for it. Without
+            // this, only the 60 s cadence pass would notice, and the snapshot on disk,
+            // written while the task was live and marked, would stay current for up to a
+            // minute; a load from it would restore a flagship the core had already
+            // dropped.
+            self.recovery.last_mutation = Some(Instant::now());
         }
         let now = Instant::now();
         // vte re-checks its ?2026 sync timeout only when bytes arrive, so a
@@ -1031,9 +1037,9 @@ impl Supervisor {
         }
     }
 
-    /// Build `{dir: [entries]}` in spawn order, preserving groups and names. Save managed
-    /// tasks as agent words with the best-known session IDs; save literals as their exact
-    /// text.
+    /// Build `{dir: [entries]}` in spawn order, preserving groups, names, tags, and the
+    /// flagship mark. Save managed tasks as agent words with the best-known session IDs;
+    /// save literals as their exact text.
     fn session_config(&self) -> SessionConfig {
         // `admit` appends monotonic IDs; `rerun` preserves both index and ID;
         // removal preserves relative order.
@@ -1056,6 +1062,8 @@ impl Supervisor {
                     kind,
                     group: t.group.clone(),
                     name: t.name.clone(),
+                    tagged: t.tagged,
+                    flagship: self.flagship == Some(t.id),
                 });
         }
         cfg
@@ -1104,8 +1112,10 @@ impl Supervisor {
 
     /// Spawn each recipe entry in its existing directory; skip missing directories. Resolve
     /// managed binaries as on the Agent page. Record a missing binary as a failed entry
-    /// with a diagnostic, then continue loading. Return the outcome for one summary line,
-    /// or `None` after reporting a missing launch context.
+    /// with a diagnostic, then continue loading. Restore each admitted entry's tag; restore
+    /// a stored flagship only when no task holds the mark, since load is additive and the
+    /// live mark outranks the file. Return the outcome for one summary line, or `None`
+    /// after reporting a missing launch context.
     fn materialize(&mut self, cfg: &SessionConfig) -> Option<LoadOutcome> {
         let launch = self.launch_or_refuse()?;
         let mut out = LoadOutcome::default();
@@ -1147,9 +1157,15 @@ impl Supervisor {
                     entry.group.clone(),
                     entry.name.clone(),
                 ) {
-                    Ok((_, notice)) => {
+                    Ok((id, notice)) => {
                         out.spawned += 1;
                         out.notes.extend(notice);
+                        if entry.tagged {
+                            self.with_task(id, |t| t.tagged = true);
+                        }
+                        if entry.flagship && self.flagship.is_none() {
+                            self.flagship = Some(id);
+                        }
                     }
                     // Track spawn failures separately from skipped entries.
                     Err(e) => {
