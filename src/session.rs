@@ -44,7 +44,7 @@ pub struct SessionEntry {
     pub name: Option<String>,
     /// The `m` "in use" tag.
     pub tagged: bool,
-    /// The `]` mark. At most one entry per file: `from_json` refuses a second.
+    /// The `]` mark. Allow at most one flagged entry per file; reject a second in `from_json`.
     pub flagship: bool,
 }
 
@@ -148,8 +148,7 @@ fn dirs_json(cfg: &SessionConfig) -> jzon::JsonValue {
             };
             insert_opt_str(&mut m, "group", e.group.as_deref());
             insert_opt_str(&mut m, "name", e.name.as_deref());
-            // Omit false marks so an unmarked file is byte-identical to one written
-            // before marks were stored.
+            // Omit false marks to preserve the exact serialization of unmarked entries.
             if e.tagged {
                 let _ = m.insert("tagged", true);
             }
@@ -186,9 +185,9 @@ pub fn fingerprint_json(cfg: &SessionConfig) -> String {
 /// of version: strings and `{"cmd"}` objects for literals, `{"agent"}` objects for managed
 /// agents. Reject the whole file for objects with both keys, unregistered agents, resume
 /// IDs that are not strict UUIDs, non-boolean `tagged` or `flagship` fields, or a second
-/// `flagship`. Never rewrite an entry: a v1 file loads verbatim, every entry literal. The
-/// rewrite that converted v1 agent commands to managed entries (v1 had no managed form)
-/// shipped in 0.15.0 and was retired in the release after it.
+/// `flagship`. Never rewrite an entry: load a v1 file verbatim, with every entry literal.
+/// Conversion of v1 agent commands to managed entries (v1 had no managed form) was
+/// introduced in 0.15.0 and retired in the release after it.
 fn from_json(text: &str) -> io::Result<(Option<String>, SessionConfig)> {
     let invalid = |message| io::Error::new(io::ErrorKind::InvalidData, message);
     let parsed = jzon::parse(text).map_err(|e| invalid(e.to_string()))?;
@@ -224,8 +223,8 @@ fn from_json(text: &str) -> io::Result<(Option<String>, SessionConfig)> {
         (None, &parsed, true)
     };
     let mut cfg = SessionConfig::new();
-    // Location of the first flagged entry, in file order: the supervisor holds one
-    // flagship id, so a second entry has no task state to land in.
+    // Retain the first flagged entry's location for diagnostics: only one flagship ID
+    // can be represented in supervisor state.
     let mut flagship_at: Option<String> = None;
     for (dir, val) in dirs.entries() {
         // In a flat file, `version` is metadata beside the directory keys.
@@ -777,8 +776,8 @@ mod tests {
         );
     }
 
-    /// Round-trip marked entries. A tagged literal leaves the bare-string form; a plain
-    /// literal keeps it. Marks are written only when true, after the labels.
+    /// Round-trip marked entries. Serialize a tagged literal as an object and a plain
+    /// literal as a bare string. Write marks only when true, after the labels.
     #[test]
     fn round_trips_marked_entries() {
         let dir = temp("session_marks_roundtrip");
@@ -808,7 +807,7 @@ mod tests {
         );
     }
 
-    /// `false`, `null`, and omission all leave a mark unset, on both entry forms.
+    /// Treat `false`, `null`, and omission as an unset mark on both entry forms.
     #[test]
     fn unset_marks_parse_as_false_in_every_spelling() {
         for spelling in [
@@ -824,8 +823,8 @@ mod tests {
     }
 
     /// Reject the entire file for a non-boolean mark, naming the field, or for a second
-    /// flagship, naming both locations. A bare-string entry has no field to carry a mark,
-    /// so it can never be the conflicting entry.
+    /// flagship, naming both locations. Use object fields to store marks; a bare-string
+    /// entry cannot be the conflicting entry.
     #[test]
     fn rejects_malformed_marks() {
         let cases = [

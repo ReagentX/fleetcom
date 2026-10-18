@@ -235,8 +235,8 @@ fn affects_recipe(cmd: &Command) -> bool {
         | Command::Flagship { .. }
         | Command::LoadSession { .. }
         | Command::LoadRecovery { .. } => true,
-        // `Kill` changes lifecycle, which the recipe does not record. The rest are
-        // input, view, or meta: they touch nothing `session_config` serializes.
+        // Exclude `Kill`: lifecycle is not part of the recipe. For the remaining input,
+        // view, and meta commands, no fields serialized by `session_config` are changed.
         Command::Kill { .. }
         | Command::Resize { .. }
         | Command::Watch { .. }
@@ -308,10 +308,9 @@ pub struct Supervisor {
     watched: Option<u64>,
     /// Whether the current watch permits clipboard forwarding.
     watch_attached: bool,
-    /// The flagship task id, or `None`: at most one id is representable. `reap` clears
-    /// it once the task is finished or absent. Between reaps it can name a task that
-    /// `Remove` dropped or whose exit is not yet latched, so decisions that need a live
-    /// holder read it through `flagship_holder`.
+    /// The flagship task ID, or `None`. Clear it in `reap` once the task is finished or
+    /// absent. Between reaps, the ID may refer to a removed task or one whose exit is not
+    /// yet latched. Use `flagship_holder` to check for an unfinished task still in the set.
     flagship: Option<u64>,
     /// The last emitted screen fingerprint. `lines` stays empty because only
     /// emitted copies carry them. Cleared when `watched` changes to force a
@@ -526,25 +525,22 @@ impl Supervisor {
             }
         }
         self.graveyard.retain_mut(|t| !t.try_collect());
-        // Check current state rather than individual transitions to handle exit,
-        // removal, session load, and marks placed on already-finished tasks. The check
-        // lives here, not in `tick`, because the detached daemon reaps without ticking:
-        // a flagship that exited between clients would otherwise keep its mark in every
-        // snapshot until the next connection.
+        // Check current state to cover exit, removal, session load, and marks placed on
+        // already-finished tasks. Check during reaping because `tick` is not called between
+        // clients; otherwise, an exited flagship would remain marked in recovery
+        // snapshots until the next connection.
         if self.flagship.is_some() && self.flagship_holder().is_none() {
             self.flagship = None;
-            // The clear is not a command, so `apply` never arms recovery for it. Without
-            // this, only the 60 s cadence pass would notice, and the snapshot on disk,
-            // written while the task was live and marked, would stay current for up to a
-            // minute; a load from it would restore a flagship the core had already
-            // dropped.
+            // Schedule recovery explicitly after clearing the mark outside `apply`.
+            // Otherwise, a user can restore the old mark from disk before the 60 s
+            // cadence pass.
             self.recovery.last_mutation = Some(Instant::now());
         }
     }
 
-    /// The flagship's id while an unfinished task in the set holds it. `flagship` itself
-    /// may be stale between reaps: `Remove` leaves it set, and an exit is latched only by
-    /// `reap`.
+    /// Return the flagship ID only for an unfinished task still in the set. Between
+    /// reaps, the stored ID may refer to a removed task or one whose exit is not yet
+    /// latched.
     fn flagship_holder(&self) -> Option<u64> {
         self.flagship.filter(|&id| {
             self.index_of(id)
@@ -1122,10 +1118,10 @@ impl Supervisor {
 
     /// Spawn each recipe entry in its existing directory; skip missing directories. Resolve
     /// managed binaries as on the Agent page. Record a missing binary as a failed entry
-    /// with a diagnostic, then continue loading. Restore each admitted entry's tag; restore
-    /// a stored flagship only when no live task holds the mark, since load is additive and
-    /// the live mark outranks the file. Return the outcome for one summary line, or `None`
-    /// after reporting a missing launch context.
+    /// with a diagnostic, then continue loading. Restore each admitted entry's tag.
+    /// Preserve the current tasks and their marks: restore a stored flagship only when
+    /// no live task is marked. Return the outcome for one summary line, or `None` after
+    /// reporting a missing launch context.
     fn materialize(&mut self, cfg: &SessionConfig) -> Option<LoadOutcome> {
         let launch = self.launch_or_refuse()?;
         let mut out = LoadOutcome::default();
@@ -1173,8 +1169,8 @@ impl Supervisor {
                         if entry.tagged {
                             self.with_task(id, |t| t.tagged = true);
                         }
-                        // `flagship` may still name a task `Remove` dropped since the last
-                        // reap; only a live holder outranks the stored mark.
+                        // Ignore a removed flagship's ID before the next reap. Preserve
+                        // the current mark only for a live holder.
                         if entry.flagship && self.flagship_holder().is_none() {
                             self.flagship = Some(id);
                         }

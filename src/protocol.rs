@@ -453,7 +453,7 @@ fn num_from<T: TryFrom<u64>>(v: &jzon::JsonValue) -> Option<T> {
 }
 
 /// Decode an optional boolean flag. Use `false` for missing or null values; reject the
-/// message for other non-boolean values. Session entry marks use the same rule.
+/// message for other non-boolean values. Apply the same rule to session entry marks.
 pub fn bool_flag(v: &jzon::JsonValue) -> Option<bool> {
     if v.is_null() {
         return Some(false);

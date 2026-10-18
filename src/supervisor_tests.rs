@@ -77,7 +77,7 @@ fn session_config_groups_by_dir_in_spawn_order() {
     assert_eq!(cfg["/tmp"], vec![SessionEntry::literal("b")]);
 }
 
-/// The recipe carries the `m` tag and the flagship mark of each task.
+/// Include each task's `m` tag and flagship mark in the recipe.
 #[test]
 fn session_config_carries_marks() {
     let mut s = sup(24, 80);
@@ -1839,7 +1839,7 @@ fn recovery_files(config: &Path) -> Vec<String> {
     names
 }
 
-/// The one recovery snapshot under `config`'s session root, as text.
+/// Read the sole recovery snapshot under `config`'s session root as text.
 fn recovery_text(config: &Path) -> String {
     let files = recovery_files(config);
     assert_eq!(
@@ -1855,8 +1855,8 @@ fn take_dirty(s: &mut Supervisor) -> bool {
     s.recovery.last_mutation.take().is_some()
 }
 
-/// Recipe-changing commands, marks included, arm recovery even when rejected; `Kill`
-/// changes only lifecycle and does not.
+/// Schedule recovery for recipe-changing commands, including marks and rejected
+/// commands. Exclude `Kill`: lifecycle is not part of the recipe.
 #[test]
 fn recovery_arms_on_recipe_mutations_not_kill() {
     let mut s = sup(24, 80);
@@ -2153,7 +2153,7 @@ fn rerun_clears_flagship() {
     assert_eq!(s.flagship, None);
 }
 
-/// Arm recovery when marking or clearing the flagship: both change the stored mark.
+/// Schedule recovery after setting or clearing the flagship mark.
 #[test]
 fn flagship_mark_and_clear_arm_recovery() {
     let mut s = sup(24, 80);
@@ -2274,8 +2274,8 @@ fn load_recovery_materializes_the_fleet_and_notices() {
     assert_eq!(by_cmd(&s, "sleep 31"), (None, Some("web".into())));
 }
 
-/// Loading restores each entry's tag and the stored flagship. A flagship already held
-/// outranks a stored one: the loaded task is admitted unmarked and the live mark stays.
+/// Restore tags and the stored flagship on load. If a live task is already marked,
+/// preserve that mark and admit the stored flagship as an unmarked task.
 #[test]
 fn load_applies_marks_and_a_live_flagship_wins() {
     let dir = scratch("load_marks");
@@ -2309,7 +2309,7 @@ fn load_applies_marks_and_a_live_flagship_wins() {
         [("sleep 30", true, false), ("sleep 31", false, true)]
     );
 
-    // The live flagship is moved to a direct spawn; a second load must not take it back.
+    // Mark a directly spawned task, then load again to check that its mark is preserved.
     spawn(&mut s, "sleep 32", dir.to_path_buf());
     let live = snapshot(&mut s).last().unwrap().id;
     s.apply(Command::Flagship { id: Some(live) });
@@ -2331,7 +2331,7 @@ fn load_applies_marks_and_a_live_flagship_wins() {
     );
 }
 
-/// A debounced snapshot follows `Tag`: the file is rewritten with the mark.
+/// Rewrite the recovery snapshot with the tag after the debounce interval.
 #[test]
 fn recovery_snapshot_carries_a_tag() {
     let dir = scratch("recovery_tag");
@@ -2367,9 +2367,9 @@ fn recovery_snapshot_carries_a_tag() {
     );
 }
 
-/// The reap that latches the flagship's exit clears the mark and arms a debounced pass;
-/// a reap with nothing to clear does neither. `reap`, not `tick`, owns the clear because
-/// the detached daemon reaps without ticking.
+/// Clear the mark and schedule recovery when latching the flagship's exit in `reap`.
+/// Preserve the recovery schedule when nothing is cleared. Reap directly, without
+/// ticking, to cover the detached daemon path.
 #[test]
 fn reap_clears_an_exited_flagship_and_arms_recovery() {
     let mut s = sup(24, 80);
@@ -2400,8 +2400,8 @@ fn reap_clears_an_exited_flagship_and_arms_recovery() {
     assert!(!take_dirty(&mut s), "arm only on the reap that clears");
 }
 
-/// Between clients the daemon reaps and runs maintenance without ticking. An exited
-/// flagship must leave the snapshot on that path too, or the next load restores it.
+/// Reap and run maintenance without ticking to match the detached daemon loop. Remove
+/// the exited flagship's mark from the snapshot to avoid restoring it on the next load.
 #[test]
 fn detached_maintenance_drops_an_exited_flagship_from_the_snapshot() {
     let dir = scratch("detached_mark");
@@ -2436,9 +2436,8 @@ fn detached_maintenance_drops_an_exited_flagship_from_the_snapshot() {
     );
 }
 
-/// `Remove` leaves the flagship id behind until a reap. Loaded before that reap, a
-/// stored mark must still be applied: nothing live holds the flagship, so the stale id
-/// has no precedence.
+/// Restore a stored flagship when loading after removal and before reaping. The old ID
+/// is still set, but no live task is marked.
 #[test]
 fn load_flagship_is_not_blocked_by_a_removed_holder() {
     let dir = scratch("load_stale_flagship");

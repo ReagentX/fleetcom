@@ -165,7 +165,7 @@ The runtime directory is validated before its contents are used. The path must b
 
 Full command lines are persisted in recipes, including any embedded secrets. A token passed as an argument is written to its session file and to every recovery snapshot that captures the task.
 
-The client environment is not persisted. Each client's environment and working directory are sent during the connection handshake and retained in daemon memory. Only directories, commands, group assignments, display names, tags, and the flagship are stored in session and recovery files.
+The client environment is not persisted. Each client's environment and working directory are sent during the connection handshake and retained in daemon memory. Use session and recovery files to preserve only directories, commands, group assignments, display names, tags, and the flagship.
 
 ### Captured IDs
 
