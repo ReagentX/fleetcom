@@ -34,9 +34,9 @@ pub enum EntryKind {
     },
 }
 
-/// One recipe entry. Serialize a literal with no group, no name, and neither mark as a
-/// bare string. Use an object for every other entry, writing optional fields only when
-/// set and marks only when true.
+/// One recipe entry. Serialize a literal with no group, no name, no mark, and not
+/// stopped as a bare string. Use an object for every other entry, writing optional
+/// fields only when set and flags only when true.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionEntry {
     pub kind: EntryKind,
@@ -46,11 +46,14 @@ pub struct SessionEntry {
     pub tagged: bool,
     /// The `]` mark. Allow at most one flagged entry per file; reject a second in `from_json`.
     pub flagship: bool,
+    /// Whether the task had no live process when the file was written. On load,
+    /// restore a stopped entry as a row without a process. Press `r` to start it.
+    pub stopped: bool,
 }
 
 #[cfg(test)]
 impl SessionEntry {
-    /// Unlabelled, unmarked literal entry.
+    /// Unlabelled, unmarked, live literal entry.
     pub fn literal(cmd: &str) -> Self {
         Self {
             kind: EntryKind::Literal(cmd.into()),
@@ -58,10 +61,11 @@ impl SessionEntry {
             name: None,
             tagged: false,
             flagship: false,
+            stopped: false,
         }
     }
 
-    /// Unlabelled, unmarked managed entry.
+    /// Unlabelled, unmarked, live managed entry.
     pub fn managed(agent: &str, resume: Option<&str>) -> Self {
         Self {
             kind: EntryKind::Managed {
@@ -72,6 +76,7 @@ impl SessionEntry {
             name: None,
             tagged: false,
             flagship: false,
+            stopped: false,
         }
     }
 }
@@ -132,9 +137,13 @@ fn dirs_json(cfg: &SessionConfig) -> jzon::JsonValue {
         let mut arr = jzon::JsonValue::new_array();
         for e in entries {
             let mut m = match &e.kind {
-                // Use the string form for a literal without optional labels or marks.
+                // Use the string form for a live literal without optional labels or marks.
                 EntryKind::Literal(cmd)
-                    if e.group.is_none() && e.name.is_none() && !e.tagged && !e.flagship =>
+                    if e.group.is_none()
+                        && e.name.is_none()
+                        && !e.tagged
+                        && !e.flagship
+                        && !e.stopped =>
                 {
                     let _ = arr.push(cmd.as_str());
                     continue;
@@ -148,12 +157,15 @@ fn dirs_json(cfg: &SessionConfig) -> jzon::JsonValue {
             };
             insert_opt_str(&mut m, "group", e.group.as_deref());
             insert_opt_str(&mut m, "name", e.name.as_deref());
-            // Omit false marks to preserve the exact serialization of unmarked entries.
+            // Omit false flags to preserve the exact serialization of unmarked entries.
             if e.tagged {
                 let _ = m.insert("tagged", true);
             }
             if e.flagship {
                 let _ = m.insert("flagship", true);
+            }
+            if e.stopped {
+                let _ = m.insert("stopped", true);
             }
             let _ = arr.push(m);
         }
@@ -184,8 +196,9 @@ pub fn fingerprint_json(cfg: &SessionConfig) -> String {
 /// through [`FORMAT_VERSION`]. Treat a missing version as 1. Accept entry forms regardless
 /// of version: strings and `{"cmd"}` objects for literals, `{"agent"}` objects for managed
 /// agents. Reject the whole file for objects with both keys, unregistered agents, resume
-/// IDs that are not strict UUIDs, non-boolean `tagged` or `flagship` fields, or a second
-/// `flagship`. Never rewrite an entry: load a v1 file verbatim, with every entry literal.
+/// IDs that are not strict UUIDs, non-boolean `tagged`, `flagship`, or `stopped` fields,
+/// or a second `flagship`. Never rewrite an entry: load a v1 file verbatim, with every
+/// entry literal.
 /// Conversion of v1 agent commands to managed entries (v1 had no managed form) was
 /// introduced in 0.15.0 and retired in the release after it.
 fn from_json(text: &str) -> io::Result<(Option<String>, SessionConfig)> {
@@ -243,6 +256,7 @@ fn from_json(text: &str) -> io::Result<(Option<String>, SessionConfig)> {
                     name: None,
                     tagged: false,
                     flagship: false,
+                    stopped: false,
                 });
                 continue;
             }
@@ -305,6 +319,7 @@ fn from_json(text: &str) -> io::Result<(Option<String>, SessionConfig)> {
                 name: label("name")?,
                 tagged: mark("tagged")?,
                 flagship: mark("flagship")?,
+                stopped: mark("stopped")?,
             };
             if entry.flagship {
                 if let Some(first) = &flagship_at {
@@ -804,6 +819,57 @@ mod tests {
             format!(
                 r#"{{"~/p":[{{"cmd":"cargo test","tagged":true}},{{"agent":"claude","resume":"{ID}","flagship":true}},"vim"]}}"#
             )
+        );
+    }
+
+    /// Round-trip stopped entries. Use the object form for a stopped literal, write
+    /// the flag after the marks for a stopped managed entry, and use a bare string
+    /// for a live unmarked literal.
+    #[test]
+    fn round_trips_stopped_entries() {
+        let dir = temp("session_stopped_roundtrip");
+        let mut cfg = SessionConfig::new();
+        cfg.insert(
+            "~/p".into(),
+            vec![
+                SessionEntry {
+                    stopped: true,
+                    ..e("cargo test")
+                },
+                SessionEntry {
+                    tagged: true,
+                    stopped: true,
+                    ..m("claude", Some(ID))
+                },
+                e("vim"),
+            ],
+        );
+
+        save_in(&dir, "stopped", &cfg).unwrap();
+        assert_eq!(load_in(&dir, "stopped").unwrap(), cfg);
+        assert_eq!(
+            fingerprint_json(&cfg),
+            format!(
+                r#"{{"~/p":[{{"cmd":"cargo test","stopped":true}},{{"agent":"claude","resume":"{ID}","tagged":true,"stopped":true}},"vim"]}}"#
+            )
+        );
+    }
+
+    /// Treat `false`, `null`, and omission as live on both entry forms; refuse any
+    /// other type, naming the field.
+    #[test]
+    fn stopped_parses_like_a_mark() {
+        for spelling in ["", r#", "stopped": false"#, r#", "stopped": null"#] {
+            let text =
+                format!(r#"{{"d": [{{"cmd": "vim"{spelling}}}, {{"agent": "omp"{spelling}}}]}}"#);
+            let (_, cfg) = from_json(&text).unwrap();
+            assert_eq!(cfg["d"], vec![e("vim"), m("omp", None)], "{text}");
+        }
+        let err = from_json(r#"{"d": ["vim", {"cmd": "top", "stopped": "yes"}]}"#).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            err.to_string(),
+            "directory \"d\", entry 2, field \"stopped\": expected a boolean or null"
         );
     }
 

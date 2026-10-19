@@ -9,6 +9,7 @@ use std::{
     os::unix::net::UnixStream,
     path::{Path, PathBuf},
     process::{Command, Stdio},
+    sync::{Arc, Mutex},
     time::Duration,
 };
 
@@ -49,10 +50,32 @@ fn hello(stream: &mut UnixStream, s: &Scratch) {
 
 /// Drain daemon events while a test polls files. Without this reader, snapshot
 /// traffic can fill the socket and block the daemon. The thread exits with the
-/// connection.
-fn drain_events(stream: &UnixStream) {
+/// connection. Return the newest `tasks` snapshot text. Read lifecycle state
+/// through this value in tests; do not compete with the drainer for stream frames.
+fn drain_events(stream: &UnixStream) -> Arc<Mutex<String>> {
     let mut rx = stream.try_clone().unwrap();
-    std::thread::spawn(move || while read_frame(&mut rx).is_ok() {});
+    let latest = Arc::new(Mutex::new(String::new()));
+    let seen = Arc::clone(&latest);
+    std::thread::spawn(move || {
+        while let Ok((kind, payload)) = read_frame(&mut rx) {
+            if kind == 1 && payload.starts_with(br#"{"t":"tasks""#) {
+                *seen.lock().unwrap() = String::from_utf8_lossy(&payload).into_owned();
+            }
+        }
+    });
+    latest
+}
+
+/// Wait for confirmation of a clean exit in the newest snapshot. Latch the exit
+/// before checking the recipe so the sole task is saved as stopped.
+fn wait_sole_task_ok(latest: &Arc<Mutex<String>>) {
+    assert!(
+        wait_until(Duration::from_secs(10), || {
+            latest.lock().unwrap().contains(r#""life":"ok""#)
+        }),
+        "the task never exited: {}",
+        latest.lock().unwrap()
+    );
 }
 
 /// Install a `claude` stub to record argv, write a `SessionStart` payload,
@@ -212,9 +235,12 @@ fn capture_slot(runtime: &Path) -> Option<String> {
         .map(|(_, contents)| contents)
 }
 
-/// Managed entry for `agent` resuming `id`, in the pretty-printed `to_json` format.
-fn managed_entry(agent: &str, id: &str) -> String {
-    format!("{{\n        \"agent\": \"{agent}\",\n        \"resume\": \"{id}\"\n      }}")
+/// Managed entry for `agent` resuming `id`, in the pretty-printed `to_json` format, as
+/// saved after the task exited, with `stopped` set to true.
+fn stopped_managed_entry(agent: &str, id: &str) -> String {
+    format!(
+        "{{\n        \"agent\": \"{agent}\",\n        \"resume\": \"{id}\",\n        \"stopped\": true\n      }}"
+    )
 }
 
 /// Capture a managed Claude ID, save without injected flags in the recipe, and reload the
@@ -225,7 +251,7 @@ fn claude_spawn_save_load_resumes_the_conversation() {
     install_claude_stub(&s);
     let (_dir, mut daemon, mut stream) = start_daemon_raw("resume_claude", |_| {});
     hello(&mut stream, &s);
-    drain_events(&stream);
+    let latest = drain_events(&stream);
 
     stream
         .write_all(&spawn_agent_frame("claude", &s.work()))
@@ -239,10 +265,13 @@ fn claude_spawn_save_load_resumes_the_conversation() {
     let settings = PathBuf::from(value_after(&argv, "--settings"));
     assert_daemon_namespaced(&settings, daemon.0.id(), "settings overlay", &argv);
 
-    // The pinned ID is stored in `resume_id` at spawn: save once to verify it.
+    // Save once to verify the ID pinned in `resume_id` at spawn. Wait for the
+    // stub's exit to save it as stopped. After loading, start the restored row
+    // with `r` to resume the conversation.
+    wait_sole_task_ok(&latest);
     let recipe = save_once(&mut stream, &s.recipe("story"), "story");
     assert!(
-        recipe.contains(&managed_entry("claude", &id)),
+        recipe.contains(&stopped_managed_entry("claude", &id)),
         "the recipe must resume the pinned id: {recipe}"
     );
     assert!(
@@ -252,6 +281,9 @@ fn claude_spawn_save_load_resumes_the_conversation() {
 
     stream
         .write_all(&control_frame(r#"{"t":"load","name":"story"}"#))
+        .unwrap();
+    stream
+        .write_all(&control_frame(r#"{"t":"restart","id":2}"#))
         .unwrap();
     let argv = wait_run(&rec, 1, |a| a.iter().any(|t| t == "--resume"));
     assert_eq!(
@@ -280,7 +312,7 @@ fn codex_capture_file_drives_save_and_load_resumes() {
     install_codex_stub(&s);
     let (_dir, mut daemon, mut stream) = start_daemon_raw("resume_codex", |_| {});
     hello(&mut stream, &s);
-    drain_events(&stream);
+    let latest = drain_events(&stream);
 
     stream
         .write_all(&spawn_agent_frame("codex", &s.work()))
@@ -326,14 +358,20 @@ fn codex_capture_file_drives_save_and_load_resumes() {
         Some(CODEX_ID),
         "the slot must hold the bare root after the title thread's notification"
     );
+    // Wait for the stub's exit to save it as stopped. After loading, start the
+    // restored row with `r` to resume the conversation.
+    wait_sole_task_ok(&latest);
     let recipe = save_once(&mut stream, &s.recipe("story"), "story");
     assert!(
-        recipe.contains(&managed_entry("codex", CODEX_ID)),
+        recipe.contains(&stopped_managed_entry("codex", CODEX_ID)),
         "the recipe must resume the captured thread: {recipe}"
     );
 
     stream
         .write_all(&control_frame(r#"{"t":"load","name":"story"}"#))
+        .unwrap();
+    stream
+        .write_all(&control_frame(r#"{"t":"restart","id":2}"#))
         .unwrap();
     let argv = wait_run(&rec, 1, |a| {
         a.first().is_some_and(|t| t == "resume") && a.len() >= 2
@@ -408,15 +446,17 @@ fn saved_recipe_resumes_across_a_daemon_restart() {
 
     let (_dir_a, mut daemon_a, mut stream_a) = start_daemon_raw("resume_restart_a", |_| {});
     hello(&mut stream_a, &s);
-    drain_events(&stream_a);
+    let latest = drain_events(&stream_a);
     stream_a
         .write_all(&spawn_agent_frame("claude", &s.work()))
         .unwrap();
     let argv = wait_run(&rec, 0, |a| a.iter().any(|t| t == "--session-id"));
     let id = value_after(&argv, "--session-id").to_string();
+    // Wait for the stub's exit to save it as stopped.
+    wait_sole_task_ok(&latest);
     let recipe = save_once(&mut stream_a, &s.recipe("overnight"), "overnight");
     assert!(
-        recipe.contains(&managed_entry("claude", &id)),
+        recipe.contains(&stopped_managed_entry("claude", &id)),
         "the recipe must resume the pinned id: {recipe}"
     );
     stop_daemon(&mut daemon_a);
@@ -425,8 +465,13 @@ fn saved_recipe_resumes_across_a_daemon_restart() {
     let (_dir_b, mut daemon_b, mut stream_b) = start_daemon_raw("resume_restart_b", |_| {});
     hello(&mut stream_b, &s);
     drain_events(&stream_b);
+    // Load the stopped entry as task 1 in the fresh daemon; start it with `r`
+    // to resume the conversation.
     stream_b
         .write_all(&control_frame(r#"{"t":"load","name":"overnight"}"#))
+        .unwrap();
+    stream_b
+        .write_all(&control_frame(r#"{"t":"restart","id":1}"#))
         .unwrap();
     let argv = wait_run(&rec, 1, |a| a.iter().any(|t| t == "--resume"));
     assert_eq!(

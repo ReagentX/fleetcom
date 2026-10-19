@@ -12,7 +12,7 @@ use crossterm::{
     cursor::{Hide, MoveTo, Show},
     queue,
     style::{Attribute, Color, Print, SetAttribute, SetBackgroundColor},
-    terminal::{BeginSynchronizedUpdate, EndSynchronizedUpdate},
+    terminal::{BeginSynchronizedUpdate, Clear, ClearType, EndSynchronizedUpdate},
 };
 
 use unicode_width::UnicodeWidthStr;
@@ -100,14 +100,21 @@ fn render_dashboard(out: &mut impl Write, app: &App) -> io::Result<()> {
     queue!(out, Hide, MoveTo(0, 0))?;
 
     // Tally the lifecycle values pre-computed by the core.
-    let (mut running, mut idle, mut done) = (0u32, 0u32, 0u32);
+    let (mut running, mut idle, mut done, mut stopped) = (0u32, 0u32, 0u32, 0u32);
     for v in &app.views {
         match v.lifecycle {
             Lifecycle::Active => running += 1,
             Lifecycle::Idle => idle += 1,
             Lifecycle::Ok | Lifecycle::Failed => done += 1,
+            Lifecycle::Stopped => stopped += 1,
         }
     }
+    // Show the stopped count only when at least one stopped row is present.
+    let stopped_tag = if stopped > 0 {
+        format!(" · {stopped} stopped")
+    } else {
+        String::new()
+    };
     // List region: rows 2..=list_bottom. Command line and footer sit below.
     // Scroll over section and task rows together to keep the selection visible.
     let list_top = 2u16;
@@ -136,7 +143,8 @@ fn render_dashboard(out: &mut impl Write, app: &App) -> io::Result<()> {
         _ => String::new(),
     };
     // Build and pad the complete header before styling each intensity run.
-    let prefix = format!("  fleetcom   {running} running · {idle} idle · {done} done      by ");
+    let prefix =
+        format!("  fleetcom   {running} running · {idle} idle · {done} done{stopped_tag}      by ");
     let suffix = format!("{mode_tag}{scroll_tag}");
     let segs = header_segments(&prefix, app.group_mode, &suffix);
     let plain: String = segs.iter().map(|(t, _)| t.as_str()).collect();
@@ -316,20 +324,27 @@ fn attached_title(v: &TaskView) -> String {
 }
 
 /// Age shown for a task: time since exit when finished, last output when idle, or
-/// launch otherwise. Use launch time when the edge timestamp is missing.
-fn row_age(v: &TaskView) -> Duration {
-    let edge = match v.lifecycle {
-        Lifecycle::Ok | Lifecycle::Failed => v.finished_ago,
-        Lifecycle::Idle => v.quiet_ago,
-        Lifecycle::Active => None,
+/// launch otherwise. Use launch time when the edge timestamp is missing. `None` for a
+/// stopped task: there is no launch, output, or exit time to measure from.
+fn row_age(v: &TaskView) -> Option<Duration> {
+    if v.lifecycle == Lifecycle::Stopped {
+        return None;
+    }
+    let edge = if v.lifecycle.finished() {
+        v.finished_ago
+    } else if v.lifecycle == Lifecycle::Idle {
+        v.quiet_ago
+    } else {
+        None
     };
-    edge.unwrap_or(v.started_ago)
+    edge.or(v.started_ago)
 }
 
 /// A task's lifecycle glyph, shared by the dashboard row and the `/` palette.
 /// Use the agent-reported turn status to choose the glyph: an agent can keep thinking
 /// past the idle window without writing output. Select adapters by command word so
-/// hand-typed agent commands get the same glyph as Agent-page launches.
+/// hand-typed agent commands get the same glyph as Agent-page launches. Leave the
+/// glyph blank for a stopped row: no process has run under it.
 fn status_glyph(v: &TaskView) -> &'static str {
     match v.lifecycle {
         Lifecycle::Active | Lifecycle::Idle if v.preview.working => "●",
@@ -337,6 +352,7 @@ fn status_glyph(v: &TaskView) -> &'static str {
         Lifecycle::Idle => "∙",
         Lifecycle::Ok => "✓",
         Lifecycle::Failed => "✗",
+        Lifecycle::Stopped => " ",
     }
 }
 
@@ -357,7 +373,8 @@ fn task_row_parts(v: &TaskView, cols: usize) -> (String, String, String) {
         .filter_map(|(on, c)| on.then_some(c))
         .collect();
     let glyph = status_glyph(v);
-    let time = rel_time(row_age(v));
+    // Leave the age cell blank for a stopped row; use its columns for the preview.
+    let time = row_age(v).map(rel_time).unwrap_or_default();
     let title_w = title_width(cols);
 
     // marks(2) glyph(1) sp(1) title(title_w) sp(1) preview(prev_w) sp(1) time
@@ -974,6 +991,12 @@ fn render_attached(out: &mut impl Write, app: &App) -> io::Result<()> {
 
     queue!(out, Hide, MoveTo(0, 0))?;
     if let Some(s) = screen {
+        // Clear the viewport for a stopped task: there are no formatted grid bytes
+        // to overwrite the dashboard. Skip identical frames in `render` and wrap
+        // each paint in DECSET 2026 to avoid repeated clears and tearing.
+        if s.formatted.is_empty() {
+            queue!(out, Clear(ClearType::All))?;
+        }
         out.write_all(&s.formatted)?;
         // Repaint selected spans as reverse-video plain text over the child's
         // formatted output.
@@ -1265,7 +1288,7 @@ mod tests {
             name: name.map(str::to_string),
             lifecycle: Lifecycle::Active,
             preview: Preview::floor(String::new()),
-            started_ago: std::time::Duration::from_secs(5),
+            started_ago: Some(std::time::Duration::from_secs(5)),
             quiet_ago: None,
             finished_ago: None,
         }
@@ -1282,7 +1305,7 @@ mod tests {
             lifecycle,
             quiet_ago,
             finished_ago,
-            started_ago: Duration::from_hours(2),
+            started_ago: Some(Duration::from_hours(2)),
             ..view(None)
         }
     }
@@ -1316,6 +1339,7 @@ mod tests {
                     Lifecycle::Idle => "∙",
                     Lifecycle::Ok => "✓",
                     Lifecycle::Failed => "✗",
+                    Lifecycle::Stopped => " ",
                 };
                 // Skip the two-column mark gutter before checking the glyph.
                 let body: String = row.chars().skip(2).collect();
@@ -1346,6 +1370,18 @@ mod tests {
                 "{lifecycle:?} working={working}: {row:?}"
             );
         }
+    }
+
+    /// Leave the glyph and age blank for a stopped row, even with the launch-age
+    /// fallback supplied by `timed_view`: no process has run under the row.
+    #[test]
+    fn stopped_row_has_a_blank_glyph_and_time_cell() {
+        let v = timed_view(Lifecycle::Stopped, None, None);
+        let (lead, _, time) = task_row_parts(&v, 80);
+        let body: String = lead.chars().skip(2).collect();
+        assert!(body.starts_with("  "), "{lead:?}");
+        assert_eq!(time, " ", "the time cell is its separator alone");
+        assert_eq!(task_row(&v, 80).width(), 80);
     }
 
     /// Title a dashboard row with the task's custom name when set.

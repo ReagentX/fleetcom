@@ -374,7 +374,7 @@ fn tv(id: u64) -> TaskView {
         name: None,
         lifecycle: Lifecycle::Ok,
         preview: Preview::floor(String::new()),
-        started_ago: Duration::from_millis(0),
+        started_ago: Some(Duration::from_millis(0)),
         quiet_ago: None,
         finished_ago: None,
     }
@@ -445,7 +445,7 @@ fn tasks_round_trip() {
                 frozen: false,
                 working: false,
             },
-            started_ago: Duration::from_millis(4200),
+            started_ago: Some(Duration::from_millis(4200)),
             quiet_ago: Some(Duration::from_millis(700)),
             finished_ago: None,
         },
@@ -454,7 +454,7 @@ fn tasks_round_trip() {
             // Exercise byte-preserving task-path serialization.
             cwd: PathBuf::from(OsString::from_vec(b"/srv/\xff\xfe".to_vec())),
             lifecycle: Lifecycle::Active,
-            started_ago: Duration::from_millis(10),
+            started_ago: Some(Duration::from_millis(10)),
             ..tv(2)
         },
     ]);
@@ -555,7 +555,7 @@ fn lifecycle_and_age_fields_round_trip() {
             let live = matches!(lifecycle, Lifecycle::Active | Lifecycle::Idle);
             let tasks = Event::Tasks(vec![TaskView {
                 lifecycle,
-                started_ago: Duration::from_millis(60_000),
+                started_ago: Some(Duration::from_millis(60_000)),
                 quiet_ago: if live { age } else { None },
                 finished_ago: if live { None } else { age },
                 ..tv(1)
@@ -575,6 +575,42 @@ fn lifecycle_and_age_fields_round_trip() {
             );
             assert_eq!(decode_event(k, &p), Some(tasks));
         }
+    }
+}
+
+/// Round-trip a stopped task without ages: omit `started_ms` and decode it as
+/// `None`. Decode a present `started_ms` as `Some`.
+#[test]
+fn stopped_round_trips_without_a_start_age() {
+    let stopped = Event::Tasks(vec![TaskView {
+        lifecycle: Lifecycle::Stopped,
+        started_ago: None,
+        ..tv(1)
+    }]);
+    let (k, p) = encode_event(&stopped);
+    let s = std::str::from_utf8(&p).unwrap();
+    assert!(s.contains("\"life\":\"stopped\""), "frame was {s}");
+    assert!(!s.contains("started_ms"), "frame was {s}");
+    assert_eq!(decode_event(k, &p), Some(stopped));
+
+    let started = Event::Tasks(vec![tv(1)]);
+    let (k, p) = encode_event(&started);
+    let s = std::str::from_utf8(&p).unwrap();
+    assert!(s.contains("\"started_ms\":0"), "frame was {s}");
+    assert_eq!(decode_event(k, &p), Some(started));
+}
+
+/// Classify every lifecycle in `finished` for client key handling and grouping.
+#[test]
+fn finished_classifies_every_lifecycle() {
+    for (lifecycle, want) in [
+        (Lifecycle::Active, false),
+        (Lifecycle::Idle, false),
+        (Lifecycle::Ok, true),
+        (Lifecycle::Failed, true),
+        (Lifecycle::Stopped, true),
+    ] {
+        assert_eq!(lifecycle.finished(), want, "{lifecycle:?}");
     }
 }
 

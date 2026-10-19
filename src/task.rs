@@ -62,12 +62,45 @@ pub fn positive_pid(field: &str) -> Option<i32> {
     field.parse::<i32>().ok().filter(|p| *p > 0)
 }
 
+/// A dashboard row's identity and optional [`Process`] for its current run.
+/// On rerun, preserve the row's identity and replace `process` as a unit:
+/// the PTY, preview state, and exit latch all belong to one launch.
 pub struct Task {
     pub id: u64,
     pub command: String,
     /// Working directory the command was launched in: the grouping key for
     /// "by dir" mode and the label shown when it differs from the default.
     pub cwd: PathBuf,
+    pub tagged: bool,
+    /// Dashboard group stored with the task; `None` means unassigned.
+    pub group: Option<String>,
+    /// Custom display name; `None` means unnamed.
+    pub name: Option<String>,
+    /// Harness for a managed task's session ID and blocked-status reads. Build the
+    /// argv through this harness on launch and rerun, with no intervening shell.
+    /// `None` for literal tasks: never read a harness channel for those tasks or
+    /// edit their command text.
+    pub harness: Option<&'static dyn crate::harness::Harness>,
+    /// Display-only summary adapter selected from the command's first word,
+    /// for literal and managed tasks alike.
+    pub summary_adapter: Option<&'static dyn crate::preview::SummaryAdapter>,
+    /// Run number used to give each rerun a distinct capture path.
+    pub run: u32,
+    /// Session ID pinned or resumed at spawn. Prefer a captured ID or matching live
+    /// registry ID when available.
+    pub resume_id: Option<String>,
+    /// The current run, or `None` for a stopped task: restored from a session
+    /// file without starting a process. Press `r` to start it.
+    /// Keep the kill backstop in `Process::drop`, with no `Drop` on `Task`,
+    /// so the run can be moved out and retired independently of the row.
+    pub process: Option<Process>,
+}
+
+/// One run of a task: the PTY, writer queue, reader thread, emulator, the
+/// harness paths resolved at launch, preview state, and exit bookkeeping for a
+/// single process group. On drop, send SIGKILL to the group and attempt to reap
+/// the leader, regardless of how the run left scope.
+pub struct Process {
     /// Keep the PTY master open for `resize` (`TIOCSWINSZ`). Split the reader and
     /// writer handles from it at spawn.
     master: Box<dyn MasterPty + Send>,
@@ -90,30 +123,12 @@ pub struct Task {
     parser: Arc<FairMutex<Emulator>>,
     last_activity: Arc<Mutex<Instant>>,
     handle: Option<JoinHandle<()>>,
-    pub tagged: bool,
-    /// Dashboard group stored with the task; `None` means unassigned.
-    pub group: Option<String>,
-    /// Custom display name; `None` means unnamed.
-    pub name: Option<String>,
-    /// Harness for a managed task's session ID and blocked-status reads: the harness built
-    /// the argv, no shell sits between, and a rerun goes through it again. `None` for
-    /// literal tasks: never read a harness channel for those tasks, and never edit their
-    /// command text.
-    pub harness: Option<&'static dyn crate::harness::Harness>,
     /// Harness home resolved from this run's launch environment.
     pub harness_home: Option<PathBuf>,
-    /// Display-only summary adapter selected from the command's first word,
-    /// for literal and managed tasks alike.
-    pub summary_adapter: Option<&'static dyn crate::preview::SummaryAdapter>,
-    /// Run number used to give each rerun a distinct capture path.
-    pub run: u32,
-    /// Session ID pinned or resumed at spawn. Prefer a captured ID or matching live
-    /// registry ID when available.
-    pub resume_id: Option<String>,
-    /// Capture path allocated for this task run.
+    /// Capture path allocated for this run.
     pub capture_file: Option<PathBuf>,
-    /// Dashboard-preview resolution state; resets with the task on rerun
-    /// because a rerun replaces the whole `Task`.
+    /// Dashboard-preview resolution state for this run. Reset on rerun by
+    /// replacing the whole `Process`.
     preview: PreviewState,
     /// Cached blocked-on-user status from the harness registry.
     blocked: Option<(String, &'static str)>,
@@ -150,7 +165,7 @@ fn signal(waker: &Waker) {
 /// Admit one whole message to a writer queue bounded by `MAX_PENDING_WRITE`,
 /// or refuse it whole. The cap check and the `fetch_add` are separate
 /// operations, so racing admitters can overshoot the cap by one message (see
-/// `Task::pending_write`). A failed send means the worker exited; the
+/// `Process::pending_write`). A failed send means the worker exited; the
 /// compensating `fetch_sub` removes that admission so the count never leaks.
 fn admit_write(
     tx: &Sender<Vec<u8>>,
@@ -223,6 +238,132 @@ impl Task {
     #[allow(clippy::too_many_arguments)] // All arguments define task launch state.
     pub fn spawn(
         id: u64,
+        command: &str,
+        exec: Exec,
+        cwd: &Path,
+        rows: u16,
+        cols: u16,
+        scrollback: usize,
+        env: &[(OsString, OsString)],
+        waker: &Waker,
+    ) -> io::Result<Self> {
+        let process = Process::spawn(command, exec, cwd, rows, cols, scrollback, env, waker)?;
+        Ok(Self {
+            process: Some(process),
+            ..Self::stopped(id, command.to_string(), cwd.to_path_buf(), None, None)
+        })
+    }
+
+    /// Create a task with no run from a stopped session entry. Press `r` to
+    /// start it. Resolve `harness` by name alone; look up the binary at rerun.
+    /// Use the stored `resume_id` to resume the conversation at that point.
+    pub fn stopped(
+        id: u64,
+        command: String,
+        cwd: PathBuf,
+        harness: Option<&'static dyn crate::harness::Harness>,
+        resume_id: Option<String>,
+    ) -> Self {
+        Self {
+            id,
+            summary_adapter: crate::harness::select(&command),
+            command,
+            cwd,
+            tagged: false,
+            group: None,
+            name: None,
+            harness,
+            run: 0,
+            resume_id,
+            process: None,
+        }
+    }
+
+    /// Check the capture file, then the live registry, then the spawn-time ID. A
+    /// managed CLI can select a session after launch, so validate captured IDs
+    /// through the harness with the task leader's PID. If a source has no valid ID,
+    /// check the next source. For literal tasks, return `None`; for stopped
+    /// tasks, the stored ID.
+    pub fn current_resume_id(&self) -> Option<String> {
+        if let (Some(h), Some(p)) = (self.harness, &self.process) {
+            if let Some(path) = &p.capture_file
+                && let Ok(payload) = std::fs::read_to_string(path)
+                && let Some(id) = h.parse_capture(&payload, p.pid())
+            {
+                return Some(id);
+            }
+            if let Some(pid) = p.pid()
+                && let Some(id) =
+                    h.live_session_id(pid, &self.cwd, p.spawned_at, p.harness_home.as_deref())
+            {
+                return Some(id);
+            }
+        }
+        self.resume_id.clone()
+    }
+
+    /// Resolve the dashboard preview through the provenance cascade under
+    /// the grid lock (see [`crate::preview`]). Use the caller's tick instant
+    /// `now` for every task in a snapshot. For a stopped task, return an empty,
+    /// frozen floor preview: there is no grid to inspect.
+    pub fn resolve_preview(&mut self, now: Instant) -> Preview {
+        self.refresh_blocked(now);
+        let Some(p) = &mut self.process else {
+            return Preview {
+                frozen: true,
+                ..Preview::floor(String::new())
+            };
+        };
+        let emu = p.parser.lock();
+        let blocked = p.blocked.as_ref().map(|(text, rule)| (&**text, *rule));
+        p.preview
+            .resolve(now, &*emu, self.summary_adapter, blocked)
+            .clone()
+    }
+
+    /// Refresh the harness's blocked-on-user status at most once per
+    /// [`BLOCKED_PROBE_INTERVAL`]. Skip the probe without a harness or PID;
+    /// clear the cached status for finished tasks.
+    fn refresh_blocked(&mut self, now: Instant) {
+        let Some(p) = &mut self.process else {
+            return;
+        };
+        let (Some(h), Some(pid), None) = (self.harness, p.pid, p.finished) else {
+            p.blocked = None;
+            return;
+        };
+        if p.blocked_probed
+            .is_some_and(|t| now.duration_since(t) < BLOCKED_PROBE_INTERVAL)
+        {
+            return;
+        }
+        p.blocked_probed = Some(now);
+        p.blocked = h.live_blocked_status(pid, &self.cwd, p.spawned_at, p.harness_home.as_deref());
+    }
+
+    /// Freeze the preview once output is complete. Apply any open `?2026` frame
+    /// first to include its buffered output in the preview. Skip stopped tasks,
+    /// which have no output.
+    pub fn finalize_preview(&mut self) {
+        let Some(p) = &mut self.process else {
+            return;
+        };
+        if p.preview.finalized() || !p.output_complete() {
+            return;
+        }
+        let mut emu = p.parser.lock();
+        let _ = emu.finish_output();
+        p.preview.finalize(&*emu, self.summary_adapter);
+    }
+}
+
+impl Process {
+    /// Spawn `exec` in a fresh `rows`×`cols` PTY with `scrollback` history
+    /// rows. For a literal `exec`, run `command` under the launch shell. Pass
+    /// exactly `env` to the child and notify the core through `waker` on
+    /// terminal output.
+    #[allow(clippy::too_many_arguments)] // All arguments define launch state.
+    pub fn spawn(
         command: &str,
         exec: Exec,
         cwd: &Path,
@@ -338,9 +479,6 @@ impl Task {
         let pid = child.process_id();
         drop(child);
         Ok(Self {
-            id,
-            command: command.to_string(),
-            cwd: cwd.to_path_buf(),
             master: pair.master,
             input_tx: Some(input_tx),
             pending_write,
@@ -348,14 +486,7 @@ impl Task {
             parser,
             last_activity,
             handle: Some(handle),
-            tagged: false,
-            group: None,
-            name: None,
-            harness: None,
             harness_home: None,
-            summary_adapter: crate::harness::select(command),
-            run: 0,
-            resume_id: None,
             capture_file: None,
             preview: PreviewState::new(),
             blocked: None,
@@ -370,39 +501,15 @@ impl Task {
         })
     }
 
-    /// Return the task's session-leader PID.
+    /// Return the session-leader PID.
     pub fn pid(&self) -> Option<u32> {
         self.pid
-    }
-
-    /// Check the capture file, then the live registry, then the spawn-time ID. A
-    /// managed CLI can select a session after launch, so validate captured IDs
-    /// through the harness with the task leader's PID. If a source has no valid ID,
-    /// check the next source. For literal tasks, return `None`.
-    pub fn current_resume_id(&self) -> Option<String> {
-        if let (Some(h), Some(path)) = (self.harness, &self.capture_file)
-            && let Ok(payload) = std::fs::read_to_string(path)
-            && let Some(id) = h.parse_capture(&payload, self.pid())
-        {
-            return Some(id);
-        }
-        if let (Some(h), Some(pid)) = (self.harness, self.pid())
-            && let Some(id) = h.live_session_id(
-                pid,
-                &self.cwd,
-                self.spawned_at,
-                self.harness_home.as_deref(),
-            )
-        {
-            return Some(id);
-        }
-        self.resume_id.clone()
     }
 
     /// Latch the exit code and finish time if the leader has exited, without
     /// reaping it. `WNOWAIT` leaves the zombie in place, which is what keeps
     /// the pid (and therefore the pgid) reserved so the group stays signalable
-    /// for the task's whole life; see the `reaped` field. The zombie is
+    /// for the run's whole life; see the `reaped` field. The zombie is
     /// collected at teardown, after SIGKILL.
     pub fn poll_exit(&mut self) -> io::Result<()> {
         if self.finished.is_some() || self.reaped {
@@ -492,7 +599,7 @@ impl Task {
     }
 
     /// Time since the reader thread last saw PTY output. Zero when the
-    /// activity lock is poisoned, so a task whose reader died mid-update
+    /// activity lock is poisoned, so a run whose reader died mid-update
     /// reads as just-active, never as stuck-idle.
     pub fn quiet_for(&self, now: Instant) -> Duration {
         self.last_activity
@@ -514,55 +621,9 @@ impl Task {
         }
     }
 
-    /// Drain OSC 52 clipboard stores captured by this task's emulator.
+    /// Drain OSC 52 clipboard stores captured by this run's emulator.
     pub fn drain_clipboard(&self) -> ClipboardStores {
         self.parser.lock().drain_clipboard()
-    }
-
-    /// The dashboard preview, resolved through the provenance cascade under
-    /// the grid lock (see [`crate::preview`]). `now` is the caller's tick
-    /// instant so every task in one snapshot resolves against the same clock.
-    pub fn resolve_preview(&mut self, now: Instant) -> Preview {
-        self.refresh_blocked(now);
-        let emu = self.parser.lock();
-        let blocked = self.blocked.as_ref().map(|(text, rule)| (&**text, *rule));
-        self.preview
-            .resolve(now, &*emu, self.summary_adapter, blocked)
-            .clone()
-    }
-
-    /// Refresh the harness's blocked-on-user status at most once per
-    /// [`BLOCKED_PROBE_INTERVAL`]. Tasks without a harness or PID do not probe;
-    /// finished tasks clear the cached status.
-    fn refresh_blocked(&mut self, now: Instant) {
-        let (Some(h), Some(pid), None) = (self.harness, self.pid, self.finished) else {
-            self.blocked = None;
-            return;
-        };
-        if self
-            .blocked_probed
-            .is_some_and(|t| now.duration_since(t) < BLOCKED_PROBE_INTERVAL)
-        {
-            return;
-        }
-        self.blocked_probed = Some(now);
-        self.blocked = h.live_blocked_status(
-            pid,
-            &self.cwd,
-            self.spawned_at,
-            self.harness_home.as_deref(),
-        );
-    }
-
-    /// Freeze the preview once output is complete. Apply any open `?2026` frame
-    /// first so the preview includes its buffered output.
-    pub fn finalize_preview(&mut self) {
-        if self.preview.finalized() || !self.output_complete() {
-            return;
-        }
-        let mut emu = self.parser.lock();
-        let _ = emu.finish_output();
-        self.preview.finalize(&*emu, self.summary_adapter);
     }
 
     /// Full screen as ANSI bytes for attached mode, plus cursor state so we can
@@ -607,7 +668,7 @@ impl Task {
 
     /// Admit one whole message to the writer queue, or refuse it whole.
     fn queue_write(&self, msg: Vec<u8>) -> Result<(), WriteRefused> {
-        // A force-killed task has no writer queue; discard subsequent input.
+        // A force-killed run has no writer queue; discard subsequent input.
         let Some(tx) = &self.input_tx else {
             return Ok(());
         };
@@ -662,10 +723,10 @@ impl Task {
         )
     }
 
-    /// Ask the whole task to exit: SIGTERM to the process *group*, not just the
+    /// Ask the whole run to exit: SIGTERM to the process *group*, not just the
     /// direct child, so every group member gets it, including background
     /// children a `cmd &` left behind (a non-interactive shell's `&` creates no
-    /// new group, so they never leave this one). TERM, not KILL: the task gets a
+    /// new group, so they never leave this one). TERM, not KILL: the child gets a
     /// chance to flush and clean up. The supervisor owns the escalation:
     /// `overdue` turns true once the grace elapses, and `force_kill` finishes it.
     ///
@@ -689,7 +750,7 @@ impl Task {
                 .is_some_and(|t| now.duration_since(t) >= grace)
     }
 
-    /// Send SIGKILL to the task's process group without waiting for it to exit.
+    /// Send SIGKILL to the process group without waiting for it to exit.
     pub fn force_kill(&mut self) {
         if !self.reaped
             && let Some(pid) = self.pid
@@ -706,10 +767,10 @@ impl Task {
     }
 }
 
-impl Drop for Task {
+impl Drop for Process {
     fn drop(&mut self) {
         // The last-resort backstop, not the policy point: guarantees no
-        // orphaned task tree regardless of how a Task leaves scope. Graceful
+        // orphaned process tree regardless of how a run leaves scope. Graceful
         // TERM-first teardown happens above this, in the supervisor. The
         // collect is best-effort: an already-exited leader reaps instantly; one
         // still dying from the KILL reparents to init, which collects it.

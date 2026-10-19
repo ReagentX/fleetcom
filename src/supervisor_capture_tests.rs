@@ -101,7 +101,11 @@ fn install_status_record(home: &Path, pid: u32, cwd: &Path, status: &str) {
 fn stamped(task: &Task, json: &str) -> String {
     format!(
         "{}\n{json}\n",
-        task.pid().expect("a spawned task has a pid")
+        task.process
+            .as_ref()
+            .unwrap()
+            .pid()
+            .expect("a spawned task has a pid")
     )
 }
 
@@ -238,7 +242,13 @@ fn spawn_claude_pins_an_id_and_layers_settings() {
     );
 
     let t = &s.tasks[0];
-    let cap = t.capture_file.clone().expect("capture file set");
+    let cap = t
+        .process
+        .as_ref()
+        .unwrap()
+        .capture_file
+        .clone()
+        .expect("capture file set");
     // An explicit runtime directory is used without a discriminator;
     // capture files sit in this incarnation's `<pid>-<nonce>` namespace
     // directly under it.
@@ -284,7 +294,7 @@ fn spawn_non_agent_command_is_not_instrumented() {
     spawn(&mut s, "printf ok", dir.to_path_buf());
     let t = &s.tasks[0];
     assert!(t.harness.is_none());
-    assert!(t.capture_file.is_none());
+    assert!(t.process.as_ref().unwrap().capture_file.is_none());
     assert!(t.resume_id.is_none());
     assert!(
         s.capture.is_empty(),
@@ -328,7 +338,7 @@ fn typed_agent_word_is_literal_runs_verbatim_and_saves_as_text() {
     );
     let t = &s.tasks[0];
     assert!(t.harness.is_none(), "a literal task has no harness channel");
-    assert!(t.capture_file.is_none());
+    assert!(t.process.as_ref().unwrap().capture_file.is_none());
     assert!(t.resume_id.is_none());
     assert_eq!(t.command, "claude");
     assert!(
@@ -340,12 +350,20 @@ fn typed_agent_word_is_literal_runs_verbatim_and_saves_as_text() {
         "no assets are installed for a literal"
     );
     assert!(!runtime.exists());
-    let pid = t.pid().expect("a spawned task has a pid");
+    let pid = t
+        .process
+        .as_ref()
+        .unwrap()
+        .pid()
+        .expect("a spawned task has a pid");
 
     // Install a namespace by launching a managed sibling. Write a capture for task 1 there,
     // stamped with task 1's leader PID, and create a registry record keyed to that PID.
     s.spawn_agent("claude", &dir, None);
     let ns = s.tasks[1]
+        .process
+        .as_ref()
+        .unwrap()
         .capture_file
         .as_deref()
         .and_then(Path::parent)
@@ -363,8 +381,17 @@ fn typed_agent_word_is_literal_runs_verbatim_and_saves_as_text() {
         r#""status":"waiting","waitingFor":"permission prompt""#,
     );
     assert_eq!(s.tasks[0].current_resume_id(), None);
+    // Save the entry as stopped after the stub exits.
+    let exited = s.tasks[0].id;
+    wait_exited(&mut s, exited);
     let entries = saved_entries(&mut s, &config, "typed");
-    assert_eq!(entries[0], SessionEntry::literal("claude"));
+    assert_eq!(
+        entries[0],
+        SessionEntry {
+            stopped: true,
+            ..SessionEntry::literal("claude")
+        }
+    );
     assert!(matches!(
         &entries[1].kind,
         EntryKind::Managed { agent, resume: Some(_) } if agent == "claude"
@@ -392,7 +419,13 @@ fn rerun_cannot_read_the_old_runs_stale_capture() {
     s.spawn_agent("claude", &dir, None);
     let id = s.tasks[0].id;
     // The old run's final capture becomes the new run's launch ID.
-    let old_cap = s.tasks[0].capture_file.clone().expect("capture file set");
+    let old_cap = s.tasks[0]
+        .process
+        .as_ref()
+        .unwrap()
+        .capture_file
+        .clone()
+        .expect("capture file set");
     std::fs::write(
         &old_cap,
         stamped(&s.tasks[0], &format!(r#"{{"session_id":"{CAP_ID}"}}"#)),
@@ -401,7 +434,13 @@ fn rerun_cannot_read_the_old_runs_stale_capture() {
     wait_exited(&mut s, id);
 
     s.apply(Command::Restart { id });
-    let new_cap = s.tasks[0].capture_file.clone().expect("capture file set");
+    let new_cap = s.tasks[0]
+        .process
+        .as_ref()
+        .unwrap()
+        .capture_file
+        .clone()
+        .expect("capture file set");
     assert_ne!(new_cap, old_cap, "the fresh run needs its own capture file");
     assert_eq!(s.tasks[0].resume_id.as_deref(), Some(CAP_ID));
     assert!(
@@ -429,7 +468,13 @@ fn reconnect_with_unchanged_root_preserves_capture_files() {
     install_stub(&bin, "claude", &dir);
     let mut s = sup_ctx(agent_ctx(&bin, &runtime, dir.to_path_buf()));
     s.spawn_agent("claude", &dir, None);
-    let cap = s.tasks[0].capture_file.clone().expect("capture file set");
+    let cap = s.tasks[0]
+        .process
+        .as_ref()
+        .unwrap()
+        .capture_file
+        .clone()
+        .expect("capture file set");
     std::fs::write(&cap, "{}").unwrap();
 
     // The client reconnects with an identical env and spawns again.
@@ -450,7 +495,13 @@ fn returning_to_a_prior_root_preserves_its_live_captures() {
     install_stub(&bin, "claude", &dir);
     let mut s = sup_ctx(agent_ctx(&bin, &root_a, dir.to_path_buf()));
     s.spawn_agent("claude", &dir, None);
-    let cap_a = s.tasks[0].capture_file.clone().expect("capture file set");
+    let cap_a = s.tasks[0]
+        .process
+        .as_ref()
+        .unwrap()
+        .capture_file
+        .clone()
+        .expect("capture file set");
     std::fs::write(&cap_a, "{}").unwrap();
 
     // The client reconnects under root B, spawns, then returns to A and
@@ -466,6 +517,9 @@ fn returning_to_a_prior_root_preserves_its_live_captures() {
         "returning to a known root must not disturb its live captures"
     );
     let ns_b = s.tasks[1]
+        .process
+        .as_ref()
+        .unwrap()
         .capture_file
         .as_deref()
         .and_then(|c| c.parent())
@@ -489,7 +543,13 @@ fn remove_deletes_the_capture_file_under_the_spawn_root() {
     let _ = wait_argv(&mut s, &dir.join("argv"));
     let id = s.tasks[0].id;
     wait_for_lifecycle(&mut s, id, |l| l == Lifecycle::Ok);
-    let cap = s.tasks[0].capture_file.clone().unwrap();
+    let cap = s.tasks[0]
+        .process
+        .as_ref()
+        .unwrap()
+        .capture_file
+        .clone()
+        .unwrap();
     std::fs::write(&cap, "{}").unwrap();
 
     // Root B is installed by a newer spawn; a same-id file under it must
@@ -497,6 +557,9 @@ fn remove_deletes_the_capture_file_under_the_spawn_root() {
     s.set_launch_context(agent_ctx(&bin, &root_b, dir.to_path_buf()));
     s.spawn_agent("claude", &dir, None);
     let decoy = s.tasks[1]
+        .process
+        .as_ref()
+        .unwrap()
         .capture_file
         .as_deref()
         .and_then(|c| c.parent())
@@ -560,7 +623,7 @@ fn spawn_codex_installs_the_notify_and_embedded_overrides() {
     let t = &s.tasks[0];
     assert_eq!(t.command, "codex");
     assert!(t.resume_id.is_none(), "codex cannot pin an id at launch");
-    assert!(t.capture_file.is_some());
+    assert!(t.process.as_ref().unwrap().capture_file.is_some());
 }
 
 /// A `grok` spawn receives exactly the pinned ID: no settings overlay,
@@ -604,9 +667,15 @@ fn spawn_grok_pins_an_id_and_injects_nothing_else() {
     );
     assert_eq!(t.resume_id.as_deref(), Some(id.as_str()));
 
+    // Save the entry as stopped after the stub exits.
+    let exited = s.tasks[0].id;
+    wait_exited(&mut s, exited);
     assert_eq!(
         saved_entries(&mut s, &config, "grokpin"),
-        [SessionEntry::managed("grok", Some(&id))],
+        [SessionEntry {
+            stopped: true,
+            ..SessionEntry::managed("grok", Some(&id))
+        }],
         "the recipe must resume the pinned session"
     );
 }
@@ -634,7 +703,13 @@ fn spawn_omp_loads_the_capture_extension() {
         "the module must write to the capture env: {text:?}"
     );
     let t = &s.tasks[0];
-    let cap = t.capture_file.clone().expect("capture file set");
+    let cap = t
+        .process
+        .as_ref()
+        .unwrap()
+        .capture_file
+        .clone()
+        .expect("capture file set");
     assert_eq!(
         module.parent(),
         cap.parent(),
@@ -703,7 +778,13 @@ fn printed_resume_hints_do_not_change_saved_recovery_or_rerun_targets() {
         let expected_id = match tool {
             "claude" => {
                 std::fs::write(
-                    s.tasks[0].capture_file.as_ref().unwrap(),
+                    s.tasks[0]
+                        .process
+                        .as_ref()
+                        .unwrap()
+                        .capture_file
+                        .as_ref()
+                        .unwrap(),
                     stamped(&s.tasks[0], &format!(r#"{{"session_id":"{CAP_OTHER}"}}"#)),
                 )
                 .unwrap();
@@ -715,7 +796,8 @@ fn printed_resume_hints_do_not_change_saved_recovery_or_rerun_targets() {
         assert_ne!(expected_id.as_deref(), Some(CAP_ID));
         assert!(
             reap_until(&mut s, Duration::from_secs(5), |s| {
-                s.tasks[0].finished.is_some() && s.tasks[0].reader_done()
+                s.tasks[0].process.as_ref().unwrap().finished.is_some()
+                    && s.tasks[0].process.as_ref().unwrap().reader_done()
             }),
             "{tool}: output never completed"
         );
@@ -723,6 +805,9 @@ fn printed_resume_hints_do_not_change_saved_recovery_or_rerun_targets() {
         s.reap();
         assert!(
             s.tasks[0]
+                .process
+                .as_ref()
+                .unwrap()
                 .screen_lines()
                 .iter()
                 .any(|line| line.contains(CAP_ID)),
@@ -733,6 +818,7 @@ fn printed_resume_hints_do_not_change_saved_recovery_or_rerun_targets() {
             vec![SessionEntry {
                 group: Some("agents".into()),
                 name: Some(tool.into()),
+                stopped: true,
                 ..SessionEntry::managed(tool, expected_id.as_deref())
             }],
         )]);
@@ -785,7 +871,7 @@ fn rerun_latches_exit_without_reap_and_preserves_the_launch_id() {
     assert!(s.tasks[0].harness.is_some());
     assert_eq!(s.tasks[0].resume_id.as_deref(), Some(CAP_OTHER));
     let id = s.tasks[0].id;
-    let pid = Pid::from_raw(s.tasks[0].pid().unwrap() as i32).unwrap();
+    let pid = Pid::from_raw(s.tasks[0].process.as_ref().unwrap().pid().unwrap() as i32).unwrap();
     assert!(
         wait_until(Duration::from_secs(5), || {
             let exited = waitid(
@@ -794,12 +880,12 @@ fn rerun_latches_exit_without_reap_and_preserves_the_launch_id() {
             )
             .unwrap()
             .is_some();
-            exited && s.tasks[0].reader_done()
+            exited && s.tasks[0].process.as_ref().unwrap().reader_done()
         }),
         "the stub never exited and drained its output"
     );
     assert!(
-        s.tasks[0].finished.is_none(),
+        s.tasks[0].process.as_ref().unwrap().finished.is_none(),
         "no exit latch may have run yet"
     );
     std::fs::remove_file(dir.join("argv")).unwrap();
@@ -842,7 +928,12 @@ fn resume_id_precedence_registry_over_spawn_under_capture() {
         .expect("a fresh claude launch pins an id");
     assert_ne!(injected.as_str(), CAP_ID);
     // Key the registry fixture to the spawned task.
-    let pid = s.tasks[0].pid().expect("a live task has a pid");
+    let pid = s.tasks[0]
+        .process
+        .as_ref()
+        .unwrap()
+        .pid()
+        .expect("a live task has a pid");
 
     install_status_record(&claude_home, pid, &dir, r#""status":"idle""#);
     assert_eq!(
@@ -852,7 +943,13 @@ fn resume_id_precedence_registry_over_spawn_under_capture() {
     );
 
     // A capture-file ID outranks the registry ID.
-    let cap = s.tasks[0].capture_file.clone().expect("capture file set");
+    let cap = s.tasks[0]
+        .process
+        .as_ref()
+        .unwrap()
+        .capture_file
+        .clone()
+        .expect("capture file set");
     std::fs::write(&cap, stamped(&s.tasks[0], &hook_json(CAP_OTHER, "clear"))).unwrap();
     assert_eq!(
         saved_resume(&mut s, &config, "capture").as_deref(),
@@ -903,8 +1000,19 @@ until [ -e '{d}/done' ]; do sleep 0.05; done"#,
         .resume_id
         .clone()
         .expect("a fresh claude launch pins an id");
-    let pid = s.tasks[0].pid().expect("a live task has a pid");
-    let cap = s.tasks[0].capture_file.clone().expect("capture file set");
+    let pid = s.tasks[0]
+        .process
+        .as_ref()
+        .unwrap()
+        .pid()
+        .expect("a live task has a pid");
+    let cap = s.tasks[0]
+        .process
+        .as_ref()
+        .unwrap()
+        .capture_file
+        .clone()
+        .expect("capture file set");
 
     // The foreign stage runs the hook command from the installed overlay.
     let overlay = std::fs::read_to_string(cap.with_file_name("claude-settings.json")).unwrap();
@@ -1006,13 +1114,16 @@ fn silent_codex_tasks_save_and_recover_without_a_resume_id() {
     assert!(reap_until(&mut s, Duration::from_secs(5), |s| s
         .tasks
         .iter()
-        .all(|t| t.finished.is_some())));
+        .all(|t| t.process.as_ref().unwrap().finished.is_some())));
     for task in &s.tasks {
         assert!(
             task.current_resume_id().is_none(),
             "no capture channel fired"
         );
         let spawn_ms = task
+            .process
+            .as_ref()
+            .unwrap()
             .spawned_at
             .duration_since(std::time::SystemTime::UNIX_EPOCH)
             .unwrap()
@@ -1025,8 +1136,14 @@ fn silent_codex_tasks_save_and_recover_without_a_resume_id() {
     let expected = SessionConfig::from([(
         path::abbreviate(&dir),
         vec![
-            SessionEntry::managed("codex", None),
-            SessionEntry::managed("codex", None),
+            SessionEntry {
+                stopped: true,
+                ..SessionEntry::managed("codex", None)
+            },
+            SessionEntry {
+                stopped: true,
+                ..SessionEntry::managed("codex", None)
+            },
         ],
     )]);
     save_and_read(&mut s, &config, "silent");
@@ -1055,7 +1172,13 @@ fn title_turn() -> String {
 /// `codex_home` as the environment. Return the written root, as for a binary invocation
 /// from the injected script.
 fn arrive(s: &Supervisor, codex_home: &Path, payload: &str) -> Option<String> {
-    let cap = s.tasks[0].capture_file.clone().expect("capture file set");
+    let cap = s.tasks[0]
+        .process
+        .as_ref()
+        .unwrap()
+        .capture_file
+        .clone()
+        .expect("capture file set");
     crate::harness::record_arrival(payload, &|key| match key {
         crate::harness::CAPTURE_ENV => Some(cap.clone()),
         "CODEX_HOME" => Some(codex_home.to_path_buf()),
@@ -1250,7 +1373,7 @@ fn home_only_launch_env_targets_the_clients_dot_codex() {
     ));
     s.spawn_agent("codex", &dir, None);
     assert_eq!(
-        s.tasks[0].harness_home.as_deref(),
+        s.tasks[0].process.as_ref().unwrap().harness_home.as_deref(),
         Some(codex_home.as_path()),
         "HOME alone must resolve the harness home"
     );
@@ -1265,7 +1388,10 @@ fn home_only_launch_env_targets_the_clients_dot_codex() {
 
     assert_eq!(
         saved_entries(&mut s, &config, "homeonly"),
-        [SessionEntry::managed("codex", None)]
+        [SessionEntry {
+            stopped: true,
+            ..SessionEntry::managed("codex", None)
+        }]
     );
 }
 
@@ -1310,7 +1436,13 @@ fn stale_inherited_notify_chain_is_never_executed() {
     s.spawn_agent("codex", &dir, None);
     let id = s.tasks[0].id;
     wait_exited(&mut s, id);
-    let cap = s.tasks[0].capture_file.clone().expect("capture file set");
+    let cap = s.tasks[0]
+        .process
+        .as_ref()
+        .unwrap()
+        .capture_file
+        .clone()
+        .expect("capture file set");
     assert_eq!(
         std::fs::read_to_string(&cap).unwrap(),
         CAP_ID,
@@ -1421,7 +1553,13 @@ fn config_toml_notify_chains_through_the_injected_script() {
         format!("{}\nturn-ended", notifier.display()),
         "the child env must carry the displaced argv, newline-joined"
     );
-    let cap = s.tasks[0].capture_file.clone().unwrap();
+    let cap = s.tasks[0]
+        .process
+        .as_ref()
+        .unwrap()
+        .capture_file
+        .clone()
+        .unwrap();
     assert_eq!(
         std::fs::read_to_string(&cap).unwrap(),
         CAP_ID,
@@ -1541,7 +1679,13 @@ fn recovery_cadence_rewrites_on_capture_drift_and_skips_when_static() {
     assert!(!snapshot(&rec).unwrap().1.contains(CAP_OTHER));
 
     // Change the capture ID without a recipe mutation.
-    let cap = s.tasks[0].capture_file.clone().expect("capture file set");
+    let cap = s.tasks[0]
+        .process
+        .as_ref()
+        .unwrap()
+        .capture_file
+        .clone()
+        .expect("capture file set");
     std::fs::write(&cap, stamped(&s.tasks[0], &hook_json(CAP_OTHER, "clear"))).unwrap();
     assert!(
         wait_until(Duration::from_secs(5), || {
@@ -1571,6 +1715,9 @@ fn recovery_cadence_rewrites_on_capture_drift_and_skips_when_static() {
 /// The settings overlay beside the sole task's capture file.
 fn settings_beside(s: &Supervisor) -> String {
     s.tasks[0]
+        .process
+        .as_ref()
+        .unwrap()
         .capture_file
         .as_deref()
         .and_then(Path::parent)
@@ -1625,7 +1772,13 @@ fn managed_claude_accepts_its_own_capture_and_refuses_a_foreign_stamp() {
     );
 
     // Reject the same payload when stamped with another process's PID.
-    let cap = s.tasks[0].capture_file.clone().unwrap();
+    let cap = s.tasks[0]
+        .process
+        .as_ref()
+        .unwrap()
+        .capture_file
+        .clone()
+        .unwrap();
     let text = std::fs::read_to_string(&cap).unwrap();
     let (_, json) = text.split_once('\n').unwrap();
     std::fs::write(&cap, format!("{}\n{json}", dead_pid())).unwrap();
@@ -1684,13 +1837,25 @@ fn managed_rerun_resumes_the_captured_id_from_the_binary_path_finds_now() {
     s.tasks[0].name = Some("pilot".into());
     wait_for_lifecycle(&mut s, id, |l| l == Lifecycle::Ok);
     std::fs::write(
-        s.tasks[0].capture_file.as_ref().unwrap(),
+        s.tasks[0]
+            .process
+            .as_ref()
+            .unwrap()
+            .capture_file
+            .as_ref()
+            .unwrap(),
         stamped(&s.tasks[0], &hook_json(CAP_OTHER, "clear")),
     )
     .unwrap();
     std::fs::remove_file(dir.join("argv")).unwrap();
 
-    let old_cap = s.tasks[0].capture_file.clone().unwrap();
+    let old_cap = s.tasks[0]
+        .process
+        .as_ref()
+        .unwrap()
+        .capture_file
+        .clone()
+        .unwrap();
     s.apply(Command::Restart { id });
     let argv = wait_argv(&mut s, &dir.join("argv"));
     assert_eq!(
@@ -1787,8 +1952,16 @@ fn managed_task_saves_as_a_managed_entry_and_reloads_managed() {
     wait_argv(&mut s, &omp_out.join("argv"));
     let claude = s.tasks[0].id;
     wait_for_lifecycle(&mut s, claude, |l| l == Lifecycle::Ok);
+    let omp = s.tasks[1].id;
+    wait_exited(&mut s, omp);
     std::fs::write(
-        s.tasks[0].capture_file.as_ref().unwrap(),
+        s.tasks[0]
+            .process
+            .as_ref()
+            .unwrap()
+            .capture_file
+            .as_ref()
+            .unwrap(),
         stamped(&s.tasks[0], &format!(r#"{{"session_id":"{CAP_ID}"}}"#)),
     )
     .unwrap();
@@ -1801,17 +1974,28 @@ fn managed_task_saves_as_a_managed_entry_and_reloads_managed() {
             vec![
                 SessionEntry {
                     group: Some("agents".into()),
+                    stopped: true,
                     ..SessionEntry::managed("claude", Some(CAP_ID))
                 },
-                SessionEntry::managed("omp", None),
+                SessionEntry {
+                    stopped: true,
+                    ..SessionEntry::managed("omp", None)
+                },
             ]
         )])
     );
 
+    // Both stubs exited before the save. Clear their stopped flags in a copy of
+    // the recipe, then load that copy to verify the relaunch argv.
+    let mut live = session::load_in(&config.join("sessions"), "managed").unwrap();
+    for entry in live.values_mut().flatten() {
+        entry.stopped = false;
+    }
+    session::save_in(&config.join("sessions"), "managed-live", &live).unwrap();
     std::fs::remove_file(claude_out.join("argv")).unwrap();
     std::fs::remove_file(omp_out.join("argv")).unwrap();
     s.apply(Command::LoadSession {
-        name: "managed".into(),
+        name: "managed-live".into(),
     });
     assert_eq!(s.tasks.len(), 4, "{:?}", notices(s.drain()));
     let reloaded = &s.tasks[2];
@@ -1929,7 +2113,17 @@ fn managed_codex_reports_the_capture_notice_and_leads_a_rerun_with_resume() {
     wait_for_lifecycle(&mut s, id, |l| l == Lifecycle::Ok);
 
     // The v1 slot holds one bare root UUID.
-    std::fs::write(s.tasks[0].capture_file.as_ref().unwrap(), CAP_ID).unwrap();
+    std::fs::write(
+        s.tasks[0]
+            .process
+            .as_ref()
+            .unwrap()
+            .capture_file
+            .as_ref()
+            .unwrap(),
+        CAP_ID,
+    )
+    .unwrap();
     std::fs::remove_file(dir.join("argv")).unwrap();
     s.apply(Command::Restart { id });
     assert_sole_notice(s.drain(), "capture unavailable");
@@ -1980,7 +2174,12 @@ fn registry_waiting_status_reaches_the_dashboard_preview() {
     ));
     s.spawn_agent("claude", &dir, None);
     // Key the record to the task's leader PID.
-    let pid = s.tasks[0].pid().expect("a live task has a pid");
+    let pid = s.tasks[0]
+        .process
+        .as_ref()
+        .unwrap()
+        .pid()
+        .expect("a live task has a pid");
 
     // A non-waiting status must not anchor the preview.
     install_status_record(&claude_home, pid, &dir, r#""status":"idle""#);

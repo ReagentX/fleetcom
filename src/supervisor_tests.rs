@@ -7,7 +7,7 @@ use nix::{
 
 use super::*;
 use crate::{
-    protocol::{ClipboardKind, FLEETCOM_RUNTIME_DIR, Key, Lifecycle, Mods},
+    protocol::{ClipboardKind, FLEETCOM_RUNTIME_DIR, Key, Lifecycle, Mods, Preview},
     testutil::{
         Scratch, here, install_fake_notifier, now_ms, read_pid, screen, sh_env, wait_until,
         write_executable,
@@ -516,7 +516,7 @@ fn ticks_without_copies(s: &mut Supervisor, why: &str) -> bool {
 /// Search the first task's formatted grid for `marker`.
 fn grid_shows(s: &Supervisor, marker: &str) -> bool {
     s.tasks.first().is_some_and(|t| {
-        let (formatted, _, _) = t.formatted();
+        let (formatted, _, _) = t.process.as_ref().unwrap().formatted();
         String::from_utf8_lossy(&formatted).contains(marker)
     })
 }
@@ -536,7 +536,7 @@ fn scrolled_task() -> (Supervisor, u64) {
             id,
             action: ScrollAction::Up(3),
         });
-        s.tasks[0].scroll_offset() > 0
+        s.tasks[0].process.as_ref().unwrap().scroll_offset() > 0
     });
     assert!(scrolled, "the task never accrued scrollback");
     (s, id)
@@ -742,7 +742,7 @@ fn clear_watch_snaps_the_watched_task_live() {
     let (mut s, _) = scrolled_task();
     s.clear_watch();
     assert_eq!(
-        s.tasks[0].scroll_offset(),
+        s.tasks[0].process.as_ref().unwrap().scroll_offset(),
         0,
         "disconnect must return the watched task's viewport to live"
     );
@@ -875,7 +875,11 @@ fn kill_with_an_unknown_id_leaves_the_live_task_alone() {
     s.apply(Command::Kill { id: 999 });
     assert!(s.drain().is_empty(), "unknown-id Kill must stay silent");
     assert!(
-        !s.tasks[0].overdue(Instant::now(), Duration::ZERO),
+        !s.tasks[0]
+            .process
+            .as_ref()
+            .unwrap()
+            .overdue(Instant::now(), Duration::ZERO),
         "unknown-id Kill must not signal the live task"
     );
     assert_eq!(view_of(&mut s, id).lifecycle, before);
@@ -902,7 +906,7 @@ fn tag_with_an_unknown_id_leaves_the_live_task_alone() {
 #[test]
 fn scrollback_with_an_unknown_id_leaves_the_live_task_alone() {
     let (mut s, _) = scrolled_task();
-    let offset = s.tasks[0].scroll_offset();
+    let offset = s.tasks[0].process.as_ref().unwrap().scroll_offset();
 
     s.apply(Command::Scrollback {
         id: 999,
@@ -913,7 +917,7 @@ fn scrollback_with_an_unknown_id_leaves_the_live_task_alone() {
         "unknown-id Scrollback must stay silent"
     );
     assert_eq!(
-        s.tasks[0].scroll_offset(),
+        s.tasks[0].process.as_ref().unwrap().scroll_offset(),
         offset,
         "unknown-id Scrollback must not snap the live task's viewport"
     );
@@ -1160,7 +1164,9 @@ fn reap_until(
 fn wait_exited(s: &mut Supervisor, id: u64) {
     assert!(
         reap_until(s, Duration::from_secs(5), |s| {
-            s.tasks.iter().all(|t| t.id != id || t.finished.is_some())
+            s.tasks
+                .iter()
+                .all(|t| t.id != id || t.process.as_ref().unwrap().finished.is_some())
         }),
         "task {id} never exited"
     );
@@ -1240,7 +1246,7 @@ fn rerun_sweeps_stragglers_of_the_old_run() {
         "rerun never swept the old run's straggler"
     );
     // The fresh run exists under the same id; its own straggler dies with
-    // the supervisor (Task::drop backstop).
+    // the supervisor (Process::drop backstop).
     assert!(s.tasks.iter().any(|t| t.id == id));
 }
 
@@ -1342,7 +1348,10 @@ fn shutdown_waits_the_grace_when_every_task_has_finished() {
         spawn(&mut s, "true", here());
     }
     assert!(reap_until(&mut s, Duration::from_secs(5), |s| {
-        s.tasks.len() == 2 && s.tasks.iter().all(|t| t.finished.is_some())
+        s.tasks.len() == 2
+            && s.tasks
+                .iter()
+                .all(|t| t.process.as_ref().unwrap().finished.is_some())
     }));
     let t0 = Instant::now();
     s.apply(Command::Shutdown);
@@ -1774,7 +1783,7 @@ fn key_command_encodes_against_live_cursor_mode() {
         s.tasks
             .iter()
             .find(|t| t.id == id)
-            .is_some_and(|t| t.input_hints().1)
+            .is_some_and(|t| t.process.as_ref().unwrap().input_hints().1)
     };
     assert!(
         wait_until(Duration::from_secs(5), || app_cursor_on(&s)),
@@ -2329,6 +2338,287 @@ fn load_applies_marks_and_a_live_flagship_wins() {
         2,
         "tags are restored on every load"
     );
+}
+
+/// Save `entries` for `dir` as `name` under `config`, load the recipe, and return the
+/// drained events.
+fn load_entries(
+    s: &mut Supervisor,
+    config: &Path,
+    name: &str,
+    dir: &Path,
+    entries: Vec<SessionEntry>,
+) -> Vec<Event> {
+    let cfg = SessionConfig::from([(dir.to_string_lossy().into_owned(), entries)]);
+    session::save_in(&config.join("sessions"), name, &cfg).unwrap();
+    s.apply(Command::LoadSession { name: name.into() });
+    s.drain()
+}
+
+/// A stopped literal entry.
+fn stopped(cmd: &str) -> SessionEntry {
+    SessionEntry {
+        stopped: true,
+        ..SessionEntry::literal(cmd)
+    }
+}
+
+/// Whether `events` contains a status line equal to `msg`.
+fn has_status(events: &[Event], msg: &str) -> bool {
+    events
+        .iter()
+        .any(|e| matches!(e, Event::Status(m) if m == msg))
+}
+
+/// Load a stopped literal beside a live one. Restore the stopped entry without a
+/// process or ages, with an empty frozen preview, and count it separately from
+/// the spawned task. Start it with `r` under the same ID, with no old run to retire.
+#[test]
+fn load_restores_stopped_entries_as_rows_and_rerun_starts_them() {
+    let dir = scratch("load_stopped");
+    let config = dir.join("config");
+    let mut s = sup_ctx(config_ctx(&config, dir.to_path_buf(), &[]));
+    let evs = load_entries(
+        &mut s,
+        &config,
+        "parked",
+        &dir,
+        vec![stopped("sleep 30"), SessionEntry::literal("sleep 31")],
+    );
+    assert!(
+        has_status(&evs, "loaded 'parked': 1 task(s), 1 stopped"),
+        "{evs:?}"
+    );
+    assert_eq!(s.tasks.len(), 2);
+    let views = snapshot(&mut s);
+    let (parked, live) = (&views[0], &views[1]);
+    assert_eq!(parked.command, "sleep 30");
+    assert_eq!(parked.lifecycle, Lifecycle::Stopped);
+    assert_eq!(
+        (parked.started_ago, parked.quiet_ago, parked.finished_ago),
+        (None, None, None)
+    );
+    assert_eq!(
+        parked.preview,
+        Preview {
+            frozen: true,
+            ..Preview::floor(String::new())
+        }
+    );
+    assert_eq!(live.lifecycle, Lifecycle::Active);
+    assert!(live.started_ago.is_some());
+
+    let id = parked.id;
+    s.apply(Command::Restart { id });
+    let v = view_of(&mut s, id);
+    assert_ne!(v.lifecycle, Lifecycle::Stopped);
+    assert!(v.started_ago.is_some());
+    assert_eq!(s.tasks.len(), 2, "rerun keeps the row");
+    assert!(s.graveyard.is_empty(), "a stopped row has no run to retire");
+}
+
+/// Ignore `Kill` on a stopped row, which has no run to retire; drop it on `Remove`.
+#[test]
+fn stopped_row_ignores_kill_and_removes_cleanly() {
+    let dir = scratch("stopped_kill");
+    let config = dir.join("config");
+    let mut s = sup_ctx(config_ctx(&config, dir.to_path_buf(), &[]));
+    load_entries(&mut s, &config, "one", &dir, vec![stopped("sleep 30")]);
+    let id = first_id(&mut s);
+
+    s.apply(Command::Kill { id });
+    assert_eq!(view_of(&mut s, id).lifecycle, Lifecycle::Stopped);
+    assert!(s.graveyard.is_empty());
+
+    s.apply(Command::Remove { id });
+    assert!(snapshot(&mut s).is_empty());
+    assert!(s.graveyard.is_empty());
+}
+
+/// Count stopped rows against the task ceiling on load and subsequent spawns:
+/// enforce the limit on the full list.
+#[test]
+fn stopped_rows_count_against_the_task_ceiling() {
+    let dir = scratch("stopped_ceiling");
+    let config = dir.join("config");
+    let mut s = sup_ctx(config_ctx(&config, dir.to_path_buf(), &[]));
+    s.set_max_tasks(1);
+    let evs = load_entries(
+        &mut s,
+        &config,
+        "cap",
+        &dir,
+        vec![stopped("sleep 30"), stopped("sleep 31")],
+    );
+    assert!(
+        has_status(
+            &evs,
+            "loaded 'cap': 1 stopped, 1 skipped (missing dir, task limit, or command too long)"
+        ),
+        "{evs:?}"
+    );
+    assert_eq!(s.tasks.len(), 1);
+
+    spawn(&mut s, "sleep 32", dir.to_path_buf());
+    assert!(
+        has_status(&s.drain(), "task limit reached (1), not spawning"),
+        "a stopped row must hold the ceiling"
+    );
+}
+
+/// Mark finished and restored tasks stopped in the recipe; leave live tasks unmarked.
+#[test]
+fn session_config_marks_tasks_without_a_live_process_stopped() {
+    let dir = scratch("stopped_cfg");
+    let config = dir.join("config");
+    let mut s = sup_ctx(config_ctx(&config, dir.to_path_buf(), &[]));
+    spawn(&mut s, "true", dir.to_path_buf());
+    spawn(&mut s, "sleep 30", dir.to_path_buf());
+    load_entries(&mut s, &config, "one", &dir, vec![stopped("sleep 31")]);
+    wait_exited(&mut s, 1);
+
+    let mut entries: Vec<(String, bool)> = s
+        .session_config()
+        .into_values()
+        .flatten()
+        .map(|e| match e.kind {
+            EntryKind::Literal(cmd) => (cmd, e.stopped),
+            EntryKind::Managed { .. } => unreachable!("every task here is literal"),
+        })
+        .collect();
+    entries.sort();
+    assert_eq!(
+        entries,
+        [
+            ("sleep 30".to_string(), false),
+            ("sleep 31".to_string(), true),
+            ("true".to_string(), true),
+        ]
+    );
+}
+
+/// Schedule recovery when latching an exit in `reap`, and only on that pass:
+/// update the entry's `stopped` flag after exit, not when applying `Kill`.
+#[test]
+fn reap_arms_recovery_on_the_exit_transition_only() {
+    let mut s = sup(24, 80);
+    spawn(&mut s, "sleep 30", here());
+    let id = first_id(&mut s);
+    s.recovery.last_mutation = None; // Reset after the spawn and the tick in first_id.
+    s.reap();
+    assert!(!take_dirty(&mut s), "a reap with no exit must not arm");
+
+    s.apply(Command::Kill { id });
+    assert!(!take_dirty(&mut s), "Kill itself does not arm");
+    wait_exited(&mut s, id);
+    assert!(
+        take_dirty(&mut s),
+        "the reap that latches the exit must arm"
+    );
+    s.reap();
+    assert!(!take_dirty(&mut s), "a later reap sees no transition");
+}
+
+/// Rewrite the recovery snapshot with `"stopped": true` after an exit, on the
+/// debounce alone: use a cadence far beyond the test's budget.
+#[test]
+fn recovery_snapshot_marks_an_exited_task_stopped() {
+    let dir = scratch("recovery_stopped");
+    let config = dir.join("config");
+    let mut s = recovery_sup(
+        &config,
+        dir.to_path_buf(),
+        Duration::from_millis(100),
+        Duration::from_secs(600),
+    );
+    spawn(&mut s, "sleep 30", dir.to_path_buf());
+    let id = first_id(&mut s);
+    assert!(
+        wait_until(Duration::from_secs(5), || {
+            s.tick();
+            recovery_files(&config).len() == 1
+        }),
+        "the spawn snapshot never landed"
+    );
+    assert!(!recovery_text(&config).contains("\"stopped\": true"));
+
+    s.apply(Command::Kill { id });
+    wait_exited(&mut s, id);
+    assert!(
+        wait_until(Duration::from_secs(5), || {
+            s.tick();
+            recovery_text(&config).contains("\"stopped\": true")
+        }),
+        "the exit never reached the snapshot: {}",
+        recovery_text(&config)
+    );
+}
+
+/// Send an empty screen when watching a stopped task; allow the watch request.
+#[test]
+fn watching_a_stopped_task_yields_an_empty_screen() {
+    let dir = scratch("stopped_watch");
+    let config = dir.join("config");
+    let mut s = sup_ctx(config_ctx(&config, dir.to_path_buf(), &[]));
+    load_entries(&mut s, &config, "one", &dir, vec![stopped("sleep 30")]);
+    let id = first_id(&mut s);
+    watch(&mut s, id);
+    s.tick();
+    let screen = s
+        .drain()
+        .into_iter()
+        .find_map(|e| match e {
+            Event::Screen(v) => Some(v),
+            _ => None,
+        })
+        .expect("a Screen for the watched stopped task");
+    assert_eq!(
+        screen,
+        ScreenView {
+            id,
+            lines: Vec::new(),
+            formatted: Vec::new(),
+            cursor: (0, 0),
+            hide_cursor: true,
+            wants_mouse: false,
+            alt_screen: false,
+            alt_scroll: false,
+            scrollback: 0,
+        }
+    );
+}
+
+/// Load a stopped managed entry without its binary on `PATH`: restore the row as
+/// stopped. At rerun, refuse to start without the binary and preserve the stopped row.
+#[test]
+fn stopped_managed_entry_loads_without_its_binary() {
+    let dir = scratch("stopped_managed");
+    let config = dir.join("config");
+    let mut s = sup_ctx(config_ctx(&config, dir.to_path_buf(), &[("PATH", "")]));
+    let evs = load_entries(
+        &mut s,
+        &config,
+        "agent",
+        &dir,
+        vec![SessionEntry {
+            stopped: true,
+            ..SessionEntry::managed("claude", None)
+        }],
+    );
+    assert!(has_status(&evs, "loaded 'agent': 1 stopped"), "{evs:?}");
+    let v = snapshot(&mut s).remove(0);
+    assert!(v.managed);
+    assert_eq!(v.command, "claude");
+    assert_eq!(v.lifecycle, Lifecycle::Stopped);
+    assert!(s.tasks[0].harness.is_some());
+
+    s.apply(Command::Restart { id: v.id });
+    let evs = s.drain();
+    assert!(
+        has_status(&evs, "claude not found on PATH, not spawning"),
+        "{evs:?}"
+    );
+    assert_eq!(view_of(&mut s, v.id).lifecycle, Lifecycle::Stopped);
 }
 
 /// Rewrite the recovery snapshot with the tag after the debounce interval.
