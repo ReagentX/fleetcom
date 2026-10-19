@@ -40,7 +40,7 @@ Managing several long-lived commands across terminal panes is pesky, especially 
 
 - Run each command in its own PTY and group tasks by state, working directory, or named group.
 - Keep tasks running under a daemon across client disconnects.
-- Save and reload task recipes: directories, commands, group assignments, display names, tags, and the flagship.
+- Save and reload task recipes: directories, commands, group assignments, display names, tags, the flagship, and which tasks had finished.
 - Rerun a completed task in place, keeping its identity, group, and name.
 - Launch `claude`, `codex`, `grok`, and `omp` as managed agents and resume their conversations on rerun and reload.
 - Recover the current task set from automatic snapshots.

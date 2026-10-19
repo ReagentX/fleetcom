@@ -34,8 +34,8 @@ Choose the operating mode with launch arguments. Use keys to control the dashboa
 | `Ctrl-]` | Attach to the flagship |
 | `g` | Assign the selected task to a group (through the group picker) |
 | `R` | Rename the selected task: a display name shown in place of the command |
-| `r` | Rerun a finished task; resume the conversation for a managed agent |
-| `X` | Kill a running task (`TERM`, then `KILL` after 2 s), or remove a finished one |
+| `r` | Rerun a finished task or start a stopped one; resume the conversation for a managed agent |
+| `X` | Kill a running task (`TERM`, then `KILL` after 2 s), or remove a finished or stopped one |
 | `w` | Save the current tasks as a session |
 | `o` | Load a saved session or a recovery snapshot (through the [session picker](#the-o-session-picker)) |
 | `?` | Open the [controls overlay](#the--controls-overlay) |
@@ -53,6 +53,7 @@ Choose the operating mode with launch arguments. Use keys to control the dashboa
 | `∙` | Idle: running, but quiet |
 | `✓` | Completed, exit 0 |
 | `✗` | Completed, non-zero exit |
+| ` ` | Stopped: restored from a [session](sessions.md) and not yet started |
 | `◆` | Tagged "in use" |
 | `⚑` | The [flagship](#the-flagship) |
 
@@ -108,13 +109,13 @@ Press `Esc`, `Enter`, `q`, or `End`, or scroll to the bottom, to return to live 
 
 #### Destroying tasks
 
-Press uppercase `X` to kill a running task or remove a finished one. On removal, remaining processes in the task's process group are also terminated: `TERM`, then `KILL` after two seconds. Lowercase `x` and `Ctrl-X` are unbound.
+Press uppercase `X` to kill a running task or remove a finished or stopped one. On removal of a finished task, remaining processes in its process group are also terminated: `TERM`, then `KILL` after two seconds. A stopped task has no process group to sweep. Lowercase `x` and `Ctrl-X` are unbound.
 
 #### Rerunning tasks
 
-Press `r` to rerun a finished task. Running tasks cannot be rerun without first being killed and are left untouched.
+Press `r` to rerun a finished task, or to start a stopped one: a task restored from a [session](sessions.md) that had finished when the file was written. A stopped task has no process; attach and peek show an empty screen until it is started. Running tasks cannot be rerun without first being killed and are left untouched.
 
-On rerun, the replacement is started in the same directory with the requesting client's environment. For a literal task, the exact command text is run again. For a managed agent, the binary is resolved on the current `PATH`, and the captured conversation is resumed when an ID is known; see [agent session resume](agent-resume.md).
+On rerun, the replacement is started in the same directory with the requesting client's environment. For a literal task, the exact command text is run again. For a managed agent, the binary is resolved on the current `PATH`, and the captured conversation is resumed when an ID is known; see [agent session resume](agent-resume.md). A stopped managed agent resumes its stored session ID, and its binary is looked up only at this point: the agent need not be installed to load the session.
 
 On rerun, the task's ID, `◆` tag, group, name, and spawn order are preserved; its clock and screen are reset. Under lifecycle sorting, the restarted task may be listed in another section. You can also rerun inside peek without closing the overlay.
 
@@ -128,9 +129,9 @@ Press uppercase `Q` to stop the daemon and terminate each task's process group: 
 
 #### Grouping and tagging
 
-Press `s` to cycle through state, dir, and custom grouping. In the header strip `by state · dir · custom`, the active mode is bold and the rest dim.
+Press `s` to cycle through state, dir, and custom grouping. In the header strip `by state · dir · custom`, the active mode is bold and the rest dim. To its left, the tally reads `N running · N idle · N done`, with ` · N stopped` appended only while at least one stopped task is listed.
 
-- By state: In use / Running / Idle / Completed. After 10 s without output, a running task is grouped under Idle. Completed tasks are grouped in one section, with exit status marked `✓`/`✗`.
+- By state: In use / Running / Idle / Completed. After 10 s without output, a running task is grouped under Idle. Completed tasks are grouped in one section, with exit status marked `✓`/`✗`. Stopped tasks are placed in Completed as well, with a blank glyph and a blank age cell: nothing has run under the row to measure from.
 - By dir: one section per working directory; the invocation directory first, then the remaining labels sorted without regard to case.
 - By custom group: one section per group name, sorted without regard to case, with Unassigned last. Fresh spawns remain unassigned unless they inherit a group, and the Unassigned section exists only while it has a member.
 
@@ -138,7 +139,7 @@ Dashboard section labels and within-section directory tiebreaks use the same cas
 
 Groups belong to task state: an assignment survives client detach and rerun (`r`), and switching grouping modes does not modify it. Press `g` to reassign the selected task through the [group picker](#the-g-group-picker).
 
-Press `m` to toggle the "in use" tag, marked `◆`. In state mode, tagged tasks form the In use section at the top. In custom mode, tagged tasks are placed at the top of their existing groups rather than in a global section. Within a dir or custom section, tasks are sorted as tagged, live, then completed; each class is then sorted by directory and spawn order. Idle state does not affect row order in these modes, so quiet tasks are kept in place and marked `∙`. In state mode, quiet tasks are moved from Running to Idle.
+Press `m` to toggle the "in use" tag, marked `◆`. In state mode, tagged tasks form the In use section at the top. In custom mode, tagged tasks are placed at the top of their existing groups rather than in a global section. Within a dir or custom section, tasks are sorted as tagged, live, then completed or stopped; each class is then sorted by directory and spawn order. Idle state does not affect row order in these modes, so quiet tasks are kept in place and marked `∙`. In state mode, quiet tasks are moved from Running to Idle.
 
 Press `M` to select the next tagged task in dashboard order, wrapping after the last. With no tagged tasks, the selection is unchanged; with one, that task is selected.
 
@@ -146,7 +147,7 @@ In custom mode only, a new command is assigned the selected task's group, throug
 
 #### The flagship
 
-Press `]` to mark the selected task as the flagship, shown as `⚑`; press it again to clear the mark. You can mark only one task at a time. Select another task and press `]` to move the mark. Finished tasks cannot be marked. Sorting is unchanged.
+Press `]` to mark the selected task as the flagship, shown as `⚑`; press it again to clear the mark. You can mark only one task at a time. Select another task and press `]` to move the mark. Finished and stopped tasks cannot be marked. Sorting is unchanged.
 
 Press `Ctrl-]` from the dashboard, peek, or an attached task to attach to the flagship, and again to go back:
 
@@ -155,7 +156,7 @@ Press `Ctrl-]` from the dashboard, peek, or an attached task to attach to the fl
 
 After attaching to the flagship with `Enter`, press `Ctrl-]` to return to the dashboard.
 
-You keep tags set with `m` after task completion, but lose the flagship mark on completion or removal. Save and load [sessions](sessions.md) to preserve and restore both marks. You can also recover both marks from automatic snapshots. When loading with a current flagship, you keep that mark.
+You keep tags set with `m` after task completion, but lose the flagship mark on completion or removal. Save and load [sessions](sessions.md) to preserve and restore both marks. You can also recover both marks from automatic snapshots. When loading with a current flagship, you keep that mark. A stored flagship on a stopped entry is not restored.
 
 #### Renaming
 
@@ -229,7 +230,7 @@ Bindings are arranged in two columns. At limited height, group headers are omitt
 
 ## Peek
 
-Peek shows the selected task's live screen (the last screenful) in a centered box over the dashboard. Use `↑`/`↓` (or `k`/`j`) to switch tasks, `Enter` to attach, `r` to rerun a finished task, or `Space`, `Esc`, or `q` to close.
+Peek shows the selected task's live screen (the last screenful) in a centered box over the dashboard. Use `↑`/`↓` (or `k`/`j`) to switch tasks, `Enter` to attach, `r` to rerun a finished task or start a stopped one, or `Space`, `Esc`, or `q` to close.
 
 Read the source of the row's dashboard preview in the footer's `preview:` segment: `floor` (the last non-blank row of the live screen), `marker` (a full-screen program with no usable title), `title` (the child's window title), or `anchor/<rule>` (a recognized agent status, tagged with the matcher that produced it). On the alternate screen, any current title is rendered; recognized title formats are normalized first. On the primary screen, only a retained title recognized by the task's agent adapter is rendered. Otherwise, `floor` is used. Most rules name a screen matcher, such as `claude:spinner` or `codex:approval-menu`. The `claude:registry-approval` and `claude:registry-waiting` rules instead come from Claude's on-disk session status.
 

@@ -1,6 +1,6 @@
 # fleetcom Documentation
 
-The daemon supervises live processes; session files store repeatable launch recipes. Reconnecting returns you to the daemon's running tasks, while loading a session starts new processes from its recipe. Use this guide for storage paths, lifecycle details, and a complete first run.
+The daemon supervises live processes; session files store repeatable launch recipes, with each task's finished state. Reconnecting returns you to the daemon's running tasks, while loading a session starts new processes from its recipe and restores the tasks that had finished as stopped rows. Use this guide for storage paths, lifecycle details, and a complete first run.
 
 ## Index
 
@@ -150,7 +150,7 @@ Press `w`, type a name, and press `Enter` to save the fleet as a [session](sessi
 | `<runtime>/daemon.lock` | `0666 & ~umask` when new; otherwise unchanged | the owning daemon's PID, trustworthy only while its `flock` is held |
 | `<runtime>/daemon.log` | `0666 & ~umask` when new; otherwise unchanged | stderr from the autostarted daemon |
 | [session directory](#config-directory-sessions) | `0700` | saved recipes |
-| `<sessions>/<name>.json` | `0600` | directories, commands, groups, display names, tags, the flagship |
+| `<sessions>/<name>.json` | `0600` | directories, commands, groups, display names, tags, the flagship, stopped flags |
 | `<sessions>/recovery/` | `0700` | [automatic snapshots](sessions.md#recovery) |
 | `<sessions>/recovery/<snapshot>.json` | `0600` | one automatic session recipe |
 | `<capture-root>/<pid>-<nonce>/` | `0700` | [agent hook, notifier, and extension-module assets plus per-run capture payloads](agent-resume.md#capture-state-and-isolation) |
@@ -165,7 +165,7 @@ The runtime directory is validated before its contents are used. The path must b
 
 Full command lines are persisted in recipes, including any embedded secrets. A token passed as an argument is written to its session file and to every recovery snapshot that captures the task.
 
-The client environment is not persisted. Each client's environment and working directory are sent during the connection handshake and retained in daemon memory. Use session and recovery files to preserve only directories, commands, group assignments, display names, tags, and the flagship.
+The client environment is not persisted. Each client's environment and working directory are sent during the connection handshake and retained in daemon memory. Use session and recovery files to preserve only directories, commands, group assignments, display names, tags, the flagship, and whether each task had finished.
 
 ### Captured IDs
 
