@@ -105,7 +105,7 @@ impl ThreadTransport {
                 true
             });
             // Loop returned (Shutdown or client gone): `sup` drops here, and with
-            // it every Task (Task::drop → killpg), so no task outlives the core.
+            // it every Task's Process (Process::drop → killpg), so no task outlives the core.
         });
         Self {
             wake_tx,
@@ -118,7 +118,7 @@ impl ThreadTransport {
     fn stop(&mut self) {
         // Tell the core to kill tasks and exit, then wait for it. The join is what
         // guarantees the SIGKILLs have been sent before we return. The core
-        // clears its tasks (Task::drop → killpg) as `run_loop` returns.
+        // clears its tasks (Process::drop → killpg) as `run_loop` returns.
         let _ = self.wake_tx.send(Wake::Cmd(Command::Shutdown));
         if let Some(h) = self.handle.take() {
             let _ = h.join();

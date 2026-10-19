@@ -516,7 +516,7 @@ fn ticks_without_copies(s: &mut Supervisor, why: &str) -> bool {
 /// Search the first task's formatted grid for `marker`.
 fn grid_shows(s: &Supervisor, marker: &str) -> bool {
     s.tasks.first().is_some_and(|t| {
-        let (formatted, _, _) = t.formatted();
+        let (formatted, _, _) = t.process.formatted();
         String::from_utf8_lossy(&formatted).contains(marker)
     })
 }
@@ -536,7 +536,7 @@ fn scrolled_task() -> (Supervisor, u64) {
             id,
             action: ScrollAction::Up(3),
         });
-        s.tasks[0].scroll_offset() > 0
+        s.tasks[0].process.scroll_offset() > 0
     });
     assert!(scrolled, "the task never accrued scrollback");
     (s, id)
@@ -742,7 +742,7 @@ fn clear_watch_snaps_the_watched_task_live() {
     let (mut s, _) = scrolled_task();
     s.clear_watch();
     assert_eq!(
-        s.tasks[0].scroll_offset(),
+        s.tasks[0].process.scroll_offset(),
         0,
         "disconnect must return the watched task's viewport to live"
     );
@@ -875,7 +875,7 @@ fn kill_with_an_unknown_id_leaves_the_live_task_alone() {
     s.apply(Command::Kill { id: 999 });
     assert!(s.drain().is_empty(), "unknown-id Kill must stay silent");
     assert!(
-        !s.tasks[0].overdue(Instant::now(), Duration::ZERO),
+        !s.tasks[0].process.overdue(Instant::now(), Duration::ZERO),
         "unknown-id Kill must not signal the live task"
     );
     assert_eq!(view_of(&mut s, id).lifecycle, before);
@@ -902,7 +902,7 @@ fn tag_with_an_unknown_id_leaves_the_live_task_alone() {
 #[test]
 fn scrollback_with_an_unknown_id_leaves_the_live_task_alone() {
     let (mut s, _) = scrolled_task();
-    let offset = s.tasks[0].scroll_offset();
+    let offset = s.tasks[0].process.scroll_offset();
 
     s.apply(Command::Scrollback {
         id: 999,
@@ -913,7 +913,7 @@ fn scrollback_with_an_unknown_id_leaves_the_live_task_alone() {
         "unknown-id Scrollback must stay silent"
     );
     assert_eq!(
-        s.tasks[0].scroll_offset(),
+        s.tasks[0].process.scroll_offset(),
         offset,
         "unknown-id Scrollback must not snap the live task's viewport"
     );
@@ -1160,7 +1160,9 @@ fn reap_until(
 fn wait_exited(s: &mut Supervisor, id: u64) {
     assert!(
         reap_until(s, Duration::from_secs(5), |s| {
-            s.tasks.iter().all(|t| t.id != id || t.finished.is_some())
+            s.tasks
+                .iter()
+                .all(|t| t.id != id || t.process.finished.is_some())
         }),
         "task {id} never exited"
     );
@@ -1240,7 +1242,7 @@ fn rerun_sweeps_stragglers_of_the_old_run() {
         "rerun never swept the old run's straggler"
     );
     // The fresh run exists under the same id; its own straggler dies with
-    // the supervisor (Task::drop backstop).
+    // the supervisor (Process::drop backstop).
     assert!(s.tasks.iter().any(|t| t.id == id));
 }
 
@@ -1342,7 +1344,7 @@ fn shutdown_waits_the_grace_when_every_task_has_finished() {
         spawn(&mut s, "true", here());
     }
     assert!(reap_until(&mut s, Duration::from_secs(5), |s| {
-        s.tasks.len() == 2 && s.tasks.iter().all(|t| t.finished.is_some())
+        s.tasks.len() == 2 && s.tasks.iter().all(|t| t.process.finished.is_some())
     }));
     let t0 = Instant::now();
     s.apply(Command::Shutdown);
@@ -1774,7 +1776,7 @@ fn key_command_encodes_against_live_cursor_mode() {
         s.tasks
             .iter()
             .find(|t| t.id == id)
-            .is_some_and(|t| t.input_hints().1)
+            .is_some_and(|t| t.process.input_hints().1)
     };
     assert!(
         wait_until(Duration::from_secs(5), || app_cursor_on(&s)),

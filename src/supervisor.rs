@@ -23,7 +23,7 @@ use crate::{
         UNASSIGNED, env_get,
     },
     session::{self, EntryKind, SessionConfig, SessionEntry},
-    task::{Exec, Task, WriteRefused},
+    task::{Exec, Process, Task, WriteRefused},
 };
 
 /// Quiet period after which a live task becomes idle.
@@ -289,14 +289,15 @@ impl Recovery {
 
 pub struct Supervisor {
     tasks: Vec<Task>,
-    /// Removed tasks whose process groups may still be winding down: `TERMed` at
-    /// removal, escalated to KILL by `reap` at grace end, and dropped once the
-    /// leader's zombie is collected. Invisible to `tick` snapshots, so the row
-    /// disappears instantly while the sweep runs behind it.
+    /// Runs of removed or rerun tasks whose process groups may still be winding
+    /// down: `TERMed` at retirement, escalated to KILL by `reap` at grace end, and
+    /// dropped once the leader's zombie is collected. Invisible to `tick`
+    /// snapshots, so the row disappears (or shows its replacement) instantly
+    /// while the sweep runs behind it.
     ///
     /// Retain each leader's zombie until SIGKILL has been sent: collecting it earlier
     /// would release the process-group ID.
-    graveyard: Vec<Task>,
+    graveyard: Vec<Process>,
     next_id: u64,
     /// PTY content size (rows already minus the client's status bar). Every task
     /// runs at this size, so attach never reflows.
@@ -320,7 +321,7 @@ pub struct Supervisor {
     /// Spawning is refused until one is installed.
     launch: Option<LaunchContext>,
     events: Vec<Event>,
-    /// Handed to every `Task` so its reader thread can wake the core loop when the PTY
+    /// Handed to every `Process` so its reader thread can wake the core loop when the PTY
     /// produces output. Install the serving loop's sender on connect (`set_waker`) and
     /// drop it on disconnect (`clear_waker`). Between clients it is `None`; task output
     /// is parsed without waking a serving loop.
@@ -436,11 +437,11 @@ impl Supervisor {
                 group,
             } => self.spawn(&command, &cwd, group),
             Command::SpawnAgent { agent, cwd, group } => self.spawn_agent(&agent, &cwd, group),
-            Command::Kill { id } => self.with_task(id, Task::terminate),
+            Command::Kill { id } => self.with_task(id, |t| t.process.terminate()),
             Command::Remove { id } => {
                 if let Some(i) = self.index_of(id) {
                     let t = self.tasks.remove(i);
-                    self.retire(t);
+                    self.retire(t.process);
                 }
             }
             Command::Restart { id } => self.rerun(id),
@@ -461,7 +462,7 @@ impl Supervisor {
                     self.cols = (MAX_CELLS / u32::from(self.rows)) as u16;
                 }
                 for t in &mut self.tasks {
-                    let _ = t.resize(self.rows, self.cols);
+                    let _ = t.process.resize(self.rows, self.cols);
                 }
             }
             Command::Watch { id, attached } => {
@@ -470,14 +471,14 @@ impl Supervisor {
                     && let Some(old) = self.watched
                     && let Some(t) = self.by_id_mut(old)
                 {
-                    t.scroll_view(ScrollAction::Live);
+                    t.process.scroll_view(ScrollAction::Live);
                 }
                 if id != self.watched || attached != self.watch_attached {
                     // Discard stores captured before this watch state took effect.
                     if let Some(new) = id
                         && let Some(t) = self.by_id_mut(new)
                     {
-                        let _ = t.drain_clipboard();
+                        let _ = t.process.drain_clipboard();
                     }
                     self.last_screen = None;
                 }
@@ -486,15 +487,19 @@ impl Supervisor {
             }
             // Paste and mouse encoding depend on the child's terminal modes,
             // which only the core's emulator can see.
-            Command::Paste { id, bytes } => self.deliver(id, "paste", |t| t.send_paste(&bytes)),
+            Command::Paste { id, bytes } => {
+                self.deliver(id, "paste", |t| t.process.send_paste(&bytes));
+            }
             Command::Mouse { id, kind, col, row } => {
-                self.deliver(id, "mouse input", |t| t.send_mouse(kind, col, row));
+                self.deliver(id, "mouse input", |t| t.process.send_mouse(kind, col, row));
             }
             // Encode keys here because the child's cursor-key mode is core-side.
             Command::Key { id, code, mods } => {
-                self.deliver(id, "key input", |t| t.send_key(code, mods));
+                self.deliver(id, "key input", |t| t.process.send_key(code, mods));
             }
-            Command::Scrollback { id, action } => self.with_task(id, |t| t.scroll_view(action)),
+            Command::Scrollback { id, action } => {
+                self.with_task(id, |t| t.process.scroll_view(action));
+            }
             Command::SaveSession { name } => self.save_session(&name),
             Command::LoadSession { name } => self.load_session(&name),
             Command::LoadRecovery { stem } => self.load_recovery(&stem),
@@ -510,14 +515,14 @@ impl Supervisor {
             // Swallow a poll error rather than propagate: the task just isn't
             // latched this pass and is retried next. waitid failing is rare and
             // must not take down the loop.
-            let _ = t.poll_exit();
+            let _ = t.process.poll_exit();
             // Freeze the preview from the complete output and final screen.
             t.finalize_preview();
-            if t.overdue(now, self.kill_grace) {
-                t.force_kill();
+            if t.process.overdue(now, self.kill_grace) {
+                t.process.force_kill();
             }
         }
-        // Removed tasks still need exit handling and escalation.
+        // Retired runs still need exit handling and escalation.
         for t in &mut self.graveyard {
             let _ = t.poll_exit();
             if t.overdue(now, self.kill_grace) {
@@ -544,7 +549,7 @@ impl Supervisor {
     fn flagship_holder(&self) -> Option<u64> {
         self.flagship.filter(|&id| {
             self.index_of(id)
-                .is_some_and(|i| self.tasks[i].finished.is_none())
+                .is_some_and(|i| self.tasks[i].process.finished.is_none())
         })
     }
 
@@ -555,7 +560,7 @@ impl Supervisor {
     /// Collection and PTY teardown never block on live processes or workers.
     fn shutdown_all(&mut self) {
         for t in &mut self.tasks {
-            t.terminate();
+            t.process.terminate();
         }
         let deadline = Instant::now() + self.kill_grace;
         while (!self.tasks.is_empty() || !self.graveyard.is_empty()) && Instant::now() < deadline {
@@ -586,9 +591,9 @@ impl Supervisor {
             .tasks
             .iter_mut()
             .map(|t| {
-                t.flush_expired_sync();
+                t.process.flush_expired_sync();
                 // Drain all tasks so stores from inactive tasks cannot be forwarded later.
-                let stores = t.drain_clipboard();
+                let stores = t.process.drain_clipboard();
                 if forwarding == Some(t.id) {
                     clipboard = Some((t.id, stores));
                 }
@@ -601,11 +606,15 @@ impl Supervisor {
                     managed: t.harness.is_some(),
                     group: t.group.clone(),
                     name: t.name.clone(),
-                    lifecycle: t.lifecycle(now, IDLE_AFTER),
+                    lifecycle: t.process.lifecycle(now, IDLE_AFTER),
                     preview: t.resolve_preview(now),
-                    started_ago: now.duration_since(t.started),
-                    quiet_ago: t.finished.is_none().then(|| t.quiet_for(now)),
-                    finished_ago: t.finished.map(|f| now.duration_since(f)),
+                    started_ago: now.duration_since(t.process.started),
+                    quiet_ago: t
+                        .process
+                        .finished
+                        .is_none()
+                        .then(|| t.process.quiet_for(now)),
+                    finished_ago: t.process.finished.map(|f| now.duration_since(f)),
                 }
             })
             .collect();
@@ -627,9 +636,9 @@ impl Supervisor {
         if let Some(id) = self.watched
             && let Some(t) = self.tasks.iter().find(|t| t.id == id)
         {
-            let (formatted, cursor, hide) = t.formatted();
-            let (wants_mouse, alt_screen, alt_scroll) = t.input_hints();
-            let sb = t.scroll_offset();
+            let (formatted, cursor, hide) = t.process.formatted();
+            let (wants_mouse, alt_screen, alt_scroll) = t.process.input_hints();
+            let sb = t.process.scroll_offset();
             let mut view = ScreenView {
                 id,
                 // `lines` stays empty on both the stored and candidate copies
@@ -648,7 +657,7 @@ impl Supervisor {
             // Send only when rendering or input-policy state changes.
             if self.last_screen.as_ref() != Some(&view) {
                 self.last_screen = Some(view.clone());
-                view.lines = t.screen_lines();
+                view.lines = t.process.screen_lines();
                 self.events.push(Event::Screen(view));
             }
         }
@@ -744,14 +753,14 @@ impl Supervisor {
         }
     }
 
-    /// Terminate a removed task, unlink its capture, and retain it for
+    /// Terminate a displaced run, unlink its capture, and retain it for
     /// escalation and reaping.
-    fn retire(&mut self, mut t: Task) {
-        t.terminate();
-        if let Some(cap) = &t.capture_file {
+    fn retire(&mut self, mut p: Process) {
+        p.terminate();
+        if let Some(cap) = &p.capture_file {
             let _ = std::fs::remove_file(cap);
         }
-        self.graveyard.push(t);
+        self.graveyard.push(p);
     }
 
     /// Route one input send to task `id`, reporting a bounded-queue refusal.
@@ -885,8 +894,8 @@ impl Supervisor {
         if let Some((h, home, capture_file, resume_id)) = meta {
             task.harness = Some(h);
             // Registry reads must keep using the launch-time configuration.
-            task.harness_home = home;
-            task.capture_file = Some(capture_file);
+            task.process.harness_home = home;
+            task.process.capture_file = Some(capture_file);
             task.resume_id = resume_id;
         }
         task.run = run;
@@ -989,8 +998,8 @@ impl Supervisor {
             return;
         };
         // A task can exit between the last reap tick and this request.
-        let _ = self.tasks[i].poll_exit();
-        if self.tasks[i].finished.is_none() {
+        let _ = self.tasks[i].process.poll_exit();
+        if self.tasks[i].process.finished.is_none() {
             self.status("rerun failed: task is still running");
             return;
         }
@@ -1023,16 +1032,26 @@ impl Supervisor {
         // run number to isolate the replacement's capture file.
         let run = self.tasks[i].run + 1;
         match self.spawn_task(id, run, &relaunch, &cwd, &launch.env) {
-            Ok((mut fresh, notice)) => {
+            Ok((fresh, notice)) => {
                 if let Some(notice) = notice {
                     self.status(format!("task {id}: {notice}"));
                 }
-                fresh.tagged = self.tasks[i].tagged;
-                fresh.group.clone_from(&self.tasks[i].group);
-                fresh.name.clone_from(&self.tasks[i].name);
-                // Read the resume ID before retiring the displaced run and removing its
-                // capture file.
-                let old = std::mem::replace(&mut self.tasks[i], fresh);
+                // Keep the row's identity; take from the fresh spawn only what a
+                // new launch sets: its harness, run number, planned resume ID,
+                // and the process. The resume ID was read above, before the
+                // displaced run and its capture file go.
+                let Task {
+                    harness,
+                    run,
+                    resume_id,
+                    process,
+                    ..
+                } = fresh;
+                let t = &mut self.tasks[i];
+                t.harness = harness;
+                t.run = run;
+                t.resume_id = resume_id;
+                let old = std::mem::replace(&mut t.process, process);
                 self.retire(old);
                 // Reset the fingerprint for the replacement task's screen.
                 if self.watched == Some(id) {

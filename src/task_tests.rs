@@ -34,8 +34,8 @@ fn spawn_sh(id: u64, command: &str) -> Task {
 fn wait_finished(t: &mut Task) {
     assert!(
         wait_until(Duration::from_secs(5), || {
-            t.poll_exit().unwrap();
-            t.finished.is_some()
+            t.process.poll_exit().unwrap();
+            t.process.finished.is_some()
         }),
         "task never finished"
     );
@@ -45,8 +45,8 @@ fn wait_finished(t: &mut Task) {
 fn wait_complete(t: &mut Task) {
     assert!(
         wait_until(Duration::from_secs(60), || {
-            t.poll_exit().unwrap();
-            t.output_complete()
+            t.process.poll_exit().unwrap();
+            t.process.output_complete()
         }),
         "child never completed"
     );
@@ -59,25 +59,25 @@ fn spawn_reads_output_and_exits_zero() {
     let mut t = spawn(1, "printf 'alpha\\nomega\\n'");
     let mut preview = String::new();
     wait_until(Duration::from_secs(5), || {
-        t.poll_exit().unwrap();
+        t.process.poll_exit().unwrap();
         preview = t.resolve_preview(Instant::now()).text;
-        t.finished.is_some() && preview.contains("omega")
+        t.process.finished.is_some() && preview.contains("omega")
     });
-    assert_eq!(t.exit_code, Some(0));
+    assert_eq!(t.process.exit_code, Some(0));
     assert!(preview.contains("omega"), "preview was {preview:?}");
-    t.terminate();
+    t.process.terminate();
 }
 
 #[test]
 fn nonzero_exit_is_recorded() {
     let mut t = spawn(2, "exit 3");
     wait_finished(&mut t);
-    assert_eq!(t.exit_code, Some(3));
+    assert_eq!(t.process.exit_code, Some(3));
     assert_eq!(
-        t.lifecycle(Instant::now(), Duration::from_secs(10)),
+        t.process.lifecycle(Instant::now(), Duration::from_secs(10)),
         Lifecycle::Failed
     );
-    t.terminate();
+    t.process.terminate();
 }
 
 /// A live task becomes idle only after the quiet threshold; output resets it.
@@ -86,19 +86,22 @@ fn lifecycle_crosses_idle_threshold_and_resets_on_activity() {
     let mut t = spawn(5, "sleep 5");
     // `sleep` writes nothing, so `last_activity` keeps its spawn value
     // and the injected `now`s measure against a fixed instant.
-    let quiet_since = *t.last_activity.lock().unwrap();
+    let quiet_since = *t.process.last_activity.lock().unwrap();
     let window = Duration::from_secs(10);
 
     let inside = quiet_since + Duration::from_secs(9);
-    assert_eq!(t.lifecycle(inside, window), Lifecycle::Active);
+    assert_eq!(t.process.lifecycle(inside, window), Lifecycle::Active);
 
-    assert_eq!(t.lifecycle(quiet_since + window, window), Lifecycle::Active);
+    assert_eq!(
+        t.process.lifecycle(quiet_since + window, window),
+        Lifecycle::Active
+    );
 
     let past = quiet_since + Duration::from_secs(11);
-    assert_eq!(t.lifecycle(past, window), Lifecycle::Idle);
-    *t.last_activity.lock().unwrap() = past;
-    assert_eq!(t.lifecycle(past, window), Lifecycle::Active);
-    t.terminate();
+    assert_eq!(t.process.lifecycle(past, window), Lifecycle::Idle);
+    *t.process.last_activity.lock().unwrap() = past;
+    assert_eq!(t.process.lifecycle(past, window), Lifecycle::Active);
+    t.process.terminate();
 }
 
 /// Keep a task active on repeated output before the quiet threshold.
@@ -106,14 +109,14 @@ fn lifecycle_crosses_idle_threshold_and_resets_on_activity() {
 fn sub_window_quiet_gaps_never_read_as_idle() {
     let mut t = spawn(7, "sleep 5");
     let window = Duration::from_secs(10);
-    let start = *t.last_activity.lock().unwrap();
+    let start = *t.process.last_activity.lock().unwrap();
     for gaps in 1..=4u32 {
         let probe = start + Duration::from_secs(9) * gaps;
-        assert_eq!(t.lifecycle(probe, window), Lifecycle::Active);
+        assert_eq!(t.process.lifecycle(probe, window), Lifecycle::Active);
         // Simulate output at the end of each quiet gap.
-        *t.last_activity.lock().unwrap() = probe;
+        *t.process.last_activity.lock().unwrap() = probe;
     }
-    t.terminate();
+    t.process.terminate();
 }
 
 /// Exit status takes precedence over elapsed quiet time.
@@ -122,18 +125,18 @@ fn finished_lifecycle_ignores_quiet_time() {
     for (command, expected) in [("exit 0", Lifecycle::Ok), ("exit 3", Lifecycle::Failed)] {
         let mut t = spawn(6, command);
         wait_finished(&mut t);
-        let now = *t.last_activity.lock().unwrap() + Duration::from_secs(11);
-        assert_eq!(t.lifecycle(now, Duration::from_secs(10)), expected);
-        t.terminate();
+        let now = *t.process.last_activity.lock().unwrap() + Duration::from_secs(11);
+        assert_eq!(t.process.lifecycle(now, Duration::from_secs(10)), expected);
+        t.process.terminate();
     }
 }
 
 #[test]
 fn resize_is_reflected_in_the_grid() {
     let mut t = spawn(3, "sleep 5");
-    t.resize(30, 100).unwrap();
-    assert_eq!(t.parser.lock().size(), (30, 100));
-    t.terminate();
+    t.process.resize(30, 100).unwrap();
+    assert_eq!(t.process.parser.lock().size(), (30, 100));
+    t.process.terminate();
 }
 
 /// The exit latch must not reap: after `finished` latches, the leader is
@@ -143,8 +146,8 @@ fn resize_is_reflected_in_the_grid() {
 fn exited_leader_stays_a_zombie_until_drop() {
     let mut t = spawn(4, "exit 7");
     wait_finished(&mut t);
-    assert_eq!(t.exit_code, Some(7));
-    let pid = Pid::from_raw(t.pid.expect("spawn always yields a pid") as i32);
+    assert_eq!(t.process.exit_code, Some(7));
+    let pid = Pid::from_raw(t.process.pid.expect("spawn always yields a pid") as i32);
     // Signal 0 = existence check; a zombie still exists.
     assert!(
         kill(pid, None).is_ok(),
@@ -181,7 +184,7 @@ fn managed_launch_makes_the_agent_the_task_leader_under_any_shell() {
     wait_finished(&mut t);
     assert_eq!(
         read_pid(&pid_file).as_raw() as u32,
-        t.pid().unwrap(),
+        t.process.pid().unwrap(),
         "the agent must be the task leader with no shell in between"
     );
 
@@ -191,7 +194,7 @@ fn managed_launch_makes_the_agent_the_task_leader_under_any_shell() {
     wait_finished(&mut t);
     assert_ne!(
         read_pid(&pid_file).as_raw() as u32,
-        t.pid().unwrap(),
+        t.process.pid().unwrap(),
         "premise: under a resident shell the literal agent is a child, not the leader"
     );
 }
@@ -210,7 +213,7 @@ fn terminate_reaches_stragglers_after_leader_exit() {
     let straggler = read_pid(&spid);
     assert!(kill(straggler, None).is_ok(), "straggler should be alive");
 
-    t.terminate(); // leader already finished: the group signal must still fire
+    t.process.terminate(); // leader already finished: the group signal must still fire
     assert!(
         wait_until(Duration::from_secs(5), || kill(straggler, None).is_err()),
         "TERM after leader exit never reached the straggler"
@@ -221,12 +224,12 @@ fn terminate_reaches_stragglers_after_leader_exit() {
 #[test]
 fn killed_leader_latches_137_via_collect() {
     let mut t = spawn(8, "sleep 300");
-    t.force_kill(); // sets kill_sent, so try_collect may reap
+    t.process.force_kill(); // sets kill_sent, so try_collect may reap
     assert!(
-        wait_until(Duration::from_secs(5), || t.try_collect()),
+        wait_until(Duration::from_secs(5), || t.process.try_collect()),
         "KILLed leader was never collected"
     );
-    assert_eq!(t.exit_code, Some(137));
+    assert_eq!(t.process.exit_code, Some(137));
 }
 
 /// Collection must retain the group reservation until escalation, including
@@ -235,19 +238,19 @@ fn killed_leader_latches_137_via_collect() {
 fn exited_leader_is_collectible_only_after_kill() {
     let mut t = spawn(30, "exit 0");
     wait_finished(&mut t);
-    assert!(!t.try_collect());
-    t.terminate();
-    let term_sent = t.term_sent.unwrap();
-    t.terminate();
+    assert!(!t.process.try_collect());
+    t.process.terminate();
+    let term_sent = t.process.term_sent.unwrap();
+    t.process.terminate();
     assert_eq!(
-        t.term_sent,
+        t.process.term_sent,
         Some(term_sent),
         "repeated TERM reset the grace"
     );
-    assert!(!t.try_collect());
-    assert!(kill(Pid::from_raw(t.pid.unwrap() as i32), None).is_ok());
-    t.force_kill();
-    assert!(t.try_collect());
+    assert!(!t.process.try_collect());
+    assert!(kill(Pid::from_raw(t.process.pid.unwrap() as i32), None).is_ok());
+    t.process.force_kill();
+    assert!(t.process.try_collect());
 }
 
 /// Clamp scrollback at both ends; return to live output on input.
@@ -256,53 +259,56 @@ fn viewport_scrolls_and_snaps_live_on_input() {
     let mut t = spawn(9, "cat");
     // Feed enough rows to create scrollback.
     for i in 0..50 {
-        t.parser.lock().process(format!("line{i}\r\n").as_bytes());
+        t.process
+            .parser
+            .lock()
+            .process(format!("line{i}\r\n").as_bytes());
     }
-    assert_eq!(t.scroll_offset(), 0);
-    t.scroll_view(ScrollAction::Up(10));
-    assert_eq!(t.scroll_offset(), 10);
-    t.scroll_view(ScrollAction::Down(4));
-    assert_eq!(t.scroll_offset(), 6);
-    t.scroll_view(ScrollAction::Top);
-    let top = t.scroll_offset();
+    assert_eq!(t.process.scroll_offset(), 0);
+    t.process.scroll_view(ScrollAction::Up(10));
+    assert_eq!(t.process.scroll_offset(), 10);
+    t.process.scroll_view(ScrollAction::Down(4));
+    assert_eq!(t.process.scroll_offset(), 6);
+    t.process.scroll_view(ScrollAction::Top);
+    let top = t.process.scroll_offset();
     assert!(top > 0);
     assert!(
-        t.screen_lines()[0].starts_with("line0"),
+        t.process.screen_lines()[0].starts_with("line0"),
         "Top must show the oldest stored row, got {:?}",
-        t.screen_lines()[0]
+        t.process.screen_lines()[0]
     );
     // Large upward movement clamps at the oldest row.
-    t.scroll_view(ScrollAction::Live);
-    t.scroll_view(ScrollAction::Up(10_000));
-    assert_eq!(t.scroll_offset(), top);
+    t.process.scroll_view(ScrollAction::Live);
+    t.process.scroll_view(ScrollAction::Up(10_000));
+    assert_eq!(t.process.scroll_offset(), top);
     // Return the viewport to live output on input.
-    t.send_input(b"x".to_vec()).unwrap();
-    assert_eq!(t.scroll_offset(), 0);
-    t.terminate();
+    t.process.send_input(b"x".to_vec()).unwrap();
+    assert_eq!(t.process.scroll_offset(), 0);
+    t.process.terminate();
 }
 
 /// `screen_lines` returns one entry per grid row, including a blank final row.
 #[test]
 fn screen_lines_yields_one_entry_per_grid_row() {
     let mut t = spawn(60, "sleep 300");
-    t.parser.lock().process(b"top");
-    let lines = t.screen_lines();
+    t.process.parser.lock().process(b"top");
+    let lines = t.process.screen_lines();
     // The spawn helper's grid is 24x80.
     assert_eq!(lines.len(), 24, "one entry per grid row");
     assert_eq!(lines[0], "top");
     assert_eq!(lines[23], "", "the blank bottom row keeps its slot");
-    t.terminate();
+    t.process.terminate();
 }
 
 /// The per-task writer worker delivers queued messages in FIFO order.
 #[test]
 fn queued_writes_reach_the_child_in_order() {
     let mut t = spawn(10, "cat");
-    t.send_input(b"zqfirstqz\n".to_vec()).unwrap();
-    t.send_input(b"zqsecondqz\n".to_vec()).unwrap();
+    t.process.send_input(b"zqfirstqz\n".to_vec()).unwrap();
+    t.process.send_input(b"zqsecondqz\n".to_vec()).unwrap();
     let mut contents = String::new();
     wait_until(Duration::from_secs(5), || {
-        contents = t.parser.lock().contents();
+        contents = t.process.parser.lock().contents();
         contents.contains("zqsecondqz")
     });
     let first = contents
@@ -312,7 +318,7 @@ fn queued_writes_reach_the_child_in_order() {
         .find("zqsecondqz")
         .expect("second message never echoed");
     assert!(first < second, "queued writes reordered: {contents:?}");
-    t.terminate();
+    t.process.terminate();
 }
 
 /// Test writer that accepts writes within `limit` bytes, then fails.
@@ -372,14 +378,14 @@ fn write_error_keeps_draining_the_pending_counter() {
 #[test]
 fn input_hints_track_child_modes() {
     let mut t = spawn(8, "sleep 5");
-    assert_eq!(t.input_hints(), (false, false, false));
-    t.parser.lock().process(b"\x1b[?1000h");
-    assert_eq!(t.input_hints(), (true, false, false));
-    t.parser.lock().process(b"\x1b[?1000l\x1b[?1049h");
-    assert_eq!(t.input_hints(), (false, true, true));
-    t.parser.lock().process(b"\x1b[?1007l");
-    assert_eq!(t.input_hints(), (false, true, false));
-    t.terminate();
+    assert_eq!(t.process.input_hints(), (false, false, false));
+    t.process.parser.lock().process(b"\x1b[?1000h");
+    assert_eq!(t.process.input_hints(), (true, false, false));
+    t.process.parser.lock().process(b"\x1b[?1000l\x1b[?1049h");
+    assert_eq!(t.process.input_hints(), (false, true, true));
+    t.process.parser.lock().process(b"\x1b[?1007l");
+    assert_eq!(t.process.input_hints(), (false, true, false));
+    t.process.terminate();
 }
 
 /// A live reader may still hold bytes that have not reached the grid, so
@@ -392,7 +398,7 @@ fn finalize_preview_waits_for_reader_eof() {
     // Reopen the reader gate: a thread outliving the child's exit stands in
     // for a reader still working through bytes the grid has not seen.
     let (release, parked) = channel::<()>();
-    t.handle = Some(thread::spawn(move || {
+    t.process.handle = Some(thread::spawn(move || {
         let _ = parked.recv();
     }));
     t.finalize_preview();
@@ -400,12 +406,12 @@ fn finalize_preview_waits_for_reader_eof() {
         !t.resolve_preview(Instant::now()).frozen,
         "finalization must wait for reader EOF"
     );
-    t.parser.lock().process(b"late output\r\n");
+    t.process.parser.lock().process(b"late output\r\n");
 
     // Dropping the sender ends the stand-in: the reader reached EOF.
     drop(release);
     assert!(
-        wait_until(Duration::from_secs(60), || t.reader_done()),
+        wait_until(Duration::from_secs(60), || t.process.reader_done()),
         "the stand-in reader never stopped"
     );
     t.finalize_preview();
@@ -420,11 +426,21 @@ fn finalize_preview_lands_an_open_sync_frame() {
     let mut t = spawn_sh(21, "printf '\\033[?2026htest result: ok\\n'");
     wait_complete(&mut t);
     assert!(
-        !t.parser.lock().contents().contains("test result: ok"),
+        !t.process
+            .parser
+            .lock()
+            .contents()
+            .contains("test result: ok"),
         "premise: the unclosed frame still buffers the final output"
     );
     t.finalize_preview();
-    assert!(t.parser.lock().contents().contains("test result: ok"));
+    assert!(
+        t.process
+            .parser
+            .lock()
+            .contents()
+            .contains("test result: ok")
+    );
     let p = t.resolve_preview(Instant::now());
     assert_eq!((p.text.as_str(), p.frozen), ("test result: ok", true));
 }
@@ -479,7 +495,7 @@ fn finalize_preview_keeps_the_last_render_across_alt_teardown() {
     std::fs::write(&teardown, b"").unwrap();
     assert!(
         wait_until(Duration::from_secs(60), || {
-            !t.parser.lock().alternate_screen()
+            !t.process.parser.lock().alternate_screen()
         }),
         "teardown never reached the grid"
     );
@@ -494,7 +510,7 @@ fn finalize_preview_keeps_the_last_render_across_alt_teardown() {
     wait_complete(&mut t);
     t.finalize_preview();
     assert_eq!(
-        t.parser.lock().live_floor(),
+        t.process.parser.lock().live_floor(),
         "prelaunch junk",
         "premise: 1049l restored the pre-launch primary screen"
     );
@@ -615,5 +631,5 @@ fn probe_replies_reach_the_child_through_the_allowlist() {
         got.ends_with(b"R"),
         "CPR reply must follow the DA reply; got {got:?}"
     );
-    t.terminate();
+    t.process.terminate();
 }
