@@ -248,6 +248,37 @@ fn view(id: u64, cwd: PathBuf, tagged: bool, group: Option<&str>) -> TaskView {
     }
 }
 
+/// Attached rendering overwrites the dashboard with the child's formatted grid. A
+/// stopped task has no grid, so its empty screen must clear the viewport instead;
+/// a screen with content must not, or every frame would wipe before painting.
+#[test]
+fn attached_stopped_task_clears_the_dashboard_beneath() {
+    let mut app = App::new_local(30, 100);
+    app.views.push(TaskView {
+        lifecycle: Lifecycle::Stopped,
+        started_ago: None,
+        quiet_ago: None,
+        ..view(7, crate::testutil::here(), false, None)
+    });
+    app.mode = Mode::Attached;
+    app.focused_id = Some(7);
+
+    app.focused_screen = Some(crate::testutil::screen(7));
+    assert!(
+        painted(&mut app).contains("\x1b[2J"),
+        "an empty screen must clear the dashboard it would otherwise leave visible"
+    );
+
+    app.focused_screen = Some(ScreenView {
+        formatted: b"grid".to_vec(),
+        ..crate::testutil::screen(7)
+    });
+    assert!(
+        !painted(&mut app).contains("\x1b[2J"),
+        "a screen with content covers the viewport itself"
+    );
+}
+
 /// Selection is bound to a task id, so a reorder (here: tagging a task into
 /// the "In use" bucket) must not move the highlight to a different task.
 #[test]

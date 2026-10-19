@@ -12,7 +12,7 @@ use crossterm::{
     cursor::{Hide, MoveTo, Show},
     queue,
     style::{Attribute, Color, Print, SetAttribute, SetBackgroundColor},
-    terminal::{BeginSynchronizedUpdate, EndSynchronizedUpdate},
+    terminal::{BeginSynchronizedUpdate, Clear, ClearType, EndSynchronizedUpdate},
 };
 
 use unicode_width::UnicodeWidthStr;
@@ -992,6 +992,12 @@ fn render_attached(out: &mut impl Write, app: &App) -> io::Result<()> {
 
     queue!(out, Hide, MoveTo(0, 0))?;
     if let Some(s) = screen {
+        // A live grid's formatted bytes cover every cell, and that is what buries the
+        // dashboard underneath. A stopped task has no grid and sends nothing, so clear
+        // explicitly; the frame diff and DECSET 2026 keep this from repeating or tearing.
+        if s.formatted.is_empty() {
+            queue!(out, Clear(ClearType::All))?;
+        }
         out.write_all(&s.formatted)?;
         // Repaint selected spans as reverse-video plain text over the child's
         // formatted output.
