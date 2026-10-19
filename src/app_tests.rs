@@ -242,7 +242,7 @@ fn view(id: u64, cwd: PathBuf, tagged: bool, group: Option<&str>) -> TaskView {
         name: None,
         lifecycle: Lifecycle::Active,
         preview: Preview::floor(String::new()),
-        started_ago: Duration::ZERO,
+        started_ago: Some(Duration::ZERO),
         quiet_ago: Some(Duration::ZERO),
         finished_ago: None,
     }
@@ -814,6 +814,71 @@ fn state_mode_ordering_survives_the_row_key_split() {
             ("Completed".to_string(), vec![8, 7]),
         ],
         "four sections in state order; within each, dir a before dir b, then id"
+    );
+}
+
+/// Count stopped rows in the header only when one exists; a fleet without them keeps
+/// the three-count header.
+#[test]
+fn header_counts_stopped_rows_only_when_present() {
+    let mut app = App::new_local(30, 100);
+    let dir = app.invocation_dir.clone();
+    app.views = vec![view(1, dir.clone(), false, None)];
+    app.resolve_selection();
+    let frame = painted(&mut app);
+    assert!(
+        frame.contains("1 running · 0 idle · 0 done      by"),
+        "{frame:?}"
+    );
+
+    app.views.push(TaskView {
+        lifecycle: Lifecycle::Stopped,
+        started_ago: None,
+        quiet_ago: None,
+        ..view(2, dir, false, None)
+    });
+    let frame = painted(&mut app);
+    assert!(
+        frame.contains("1 running · 0 idle · 0 done · 1 stopped      by"),
+        "{frame:?}"
+    );
+}
+
+/// A stopped row is finished for every client gate: it lands in Completed at the
+/// finished rank, `]` sends nothing, `r` sends `Restart`, and `X` sends `Remove`.
+#[test]
+fn stopped_row_is_finished_for_every_client_gate() {
+    let mut app = App::new_local(30, 100);
+    let dir = app.invocation_dir.clone();
+    let stopped = TaskView {
+        lifecycle: Lifecycle::Stopped,
+        started_ago: None,
+        quiet_ago: None,
+        ..view(1, dir.clone(), false, None)
+    };
+    app.views = vec![stopped, view(2, dir, false, None)];
+    app.resolve_selection();
+    assert_eq!(
+        app.section_ids(),
+        vec![
+            ("Running".to_string(), vec![2]),
+            ("Completed".to_string(), vec![1]),
+        ]
+    );
+    assert_eq!(row_rank(&app.views[0]), 2);
+
+    app.selected_id = Some(1);
+    let sent = app.record_sends();
+    app.hit(key(KeyCode::Char(']')));
+    assert!(
+        sent.lock().unwrap().is_empty(),
+        "`]` sends nothing for a stopped row"
+    );
+    app.hit(key(KeyCode::Char('r')));
+    app.hit(key(KeyCode::Char('X')));
+    assert_eq!(
+        *sent.lock().unwrap(),
+        vec![Command::Restart { id: 1 }, Command::Remove { id: 1 }]
     );
 }
 

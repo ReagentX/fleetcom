@@ -90,9 +90,11 @@ pub struct Task {
     /// Session ID pinned or resumed at spawn. Prefer a captured ID or matching live
     /// registry ID when available.
     pub resume_id: Option<String>,
-    /// The current run. `Task` has no `Drop` of its own so the run can be moved
-    /// out and retired on its own; the kill backstop travels with it.
-    pub process: Process,
+    /// The current run, or `None` for a stopped task: one restored from a
+    /// session file with no process in this daemon's lifetime, waiting for `r`.
+    /// `Task` has no `Drop` of its own so the run can be moved out and retired
+    /// on its own; the kill backstop travels with it.
+    pub process: Option<Process>,
 }
 
 /// One run of a task: the PTY, writer queue, reader thread, emulator, the
@@ -248,37 +250,56 @@ impl Task {
     ) -> io::Result<Self> {
         let process = Process::spawn(command, exec, cwd, rows, cols, scrollback, env, waker)?;
         Ok(Self {
+            process: Some(process),
+            ..Self::stopped(id, command.to_string(), cwd.to_path_buf(), None, None)
+        })
+    }
+
+    /// A task with no run: the identity a session file restores for a
+    /// stopped entry, waiting for `r`. `harness` is the managed entry's
+    /// harness, resolved by name alone; the binary is looked up at rerun.
+    /// `resume_id` is the stored session ID a rerun resumes.
+    pub fn stopped(
+        id: u64,
+        command: String,
+        cwd: PathBuf,
+        harness: Option<&'static dyn crate::harness::Harness>,
+        resume_id: Option<String>,
+    ) -> Self {
+        Self {
             id,
-            command: command.to_string(),
-            cwd: cwd.to_path_buf(),
+            summary_adapter: crate::harness::select(&command),
+            command,
+            cwd,
             tagged: false,
             group: None,
             name: None,
-            harness: None,
-            summary_adapter: crate::harness::select(command),
+            harness,
             run: 0,
-            resume_id: None,
-            process,
-        })
+            resume_id,
+            process: None,
+        }
     }
 
     /// Check the capture file, then the live registry, then the spawn-time ID. A
     /// managed CLI can select a session after launch, so validate captured IDs
     /// through the harness with the task leader's PID. If a source has no valid ID,
-    /// check the next source. For literal tasks, return `None`.
+    /// check the next source. For literal tasks, return `None`; for stopped
+    /// tasks, the stored ID.
     pub fn current_resume_id(&self) -> Option<String> {
-        let p = &self.process;
-        if let (Some(h), Some(path)) = (self.harness, &p.capture_file)
-            && let Ok(payload) = std::fs::read_to_string(path)
-            && let Some(id) = h.parse_capture(&payload, p.pid())
-        {
-            return Some(id);
-        }
-        if let (Some(h), Some(pid)) = (self.harness, p.pid())
-            && let Some(id) =
-                h.live_session_id(pid, &self.cwd, p.spawned_at, p.harness_home.as_deref())
-        {
-            return Some(id);
+        if let (Some(h), Some(p)) = (self.harness, &self.process) {
+            if let Some(path) = &p.capture_file
+                && let Ok(payload) = std::fs::read_to_string(path)
+                && let Some(id) = h.parse_capture(&payload, p.pid())
+            {
+                return Some(id);
+            }
+            if let Some(pid) = p.pid()
+                && let Some(id) =
+                    h.live_session_id(pid, &self.cwd, p.spawned_at, p.harness_home.as_deref())
+            {
+                return Some(id);
+            }
         }
         self.resume_id.clone()
     }
@@ -286,9 +307,15 @@ impl Task {
     /// The dashboard preview, resolved through the provenance cascade under
     /// the grid lock (see [`crate::preview`]). `now` is the caller's tick
     /// instant so every task in one snapshot resolves against the same clock.
+    /// A stopped task has no grid: its preview is an empty, frozen floor.
     pub fn resolve_preview(&mut self, now: Instant) -> Preview {
         self.refresh_blocked(now);
-        let p = &mut self.process;
+        let Some(p) = &mut self.process else {
+            return Preview {
+                frozen: true,
+                ..Preview::floor(String::new())
+            };
+        };
         let emu = p.parser.lock();
         let blocked = p.blocked.as_ref().map(|(text, rule)| (&**text, *rule));
         p.preview
@@ -300,7 +327,9 @@ impl Task {
     /// [`BLOCKED_PROBE_INTERVAL`]. Tasks without a harness or PID do not probe;
     /// finished tasks clear the cached status.
     fn refresh_blocked(&mut self, now: Instant) {
-        let p = &mut self.process;
+        let Some(p) = &mut self.process else {
+            return;
+        };
         let (Some(h), Some(pid), None) = (self.harness, p.pid, p.finished) else {
             p.blocked = None;
             return;
@@ -315,9 +344,12 @@ impl Task {
     }
 
     /// Freeze the preview once output is complete. Apply any open `?2026` frame
-    /// first so the preview includes its buffered output.
+    /// first so the preview includes its buffered output. Nothing to do for a
+    /// stopped task.
     pub fn finalize_preview(&mut self) {
-        let p = &mut self.process;
+        let Some(p) = &mut self.process else {
+            return;
+        };
         if p.preview.finalized() || !p.output_complete() {
             return;
         }

@@ -19,8 +19,8 @@ use crate::{
     harness::{self, Harness, Intent, assets},
     path,
     protocol::{
-        Command, Event, FLEETCOM_RUNTIME_DIR, LaunchContext, ScreenView, ScrollAction, TaskView,
-        UNASSIGNED, env_get,
+        Command, Event, FLEETCOM_RUNTIME_DIR, LaunchContext, Lifecycle, ScreenView, ScrollAction,
+        TaskView, UNASSIGNED, env_get,
     },
     session::{self, EntryKind, SessionConfig, SessionEntry},
     task::{Exec, Process, Task, WriteRefused},
@@ -77,6 +77,8 @@ const SKIP_REASONS: &str = "missing dir, task limit, or command too long";
 #[derive(Default)]
 struct LoadOutcome {
     spawned: usize,
+    /// Entries restored as rows without a process.
+    stopped: usize,
     skipped: usize,
     failed: usize,
     /// Launch notices and failure reasons, in load order.
@@ -84,9 +86,12 @@ struct LoadOutcome {
 }
 
 impl LoadOutcome {
-    /// Format nonzero skipped and failed counts as summary clauses.
+    /// Format nonzero stopped, skipped, and failed counts as summary clauses.
     fn clauses(&self) -> Vec<String> {
         let mut parts = Vec::new();
+        if self.stopped > 0 {
+            parts.push(format!("{} stopped", self.stopped));
+        }
         if self.skipped > 0 {
             parts.push(format!("{} skipped ({SKIP_REASONS})", self.skipped));
         }
@@ -235,8 +240,9 @@ fn affects_recipe(cmd: &Command) -> bool {
         | Command::Flagship { .. }
         | Command::LoadSession { .. }
         | Command::LoadRecovery { .. } => true,
-        // Exclude `Kill`: lifecycle is not part of the recipe. For the remaining input,
-        // view, and meta commands, no fields serialized by `session_config` are changed.
+        // Exclude `Kill`: the recipe changes when the exit lands, not when the signal is
+        // sent, and `reap` arms recovery on that exit. For the remaining input, view, and
+        // meta commands, no fields serialized by `session_config` are changed.
         Command::Kill { .. }
         | Command::Resize { .. }
         | Command::Watch { .. }
@@ -437,11 +443,17 @@ impl Supervisor {
                 group,
             } => self.spawn(&command, &cwd, group),
             Command::SpawnAgent { agent, cwd, group } => self.spawn_agent(&agent, &cwd, group),
-            Command::Kill { id } => self.with_task(id, |t| t.process.terminate()),
+            // Signals, resizes, and viewport moves have no target on a stopped task.
+            Command::Kill { id } => self.with_task(id, |t| {
+                if let Some(p) = &mut t.process {
+                    p.terminate();
+                }
+            }),
             Command::Remove { id } => {
-                if let Some(i) = self.index_of(id) {
-                    let t = self.tasks.remove(i);
-                    self.retire(t.process);
+                if let Some(i) = self.index_of(id)
+                    && let Some(p) = self.tasks.remove(i).process
+                {
+                    self.retire(p);
                 }
             }
             Command::Restart { id } => self.rerun(id),
@@ -461,8 +473,8 @@ impl Supervisor {
                 if u32::from(self.rows) * u32::from(self.cols) > MAX_CELLS {
                     self.cols = (MAX_CELLS / u32::from(self.rows)) as u16;
                 }
-                for t in &mut self.tasks {
-                    let _ = t.process.resize(self.rows, self.cols);
+                for p in self.tasks.iter().filter_map(|t| t.process.as_ref()) {
+                    let _ = p.resize(self.rows, self.cols);
                 }
             }
             Command::Watch { id, attached } => {
@@ -470,15 +482,17 @@ impl Supervisor {
                 if id != self.watched
                     && let Some(old) = self.watched
                     && let Some(t) = self.by_id_mut(old)
+                    && let Some(p) = &t.process
                 {
-                    t.process.scroll_view(ScrollAction::Live);
+                    p.scroll_view(ScrollAction::Live);
                 }
                 if id != self.watched || attached != self.watch_attached {
                     // Discard stores captured before this watch state took effect.
                     if let Some(new) = id
                         && let Some(t) = self.by_id_mut(new)
+                        && let Some(p) = &t.process
                     {
-                        let _ = t.process.drain_clipboard();
+                        let _ = p.drain_clipboard();
                     }
                     self.last_screen = None;
                 }
@@ -488,17 +502,21 @@ impl Supervisor {
             // Paste and mouse encoding depend on the child's terminal modes,
             // which only the core's emulator can see.
             Command::Paste { id, bytes } => {
-                self.deliver(id, "paste", |t| t.process.send_paste(&bytes));
+                self.deliver(id, "paste", |p| p.send_paste(&bytes));
             }
             Command::Mouse { id, kind, col, row } => {
-                self.deliver(id, "mouse input", |t| t.process.send_mouse(kind, col, row));
+                self.deliver(id, "mouse input", |p| p.send_mouse(kind, col, row));
             }
             // Encode keys here because the child's cursor-key mode is core-side.
             Command::Key { id, code, mods } => {
-                self.deliver(id, "key input", |t| t.process.send_key(code, mods));
+                self.deliver(id, "key input", |p| p.send_key(code, mods));
             }
             Command::Scrollback { id, action } => {
-                self.with_task(id, |t| t.process.scroll_view(action));
+                self.with_task(id, |t| {
+                    if let Some(p) = &t.process {
+                        p.scroll_view(action);
+                    }
+                });
             }
             Command::SaveSession { name } => self.save_session(&name),
             Command::LoadSession { name } => self.load_session(&name),
@@ -511,15 +529,23 @@ impl Supervisor {
     /// Latch exits, escalate overdue TERM requests, and collect removed tasks.
     pub fn reap(&mut self) {
         let now = Instant::now();
+        let mut exited = false;
         for t in &mut self.tasks {
+            let Some(p) = &mut t.process else {
+                continue;
+            };
+            let was_live = p.finished.is_none();
             // Swallow a poll error rather than propagate: the task just isn't
             // latched this pass and is retried next. waitid failing is rare and
             // must not take down the loop.
-            let _ = t.process.poll_exit();
+            let _ = p.poll_exit();
+            exited |= was_live && p.finished.is_some();
             // Freeze the preview from the complete output and final screen.
             t.finalize_preview();
-            if t.process.overdue(now, self.kill_grace) {
-                t.process.force_kill();
+            if let Some(p) = &mut t.process
+                && p.overdue(now, self.kill_grace)
+            {
+                p.force_kill();
             }
         }
         // Retired runs still need exit handling and escalation.
@@ -534,22 +560,30 @@ impl Supervisor {
         // already-finished tasks. Check during reaping because `tick` is not called between
         // clients; otherwise, an exited flagship would remain marked in recovery
         // snapshots until the next connection.
-        if self.flagship.is_some() && self.flagship_holder().is_none() {
+        let cleared = self.flagship.is_some() && self.flagship_holder().is_none();
+        if cleared {
             self.flagship = None;
-            // Schedule recovery explicitly after clearing the mark outside `apply`.
-            // Otherwise, a user can restore the old mark from disk before the 60 s
-            // cadence pass.
+        }
+        // Schedule recovery explicitly for changes that land outside `apply`: an
+        // exit flips the entry's `stopped` flag, and a cleared mark must leave the
+        // snapshot. Otherwise, a user can restore the old recipe from disk before
+        // the 60 s cadence pass.
+        if exited || cleared {
             self.recovery.last_mutation = Some(Instant::now());
         }
     }
 
-    /// Return the flagship ID only for an unfinished task still in the set. Between
-    /// reaps, the stored ID may refer to a removed task or one whose exit is not yet
-    /// latched.
+    /// Return the flagship ID only for a task still in the set with a live process.
+    /// Between reaps, the stored ID may refer to a removed task or one whose exit is
+    /// not yet latched. A stopped task has no process and never holds the mark.
     fn flagship_holder(&self) -> Option<u64> {
         self.flagship.filter(|&id| {
-            self.index_of(id)
-                .is_some_and(|i| self.tasks[i].process.finished.is_none())
+            self.index_of(id).is_some_and(|i| {
+                self.tasks[i]
+                    .process
+                    .as_ref()
+                    .is_some_and(|p| p.finished.is_none())
+            })
         })
     }
 
@@ -559,8 +593,8 @@ impl Supervisor {
     /// continue through `reap`; a nonempty fleet waits even if leaders exit.
     /// Collection and PTY teardown never block on live processes or workers.
     fn shutdown_all(&mut self) {
-        for t in &mut self.tasks {
-            t.process.terminate();
+        for p in self.tasks.iter_mut().filter_map(|t| t.process.as_mut()) {
+            p.terminate();
         }
         let deadline = Instant::now() + self.kill_grace;
         while (!self.tasks.is_empty() || !self.graveyard.is_empty()) && Instant::now() < deadline {
@@ -591,12 +625,26 @@ impl Supervisor {
             .tasks
             .iter_mut()
             .map(|t| {
-                t.process.flush_expired_sync();
-                // Drain all tasks so stores from inactive tasks cannot be forwarded later.
-                let stores = t.process.drain_clipboard();
-                if forwarding == Some(t.id) {
-                    clipboard = Some((t.id, stores));
-                }
+                // A stopped task has no run: no grid to flush or drain, no clock
+                // to measure.
+                let (lifecycle, started_ago, quiet_ago, finished_ago) = match &t.process {
+                    Some(p) => {
+                        p.flush_expired_sync();
+                        // Drain all tasks so stores from inactive tasks cannot be
+                        // forwarded later.
+                        let stores = p.drain_clipboard();
+                        if forwarding == Some(t.id) {
+                            clipboard = Some((t.id, stores));
+                        }
+                        (
+                            p.lifecycle(now, IDLE_AFTER),
+                            Some(now.duration_since(p.started)),
+                            p.finished.is_none().then(|| p.quiet_for(now)),
+                            p.finished.map(|f| now.duration_since(f)),
+                        )
+                    }
+                    None => (Lifecycle::Stopped, None, None, None),
+                };
                 TaskView {
                     id: t.id,
                     command: t.command.clone(),
@@ -606,15 +654,11 @@ impl Supervisor {
                     managed: t.harness.is_some(),
                     group: t.group.clone(),
                     name: t.name.clone(),
-                    lifecycle: t.process.lifecycle(now, IDLE_AFTER),
+                    lifecycle,
                     preview: t.resolve_preview(now),
-                    started_ago: now.duration_since(t.process.started),
-                    quiet_ago: t
-                        .process
-                        .finished
-                        .is_none()
-                        .then(|| t.process.quiet_for(now)),
-                    finished_ago: t.process.finished.map(|f| now.duration_since(f)),
+                    started_ago,
+                    quiet_ago,
+                    finished_ago,
                 }
             })
             .collect();
@@ -636,28 +680,48 @@ impl Supervisor {
         if let Some(id) = self.watched
             && let Some(t) = self.tasks.iter().find(|t| t.id == id)
         {
-            let (formatted, cursor, hide) = t.process.formatted();
-            let (wants_mouse, alt_screen, alt_scroll) = t.process.input_hints();
-            let sb = t.process.scroll_offset();
-            let mut view = ScreenView {
-                id,
-                // `lines` stays empty on both the stored and candidate copies
-                // so it never affects equality; it is filled only on the
-                // emitted copy.
-                lines: Vec::new(),
-                formatted,
-                cursor,
-                // Hide the live cursor while displaying scrollback.
-                hide_cursor: hide || sb > 0,
-                wants_mouse,
-                alt_screen,
-                alt_scroll,
-                scrollback: sb,
+            // A stopped task shows an empty screen with a hidden cursor, so attach
+            // and peek open on it instead of refusing.
+            let mut view = match &t.process {
+                Some(p) => {
+                    let (formatted, cursor, hide) = p.formatted();
+                    let (wants_mouse, alt_screen, alt_scroll) = p.input_hints();
+                    let sb = p.scroll_offset();
+                    ScreenView {
+                        id,
+                        // `lines` stays empty on both the stored and candidate copies
+                        // so it never affects equality; it is filled only on the
+                        // emitted copy.
+                        lines: Vec::new(),
+                        formatted,
+                        cursor,
+                        // Hide the live cursor while displaying scrollback.
+                        hide_cursor: hide || sb > 0,
+                        wants_mouse,
+                        alt_screen,
+                        alt_scroll,
+                        scrollback: sb,
+                    }
+                }
+                None => ScreenView {
+                    id,
+                    lines: Vec::new(),
+                    formatted: Vec::new(),
+                    cursor: (0, 0),
+                    hide_cursor: true,
+                    wants_mouse: false,
+                    alt_screen: false,
+                    alt_scroll: false,
+                    scrollback: 0,
+                },
             };
             // Send only when rendering or input-policy state changes.
             if self.last_screen.as_ref() != Some(&view) {
                 self.last_screen = Some(view.clone());
-                view.lines = t.process.screen_lines();
+                view.lines = t
+                    .process
+                    .as_ref()
+                    .map_or_else(Vec::new, Process::screen_lines);
                 self.events.push(Event::Screen(view));
             }
         }
@@ -763,14 +827,19 @@ impl Supervisor {
         self.graveyard.push(p);
     }
 
-    /// Route one input send to task `id`, reporting a bounded-queue refusal.
+    /// Route one input send to task `id`'s run, reporting a bounded-queue refusal.
+    /// Input to a stopped task is dropped silently, as to a force-killed run.
     fn deliver(
         &mut self,
         id: u64,
         what: &str,
-        f: impl FnOnce(&mut Task) -> Result<(), WriteRefused>,
+        f: impl FnOnce(&Process) -> Result<(), WriteRefused>,
     ) {
-        if let Some(r) = self.by_id_mut(id).and_then(|t| f(t).err()) {
+        if let Some(r) = self
+            .by_id_mut(id)
+            .and_then(|t| t.process.as_ref())
+            .and_then(|p| f(p).err())
+        {
             self.status(format!(
                 "task {id} is not reading input; dropped {} {what}",
                 crate::format::bytes(r.len)
@@ -893,10 +962,12 @@ impl Supervisor {
         )?;
         if let Some((h, home, capture_file, resume_id)) = meta {
             task.harness = Some(h);
-            // Registry reads must keep using the launch-time configuration.
-            task.process.harness_home = home;
-            task.process.capture_file = Some(capture_file);
             task.resume_id = resume_id;
+            if let Some(p) = &mut task.process {
+                // Registry reads must keep using the launch-time configuration.
+                p.harness_home = home;
+                p.capture_file = Some(capture_file);
+            }
         }
         task.run = run;
         // Return the notice for inclusion in the load summary. A separate status queued
@@ -916,12 +987,19 @@ impl Supervisor {
         name: Option<String>,
     ) -> io::Result<(u64, Option<String>)> {
         let id = self.next_id;
-        let (mut task, notice) = self.spawn_task(id, 0, launch, cwd, env)?;
+        let (task, notice) = self.spawn_task(id, 0, launch, cwd, env)?;
+        self.enroll(task, group, name);
+        Ok((id, notice))
+    }
+
+    /// Append `task`, built under `next_id`, with its labels normalized; the
+    /// one place the id counter advances.
+    fn enroll(&mut self, mut task: Task, group: Option<String>, name: Option<String>) {
+        debug_assert_eq!(task.id, self.next_id, "task built under a stale id");
         task.group = normalize_group(group);
         task.name = normalize_label(name);
         self.next_id += 1;
         self.tasks.push(task);
-        Ok((id, notice))
     }
 
     /// Report an interactive spawn: send its notice, then acknowledge the new row for
@@ -989,19 +1067,22 @@ impl Supervisor {
         self.report_spawn(admitted);
     }
 
-    /// Rerun a finished task in place, preserving its ID, tag, group, and name. For managed
-    /// tasks, resolve the binary on the current `PATH` and resume the best-known session
-    /// ID, or start fresh if none is known. For literal tasks, rerun the exact text.
+    /// Rerun a finished or stopped task in place, preserving its ID, tag, group, and
+    /// name. For managed tasks, resolve the binary on the current `PATH` and resume the
+    /// best-known session ID, or start fresh if none is known. For literal tasks, rerun
+    /// the exact text.
     fn rerun(&mut self, id: u64) {
         let Some(i) = self.index_of(id) else {
             self.status(format!("rerun failed: no task {id}"));
             return;
         };
-        // A task can exit between the last reap tick and this request.
-        let _ = self.tasks[i].process.poll_exit();
-        if self.tasks[i].process.finished.is_none() {
-            self.status("rerun failed: task is still running");
-            return;
+        if let Some(p) = &mut self.tasks[i].process {
+            // A task can exit between the last reap tick and this request.
+            let _ = p.poll_exit();
+            if p.finished.is_none() {
+                self.status("rerun failed: task is still running");
+                return;
+            }
         }
         // Exit may have been latched just above, between ticks. Clear the mark
         // before reusing the id for a live replacement. At the next tick, the
@@ -1028,8 +1109,8 @@ impl Supervisor {
                 Launch::Literal(&command)
             }
         };
-        // Preserve the finished task if its replacement cannot start. Use a distinct
-        // run number to isolate the replacement's capture file.
+        // Preserve the finished or stopped task if its replacement cannot start. Use a
+        // distinct run number to isolate the replacement's capture file.
         let run = self.tasks[i].run + 1;
         match self.spawn_task(id, run, &relaunch, &cwd, &launch.env) {
             Ok((fresh, notice)) => {
@@ -1039,7 +1120,8 @@ impl Supervisor {
                 // Keep the row's identity; take from the fresh spawn only what a
                 // new launch sets: its harness, run number, planned resume ID,
                 // and the process. The resume ID was read above, before the
-                // displaced run and its capture file go.
+                // displaced run and its capture file go. A stopped task has no
+                // run to displace.
                 let Task {
                     harness,
                     run,
@@ -1052,7 +1134,9 @@ impl Supervisor {
                 t.run = run;
                 t.resume_id = resume_id;
                 let old = std::mem::replace(&mut t.process, process);
-                self.retire(old);
+                if let Some(old) = old {
+                    self.retire(old);
+                }
                 // Reset the fingerprint for the replacement task's screen.
                 if self.watched == Some(id) {
                     self.last_screen = None;
@@ -1064,7 +1148,8 @@ impl Supervisor {
 
     /// Build `{dir: [entries]}` in spawn order, preserving groups, names, tags, and the
     /// flagship mark. Save managed tasks as agent words with the best-known session IDs;
-    /// save literals as their exact text.
+    /// save literals as their exact text. Mark a task with no live process, exited or
+    /// never started, as stopped so a load restores the row without running it.
     fn session_config(&self) -> SessionConfig {
         // `admit` appends monotonic IDs; `rerun` preserves both index and ID;
         // removal preserves relative order.
@@ -1089,6 +1174,7 @@ impl Supervisor {
                     name: t.name.clone(),
                     tagged: t.tagged,
                     flagship: self.flagship == Some(t.id),
+                    stopped: t.process.as_ref().is_none_or(|p| p.finished.is_some()),
                 });
         }
         cfg
@@ -1137,10 +1223,12 @@ impl Supervisor {
 
     /// Spawn each recipe entry in its existing directory; skip missing directories. Resolve
     /// managed binaries as on the Agent page. Record a missing binary as a failed entry
-    /// with a diagnostic, then continue loading. Restore each admitted entry's tag.
-    /// Preserve the current tasks and their marks: restore a stored flagship only when
-    /// no live task is marked. Return the outcome for one summary line, or `None` after
-    /// reporting a missing launch context.
+    /// with a diagnostic, then continue loading. Restore a stopped entry as a row with no
+    /// process, without resolving a managed binary: `rerun` looks it up on the `PATH` of
+    /// that moment. Restore each admitted entry's tag. Preserve the current tasks and
+    /// their marks: restore a stored flagship only when no live task is marked, and
+    /// never on a stopped entry, which cannot hold it. Return the outcome for one summary
+    /// line, or `None` after reporting a missing launch context.
     fn materialize(&mut self, cfg: &SessionConfig) -> Option<LoadOutcome> {
         let launch = self.launch_or_refuse()?;
         let mut out = LoadOutcome::default();
@@ -1155,14 +1243,33 @@ impl Supervisor {
                     out.skipped += 1;
                     continue;
                 }
+                if let EntryKind::Literal(text) = &entry.kind
+                    && text.len() > MAX_COMMAND_LEN
+                {
+                    out.skipped += 1;
+                    continue;
+                }
+                if entry.stopped {
+                    let (command, harness, resume) = match &entry.kind {
+                        EntryKind::Literal(text) => (text.clone(), None, None),
+                        EntryKind::Managed { agent, resume } => match harness::registered(agent) {
+                            Some(h) => (h.shape().0.to_string(), Some(h), resume.clone()),
+                            None => {
+                                out.failed += 1;
+                                out.notes.push(format!("no agent named {agent:?}"));
+                                continue;
+                            }
+                        },
+                    };
+                    let mut task =
+                        Task::stopped(self.next_id, command, resolved.clone(), harness, resume);
+                    task.tagged = entry.tagged;
+                    self.enroll(task, entry.group.clone(), entry.name.clone());
+                    out.stopped += 1;
+                    continue;
+                }
                 let kind = match &entry.kind {
-                    EntryKind::Literal(text) => {
-                        if text.len() > MAX_COMMAND_LEN {
-                            out.skipped += 1;
-                            continue;
-                        }
-                        Launch::Literal(text)
-                    }
+                    EntryKind::Literal(text) => Launch::Literal(text),
                     EntryKind::Managed { agent, resume } => {
                         match resolve_agent(agent, &launch, resume.clone()) {
                             Ok(m) => Launch::Managed(m),
@@ -1242,7 +1349,7 @@ impl Supervisor {
         };
         // Report zero tasks only for an empty recipe.
         let mut parts = Vec::new();
-        if out.spawned > 0 || (out.skipped == 0 && out.failed == 0) {
+        if out.spawned > 0 || (out.stopped == 0 && out.skipped == 0 && out.failed == 0) {
             parts.push(format!("{} task(s)", out.spawned));
         }
         parts.extend(out.clauses());

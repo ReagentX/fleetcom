@@ -12,7 +12,7 @@ use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
 use crate::frame::{KIND_CONTROL, KIND_HELLO, KIND_SCREEN};
 
 /// Wire-protocol version; mismatched peers are rejected during the handshake.
-pub const PROTOCOL_VERSION: u32 = 15;
+pub const PROTOCOL_VERSION: u32 = 16;
 
 /// Reserved dashboard label for tasks without a custom group.
 pub const UNASSIGNED: &str = "Unassigned";
@@ -267,12 +267,15 @@ pub struct RecoveryEntry {
 
 /// Process-derived lifecycle state, independent of the user's `tagged` intent.
 /// `Idle` means no recent output, not that the process is waiting for input.
+/// `Stopped` means no process at all: the row was restored from a session
+/// file and nothing has run under it in this daemon's lifetime.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Lifecycle {
     Active,
     Idle,
     Ok,
     Failed,
+    Stopped,
 }
 
 impl Lifecycle {
@@ -283,6 +286,7 @@ impl Lifecycle {
             Self::Idle => "idle",
             Self::Ok => "ok",
             Self::Failed => "failed",
+            Self::Stopped => "stopped",
         }
     }
 
@@ -293,7 +297,18 @@ impl Lifecycle {
             "idle" => Some(Self::Idle),
             "ok" => Some(Self::Ok),
             "failed" => Some(Self::Failed),
+            "stopped" => Some(Self::Stopped),
             _ => None,
+        }
+    }
+
+    /// Whether no process runs under the row: exited (`Ok`, `Failed`) or never
+    /// started (`Stopped`). The client gates `r`, `X`, `]`, and the Completed
+    /// section on this one predicate, so a new variant is classified here once.
+    pub fn finished(self) -> bool {
+        match self {
+            Self::Active | Self::Idle => false,
+            Self::Ok | Self::Failed | Self::Stopped => true,
         }
     }
 }
@@ -391,7 +406,9 @@ pub struct TaskView {
     pub lifecycle: Lifecycle,
     /// The dashboard preview, resolved by the core at snapshot time.
     pub preview: Preview,
-    pub started_ago: Duration,
+    /// Time since the current run launched; `None` for a stopped task, which
+    /// has no run.
+    pub started_ago: Option<Duration>,
     /// Time since the last PTY output; `Some` only while the task is live.
     pub quiet_ago: Option<Duration>,
     /// Time since the exit latched; `Some` only once the task is finished.
@@ -897,9 +914,10 @@ pub fn encode_event(ev: &Event) -> (u8, Vec<u8>) {
                 // Include `working` on the wire. The dashboard has no `rule` field from
                 // which to derive it.
                 let _ = o.insert("working", tv.preview.working);
-                let _ = o.insert("started_ms", tv.started_ago.as_millis() as u64);
-                // Each age exists in exactly one phase: `quiet_ms` while
-                // live, `finished_ms` once finished.
+                // Each age exists in exactly one phase: `started_ms` for any
+                // run, `quiet_ms` while live, `finished_ms` once finished. A
+                // stopped task carries none of them.
+                insert_opt_ms(&mut o, "started_ms", tv.started_ago);
                 insert_opt_ms(&mut o, "quiet_ms", tv.quiet_ago);
                 insert_opt_ms(&mut o, "finished_ms", tv.finished_ago);
                 let _ = arr.push(o);
@@ -985,7 +1003,7 @@ pub fn decode_event(kind: u8, payload: &[u8]) -> Option<Event> {
                                 frozen: tv["frozen"].as_bool()?,
                                 working: tv["working"].as_bool()?,
                             },
-                            started_ago: Duration::from_millis(tv["started_ms"].as_u64()?),
+                            started_ago: opt_ms(&tv["started_ms"])?,
                             quiet_ago: opt_ms(&tv["quiet_ms"])?,
                             finished_ago: opt_ms(&tv["finished_ms"])?,
                         });

@@ -364,12 +364,12 @@ fn step_down(sel: usize, len: usize) -> usize {
 fn state_section(v: &TaskView) -> (u8, &'static str) {
     if v.tagged {
         (0, "In use")
+    } else if v.lifecycle.finished() {
+        (3, "Completed")
+    } else if v.lifecycle == Lifecycle::Idle {
+        (2, "Idle")
     } else {
-        match v.lifecycle {
-            Lifecycle::Active => (1, "Running"),
-            Lifecycle::Idle => (2, "Idle"),
-            Lifecycle::Ok | Lifecycle::Failed => (3, "Completed"),
-        }
+        (1, "Running")
     }
 }
 
@@ -379,7 +379,7 @@ fn state_section(v: &TaskView) -> (u8, &'static str) {
 fn row_rank(v: &TaskView) -> u8 {
     if v.tagged {
         0
-    } else if matches!(v.lifecycle, Lifecycle::Ok | Lifecycle::Failed) {
+    } else if v.lifecycle.finished() {
         2
     } else {
         1
@@ -1327,7 +1327,7 @@ impl App {
             // next daemon tick, before inclusion in a snapshot.
             KeyCode::Char(']') => {
                 if let Some(i) = self.selected_task()
-                    && !matches!(self.views[i].lifecycle, Lifecycle::Ok | Lifecycle::Failed)
+                    && !self.views[i].lifecycle.finished()
                 {
                     let v = &self.views[i];
                     let id = (!v.flagship).then_some(v.id);
@@ -1961,7 +1961,7 @@ impl App {
     /// Restart the selected task only when the local snapshot marks it finished.
     fn rerun_selected(&mut self) {
         if let Some(i) = self.selected_task()
-            && matches!(self.views[i].lifecycle, Lifecycle::Ok | Lifecycle::Failed)
+            && self.views[i].lifecycle.finished()
         {
             self.transport.send(Command::Restart {
                 id: self.views[i].id,
@@ -1974,8 +1974,7 @@ impl App {
             return;
         };
         let id = self.views[i].id;
-        let finished = matches!(self.views[i].lifecycle, Lifecycle::Ok | Lifecycle::Failed);
-        if finished {
+        if self.views[i].lifecycle.finished() {
             // Drop it, landing selection on the neighbor (not the top). The
             // removal reflects next tick, so pick the neighbor id from the
             // *current* order now and pin selection to it.
