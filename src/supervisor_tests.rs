@@ -2363,16 +2363,16 @@ fn stopped(cmd: &str) -> SessionEntry {
     }
 }
 
-/// Whether `events` carries exactly the status line `msg`.
+/// Whether `events` contains a status line equal to `msg`.
 fn has_status(events: &[Event], msg: &str) -> bool {
     events
         .iter()
         .any(|e| matches!(e, Event::Status(m) if m == msg))
 }
 
-/// Load a stopped literal beside a live one. The stopped entry becomes a row with no
-/// process, no ages, and an empty frozen preview, counted apart from the spawned task.
-/// `r` then runs it under the same id with nothing to retire.
+/// Load a stopped literal beside a live one. Restore the stopped entry without a
+/// process or ages, with an empty frozen preview, and count it separately from
+/// the spawned task. Start it with `r` under the same ID, with no old run to retire.
 #[test]
 fn load_restores_stopped_entries_as_rows_and_rerun_starts_them() {
     let dir = scratch("load_stopped");
@@ -2417,7 +2417,7 @@ fn load_restores_stopped_entries_as_rows_and_rerun_starts_them() {
     assert!(s.graveyard.is_empty(), "a stopped row has no run to retire");
 }
 
-/// `Kill` on a stopped row is a no-op with nothing to retire; `Remove` drops it.
+/// Ignore `Kill` on a stopped row, which has no run to retire; drop it on `Remove`.
 #[test]
 fn stopped_row_ignores_kill_and_removes_cleanly() {
     let dir = scratch("stopped_kill");
@@ -2435,8 +2435,8 @@ fn stopped_row_ignores_kill_and_removes_cleanly() {
     assert!(s.graveyard.is_empty());
 }
 
-/// A stopped row counts against the ceiling like any other entry: the limit bounds
-/// the list, on load and on the spawn after.
+/// Count stopped rows against the task ceiling on load and subsequent spawns:
+/// enforce the limit on the full list.
 #[test]
 fn stopped_rows_count_against_the_task_ceiling() {
     let dir = scratch("stopped_ceiling");
@@ -2497,8 +2497,8 @@ fn session_config_marks_tasks_without_a_live_process_stopped() {
     );
 }
 
-/// Arm recovery on the reap that latches an exit, and only on that reap: the exit
-/// flips the entry's `stopped` flag, which `Kill` itself does not.
+/// Schedule recovery when latching an exit in `reap`, and only on that pass:
+/// update the entry's `stopped` flag after exit, not when applying `Kill`.
 #[test]
 fn reap_arms_recovery_on_the_exit_transition_only() {
     let mut s = sup(24, 80);
@@ -2520,7 +2520,7 @@ fn reap_arms_recovery_on_the_exit_transition_only() {
 }
 
 /// Rewrite the recovery snapshot with `"stopped": true` after an exit, on the
-/// debounce alone: the cadence here is far beyond the test's budget.
+/// debounce alone: use a cadence far beyond the test's budget.
 #[test]
 fn recovery_snapshot_marks_an_exited_task_stopped() {
     let dir = scratch("recovery_stopped");
@@ -2554,7 +2554,7 @@ fn recovery_snapshot_marks_an_exited_task_stopped() {
     );
 }
 
-/// Watching a stopped task yields an empty screen rather than a refusal.
+/// Send an empty screen when watching a stopped task; allow the watch request.
 #[test]
 fn watching_a_stopped_task_yields_an_empty_screen() {
     let dir = scratch("stopped_watch");
@@ -2588,9 +2588,8 @@ fn watching_a_stopped_task_yields_an_empty_screen() {
     );
 }
 
-/// Load a stopped managed entry without its binary on `PATH`: the row is restored
-/// stopped, not failed. The binary is resolved at rerun, which refuses without it and
-/// leaves the row stopped.
+/// Load a stopped managed entry without its binary on `PATH`: restore the row as
+/// stopped. At rerun, refuse to start without the binary and preserve the stopped row.
 #[test]
 fn stopped_managed_entry_loads_without_its_binary() {
     let dir = scratch("stopped_managed");

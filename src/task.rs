@@ -62,10 +62,9 @@ pub fn positive_pid(field: &str) -> Option<i32> {
     field.parse::<i32>().ok().filter(|p| *p > 0)
 }
 
-/// A dashboard row: the identity a rerun preserves, plus the [`Process`] of
-/// its current run. Every field here survives `r`; everything bound to one
-/// launch, from the PTY to the exit latch, sits in `process` and is swapped
-/// whole on rerun.
+/// A dashboard row's identity and optional [`Process`] for its current run.
+/// On rerun, preserve the row's identity and replace `process` as a unit:
+/// the PTY, preview state, and exit latch all belong to one launch.
 pub struct Task {
     pub id: u64,
     pub command: String,
@@ -77,10 +76,10 @@ pub struct Task {
     pub group: Option<String>,
     /// Custom display name; `None` means unnamed.
     pub name: Option<String>,
-    /// Harness for a managed task's session ID and blocked-status reads: the harness built
-    /// the argv, no shell sits between, and a rerun goes through it again. `None` for
-    /// literal tasks: never read a harness channel for those tasks, and never edit their
-    /// command text.
+    /// Harness for a managed task's session ID and blocked-status reads. Build the
+    /// argv through this harness on launch and rerun, with no intervening shell.
+    /// `None` for literal tasks: never read a harness channel for those tasks or
+    /// edit their command text.
     pub harness: Option<&'static dyn crate::harness::Harness>,
     /// Display-only summary adapter selected from the command's first word,
     /// for literal and managed tasks alike.
@@ -90,17 +89,17 @@ pub struct Task {
     /// Session ID pinned or resumed at spawn. Prefer a captured ID or matching live
     /// registry ID when available.
     pub resume_id: Option<String>,
-    /// The current run, or `None` for a stopped task: one restored from a
-    /// session file with no process in this daemon's lifetime, waiting for `r`.
-    /// `Task` has no `Drop` of its own so the run can be moved out and retired
-    /// on its own; the kill backstop travels with it.
+    /// The current run, or `None` for a stopped task: restored from a session
+    /// file without starting a process. Press `r` to start it.
+    /// Keep the kill backstop in `Process::drop`, with no `Drop` on `Task`,
+    /// so the run can be moved out and retired independently of the row.
     pub process: Option<Process>,
 }
 
 /// One run of a task: the PTY, writer queue, reader thread, emulator, the
 /// harness paths resolved at launch, preview state, and exit bookkeeping for a
-/// single process group. Dropping it is the kill backstop: SIGKILL to the group
-/// and a best-effort reap, however the run leaves scope.
+/// single process group. On drop, send SIGKILL to the group and attempt to reap
+/// the leader, regardless of how the run left scope.
 pub struct Process {
     /// Keep the PTY master open for `resize` (`TIOCSWINSZ`). Split the reader and
     /// writer handles from it at spawn.
@@ -128,8 +127,8 @@ pub struct Process {
     pub harness_home: Option<PathBuf>,
     /// Capture path allocated for this run.
     pub capture_file: Option<PathBuf>,
-    /// Dashboard-preview resolution state; resets on rerun because a rerun
-    /// replaces the whole `Process`.
+    /// Dashboard-preview resolution state for this run. Reset on rerun by
+    /// replacing the whole `Process`.
     preview: PreviewState,
     /// Cached blocked-on-user status from the harness registry.
     blocked: Option<(String, &'static str)>,
@@ -255,10 +254,9 @@ impl Task {
         })
     }
 
-    /// A task with no run: the identity a session file restores for a
-    /// stopped entry, waiting for `r`. `harness` is the managed entry's
-    /// harness, resolved by name alone; the binary is looked up at rerun.
-    /// `resume_id` is the stored session ID a rerun resumes.
+    /// Create a task with no run from a stopped session entry. Press `r` to
+    /// start it. Resolve `harness` by name alone; look up the binary at rerun.
+    /// Use the stored `resume_id` to resume the conversation at that point.
     pub fn stopped(
         id: u64,
         command: String,
@@ -304,10 +302,10 @@ impl Task {
         self.resume_id.clone()
     }
 
-    /// The dashboard preview, resolved through the provenance cascade under
-    /// the grid lock (see [`crate::preview`]). `now` is the caller's tick
-    /// instant so every task in one snapshot resolves against the same clock.
-    /// A stopped task has no grid: its preview is an empty, frozen floor.
+    /// Resolve the dashboard preview through the provenance cascade under
+    /// the grid lock (see [`crate::preview`]). Use the caller's tick instant
+    /// `now` for every task in a snapshot. For a stopped task, return an empty,
+    /// frozen floor preview: there is no grid to inspect.
     pub fn resolve_preview(&mut self, now: Instant) -> Preview {
         self.refresh_blocked(now);
         let Some(p) = &mut self.process else {
@@ -324,8 +322,8 @@ impl Task {
     }
 
     /// Refresh the harness's blocked-on-user status at most once per
-    /// [`BLOCKED_PROBE_INTERVAL`]. Tasks without a harness or PID do not probe;
-    /// finished tasks clear the cached status.
+    /// [`BLOCKED_PROBE_INTERVAL`]. Skip the probe without a harness or PID;
+    /// clear the cached status for finished tasks.
     fn refresh_blocked(&mut self, now: Instant) {
         let Some(p) = &mut self.process else {
             return;
@@ -344,8 +342,8 @@ impl Task {
     }
 
     /// Freeze the preview once output is complete. Apply any open `?2026` frame
-    /// first so the preview includes its buffered output. Nothing to do for a
-    /// stopped task.
+    /// first to include its buffered output in the preview. Skip stopped tasks,
+    /// which have no output.
     pub fn finalize_preview(&mut self) {
         let Some(p) = &mut self.process else {
             return;
@@ -361,7 +359,7 @@ impl Task {
 
 impl Process {
     /// Spawn `exec` in a fresh `rows`×`cols` PTY with `scrollback` history
-    /// rows; a literal `exec` runs `command` under the launch shell. Pass
+    /// rows. For a literal `exec`, run `command` under the launch shell. Pass
     /// exactly `env` to the child and notify the core through `waker` on
     /// terminal output.
     #[allow(clippy::too_many_arguments)] // All arguments define launch state.

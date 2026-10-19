@@ -248,9 +248,8 @@ fn view(id: u64, cwd: PathBuf, tagged: bool, group: Option<&str>) -> TaskView {
     }
 }
 
-/// Attached rendering overwrites the dashboard with the child's formatted grid. A
-/// stopped task has no grid, so its empty screen must clear the viewport instead;
-/// a screen with content must not, or every frame would wipe before painting.
+/// Clear the attached viewport for a stopped task: there is no formatted grid to
+/// paint over the dashboard. With a nonempty grid, paint without clearing first.
 #[test]
 fn attached_stopped_task_clears_the_dashboard_beneath() {
     let mut app = App::new_local(30, 100);
@@ -848,8 +847,8 @@ fn state_mode_ordering_survives_the_row_key_split() {
     );
 }
 
-/// Count stopped rows in the header only when one exists; a fleet without them keeps
-/// the three-count header.
+/// Count stopped rows in the header only when one exists; otherwise, show only
+/// the running, idle, and done counts.
 #[test]
 fn header_counts_stopped_rows_only_when_present() {
     let mut app = App::new_local(30, 100);
@@ -875,8 +874,9 @@ fn header_counts_stopped_rows_only_when_present() {
     );
 }
 
-/// A stopped row is finished for every client gate: it lands in Completed at the
-/// finished rank, `]` sends nothing, `r` sends `Restart`, and `X` sends `Remove`.
+/// Treat a stopped row as finished for grouping, ranking, and key handling: place
+/// it in Completed at the finished rank, ignore `]`, send `Restart` on `r`, and
+/// send `Remove` on `X`.
 #[test]
 fn stopped_row_is_finished_for_every_client_gate() {
     let mut app = App::new_local(30, 100);

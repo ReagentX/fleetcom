@@ -302,9 +302,9 @@ impl Lifecycle {
         }
     }
 
-    /// Whether no process runs under the row: exited (`Ok`, `Failed`) or never
-    /// started (`Stopped`). The client gates `r`, `X`, `]`, and the Completed
-    /// section on this one predicate, so a new variant is classified here once.
+    /// Whether the process has exited (`Ok`, `Failed`) or was never started
+    /// (`Stopped`). Use this predicate for `r`, `X`, `]`, and the Completed
+    /// section; classify new variants here to keep those decisions consistent.
     pub fn finished(self) -> bool {
         match self {
             Self::Active | Self::Idle => false,
@@ -406,7 +406,7 @@ pub struct TaskView {
     pub lifecycle: Lifecycle,
     /// The dashboard preview, resolved by the core at snapshot time.
     pub preview: Preview,
-    /// Time since the current run launched; `None` for a stopped task, which
+    /// Time since launch of the current run; `None` for a stopped task, which
     /// has no run.
     pub started_ago: Option<Duration>,
     /// Time since the last PTY output; `Some` only while the task is live.
@@ -914,9 +914,8 @@ pub fn encode_event(ev: &Event) -> (u8, Vec<u8>) {
                 // Include `working` on the wire. The dashboard has no `rule` field from
                 // which to derive it.
                 let _ = o.insert("working", tv.preview.working);
-                // Each age exists in exactly one phase: `started_ms` for any
-                // run, `quiet_ms` while live, `finished_ms` once finished. A
-                // stopped task carries none of them.
+                // Include `started_ms` for any run, `quiet_ms` while live, and
+                // `finished_ms` once finished. Omit all ages for stopped tasks.
                 insert_opt_ms(&mut o, "started_ms", tv.started_ago);
                 insert_opt_ms(&mut o, "quiet_ms", tv.quiet_ago);
                 insert_opt_ms(&mut o, "finished_ms", tv.finished_ago);

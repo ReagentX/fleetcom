@@ -113,9 +113,9 @@ Press uppercase `X` to kill a running task or remove a finished or stopped one. 
 
 #### Rerunning tasks
 
-Press `r` to rerun a finished task, or to start a stopped one: a task restored from a [session](sessions.md) that had finished when the file was written. A stopped task has no process; attach and peek show an empty screen until it is started. Running tasks cannot be rerun without first being killed and are left untouched.
+Press `r` to rerun a finished task or start a stopped one: a task restored from a [session](sessions.md) that had finished when the file was written. Until you start a stopped task, there is no process or output to view in attach or peek. Kill a running task before rerunning it; pressing `r` while it is running has no effect.
 
-On rerun, the replacement is started in the same directory with the requesting client's environment. For a literal task, the exact command text is run again. For a managed agent, the binary is resolved on the current `PATH`, and the captured conversation is resumed when an ID is known; see [agent session resume](agent-resume.md). A stopped managed agent resumes its stored session ID, and its binary is looked up only at this point: the agent need not be installed to load the session.
+On rerun, start the replacement in the same directory with the requesting client's environment. For a literal task, run the exact command text again. For a managed agent, resolve the binary on the current `PATH` and resume the captured conversation when an ID is known; see [agent session resume](agent-resume.md). For a stopped managed agent, resume its stored session ID. Binary lookup is deferred until you press `r`, so you can load the session without the agent installed.
 
 On rerun, the task's ID, `◆` tag, group, name, and spawn order are preserved; its clock and screen are reset. Under lifecycle sorting, the restarted task may be listed in another section. You can also rerun inside peek without closing the overlay.
 
@@ -129,9 +129,9 @@ Press uppercase `Q` to stop the daemon and terminate each task's process group: 
 
 #### Grouping and tagging
 
-Press `s` to cycle through state, dir, and custom grouping. In the header strip `by state · dir · custom`, the active mode is bold and the rest dim. To its left, the tally reads `N running · N idle · N done`, with ` · N stopped` appended only while at least one stopped task is listed.
+Press `s` to cycle through state, dir, and custom grouping. In the header strip `by state · dir · custom`, the active mode is bold and the rest dim. To its left, read the counts as `N running · N idle · N done`, followed by ` · N stopped` only while at least one stopped task is listed.
 
-- By state: In use / Running / Idle / Completed. After 10 s without output, a running task is grouped under Idle. Completed tasks are grouped in one section, with exit status marked `✓`/`✗`. Stopped tasks are placed in Completed as well, with a blank glyph and a blank age cell: nothing has run under the row to measure from.
+- By state: In use / Running / Idle / Completed. After 10 s without output, a running task is grouped under Idle. Completed tasks are grouped in one section, with exit status marked `✓`/`✗`. Stopped tasks are placed in Completed as well, with a blank glyph and a blank age cell: no process has run under the row, so there is no launch, output, or exit time to measure from.
 - By dir: one section per working directory; the invocation directory first, then the remaining labels sorted without regard to case.
 - By custom group: one section per group name, sorted without regard to case, with Unassigned last. Fresh spawns remain unassigned unless they inherit a group, and the Unassigned section exists only while it has a member.
 
@@ -230,7 +230,7 @@ Bindings are arranged in two columns. At limited height, group headers are omitt
 
 ## Peek
 
-Peek shows the selected task's live screen (the last screenful) in a centered box over the dashboard. Use `↑`/`↓` (or `k`/`j`) to switch tasks, `Enter` to attach, `r` to rerun a finished task or start a stopped one, or `Space`, `Esc`, or `q` to close.
+Use peek to view the selected task's live screen (the last screenful) in a centered box over the dashboard. Use `↑`/`↓` (or `k`/`j`) to switch tasks, `Enter` to attach, `r` to rerun a finished task or start a stopped one, or `Space`, `Esc`, or `q` to close.
 
 Read the source of the row's dashboard preview in the footer's `preview:` segment: `floor` (the last non-blank row of the live screen), `marker` (a full-screen program with no usable title), `title` (the child's window title), or `anchor/<rule>` (a recognized agent status, tagged with the matcher that produced it). On the alternate screen, any current title is rendered; recognized title formats are normalized first. On the primary screen, only a retained title recognized by the task's agent adapter is rendered. Otherwise, `floor` is used. Most rules name a screen matcher, such as `claude:spinner` or `codex:approval-menu`. The `claude:registry-approval` and `claude:registry-waiting` rules instead come from Claude's on-disk session status.
 

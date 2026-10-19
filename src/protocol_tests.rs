@@ -578,8 +578,8 @@ fn lifecycle_and_age_fields_round_trip() {
     }
 }
 
-/// A stopped task round-trips with no ages: `started_ms` is omitted and decodes to
-/// `None`; a present `started_ms` decodes to `Some`.
+/// Round-trip a stopped task without ages: omit `started_ms` and decode it as
+/// `None`. Decode a present `started_ms` as `Some`.
 #[test]
 fn stopped_round_trips_without_a_start_age() {
     let stopped = Event::Tasks(vec![TaskView {
@@ -600,7 +600,7 @@ fn stopped_round_trips_without_a_start_age() {
     assert_eq!(decode_event(k, &p), Some(started));
 }
 
-/// `finished` is the one classification point the client gates on.
+/// Classify every lifecycle in `finished` for client key handling and grouping.
 #[test]
 fn finished_classifies_every_lifecycle() {
     for (lifecycle, want) in [

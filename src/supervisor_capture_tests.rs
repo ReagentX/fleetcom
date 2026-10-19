@@ -381,7 +381,7 @@ fn typed_agent_word_is_literal_runs_verbatim_and_saves_as_text() {
         r#""status":"waiting","waitingFor":"permission prompt""#,
     );
     assert_eq!(s.tasks[0].current_resume_id(), None);
-    // The stub has exited, so the entry saves as stopped.
+    // Save the entry as stopped after the stub exits.
     let exited = s.tasks[0].id;
     wait_exited(&mut s, exited);
     let entries = saved_entries(&mut s, &config, "typed");
@@ -667,7 +667,7 @@ fn spawn_grok_pins_an_id_and_injects_nothing_else() {
     );
     assert_eq!(t.resume_id.as_deref(), Some(id.as_str()));
 
-    // The stub has exited, so the entry saves as stopped.
+    // Save the entry as stopped after the stub exits.
     let exited = s.tasks[0].id;
     wait_exited(&mut s, exited);
     assert_eq!(
@@ -1985,8 +1985,8 @@ fn managed_task_saves_as_a_managed_entry_and_reloads_managed() {
         )])
     );
 
-    // Both stubs exited before the save, so a load of that file restores rows without
-    // running them. Reload a live copy to drive the relaunch argv.
+    // Both stubs exited before the save. Clear their stopped flags in a copy of
+    // the recipe, then load that copy to verify the relaunch argv.
     let mut live = session::load_in(&config.join("sessions"), "managed").unwrap();
     for entry in live.values_mut().flatten() {
         entry.stopped = false;

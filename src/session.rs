@@ -46,8 +46,8 @@ pub struct SessionEntry {
     pub tagged: bool,
     /// The `]` mark. Allow at most one flagged entry per file; reject a second in `from_json`.
     pub flagship: bool,
-    /// Whether the task had no live process when the file was written. Load restores
-    /// a stopped entry as a row without a process; only `r` runs it.
+    /// Whether the task had no live process when the file was written. On load,
+    /// restore a stopped entry as a row without a process. Press `r` to start it.
     pub stopped: bool,
 }
 
@@ -822,9 +822,9 @@ mod tests {
         );
     }
 
-    /// Round-trip stopped entries. A stopped literal needs the object form; a stopped
-    /// managed entry writes the flag after its marks; a live unmarked literal keeps the
-    /// bare string.
+    /// Round-trip stopped entries. Use the object form for a stopped literal, write
+    /// the flag after the marks for a stopped managed entry, and use a bare string
+    /// for a live unmarked literal.
     #[test]
     fn round_trips_stopped_entries() {
         let dir = temp("session_stopped_roundtrip");

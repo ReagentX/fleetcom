@@ -109,7 +109,7 @@ fn render_dashboard(out: &mut impl Write, app: &App) -> io::Result<()> {
             Lifecycle::Stopped => stopped += 1,
         }
     }
-    // Most fleets have no stopped rows; show the count only when one exists.
+    // Show the stopped count only when at least one stopped row is present.
     let stopped_tag = if stopped > 0 {
         format!(" · {stopped} stopped")
     } else {
@@ -325,7 +325,7 @@ fn attached_title(v: &TaskView) -> String {
 
 /// Age shown for a task: time since exit when finished, last output when idle, or
 /// launch otherwise. Use launch time when the edge timestamp is missing. `None` for a
-/// stopped task, which has done nothing in this lifetime to measure from.
+/// stopped task: there is no launch, output, or exit time to measure from.
 fn row_age(v: &TaskView) -> Option<Duration> {
     if v.lifecycle == Lifecycle::Stopped {
         return None;
@@ -343,9 +343,8 @@ fn row_age(v: &TaskView) -> Option<Duration> {
 /// A task's lifecycle glyph, shared by the dashboard row and the `/` palette.
 /// Use the agent-reported turn status to choose the glyph: an agent can keep thinking
 /// past the idle window without writing output. Select adapters by command word so
-/// hand-typed agent commands get the same glyph as Agent-page launches. A stopped
-/// row shows nothing: the dashboard is a fleet overview, and the row has done
-/// nothing yet.
+/// hand-typed agent commands get the same glyph as Agent-page launches. Leave the
+/// glyph blank for a stopped row: no process has run under it.
 fn status_glyph(v: &TaskView) -> &'static str {
     match v.lifecycle {
         Lifecycle::Active | Lifecycle::Idle if v.preview.working => "●",
@@ -374,7 +373,7 @@ fn task_row_parts(v: &TaskView, cols: usize) -> (String, String, String) {
         .filter_map(|(on, c)| on.then_some(c))
         .collect();
     let glyph = status_glyph(v);
-    // Blank for a stopped row: no age cell, and its columns go to the preview.
+    // Leave the age cell blank for a stopped row; use its columns for the preview.
     let time = row_age(v).map(rel_time).unwrap_or_default();
     let title_w = title_width(cols);
 
@@ -992,9 +991,9 @@ fn render_attached(out: &mut impl Write, app: &App) -> io::Result<()> {
 
     queue!(out, Hide, MoveTo(0, 0))?;
     if let Some(s) = screen {
-        // A live grid's formatted bytes cover every cell, and that is what buries the
-        // dashboard underneath. A stopped task has no grid and sends nothing, so clear
-        // explicitly; the frame diff and DECSET 2026 keep this from repeating or tearing.
+        // Clear the viewport for a stopped task: there are no formatted grid bytes
+        // to overwrite the dashboard. Skip identical frames in `render` and wrap
+        // each paint in DECSET 2026 to avoid repeated clears and tearing.
         if s.formatted.is_empty() {
             queue!(out, Clear(ClearType::All))?;
         }
@@ -1373,8 +1372,8 @@ mod tests {
         }
     }
 
-    /// A stopped row shows no glyph and no age: nothing has run under it. The
-    /// launch-age fallback in `timed_view` must not leak into the time cell.
+    /// Leave the glyph and age blank for a stopped row, even with the launch-age
+    /// fallback supplied by `timed_view`: no process has run under the row.
     #[test]
     fn stopped_row_has_a_blank_glyph_and_time_cell() {
         let v = timed_view(Lifecycle::Stopped, None, None);

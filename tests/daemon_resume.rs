@@ -50,9 +50,8 @@ fn hello(stream: &mut UnixStream, s: &Scratch) {
 
 /// Drain daemon events while a test polls files. Without this reader, snapshot
 /// traffic can fill the socket and block the daemon. The thread exits with the
-/// connection. Return the newest `tasks` snapshot text; the drainer owns the
-/// stream's frames, so a test waits on a lifecycle through it, never by reading
-/// the stream itself.
+/// connection. Return the newest `tasks` snapshot text. Read lifecycle state
+/// through this value in tests; do not compete with the drainer for stream frames.
 fn drain_events(stream: &UnixStream) -> Arc<Mutex<String>> {
     let mut rx = stream.try_clone().unwrap();
     let latest = Arc::new(Mutex::new(String::new()));
@@ -67,9 +66,8 @@ fn drain_events(stream: &UnixStream) -> Arc<Mutex<String>> {
     latest
 }
 
-/// Wait until the newest snapshot shows the fleet's sole task exited cleanly. A
-/// finished task saves as a stopped entry, so a recipe assertion needs the exit
-/// latched first.
+/// Wait for confirmation of a clean exit in the newest snapshot. Latch the exit
+/// before checking the recipe so the sole task is saved as stopped.
 fn wait_sole_task_ok(latest: &Arc<Mutex<String>>) {
     assert!(
         wait_until(Duration::from_secs(10), || {
@@ -238,7 +236,7 @@ fn capture_slot(runtime: &Path) -> Option<String> {
 }
 
 /// Managed entry for `agent` resuming `id`, in the pretty-printed `to_json` format, as
-/// saved after the task exited: a finished task saves as stopped.
+/// saved after the task exited, with `stopped` set to true.
 fn stopped_managed_entry(agent: &str, id: &str) -> String {
     format!(
         "{{\n        \"agent\": \"{agent}\",\n        \"resume\": \"{id}\",\n        \"stopped\": true\n      }}"
@@ -267,9 +265,9 @@ fn claude_spawn_save_load_resumes_the_conversation() {
     let settings = PathBuf::from(value_after(&argv, "--settings"));
     assert_daemon_namespaced(&settings, daemon.0.id(), "settings overlay", &argv);
 
-    // The pinned ID is stored in `resume_id` at spawn: save once to verify it. The
-    // stub has exited, so the entry saves as stopped: a load restores the row
-    // without running it, and `r` on that row drives the resume.
+    // Save once to verify the ID pinned in `resume_id` at spawn. Wait for the
+    // stub's exit to save it as stopped. After loading, start the restored row
+    // with `r` to resume the conversation.
     wait_sole_task_ok(&latest);
     let recipe = save_once(&mut stream, &s.recipe("story"), "story");
     assert!(
@@ -360,8 +358,8 @@ fn codex_capture_file_drives_save_and_load_resumes() {
         Some(CODEX_ID),
         "the slot must hold the bare root after the title thread's notification"
     );
-    // The stub has exited, so the entry saves as stopped: a load restores the row
-    // without running it, and `r` on that row drives the resume.
+    // Wait for the stub's exit to save it as stopped. After loading, start the
+    // restored row with `r` to resume the conversation.
     wait_sole_task_ok(&latest);
     let recipe = save_once(&mut stream, &s.recipe("story"), "story");
     assert!(
@@ -454,7 +452,7 @@ fn saved_recipe_resumes_across_a_daemon_restart() {
         .unwrap();
     let argv = wait_run(&rec, 0, |a| a.iter().any(|t| t == "--session-id"));
     let id = value_after(&argv, "--session-id").to_string();
-    // The stub has exited, so the entry saves as stopped.
+    // Wait for the stub's exit to save it as stopped.
     wait_sole_task_ok(&latest);
     let recipe = save_once(&mut stream_a, &s.recipe("overnight"), "overnight");
     assert!(
@@ -467,7 +465,8 @@ fn saved_recipe_resumes_across_a_daemon_restart() {
     let (_dir_b, mut daemon_b, mut stream_b) = start_daemon_raw("resume_restart_b", |_| {});
     hello(&mut stream_b, &s);
     drain_events(&stream_b);
-    // The fresh daemon restores the stopped entry as task 1; `r` on it resumes.
+    // Load the stopped entry as task 1 in the fresh daemon; start it with `r`
+    // to resume the conversation.
     stream_b
         .write_all(&control_frame(r#"{"t":"load","name":"overnight"}"#))
         .unwrap();

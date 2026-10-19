@@ -240,9 +240,9 @@ fn affects_recipe(cmd: &Command) -> bool {
         | Command::Flagship { .. }
         | Command::LoadSession { .. }
         | Command::LoadRecovery { .. } => true,
-        // Exclude `Kill`: the recipe changes when the exit lands, not when the signal is
-        // sent, and `reap` arms recovery on that exit. For the remaining input, view, and
-        // meta commands, no fields serialized by `session_config` are changed.
+        // Exclude `Kill`: update the recipe and schedule recovery in `reap` when
+        // latching the exit, not when sending the signal. The remaining input, view,
+        // and meta commands do not change fields serialized by `session_config`.
         Command::Kill { .. }
         | Command::Resize { .. }
         | Command::Watch { .. }
@@ -295,11 +295,11 @@ impl Recovery {
 
 pub struct Supervisor {
     tasks: Vec<Task>,
-    /// Runs of removed or rerun tasks whose process groups may still be winding
-    /// down: `TERMed` at retirement, escalated to KILL by `reap` at grace end, and
-    /// dropped once the leader's zombie is collected. Invisible to `tick`
-    /// snapshots, so the row disappears (or shows its replacement) instantly
-    /// while the sweep runs behind it.
+    /// Retired runs awaiting process-group cleanup after removal or rerun. Send
+    /// TERM at retirement, escalate to KILL in `reap` at grace end, and drop each
+    /// run after collecting the leader's zombie. Omit these runs from `tick`
+    /// snapshots: remove the row or display its replacement immediately while
+    /// cleaning up the old process group in the background.
     ///
     /// Retain each leader's zombie until SIGKILL has been sent: collecting it earlier
     /// would release the process-group ID.
@@ -548,7 +548,7 @@ impl Supervisor {
                 p.force_kill();
             }
         }
-        // Retired runs still need exit handling and escalation.
+        // Continue exit handling and escalation for retired runs.
         for t in &mut self.graveyard {
             let _ = t.poll_exit();
             if t.overdue(now, self.kill_grace) {
@@ -564,10 +564,10 @@ impl Supervisor {
         if cleared {
             self.flagship = None;
         }
-        // Schedule recovery explicitly for changes that land outside `apply`: an
-        // exit flips the entry's `stopped` flag, and a cleared mark must leave the
-        // snapshot. Otherwise, a user can restore the old recipe from disk before
-        // the 60 s cadence pass.
+        // Schedule recovery after latching an exit or clearing a flagship mark
+        // outside `apply`: persist the new `stopped` flag and omit the cleared mark.
+        // Otherwise, a user can restore the old recipe from disk before the 60 s
+        // cadence pass.
         if exited || cleared {
             self.recovery.last_mutation = Some(Instant::now());
         }
@@ -575,7 +575,7 @@ impl Supervisor {
 
     /// Return the flagship ID only for a task still in the set with a live process.
     /// Between reaps, the stored ID may refer to a removed task or one whose exit is
-    /// not yet latched. A stopped task has no process and never holds the mark.
+    /// not yet latched. Exclude stopped tasks, which have no process to mark.
     fn flagship_holder(&self) -> Option<u64> {
         self.flagship.filter(|&id| {
             self.index_of(id).is_some_and(|i| {
@@ -625,8 +625,8 @@ impl Supervisor {
             .tasks
             .iter_mut()
             .map(|t| {
-                // A stopped task has no run: no grid to flush or drain, no clock
-                // to measure.
+                // Skip grid operations and age calculations for a stopped task:
+                // no process has run under the row.
                 let (lifecycle, started_ago, quiet_ago, finished_ago) = match &t.process {
                     Some(p) => {
                         p.flush_expired_sync();
@@ -680,8 +680,8 @@ impl Supervisor {
         if let Some(id) = self.watched
             && let Some(t) = self.tasks.iter().find(|t| t.id == id)
         {
-            // A stopped task shows an empty screen with a hidden cursor, so attach
-            // and peek open on it instead of refusing.
+            // Allow attach and peek on stopped tasks; send an empty screen with
+            // a hidden cursor because there is no grid to display.
             let mut view = match &t.process {
                 Some(p) => {
                     let (formatted, cursor, hide) = p.formatted();
@@ -689,9 +689,8 @@ impl Supervisor {
                     let sb = p.scroll_offset();
                     ScreenView {
                         id,
-                        // `lines` stays empty on both the stored and candidate copies
-                        // so it never affects equality; it is filled only on the
-                        // emitted copy.
+                        // Leave `lines` empty on the stored and candidate copies
+                        // to exclude it from equality; fill only the emitted copy.
                         lines: Vec::new(),
                         formatted,
                         cursor,
@@ -828,7 +827,7 @@ impl Supervisor {
     }
 
     /// Route one input send to task `id`'s run, reporting a bounded-queue refusal.
-    /// Input to a stopped task is dropped silently, as to a force-killed run.
+    /// Silently discard input to stopped tasks and force-killed runs.
     fn deliver(
         &mut self,
         id: u64,
@@ -964,7 +963,7 @@ impl Supervisor {
             task.harness = Some(h);
             task.resume_id = resume_id;
             if let Some(p) = &mut task.process {
-                // Registry reads must keep using the launch-time configuration.
+                // Use the launch-time configuration for registry reads.
                 p.harness_home = home;
                 p.capture_file = Some(capture_file);
             }
@@ -992,8 +991,8 @@ impl Supervisor {
         Ok((id, notice))
     }
 
-    /// Append `task`, built under `next_id`, with its labels normalized; the
-    /// one place the id counter advances.
+    /// Append `task`, built under `next_id`, with its labels normalized.
+    /// Increment the ID counter only here.
     fn enroll(&mut self, mut task: Task, group: Option<String>, name: Option<String>) {
         debug_assert_eq!(task.id, self.next_id, "task built under a stale id");
         task.group = normalize_group(group);
@@ -1117,11 +1116,11 @@ impl Supervisor {
                 if let Some(notice) = notice {
                     self.status(format!("task {id}: {notice}"));
                 }
-                // Keep the row's identity; take from the fresh spawn only what a
-                // new launch sets: its harness, run number, planned resume ID,
-                // and the process. The resume ID was read above, before the
-                // displaced run and its capture file go. A stopped task has no
-                // run to displace.
+                // Preserve the row's identity; copy only the launch state from
+                // the fresh spawn: harness, run number, planned resume ID, and
+                // process. Read the resume ID above, before retiring the old run
+                // and unlinking its capture file. For a stopped task, there is
+                // no old run to retire.
                 let Task {
                     harness,
                     run,
@@ -1149,7 +1148,7 @@ impl Supervisor {
     /// Build `{dir: [entries]}` in spawn order, preserving groups, names, tags, and the
     /// flagship mark. Save managed tasks as agent words with the best-known session IDs;
     /// save literals as their exact text. Mark a task with no live process, exited or
-    /// never started, as stopped so a load restores the row without running it.
+    /// never started, as stopped; on load, restore its row without starting a process.
     fn session_config(&self) -> SessionConfig {
         // `admit` appends monotonic IDs; `rerun` preserves both index and ID;
         // removal preserves relative order.
@@ -1224,11 +1223,11 @@ impl Supervisor {
     /// Spawn each recipe entry in its existing directory; skip missing directories. Resolve
     /// managed binaries as on the Agent page. Record a missing binary as a failed entry
     /// with a diagnostic, then continue loading. Restore a stopped entry as a row with no
-    /// process, without resolving a managed binary: `rerun` looks it up on the `PATH` of
-    /// that moment. Restore each admitted entry's tag. Preserve the current tasks and
+    /// process; defer managed binary lookup until `rerun`, using the `PATH` of that
+    /// moment. Restore each admitted entry's tag. Preserve the current tasks and
     /// their marks: restore a stored flagship only when no live task is marked, and
-    /// never on a stopped entry, which cannot hold it. Return the outcome for one summary
-    /// line, or `None` after reporting a missing launch context.
+    /// never on a stopped entry, which has no process to mark. Return the outcome for
+    /// one summary line, or `None` after reporting a missing launch context.
     fn materialize(&mut self, cfg: &SessionConfig) -> Option<LoadOutcome> {
         let launch = self.launch_or_refuse()?;
         let mut out = LoadOutcome::default();

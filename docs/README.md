@@ -1,6 +1,6 @@
 # fleetcom Documentation
 
-The daemon supervises live processes; session files store repeatable launch recipes, with each task's finished state. Reconnecting returns you to the daemon's running tasks, while loading a session starts new processes from its recipe and restores the tasks that had finished as stopped rows. Use this guide for storage paths, lifecycle details, and a complete first run.
+Use the daemon to supervise live processes and session files to save repeatable launch recipes, including whether each task had finished. Reconnect to access the daemon's running tasks. Load a session to start new processes for its live entries and restore finished tasks as stopped rows. Use this guide for storage paths, lifecycle details, and a complete first run.
 
 ## Index
 
